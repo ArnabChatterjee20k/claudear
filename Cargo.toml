@@ -25,7 +25,7 @@ tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
 
 # Embeddings
-fastembed = "4"
+fastembed = "5"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -55,7 +55,7 @@ hex = "0.4"
 subtle = "2"
 
 # GraphQL for Linear
-graphql_client = { version = "0.14", features = ["reqwest"] }
+graphql_client = { version = "0.16", features = ["reqwest"] }
 
 # Async utilities
 futures = "0.3"
@@ -67,7 +67,7 @@ regex-lite = "0.1"
 
 # File system utilities
 walkdir = "2"
-dirs = "5"
+dirs = "6"
 
 # URL encoding
 urlencoding = "2"
@@ -81,7 +81,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-mockall = "0.13"
+mockall = "0.14"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
