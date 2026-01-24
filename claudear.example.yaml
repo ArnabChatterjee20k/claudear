@@ -1,0 +1,239 @@
+# ============================================
+# Claudear Configuration
+# ============================================
+# Copy this file to claudear.yaml and fill in your values.
+# Environment variables can override any setting (useful for secrets in containers).
+
+# ============================================
+# Core Configuration (REQUIRED)
+# ============================================
+
+# Working directory where repositories are cloned
+work_dir: ~/.claudear/repos
+
+# ============================================
+# Repository Discovery (REQUIRED)
+# ============================================
+# Claudear auto-discovers repositories from known organizations.
+# Issues are automatically routed to the correct repository by
+# inferring the target repo from file paths in stack traces and issue content.
+
+# GitHub organizations to track
+# Repositories from these orgs will be indexed for issue-to-repo inference
+known_orgs:
+  - utopia-php
+  - appwrite
+  - appwrite-labs
+  - open-runtimes
+
+# Paths to scan for local repository clones
+# These directories are scanned to find repos matching known_orgs
+auto_discover_paths:
+  - ~/Local
+
+# ============================================
+# Processing Configuration
+# ============================================
+
+# Polling interval in milliseconds (default: 300000 = 5 minutes)
+poll_interval_ms: 300000
+
+# SQLite database path (default: ./claudear.db)
+db_path: ./claudear.db
+
+# Webhook server port (default: 3100)
+webhook_port: 3100
+
+# ============================================
+# Rate Limiting
+# ============================================
+
+# Max issues to process per poll cycle (default: 5)
+max_issues_per_cycle: 5
+
+# Max concurrent issue processing (default: 1)
+max_concurrent: 1
+
+# Delay between processing issues in ms (default: 5000)
+processing_delay_ms: 5000
+
+# ============================================
+# Retry Configuration
+# ============================================
+
+retry:
+  # Maximum retry attempts for failed fixes (default: 2)
+  max_retries: 2
+
+  # Base delay between retries in ms (default: 60000 = 1 minute)
+  # Uses exponential backoff: delay = base_delay * 2^retry_count
+  base_delay_ms: 60000
+
+  # Maximum delay between retries in ms (default: 3600000 = 1 hour)
+  max_delay_ms: 3600000
+
+# ============================================
+# Embeddings Configuration (for similarity search)
+# ============================================
+# Uses fastembed for local embedding generation - no external services required.
+# Models are downloaded automatically on first use and cached locally.
+
+embeddings:
+  # Embedding model to use (default: nomic)
+  # Options: nomic (768d), minilm (384d, faster), bge (384d)
+  model: nomic
+
+  # Custom cache directory for embedding models (optional)
+  # cache_dir: ~/.cache/fastembed
+
+# ============================================
+# Discord Notifications (Optional)
+# ============================================
+
+discord:
+  # Discord webhook URL for notifications
+  webhook_url: https://discord.com/api/webhooks/...
+
+  # Discord user ID to mention in notifications
+  user_id: ""
+
+# ============================================
+# Linear Configuration
+# ============================================
+# To use Linear, provide an API key from Linear Settings > API
+
+linear:
+  # Enable/disable Linear source (default: true if api_key provided)
+  enabled: true
+
+  # Linear API key (REQUIRED for Linear)
+  api_key: lin_api_xxxx
+
+  # Labels that trigger automation
+  trigger_labels:
+    - auto-implement
+    - claude
+
+  # States that trigger automation
+  trigger_states:
+    - backlog
+    - todo
+
+  # Optional: Filter by team ID
+  team_id: ""
+
+  # Optional: Filter by project ID
+  project_id: ""
+
+  # Optional: Webhook signature verification secret
+  # Set via LINEAR_WEBHOOK_SECRET env var for security
+  webhook_secret: ""
+
+# ============================================
+# Sentry Configuration
+# ============================================
+# To use Sentry, provide an auth token from https://sentry.io/settings/account/api/auth-tokens/
+
+sentry:
+  # Enable/disable Sentry source (default: true if auth_token provided)
+  enabled: true
+
+  # Sentry auth token (REQUIRED for Sentry)
+  auth_token: ""
+
+  # Sentry organization slug (REQUIRED if using Sentry)
+  org_slug: your-org
+
+  # Optional: Filter by project slugs
+  project_slugs: []
+
+  # Number of top issues to fetch (default: 100)
+  top_issues_count: 100
+
+  # Time period for fetching top issues (default: 24h)
+  # Options: 1h (1 hour), 12h (12 hours), 24h (1 day), 7d (1 week), 30d (1 month)
+  top_issues_period: 24h
+
+  # Minimum event count for issue to be processed (default: 10)
+  min_event_count: 10
+
+  # Percentage increase to consider issue escalating (default: 50)
+  escalation_threshold_percent: 50
+
+  # Optional: Webhook client secret for signature verification
+  # Set via SENTRY_CLIENT_SECRET env var for security
+  client_secret: ""
+
+# ============================================
+# GitHub PR Monitoring (Optional)
+# ============================================
+
+github:
+  # GitHub personal access token (for checking PR status)
+  token: ghp_xxxxxxxxxxxx
+
+  # PR status check interval in milliseconds (default: 60000 = 1 minute)
+  poll_interval_ms: 60000
+
+  # Auto-resolve issues on Linear/Sentry when PRs merge (default: true)
+  auto_resolve_on_merge: true
+
+# ============================================
+# Email Notifications (Optional)
+# ============================================
+
+email:
+  # SMTP server host
+  smtp_host: smtp.gmail.com
+
+  # SMTP server port (default: 587)
+  smtp_port: 587
+
+  # SMTP username
+  smtp_username: ""
+
+  # SMTP password
+  smtp_password: ""
+
+  # Sender email address
+  from_address: ""
+
+  # Recipient email addresses
+  to_addresses: []
+
+  # Use TLS (default: true)
+  use_tls: true
+
+# ============================================
+# SMS Notifications via Twilio (Optional)
+# ============================================
+
+sms:
+  # Twilio Account SID
+  account_sid: ""
+
+  # Twilio Auth Token
+  auth_token: ""
+
+  # Twilio phone number (sender)
+  from_number: ""
+
+  # Recipient phone numbers
+  to_numbers: []
+
+# ============================================
+# Push Notifications via Pushover (Optional)
+# ============================================
+
+push:
+  # Pushover API token
+  api_token: ""
+
+  # Pushover user key
+  user_key: ""
+
+  # Optional: Device name (sends to all devices if empty)
+  device: ""
+
+  # Optional: Priority (-2 to 2)
+  priority: 0

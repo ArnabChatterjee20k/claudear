@@ -1,0 +1,77 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: claudear-app
+    restart: unless-stopped
+    environment:
+      # Data directory (SQLite database stored here)
+      DATA_DIR: /app/data
+
+      # Project directory (mounted)
+      PROJECT_DIR: /app/project
+
+      # Webhook port
+      WEBHOOK_PORT: 3100
+
+      # Embedding model (default: nomic, options: nomic, minilm, bge)
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic}
+
+      # Source configurations (from .env)
+      LINEAR_API_KEY: ${LINEAR_API_KEY:-}
+      LINEAR_ENABLED: ${LINEAR_ENABLED:-true}
+      LINEAR_TRIGGER_LABELS: ${LINEAR_TRIGGER_LABELS:-auto-implement,claude}
+      LINEAR_TRIGGER_STATES: ${LINEAR_TRIGGER_STATES:-backlog,todo}
+      LINEAR_WEBHOOK_SECRET: ${LINEAR_WEBHOOK_SECRET:-}
+
+      SENTRY_AUTH_TOKEN: ${SENTRY_AUTH_TOKEN:-}
+      SENTRY_ORG_SLUG: ${SENTRY_ORG_SLUG:-}
+      SENTRY_ENABLED: ${SENTRY_ENABLED:-true}
+      SENTRY_CLIENT_SECRET: ${SENTRY_CLIENT_SECRET:-}
+
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_AUTO_RESOLVE_ON_MERGE: ${GITHUB_AUTO_RESOLVE_ON_MERGE:-true}
+
+      # Notifications
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      DISCORD_USER_ID: ${DISCORD_USER_ID:-}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:-}
+
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_TO: ${EMAIL_TO:-}
+    volumes:
+      - ./data:/app/data
+      - ${PROJECT_DIR:-.}:/app/project:ro
+      - ./claudear.yaml:/app/claudear.yaml:ro
+      # Cache embedding models between container restarts
+      - embedding_cache:/root/.cache/fastembed
+    ports:
+      - "${APP_PORT:-3100}:3100"
+    networks:
+      - edge
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: claudear-dashboard
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "${DASHBOARD_PORT:-8080}:80"
+    networks:
+      - edge
+
+networks:
+  edge:
+    driver: bridge
+
+volumes:
+  embedding_cache:

@@ -1,0 +1,38 @@
+# typed: false
+# frozen_string_literal: true
+
+class Claudear < Formula
+  desc "High-performance watcher service that monitors issue trackers and spawns Claude Code agents to own resolution"
+  homepage "https://github.com/{{REPO_OWNER}}/claudear"
+  version "{{VERSION}}"
+  license "MIT"
+
+  on_macos do
+    on_intel do
+      url "https://github.com/{{REPO_OWNER}}/claudear/releases/download/v{{VERSION}}/claudear-macos-amd64.tar.gz"
+      sha256 "{{SHA256_MACOS_AMD64}}"
+    end
+
+    on_arm do
+      url "https://github.com/{{REPO_OWNER}}/claudear/releases/download/v{{VERSION}}/claudear-macos-arm64.tar.gz"
+      sha256 "{{SHA256_MACOS_ARM64}}"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/{{REPO_OWNER}}/claudear/releases/download/v{{VERSION}}/claudear-linux-amd64.tar.gz"
+      sha256 "{{SHA256_LINUX_AMD64}}"
+    end
+  end
+
+  def install
+    bin.install "claudear-macos-amd64" => "claudear" if OS.mac? && Hardware::CPU.intel?
+    bin.install "claudear-macos-arm64" => "claudear" if OS.mac? && Hardware::CPU.arm?
+    bin.install "claudear-linux-amd64" => "claudear" if OS.linux? && Hardware::CPU.intel?
+  end
+
+  test do
+    system "#{bin}/claudear", "--version"
+  end
+end
