@@ -116,7 +116,7 @@ impl EmbeddingClient {
 
     /// Generate embedding for text.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let model = self.model.lock().await;
+        let mut model = self.model.lock().await;
 
         let embeddings = model
             .embed(vec![text], None)
@@ -130,7 +130,7 @@ impl EmbeddingClient {
 
     /// Generate embeddings for multiple texts.
     pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let model = self.model.lock().await;
+        let mut model = self.model.lock().await;
 
         let texts_owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
 
