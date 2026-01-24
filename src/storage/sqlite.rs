@@ -11,7 +11,16 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+
+/// Compiled regex for parsing GitHub PR URLs (compiled once, reused).
+static PR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+    regex_lite::Regex::new(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
+        .expect("PR URL regex should be valid")
+});
+
+/// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
+const MAX_PR_URL_LENGTH: usize = 2048;
 
 /// SQLite-based fix attempt tracker for persistence.
 ///
@@ -444,8 +453,11 @@ impl SqliteTracker {
     /// Parse a GitHub PR URL to extract repo and PR number.
     /// Supports: https://github.com/owner/repo/pull/123
     fn parse_pr_url(url: &str) -> Option<(String, i64)> {
-        let regex = regex_lite::Regex::new(r"github\.com/([^/]+/[^/]+)/pull/(\d+)").ok()?;
-        let caps = regex.captures(url)?;
+        // Reject excessively long URLs to prevent ReDoS and memory issues
+        if url.len() > MAX_PR_URL_LENGTH {
+            return None;
+        }
+        let caps = PR_URL_REGEX.captures(url)?;
         let repo = caps.get(1)?.as_str().to_string();
         let pr_number: i64 = caps.get(2)?.as_str().parse().ok()?;
         Some((repo, pr_number))

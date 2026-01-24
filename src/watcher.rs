@@ -228,12 +228,31 @@ impl Watcher {
         tracing::info!("");
 
         // Sync repository index to database (includes file lists)
-        match self.sync_repos_to_db(true) {
-            Ok(count) if count > 0 => {
+        // Use spawn_blocking since sync_repos_to_db performs blocking I/O
+        let inferrer = self.inferrer.clone();
+        let sqlite_tracker = self.sqlite_tracker.clone();
+        let sync_result = tokio::task::spawn_blocking(move || -> crate::error::Result<usize> {
+            let inferrer = match &inferrer {
+                Some(inf) => inf,
+                None => return Ok(0),
+            };
+            let sqlite_tracker = match &sqlite_tracker {
+                Some(t) => t,
+                None => return Ok(0),
+            };
+            inferrer.with_index(|index| sqlite_tracker.sync_from_index(index, true))
+        })
+        .await;
+
+        match sync_result {
+            Ok(Ok(count)) if count > 0 => {
                 tracing::info!("Synced {} repositories to database", count);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!("Failed to sync repos to database: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!("Sync task panicked: {}", e);
             }
             _ => {}
         }
@@ -254,7 +273,7 @@ impl Watcher {
         while self.is_running.load(Ordering::SeqCst) {
             poll_timer.tick().await;
             if self.is_running.load(Ordering::SeqCst) {
-                poll_count += 1;
+                poll_count = poll_count.wrapping_add(1);
 
                 // Periodically refresh repo index to detect new repositories
                 if poll_count % REFRESH_INTERVAL == 0 {

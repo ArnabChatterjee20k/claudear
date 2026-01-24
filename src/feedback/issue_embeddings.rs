@@ -261,9 +261,16 @@ fn build_embedding_text(issue: &Issue) -> String {
 
     // Stack trace from metadata if available (very important for bug similarity)
     if let Some(stack) = issue.metadata.get("stack_trace").and_then(|v| v.as_str()) {
-        // Truncate very long stack traces
+        // Truncate very long stack traces (using char_indices to avoid panic on UTF-8 boundaries)
         let truncated = if stack.len() > 2000 {
-            format!("{}...", &stack[..2000])
+            // Find a valid UTF-8 boundary at or before position 2000
+            let truncate_pos = stack
+                .char_indices()
+                .take_while(|(i, _)| *i < 2000)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            format!("{}...", &stack[..truncate_pos])
         } else {
             stack.to_string()
         };

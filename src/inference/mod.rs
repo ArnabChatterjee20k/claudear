@@ -349,16 +349,24 @@ impl RepoInferrer {
 
     /// Check if embeddings are available.
     pub fn has_embeddings(&self) -> bool {
-        let embeddings = self.repo_embeddings.read()
-            .expect("repo_embeddings RwLock poisoned in has_embeddings");
-        !embeddings.is_empty()
+        match self.repo_embeddings.read() {
+            Ok(embeddings) => !embeddings.is_empty(),
+            Err(e) => {
+                tracing::error!(error = %e, "repo_embeddings RwLock poisoned in has_embeddings");
+                false
+            }
+        }
     }
 
     /// Get the number of embedded repositories.
     pub fn embedding_count(&self) -> usize {
-        let embeddings = self.repo_embeddings.read()
-            .expect("repo_embeddings RwLock poisoned in embedding_count");
-        embeddings.len()
+        match self.repo_embeddings.read() {
+            Ok(embeddings) => embeddings.len(),
+            Err(e) => {
+                tracing::error!(error = %e, "repo_embeddings RwLock poisoned in embedding_count");
+                0
+            }
+        }
     }
 
     /// Refresh the index and embed any new repositories.
@@ -378,7 +386,7 @@ impl RepoInferrer {
         // Find repos that don't have embeddings yet
         let existing_names: std::collections::HashSet<String> = {
             let embeddings = self.repo_embeddings.read()
-                .expect("repo_embeddings RwLock poisoned in refresh_repos");
+                .map_err(|e| crate::error::Error::Other(format!("repo_embeddings RwLock poisoned: {}", e)))?;
             embeddings.iter().map(|e| e.name.clone()).collect()
         };
 
@@ -391,7 +399,7 @@ impl RepoInferrer {
         if new_repos.is_empty() {
             // Update index anyway (file lists may have changed)
             let mut index = self.index.write()
-                .expect("index RwLock poisoned in refresh_repos");
+                .map_err(|e| crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))?;
             *index = new_index;
             return Ok(0);
         }
@@ -421,7 +429,7 @@ impl RepoInferrer {
         // Update state with size limit enforcement
         {
             let mut embeddings = self.repo_embeddings.write()
-                .expect("repo_embeddings RwLock poisoned in refresh_repos (write)");
+                .map_err(|e| crate::error::Error::Other(format!("repo_embeddings RwLock poisoned: {}", e)))?;
             embeddings.extend(new_embeddings);
 
             // Evict oldest embeddings if we exceed the limit (LRU-style)
@@ -439,7 +447,7 @@ impl RepoInferrer {
         }
         {
             let mut index = self.index.write()
-                .expect("index RwLock poisoned in refresh_repos (write)");
+                .map_err(|e| crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))?;
             *index = new_index;
         }
 
@@ -451,8 +459,13 @@ impl RepoInferrer {
     fn find_by_embedding(&self, query_embedding: &[f32], min_similarity: f32) -> Option<(String, f32)> {
         use crate::feedback::cosine_similarity;
 
-        let embeddings = self.repo_embeddings.read()
-            .expect("repo_embeddings RwLock poisoned in find_by_embedding");
+        let embeddings = match self.repo_embeddings.read() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(error = %e, "repo_embeddings RwLock poisoned in find_by_embedding");
+                return None;
+            }
+        };
         let mut best_match: Option<(String, f32)> = None;
 
         for repo_emb in embeddings.iter() {
@@ -476,8 +489,13 @@ impl RepoInferrer {
     /// 4. Basename match
     pub fn infer(&self, issue: &Issue) -> Option<InferredRepo> {
         let context = IssueContext::from_issue(issue);
-        let index = self.index.read()
-            .expect("index RwLock poisoned in infer");
+        let index = match self.index.read() {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::error!(error = %e, "index RwLock poisoned in infer");
+                return None;
+            }
+        };
 
         tracing::debug!(
             issue_id = %issue.short_id,
@@ -627,8 +645,13 @@ impl RepoInferrer {
                 const MIN_SIMILARITY: f32 = 0.5; // Threshold for semantic match
 
                 if let Some((repo_name, similarity)) = self.find_by_embedding(embedding, MIN_SIMILARITY) {
-                    let index = self.index.read()
-                        .expect("index RwLock poisoned in infer_with_embedding");
+                    let index = match self.index.read() {
+                        Ok(i) => i,
+                        Err(e) => {
+                            tracing::error!(error = %e, "index RwLock poisoned in infer_with_embedding");
+                            return None;
+                        }
+                    };
                     if let Some(repo) = index.get(&repo_name) {
                         let confidence = if similarity >= 0.8 {
                             Confidence::High
@@ -662,9 +685,13 @@ impl RepoInferrer {
 
     /// Get the number of indexed repositories.
     pub fn repo_count(&self) -> usize {
-        let index = self.index.read()
-            .expect("index RwLock poisoned in repo_count");
-        index.len()
+        match self.index.read() {
+            Ok(index) => index.len(),
+            Err(e) => {
+                tracing::error!(error = %e, "index RwLock poisoned in repo_count");
+                0
+            }
+        }
     }
 
     /// Find repo references in context that are not in our index.
@@ -672,24 +699,34 @@ impl RepoInferrer {
     /// Returns a list of repo names (org/repo format) that were referenced
     /// but not found locally.
     pub fn find_unknown_repos(&self, context: &IssueContext) -> Vec<String> {
-        let index = self.index.read()
-            .expect("index RwLock poisoned in find_unknown_repos");
-        context
-            .repos
-            .iter()
-            .filter(|repo_ref| index.get(repo_ref).is_none())
-            .cloned()
-            .collect()
+        match self.index.read() {
+            Ok(index) => context
+                .repos
+                .iter()
+                .filter(|repo_ref| index.get(repo_ref).is_none())
+                .cloned()
+                .collect(),
+            Err(e) => {
+                tracing::error!(error = %e, "index RwLock poisoned in find_unknown_repos");
+                Vec::new()
+            }
+        }
     }
 
     /// Get a read lock on the index for syncing to external storage.
-    pub fn with_index<F, R>(&self, f: F) -> R
+    ///
+    /// Returns an error if the lock is poisoned.
+    pub fn with_index<F, R>(&self, f: F) -> crate::error::Result<R>
     where
-        F: FnOnce(&RepoIndex) -> R,
+        F: FnOnce(&RepoIndex) -> crate::error::Result<R>,
     {
-        let index = self.index.read()
-            .expect("index RwLock poisoned in with_index");
-        f(&index)
+        match self.index.read() {
+            Ok(index) => f(&index),
+            Err(e) => {
+                tracing::error!(error = %e, "index RwLock poisoned in with_index");
+                Err(crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))
+            }
+        }
     }
 }
 
