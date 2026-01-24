@@ -55,7 +55,7 @@ hex = "0.4"
 subtle = "2"
 
 # GraphQL for Linear
-graphql_client = { version = "0.14", features = ["reqwest"] }
+graphql_client = { version = "0.16", features = ["reqwest"] }
 
 # Async utilities
 futures = "0.3"
