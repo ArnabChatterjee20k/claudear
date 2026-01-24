@@ -740,7 +740,11 @@ pub struct IssueEmbedding {
 
 impl IssueEmbedding {
     /// Create a new issue embedding.
-    pub fn new(source: impl Into<String>, issue_id: impl Into<String>, embedding: Vec<f32>) -> Self {
+    pub fn new(
+        source: impl Into<String>,
+        issue_id: impl Into<String>,
+        embedding: Vec<f32>,
+    ) -> Self {
         Self {
             id: 0,
             source: source.into(),

@@ -402,14 +402,12 @@ impl RepoRelationships {
     ) -> Result<()> {
         // Ensure both repos exist in the graph
         if self.graph.get_repository(upstream).is_none() {
-            self.graph.add_repository(
-                Repository::new(upstream).with_github_url(upstream),
-            );
+            self.graph
+                .add_repository(Repository::new(upstream).with_github_url(upstream));
         }
         if self.graph.get_repository(downstream).is_none() {
-            self.graph.add_repository(
-                Repository::new(downstream).with_github_url(downstream),
-            );
+            self.graph
+                .add_repository(Repository::new(downstream).with_github_url(downstream));
         }
 
         let dep = Dependency {

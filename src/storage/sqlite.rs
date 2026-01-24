@@ -4,7 +4,7 @@ use super::FixAttemptTracker;
 use crate::error::Result;
 use crate::types::{
     ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
-    FixAttemptStatus, IssueEmbedding, ProcessingMetric, PromptExperiment, PrReviewRecord,
+    FixAttemptStatus, IssueEmbedding, PrReviewRecord, ProcessingMetric, PromptExperiment,
     SimilarIssue, SourceStats,
 };
 use chrono::{DateTime, Utc};
@@ -409,16 +409,43 @@ impl SqliteTracker {
         // which is expected and safe to ignore. Other errors are logged.
         let migrations = [
             // fix_attempts migrations
-            ("fix_attempts.github_repo", "ALTER TABLE fix_attempts ADD COLUMN github_repo TEXT"),
-            ("fix_attempts.github_pr_number", "ALTER TABLE fix_attempts ADD COLUMN github_pr_number INTEGER"),
-            ("fix_attempts.merged_at", "ALTER TABLE fix_attempts ADD COLUMN merged_at TEXT"),
-            ("fix_attempts.resolved_at", "ALTER TABLE fix_attempts ADD COLUMN resolved_at TEXT"),
-            ("fix_attempts.retry_count", "ALTER TABLE fix_attempts ADD COLUMN retry_count INTEGER DEFAULT 0"),
-            ("fix_attempts.last_retry_at", "ALTER TABLE fix_attempts ADD COLUMN last_retry_at TEXT"),
+            (
+                "fix_attempts.github_repo",
+                "ALTER TABLE fix_attempts ADD COLUMN github_repo TEXT",
+            ),
+            (
+                "fix_attempts.github_pr_number",
+                "ALTER TABLE fix_attempts ADD COLUMN github_pr_number INTEGER",
+            ),
+            (
+                "fix_attempts.merged_at",
+                "ALTER TABLE fix_attempts ADD COLUMN merged_at TEXT",
+            ),
+            (
+                "fix_attempts.resolved_at",
+                "ALTER TABLE fix_attempts ADD COLUMN resolved_at TEXT",
+            ),
+            (
+                "fix_attempts.retry_count",
+                "ALTER TABLE fix_attempts ADD COLUMN retry_count INTEGER DEFAULT 0",
+            ),
+            (
+                "fix_attempts.last_retry_at",
+                "ALTER TABLE fix_attempts ADD COLUMN last_retry_at TEXT",
+            ),
             // repositories migrations (unified table)
-            ("repositories.default_branch", "ALTER TABLE repositories ADD COLUMN default_branch TEXT DEFAULT 'main'"),
-            ("repositories.file_count", "ALTER TABLE repositories ADD COLUMN file_count INTEGER DEFAULT 0"),
-            ("repositories.last_indexed_at", "ALTER TABLE repositories ADD COLUMN last_indexed_at TEXT"),
+            (
+                "repositories.default_branch",
+                "ALTER TABLE repositories ADD COLUMN default_branch TEXT DEFAULT 'main'",
+            ),
+            (
+                "repositories.file_count",
+                "ALTER TABLE repositories ADD COLUMN file_count INTEGER DEFAULT 0",
+            ),
+            (
+                "repositories.last_indexed_at",
+                "ALTER TABLE repositories ADD COLUMN last_indexed_at TEXT",
+            ),
         ];
 
         for (column_name, sql) in migrations {
@@ -1126,7 +1153,9 @@ impl SqliteTracker {
             params![
                 execution.attempt_id,
                 execution.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                execution.completed_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                execution
+                    .completed_at
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
                 execution.duration_secs,
                 execution.exit_code,
                 execution.timed_out as i32,
@@ -1327,17 +1356,21 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
 
         let query = match source {
-            Some(_) => r#"
+            Some(_) => {
+                r#"
                 SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at
                 FROM issue_embeddings
                 WHERE source = ?
                 ORDER BY created_at DESC
-            "#,
-            None => r#"
+            "#
+            }
+            None => {
+                r#"
                 SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at
                 FROM issue_embeddings
                 ORDER BY created_at DESC
-            "#,
+            "#
+            }
         };
 
         let mut stmt = conn.prepare(query)?;
@@ -1388,8 +1421,14 @@ impl SqliteTracker {
     pub fn record_error_pattern(&self, pattern: &ErrorPattern) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
-        let sources_json = pattern.sources.as_ref().and_then(|s| serde_json::to_string(s).ok());
-        let example_ids_json = pattern.example_issue_ids.as_ref().and_then(|s| serde_json::to_string(s).ok());
+        let sources_json = pattern
+            .sources
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
+        let example_ids_json = pattern
+            .example_issue_ids
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
 
         conn.execute(
             r#"
@@ -1961,12 +2000,7 @@ impl SqliteTracker {
 
     /// Add a dependency between two repositories.
     /// Creates the repos if they don't exist.
-    pub fn add_dependency(
-        &self,
-        upstream: &str,
-        downstream: &str,
-        dep_type: &str,
-    ) -> Result<()> {
+    pub fn add_dependency(&self, upstream: &str, downstream: &str, dep_type: &str) -> Result<()> {
         // Ensure both repos exist
         let upstream_id = self.upsert_repository(upstream, None, None)?;
         let downstream_id = self.upsert_repository(downstream, None, None)?;
@@ -2132,22 +2166,29 @@ impl SqliteTracker {
         )?;
 
         // last_insert_rowid() returns 0 on UPDATE, so query for the actual ID
-        let id: i64 = conn.query_row(
-            "SELECT id FROM repositories WHERE name = ?",
-            params![name],
-            |row| row.get(0),
-        ).map_err(|e| {
-            crate::error::Error::Storage(format!(
-                "Failed to retrieve repository ID after UPSERT for '{}': {}. \
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM repositories WHERE name = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                crate::error::Error::Storage(format!(
+                    "Failed to retrieve repository ID after UPSERT for '{}': {}. \
                 This indicates a database inconsistency.",
-                name, e
-            ))
-        })?;
+                    name, e
+                ))
+            })?;
         Ok(id)
     }
 
     /// Save a file to the repo files index.
-    pub fn save_repo_file(&self, repo_id: i64, file_path: &str, file_type: Option<&str>) -> Result<()> {
+    pub fn save_repo_file(
+        &self,
+        repo_id: i64,
+        file_path: &str,
+        file_type: Option<&str>,
+    ) -> Result<()> {
         let conn = self.acquire_lock()?;
         conn.execute(
             r#"
@@ -2252,13 +2293,15 @@ impl SqliteTracker {
     pub fn get_index_stats(&self) -> Result<IndexStats> {
         let conn = self.acquire_lock()?;
 
-        let repo_count: i64 = conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
-        let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM repo_files", [], |row| row.get(0))?;
-        let last_indexed: Option<String> = conn.query_row(
-            "SELECT MAX(last_indexed_at) FROM repositories",
-            [],
-            |row| row.get(0),
-        ).ok();
+        let repo_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+        let file_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repo_files", [], |row| row.get(0))?;
+        let last_indexed: Option<String> = conn
+            .query_row("SELECT MAX(last_indexed_at) FROM repositories", [], |row| {
+                row.get(0)
+            })
+            .ok();
 
         Ok(IndexStats {
             repo_count: repo_count as usize,
@@ -2339,7 +2382,9 @@ impl SqliteTracker {
     pub fn get_inference_stats(&self) -> Result<InferenceStats> {
         let conn = self.acquire_lock()?;
 
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM inference_attempts", [], |row| row.get(0))?;
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM inference_attempts", [], |row| {
+            row.get(0)
+        })?;
         let with_feedback: i64 = conn.query_row(
             "SELECT COUNT(*) FROM inference_attempts WHERE was_correct IS NOT NULL",
             [],
@@ -2396,16 +2441,12 @@ impl SqliteTracker {
     pub fn get_diagnostic_counts(&self) -> Result<DiagnosticCounts> {
         let conn = self.acquire_lock()?;
 
-        let fix_attempts: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM fix_attempts",
-            [],
-            |row| row.get(0),
-        )?;
+        let fix_attempts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?;
         let fix_attempts_by_status: HashMap<String, i64> = {
             let mut map = HashMap::new();
-            let mut stmt = conn.prepare(
-                "SELECT status, COUNT(*) FROM fix_attempts GROUP BY status"
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT status, COUNT(*) FROM fix_attempts GROUP BY status")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?;
@@ -2415,83 +2456,55 @@ impl SqliteTracker {
             map
         };
 
-        let activity_log: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM activity_log",
-            [],
-            |row| row.get(0),
-        )?;
+        let activity_log: i64 =
+            conn.query_row("SELECT COUNT(*) FROM activity_log", [], |row| row.get(0))?;
 
-        let claude_executions: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM claude_executions",
-            [],
-            |row| row.get(0),
-        )?;
+        let claude_executions: i64 =
+            conn.query_row("SELECT COUNT(*) FROM claude_executions", [], |row| {
+                row.get(0)
+            })?;
 
-        let pr_reviews: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pr_reviews",
-            [],
-            |row| row.get(0),
-        )?;
+        let pr_reviews: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pr_reviews", [], |row| row.get(0))?;
 
-        let pr_review_states: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pr_review_states",
-            [],
-            |row| row.get(0),
-        )?;
+        let pr_review_states: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pr_review_states", [], |row| {
+                row.get(0)
+            })?;
 
-        let issue_embeddings: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM issue_embeddings",
-            [],
-            |row| row.get(0),
-        )?;
+        let issue_embeddings: i64 =
+            conn.query_row("SELECT COUNT(*) FROM issue_embeddings", [], |row| {
+                row.get(0)
+            })?;
 
-        let similar_issues: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM similar_issues",
-            [],
-            |row| row.get(0),
-        )?;
+        let similar_issues: i64 =
+            conn.query_row("SELECT COUNT(*) FROM similar_issues", [], |row| row.get(0))?;
 
-        let repositories: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM repositories",
-            [],
-            |row| row.get(0),
-        )?;
+        let repositories: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
 
-        let repo_files: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM repo_files",
-            [],
-            |row| row.get(0),
-        )?;
+        let repo_files: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repo_files", [], |row| row.get(0))?;
 
-        let inference_attempts: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM inference_attempts",
-            [],
-            |row| row.get(0),
-        )?;
+        let inference_attempts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM inference_attempts", [], |row| {
+                row.get(0)
+            })?;
 
-        let error_patterns: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM error_patterns",
-            [],
-            |row| row.get(0),
-        )?;
+        let error_patterns: i64 =
+            conn.query_row("SELECT COUNT(*) FROM error_patterns", [], |row| row.get(0))?;
 
-        let processing_metrics: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM processing_metrics",
-            [],
-            |row| row.get(0),
-        )?;
+        let processing_metrics: i64 =
+            conn.query_row("SELECT COUNT(*) FROM processing_metrics", [], |row| {
+                row.get(0)
+            })?;
 
-        let feedback_outcomes: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM feedback_outcomes",
-            [],
-            |row| row.get(0),
-        )?;
+        let feedback_outcomes: i64 =
+            conn.query_row("SELECT COUNT(*) FROM feedback_outcomes", [], |row| {
+                row.get(0)
+            })?;
 
-        let prs: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM prs",
-            [],
-            |row| row.get(0),
-        )?;
+        let prs: i64 = conn.query_row("SELECT COUNT(*) FROM prs", [], |row| row.get(0))?;
 
         // Get recent fix attempts for debugging
         let recent_fix_attempts: Vec<(String, String, String, String)> = {
@@ -2691,17 +2704,17 @@ impl SqliteTracker {
             |row| row.get(0),
         ).ok();
 
-        let avg_time_to_merge_mins: Option<f64> = conn.query_row(
-            "SELECT AVG(time_to_merge_mins) FROM prs WHERE time_to_merge_mins IS NOT NULL",
-            [],
-            |row| row.get(0),
-        ).ok();
+        let avg_time_to_merge_mins: Option<f64> = conn
+            .query_row(
+                "SELECT AVG(time_to_merge_mins) FROM prs WHERE time_to_merge_mins IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
 
-        let avg_review_cycles: Option<f64> = conn.query_row(
-            "SELECT AVG(review_cycles) FROM prs",
-            [],
-            |row| row.get(0),
-        ).ok();
+        let avg_review_cycles: Option<f64> = conn
+            .query_row("SELECT AVG(review_cycles) FROM prs", [], |row| row.get(0))
+            .ok();
 
         let merge_rate = if merged + closed > 0 {
             Some(merged as f64 / (merged + closed) as f64)
@@ -2711,7 +2724,8 @@ impl SqliteTracker {
 
         // Get counts by repository
         let mut by_repo = HashMap::new();
-        let mut stmt = conn.prepare("SELECT github_repo, COUNT(*) FROM prs GROUP BY github_repo")?;
+        let mut stmt =
+            conn.prepare("SELECT github_repo, COUNT(*) FROM prs GROUP BY github_repo")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;

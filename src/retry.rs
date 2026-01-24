@@ -109,7 +109,8 @@ impl RetryManager {
                     self.tracker.mark_failed(source, issue_id, error)?;
 
                     let delay = self.get_delay(new_retry_count);
-                    let next_retry_time = Utc::now() + ChronoDuration::milliseconds(delay.as_millis() as i64);
+                    let next_retry_time =
+                        Utc::now() + ChronoDuration::milliseconds(delay.as_millis() as i64);
 
                     tracing::info!(
                         component = "retry",
@@ -123,7 +124,11 @@ impl RetryManager {
                     // Log retry_scheduled activity
                     let activity = ActivityLogEntry::new(
                         "retry_scheduled",
-                        format!("Retry scheduled for {} at {}", attempt.short_id, next_retry_time.format("%Y-%m-%dT%H:%M:%SZ")),
+                        format!(
+                            "Retry scheduled for {} at {}",
+                            attempt.short_id,
+                            next_retry_time.format("%Y-%m-%dT%H:%M:%SZ")
+                        ),
                     )
                     .with_source(source.to_string())
                     .with_issue(issue_id.to_string(), attempt.short_id.clone())

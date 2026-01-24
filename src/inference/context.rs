@@ -24,9 +24,8 @@ static CLASS_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r"\b([A-Z][a-zA-Z0-9]+(?:Controller|Service|Handler|Manager|Repository|Factory|Provider|Module|Component|Middleware))\b").ok()
 });
 
-static ERROR_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(r"\b([A-Z][a-zA-Z0-9]*(?:Error|Exception|Failure))\b").ok()
-});
+static ERROR_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"\b([A-Z][a-zA-Z0-9]*(?:Error|Exception|Failure))\b").ok());
 
 /// Extracted context from an issue for repository inference.
 #[derive(Debug, Clone, Default)]
@@ -393,16 +392,19 @@ mod tests {
 
         let context = IssueContext::from_sentry(&issue);
 
-        assert!(context.filenames.contains(&"src/handlers/auth.rs".to_string()));
+        assert!(context
+            .filenames
+            .contains(&"src/handlers/auth.rs".to_string()));
         assert!(context.functions.contains(&"authenticate".to_string()));
     }
 
     #[test]
     fn test_context_from_sentry_with_culprit() {
         let mut issue = create_test_issue("sentry", "Error in handler", "");
-        issue
-            .metadata
-            .insert("culprit".to_string(), json!("api/routes.ts in handleRequest"));
+        issue.metadata.insert(
+            "culprit".to_string(),
+            json!("api/routes.ts in handleRequest"),
+        );
 
         let context = IssueContext::from_sentry(&issue);
 
@@ -415,12 +417,14 @@ mod tests {
         let mut issue = create_test_issue("sentry", "Error in handler", "");
         issue.metadata.insert(
             "stacktrace".to_string(),
-            json!(r#"
+            json!(
+                r#"
                 File "app/services/user_service.py", line 45, in create_user
                     raise ValueError("Invalid email")
                 File "app/controllers/user_controller.py", line 23, in handle
                     return service.create_user(data)
-            "#),
+            "#
+            ),
         );
 
         let context = IssueContext::from_sentry(&issue);
@@ -445,10 +449,7 @@ mod tests {
 
         let context = IssueContext::from_linear(&issue);
 
-        assert!(context
-            .filenames
-            .iter()
-            .any(|f| f.contains("session.rs")));
+        assert!(context.filenames.iter().any(|f| f.contains("session.rs")));
     }
 
     #[test]

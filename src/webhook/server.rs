@@ -453,7 +453,6 @@ async fn process_issue(
     result
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -436,7 +436,8 @@ fn create_notifier(config: &Config) -> Arc<dyn Notifier> {
 }
 
 fn create_tracker(config: &Config) -> (Arc<dyn FixAttemptTracker>, Arc<SqliteTracker>) {
-    let tracker = Arc::new(SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker"));
+    let tracker =
+        Arc::new(SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker"));
     (tracker.clone(), tracker)
 }
 
@@ -611,7 +612,10 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     println!("\nIndexed Repositories ({}):", indexed_repos.len());
                     for repo in &indexed_repos {
-                        println!("  {} - {} files [{}]", repo.name, repo.file_count, repo.path);
+                        println!(
+                            "  {} - {} files [{}]",
+                            repo.name, repo.file_count, repo.path
+                        );
                     }
                 }
 
@@ -632,7 +636,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Scanning: {:?}", config.auto_discover_paths);
 
                 if config.known_orgs.is_empty() || config.auto_discover_paths.is_empty() {
-                    anyhow::bail!("known_orgs and auto_discover_paths must be configured in claudear.yaml");
+                    anyhow::bail!(
+                        "known_orgs and auto_discover_paths must be configured in claudear.yaml"
+                    );
                 }
 
                 let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
@@ -665,7 +671,9 @@ async fn main() -> anyhow::Result<()> {
                     )?;
 
                     // Convert files to (path, file_type) tuples for storage
-                    let files_with_types: Vec<(String, Option<String>)> = repo.files.iter()
+                    let files_with_types: Vec<(String, Option<String>)> = repo
+                        .files
+                        .iter()
                         .map(|f| {
                             let file_type = std::path::Path::new(f)
                                 .extension()
@@ -681,7 +689,10 @@ async fn main() -> anyhow::Result<()> {
                     saved_count += 1;
                 }
 
-                println!("\nIndexed {} repositories to {:?}", saved_count, config.db_path);
+                println!(
+                    "\nIndexed {} repositories to {:?}",
+                    saved_count, config.db_path
+                );
             }
 
             ReposCommands::Search { query } => {
@@ -716,7 +727,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Total files indexed: {}", stats.file_count);
 
                 if stats.repo_count > 0 {
-                    println!("  Average files per repo: {:.1}", stats.file_count as f64 / stats.repo_count as f64);
+                    println!(
+                        "  Average files per repo: {:.1}",
+                        stats.file_count as f64 / stats.repo_count as f64
+                    );
                 }
 
                 if let Some(ref last_indexed) = stats.last_indexed_at {
@@ -745,7 +759,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("The 'repos add' command is deprecated.");
                 println!("Repositories are now auto-discovered from known_orgs config.");
                 println!("\nUse 'claudear repos index' instead.");
-                println!("\nIf you still want to manually track '{}', add the org to known_orgs", name);
+                println!(
+                    "\nIf you still want to manually track '{}', add the org to known_orgs",
+                    name
+                );
                 let _ = (path, github_url); // Suppress unused warning
             }
 
@@ -755,7 +772,10 @@ async fn main() -> anyhow::Result<()> {
                 dep_type,
             } => {
                 db_tracker.add_dependency(upstream, downstream, dep_type)?;
-                println!("Linked: {} depends on {} ({})", downstream, upstream, dep_type);
+                println!(
+                    "Linked: {} depends on {} ({})",
+                    downstream, upstream, dep_type
+                );
                 println!("  Saved to database at: {:?}", config.db_path);
             }
 
@@ -766,8 +786,11 @@ async fn main() -> anyhow::Result<()> {
                 // Add DB dependencies to the manager
                 let db_deps = db_tracker.list_all_dependencies()?;
                 for dep in db_deps {
-                    let dtype = DependencyType::parse(&dep.dep_type).unwrap_or(DependencyType::Manual);
-                    manager.add_dependency(&dep.upstream, &dep.downstream, dtype, None).ok();
+                    let dtype =
+                        DependencyType::parse(&dep.dep_type).unwrap_or(DependencyType::Manual);
+                    manager
+                        .add_dependency(&dep.upstream, &dep.downstream, dtype, None)
+                        .ok();
                 }
 
                 println!("\n=== Repository Dependency Graph ===\n");
@@ -835,12 +858,17 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Group by repo for display
-                let mut by_repo: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
+                let mut by_repo: std::collections::HashMap<String, Vec<_>> =
+                    std::collections::HashMap::new();
                 for dep in &discovered {
                     by_repo.entry(dep.repo.clone()).or_default().push(dep);
                 }
 
-                println!("Discovered {} dependencies across {} repositories:\n", discovered.len(), by_repo.len());
+                println!(
+                    "Discovered {} dependencies across {} repositories:\n",
+                    discovered.len(),
+                    by_repo.len()
+                );
                 for (repo, deps) in &by_repo {
                     println!("  {}", repo);
                     for dep in deps {
@@ -861,7 +889,11 @@ async fn main() -> anyhow::Result<()> {
                         // Add dependency
                         db_tracker.add_dependency(&dep.depends_on, &dep.repo, &dep.dep_type)?;
                     }
-                    println!("Saved {} dependencies to {:?}", discovered.len(), config.db_path);
+                    println!(
+                        "Saved {} dependencies to {:?}",
+                        discovered.len(),
+                        config.db_path
+                    );
                 } else {
                     println!("\nRun with --save to persist to database.");
                 }
@@ -883,7 +915,11 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                println!("  Found {} repositories with {} files", index.len(), index.total_files());
+                println!(
+                    "  Found {} repositories with {} files",
+                    index.len(),
+                    index.total_files()
+                );
 
                 // Sync to database
                 let synced = db_tracker.sync_from_index(&index, *files)?;
@@ -916,9 +952,11 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Attempts with feedback: {}", stats.with_feedback);
 
                 if stats.with_feedback > 0 {
-                    println!("  Correct inferences: {} ({:.1}%)",
+                    println!(
+                        "  Correct inferences: {} ({:.1}%)",
                         stats.correct,
-                        stats.accuracy * 100.0);
+                        stats.accuracy * 100.0
+                    );
                 }
 
                 println!("\n  By confidence level:");
@@ -936,7 +974,11 @@ async fn main() -> anyhow::Result<()> {
                 println!("\n  Use 'claudear inference stats' to see aggregate statistics.");
             }
 
-            InferenceCommands::Feedback { id, correct, actual_repo } => {
+            InferenceCommands::Feedback {
+                id,
+                correct,
+                actual_repo,
+            } => {
                 let actual_repo_id = if let Some(ref repo_name) = actual_repo {
                     // Look up repo ID by name
                     if let Some(repo) = db_tracker.get_indexed_repo(repo_name)? {
@@ -948,12 +990,7 @@ async fn main() -> anyhow::Result<()> {
                     None
                 };
 
-                db_tracker.record_inference_feedback(
-                    *id,
-                    *correct,
-                    actual_repo_id,
-                    "manual",
-                )?;
+                db_tracker.record_inference_feedback(*id, *correct, actual_repo_id, "manual")?;
 
                 println!("\nFeedback recorded for inference attempt {}:", id);
                 println!("  Correct: {}", correct);
@@ -1008,7 +1045,9 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     println!("\nNo fix attempts recorded yet.");
                     println!("\nTo debug why fix_attempts is empty:");
-                    println!("  1. Run with verbose logging: RUST_LOG=claudear=debug claudear poll");
+                    println!(
+                        "  1. Run with verbose logging: RUST_LOG=claudear=debug claudear poll"
+                    );
                     println!("  2. Check that issues have the trigger labels configured");
                     println!("  3. Verify the watcher is processing issues (check activity_log)");
                 }
@@ -1174,8 +1213,14 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Webhook server also serves health endpoint which dashboard uses
-                let server =
-                    WebhookServer::new(config.clone(), handlers, notifier.clone(), tracker.clone(), Some(sqlite_tracker.clone()), inferrer_clone);
+                let server = WebhookServer::new(
+                    config.clone(),
+                    handlers,
+                    notifier.clone(),
+                    tracker.clone(),
+                    Some(sqlite_tracker.clone()),
+                    inferrer_clone,
+                );
                 server.start().await?;
             } else if enable_dashboard {
                 // Dashboard only (no webhooks)
@@ -1670,7 +1715,14 @@ async fn main() -> anyhow::Result<()> {
             // Build inferrer for repo inference
             let inferrer = WebhookServer::build_inferrer(&config)?;
 
-            let server = WebhookServer::new(config, handlers, notifier, tracker, Some(sqlite_tracker), inferrer);
+            let server = WebhookServer::new(
+                config,
+                handlers,
+                notifier,
+                tracker,
+                Some(sqlite_tracker),
+                inferrer,
+            );
 
             // Handle shutdown signals
             let shutdown = async {

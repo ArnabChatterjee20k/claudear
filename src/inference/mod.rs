@@ -101,7 +101,10 @@ pub fn resolve_repo_for_issue_with_embedding(
                     if let Some(t) = tracker {
                         let activity = ActivityLogEntry::new(
                             "repo_inferred",
-                            format!("Inferred repo {} for {}", inferred.repo.name, issue.short_id),
+                            format!(
+                                "Inferred repo {} for {}",
+                                inferred.repo.name, issue.short_id
+                            ),
                         )
                         .with_source(issue.source.clone())
                         .with_issue(issue.id.clone(), issue.short_id.clone())
@@ -154,7 +157,10 @@ pub fn resolve_repo_for_issue_with_embedding(
                     if let Some(t) = tracker {
                         let activity = ActivityLogEntry::new(
                             "inference_failed",
-                            format!("Could not infer repository for {}, skipping", issue.short_id),
+                            format!(
+                                "Could not infer repository for {}, skipping",
+                                issue.short_id
+                            ),
                         )
                         .with_source(issue.source.clone())
                         .with_issue(issue.id.clone(), issue.short_id.clone())
@@ -385,8 +391,9 @@ impl RepoInferrer {
 
         // Find repos that don't have embeddings yet
         let existing_names: std::collections::HashSet<String> = {
-            let embeddings = self.repo_embeddings.read()
-                .map_err(|e| crate::error::Error::Other(format!("repo_embeddings RwLock poisoned: {}", e)))?;
+            let embeddings = self.repo_embeddings.read().map_err(|e| {
+                crate::error::Error::Other(format!("repo_embeddings RwLock poisoned: {}", e))
+            })?;
             embeddings.iter().map(|e| e.name.clone()).collect()
         };
 
@@ -398,7 +405,9 @@ impl RepoInferrer {
 
         if new_repos.is_empty() {
             // Update index anyway (file lists may have changed)
-            let mut index = self.index.write()
+            let mut index = self
+                .index
+                .write()
                 .map_err(|e| crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))?;
             *index = new_index;
             return Ok(0);
@@ -428,8 +437,9 @@ impl RepoInferrer {
 
         // Update state with size limit enforcement
         {
-            let mut embeddings = self.repo_embeddings.write()
-                .map_err(|e| crate::error::Error::Other(format!("repo_embeddings RwLock poisoned: {}", e)))?;
+            let mut embeddings = self.repo_embeddings.write().map_err(|e| {
+                crate::error::Error::Other(format!("repo_embeddings RwLock poisoned: {}", e))
+            })?;
             embeddings.extend(new_embeddings);
 
             // Evict oldest embeddings if we exceed the limit (LRU-style)
@@ -446,7 +456,9 @@ impl RepoInferrer {
             }
         }
         {
-            let mut index = self.index.write()
+            let mut index = self
+                .index
+                .write()
                 .map_err(|e| crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))?;
             *index = new_index;
         }
@@ -456,7 +468,11 @@ impl RepoInferrer {
     }
 
     /// Find the best matching repository using semantic similarity.
-    fn find_by_embedding(&self, query_embedding: &[f32], min_similarity: f32) -> Option<(String, f32)> {
+    fn find_by_embedding(
+        &self,
+        query_embedding: &[f32],
+        min_similarity: f32,
+    ) -> Option<(String, f32)> {
         use crate::feedback::cosine_similarity;
 
         let embeddings = match self.repo_embeddings.read() {
@@ -471,9 +487,10 @@ impl RepoInferrer {
         for repo_emb in embeddings.iter() {
             let similarity = cosine_similarity(query_embedding, &repo_emb.embedding);
             if similarity >= min_similarity
-                && (best_match.is_none() || similarity > best_match.as_ref().unwrap().1) {
-                    best_match = Some((repo_emb.name.clone(), similarity));
-                }
+                && (best_match.is_none() || similarity > best_match.as_ref().unwrap().1)
+            {
+                best_match = Some((repo_emb.name.clone(), similarity));
+            }
         }
 
         best_match
@@ -643,7 +660,9 @@ impl RepoInferrer {
             if self.has_embeddings() {
                 const MIN_SIMILARITY: f32 = 0.5; // Threshold for semantic match
 
-                if let Some((repo_name, similarity)) = self.find_by_embedding(embedding, MIN_SIMILARITY) {
+                if let Some((repo_name, similarity)) =
+                    self.find_by_embedding(embedding, MIN_SIMILARITY)
+                {
                     let index = match self.index.read() {
                         Ok(i) => i,
                         Err(e) => {
@@ -723,7 +742,10 @@ impl RepoInferrer {
             Ok(index) => f(&index),
             Err(e) => {
                 tracing::error!(error = %e, "index RwLock poisoned in with_index");
-                Err(crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))
+                Err(crate::error::Error::Other(format!(
+                    "index RwLock poisoned: {}",
+                    e
+                )))
             }
         }
     }

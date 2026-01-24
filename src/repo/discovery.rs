@@ -247,10 +247,8 @@ mod tests {
 
     #[test]
     fn test_is_known_org() {
-        let discovery = DependencyDiscovery::new(vec![
-            "utopia-php".to_string(),
-            "appwrite".to_string(),
-        ]);
+        let discovery =
+            DependencyDiscovery::new(vec!["utopia-php".to_string(), "appwrite".to_string()]);
 
         assert!(discovery.is_known_org("utopia-php/database"));
         assert!(discovery.is_known_org("appwrite/sdk"));

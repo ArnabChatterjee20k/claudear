@@ -318,7 +318,6 @@ impl Default for SentryConfig {
     }
 }
 
-
 impl Config {
     /// Load configuration from a YAML file with environment variable overrides.
     ///
@@ -1070,13 +1069,16 @@ auto_discover_paths:
 "#;
         let file = create_temp_yaml(yaml);
 
-        with_env(&[("AUTO_DISCOVER_PATHS", "~/env/path1, ~/env/path2")], || {
-            let config = Config::load(file.path()).unwrap();
-            assert_eq!(
-                config.auto_discover_paths,
-                vec!["~/env/path1", "~/env/path2"]
-            );
-        });
+        with_env(
+            &[("AUTO_DISCOVER_PATHS", "~/env/path1, ~/env/path2")],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(
+                    config.auto_discover_paths,
+                    vec!["~/env/path1", "~/env/path2"]
+                );
+            },
+        );
     }
 
     #[test]
@@ -1358,41 +1360,113 @@ linear:
     #[test]
     fn test_top_issues_period_from_str() {
         // 1 hour variants
-        assert_eq!("1h".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneHour));
-        assert_eq!("1hr".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneHour));
-        assert_eq!("hour".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneHour));
-        assert_eq!("one_hour".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneHour));
+        assert_eq!(
+            "1h".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneHour)
+        );
+        assert_eq!(
+            "1hr".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneHour)
+        );
+        assert_eq!(
+            "hour".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneHour)
+        );
+        assert_eq!(
+            "one_hour".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneHour)
+        );
 
         // 12 hours variants
-        assert_eq!("12h".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::TwelveHours));
-        assert_eq!("12hr".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::TwelveHours));
-        assert_eq!("12hrs".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::TwelveHours));
-        assert_eq!("twelve_hours".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::TwelveHours));
+        assert_eq!(
+            "12h".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::TwelveHours)
+        );
+        assert_eq!(
+            "12hr".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::TwelveHours)
+        );
+        assert_eq!(
+            "12hrs".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::TwelveHours)
+        );
+        assert_eq!(
+            "twelve_hours".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::TwelveHours)
+        );
 
         // 1 day variants
-        assert_eq!("24h".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneDay));
+        assert_eq!(
+            "24h".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneDay)
+        );
         assert_eq!("1d".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneDay));
-        assert_eq!("day".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneDay));
-        assert_eq!("1day".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneDay));
-        assert_eq!("one_day".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneDay));
+        assert_eq!(
+            "day".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneDay)
+        );
+        assert_eq!(
+            "1day".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneDay)
+        );
+        assert_eq!(
+            "one_day".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneDay)
+        );
 
         // 1 week variants
-        assert_eq!("7d".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneWeek));
-        assert_eq!("1w".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneWeek));
-        assert_eq!("week".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneWeek));
-        assert_eq!("1week".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneWeek));
-        assert_eq!("one_week".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneWeek));
+        assert_eq!(
+            "7d".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneWeek)
+        );
+        assert_eq!(
+            "1w".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneWeek)
+        );
+        assert_eq!(
+            "week".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneWeek)
+        );
+        assert_eq!(
+            "1week".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneWeek)
+        );
+        assert_eq!(
+            "one_week".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneWeek)
+        );
 
         // 1 month variants
-        assert_eq!("30d".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneMonth));
-        assert_eq!("1m".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneMonth));
-        assert_eq!("month".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneMonth));
-        assert_eq!("1month".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneMonth));
-        assert_eq!("one_month".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneMonth));
+        assert_eq!(
+            "30d".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneMonth)
+        );
+        assert_eq!(
+            "1m".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneMonth)
+        );
+        assert_eq!(
+            "month".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneMonth)
+        );
+        assert_eq!(
+            "1month".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneMonth)
+        );
+        assert_eq!(
+            "one_month".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneMonth)
+        );
 
         // Case insensitivity
-        assert_eq!("1H".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneHour));
-        assert_eq!("ONE_WEEK".parse::<TopIssuesPeriod>(), Ok(TopIssuesPeriod::OneWeek));
+        assert_eq!(
+            "1H".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneHour)
+        );
+        assert_eq!(
+            "ONE_WEEK".parse::<TopIssuesPeriod>(),
+            Ok(TopIssuesPeriod::OneWeek)
+        );
 
         // Invalid
         assert!("invalid".parse::<TopIssuesPeriod>().is_err());

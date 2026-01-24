@@ -87,9 +87,7 @@ pub fn cleanup_stale_files() {
     } else {
         // No PID file but socket exists - stale
         let socket_path = default_socket_path();
-        if socket_path.exists()
-            && std::os::unix::net::UnixStream::connect(&socket_path).is_err()
-        {
+        if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
             tracing::info!("Cleaning up stale socket file");
             remove_socket_file();
         }
@@ -117,7 +115,7 @@ fn is_process_running(pid: u32) -> bool {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid; // Suppress unused warning
-        // Assume running if we can't check
+                     // Assume running if we can't check
         true
     }
 }

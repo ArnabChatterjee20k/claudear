@@ -10,7 +10,10 @@ use crate::repo::RepoIndex;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::source::IssueSource;
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
-use crate::types::{ActivityLogEntry, ErrorPattern, FixAttemptStats, Issue, MatchPriority, MatchResult, ProcessingMetric};
+use crate::types::{
+    ActivityLogEntry, ErrorPattern, FixAttemptStats, Issue, MatchPriority, MatchResult,
+    ProcessingMetric,
+};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -104,7 +107,10 @@ impl Watcher {
     /// Build a repository inferrer with embeddings for semantic matching.
     pub async fn build_inferrer_with_embeddings(
         config: &Config,
-    ) -> Result<(Option<RepoInferrer>, Option<crate::feedback::EmbeddingClient>)> {
+    ) -> Result<(
+        Option<RepoInferrer>,
+        Option<crate::feedback::EmbeddingClient>,
+    )> {
         use crate::feedback::{EmbeddingClient, EmbeddingConfig};
         use crate::inference::build_repo_embeddings;
 
@@ -388,7 +394,10 @@ impl Watcher {
 
             // Find the original issue for this PR
             if let Some(attempt) = self.tracker.get_attempt_by_pr_url(pr_url)? {
-                if let Err(e) = self.process_review_action(&attempt, &feedback_summary).await {
+                if let Err(e) = self
+                    .process_review_action(&attempt, &feedback_summary)
+                    .await
+                {
                     tracing::error!(
                         pr_url = %pr_url,
                         error = %e,
@@ -758,11 +767,8 @@ impl Watcher {
         tracing::info!(short_id = %issue.short_id, priority = ?match_result.priority, "Match priority");
 
         // Infer the target repository using the shared resolution function
-        let resolution = resolve_repo_for_issue(
-            self.inferrer.as_ref(),
-            &issue,
-            self.sqlite_tracker.as_ref(),
-        );
+        let resolution =
+            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, self.sqlite_tracker.as_ref());
 
         let project_dir = match resolution {
             RepoResolution::Resolved { project_dir, .. } => project_dir,
@@ -786,7 +792,8 @@ impl Watcher {
         }
 
         // Get the attempt ID for analytics tracking
-        let attempt_id = self.tracker
+        let attempt_id = self
+            .tracker
             .get_attempt(source.name(), &issue.id)
             .ok()
             .flatten()
@@ -1014,8 +1021,7 @@ impl Watcher {
                         let _ = self.tracker.record_activity(&activity);
 
                         // Mark as closed in tracker
-                        if let Err(e) =
-                            self.tracker.mark_closed(&attempt.source, &attempt.issue_id)
+                        if let Err(e) = self.tracker.mark_closed(&attempt.source, &attempt.issue_id)
                         {
                             tracing::warn!(
                                 error = %e,
@@ -1057,7 +1063,10 @@ impl Watcher {
         }
 
         if !auto_closed.is_empty() {
-            tracing::info!(count = auto_closed.len(), "Auto-closed PRs due to issue state changes");
+            tracing::info!(
+                count = auto_closed.len(),
+                "Auto-closed PRs due to issue state changes"
+            );
         }
 
         Ok(auto_closed)

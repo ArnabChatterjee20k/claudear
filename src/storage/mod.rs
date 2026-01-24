@@ -1,23 +1,22 @@
 //! Storage implementations for tracking fix attempts, embeddings, and analytics.
 
-mod sqlite;
 pub mod analytics;
+mod sqlite;
 pub mod vectorlite;
 
+pub use analytics::{
+    classify_error, compute_error_hash, AnalyticsService, TimePeriod, TrendAnalysis, TrendDirection,
+};
 pub use sqlite::{
     ConfidenceBreakdown, DiagnosticCounts, IndexStats, InferenceStats, SqliteTracker,
     StoredDependency, StoredIndexedRepo, StoredRepository,
 };
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite, VectorStoreConfig};
-pub use analytics::{
-    AnalyticsService, TimePeriod, TrendAnalysis, TrendDirection,
-    classify_error, compute_error_hash,
-};
 
 use crate::error::Result;
 use crate::types::{
-    ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt,
-    FixAttemptStats, FixAttemptStatus, PrReviewRecord, ProcessingMetric,
+    ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
+    FixAttemptStatus, PrReviewRecord, ProcessingMetric,
 };
 use std::collections::HashSet;
 

@@ -764,11 +764,7 @@ impl<H: HttpClient> ReviewWatcher<H> {
             }
 
             // Log activity event for the review
-            let message = format!(
-                "PR review from {}: {}",
-                review.user.login,
-                review.state
-            );
+            let message = format!("PR review from {}: {}", review.user.login, review.state);
             let activity = crate::types::ActivityLogEntry::new("pr_review_received", &message)
                 .with_source("github".to_string())
                 .with_metadata(serde_json::json!({

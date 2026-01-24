@@ -148,19 +148,15 @@ impl<'a> AnalyticsService<'a> {
 
         // Current period
         let current_start = now - period_duration;
-        let current_metrics = self.tracker.get_metrics(
-            metric_name,
-            Some(current_start),
-            1000,
-        )?;
+        let current_metrics = self
+            .tracker
+            .get_metrics(metric_name, Some(current_start), 1000)?;
 
         // Previous period
         let previous_start = current_start - period_duration;
-        let previous_metrics = self.tracker.get_metrics(
-            metric_name,
-            Some(previous_start),
-            1000,
-        )?;
+        let previous_metrics = self
+            .tracker
+            .get_metrics(metric_name, Some(previous_start), 1000)?;
 
         // Filter previous metrics to only include those before current period
         let previous_metrics: Vec<_> = previous_metrics
@@ -200,7 +196,10 @@ impl<'a> AnalyticsService<'a> {
         let mut by_source: HashMap<String, Vec<f64>> = HashMap::new();
         for metric in metrics {
             if let Some(source) = metric.source {
-                by_source.entry(source).or_default().push(metric.metric_value);
+                by_source
+                    .entry(source)
+                    .or_default()
+                    .push(metric.metric_value);
             }
         }
 
@@ -217,9 +216,7 @@ impl<'a> AnalyticsService<'a> {
 
     /// Calculate throughput (issues processed per hour) over a time period.
     pub fn calculate_throughput(&self, period: TimePeriod) -> Result<f64> {
-        let activities = self
-            .tracker
-            .get_recent_activities(10000, None)?;
+        let activities = self.tracker.get_recent_activities(10000, None)?;
 
         let start_time = period.start_time();
         let processing_count = activities
@@ -364,13 +361,25 @@ mod tests {
 
     #[test]
     fn test_classify_error() {
-        assert_eq!(classify_error("Process timed out after 60 seconds"), "timeout");
-        assert_eq!(classify_error("Build failed: cargo build error"), "build_failure");
+        assert_eq!(
+            classify_error("Process timed out after 60 seconds"),
+            "timeout"
+        );
+        assert_eq!(
+            classify_error("Build failed: cargo build error"),
+            "build_failure"
+        );
         assert_eq!(classify_error("Test assertion failed"), "test_failure");
-        assert_eq!(classify_error("Claude API rate limit exceeded"), "claude_error");
+        assert_eq!(
+            classify_error("Claude API rate limit exceeded"),
+            "claude_error"
+        );
         assert_eq!(classify_error("Git merge conflict"), "git_error");
         assert_eq!(classify_error("Permission denied"), "permission_error");
-        assert_eq!(classify_error("Network connection refused"), "network_error");
+        assert_eq!(
+            classify_error("Network connection refused"),
+            "network_error"
+        );
         assert_eq!(classify_error("Some random error"), "unknown");
     }
 

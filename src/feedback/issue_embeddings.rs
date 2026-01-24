@@ -144,7 +144,11 @@ impl IssueEmbeddingService {
     /// Find similar issues for a given issue.
     ///
     /// Returns issues sorted by similarity score (highest first).
-    pub async fn find_similar(&self, issue: &Issue, source: &str) -> Result<Vec<SimilarIssueWithDetails>> {
+    pub async fn find_similar(
+        &self,
+        issue: &Issue,
+        source: &str,
+    ) -> Result<Vec<SimilarIssueWithDetails>> {
         if !self.config.enabled {
             return Ok(Vec::new());
         }
@@ -184,7 +188,11 @@ impl IssueEmbeddingService {
         let mut results = Vec::with_capacity(top_similar.len());
         for (embedding, similarity) in top_similar {
             // Look up fix attempt for this issue
-            let attempt = self.tracker.get_attempt(&embedding.source, &embedding.issue_id).ok().flatten();
+            let attempt = self
+                .tracker
+                .get_attempt(&embedding.source, &embedding.issue_id)
+                .ok()
+                .flatten();
 
             let (outcome, pr_url) = match attempt {
                 Some(a) => (Some(a.status.to_string()), a.pr_url),
@@ -230,7 +238,9 @@ impl IssueEmbeddingService {
 
     /// Check if an issue already has an embedding.
     pub fn has_embedding(&self, source: &str, issue_id: &str) -> bool {
-        self.get_embedding(source, issue_id).map(|e| e.is_some()).unwrap_or(false)
+        self.get_embedding(source, issue_id)
+            .map(|e| e.is_some())
+            .unwrap_or(false)
     }
 }
 
@@ -249,10 +259,7 @@ fn build_embedding_text(issue: &Issue) -> String {
     // Add labels from metadata if available
     if let Some(labels) = issue.metadata.get("labels") {
         if let Some(labels_arr) = labels.as_array() {
-            let label_strs: Vec<&str> = labels_arr
-                .iter()
-                .filter_map(|l| l.as_str())
-                .collect();
+            let label_strs: Vec<&str> = labels_arr.iter().filter_map(|l| l.as_str()).collect();
             if !label_strs.is_empty() {
                 parts.push(format!("Labels: {}", label_strs.join(", ")));
             }
@@ -299,7 +306,10 @@ pub fn format_similar_issues_context(similar: &[SimilarIssueWithDetails]) -> Str
         context.push_str(&format!(
             "### {}. {} (Similarity: {:.0}%)\n",
             i + 1,
-            sim.embedding.short_id.as_deref().unwrap_or(&sim.embedding.issue_id),
+            sim.embedding
+                .short_id
+                .as_deref()
+                .unwrap_or(&sim.embedding.issue_id),
             sim.similarity * 100.0
         ));
 
@@ -330,10 +340,7 @@ mod tests {
     #[test]
     fn test_build_embedding_text() {
         let mut metadata = HashMap::new();
-        metadata.insert(
-            "labels".to_string(),
-            serde_json::json!(["bug", "auth"]),
-        );
+        metadata.insert("labels".to_string(), serde_json::json!(["bug", "auth"]));
         metadata.insert(
             "stack_trace".to_string(),
             serde_json::json!("Error at auth.rs:42"),

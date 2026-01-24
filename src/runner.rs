@@ -138,11 +138,21 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
     /// Build a prompt for the given issue and context.
     ///
     /// This is public to allow callers to get the prompt string for analytics/logging.
-    pub fn build_prompt_for_issue(&self, issue: &Issue, context: &str, project_dir: &Path) -> String {
+    pub fn build_prompt_for_issue(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> String {
         self.build_prompt(issue, context, project_dir)
     }
 
-    async fn execute(&self, prompt: &str, issue: Option<&Issue>, project_dir: &Path) -> Result<ClaudeResult> {
+    async fn execute(
+        &self,
+        prompt: &str,
+        issue: Option<&Issue>,
+        project_dir: &Path,
+    ) -> Result<ClaudeResult> {
         let mut env: HashMap<String, String> = std::env::vars().collect();
 
         if let Some(issue) = issue {
@@ -166,7 +176,8 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         env: HashMap<String, String>,
         project_dir: &Path,
     ) -> Result<ClaudeResult> {
-        self.execute_with_env_and_attempt(prompt, label, env, None, project_dir).await
+        self.execute_with_env_and_attempt(prompt, label, env, None, project_dir)
+            .await
     }
 
     /// Execute Claude with optional attempt ID for analytics tracking.
@@ -190,7 +201,8 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         }
 
         let label = issue.map(|i| i.short_id.as_str()).unwrap_or("custom");
-        self.execute_with_env_and_attempt(prompt, label, env, attempt_id, project_dir).await
+        self.execute_with_env_and_attempt(prompt, label, env, attempt_id, project_dir)
+            .await
     }
 
     async fn execute_with_env_and_attempt(
@@ -405,7 +417,11 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
             };
             let activity = ActivityLogEntry::new(
                 "claude_failed",
-                format!("Claude failed for {}: {}", label, Self::truncate(&error_msg, 100)),
+                format!(
+                    "Claude failed for {}: {}",
+                    label,
+                    Self::truncate(&error_msg, 100)
+                ),
             )
             .with_source("claude".to_string())
             .with_metadata(json!({
@@ -683,9 +699,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_config_debug() {
-        let config = ClaudeRunnerConfig {
-            timeout_secs: 3600,
-        };
+        let config = ClaudeRunnerConfig { timeout_secs: 3600 };
         let debug = format!("{:?}", config);
         assert!(debug.contains("timeout_secs"));
     }
@@ -823,9 +837,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_config_clone() {
-        let config = ClaudeRunnerConfig {
-            timeout_secs: 3600,
-        };
+        let config = ClaudeRunnerConfig { timeout_secs: 3600 };
         let cloned = config.clone();
         assert_eq!(cloned.timeout_secs, config.timeout_secs);
     }
