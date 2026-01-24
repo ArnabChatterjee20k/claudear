@@ -1346,7 +1346,7 @@ impl SqliteTracker {
             let embedding_bytes: Vec<u8> = row.get(5)?;
 
             // Validate embedding data integrity: must be divisible by 4 (f32 = 4 bytes)
-            if embedding_bytes.len() % 4 != 0 {
+            if !embedding_bytes.len().is_multiple_of(4) {
                 return Err(rusqlite::Error::InvalidColumnType(
                     5,
                     "embedding".to_string(),

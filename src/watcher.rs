@@ -276,7 +276,7 @@ impl Watcher {
                 poll_count = poll_count.wrapping_add(1);
 
                 // Periodically refresh repo index to detect new repositories
-                if poll_count % REFRESH_INTERVAL == 0 {
+                if poll_count.is_multiple_of(REFRESH_INTERVAL) {
                     match self.refresh_repos().await {
                         Ok(0) => {} // No new repos
                         Ok(n) => tracing::info!("Discovered and embedded {} new repositories", n),
@@ -291,7 +291,7 @@ impl Watcher {
 
                 // Check for PR reviews (every 3rd poll cycle)
                 let review_count = self.review_poll_counter.fetch_add(1, Ordering::SeqCst);
-                if review_count % 3 == 0 {
+                if review_count.is_multiple_of(3) {
                     if let Err(e) = self.check_reviews().await {
                         tracing::debug!(error = %e, "Error checking for PR reviews");
                     }

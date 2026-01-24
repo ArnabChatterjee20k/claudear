@@ -409,7 +409,7 @@ impl RepoInferrer {
         // Generate embeddings for new repos
         let texts: Vec<String> = new_repos
             .iter()
-            .map(|r| r.name.replace('/', " ").replace('-', " "))
+            .map(|r| r.name.replace(['/', '-'], " "))
             .collect();
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
@@ -470,11 +470,10 @@ impl RepoInferrer {
 
         for repo_emb in embeddings.iter() {
             let similarity = cosine_similarity(query_embedding, &repo_emb.embedding);
-            if similarity >= min_similarity {
-                if best_match.is_none() || similarity > best_match.as_ref().unwrap().1 {
+            if similarity >= min_similarity
+                && (best_match.is_none() || similarity > best_match.as_ref().unwrap().1) {
                     best_match = Some((repo_emb.name.clone(), similarity));
                 }
-            }
         }
 
         best_match
@@ -746,7 +745,7 @@ pub async fn build_repo_embeddings(
         .map(|r| {
             // Use repo name as the main identifier
             // Could be enhanced with README content, file list summary, etc.
-            r.name.replace('/', " ").replace('-', " ")
+            r.name.replace(['/', '-'], " ")
         })
         .collect();
 
