@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["full", "process", "signal"] }
 
 # HTTP server & client
 axum = { version = "0.8", features = ["macros"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 
