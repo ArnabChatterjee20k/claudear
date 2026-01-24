@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+*.db
+*.log
+.DS_Store
+
+
+# Added by cargo
+
+/target
+.claude/plans
+claudear.yaml
+.idea

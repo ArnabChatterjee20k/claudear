@@ -1,0 +1,2924 @@
+//! SQLite-based fix attempt tracker and analytics storage.
+
+use super::FixAttemptTracker;
+use crate::error::Result;
+use crate::types::{
+    ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
+    FixAttemptStatus, IssueEmbedding, ProcessingMetric, PromptExperiment, PrReviewRecord,
+    SimilarIssue, SourceStats,
+};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Mutex;
+
+/// SQLite-based fix attempt tracker for persistence.
+///
+/// # Async Safety
+///
+/// This implementation uses `std::sync::Mutex` which is appropriate for:
+/// - Short-duration locks (SQLite in-process operations are typically fast)
+/// - Operations that don't hold the lock across `.await` points
+///
+/// All methods are synchronous and complete quickly, making this safe to call
+/// from async contexts without risking thread starvation. The mutex is never
+/// held across await points since all trait methods are synchronous.
+pub struct SqliteTracker {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteTracker {
+    /// Create a new SQLite tracker with the given database path.
+    pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open(db_path)?;
+        let tracker = Self {
+            conn: Mutex::new(conn),
+        };
+        tracker.init()?;
+        Ok(tracker)
+    }
+
+    /// Create an in-memory SQLite tracker (for testing).
+    pub fn in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let tracker = Self {
+            conn: Mutex::new(conn),
+        };
+        tracker.init()?;
+        Ok(tracker)
+    }
+
+    /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
+    fn acquire_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|e| {
+            crate::error::Error::Storage(format!("Failed to acquire database lock: {}", e))
+        })
+    }
+
+    fn init(&self) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS fix_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                issue_id TEXT NOT NULL,
+                short_id TEXT NOT NULL,
+                attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
+                pr_url TEXT,
+                github_repo TEXT,
+                github_pr_number INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error_message TEXT,
+                merged_at TEXT,
+                resolved_at TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(source, issue_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fix_attempts_status ON fix_attempts(status);
+            CREATE INDEX IF NOT EXISTS idx_fix_attempts_source_issue ON fix_attempts(source, issue_id);
+            CREATE INDEX IF NOT EXISTS idx_fix_attempts_pr_url ON fix_attempts(pr_url);
+            CREATE INDEX IF NOT EXISTS idx_fix_attempts_retryable ON fix_attempts(status, retry_count, attempted_at);
+
+            -- Feedback outcomes table for learning from past fixes
+            CREATE TABLE IF NOT EXISTS feedback_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER REFERENCES fix_attempts(id),
+                source TEXT NOT NULL,
+                issue_id TEXT NOT NULL,
+                issue_text TEXT NOT NULL,
+                prompt_used TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                error_type TEXT,
+                learnings TEXT,
+                keywords TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_feedback_outcomes_source ON feedback_outcomes(source);
+            CREATE INDEX IF NOT EXISTS idx_feedback_outcomes_outcome ON feedback_outcomes(outcome);
+            CREATE INDEX IF NOT EXISTS idx_feedback_outcomes_attempt ON feedback_outcomes(attempt_id);
+            CREATE INDEX IF NOT EXISTS idx_feedback_source_issue ON feedback_outcomes(source, issue_id);
+
+            -- Discord threads table
+            CREATE TABLE IF NOT EXISTS discord_threads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL UNIQUE,
+                thread_name TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                pr_url TEXT NOT NULL,
+                issue_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                last_message_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_discord_threads_pr ON discord_threads(pr_url);
+            CREATE INDEX IF NOT EXISTS idx_discord_threads_active ON discord_threads(is_active);
+
+            -- PR review states table
+            CREATE TABLE IF NOT EXISTS pr_review_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pr_url TEXT NOT NULL UNIQUE,
+                repo TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                issue_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                last_review_id INTEGER,
+                last_review_time TEXT,
+                last_comment_id INTEGER,
+                last_comment_time TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pr_review_states_active ON pr_review_states(is_active);
+
+            -- Repositories table
+            CREATE TABLE IF NOT EXISTS repositories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                path TEXT NOT NULL,
+                github_url TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- Repository dependencies table
+            CREATE TABLE IF NOT EXISTS repository_dependencies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                upstream_id INTEGER REFERENCES repositories(id),
+                downstream_id INTEGER REFERENCES repositories(id),
+                dependency_type TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(upstream_id, downstream_id)
+            );
+
+            -- ============================================================
+            -- Analytics Tables
+            -- ============================================================
+
+            -- Activity log - persistent activity tracking (replaces in-memory)
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                activity_type TEXT NOT NULL,
+                source TEXT,
+                issue_id TEXT,
+                short_id TEXT,
+                message TEXT NOT NULL,
+                metadata TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_activity_source ON activity_log(source);
+            CREATE INDEX IF NOT EXISTS idx_activity_issue ON activity_log(issue_id);
+            CREATE INDEX IF NOT EXISTS idx_activity_source_issue ON activity_log(source, issue_id, timestamp DESC);
+
+            -- Claude executions - detailed execution metrics
+            CREATE TABLE IF NOT EXISTS claude_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER REFERENCES fix_attempts(id),
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                duration_secs REAL,
+                exit_code INTEGER,
+                timed_out INTEGER DEFAULT 0,
+                stdout_preview TEXT,
+                stderr_preview TEXT,
+                prompt_used TEXT,
+                prompt_hash TEXT,
+                model_version TEXT,
+                working_directory TEXT,
+                git_branch TEXT,
+                git_commit_before TEXT,
+                git_commit_after TEXT,
+                files_changed INTEGER,
+                lines_added INTEGER,
+                lines_removed INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_executions_attempt ON claude_executions(attempt_id);
+            CREATE INDEX IF NOT EXISTS idx_executions_prompt_hash ON claude_executions(prompt_hash);
+
+            -- PR reviews - PR review feedback for learning
+            CREATE TABLE IF NOT EXISTS pr_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER REFERENCES fix_attempts(id),
+                pr_url TEXT NOT NULL,
+                reviewer TEXT,
+                review_state TEXT,
+                submitted_at TEXT,
+                body TEXT,
+                sentiment TEXT,
+                actionable_feedback TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_pr_reviews_attempt ON pr_reviews(attempt_id);
+
+            -- Issue embeddings - vector embeddings for similarity
+            CREATE TABLE IF NOT EXISTS issue_embeddings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                issue_id TEXT NOT NULL,
+                short_id TEXT,
+                title TEXT,
+                embedding BLOB NOT NULL,
+                embedding_model TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(source, issue_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_source ON issue_embeddings(source);
+
+            -- Error patterns - recurring error analysis
+            CREATE TABLE IF NOT EXISTS error_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern_hash TEXT UNIQUE,
+                error_type TEXT,
+                error_message TEXT,
+                first_seen TEXT,
+                last_seen TEXT,
+                occurrence_count INTEGER DEFAULT 1,
+                sources TEXT,
+                example_issue_ids TEXT,
+                resolution_hints TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_error_patterns_type ON error_patterns(error_type);
+            CREATE INDEX IF NOT EXISTS idx_error_patterns_count ON error_patterns(occurrence_count DESC);
+
+            -- Processing metrics - time-series operational metrics
+            CREATE TABLE IF NOT EXISTS processing_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                metric_name TEXT NOT NULL,
+                metric_value REAL NOT NULL,
+                source TEXT,
+                tags TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_metrics_name_time ON processing_metrics(metric_name, timestamp DESC);
+
+            -- Prompt experiments - A/B testing prompts
+            CREATE TABLE IF NOT EXISTS prompt_experiments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_name TEXT NOT NULL,
+                variant TEXT NOT NULL,
+                prompt_template TEXT NOT NULL,
+                prompt_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                active INTEGER DEFAULT 1,
+                success_count INTEGER DEFAULT 0,
+                failure_count INTEGER DEFAULT 0,
+                avg_time_to_merge REAL,
+                avg_review_score REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_experiments_active ON prompt_experiments(active, experiment_name);
+
+            -- Similar issues - cached similarity matches
+            CREATE TABLE IF NOT EXISTS similar_issues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_issue_id TEXT NOT NULL,
+                similar_issue_id TEXT NOT NULL,
+                similarity_score REAL NOT NULL,
+                computed_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(source_issue_id, similar_issue_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_similar_source ON similar_issues(source_issue_id);
+            CREATE INDEX IF NOT EXISTS idx_similar_score ON similar_issues(similarity_score DESC);
+
+            -- ============================================================
+            -- Repository Index Tables
+            -- ============================================================
+
+            -- Indexed repositories - repos discovered from known_orgs
+            CREATE TABLE IF NOT EXISTS indexed_repos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                path TEXT NOT NULL,
+                github_url TEXT,
+                default_branch TEXT DEFAULT 'main',
+                file_count INTEGER NOT NULL DEFAULT 0,
+                last_indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_indexed_repos_name ON indexed_repos(name);
+
+            -- File index for searching - files within indexed repos
+            CREATE TABLE IF NOT EXISTS repo_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id INTEGER NOT NULL REFERENCES indexed_repos(id) ON DELETE CASCADE,
+                file_path TEXT NOT NULL,
+                file_type TEXT,
+                last_modified TEXT,
+                UNIQUE(repo_id, file_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_repo_files_path ON repo_files(file_path);
+            CREATE INDEX IF NOT EXISTS idx_repo_files_type ON repo_files(file_type);
+            CREATE INDEX IF NOT EXISTS idx_repo_files_repo ON repo_files(repo_id);
+
+            -- ============================================================
+            -- Inference Tracking Tables
+            -- ============================================================
+
+            -- Track every inference attempt for learning and analytics
+            CREATE TABLE IF NOT EXISTS inference_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                issue_source TEXT NOT NULL,
+
+                -- Input context
+                extracted_filenames TEXT,
+                extracted_functions TEXT,
+                extracted_keywords TEXT,
+                raw_context TEXT,
+
+                -- Inference result
+                inferred_repo_id INTEGER REFERENCES indexed_repos(id),
+                confidence TEXT,
+                inference_reason TEXT,
+                match_details TEXT,
+
+                -- Outcome tracking (updated later)
+                was_correct INTEGER,
+                actual_repo_id INTEGER REFERENCES indexed_repos(id),
+                feedback_source TEXT,
+
+                -- Timing
+                inference_duration_ms INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                feedback_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_inference_issue ON inference_attempts(issue_id);
+            CREATE INDEX IF NOT EXISTS idx_inference_confidence ON inference_attempts(confidence);
+            CREATE INDEX IF NOT EXISTS idx_inference_correct ON inference_attempts(was_correct);
+            CREATE INDEX IF NOT EXISTS idx_inference_created ON inference_attempts(created_at DESC);
+            "#,
+        )?;
+
+        // Add new columns if they don't exist (migration for existing DBs)
+        // Note: These will fail with "duplicate column name" if column already exists,
+        // which is expected and safe to ignore. Other errors are logged.
+        let migrations = [
+            (
+                "github_repo",
+                "ALTER TABLE fix_attempts ADD COLUMN github_repo TEXT",
+            ),
+            (
+                "github_pr_number",
+                "ALTER TABLE fix_attempts ADD COLUMN github_pr_number INTEGER",
+            ),
+            (
+                "merged_at",
+                "ALTER TABLE fix_attempts ADD COLUMN merged_at TEXT",
+            ),
+            (
+                "resolved_at",
+                "ALTER TABLE fix_attempts ADD COLUMN resolved_at TEXT",
+            ),
+            (
+                "retry_count",
+                "ALTER TABLE fix_attempts ADD COLUMN retry_count INTEGER DEFAULT 0",
+            ),
+            (
+                "last_retry_at",
+                "ALTER TABLE fix_attempts ADD COLUMN last_retry_at TEXT",
+            ),
+        ];
+
+        for (column_name, sql) in migrations {
+            if let Err(e) = conn.execute(sql, []) {
+                // "duplicate column name" is expected if column already exists
+                if !e.to_string().contains("duplicate column name") {
+                    tracing::error!(
+                        column = column_name,
+                        error = %e,
+                        "Failed to run migration"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_datetime(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&Utc))
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").map(|dt| dt.and_utc())
+            })
+            .unwrap_or_else(|_| Utc::now())
+    }
+
+    fn parse_optional_datetime(s: Option<String>) -> Option<DateTime<Utc>> {
+        s.map(|s| Self::parse_datetime(&s))
+    }
+
+    /// Parse a GitHub PR URL to extract repo and PR number.
+    /// Supports: https://github.com/owner/repo/pull/123
+    fn parse_pr_url(url: &str) -> Option<(String, i64)> {
+        let regex = regex_lite::Regex::new(r"github\.com/([^/]+/[^/]+)/pull/(\d+)").ok()?;
+        let caps = regex.captures(url)?;
+        let repo = caps.get(1)?.as_str().to_string();
+        let pr_number: i64 = caps.get(2)?.as_str().parse().ok()?;
+        Some((repo, pr_number))
+    }
+}
+
+impl FixAttemptTracker for SqliteTracker {
+    fn has_attempted(&self, source: &str, issue_id: &str) -> bool {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to acquire database lock in has_attempted");
+                return false;
+            }
+        };
+        let mut stmt =
+            match conn.prepare("SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ?") {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to prepare statement in has_attempted");
+                    return false;
+                }
+            };
+        stmt.exists(params![source, issue_id]).unwrap_or(false)
+    }
+
+    fn get_attempted_issue_ids(&self, source: &str) -> HashSet<String> {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to acquire database lock in get_attempted_issue_ids");
+                return HashSet::new();
+            }
+        };
+        let mut stmt = match conn.prepare("SELECT issue_id FROM fix_attempts WHERE source = ?") {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to prepare statement in get_attempted_issue_ids");
+                return HashSet::new();
+            }
+        };
+
+        // Collect results immediately to avoid borrow lifetime issues
+        let query_result = stmt.query_map(params![source], |row| row.get::<_, String>(0));
+        let mut result = HashSet::new();
+
+        match query_result {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(id) => {
+                            result.insert(id);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to read issue_id row");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to query issue IDs");
+            }
+        }
+        result
+    }
+
+    fn record_attempt(&self, source: &str, issue_id: &str, short_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| {
+            crate::error::Error::Storage(format!("Failed to acquire database lock: {}", e))
+        })?;
+        conn.execute(
+            r#"
+            INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at)
+            VALUES (?, ?, ?, 'pending', datetime('now'))
+            ON CONFLICT(source, issue_id) DO UPDATE SET
+                short_id = excluded.short_id,
+                attempted_at = datetime('now')
+            "#,
+            params![source, issue_id, short_id],
+        )?;
+        Ok(())
+    }
+
+    fn mark_success(&self, source: &str, issue_id: &str, pr_url: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+
+        // Parse PR URL to extract GitHub repo and PR number
+        let (github_repo, github_pr_number) = Self::parse_pr_url(pr_url)
+            .map(|(r, n)| (Some(r), Some(n)))
+            .unwrap_or((None, None));
+
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'success', pr_url = ?, github_repo = ?, github_pr_number = ?
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![pr_url, github_repo, github_pr_number, source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn mark_merged(&self, source: &str, issue_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'merged', merged_at = datetime('now')
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn mark_closed(&self, source: &str, issue_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'closed'
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn mark_resolved(&self, source: &str, issue_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET resolved_at = datetime('now')
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn mark_failed(&self, source: &str, issue_id: &str, error_message: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'failed', error_message = ?
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![error_message, source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn get_attempt(&self, source: &str, issue_id: &str) -> Result<Option<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at
+            FROM fix_attempts
+            WHERE source = ? AND issue_id = ?
+            "#,
+        )?;
+
+        let result = stmt
+            .query_row(params![source, issue_id], |row| {
+                Ok(FixAttempt {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    issue_id: row.get(2)?,
+                    short_id: row.get(3)?,
+                    attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+                    pr_url: row.get(5)?,
+                    github_repo: row.get(6)?,
+                    github_pr_number: row.get(7)?,
+                    status: row
+                        .get::<_, String>(8)?
+                        .parse()
+                        .unwrap_or(FixAttemptStatus::Pending),
+                    error_message: row.get(9)?,
+                    merged_at: Self::parse_optional_datetime(row.get(10)?),
+                    resolved_at: Self::parse_optional_datetime(row.get(11)?),
+                    retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
+                    last_retry_at: Self::parse_optional_datetime(row.get(13)?),
+                })
+            })
+            .ok();
+
+        Ok(result)
+    }
+
+    fn get_attempts_by_status(&self, status: FixAttemptStatus) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at
+            FROM fix_attempts
+            WHERE status = ?
+            ORDER BY attempted_at DESC
+            "#,
+        )?;
+
+        let status_str = status.to_string();
+        let rows = stmt.query_map(params![status_str], |row| {
+            Ok(FixAttempt {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                issue_id: row.get(2)?,
+                short_id: row.get(3)?,
+                attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+                pr_url: row.get(5)?,
+                github_repo: row.get(6)?,
+                github_pr_number: row.get(7)?,
+                status: row
+                    .get::<_, String>(8)?
+                    .parse()
+                    .unwrap_or(FixAttemptStatus::Pending),
+                error_message: row.get(9)?,
+                merged_at: Self::parse_optional_datetime(row.get(10)?),
+                resolved_at: Self::parse_optional_datetime(row.get(11)?),
+                retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
+                last_retry_at: Self::parse_optional_datetime(row.get(13)?),
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(attempt) => results.push(attempt),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read fix attempt row");
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn get_pending_prs(&self) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at
+            FROM fix_attempts
+            WHERE status = 'success' AND pr_url IS NOT NULL AND github_repo IS NOT NULL
+            ORDER BY attempted_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(FixAttempt {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                issue_id: row.get(2)?,
+                short_id: row.get(3)?,
+                attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+                pr_url: row.get(5)?,
+                github_repo: row.get(6)?,
+                github_pr_number: row.get(7)?,
+                status: row
+                    .get::<_, String>(8)?
+                    .parse()
+                    .unwrap_or(FixAttemptStatus::Success),
+                error_message: row.get(9)?,
+                merged_at: Self::parse_optional_datetime(row.get(10)?),
+                resolved_at: Self::parse_optional_datetime(row.get(11)?),
+                retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
+                last_retry_at: Self::parse_optional_datetime(row.get(13)?),
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(attempt) => results.push(attempt),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read pending PR row");
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn get_attempt_by_pr_url(&self, pr_url: &str) -> Result<Option<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at
+            FROM fix_attempts
+            WHERE pr_url = ?
+            "#,
+        )?;
+
+        let result = stmt
+            .query_row(params![pr_url], |row| {
+                Ok(FixAttempt {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    issue_id: row.get(2)?,
+                    short_id: row.get(3)?,
+                    attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+                    pr_url: row.get(5)?,
+                    github_repo: row.get(6)?,
+                    github_pr_number: row.get(7)?,
+                    status: row
+                        .get::<_, String>(8)?
+                        .parse()
+                        .unwrap_or(FixAttemptStatus::Pending),
+                    error_message: row.get(9)?,
+                    merged_at: Self::parse_optional_datetime(row.get(10)?),
+                    resolved_at: Self::parse_optional_datetime(row.get(11)?),
+                    retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
+                    last_retry_at: Self::parse_optional_datetime(row.get(13)?),
+                })
+            })
+            .ok();
+
+        Ok(result)
+    }
+
+    fn reset_attempt(&self, source: &str, issue_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "DELETE FROM fix_attempts WHERE source = ? AND issue_id = ?",
+            params![source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn increment_retry(&self, source: &str, issue_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET retry_count = COALESCE(retry_count, 0) + 1,
+                last_retry_at = datetime('now')
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn mark_cannot_fix(&self, source: &str, issue_id: &str, reason: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'cannot_fix', error_message = ?
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![reason, source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn get_retryable_issues(&self, max_retries: u32) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at
+            FROM fix_attempts
+            WHERE (status = 'failed' OR status = 'closed')
+              AND COALESCE(retry_count, 0) < ?
+            ORDER BY attempted_at ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![max_retries], |row| {
+            Ok(FixAttempt {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                issue_id: row.get(2)?,
+                short_id: row.get(3)?,
+                attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+                pr_url: row.get(5)?,
+                github_repo: row.get(6)?,
+                github_pr_number: row.get(7)?,
+                status: row
+                    .get::<_, String>(8)?
+                    .parse()
+                    .unwrap_or(FixAttemptStatus::Failed),
+                error_message: row.get(9)?,
+                merged_at: Self::parse_optional_datetime(row.get(10)?),
+                resolved_at: Self::parse_optional_datetime(row.get(11)?),
+                retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
+                last_retry_at: Self::parse_optional_datetime(row.get(13)?),
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(attempt) => results.push(attempt),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read retryable issue row");
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn prepare_for_retry(&self, source: &str, issue_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'pending',
+                pr_url = NULL,
+                github_repo = NULL,
+                github_pr_number = NULL,
+                error_message = NULL,
+                attempted_at = datetime('now')
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn get_stats(&self) -> Result<FixAttemptStats> {
+        let conn = self.acquire_lock()?;
+        let mut stats = FixAttemptStats::default();
+
+        // Overall stats
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT status, COUNT(*) as count
+            FROM fix_attempts
+            GROUP BY status
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+        })?;
+
+        for row in rows {
+            match row {
+                Ok((status, count)) => {
+                    stats.total += count;
+                    match status.as_str() {
+                        "pending" => stats.pending = count,
+                        "success" => stats.success = count,
+                        "failed" => stats.failed = count,
+                        "merged" => stats.merged = count,
+                        "closed" => stats.closed = count,
+                        "cannot_fix" => stats.cannot_fix = count,
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read stats row");
+                }
+            }
+        }
+
+        // Stats by source
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT source, status, COUNT(*) as count
+            FROM fix_attempts
+            GROUP BY source, status
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, usize>(2)?,
+            ))
+        })?;
+
+        let mut by_source: HashMap<String, SourceStats> = HashMap::new();
+
+        for row in rows {
+            match row {
+                Ok((source, status, count)) => {
+                    let entry = by_source.entry(source).or_default();
+                    entry.total += count;
+                    match status.as_str() {
+                        "success" => entry.success = count,
+                        "failed" => entry.failed = count,
+                        "merged" => entry.merged = count,
+                        "closed" => entry.closed = count,
+                        "cannot_fix" => entry.cannot_fix = count,
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read source stats row");
+                }
+            }
+        }
+
+        stats.by_source = by_source;
+
+        Ok(stats)
+    }
+
+    fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
+        SqliteTracker::record_activity(self, entry)
+    }
+
+    fn get_recent_activities(&self, limit: usize) -> Result<Vec<ActivityLogEntry>> {
+        SqliteTracker::get_recent_activities(self, limit, None)
+    }
+
+    fn record_execution(&self, execution: &ClaudeExecution) -> Result<i64> {
+        SqliteTracker::record_execution(self, execution)
+    }
+
+    fn record_pr_review(&self, review: &PrReviewRecord) -> Result<i64> {
+        SqliteTracker::record_pr_review(self, review)
+    }
+
+    fn record_error_pattern(&self, pattern: &ErrorPattern) -> Result<i64> {
+        SqliteTracker::record_error_pattern(self, pattern)
+    }
+
+    fn record_metric(&self, metric: &ProcessingMetric) -> Result<i64> {
+        SqliteTracker::record_metric(self, metric)
+    }
+
+    fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
+        SqliteTracker::get_analytics_summary(self)
+    }
+}
+
+impl SqliteTracker {
+    /// Record an activity to the activity log.
+    pub fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let metadata_json = entry.metadata.as_ref().map(|m| m.to_string());
+
+        conn.execute(
+            r#"
+            INSERT INTO activity_log (timestamp, activity_type, source, issue_id, short_id, message, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                entry.activity_type,
+                entry.source,
+                entry.issue_id,
+                entry.short_id,
+                entry.message,
+                metadata_json,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get recent activities, optionally filtered by source.
+    pub fn get_recent_activities(
+        &self,
+        limit: usize,
+        source_filter: Option<&str>,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        let conn = self.acquire_lock()?;
+
+        let mut entries = Vec::new();
+        if let Some(source) = source_filter {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
+                FROM activity_log
+                WHERE source = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                "#,
+            )?;
+
+            let rows = stmt.query_map(params![source, limit as i64], |row| {
+                Ok(Self::row_to_activity_entry(row))
+            })?;
+
+            for row in rows.flatten() {
+                entries.push(row);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
+                FROM activity_log
+                ORDER BY timestamp DESC
+                LIMIT ?
+                "#,
+            )?;
+
+            let rows = stmt.query_map(params![limit as i64], |row| {
+                Ok(Self::row_to_activity_entry(row))
+            })?;
+
+            for row in rows.flatten() {
+                entries.push(row);
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Get activities for a specific issue.
+    pub fn get_activities_for_issue(
+        &self,
+        source: &str,
+        issue_id: &str,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
+            FROM activity_log
+            WHERE source = ? AND issue_id = ?
+            ORDER BY timestamp DESC
+            "#,
+        )?;
+
+        let mut entries = Vec::new();
+        let rows = stmt.query_map(params![source, issue_id], |row| {
+            Ok(Self::row_to_activity_entry(row))
+        })?;
+
+        for row in rows.flatten() {
+            entries.push(row);
+        }
+
+        Ok(entries)
+    }
+
+    fn row_to_activity_entry(row: &rusqlite::Row<'_>) -> ActivityLogEntry {
+        let metadata_str: Option<String> = row.get(7).ok();
+        let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+
+        ActivityLogEntry {
+            id: row.get(0).unwrap_or(0),
+            timestamp: Self::parse_datetime(&row.get::<_, String>(1).unwrap_or_default()),
+            activity_type: row.get(2).unwrap_or_default(),
+            source: row.get(3).ok(),
+            issue_id: row.get(4).ok(),
+            short_id: row.get(5).ok(),
+            message: row.get(6).unwrap_or_default(),
+            metadata,
+        }
+    }
+
+    /// Record a Claude execution.
+    pub fn record_execution(&self, execution: &ClaudeExecution) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO claude_executions (
+                attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
+                stdout_preview, stderr_preview, prompt_used, prompt_hash, model_version,
+                working_directory, git_branch, git_commit_before, git_commit_after,
+                files_changed, lines_added, lines_removed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                execution.attempt_id,
+                execution.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                execution.completed_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                execution.duration_secs,
+                execution.exit_code,
+                execution.timed_out as i32,
+                execution.stdout_preview,
+                execution.stderr_preview,
+                execution.prompt_used,
+                execution.prompt_hash,
+                execution.model_version,
+                execution.working_directory,
+                execution.git_branch,
+                execution.git_commit_before,
+                execution.git_commit_after,
+                execution.files_changed,
+                execution.lines_added,
+                execution.lines_removed,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get executions for a specific attempt.
+    pub fn get_executions_for_attempt(&self, attempt_id: i64) -> Result<Vec<ClaudeExecution>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
+                   stdout_preview, stderr_preview, prompt_used, prompt_hash, model_version,
+                   working_directory, git_branch, git_commit_before, git_commit_after,
+                   files_changed, lines_added, lines_removed
+            FROM claude_executions
+            WHERE attempt_id = ?
+            ORDER BY started_at DESC
+            "#,
+        )?;
+
+        let mut executions = Vec::new();
+        let rows = stmt.query_map(params![attempt_id], |row| {
+            Ok(ClaudeExecution {
+                id: row.get(0)?,
+                attempt_id: row.get(1)?,
+                started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
+                completed_at: Self::parse_optional_datetime(row.get(3)?),
+                duration_secs: row.get(4)?,
+                exit_code: row.get(5)?,
+                timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
+                stdout_preview: row.get(7)?,
+                stderr_preview: row.get(8)?,
+                prompt_used: row.get(9)?,
+                prompt_hash: row.get(10)?,
+                model_version: row.get(11)?,
+                working_directory: row.get(12)?,
+                git_branch: row.get(13)?,
+                git_commit_before: row.get(14)?,
+                git_commit_after: row.get(15)?,
+                files_changed: row.get(16)?,
+                lines_added: row.get(17)?,
+                lines_removed: row.get(18)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            executions.push(row);
+        }
+
+        Ok(executions)
+    }
+
+    /// Record a PR review.
+    pub fn record_pr_review(&self, review: &PrReviewRecord) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO pr_reviews (attempt_id, pr_url, reviewer, review_state, submitted_at, body, sentiment, actionable_feedback)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                review.attempt_id,
+                review.pr_url,
+                review.reviewer,
+                review.review_state,
+                review.submitted_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                review.body,
+                review.sentiment,
+                review.actionable_feedback,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get reviews for a specific attempt.
+    pub fn get_reviews_for_attempt(&self, attempt_id: i64) -> Result<Vec<PrReviewRecord>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, pr_url, reviewer, review_state, submitted_at, body, sentiment, actionable_feedback
+            FROM pr_reviews
+            WHERE attempt_id = ?
+            ORDER BY submitted_at DESC
+            "#,
+        )?;
+
+        let mut reviews = Vec::new();
+        let rows = stmt.query_map(params![attempt_id], |row| {
+            Ok(PrReviewRecord {
+                id: row.get(0)?,
+                attempt_id: row.get(1)?,
+                pr_url: row.get(2)?,
+                reviewer: row.get(3)?,
+                review_state: row.get(4)?,
+                submitted_at: Self::parse_optional_datetime(row.get(5)?),
+                body: row.get(6)?,
+                sentiment: row.get(7)?,
+                actionable_feedback: row.get(8)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            reviews.push(row);
+        }
+
+        Ok(reviews)
+    }
+
+    /// Store an issue embedding.
+    pub fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        // Serialize the embedding vector to bytes
+        let embedding_bytes: Vec<u8> = embedding
+            .embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        conn.execute(
+            r#"
+            INSERT INTO issue_embeddings (source, issue_id, short_id, title, embedding, embedding_model, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, issue_id) DO UPDATE SET
+                embedding = excluded.embedding,
+                embedding_model = excluded.embedding_model,
+                created_at = excluded.created_at
+            "#,
+            params![
+                embedding.source,
+                embedding.issue_id,
+                embedding.short_id,
+                embedding.title,
+                embedding_bytes,
+                embedding.embedding_model,
+                embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get an embedding by source and issue ID.
+    pub fn get_embedding(&self, source: &str, issue_id: &str) -> Result<Option<IssueEmbedding>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at
+            FROM issue_embeddings
+            WHERE source = ? AND issue_id = ?
+            "#,
+        )?;
+
+        let result = stmt
+            .query_row(params![source, issue_id], |row| {
+                let embedding_bytes: Vec<u8> = row.get(5)?;
+                let embedding: Vec<f32> = embedding_bytes
+                    .chunks(4)
+                    .map(|chunk| {
+                        let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+                        f32::from_le_bytes(arr)
+                    })
+                    .collect();
+
+                Ok(IssueEmbedding {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    issue_id: row.get(2)?,
+                    short_id: row.get(3)?,
+                    title: row.get(4)?,
+                    embedding,
+                    embedding_model: row.get(6)?,
+                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
+                })
+            })
+            .ok();
+
+        Ok(result)
+    }
+
+    /// Record or update an error pattern.
+    pub fn record_error_pattern(&self, pattern: &ErrorPattern) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        let sources_json = pattern.sources.as_ref().and_then(|s| serde_json::to_string(s).ok());
+        let example_ids_json = pattern.example_issue_ids.as_ref().and_then(|s| serde_json::to_string(s).ok());
+
+        conn.execute(
+            r#"
+            INSERT INTO error_patterns (pattern_hash, error_type, error_message, first_seen, last_seen, occurrence_count, sources, example_issue_ids, resolution_hints)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pattern_hash) DO UPDATE SET
+                last_seen = excluded.last_seen,
+                occurrence_count = occurrence_count + 1,
+                sources = excluded.sources,
+                example_issue_ids = excluded.example_issue_ids
+            "#,
+            params![
+                pattern.pattern_hash,
+                pattern.error_type,
+                pattern.error_message,
+                pattern.first_seen.format("%Y-%m-%d %H:%M:%S").to_string(),
+                pattern.last_seen.format("%Y-%m-%d %H:%M:%S").to_string(),
+                pattern.occurrence_count,
+                sources_json,
+                example_ids_json,
+                pattern.resolution_hints,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get the most common error patterns.
+    pub fn get_error_patterns(&self, limit: usize) -> Result<Vec<ErrorPattern>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, pattern_hash, error_type, error_message, first_seen, last_seen, occurrence_count, sources, example_issue_ids, resolution_hints
+            FROM error_patterns
+            ORDER BY occurrence_count DESC
+            LIMIT ?
+            "#,
+        )?;
+
+        let mut patterns = Vec::new();
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let sources_str: Option<String> = row.get(7)?;
+            let example_ids_str: Option<String> = row.get(8)?;
+
+            Ok(ErrorPattern {
+                id: row.get(0)?,
+                pattern_hash: row.get(1)?,
+                error_type: row.get(2)?,
+                error_message: row.get(3)?,
+                first_seen: Self::parse_datetime(&row.get::<_, String>(4)?),
+                last_seen: Self::parse_datetime(&row.get::<_, String>(5)?),
+                occurrence_count: row.get(6)?,
+                sources: sources_str.and_then(|s| serde_json::from_str(&s).ok()),
+                example_issue_ids: example_ids_str.and_then(|s| serde_json::from_str(&s).ok()),
+                resolution_hints: row.get(9)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            patterns.push(row);
+        }
+
+        Ok(patterns)
+    }
+
+    /// Record a processing metric.
+    pub fn record_metric(&self, metric: &ProcessingMetric) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        let tags_json = metric.tags.as_ref().map(|t| t.to_string());
+
+        conn.execute(
+            r#"
+            INSERT INTO processing_metrics (timestamp, metric_name, metric_value, source, tags)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+            params![
+                metric.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                metric.metric_name,
+                metric.metric_value,
+                metric.source,
+                tags_json,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get metrics by name within a time range.
+    pub fn get_metrics(
+        &self,
+        metric_name: &str,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<ProcessingMetric>> {
+        let conn = self.acquire_lock()?;
+
+        let mut metrics = Vec::new();
+        if let Some(since_time) = since {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, timestamp, metric_name, metric_value, source, tags
+                FROM processing_metrics
+                WHERE metric_name = ? AND timestamp >= ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                "#,
+            )?;
+
+            let rows = stmt.query_map(
+                params![metric_name, since_time.format("%Y-%m-%d %H:%M:%S").to_string(), limit as i64],
+                Self::row_to_metric,
+            )?;
+
+            for row in rows.flatten() {
+                metrics.push(row);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, timestamp, metric_name, metric_value, source, tags
+                FROM processing_metrics
+                WHERE metric_name = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                "#,
+            )?;
+
+            let rows = stmt.query_map(params![metric_name, limit as i64], |row| {
+                Self::row_to_metric(row)
+            })?;
+
+            for row in rows.flatten() {
+                metrics.push(row);
+            }
+        }
+
+        Ok(metrics)
+    }
+
+    fn row_to_metric(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessingMetric> {
+        let tags_str: Option<String> = row.get(5)?;
+        let tags = tags_str.and_then(|s| serde_json::from_str(&s).ok());
+
+        Ok(ProcessingMetric {
+            id: row.get(0)?,
+            timestamp: Self::parse_datetime(&row.get::<_, String>(1)?),
+            metric_name: row.get(2)?,
+            metric_value: row.get(3)?,
+            source: row.get(4)?,
+            tags,
+        })
+    }
+
+    /// Create or update a prompt experiment.
+    pub fn save_experiment(&self, experiment: &PromptExperiment) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO prompt_experiments (experiment_name, variant, prompt_template, prompt_hash, created_at, active, success_count, failure_count, avg_time_to_merge, avg_review_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                experiment.experiment_name,
+                experiment.variant,
+                experiment.prompt_template,
+                experiment.prompt_hash,
+                experiment.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                experiment.active as i32,
+                experiment.success_count,
+                experiment.failure_count,
+                experiment.avg_time_to_merge,
+                experiment.avg_review_score,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get active experiments.
+    pub fn get_active_experiments(&self) -> Result<Vec<PromptExperiment>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, experiment_name, variant, prompt_template, prompt_hash, created_at, active, success_count, failure_count, avg_time_to_merge, avg_review_score
+            FROM prompt_experiments
+            WHERE active = 1
+            ORDER BY experiment_name, variant
+            "#,
+        )?;
+
+        let mut experiments = Vec::new();
+        let rows = stmt.query_map([], |row| {
+            Ok(PromptExperiment {
+                id: row.get(0)?,
+                experiment_name: row.get(1)?,
+                variant: row.get(2)?,
+                prompt_template: row.get(3)?,
+                prompt_hash: row.get(4)?,
+                created_at: Self::parse_datetime(&row.get::<_, String>(5)?),
+                active: row.get::<_, i32>(6)? != 0,
+                success_count: row.get(7)?,
+                failure_count: row.get(8)?,
+                avg_time_to_merge: row.get(9)?,
+                avg_review_score: row.get(10)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            experiments.push(row);
+        }
+
+        Ok(experiments)
+    }
+
+    /// Update experiment statistics.
+    pub fn update_experiment_stats(
+        &self,
+        experiment_id: i64,
+        success: bool,
+        time_to_merge: Option<f64>,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+
+        if success {
+            conn.execute(
+                r#"
+                UPDATE prompt_experiments
+                SET success_count = success_count + 1
+                WHERE id = ?
+                "#,
+                params![experiment_id],
+            )?;
+        } else {
+            conn.execute(
+                r#"
+                UPDATE prompt_experiments
+                SET failure_count = failure_count + 1
+                WHERE id = ?
+                "#,
+                params![experiment_id],
+            )?;
+        }
+
+        if let Some(ttm) = time_to_merge {
+            // Update rolling average of time to merge
+            conn.execute(
+                r#"
+                UPDATE prompt_experiments
+                SET avg_time_to_merge = CASE
+                    WHEN avg_time_to_merge IS NULL THEN ?
+                    ELSE (avg_time_to_merge * success_count + ?) / (success_count + 1)
+                END
+                WHERE id = ?
+                "#,
+                params![ttm, ttm, experiment_id],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Store a similar issue relationship.
+    pub fn store_similar_issue(&self, similar: &SimilarIssue) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO similar_issues (source_issue_id, similar_issue_id, similarity_score, computed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(source_issue_id, similar_issue_id) DO UPDATE SET
+                similarity_score = excluded.similarity_score,
+                computed_at = excluded.computed_at
+            "#,
+            params![
+                similar.source_issue_id,
+                similar.similar_issue_id,
+                similar.similarity_score,
+                similar.computed_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Find similar issues for a given issue.
+    pub fn find_similar_issues(
+        &self,
+        issue_id: &str,
+        min_score: f64,
+        limit: usize,
+    ) -> Result<Vec<SimilarIssue>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source_issue_id, similar_issue_id, similarity_score, computed_at
+            FROM similar_issues
+            WHERE source_issue_id = ? AND similarity_score >= ?
+            ORDER BY similarity_score DESC
+            LIMIT ?
+            "#,
+        )?;
+
+        let mut results = Vec::new();
+        let rows = stmt.query_map(params![issue_id, min_score, limit as i64], |row| {
+            Ok(SimilarIssue {
+                id: row.get(0)?,
+                source_issue_id: row.get(1)?,
+                similar_issue_id: row.get(2)?,
+                similarity_score: row.get(3)?,
+                computed_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+            })
+        })?;
+
+        for row in rows.flatten() {
+            results.push(row);
+        }
+
+        Ok(results)
+    }
+
+    /// Get the overall success rate.
+    pub fn get_success_rate(&self) -> Result<f64> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                CAST(SUM(CASE WHEN status IN ('success', 'merged') THEN 1 ELSE 0 END) AS REAL) /
+                NULLIF(CAST(COUNT(*) AS REAL), 0)
+            FROM fix_attempts
+            "#,
+        )?;
+
+        let rate: f64 = stmt.query_row([], |row| row.get(0)).unwrap_or(0.0);
+        Ok(rate)
+    }
+
+    /// Get a comprehensive analytics summary.
+    pub fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
+        let conn = self.acquire_lock()?;
+
+        // Get basic stats
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status IN ('success', 'merged') THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN status = 'merged' THEN 1 ELSE 0 END) as merged
+            FROM fix_attempts
+            "#,
+        )?;
+
+        let (total, successful, merged): (i64, i64, i64) = stmt
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap_or((0, 0, 0));
+
+        let success_rate = if total > 0 {
+            successful as f64 / total as f64
+        } else {
+            0.0
+        };
+
+        // Get average processing time
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT AVG(duration_secs) FROM claude_executions WHERE duration_secs IS NOT NULL
+            "#,
+        )?;
+        let avg_processing_time: Option<f64> = stmt.query_row([], |row| row.get(0)).ok();
+
+        // Get most common error
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT error_type FROM error_patterns ORDER BY occurrence_count DESC LIMIT 1
+            "#,
+        )?;
+        let most_common_error: Option<String> = stmt.query_row([], |row| row.get(0)).ok();
+
+        // Get success rate by source
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT source,
+                   CAST(SUM(CASE WHEN status IN ('success', 'merged') THEN 1 ELSE 0 END) AS REAL) /
+                   NULLIF(CAST(COUNT(*) AS REAL), 0) as rate
+            FROM fix_attempts
+            GROUP BY source
+            "#,
+        )?;
+
+        let mut success_rate_by_source = HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+
+        for row in rows.flatten() {
+            success_rate_by_source.insert(row.0, row.1);
+        }
+
+        Ok(AnalyticsSummary {
+            success_rate,
+            total_processed: total,
+            total_successful: successful,
+            total_merged: merged,
+            avg_processing_time_secs: avg_processing_time,
+            avg_time_to_merge_hours: None, // Would need more complex calculation
+            most_common_error,
+            success_rate_by_source,
+        })
+    }
+
+    /// Prune old activity logs to prevent unbounded growth.
+    pub fn prune_old_activities(&self, days_to_keep: i64) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+
+        let deleted = conn.execute(
+            r#"
+            DELETE FROM activity_log
+            WHERE timestamp < datetime('now', ? || ' days')
+            "#,
+            params![format!("-{}", days_to_keep)],
+        )?;
+
+        Ok(deleted)
+    }
+
+    /// Prune old metrics to prevent unbounded growth.
+    pub fn prune_old_metrics(&self, days_to_keep: i64) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+
+        let deleted = conn.execute(
+            r#"
+            DELETE FROM processing_metrics
+            WHERE timestamp < datetime('now', ? || ' days')
+            "#,
+            params![format!("-{}", days_to_keep)],
+        )?;
+
+        Ok(deleted)
+    }
+
+    /// Add or update a repository in the database.
+    pub fn upsert_repository(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        github_url: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        // Use name as github_url if not provided
+        let github_url = github_url.unwrap_or(name);
+        let path = path.unwrap_or("");
+
+        conn.execute(
+            r#"
+            INSERT INTO repositories (name, path, github_url)
+            VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                path = CASE WHEN excluded.path != '' THEN excluded.path ELSE repositories.path END,
+                github_url = excluded.github_url
+            "#,
+            params![name, path, github_url],
+        )?;
+
+        // Get the id
+        let id: i64 = conn.query_row(
+            "SELECT id FROM repositories WHERE name = ?",
+            params![name],
+            |row| row.get(0),
+        )?;
+
+        Ok(id)
+    }
+
+    /// Get a repository by name.
+    pub fn get_repository(&self, name: &str) -> Result<Option<StoredRepository>> {
+        let conn = self.acquire_lock()?;
+
+        let result = conn.query_row(
+            r#"
+            SELECT id, name, path, github_url, created_at
+            FROM repositories WHERE name = ?
+            "#,
+            params![name],
+            |row| {
+                Ok(StoredRepository {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get::<_, String>(2).ok().filter(|s| !s.is_empty()),
+                    github_url: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(repo) => Ok(Some(repo)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List all repositories.
+    pub fn list_repositories(&self) -> Result<Vec<StoredRepository>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, path, github_url, created_at
+            FROM repositories ORDER BY name
+            "#,
+        )?;
+
+        let mut repos = Vec::new();
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredRepository {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get::<_, String>(2).ok().filter(|s| !s.is_empty()),
+                github_url: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            repos.push(row);
+        }
+
+        Ok(repos)
+    }
+
+    /// Add a dependency between two repositories.
+    /// Creates the repos if they don't exist.
+    pub fn add_dependency(
+        &self,
+        upstream: &str,
+        downstream: &str,
+        dep_type: &str,
+    ) -> Result<()> {
+        // Ensure both repos exist
+        let upstream_id = self.upsert_repository(upstream, None, None)?;
+        let downstream_id = self.upsert_repository(downstream, None, None)?;
+
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO repository_dependencies (upstream_id, downstream_id, dependency_type)
+            VALUES (?, ?, ?)
+            ON CONFLICT(upstream_id, downstream_id) DO UPDATE SET
+                dependency_type = excluded.dependency_type
+            "#,
+            params![upstream_id, downstream_id, dep_type],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get all dependencies for a repository (what it depends on).
+    pub fn get_dependencies(&self, repo_name: &str) -> Result<Vec<StoredDependency>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT rd.id, u.name, d.name, rd.dependency_type, rd.created_at
+            FROM repository_dependencies rd
+            JOIN repositories u ON rd.upstream_id = u.id
+            JOIN repositories d ON rd.downstream_id = d.id
+            WHERE d.name = ?
+            "#,
+        )?;
+
+        let mut deps = Vec::new();
+        let rows = stmt.query_map(params![repo_name], |row| {
+            Ok(StoredDependency {
+                id: row.get(0)?,
+                upstream: row.get(1)?,
+                downstream: row.get(2)?,
+                dep_type: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            deps.push(row);
+        }
+
+        Ok(deps)
+    }
+
+    /// Get all dependents of a repository (what depends on it).
+    pub fn get_dependents(&self, repo_name: &str) -> Result<Vec<StoredDependency>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT rd.id, u.name, d.name, rd.dependency_type, rd.created_at
+            FROM repository_dependencies rd
+            JOIN repositories u ON rd.upstream_id = u.id
+            JOIN repositories d ON rd.downstream_id = d.id
+            WHERE u.name = ?
+            "#,
+        )?;
+
+        let mut deps = Vec::new();
+        let rows = stmt.query_map(params![repo_name], |row| {
+            Ok(StoredDependency {
+                id: row.get(0)?,
+                upstream: row.get(1)?,
+                downstream: row.get(2)?,
+                dep_type: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            deps.push(row);
+        }
+
+        Ok(deps)
+    }
+
+    /// Get all dependencies in the database.
+    pub fn list_all_dependencies(&self) -> Result<Vec<StoredDependency>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT rd.id, u.name, d.name, rd.dependency_type, rd.created_at
+            FROM repository_dependencies rd
+            JOIN repositories u ON rd.upstream_id = u.id
+            JOIN repositories d ON rd.downstream_id = d.id
+            ORDER BY d.name, u.name
+            "#,
+        )?;
+
+        let mut deps = Vec::new();
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredDependency {
+                id: row.get(0)?,
+                upstream: row.get(1)?,
+                downstream: row.get(2)?,
+                dep_type: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            deps.push(row);
+        }
+
+        Ok(deps)
+    }
+
+    /// Clear all repositories and dependencies from the database.
+    pub fn clear_repositories(&self) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute_batch(
+            r#"
+            DELETE FROM repository_dependencies;
+            DELETE FROM repositories;
+            "#,
+        )?;
+        Ok(())
+    }
+
+    /// Get repositories that directly depend on the given repository.
+    ///
+    /// Returns repos where the given repo is an upstream dependency.
+    pub fn get_direct_dependants(&self, repo: &str) -> Result<Vec<StoredDependency>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT rd.id, u.name, d.name, rd.dependency_type, rd.created_at
+            FROM repository_dependencies rd
+            JOIN repositories u ON rd.upstream_id = u.id
+            JOIN repositories d ON rd.downstream_id = d.id
+            WHERE u.name = ?
+            ORDER BY d.name
+            "#,
+        )?;
+
+        let mut deps = Vec::new();
+        let rows = stmt.query_map(params![repo], |row| {
+            Ok(StoredDependency {
+                id: row.get(0)?,
+                upstream: row.get(1)?,
+                downstream: row.get(2)?,
+                dep_type: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            deps.push(row);
+        }
+
+        Ok(deps)
+    }
+
+    /// Get all repositories that depend on the given repository, transitively.
+    ///
+    /// Uses a recursive CTE to traverse the dependency graph.
+    /// Returns (repo_name, depth) pairs where depth indicates how many hops from the source.
+    pub fn get_all_dependants(&self, repo: &str) -> Result<Vec<(String, i32)>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            WITH RECURSIVE dependants AS (
+                -- Base case: direct dependants
+                SELECT d.id, d.name, 1 as depth
+                FROM repository_dependencies rd
+                JOIN repositories u ON rd.upstream_id = u.id
+                JOIN repositories d ON rd.downstream_id = d.id
+                WHERE u.name = ?
+
+                UNION
+
+                -- Recursive case: dependants of dependants
+                SELECT d.id, d.name, dep.depth + 1
+                FROM dependants dep
+                JOIN repository_dependencies rd ON rd.upstream_id = dep.id
+                JOIN repositories d ON rd.downstream_id = d.id
+                WHERE dep.depth < 10  -- Prevent infinite loops
+            )
+            SELECT DISTINCT name, MIN(depth) as depth
+            FROM dependants
+            GROUP BY name
+            ORDER BY depth, name
+            "#,
+        )?;
+
+        let mut results = Vec::new();
+        let rows = stmt.query_map(params![repo], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+        })?;
+
+        for row in rows.flatten() {
+            results.push(row);
+        }
+
+        Ok(results)
+    }
+
+    // ================================================================
+    // Indexed Repository Methods
+    // ================================================================
+
+    /// Save an indexed repository to the database.
+    pub fn save_indexed_repo(
+        &self,
+        name: &str,
+        path: &str,
+        github_url: Option<&str>,
+        default_branch: &str,
+        file_count: usize,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO indexed_repos (name, path, github_url, default_branch, file_count, last_indexed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+            ON CONFLICT(name) DO UPDATE SET
+                path = excluded.path,
+                github_url = excluded.github_url,
+                default_branch = excluded.default_branch,
+                file_count = excluded.file_count,
+                last_indexed_at = datetime('now')
+            "#,
+            params![name, path, github_url, default_branch, file_count as i64],
+        )?;
+
+        let id = conn.last_insert_rowid();
+        Ok(id)
+    }
+
+    /// Save a file to the repo files index.
+    pub fn save_repo_file(&self, repo_id: i64, file_path: &str, file_type: Option<&str>) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO repo_files (repo_id, file_path, file_type)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(repo_id, file_path) DO UPDATE SET
+                file_type = excluded.file_type
+            "#,
+            params![repo_id, file_path, file_type],
+        )?;
+        Ok(())
+    }
+
+    /// Save multiple files to the repo files index efficiently.
+    pub fn save_repo_files(&self, repo_id: i64, files: &[(String, Option<String>)]) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            INSERT INTO repo_files (repo_id, file_path, file_type)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(repo_id, file_path) DO UPDATE SET
+                file_type = excluded.file_type
+            "#,
+        )?;
+
+        for (file_path, file_type) in files {
+            stmt.execute(params![repo_id, file_path, file_type.as_deref()])?;
+        }
+
+        Ok(())
+    }
+
+    /// Clear files for a repository (before re-indexing).
+    pub fn clear_repo_files(&self, repo_id: i64) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute("DELETE FROM repo_files WHERE repo_id = ?", params![repo_id])?;
+        Ok(())
+    }
+
+    /// Get an indexed repository by name.
+    pub fn get_indexed_repo(&self, name: &str) -> Result<Option<StoredIndexedRepo>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, path, github_url, default_branch, file_count, last_indexed_at, created_at
+            FROM indexed_repos WHERE name = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![name], |row| {
+            Ok(StoredIndexedRepo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                github_url: row.get(3)?,
+                default_branch: row.get(4)?,
+                file_count: row.get(5)?,
+                last_indexed_at: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        });
+
+        match result {
+            Ok(repo) => Ok(Some(repo)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List all indexed repositories.
+    pub fn list_indexed_repos(&self) -> Result<Vec<StoredIndexedRepo>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, path, github_url, default_branch, file_count, last_indexed_at, created_at
+            FROM indexed_repos ORDER BY name
+            "#,
+        )?;
+
+        let mut repos = Vec::new();
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredIndexedRepo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                github_url: row.get(3)?,
+                default_branch: row.get(4)?,
+                file_count: row.get(5)?,
+                last_indexed_at: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            repos.push(row);
+        }
+
+        Ok(repos)
+    }
+
+    /// Get index statistics.
+    pub fn get_index_stats(&self) -> Result<IndexStats> {
+        let conn = self.acquire_lock()?;
+
+        let repo_count: i64 = conn.query_row("SELECT COUNT(*) FROM indexed_repos", [], |row| row.get(0))?;
+        let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM repo_files", [], |row| row.get(0))?;
+        let last_indexed: Option<String> = conn.query_row(
+            "SELECT MAX(last_indexed_at) FROM indexed_repos",
+            [],
+            |row| row.get(0),
+        ).ok();
+
+        Ok(IndexStats {
+            repo_count: repo_count as usize,
+            file_count: file_count as usize,
+            last_indexed_at: last_indexed,
+        })
+    }
+
+    // ================================================================
+    // Inference Tracking Methods
+    // ================================================================
+
+    /// Record an inference attempt.
+    pub fn record_inference_attempt(
+        &self,
+        issue_id: &str,
+        issue_source: &str,
+        extracted_filenames: &[String],
+        extracted_functions: &[String],
+        extracted_keywords: &[String],
+        inferred_repo_id: Option<i64>,
+        confidence: &str,
+        inference_reason: &str,
+        duration_ms: Option<u64>,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        let filenames_json = serde_json::to_string(extracted_filenames).unwrap_or_default();
+        let functions_json = serde_json::to_string(extracted_functions).unwrap_or_default();
+        let keywords_json = serde_json::to_string(extracted_keywords).unwrap_or_default();
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_attempts (
+                issue_id, issue_source, extracted_filenames, extracted_functions,
+                extracted_keywords, inferred_repo_id, confidence, inference_reason,
+                inference_duration_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                issue_id,
+                issue_source,
+                filenames_json,
+                functions_json,
+                keywords_json,
+                inferred_repo_id,
+                confidence,
+                inference_reason,
+                duration_ms.map(|d| d as i64),
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Record feedback on an inference attempt (was it correct?).
+    pub fn record_inference_feedback(
+        &self,
+        inference_id: i64,
+        was_correct: bool,
+        actual_repo_id: Option<i64>,
+        feedback_source: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE inference_attempts
+            SET was_correct = ?1, actual_repo_id = ?2, feedback_source = ?3, feedback_at = datetime('now')
+            WHERE id = ?4
+            "#,
+            params![was_correct, actual_repo_id, feedback_source, inference_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get inference statistics.
+    pub fn get_inference_stats(&self) -> Result<InferenceStats> {
+        let conn = self.acquire_lock()?;
+
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM inference_attempts", [], |row| row.get(0))?;
+        let with_feedback: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inference_attempts WHERE was_correct IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let correct: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inference_attempts WHERE was_correct = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let high_confidence: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inference_attempts WHERE confidence = 'high'",
+            [],
+            |row| row.get(0),
+        )?;
+        let medium_confidence: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inference_attempts WHERE confidence = 'medium'",
+            [],
+            |row| row.get(0),
+        )?;
+        let low_confidence: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inference_attempts WHERE confidence = 'low'",
+            [],
+            |row| row.get(0),
+        )?;
+        let no_match: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inference_attempts WHERE inferred_repo_id IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(InferenceStats {
+            total_attempts: total as usize,
+            with_feedback: with_feedback as usize,
+            correct: correct as usize,
+            accuracy: if with_feedback > 0 {
+                (correct as f64 / with_feedback as f64) * 100.0
+            } else {
+                0.0
+            },
+            by_confidence: ConfidenceBreakdown {
+                high: high_confidence as usize,
+                medium: medium_confidence as usize,
+                low: low_confidence as usize,
+                none: no_match as usize,
+            },
+        })
+    }
+}
+
+/// An indexed repository stored in the database.
+#[derive(Debug, Clone)]
+pub struct StoredIndexedRepo {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+    pub github_url: Option<String>,
+    pub default_branch: String,
+    pub file_count: i64,
+    pub last_indexed_at: String,
+    pub created_at: String,
+}
+
+/// Index statistics.
+#[derive(Debug, Clone)]
+pub struct IndexStats {
+    pub repo_count: usize,
+    pub file_count: usize,
+    pub last_indexed_at: Option<String>,
+}
+
+/// Inference statistics.
+#[derive(Debug, Clone)]
+pub struct InferenceStats {
+    pub total_attempts: usize,
+    pub with_feedback: usize,
+    pub correct: usize,
+    pub accuracy: f64,
+    pub by_confidence: ConfidenceBreakdown,
+}
+
+/// Breakdown by confidence level.
+#[derive(Debug, Clone)]
+pub struct ConfidenceBreakdown {
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+    pub none: usize,
+}
+
+/// A repository stored in the database.
+#[derive(Debug, Clone)]
+pub struct StoredRepository {
+    pub id: i64,
+    pub name: String,
+    pub path: Option<String>,
+    pub github_url: String,
+    pub created_at: String,
+}
+
+/// A dependency relationship stored in the database.
+#[derive(Debug, Clone)]
+pub struct StoredDependency {
+    pub id: i64,
+    pub upstream: String,
+    pub downstream: String,
+    pub dep_type: String,
+    pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Datelike, Timelike};
+
+    #[test]
+    fn test_record_and_retrieve_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+
+        assert!(tracker.has_attempted("linear", "123"));
+        assert!(!tracker.has_attempted("linear", "456"));
+        assert!(!tracker.has_attempted("sentry", "123"));
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.issue_id, "123");
+        assert_eq!(attempt.short_id, "PROJ-123");
+        assert_eq!(attempt.source, "linear");
+        assert_eq!(attempt.status, FixAttemptStatus::Pending);
+    }
+
+    #[test]
+    fn test_mark_success() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/42")
+            .unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Success);
+        assert_eq!(
+            attempt.pr_url,
+            Some("https://github.com/org/repo/pull/42".to_string())
+        );
+        // Check that GitHub info was extracted
+        assert_eq!(attempt.github_repo, Some("org/repo".to_string()));
+        assert_eq!(attempt.github_pr_number, Some(42));
+    }
+
+    #[test]
+    fn test_mark_merged() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/42")
+            .unwrap();
+        tracker.mark_merged("linear", "123").unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Merged);
+        assert!(attempt.merged_at.is_some());
+    }
+
+    #[test]
+    fn test_mark_closed() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/42")
+            .unwrap();
+        tracker.mark_closed("linear", "123").unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Closed);
+    }
+
+    #[test]
+    fn test_get_pending_prs() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a successful attempt with a PR
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/42")
+            .unwrap();
+
+        // Create a merged attempt (should not be in pending PRs)
+        tracker.record_attempt("linear", "456", "PROJ-456").unwrap();
+        tracker
+            .mark_success("linear", "456", "https://github.com/org/repo/pull/43")
+            .unwrap();
+        tracker.mark_merged("linear", "456").unwrap();
+
+        let pending_prs = tracker.get_pending_prs().unwrap();
+        assert_eq!(pending_prs.len(), 1);
+        assert_eq!(pending_prs[0].issue_id, "123");
+    }
+
+    #[test]
+    fn test_get_attempt_by_pr_url() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/42")
+            .unwrap();
+
+        let attempt = tracker
+            .get_attempt_by_pr_url("https://github.com/org/repo/pull/42")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.issue_id, "123");
+        assert_eq!(attempt.source, "linear");
+    }
+
+    #[test]
+    fn test_parse_pr_url() {
+        let (repo, pr) =
+            SqliteTracker::parse_pr_url("https://github.com/owner/repo/pull/123").unwrap();
+        assert_eq!(repo, "owner/repo");
+        assert_eq!(pr, 123);
+
+        // Non-GitHub URL should return None
+        assert!(
+            SqliteTracker::parse_pr_url("https://gitlab.com/owner/repo/merge_requests/123")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_mark_failed() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_failed("linear", "123", "Something went wrong")
+            .unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Failed);
+        assert_eq!(
+            attempt.error_message,
+            Some("Something went wrong".to_string())
+        );
+    }
+
+    #[test]
+    fn test_reset_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        assert!(tracker.has_attempted("linear", "123"));
+
+        tracker.reset_attempt("linear", "123").unwrap();
+        assert!(!tracker.has_attempted("linear", "123"));
+    }
+
+    #[test]
+    fn test_get_attempted_issue_ids() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker.record_attempt("linear", "456", "PROJ-456").unwrap();
+        tracker
+            .record_attempt("sentry", "789", "SENTRY-789")
+            .unwrap();
+
+        let linear_ids = tracker.get_attempted_issue_ids("linear");
+        assert_eq!(linear_ids.len(), 2);
+        assert!(linear_ids.contains("123"));
+        assert!(linear_ids.contains("456"));
+
+        let sentry_ids = tracker.get_attempted_issue_ids("sentry");
+        assert_eq!(sentry_ids.len(), 1);
+        assert!(sentry_ids.contains("789"));
+    }
+
+    #[test]
+    fn test_get_attempts_by_status() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker.record_attempt("linear", "456", "PROJ-456").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://example.com/pr/1")
+            .unwrap();
+
+        let pending = tracker
+            .get_attempts_by_status(FixAttemptStatus::Pending)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].issue_id, "456");
+
+        let success = tracker
+            .get_attempts_by_status(FixAttemptStatus::Success)
+            .unwrap();
+        assert_eq!(success.len(), 1);
+        assert_eq!(success[0].issue_id, "123");
+    }
+
+    #[test]
+    fn test_get_stats() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "1", "PROJ-1").unwrap();
+        tracker.record_attempt("linear", "2", "PROJ-2").unwrap();
+        tracker.record_attempt("sentry", "3", "SENTRY-3").unwrap();
+
+        tracker
+            .mark_success("linear", "1", "https://example.com/pr/1")
+            .unwrap();
+        tracker.mark_failed("linear", "2", "Error").unwrap();
+
+        let stats = tracker.get_stats().unwrap();
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.success, 1);
+        assert_eq!(stats.failed, 1);
+
+        let linear_stats = stats.by_source.get("linear").unwrap();
+        assert_eq!(linear_stats.total, 2);
+        assert_eq!(linear_stats.success, 1);
+        assert_eq!(linear_stats.failed, 1);
+
+        let sentry_stats = stats.by_source.get("sentry").unwrap();
+        assert_eq!(sentry_stats.total, 1);
+    }
+
+    #[test]
+    fn test_mark_resolved() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/42")
+            .unwrap();
+        tracker.mark_resolved("linear", "123").unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert!(attempt.resolved_at.is_some());
+    }
+
+    #[test]
+    fn test_increment_retry() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker.mark_failed("linear", "123", "Error").unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.retry_count, 0);
+
+        tracker.increment_retry("linear", "123").unwrap();
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.retry_count, 1);
+        assert!(attempt.last_retry_at.is_some());
+
+        tracker.increment_retry("linear", "123").unwrap();
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.retry_count, 2);
+    }
+
+    #[test]
+    fn test_mark_cannot_fix() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_cannot_fix("linear", "123", "Max retries exceeded")
+            .unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::CannotFix);
+        assert_eq!(
+            attempt.error_message,
+            Some("Max retries exceeded".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_retryable_issues() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Failed with 0 retries - retryable
+        tracker.record_attempt("linear", "1", "PROJ-1").unwrap();
+        tracker.mark_failed("linear", "1", "Error").unwrap();
+
+        // Failed with 2 retries - still retryable if max is 3
+        tracker.record_attempt("linear", "2", "PROJ-2").unwrap();
+        tracker.mark_failed("linear", "2", "Error").unwrap();
+        tracker.increment_retry("linear", "2").unwrap();
+        tracker.increment_retry("linear", "2").unwrap();
+
+        // Closed - retryable
+        tracker.record_attempt("linear", "3", "PROJ-3").unwrap();
+        tracker
+            .mark_success("linear", "3", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_closed("linear", "3").unwrap();
+
+        // Success - not retryable
+        tracker.record_attempt("linear", "4", "PROJ-4").unwrap();
+        tracker
+            .mark_success("linear", "4", "https://github.com/org/repo/pull/2")
+            .unwrap();
+
+        let retryable = tracker.get_retryable_issues(3).unwrap();
+        assert_eq!(retryable.len(), 3);
+
+        // With max 2 retries, issue 2 should be excluded
+        let retryable = tracker.get_retryable_issues(2).unwrap();
+        assert_eq!(retryable.len(), 2);
+    }
+
+    #[test]
+    fn test_prepare_for_retry() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/42")
+            .unwrap();
+        tracker.mark_closed("linear", "123").unwrap();
+
+        // Prepare for retry should reset to pending
+        tracker.prepare_for_retry("linear", "123").unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Pending);
+        assert!(attempt.pr_url.is_none());
+        assert!(attempt.github_repo.is_none());
+        assert!(attempt.github_pr_number.is_none());
+        assert!(attempt.error_message.is_none());
+    }
+
+    #[test]
+    fn test_parse_pr_url_various_formats() {
+        // Standard format
+        let (repo, pr) =
+            SqliteTracker::parse_pr_url("https://github.com/owner/repo/pull/123").unwrap();
+        assert_eq!(repo, "owner/repo");
+        assert_eq!(pr, 123);
+
+        // With trailing slash
+        let (repo, pr) = SqliteTracker::parse_pr_url("https://github.com/owner/repo/pull/456/")
+            .unwrap_or(("".into(), 0));
+        // Regex doesn't match trailing slash, this is expected behavior
+        assert_eq!(repo, "owner/repo");
+        assert_eq!(pr, 456);
+
+        // HTTP instead of HTTPS (should still work as regex doesn't require https)
+        let result = SqliteTracker::parse_pr_url("http://github.com/owner/repo/pull/789");
+        assert!(result.is_some());
+
+        // Invalid URL
+        assert!(SqliteTracker::parse_pr_url("not a url").is_none());
+
+        // Empty string
+        assert!(SqliteTracker::parse_pr_url("").is_none());
+    }
+
+    #[test]
+    fn test_get_attempt_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let attempt = tracker.get_attempt("linear", "nonexistent").unwrap();
+        assert!(attempt.is_none());
+    }
+
+    #[test]
+    fn test_get_attempt_by_pr_url_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let attempt = tracker
+            .get_attempt_by_pr_url("https://github.com/org/repo/pull/999")
+            .unwrap();
+        assert!(attempt.is_none());
+    }
+
+    #[test]
+    fn test_get_attempts_by_status_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let attempts = tracker
+            .get_attempts_by_status(FixAttemptStatus::Merged)
+            .unwrap();
+        assert!(attempts.is_empty());
+    }
+
+    #[test]
+    fn test_stats_empty_database() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let stats = tracker.get_stats().unwrap();
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.success, 0);
+        assert_eq!(stats.failed, 0);
+        assert!(stats.by_source.is_empty());
+    }
+
+    #[test]
+    fn test_stats_all_statuses() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Pending
+        tracker.record_attempt("linear", "1", "PROJ-1").unwrap();
+
+        // Success
+        tracker.record_attempt("linear", "2", "PROJ-2").unwrap();
+        tracker
+            .mark_success("linear", "2", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        // Failed
+        tracker.record_attempt("linear", "3", "PROJ-3").unwrap();
+        tracker.mark_failed("linear", "3", "Error").unwrap();
+
+        // Merged
+        tracker.record_attempt("linear", "4", "PROJ-4").unwrap();
+        tracker
+            .mark_success("linear", "4", "https://github.com/org/repo/pull/2")
+            .unwrap();
+        tracker.mark_merged("linear", "4").unwrap();
+
+        // Closed
+        tracker.record_attempt("linear", "5", "PROJ-5").unwrap();
+        tracker
+            .mark_success("linear", "5", "https://github.com/org/repo/pull/3")
+            .unwrap();
+        tracker.mark_closed("linear", "5").unwrap();
+
+        // Cannot fix
+        tracker.record_attempt("linear", "6", "PROJ-6").unwrap();
+        tracker
+            .mark_cannot_fix("linear", "6", "Max retries")
+            .unwrap();
+
+        let stats = tracker.get_stats().unwrap();
+        assert_eq!(stats.total, 6);
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.success, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.merged, 1);
+        assert_eq!(stats.closed, 1);
+        assert_eq!(stats.cannot_fix, 1);
+    }
+
+    #[test]
+    fn test_record_attempt_upsert_preserves_data() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Record initial attempt
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        // Record again - using ON CONFLICT DO UPDATE, this should only update
+        // short_id and attempted_at, preserving status and pr_url
+        tracker
+            .record_attempt("linear", "123", "PROJ-123-v2")
+            .unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        // short_id should be updated
+        assert_eq!(attempt.short_id, "PROJ-123-v2");
+        // status and pr_url should be preserved (not reset)
+        assert_eq!(attempt.status, FixAttemptStatus::Success);
+        assert_eq!(
+            attempt.pr_url,
+            Some("https://github.com/org/repo/pull/1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_multiple_sources_isolation() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Same issue_id in different sources
+        tracker
+            .record_attempt("linear", "123", "LINEAR-123")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "123", "SENTRY-123")
+            .unwrap();
+
+        assert!(tracker.has_attempted("linear", "123"));
+        assert!(tracker.has_attempted("sentry", "123"));
+
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let linear_attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        let sentry_attempt = tracker.get_attempt("sentry", "123").unwrap().unwrap();
+
+        assert_eq!(linear_attempt.status, FixAttemptStatus::Success);
+        assert_eq!(sentry_attempt.status, FixAttemptStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_datetime_rfc3339() {
+        let dt = SqliteTracker::parse_datetime("2024-01-15T10:30:00Z");
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 1);
+        assert_eq!(dt.day(), 15);
+        assert_eq!(dt.hour(), 10);
+        assert_eq!(dt.minute(), 30);
+    }
+
+    #[test]
+    fn test_parse_datetime_sqlite_format() {
+        let dt = SqliteTracker::parse_datetime("2024-01-15 10:30:00");
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 1);
+        assert_eq!(dt.day(), 15);
+    }
+
+    #[test]
+    fn test_parse_datetime_invalid() {
+        // Should return current time for invalid format
+        let dt = SqliteTracker::parse_datetime("not a date");
+        // Just verify it doesn't panic and returns a valid datetime
+        assert!(dt.year() >= 2024);
+    }
+
+    #[test]
+    fn test_parse_optional_datetime() {
+        let none_result = SqliteTracker::parse_optional_datetime(None);
+        assert!(none_result.is_none());
+
+        let some_result =
+            SqliteTracker::parse_optional_datetime(Some("2024-01-15T10:30:00Z".to_string()));
+        assert!(some_result.is_some());
+    }
+
+    #[test]
+    fn test_get_pending_prs_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pending_prs = tracker.get_pending_prs().unwrap();
+        assert!(pending_prs.is_empty());
+    }
+
+    #[test]
+    fn test_get_pending_prs_no_github_info() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create attempt with non-GitHub PR URL
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success(
+                "linear",
+                "123",
+                "https://gitlab.com/org/repo/-/merge_requests/42",
+            )
+            .unwrap();
+
+        // Should not be included because github_repo is None
+        let pending_prs = tracker.get_pending_prs().unwrap();
+        assert!(pending_prs.is_empty());
+    }
+}
