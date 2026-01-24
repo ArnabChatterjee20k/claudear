@@ -50,15 +50,18 @@ pub use config::{Config, RetryConfig};
 pub use discord::{DiscordClient, ThreadManager, ThreadState};
 pub use error::{Error, Result};
 pub use feedback::{
-    cosine_similarity, euclidean_distance, normalize, EmbeddingClient, EmbeddingConfig,
-    EmbeddingResult, FeedbackAnalyzer, FixOutcome, MemoryVectorStore, Outcome, PromptSuggestion,
-    SimilarIssue,
+    cosine_similarity, euclidean_distance, format_similar_issues_context, normalize,
+    EmbeddingClient, EmbeddingConfig, EmbeddingResult, FeedbackAnalyzer, FixOutcome,
+    IssueEmbeddingConfig, IssueEmbeddingService, MemoryVectorStore, Outcome, PromptSuggestion,
+    SimilarIssue, SimilarIssueWithDetails,
 };
 pub use github::{
     GitHubClient, GitHubUser, PrMonitor, PrReview, PrReviewComment, PrReviewState, PrStatus,
     PrStatusUpdate, ReviewEvent, ReviewWatcher,
 };
-pub use inference::{Confidence, InferredRepo, IssueContext, RepoInferrer};
+pub use inference::{
+    resolve_repo_for_issue, Confidence, InferredRepo, IssueContext, RepoInferrer, RepoResolution,
+};
 pub use ipc::{
     default_socket_path, is_daemon_running, print_response, IpcClient, IpcCommand, IpcData,
     IpcResponse, IpcServer, WatcherState,

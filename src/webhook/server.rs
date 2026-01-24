@@ -3,7 +3,7 @@
 use super::{WebhookHandler, WebhookHandlerRegistry};
 use crate::config::Config;
 use crate::error::Result;
-use crate::inference::{IssueContext, RepoInferrer};
+use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::Notifier;
 use crate::repo::RepoIndex;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
@@ -20,7 +20,6 @@ use axum::{
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::RwLock;
 use tower::limit::ConcurrencyLimitLayer;
 
@@ -30,6 +29,7 @@ struct AppState {
     handlers: WebhookHandlerRegistry,
     notifier: Arc<dyn Notifier>,
     tracker: Arc<dyn FixAttemptTracker>,
+    sqlite_tracker: Option<Arc<SqliteTracker>>,
     inferrer: Option<RepoInferrer>,
     claude: ClaudeRunner,
     processing: RwLock<HashSet<String>>,
@@ -41,6 +41,7 @@ pub struct WebhookServer {
     handlers: WebhookHandlerRegistry,
     notifier: Arc<dyn Notifier>,
     tracker: Arc<dyn FixAttemptTracker>,
+    sqlite_tracker: Option<Arc<SqliteTracker>>,
     inferrer: Option<RepoInferrer>,
     port: u16,
 }
@@ -52,6 +53,7 @@ impl WebhookServer {
         handlers: WebhookHandlerRegistry,
         notifier: Arc<dyn Notifier>,
         tracker: Arc<dyn FixAttemptTracker>,
+        sqlite_tracker: Option<Arc<SqliteTracker>>,
         inferrer: Option<RepoInferrer>,
     ) -> Self {
         let port = config.webhook_port;
@@ -60,6 +62,7 @@ impl WebhookServer {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker,
             inferrer,
             port,
         }
@@ -100,6 +103,7 @@ impl WebhookServer {
             handlers: self.handlers,
             notifier: self.notifier,
             tracker: self.tracker,
+            sqlite_tracker: self.sqlite_tracker,
             inferrer: self.inferrer,
             processing: RwLock::new(HashSet::new()),
         });
@@ -342,88 +346,18 @@ async fn process_issue(
     tracing::info!(short_id = %issue.short_id, title = %issue.title, "Processing webhook issue");
     tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
 
-    // Infer the target repository
-    let inference_start = Instant::now();
-    let context = IssueContext::from_issue(&issue);
+    // Infer the target repository using the shared resolution function
+    let resolution = resolve_repo_for_issue(
+        state.inferrer.as_ref(),
+        &issue,
+        state.sqlite_tracker.as_ref(),
+    );
 
-    let project_dir = match &state.inferrer {
-        Some(inferrer) => {
-            match inferrer.infer(&issue) {
-                Some(inferred) => {
-                    let duration_ms = inference_start.elapsed().as_millis() as i64;
-                    tracing::info!(
-                        short_id = %issue.short_id,
-                        repo = %inferred.repo.name,
-                        confidence = %inferred.confidence,
-                        reason = %inferred.reason,
-                        duration_ms = duration_ms,
-                        "Repository inferred"
-                    );
-
-                    // Record inference attempt for analytics
-                    record_inference_attempt(&state, &issue, &context, Some(&inferred), duration_ms);
-
-                    let activity = ActivityLogEntry::new(
-                        "repo_inferred",
-                        format!("Inferred repo {} for {}", inferred.repo.name, issue.short_id),
-                    )
-                    .with_source(issue.source.clone())
-                    .with_issue(issue.id.clone(), issue.short_id.clone())
-                    .with_metadata(json!({
-                        "repo": inferred.repo.name,
-                        "confidence": inferred.confidence.to_string(),
-                        "reason": inferred.reason,
-                        "matched_file": inferred.matched_file
-                    }));
-                    state.tracker.record_activity(&activity).ok();
-
-                    inferred.repo.path.clone()
-                }
-                None => {
-                    let duration_ms = inference_start.elapsed().as_millis() as i64;
-                    tracing::warn!(
-                        short_id = %issue.short_id,
-                        source = %issue.source,
-                        "Could not infer repository for issue"
-                    );
-
-                    // Record failed inference attempt
-                    record_inference_attempt(&state, &issue, &context, None, duration_ms);
-
-                    let activity = ActivityLogEntry::new(
-                        "inference_failed",
-                        format!("Could not infer repository for {}", issue.short_id),
-                    )
-                    .with_source(issue.source.clone())
-                    .with_issue(issue.id.clone(), issue.short_id.clone())
-                    .with_metadata(json!({
-                        "extracted_filenames": context.filenames,
-                        "extracted_functions": context.functions
-                    }));
-                    state.tracker.record_activity(&activity).ok();
-
-                    // Fall back to work_dir
-                    state.config.work_dir.clone()
-                }
-            }
-        }
-        None => {
-            tracing::warn!(
-                short_id = %issue.short_id,
-                "No inferrer configured, using work_dir"
-            );
-            let activity = ActivityLogEntry::new(
-                "webhook_processing",
-                format!("No inferrer configured for {}", issue.short_id),
-            )
-            .with_source(issue.source.clone())
-            .with_issue(issue.id.clone(), issue.short_id.clone())
-            .with_metadata(json!({
-                "reason": "no_inferrer_configured"
-            }));
-            state.tracker.record_activity(&activity).ok();
-
-            state.config.work_dir.clone()
+    let project_dir = match resolution {
+        RepoResolution::Resolved { project_dir, .. } => project_dir,
+        RepoResolution::Skip { reason } => {
+            tracing::debug!(short_id = %issue.short_id, reason = %reason, "Skipping issue");
+            return Ok(());
         }
     };
 
@@ -519,41 +453,6 @@ async fn process_issue(
     result
 }
 
-/// Record an inference attempt for analytics.
-fn record_inference_attempt(
-    state: &AppState,
-    issue: &Issue,
-    context: &IssueContext,
-    inferred: Option<&crate::inference::InferredRepo>,
-    duration_ms: i64,
-) {
-    // Try to downcast tracker to SqliteTracker for inference recording
-    let tracker_any = &state.tracker as &dyn std::any::Any;
-    if let Some(sqlite_tracker) = tracker_any.downcast_ref::<Arc<SqliteTracker>>() {
-        let (confidence, reason, repo_id) = match inferred {
-            Some(inf) => (
-                inf.confidence.to_string(),
-                inf.reason.clone(),
-                sqlite_tracker.get_indexed_repo(&inf.repo.name).ok().flatten().map(|r| r.id),
-            ),
-            None => ("none".to_string(), "No match found".to_string(), None),
-        };
-
-        if let Err(e) = sqlite_tracker.record_inference_attempt(
-            &issue.id,
-            &issue.source,
-            &context.filenames,
-            &context.functions,
-            &context.keywords,
-            repo_id,
-            &confidence,
-            &reason,
-            Some(duration_ms as u64),
-        ) {
-            tracing::warn!(error = %e, "Failed to record inference attempt");
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -696,7 +595,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
 
         assert_eq!(server.port, 8080);
     }
@@ -709,7 +608,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
 
         assert_eq!(server.port, 3000);
     }
@@ -934,6 +833,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });
@@ -968,6 +868,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(processing_set),
         });
@@ -1000,6 +901,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });
@@ -1066,6 +968,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });
@@ -1107,6 +1010,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });
@@ -1170,6 +1074,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });
@@ -1243,6 +1148,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });
@@ -1288,6 +1194,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });
@@ -1334,6 +1241,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(processing),
         });
@@ -1376,6 +1284,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });
@@ -1440,6 +1349,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });
@@ -1525,7 +1435,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config.clone(), handlers, notifier, tracker, None);
+        let server = WebhookServer::new(config.clone(), handlers, notifier, tracker, None, None);
 
         assert_eq!(server.port, config.webhook_port);
         assert_eq!(server.config.work_dir, config.work_dir);
@@ -1551,6 +1461,7 @@ mod tests {
             handlers,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
             processing: RwLock::new(HashSet::new()),
         });

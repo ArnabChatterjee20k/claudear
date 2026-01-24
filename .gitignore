@@ -12,3 +12,4 @@ dist/
 .claude/plans
 claudear.yaml
 .idea
+.fastembed_cache

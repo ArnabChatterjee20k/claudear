@@ -5,8 +5,8 @@ pub mod analytics;
 pub mod vectorlite;
 
 pub use sqlite::{
-    ConfidenceBreakdown, IndexStats, InferenceStats, SqliteTracker, StoredDependency,
-    StoredIndexedRepo, StoredRepository,
+    ConfidenceBreakdown, DiagnosticCounts, IndexStats, InferenceStats, SqliteTracker,
+    StoredDependency, StoredIndexedRepo, StoredRepository,
 };
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite, VectorStoreConfig};
 pub use analytics::{

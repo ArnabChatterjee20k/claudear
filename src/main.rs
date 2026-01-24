@@ -168,6 +168,10 @@ enum Commands {
     /// Report generation and scheduling
     #[command(subcommand)]
     Report(ReportCommands),
+
+    /// Diagnostic commands for debugging
+    #[command(subcommand)]
+    Diag(DiagCommands),
 }
 
 /// Repository management subcommands
@@ -248,9 +252,12 @@ enum ReposCommands {
         github_url: Option<String>,
     },
 
-    /// [DEPRECATED] Sync (repos now auto-discovered via known_orgs)
-    #[command(hide = true)]
-    Sync,
+    /// Sync repository index to database (paths and optionally files)
+    Sync {
+        /// Also sync file lists (can be slow for large codebases)
+        #[arg(long, default_value = "false")]
+        files: bool,
+    },
 }
 
 /// Inference analytics subcommands
@@ -338,6 +345,13 @@ enum ReportCommands {
     },
 }
 
+/// Diagnostic subcommands
+#[derive(Subcommand)]
+enum DiagCommands {
+    /// Show database table counts and recent operations
+    Db,
+}
+
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -421,9 +435,9 @@ fn create_notifier(config: &Config) -> Arc<dyn Notifier> {
     Arc::new(composite)
 }
 
-fn create_tracker(config: &Config) -> Arc<dyn FixAttemptTracker> {
-    let tracker = SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker");
-    Arc::new(tracker)
+fn create_tracker(config: &Config) -> (Arc<dyn FixAttemptTracker>, Arc<SqliteTracker>) {
+    let tracker = Arc::new(SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker"));
+    (tracker.clone(), tracker)
 }
 
 #[tokio::main]
@@ -853,12 +867,36 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            ReposCommands::Sync => {
-                // Sync command is deprecated - repos and dependencies are now discovered automatically
-                println!("\n=== Note ===\n");
-                println!("The 'repos sync' command is deprecated.");
-                println!("Repository configuration is now auto-discovered from known_orgs.");
-                println!("\nUse 'claudear repos discover --save' to discover and save repositories.");
+            ReposCommands::Sync { files } => {
+                use claudear::repo::RepoIndex;
+
+                println!("\nSyncing repository index to database...");
+
+                if config.known_orgs.is_empty() || config.auto_discover_paths.is_empty() {
+                    anyhow::bail!("known_orgs and auto_discover_paths must be configured");
+                }
+
+                // Build in-memory index
+                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                if index.is_empty() {
+                    println!("No repositories found.");
+                    return Ok(());
+                }
+
+                println!("  Found {} repositories with {} files", index.len(), index.total_files());
+
+                // Sync to database
+                let synced = db_tracker.sync_from_index(&index, *files)?;
+
+                println!("\nSynced {} repository paths to database", synced);
+                if *files {
+                    println!("  Including file lists (this may have taken a while)");
+                    // Show stats after file sync
+                    let stats = db_tracker.get_index_stats()?;
+                    println!("  Total files in database: {}", stats.file_count);
+                } else {
+                    println!("\nRun with --files to also sync file lists (slower)");
+                }
             }
         }
 
@@ -928,12 +966,64 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Handle Diag commands early (don't need sources or full validation)
+    if let Commands::Diag(ref diag_cmd) = cli.command {
+        let db_tracker = SqliteTracker::new(&config.db_path)?;
+
+        match diag_cmd {
+            DiagCommands::Db => {
+                let counts = db_tracker.get_diagnostic_counts()?;
+
+                println!("\n=== Database Diagnostics ===\n");
+                println!("Database path: {:?}", config.db_path);
+                println!();
+
+                println!("Table Counts:");
+                println!("  fix_attempts:       {}", counts.fix_attempts);
+                if !counts.fix_attempts_by_status.is_empty() {
+                    println!("    By status:");
+                    for (status, count) in &counts.fix_attempts_by_status {
+                        println!("      {}: {}", status, count);
+                    }
+                }
+                println!("  activity_log:       {}", counts.activity_log);
+                println!("  claude_executions:  {}", counts.claude_executions);
+                println!("  pr_reviews:         {}", counts.pr_reviews);
+                println!("  pr_review_states:   {}", counts.pr_review_states);
+                println!("  issue_embeddings:   {}", counts.issue_embeddings);
+                println!("  similar_issues:     {}", counts.similar_issues);
+                println!("  repositories:       {}", counts.repositories);
+                println!("  repo_files:         {}", counts.repo_files);
+                println!("  inference_attempts: {}", counts.inference_attempts);
+                println!("  error_patterns:     {}", counts.error_patterns);
+                println!("  processing_metrics: {}", counts.processing_metrics);
+                println!("  feedback_outcomes:  {}", counts.feedback_outcomes);
+                println!("  prs:                {}", counts.prs);
+
+                if !counts.recent_fix_attempts.is_empty() {
+                    println!("\nRecent Fix Attempts (last 5):");
+                    for (source, issue_id, short_id, status) in &counts.recent_fix_attempts {
+                        println!("  [{}] {} ({}) - {}", source, short_id, issue_id, status);
+                    }
+                } else {
+                    println!("\nNo fix attempts recorded yet.");
+                    println!("\nTo debug why fix_attempts is empty:");
+                    println!("  1. Run with verbose logging: RUST_LOG=claudear=debug claudear poll");
+                    println!("  2. Check that issues have the trigger labels configured");
+                    println!("  3. Verify the watcher is processing issues (check activity_log)");
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
     config.validate()?;
 
     // Initialize components
     tracing::info!("Initializing...");
     let notifier = create_notifier(&config);
-    let tracker = create_tracker(&config);
+    let (tracker, sqlite_tracker) = create_tracker(&config);
 
     // Handle Start command (daemon mode with IPC - runs all services concurrently)
     if let Commands::Start {
@@ -988,7 +1078,11 @@ async fn main() -> anyhow::Result<()> {
                 sources: sources.clone(),
                 notifier: notifier.clone(),
                 tracker: tracker.clone(),
+                sqlite_tracker: Some(sqlite_tracker.clone()),
                 inferrer: inferrer.clone(),
+                embedding_client: None,
+                review_watcher: None,
+                issue_embedding_service: None,
                 dry_run: false,
             })))
         } else {
@@ -1081,7 +1175,7 @@ async fn main() -> anyhow::Result<()> {
 
                 // Webhook server also serves health endpoint which dashboard uses
                 let server =
-                    WebhookServer::new(config.clone(), handlers, notifier.clone(), tracker.clone(), inferrer_clone);
+                    WebhookServer::new(config.clone(), handlers, notifier.clone(), tracker.clone(), Some(sqlite_tracker.clone()), inferrer_clone);
                 server.start().await?;
             } else if enable_dashboard {
                 // Dashboard only (no webhooks)
@@ -1380,7 +1474,11 @@ async fn main() -> anyhow::Result<()> {
             sources,
             notifier,
             tracker: tracker.clone(),
+            sqlite_tracker: Some(sqlite_tracker.clone()),
             inferrer,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
             dry_run: false,
         });
 
@@ -1572,7 +1670,7 @@ async fn main() -> anyhow::Result<()> {
             // Build inferrer for repo inference
             let inferrer = WebhookServer::build_inferrer(&config)?;
 
-            let server = WebhookServer::new(config, handlers, notifier, tracker, inferrer);
+            let server = WebhookServer::new(config, handlers, notifier, tracker, Some(sqlite_tracker), inferrer);
 
             // Handle shutdown signals
             let shutdown = async {
@@ -1599,15 +1697,20 @@ async fn main() -> anyhow::Result<()> {
 
             let dry_run = matches!(cli.command, Commands::DryRun);
 
-            // Build inferrer for repo inference
-            let inferrer = Watcher::build_inferrer(&config)?;
+            // Build inferrer for repo inference (with embeddings for semantic matching)
+            let (inferrer, embedding_client) =
+                Watcher::build_inferrer_with_embeddings(&config).await?;
 
             let watcher = Watcher::new(WatcherOptions {
                 config: config.clone(),
                 sources,
                 notifier,
                 tracker,
+                sqlite_tracker: Some(sqlite_tracker.clone()),
                 inferrer,
+                embedding_client,
+                review_watcher: None,
+                issue_embedding_service: None,
                 dry_run,
             });
 
@@ -1704,7 +1807,8 @@ async fn main() -> anyhow::Result<()> {
                 | Commands::Dashboard { .. }
                 | Commands::Report(_)
                 | Commands::Repos(_)
-                | Commands::Inference(_) => unreachable!(),
+                | Commands::Inference(_)
+                | Commands::Diag(_) => unreachable!(),
             }
         }
     }

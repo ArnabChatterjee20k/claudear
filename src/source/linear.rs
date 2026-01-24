@@ -370,26 +370,28 @@ impl<H: LinearHttpClient + 'static> IssueSource for LinearSource<H> {
         let mut filter = serde_json::Map::new();
 
         if let Some(ref team_id) = self.config.team_id {
-            filter.insert(
-                "team".to_string(),
-                serde_json::json!({ "id": { "eq": team_id } }),
-            );
+            if !team_id.is_empty() {
+                filter.insert(
+                    "team".to_string(),
+                    serde_json::json!({ "id": { "eq": team_id } }),
+                );
+            }
         }
 
         if let Some(ref project_id) = self.config.project_id {
-            filter.insert(
-                "project".to_string(),
-                serde_json::json!({ "id": { "eq": project_id } }),
-            );
+            if !project_id.is_empty() {
+                filter.insert(
+                    "project".to_string(),
+                    serde_json::json!({ "id": { "eq": project_id } }),
+                );
+            }
         }
 
         if !self.config.trigger_labels.is_empty() {
             filter.insert(
                 "labels".to_string(),
                 serde_json::json!({
-                    "some": {
-                        "name": { "in": self.config.trigger_labels }
-                    }
+                    "some": { "name": { "in": self.config.trigger_labels } }
                 }),
             );
         }

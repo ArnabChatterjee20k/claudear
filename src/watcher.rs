@@ -2,7 +2,9 @@
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::inference::{IssueContext, RepoInferrer};
+use crate::feedback::{format_similar_issues_context, IssueEmbeddingService};
+use crate::github::ReviewWatcher;
+use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::Notifier;
 use crate::repo::RepoIndex;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
@@ -13,7 +15,6 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
@@ -23,7 +24,11 @@ pub struct WatcherOptions {
     pub sources: Vec<Arc<dyn IssueSource>>,
     pub notifier: Arc<dyn Notifier>,
     pub tracker: Arc<dyn FixAttemptTracker>,
+    pub sqlite_tracker: Option<Arc<SqliteTracker>>,
     pub inferrer: Option<RepoInferrer>,
+    pub embedding_client: Option<crate::feedback::EmbeddingClient>,
+    pub review_watcher: Option<Arc<ReviewWatcher>>,
+    pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub dry_run: bool,
 }
 
@@ -33,12 +38,18 @@ pub struct Watcher {
     sources: Vec<Arc<dyn IssueSource>>,
     notifier: Arc<dyn Notifier>,
     tracker: Arc<dyn FixAttemptTracker>,
+    sqlite_tracker: Option<Arc<SqliteTracker>>,
     inferrer: Option<RepoInferrer>,
+    embedding_client: Option<crate::feedback::EmbeddingClient>,
+    review_watcher: Option<Arc<ReviewWatcher>>,
+    issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     claude: ClaudeRunner,
     dry_run: bool,
     is_running: AtomicBool,
     processing: RwLock<HashSet<String>>,
     active_processing: AtomicUsize,
+    /// Counter for review poll intervals (check reviews every N poll cycles)
+    review_poll_counter: AtomicUsize,
 }
 
 impl Watcher {
@@ -55,11 +66,16 @@ impl Watcher {
             sources: options.sources,
             notifier: options.notifier,
             tracker: options.tracker,
+            sqlite_tracker: options.sqlite_tracker,
             inferrer: options.inferrer,
+            embedding_client: options.embedding_client,
+            review_watcher: options.review_watcher,
+            issue_embedding_service: options.issue_embedding_service,
             dry_run: options.dry_run,
             is_running: AtomicBool::new(false),
             processing: RwLock::new(HashSet::new()),
             active_processing: AtomicUsize::new(0),
+            review_poll_counter: AtomicUsize::new(0),
         }
     }
 
@@ -85,8 +101,97 @@ impl Watcher {
         Ok(Some(RepoInferrer::new(index)))
     }
 
+    /// Build a repository inferrer with embeddings for semantic matching.
+    pub async fn build_inferrer_with_embeddings(
+        config: &Config,
+    ) -> Result<(Option<RepoInferrer>, Option<crate::feedback::EmbeddingClient>)> {
+        use crate::feedback::{EmbeddingClient, EmbeddingConfig};
+        use crate::inference::build_repo_embeddings;
+
+        if config.known_orgs.is_empty() || config.auto_discover_paths.is_empty() {
+            tracing::info!("No known_orgs or auto_discover_paths configured, inference disabled");
+            return Ok((None, None));
+        }
+
+        let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+        if index.is_empty() {
+            tracing::warn!("Repository index is empty, no repos discovered");
+            return Ok((None, None));
+        }
+
+        tracing::info!(
+            repos = index.len(),
+            files = index.total_files(),
+            "Repository index built for inference"
+        );
+
+        // Try to initialize embedding client
+        match EmbeddingClient::new(EmbeddingConfig::default()) {
+            Ok(client) => {
+                // Build embeddings for all repos
+                match build_repo_embeddings(&index, &client).await {
+                    Ok(embeddings) => {
+                        tracing::info!(
+                            "Semantic inference enabled with {} repo embeddings",
+                            embeddings.len()
+                        );
+                        // Use with_discovery to enable incremental updates
+                        let inferrer = RepoInferrer::with_discovery(
+                            index,
+                            embeddings,
+                            config.known_orgs.clone(),
+                            config.auto_discover_paths.clone(),
+                        );
+                        Ok((Some(inferrer), Some(client)))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to build repo embeddings: {}, falling back to file-based inference", e);
+                        Ok((Some(RepoInferrer::new(index)), None))
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to initialize embedding client: {}, using file-based inference only",
+                    e
+                );
+                Ok((Some(RepoInferrer::new(index)), None))
+            }
+        }
+    }
+
     // Repository resolution is now handled by the inference engine (RepoInferrer).
     // See src/inference/mod.rs for the new implementation.
+
+    /// Refresh the repo index and embed any new repositories.
+    ///
+    /// Returns the number of new repos discovered and embedded.
+    pub async fn refresh_repos(&self) -> Result<usize> {
+        let (inferrer, client) = match (&self.inferrer, &self.embedding_client) {
+            (Some(inf), Some(cli)) => (inf, cli),
+            _ => return Ok(0),
+        };
+
+        inferrer.refresh_repos(client).await
+    }
+
+    /// Sync repository index to the database.
+    ///
+    /// Updates repository paths and optionally file lists in the database
+    /// from the in-memory RepoIndex.
+    pub fn sync_repos_to_db(&self, sync_files: bool) -> Result<usize> {
+        let inferrer = match &self.inferrer {
+            Some(inf) => inf,
+            None => return Ok(0),
+        };
+
+        let sqlite_tracker = match &self.sqlite_tracker {
+            Some(t) => t,
+            None => return Ok(0),
+        };
+
+        inferrer.with_index(|index| sqlite_tracker.sync_from_index(index, sync_files))
+    }
 
     /// Start the watcher with polling.
     pub async fn start(&self, interval_ms: Option<u64>) -> Result<()> {
@@ -122,6 +227,17 @@ impl Watcher {
 
         tracing::info!("");
 
+        // Sync repository index to database (includes file lists)
+        match self.sync_repos_to_db(true) {
+            Ok(count) if count > 0 => {
+                tracing::info!("Synced {} repositories to database", count);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to sync repos to database: {}", e);
+            }
+            _ => {}
+        }
+
         self.is_running.store(true, Ordering::SeqCst);
 
         // Initial poll
@@ -131,12 +247,35 @@ impl Watcher {
         let mut poll_timer = interval(Duration::from_millis(poll_interval));
         poll_timer.tick().await; // Skip immediate first tick
 
+        // Counter for periodic repo refresh (every 5 polls)
+        let mut poll_count: u32 = 0;
+        const REFRESH_INTERVAL: u32 = 5;
+
         while self.is_running.load(Ordering::SeqCst) {
             poll_timer.tick().await;
             if self.is_running.load(Ordering::SeqCst) {
+                poll_count += 1;
+
+                // Periodically refresh repo index to detect new repositories
+                if poll_count % REFRESH_INTERVAL == 0 {
+                    match self.refresh_repos().await {
+                        Ok(0) => {} // No new repos
+                        Ok(n) => tracing::info!("Discovered and embedded {} new repositories", n),
+                        Err(e) => tracing::debug!(error = %e, "Error refreshing repos"),
+                    }
+                }
+
                 // Check for PRs to auto-close due to issue state changes
                 if let Err(e) = self.check_and_auto_close_prs().await {
                     tracing::debug!(error = %e, "Error checking for auto-close PRs");
+                }
+
+                // Check for PR reviews (every 3rd poll cycle)
+                let review_count = self.review_poll_counter.fetch_add(1, Ordering::SeqCst);
+                if review_count % 3 == 0 {
+                    if let Err(e) = self.check_reviews().await {
+                        tracing::debug!(error = %e, "Error checking for PR reviews");
+                    }
                 }
 
                 // Poll for new issues
@@ -199,6 +338,134 @@ impl Watcher {
     /// Get the count of currently active processing tasks.
     pub fn active_count(&self) -> usize {
         self.active_processing.load(Ordering::SeqCst)
+    }
+
+    /// Check for new PR reviews that require action.
+    ///
+    /// This polls the ReviewWatcher for any new CHANGES_REQUESTED or COMMENTED reviews
+    /// and triggers Claude to address the feedback.
+    pub async fn check_reviews(&self) -> Result<()> {
+        let review_watcher = match &self.review_watcher {
+            Some(rw) => rw,
+            None => return Ok(()),
+        };
+
+        // Check for new reviews
+        let events = review_watcher.check_for_reviews().await?;
+
+        for event in events {
+            if !event.requires_action() {
+                continue;
+            }
+
+            // Get the PR URL from the event
+            let pr_url = event.pr_url();
+            let feedback_summary = event.get_feedback_summary();
+
+            tracing::info!(
+                pr_url = %pr_url,
+                "Review feedback received, processing..."
+            );
+
+            // Find the original issue for this PR
+            if let Some(attempt) = self.tracker.get_attempt_by_pr_url(pr_url)? {
+                if let Err(e) = self.process_review_action(&attempt, &feedback_summary).await {
+                    tracing::error!(
+                        pr_url = %pr_url,
+                        error = %e,
+                        "Failed to process review feedback"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    pr_url = %pr_url,
+                    "Received review for unknown PR, skipping"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process review feedback by triggering Claude to address the feedback.
+    ///
+    /// This creates a new Claude session with the original issue context plus
+    /// the review feedback appended to help Claude understand what to fix.
+    async fn process_review_action(
+        &self,
+        attempt: &crate::types::FixAttempt,
+        feedback: &str,
+    ) -> Result<()> {
+        tracing::info!(
+            source = %attempt.source,
+            issue_id = %attempt.issue_id,
+            short_id = %attempt.short_id,
+            feedback_preview = %feedback.chars().take(100).collect::<String>(),
+            "Processing review feedback for issue"
+        );
+
+        // Increment the review_cycles count
+        if let Some(sqlite) = &self.sqlite_tracker {
+            if let Some(ref pr_url) = attempt.pr_url {
+                // Update the PR record with incremented review_cycles
+                if let Ok(Some(mut pr_record)) = sqlite.get_pr(pr_url) {
+                    pr_record.review_cycles += 1;
+                    pr_record.last_review_at = Some(chrono::Utc::now());
+                    if let Err(e) = sqlite.upsert_pr(&pr_record) {
+                        tracing::warn!(error = %e, "Failed to update PR review cycles");
+                    }
+                }
+            }
+        }
+
+        // Find the source for this issue
+        let source = match self.sources.iter().find(|s| s.name() == attempt.source) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    source = %attempt.source,
+                    "Source not found for review action"
+                );
+                return Ok(());
+            }
+        };
+
+        // Verify the issue exists before processing
+        let issues = source.fetch_issues().await?;
+        let issue_exists = issues.iter().any(|i| i.id == attempt.issue_id)
+            || source.get_issue(&attempt.issue_id).await.is_ok();
+
+        if !issue_exists {
+            tracing::warn!(
+                issue_id = %attempt.issue_id,
+                "Could not find original issue for review action"
+            );
+            return Err(crate::error::Error::source(
+                source.name(),
+                format!("Issue {} not found for review action", attempt.issue_id),
+            ));
+        }
+
+        // Process the issue (this will create a new commit on the existing branch)
+        // Note: The issue will be re-fetched by trigger_issue, which will get the
+        // latest description. Review feedback context is passed via the tracker's
+        // attempt record for reference.
+        if let Some(pr_url) = &attempt.pr_url {
+            tracing::info!(
+                pr_url = %pr_url,
+                "Re-processing issue to address review feedback"
+            );
+
+            // Use trigger_issue to re-process
+            if let Err(e) = self.trigger_issue(&attempt.source, &attempt.issue_id).await {
+                tracing::error!(
+                    error = %e,
+                    "Failed to trigger re-processing for review feedback"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Seed the tracker with existing issues.
@@ -338,6 +605,8 @@ impl Watcher {
 
         // In dry-run mode, just show what would be processed
         if self.dry_run {
+            use crate::inference::resolve_repo_for_issue_with_embedding;
+
             tracing::info!("");
             tracing::info!("[DRY RUN] Would process the following issues:");
             for (issue, match_result) in &to_process {
@@ -348,6 +617,40 @@ impl Watcher {
                     match_result.reason
                 );
                 tracing::info!("    URL: {}", issue.url);
+
+                // Generate embedding for issue if client is available
+                let query_embedding = if let Some(ref client) = self.embedding_client {
+                    let issue_text = format!(
+                        "{}\n{}",
+                        issue.title,
+                        issue.description.as_deref().unwrap_or("")
+                    );
+                    match client.embed(&issue_text).await {
+                        Ok(emb) => Some(emb),
+                        Err(e) => {
+                            tracing::debug!("Failed to embed issue text: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Show inferred repository (with optional semantic matching)
+                let resolution = resolve_repo_for_issue_with_embedding(
+                    self.inferrer.as_ref(),
+                    issue,
+                    self.sqlite_tracker.as_ref(),
+                    query_embedding.as_deref(),
+                );
+                match resolution {
+                    RepoResolution::Resolved { project_dir, .. } => {
+                        tracing::info!("    Repo: {}", project_dir.display());
+                    }
+                    RepoResolution::Skip { reason } => {
+                        tracing::info!("    Repo: SKIP - {}", reason);
+                    }
+                }
             }
             return Ok(());
         }
@@ -415,108 +718,46 @@ impl Watcher {
     ) {
         let processing_key = format!("{}:{}", source.name(), issue.id);
 
+        // Atomic check-and-insert to prevent race conditions.
+        // Use a single write lock for both checking and inserting.
+        {
+            let mut processing = self.processing.write().await;
+            if processing.contains(&processing_key) {
+                tracing::debug!(
+                    short_id = %issue.short_id,
+                    "Issue already being processed, skipping"
+                );
+                return;
+            }
+            processing.insert(processing_key.clone());
+        }
+        self.active_processing.fetch_add(1, Ordering::SeqCst);
+
         tracing::info!("");
         tracing::info!(short_id = %issue.short_id, title = %issue.title, "Processing issue");
         tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
         tracing::info!(short_id = %issue.short_id, priority = ?match_result.priority, "Match priority");
 
-        // Infer the target repository
-        let inference_start = Instant::now();
-        let context = IssueContext::from_issue(&issue);
+        // Infer the target repository using the shared resolution function
+        let resolution = resolve_repo_for_issue(
+            self.inferrer.as_ref(),
+            &issue,
+            self.sqlite_tracker.as_ref(),
+        );
 
-        let (project_dir, inferred_repo_id) = match &self.inferrer {
-            Some(inferrer) => {
-                match inferrer.infer(&issue) {
-                    Some(inferred) => {
-                        let duration_ms = inference_start.elapsed().as_millis() as i64;
-                        tracing::info!(
-                            short_id = %issue.short_id,
-                            repo = %inferred.repo.name,
-                            confidence = %inferred.confidence,
-                            reason = %inferred.reason,
-                            duration_ms = duration_ms,
-                            "Repository inferred"
-                        );
-
-                        // Record inference attempt for analytics
-                        let repo_id = self.record_inference_attempt(
-                            &issue,
-                            &context,
-                            Some(&inferred),
-                            duration_ms,
-                        );
-
-                        let activity = ActivityLogEntry::new(
-                            "repo_inferred",
-                            format!("Inferred repo {} for {}", inferred.repo.name, issue.short_id),
-                        )
-                        .with_source(issue.source.clone())
-                        .with_issue(issue.id.clone(), issue.short_id.clone())
-                        .with_metadata(json!({
-                            "repo": inferred.repo.name,
-                            "confidence": inferred.confidence.to_string(),
-                            "reason": inferred.reason,
-                            "matched_file": inferred.matched_file
-                        }));
-                        self.tracker.record_activity(&activity).ok();
-
-                        (inferred.repo.path.clone(), repo_id)
-                    }
-                    None => {
-                        let duration_ms = inference_start.elapsed().as_millis() as i64;
-                        tracing::warn!(
-                            short_id = %issue.short_id,
-                            source = %issue.source,
-                            "Could not infer repository for issue"
-                        );
-
-                        // Record failed inference attempt
-                        self.record_inference_attempt(&issue, &context, None, duration_ms);
-
-                        let activity = ActivityLogEntry::new(
-                            "inference_failed",
-                            format!("Could not infer repository for {}", issue.short_id),
-                        )
-                        .with_source(issue.source.clone())
-                        .with_issue(issue.id.clone(), issue.short_id.clone())
-                        .with_metadata(json!({
-                            "extracted_filenames": context.filenames,
-                            "extracted_functions": context.functions
-                        }));
-                        self.tracker.record_activity(&activity).ok();
-
-                        // Fall back to work_dir
-                        (self.config.work_dir.clone(), None)
-                    }
+        let project_dir = match resolution {
+            RepoResolution::Resolved { project_dir, .. } => project_dir,
+            RepoResolution::Skip { reason } => {
+                tracing::debug!(short_id = %issue.short_id, reason = %reason, "Skipping issue");
+                // Clean up processing state before returning
+                {
+                    let mut processing = self.processing.write().await;
+                    processing.remove(&processing_key);
                 }
-            }
-            None => {
-                tracing::warn!(
-                    short_id = %issue.short_id,
-                    "No inferrer configured, using work_dir"
-                );
-                let activity = ActivityLogEntry::new(
-                    "processing_skipped",
-                    format!("No inferrer configured for {}", issue.short_id),
-                )
-                .with_source(issue.source.clone())
-                .with_issue(issue.id.clone(), issue.short_id.clone())
-                .with_metadata(json!({
-                    "reason": "no_inferrer_configured"
-                }));
-                self.tracker.record_activity(&activity).ok();
-
-                (self.config.work_dir.clone(), None)
+                self.active_processing.fetch_sub(1, Ordering::SeqCst);
+                return;
             }
         };
-        let _ = inferred_repo_id; // Used for analytics tracking
-
-        // Mark as processing
-        {
-            let mut processing = self.processing.write().await;
-            processing.insert(processing_key.clone());
-        }
-        self.active_processing.fetch_add(1, Ordering::SeqCst);
 
         if let Err(e) = self
             .tracker
@@ -536,8 +777,35 @@ impl Watcher {
             // Notify start
             self.notifier.notify_start(&issue).await?;
 
+            // Find similar issues for context (if embedding service is available)
+            let similar_issues_context = if let Some(ref embedding_service) = self.issue_embedding_service {
+                match embedding_service.find_similar(&issue, source.name()).await {
+                    Ok(similar) if !similar.is_empty() => {
+                        tracing::info!(
+                            short_id = %issue.short_id,
+                            similar_count = similar.len(),
+                            "Found similar past issues for context"
+                        );
+                        format_similar_issues_context(&similar)
+                    }
+                    Ok(_) => String::new(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to find similar issues");
+                        String::new()
+                    }
+                }
+            } else {
+                String::new()
+            };
+
             // Build context and run Claude with attempt ID for analytics
-            let context = source.build_issue_context(&issue).await?;
+            let mut context = source.build_issue_context(&issue).await?;
+
+            // Append similar issues context if available
+            if !similar_issues_context.is_empty() {
+                context = format!("{}\n{}", context, similar_issues_context);
+            }
+
             let prompt = self.claude.build_prompt_for_issue(&issue, &context, &project_dir);
             let claude_result = self.claude.execute_with_attempt(&prompt, Some(&issue), attempt_id, &project_dir).await?;
 
@@ -553,6 +821,13 @@ impl Watcher {
                         .with_source(source.name().to_string());
                     if let Err(e) = self.tracker.record_metric(&metric) {
                         tracing::warn!(error = %e, "Failed to record pr_created metric");
+                    }
+
+                    // Store embedding for future similarity lookups
+                    if let Some(ref embedding_service) = self.issue_embedding_service {
+                        if let Err(e) = embedding_service.embed_issue(&issue, source.name()).await {
+                            tracing::warn!(error = %e, "Failed to store issue embedding");
+                        }
                     }
 
                     // Log processing_completed activity
@@ -637,47 +912,6 @@ impl Watcher {
         if let Err(e) = self.tracker.record_error_pattern(&pattern) {
             tracing::warn!(error = %e, "Failed to record error pattern");
         }
-    }
-
-    /// Record an inference attempt for analytics.
-    fn record_inference_attempt(
-        &self,
-        issue: &Issue,
-        context: &IssueContext,
-        inferred: Option<&crate::inference::InferredRepo>,
-        duration_ms: i64,
-    ) -> Option<i64> {
-        // Try to downcast tracker to SqliteTracker for inference recording
-        // This is a bit awkward but allows us to keep FixAttemptTracker trait simple
-        let tracker_any = &self.tracker as &dyn std::any::Any;
-        if let Some(sqlite_tracker) = tracker_any.downcast_ref::<Arc<SqliteTracker>>() {
-            let (confidence, reason, repo_id) = match inferred {
-                Some(inf) => (
-                    inf.confidence.to_string(),
-                    inf.reason.clone(),
-                    sqlite_tracker.get_indexed_repo(&inf.repo.name).ok().flatten().map(|r| r.id),
-                ),
-                None => ("none".to_string(), "No match found".to_string(), None),
-            };
-
-            match sqlite_tracker.record_inference_attempt(
-                &issue.id,
-                &issue.source,
-                &context.filenames,
-                &context.functions,
-                &context.keywords,
-                repo_id,
-                &confidence,
-                &reason,
-                Some(duration_ms as u64),
-            ) {
-                Ok(id) => return Some(id),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to record inference attempt");
-                }
-            }
-        }
-        None
     }
 
     /// Manually trigger processing for a specific issue.
@@ -1029,7 +1263,11 @@ mod tests {
             sources,
             notifier,
             tracker,
-            inferrer: None, // Tests don't need inference
+            sqlite_tracker: None, // Tests don't need DB sync
+            inferrer: None,       // Tests don't need inference
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
             dry_run,
         })
     }
@@ -1298,7 +1536,11 @@ mod tests {
             sources: sources.clone(),
             notifier: notifier.clone(),
             tracker: tracker.clone(),
+            sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
             dry_run: true,
         };
 
@@ -1824,7 +2066,11 @@ mod tests {
             sources,
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
             dry_run: false,
         });
 
@@ -1897,7 +2143,11 @@ mod tests {
             sources: vec![source.clone()],
             notifier,
             tracker,
+            sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
             dry_run: true,
         });
 

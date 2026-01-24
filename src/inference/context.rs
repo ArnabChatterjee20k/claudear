@@ -6,6 +6,27 @@
 use crate::types::Issue;
 use regex_lite::Regex;
 use std::collections::HashSet;
+use std::sync::LazyLock;
+
+/// Pre-compiled regex patterns for text extraction.
+/// These are compiled once at first use and reused for all subsequent calls.
+static PATH_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:^|[\s"'`(])([a-zA-Z_./\\-]+\.(rs|js|ts|tsx|jsx|py|php|go|java|rb|swift|kt|c|cpp|h|hpp|cs|vue|svelte|html|css|scss|sass|yaml|yml|json|xml|md))\b"#
+    ).ok()
+});
+
+static REPO_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[\s:,(`])([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)(?:$|[\s,):`])").ok()
+});
+
+static CLASS_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"\b([A-Z][a-zA-Z0-9]+(?:Controller|Service|Handler|Manager|Repository|Factory|Provider|Module|Component|Middleware))\b").ok()
+});
+
+static ERROR_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"\b([A-Z][a-zA-Z0-9]*(?:Error|Exception|Failure))\b").ok()
+});
 
 /// Extracted context from an issue for repository inference.
 #[derive(Debug, Clone, Default)]
@@ -16,6 +37,8 @@ pub struct IssueContext {
     pub functions: Vec<String>,
     /// Other searchable keywords.
     pub keywords: Vec<String>,
+    /// Extracted repository references (org/repo format).
+    pub repos: Vec<String>,
     /// Raw text used for extraction (for debugging).
     pub raw_text: String,
 }
@@ -151,11 +174,17 @@ impl IssueContext {
 
         let keywords_set: HashSet<_> = self.keywords.drain(..).collect();
         self.keywords = keywords_set.into_iter().collect();
+
+        let repos_set: HashSet<_> = self.repos.drain(..).collect();
+        self.repos = repos_set.into_iter().collect();
     }
 
     /// Check if context has any useful data.
     pub fn is_empty(&self) -> bool {
-        self.filenames.is_empty() && self.functions.is_empty() && self.keywords.is_empty()
+        self.filenames.is_empty()
+            && self.functions.is_empty()
+            && self.keywords.is_empty()
+            && self.repos.is_empty()
     }
 }
 
@@ -251,15 +280,10 @@ fn extract_from_stacktrace(context: &mut IssueContext, stacktrace: &str) {
 }
 
 /// Extract file paths and keywords from general text.
+/// Uses pre-compiled regex patterns for efficiency.
 fn extract_from_text(context: &mut IssueContext, text: &str) {
-    // Common file path patterns
-    // Unix paths: /path/to/file.ext or src/path/to/file.ext
-    // Relative paths with extensions
-    let path_re = Regex::new(
-        r#"(?:^|[\s"'`(])([a-zA-Z_./\\-]+\.(rs|js|ts|tsx|jsx|py|php|go|java|rb|swift|kt|c|cpp|h|hpp|cs|vue|svelte|html|css|scss|sass|yaml|yml|json|xml|md))\b"#
-    ).ok();
-
-    if let Some(re) = path_re {
+    // Extract file paths using pre-compiled regex
+    if let Some(re) = PATH_RE.as_ref() {
         for cap in re.captures_iter(text) {
             if let Some(m) = cap.get(1) {
                 let path = m.as_str().trim_start_matches(['/', '\\']);
@@ -270,9 +294,32 @@ fn extract_from_text(context: &mut IssueContext, text: &str) {
         }
     }
 
-    // Extract class names (PascalCase)
-    let class_re = Regex::new(r"\b([A-Z][a-zA-Z0-9]+(?:Controller|Service|Handler|Manager|Repository|Factory|Provider|Module|Component|Middleware))\b").ok();
-    if let Some(re) = class_re {
+    // Extract repository references (org/repo format) using pre-compiled regex
+    if let Some(re) = REPO_RE.as_ref() {
+        for cap in re.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                let repo = m.as_str();
+                // Filter out common false positives (file paths, URLs)
+                if !repo.contains("http")
+                    && !repo.contains("www")
+                    && !repo.ends_with(".rs")
+                    && !repo.ends_with(".js")
+                    && !repo.ends_with(".ts")
+                    && !repo.ends_with(".php")
+                    && !repo.ends_with(".py")
+                    && !repo.ends_with(".go")
+                    && !repo.starts_with("src/")
+                    && !repo.starts_with("lib/")
+                    && !repo.starts_with("app/")
+                {
+                    context.repos.push(repo.to_string());
+                }
+            }
+        }
+    }
+
+    // Extract class names (PascalCase) using pre-compiled regex
+    if let Some(re) = CLASS_RE.as_ref() {
         for cap in re.captures_iter(text) {
             if let Some(m) = cap.get(1) {
                 context.keywords.push(m.as_str().to_string());
@@ -280,9 +327,8 @@ fn extract_from_text(context: &mut IssueContext, text: &str) {
         }
     }
 
-    // Extract error types
-    let error_re = Regex::new(r"\b([A-Z][a-zA-Z0-9]*(?:Error|Exception|Failure))\b").ok();
-    if let Some(re) = error_re {
+    // Extract error types using pre-compiled regex
+    if let Some(re) = ERROR_RE.as_ref() {
         for cap in re.captures_iter(text) {
             if let Some(m) = cap.get(1) {
                 context.keywords.push(m.as_str().to_string());

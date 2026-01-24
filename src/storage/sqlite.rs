@@ -137,14 +137,18 @@ impl SqliteTracker {
 
             CREATE INDEX IF NOT EXISTS idx_pr_review_states_active ON pr_review_states(is_active);
 
-            -- Repositories table
+            -- Repositories table (unified: includes index metadata)
             CREATE TABLE IF NOT EXISTS repositories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
-                path TEXT NOT NULL,
+                path TEXT NOT NULL DEFAULT '',
                 github_url TEXT,
+                default_branch TEXT DEFAULT 'main',
+                file_count INTEGER DEFAULT 0,
+                last_indexed_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE INDEX IF NOT EXISTS idx_repositories_name ON repositories(name);
 
             -- Repository dependencies table
             CREATE TABLE IF NOT EXISTS repository_dependencies (
@@ -172,8 +176,8 @@ impl SqliteTracker {
                 metadata TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_activity_source ON activity_log(source);
             CREATE INDEX IF NOT EXISTS idx_activity_issue ON activity_log(issue_id);
+            -- Composite index covers queries on source alone and source+issue_id
             CREATE INDEX IF NOT EXISTS idx_activity_source_issue ON activity_log(source, issue_id, timestamp DESC);
 
             -- Claude executions - detailed execution metrics
@@ -285,26 +289,13 @@ impl SqliteTracker {
             CREATE INDEX IF NOT EXISTS idx_similar_score ON similar_issues(similarity_score DESC);
 
             -- ============================================================
-            -- Repository Index Tables
+            -- Repository File Index
             -- ============================================================
 
-            -- Indexed repositories - repos discovered from known_orgs
-            CREATE TABLE IF NOT EXISTS indexed_repos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                path TEXT NOT NULL,
-                github_url TEXT,
-                default_branch TEXT DEFAULT 'main',
-                file_count INTEGER NOT NULL DEFAULT 0,
-                last_indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_indexed_repos_name ON indexed_repos(name);
-
-            -- File index for searching - files within indexed repos
+            -- File index for searching - files within repositories
             CREATE TABLE IF NOT EXISTS repo_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo_id INTEGER NOT NULL REFERENCES indexed_repos(id) ON DELETE CASCADE,
+                repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
                 file_path TEXT NOT NULL,
                 file_type TEXT,
                 last_modified TEXT,
@@ -331,14 +322,14 @@ impl SqliteTracker {
                 raw_context TEXT,
 
                 -- Inference result
-                inferred_repo_id INTEGER REFERENCES indexed_repos(id),
+                inferred_repo_id INTEGER REFERENCES repositories(id),
                 confidence TEXT,
                 inference_reason TEXT,
                 match_details TEXT,
 
                 -- Outcome tracking (updated later)
                 was_correct INTEGER,
-                actual_repo_id INTEGER REFERENCES indexed_repos(id),
+                actual_repo_id INTEGER REFERENCES repositories(id),
                 feedback_source TEXT,
 
                 -- Timing
@@ -350,6 +341,57 @@ impl SqliteTracker {
             CREATE INDEX IF NOT EXISTS idx_inference_confidence ON inference_attempts(confidence);
             CREATE INDEX IF NOT EXISTS idx_inference_correct ON inference_attempts(was_correct);
             CREATE INDEX IF NOT EXISTS idx_inference_created ON inference_attempts(created_at DESC);
+
+            -- ============================================================
+            -- PR Lifecycle Tracking Table
+            -- ============================================================
+
+            -- Comprehensive PR tracking for lifecycle management
+            CREATE TABLE IF NOT EXISTS prs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pr_url TEXT NOT NULL UNIQUE,
+                github_repo TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+
+                -- Links
+                attempt_id INTEGER REFERENCES fix_attempts(id),
+                issue_id TEXT,
+                issue_source TEXT,
+
+                -- Metadata
+                title TEXT,
+                description TEXT,
+                author TEXT,
+                head_branch TEXT,
+                base_branch TEXT,
+
+                -- Status: open, merged, closed
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT,
+                merged_at TEXT,
+                closed_at TEXT,
+
+                -- Review summary
+                approvals_count INTEGER DEFAULT 0,
+                changes_requested_count INTEGER DEFAULT 0,
+                comments_count INTEGER DEFAULT 0,
+                last_review_at TEXT,
+
+                -- Timing analytics
+                time_to_first_review_mins INTEGER,
+                time_to_merge_mins INTEGER,
+                review_cycles INTEGER DEFAULT 0,
+
+                -- Content metrics
+                files_changed INTEGER,
+                lines_added INTEGER,
+                lines_removed INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_prs_status ON prs(status);
+            CREATE INDEX IF NOT EXISTS idx_prs_repo ON prs(github_repo);
+            CREATE INDEX IF NOT EXISTS idx_prs_attempt ON prs(attempt_id);
+            CREATE INDEX IF NOT EXISTS idx_prs_issue ON prs(issue_source, issue_id);
             "#,
         )?;
 
@@ -357,30 +399,17 @@ impl SqliteTracker {
         // Note: These will fail with "duplicate column name" if column already exists,
         // which is expected and safe to ignore. Other errors are logged.
         let migrations = [
-            (
-                "github_repo",
-                "ALTER TABLE fix_attempts ADD COLUMN github_repo TEXT",
-            ),
-            (
-                "github_pr_number",
-                "ALTER TABLE fix_attempts ADD COLUMN github_pr_number INTEGER",
-            ),
-            (
-                "merged_at",
-                "ALTER TABLE fix_attempts ADD COLUMN merged_at TEXT",
-            ),
-            (
-                "resolved_at",
-                "ALTER TABLE fix_attempts ADD COLUMN resolved_at TEXT",
-            ),
-            (
-                "retry_count",
-                "ALTER TABLE fix_attempts ADD COLUMN retry_count INTEGER DEFAULT 0",
-            ),
-            (
-                "last_retry_at",
-                "ALTER TABLE fix_attempts ADD COLUMN last_retry_at TEXT",
-            ),
+            // fix_attempts migrations
+            ("fix_attempts.github_repo", "ALTER TABLE fix_attempts ADD COLUMN github_repo TEXT"),
+            ("fix_attempts.github_pr_number", "ALTER TABLE fix_attempts ADD COLUMN github_pr_number INTEGER"),
+            ("fix_attempts.merged_at", "ALTER TABLE fix_attempts ADD COLUMN merged_at TEXT"),
+            ("fix_attempts.resolved_at", "ALTER TABLE fix_attempts ADD COLUMN resolved_at TEXT"),
+            ("fix_attempts.retry_count", "ALTER TABLE fix_attempts ADD COLUMN retry_count INTEGER DEFAULT 0"),
+            ("fix_attempts.last_retry_at", "ALTER TABLE fix_attempts ADD COLUMN last_retry_at TEXT"),
+            // repositories migrations (unified table)
+            ("repositories.default_branch", "ALTER TABLE repositories ADD COLUMN default_branch TEXT DEFAULT 'main'"),
+            ("repositories.file_count", "ALTER TABLE repositories ADD COLUMN file_count INTEGER DEFAULT 0"),
+            ("repositories.last_indexed_at", "ALTER TABLE repositories ADD COLUMN last_indexed_at TEXT"),
         ];
 
         for (column_name, sql) in migrations {
@@ -484,10 +513,14 @@ impl FixAttemptTracker for SqliteTracker {
     }
 
     fn record_attempt(&self, source: &str, issue_id: &str, short_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| {
-            crate::error::Error::Storage(format!("Failed to acquire database lock: {}", e))
-        })?;
-        conn.execute(
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            short_id = short_id,
+            "Recording fix attempt"
+        );
+        let conn = self.acquire_lock()?;
+        let rows_affected = conn.execute(
             r#"
             INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at)
             VALUES (?, ?, ?, 'pending', datetime('now'))
@@ -497,10 +530,22 @@ impl FixAttemptTracker for SqliteTracker {
             "#,
             params![source, issue_id, short_id],
         )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            "Fix attempt recorded"
+        );
         Ok(())
     }
 
     fn mark_success(&self, source: &str, issue_id: &str, pr_url: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            pr_url = pr_url,
+            "Marking fix attempt as success"
+        );
         let conn = self.acquire_lock()?;
 
         // Parse PR URL to extract GitHub repo and PR number
@@ -508,7 +553,7 @@ impl FixAttemptTracker for SqliteTracker {
             .map(|(r, n)| (Some(r), Some(n)))
             .unwrap_or((None, None));
 
-        conn.execute(
+        let rows_affected = conn.execute(
             r#"
             UPDATE fix_attempts
             SET status = 'success', pr_url = ?, github_repo = ?, github_pr_number = ?
@@ -516,12 +561,24 @@ impl FixAttemptTracker for SqliteTracker {
             "#,
             params![pr_url, github_repo, github_pr_number, source, issue_id],
         )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            github_repo = ?github_repo,
+            "Fix attempt marked as success"
+        );
         Ok(())
     }
 
     fn mark_merged(&self, source: &str, issue_id: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            "Marking fix attempt as merged"
+        );
         let conn = self.acquire_lock()?;
-        conn.execute(
+        let rows_affected = conn.execute(
             r#"
             UPDATE fix_attempts
             SET status = 'merged', merged_at = datetime('now')
@@ -529,12 +586,23 @@ impl FixAttemptTracker for SqliteTracker {
             "#,
             params![source, issue_id],
         )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            "Fix attempt marked as merged"
+        );
         Ok(())
     }
 
     fn mark_closed(&self, source: &str, issue_id: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            "Marking fix attempt as closed"
+        );
         let conn = self.acquire_lock()?;
-        conn.execute(
+        let rows_affected = conn.execute(
             r#"
             UPDATE fix_attempts
             SET status = 'closed'
@@ -542,12 +610,23 @@ impl FixAttemptTracker for SqliteTracker {
             "#,
             params![source, issue_id],
         )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            "Fix attempt marked as closed"
+        );
         Ok(())
     }
 
     fn mark_resolved(&self, source: &str, issue_id: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            "Marking fix attempt as resolved"
+        );
         let conn = self.acquire_lock()?;
-        conn.execute(
+        let rows_affected = conn.execute(
             r#"
             UPDATE fix_attempts
             SET resolved_at = datetime('now')
@@ -555,12 +634,24 @@ impl FixAttemptTracker for SqliteTracker {
             "#,
             params![source, issue_id],
         )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            "Fix attempt marked as resolved"
+        );
         Ok(())
     }
 
     fn mark_failed(&self, source: &str, issue_id: &str, error_message: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            error_message = error_message,
+            "Marking fix attempt as failed"
+        );
         let conn = self.acquire_lock()?;
-        conn.execute(
+        let rows_affected = conn.execute(
             r#"
             UPDATE fix_attempts
             SET status = 'failed', error_message = ?
@@ -568,6 +659,12 @@ impl FixAttemptTracker for SqliteTracker {
             "#,
             params![error_message, source, issue_id],
         )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            "Fix attempt marked as failed"
+        );
         Ok(())
     }
 
@@ -584,27 +681,7 @@ impl FixAttemptTracker for SqliteTracker {
         )?;
 
         let result = stmt
-            .query_row(params![source, issue_id], |row| {
-                Ok(FixAttempt {
-                    id: row.get(0)?,
-                    source: row.get(1)?,
-                    issue_id: row.get(2)?,
-                    short_id: row.get(3)?,
-                    attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
-                    pr_url: row.get(5)?,
-                    github_repo: row.get(6)?,
-                    github_pr_number: row.get(7)?,
-                    status: row
-                        .get::<_, String>(8)?
-                        .parse()
-                        .unwrap_or(FixAttemptStatus::Pending),
-                    error_message: row.get(9)?,
-                    merged_at: Self::parse_optional_datetime(row.get(10)?),
-                    resolved_at: Self::parse_optional_datetime(row.get(11)?),
-                    retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
-                    last_retry_at: Self::parse_optional_datetime(row.get(13)?),
-                })
-            })
+            .query_row(params![source, issue_id], Self::row_to_fix_attempt)
             .ok();
 
         Ok(result)
@@ -624,36 +701,11 @@ impl FixAttemptTracker for SqliteTracker {
         )?;
 
         let status_str = status.to_string();
-        let rows = stmt.query_map(params![status_str], |row| {
-            Ok(FixAttempt {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                issue_id: row.get(2)?,
-                short_id: row.get(3)?,
-                attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
-                pr_url: row.get(5)?,
-                github_repo: row.get(6)?,
-                github_pr_number: row.get(7)?,
-                status: row
-                    .get::<_, String>(8)?
-                    .parse()
-                    .unwrap_or(FixAttemptStatus::Pending),
-                error_message: row.get(9)?,
-                merged_at: Self::parse_optional_datetime(row.get(10)?),
-                resolved_at: Self::parse_optional_datetime(row.get(11)?),
-                retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
-                last_retry_at: Self::parse_optional_datetime(row.get(13)?),
-            })
-        })?;
+        let rows = stmt.query_map(params![status_str], Self::row_to_fix_attempt)?;
 
         let mut results = Vec::new();
-        for row in rows {
-            match row {
-                Ok(attempt) => results.push(attempt),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to read fix attempt row");
-                }
-            }
+        for row in rows.flatten() {
+            results.push(row);
         }
         Ok(results)
     }
@@ -671,36 +723,11 @@ impl FixAttemptTracker for SqliteTracker {
             "#,
         )?;
 
-        let rows = stmt.query_map([], |row| {
-            Ok(FixAttempt {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                issue_id: row.get(2)?,
-                short_id: row.get(3)?,
-                attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
-                pr_url: row.get(5)?,
-                github_repo: row.get(6)?,
-                github_pr_number: row.get(7)?,
-                status: row
-                    .get::<_, String>(8)?
-                    .parse()
-                    .unwrap_or(FixAttemptStatus::Success),
-                error_message: row.get(9)?,
-                merged_at: Self::parse_optional_datetime(row.get(10)?),
-                resolved_at: Self::parse_optional_datetime(row.get(11)?),
-                retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
-                last_retry_at: Self::parse_optional_datetime(row.get(13)?),
-            })
-        })?;
+        let rows = stmt.query_map([], Self::row_to_fix_attempt)?;
 
         let mut results = Vec::new();
-        for row in rows {
-            match row {
-                Ok(attempt) => results.push(attempt),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to read pending PR row");
-                }
-            }
+        for row in rows.flatten() {
+            results.push(row);
         }
         Ok(results)
     }
@@ -718,27 +745,7 @@ impl FixAttemptTracker for SqliteTracker {
         )?;
 
         let result = stmt
-            .query_row(params![pr_url], |row| {
-                Ok(FixAttempt {
-                    id: row.get(0)?,
-                    source: row.get(1)?,
-                    issue_id: row.get(2)?,
-                    short_id: row.get(3)?,
-                    attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
-                    pr_url: row.get(5)?,
-                    github_repo: row.get(6)?,
-                    github_pr_number: row.get(7)?,
-                    status: row
-                        .get::<_, String>(8)?
-                        .parse()
-                        .unwrap_or(FixAttemptStatus::Pending),
-                    error_message: row.get(9)?,
-                    merged_at: Self::parse_optional_datetime(row.get(10)?),
-                    resolved_at: Self::parse_optional_datetime(row.get(11)?),
-                    retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
-                    last_retry_at: Self::parse_optional_datetime(row.get(13)?),
-                })
-            })
+            .query_row(params![pr_url], Self::row_to_fix_attempt)
             .ok();
 
         Ok(result)
@@ -768,8 +775,14 @@ impl FixAttemptTracker for SqliteTracker {
     }
 
     fn mark_cannot_fix(&self, source: &str, issue_id: &str, reason: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            reason = reason,
+            "Marking fix attempt as cannot_fix"
+        );
         let conn = self.acquire_lock()?;
-        conn.execute(
+        let rows_affected = conn.execute(
             r#"
             UPDATE fix_attempts
             SET status = 'cannot_fix', error_message = ?
@@ -777,6 +790,12 @@ impl FixAttemptTracker for SqliteTracker {
             "#,
             params![reason, source, issue_id],
         )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            "Fix attempt marked as cannot_fix"
+        );
         Ok(())
     }
 
@@ -794,36 +813,11 @@ impl FixAttemptTracker for SqliteTracker {
             "#,
         )?;
 
-        let rows = stmt.query_map(params![max_retries], |row| {
-            Ok(FixAttempt {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                issue_id: row.get(2)?,
-                short_id: row.get(3)?,
-                attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
-                pr_url: row.get(5)?,
-                github_repo: row.get(6)?,
-                github_pr_number: row.get(7)?,
-                status: row
-                    .get::<_, String>(8)?
-                    .parse()
-                    .unwrap_or(FixAttemptStatus::Failed),
-                error_message: row.get(9)?,
-                merged_at: Self::parse_optional_datetime(row.get(10)?),
-                resolved_at: Self::parse_optional_datetime(row.get(11)?),
-                retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
-                last_retry_at: Self::parse_optional_datetime(row.get(13)?),
-            })
-        })?;
+        let rows = stmt.query_map(params![max_retries], Self::row_to_fix_attempt)?;
 
         let mut results = Vec::new();
-        for row in rows {
-            match row {
-                Ok(attempt) => results.push(attempt),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to read retryable issue row");
-                }
-            }
+        for row in rows.flatten() {
+            results.push(row);
         }
         Ok(results)
     }
@@ -988,45 +982,38 @@ impl SqliteTracker {
     ) -> Result<Vec<ActivityLogEntry>> {
         let conn = self.acquire_lock()?;
 
-        let mut entries = Vec::new();
-        if let Some(source) = source_filter {
-            let mut stmt = conn.prepare(
+        // Build query dynamically based on whether source filter is provided
+        let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match source_filter {
+            Some(source) => (
                 r#"
                 SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
                 FROM activity_log
-                WHERE source = ?
+                WHERE source = ?1
                 ORDER BY timestamp DESC
-                LIMIT ?
-                "#,
-            )?;
-
-            let rows = stmt.query_map(params![source, limit as i64], |row| {
-                Ok(Self::row_to_activity_entry(row))
-            })?;
-
-            for row in rows.flatten() {
-                entries.push(row);
-            }
-        } else {
-            let mut stmt = conn.prepare(
+                LIMIT ?2
+                "#
+                .to_string(),
+                vec![Box::new(source.to_string()), Box::new(limit as i64)],
+            ),
+            None => (
                 r#"
                 SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
                 FROM activity_log
                 ORDER BY timestamp DESC
-                LIMIT ?
-                "#,
-            )?;
+                LIMIT ?1
+                "#
+                .to_string(),
+                vec![Box::new(limit as i64)],
+            ),
+        };
 
-            let rows = stmt.query_map(params![limit as i64], |row| {
-                Ok(Self::row_to_activity_entry(row))
-            })?;
+        let mut stmt = conn.prepare(&query)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok(Self::row_to_activity_entry(row))
+        })?;
 
-            for row in rows.flatten() {
-                entries.push(row);
-            }
-        }
-
-        Ok(entries)
+        Ok(rows.flatten().collect())
     }
 
     /// Get activities for a specific issue.
@@ -1071,6 +1058,44 @@ impl SqliteTracker {
             message: row.get(6).unwrap_or_default(),
             metadata,
         }
+    }
+
+    /// Convert a database row to a FixAttempt.
+    /// Expects columns in order: id, source, issue_id, short_id, attempted_at, pr_url,
+    /// github_repo, github_pr_number, status, error_message, merged_at, resolved_at,
+    /// retry_count, last_retry_at
+    fn row_to_fix_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<FixAttempt> {
+        Ok(FixAttempt {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            issue_id: row.get(2)?,
+            short_id: row.get(3)?,
+            attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+            pr_url: row.get(5)?,
+            github_repo: row.get(6)?,
+            github_pr_number: row.get(7)?,
+            status: row
+                .get::<_, String>(8)?
+                .parse()
+                .unwrap_or(FixAttemptStatus::Pending),
+            error_message: row.get(9)?,
+            merged_at: Self::parse_optional_datetime(row.get(10)?),
+            resolved_at: Self::parse_optional_datetime(row.get(11)?),
+            retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
+            last_retry_at: Self::parse_optional_datetime(row.get(13)?),
+        })
+    }
+
+    /// Convert a database row to a StoredDependency.
+    /// Expects columns: rd.id, u.name, d.name, rd.dependency_type, rd.created_at
+    fn row_to_dependency(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDependency> {
+        Ok(StoredDependency {
+            id: row.get(0)?,
+            upstream: row.get(1)?,
+            downstream: row.get(2)?,
+            dep_type: row.get(3)?,
+            created_at: row.get(4)?,
+        })
     }
 
     /// Record a Claude execution.
@@ -1285,6 +1310,68 @@ impl SqliteTracker {
         Ok(result)
     }
 
+    /// Get all embeddings, optionally filtered by source.
+    pub fn get_all_embeddings(&self, source: Option<&str>) -> Result<Vec<IssueEmbedding>> {
+        let conn = self.acquire_lock()?;
+
+        let query = match source {
+            Some(_) => r#"
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at
+                FROM issue_embeddings
+                WHERE source = ?
+                ORDER BY created_at DESC
+            "#,
+            None => r#"
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at
+                FROM issue_embeddings
+                ORDER BY created_at DESC
+            "#,
+        };
+
+        let mut stmt = conn.prepare(query)?;
+
+        let row_mapper = |row: &rusqlite::Row<'_>| {
+            let embedding_bytes: Vec<u8> = row.get(5)?;
+
+            // Validate embedding data integrity: must be divisible by 4 (f32 = 4 bytes)
+            if embedding_bytes.len() % 4 != 0 {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    5,
+                    "embedding".to_string(),
+                    rusqlite::types::Type::Blob,
+                ));
+            }
+
+            let embedding: Vec<f32> = embedding_bytes
+                .chunks_exact(4)
+                .map(|chunk| {
+                    let arr: [u8; 4] = chunk.try_into().expect("chunks_exact guarantees 4 bytes");
+                    f32::from_le_bytes(arr)
+                })
+                .collect();
+
+            Ok(IssueEmbedding {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                issue_id: row.get(2)?,
+                short_id: row.get(3)?,
+                title: row.get(4)?,
+                embedding,
+                embedding_model: row.get(6)?,
+                created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
+            })
+        };
+
+        let rows = match source {
+            Some(s) => stmt.query_map(params![s], row_mapper)?,
+            None => stmt.query_map([], row_mapper)?,
+        };
+
+        // Collect results, propagating any errors from corrupted embeddings
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::error::Error::Storage(format!("Failed to read embeddings: {}", e)))
+    }
+
     /// Record or update an error pattern.
     pub fn record_error_pattern(&self, pattern: &ErrorPattern) -> Result<i64> {
         let conn = self.acquire_lock()?;
@@ -1386,47 +1473,41 @@ impl SqliteTracker {
     ) -> Result<Vec<ProcessingMetric>> {
         let conn = self.acquire_lock()?;
 
-        let mut metrics = Vec::new();
-        if let Some(since_time) = since {
-            let mut stmt = conn.prepare(
+        // Build query dynamically based on whether since filter is provided
+        let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match since {
+            Some(since_time) => (
                 r#"
                 SELECT id, timestamp, metric_name, metric_value, source, tags
                 FROM processing_metrics
-                WHERE metric_name = ? AND timestamp >= ?
+                WHERE metric_name = ?1 AND timestamp >= ?2
                 ORDER BY timestamp DESC
-                LIMIT ?
-                "#,
-            )?;
-
-            let rows = stmt.query_map(
-                params![metric_name, since_time.format("%Y-%m-%d %H:%M:%S").to_string(), limit as i64],
-                Self::row_to_metric,
-            )?;
-
-            for row in rows.flatten() {
-                metrics.push(row);
-            }
-        } else {
-            let mut stmt = conn.prepare(
+                LIMIT ?3
+                "#
+                .to_string(),
+                vec![
+                    Box::new(metric_name.to_string()),
+                    Box::new(since_time.format("%Y-%m-%d %H:%M:%S").to_string()),
+                    Box::new(limit as i64),
+                ],
+            ),
+            None => (
                 r#"
                 SELECT id, timestamp, metric_name, metric_value, source, tags
                 FROM processing_metrics
-                WHERE metric_name = ?
+                WHERE metric_name = ?1
                 ORDER BY timestamp DESC
-                LIMIT ?
-                "#,
-            )?;
+                LIMIT ?2
+                "#
+                .to_string(),
+                vec![Box::new(metric_name.to_string()), Box::new(limit as i64)],
+            ),
+        };
 
-            let rows = stmt.query_map(params![metric_name, limit as i64], |row| {
-                Self::row_to_metric(row)
-            })?;
+        let mut stmt = conn.prepare(&query)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), Self::row_to_metric)?;
 
-            for row in rows.flatten() {
-                metrics.push(row);
-            }
-        }
-
-        Ok(metrics)
+        Ok(rows.flatten().collect())
     }
 
     fn row_to_metric(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessingMetric> {
@@ -1762,6 +1843,54 @@ impl SqliteTracker {
         Ok(id)
     }
 
+    /// Sync repositories from a RepoIndex to the database.
+    ///
+    /// Updates paths for all repos in the index and optionally syncs files.
+    pub fn sync_from_index(
+        &self,
+        index: &crate::repo::RepoIndex,
+        sync_files: bool,
+    ) -> Result<usize> {
+        let repos = index.list();
+        let mut synced = 0;
+
+        for repo in repos {
+            let path_str = repo.path.to_string_lossy();
+
+            if sync_files {
+                // Use save_indexed_repo which also updates file_count and last_indexed_at
+                let repo_id = self.save_indexed_repo(
+                    &repo.name,
+                    &path_str,
+                    Some(&repo.github_url),
+                    &repo.default_branch,
+                    repo.files.len(),
+                )?;
+
+                if !repo.files.is_empty() {
+                    let files_with_types: Vec<(String, Option<String>)> = repo
+                        .files
+                        .iter()
+                        .map(|f| {
+                            let file_type = std::path::Path::new(f)
+                                .extension()
+                                .map(|e| e.to_string_lossy().to_string());
+                            (f.clone(), file_type)
+                        })
+                        .collect();
+
+                    self.save_repo_files(repo_id, &files_with_types)?;
+                }
+            } else {
+                // Just update paths in repositories table
+                self.upsert_repository(&repo.name, Some(&path_str), None)?;
+            }
+            synced += 1;
+        }
+
+        Ok(synced)
+    }
+
     /// Get a repository by name.
     pub fn get_repository(&self, name: &str) -> Result<Option<StoredRepository>> {
         let conn = self.acquire_lock()?;
@@ -1857,53 +1986,16 @@ impl SqliteTracker {
             "#,
         )?;
 
-        let mut deps = Vec::new();
-        let rows = stmt.query_map(params![repo_name], |row| {
-            Ok(StoredDependency {
-                id: row.get(0)?,
-                upstream: row.get(1)?,
-                downstream: row.get(2)?,
-                dep_type: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        })?;
-
-        for row in rows.flatten() {
-            deps.push(row);
-        }
-
-        Ok(deps)
+        let rows = stmt.query_map(params![repo_name], Self::row_to_dependency)?;
+        Ok(rows.flatten().collect())
     }
 
     /// Get all dependents of a repository (what depends on it).
+    ///
+    /// This is an alias for `get_direct_dependants` for API compatibility.
+    #[inline]
     pub fn get_dependents(&self, repo_name: &str) -> Result<Vec<StoredDependency>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT rd.id, u.name, d.name, rd.dependency_type, rd.created_at
-            FROM repository_dependencies rd
-            JOIN repositories u ON rd.upstream_id = u.id
-            JOIN repositories d ON rd.downstream_id = d.id
-            WHERE u.name = ?
-            "#,
-        )?;
-
-        let mut deps = Vec::new();
-        let rows = stmt.query_map(params![repo_name], |row| {
-            Ok(StoredDependency {
-                id: row.get(0)?,
-                upstream: row.get(1)?,
-                downstream: row.get(2)?,
-                dep_type: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        })?;
-
-        for row in rows.flatten() {
-            deps.push(row);
-        }
-
-        Ok(deps)
+        self.get_direct_dependants(repo_name)
     }
 
     /// Get all dependencies in the database.
@@ -1919,22 +2011,8 @@ impl SqliteTracker {
             "#,
         )?;
 
-        let mut deps = Vec::new();
-        let rows = stmt.query_map([], |row| {
-            Ok(StoredDependency {
-                id: row.get(0)?,
-                upstream: row.get(1)?,
-                downstream: row.get(2)?,
-                dep_type: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        })?;
-
-        for row in rows.flatten() {
-            deps.push(row);
-        }
-
-        Ok(deps)
+        let rows = stmt.query_map([], Self::row_to_dependency)?;
+        Ok(rows.flatten().collect())
     }
 
     /// Clear all repositories and dependencies from the database.
@@ -1965,22 +2043,8 @@ impl SqliteTracker {
             "#,
         )?;
 
-        let mut deps = Vec::new();
-        let rows = stmt.query_map(params![repo], |row| {
-            Ok(StoredDependency {
-                id: row.get(0)?,
-                upstream: row.get(1)?,
-                downstream: row.get(2)?,
-                dep_type: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        })?;
-
-        for row in rows.flatten() {
-            deps.push(row);
-        }
-
-        Ok(deps)
+        let rows = stmt.query_map(params![repo], Self::row_to_dependency)?;
+        Ok(rows.flatten().collect())
     }
 
     /// Get all repositories that depend on the given repository, transitively.
@@ -2043,11 +2107,11 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         conn.execute(
             r#"
-            INSERT INTO indexed_repos (name, path, github_url, default_branch, file_count, last_indexed_at)
+            INSERT INTO repositories (name, path, github_url, default_branch, file_count, last_indexed_at)
             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
             ON CONFLICT(name) DO UPDATE SET
                 path = excluded.path,
-                github_url = excluded.github_url,
+                github_url = COALESCE(excluded.github_url, github_url),
                 default_branch = excluded.default_branch,
                 file_count = excluded.file_count,
                 last_indexed_at = datetime('now')
@@ -2055,7 +2119,18 @@ impl SqliteTracker {
             params![name, path, github_url, default_branch, file_count as i64],
         )?;
 
-        let id = conn.last_insert_rowid();
+        // last_insert_rowid() returns 0 on UPDATE, so query for the actual ID
+        let id: i64 = conn.query_row(
+            "SELECT id FROM repositories WHERE name = ?",
+            params![name],
+            |row| row.get(0),
+        ).map_err(|e| {
+            crate::error::Error::Storage(format!(
+                "Failed to retrieve repository ID after UPSERT for '{}': {}. \
+                This indicates a database inconsistency.",
+                name, e
+            ))
+        })?;
         Ok(id)
     }
 
@@ -2106,7 +2181,7 @@ impl SqliteTracker {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, name, path, github_url, default_branch, file_count, last_indexed_at, created_at
-            FROM indexed_repos WHERE name = ?
+            FROM repositories WHERE name = ?
             "#,
         )?;
 
@@ -2136,7 +2211,7 @@ impl SqliteTracker {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, name, path, github_url, default_branch, file_count, last_indexed_at, created_at
-            FROM indexed_repos ORDER BY name
+            FROM repositories ORDER BY name
             "#,
         )?;
 
@@ -2165,10 +2240,10 @@ impl SqliteTracker {
     pub fn get_index_stats(&self) -> Result<IndexStats> {
         let conn = self.acquire_lock()?;
 
-        let repo_count: i64 = conn.query_row("SELECT COUNT(*) FROM indexed_repos", [], |row| row.get(0))?;
+        let repo_count: i64 = conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
         let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM repo_files", [], |row| row.get(0))?;
         let last_indexed: Option<String> = conn.query_row(
-            "SELECT MAX(last_indexed_at) FROM indexed_repos",
+            "SELECT MAX(last_indexed_at) FROM repositories",
             [],
             |row| row.get(0),
         ).ok();
@@ -2302,6 +2377,412 @@ impl SqliteTracker {
             },
         })
     }
+
+    /// Get diagnostic counts for all major tables.
+    ///
+    /// This is useful for debugging and verifying that data is being written correctly.
+    pub fn get_diagnostic_counts(&self) -> Result<DiagnosticCounts> {
+        let conn = self.acquire_lock()?;
+
+        let fix_attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM fix_attempts",
+            [],
+            |row| row.get(0),
+        )?;
+        let fix_attempts_by_status: HashMap<String, i64> = {
+            let mut map = HashMap::new();
+            let mut stmt = conn.prepare(
+                "SELECT status, COUNT(*) FROM fix_attempts GROUP BY status"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows.flatten() {
+                map.insert(row.0, row.1);
+            }
+            map
+        };
+
+        let activity_log: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM activity_log",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let claude_executions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM claude_executions",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let pr_reviews: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pr_reviews",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let pr_review_states: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pr_review_states",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let issue_embeddings: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM issue_embeddings",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let similar_issues: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM similar_issues",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let repositories: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM repositories",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let repo_files: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM repo_files",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let inference_attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inference_attempts",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let error_patterns: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM error_patterns",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let processing_metrics: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM processing_metrics",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let feedback_outcomes: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM feedback_outcomes",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let prs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM prs",
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Get recent fix attempts for debugging
+        let recent_fix_attempts: Vec<(String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT source, issue_id, short_id, status FROM fix_attempts ORDER BY attempted_at DESC LIMIT 5"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.flatten().collect()
+        };
+
+        Ok(DiagnosticCounts {
+            fix_attempts,
+            fix_attempts_by_status,
+            activity_log,
+            claude_executions,
+            pr_reviews,
+            pr_review_states,
+            issue_embeddings,
+            similar_issues,
+            repositories,
+            repo_files,
+            inference_attempts,
+            error_patterns,
+            processing_metrics,
+            feedback_outcomes,
+            prs,
+            recent_fix_attempts,
+        })
+    }
+
+    // ================================================================
+    // PR Lifecycle Methods
+    // ================================================================
+
+    /// Upsert a PR record.
+    ///
+    /// Creates a new record or updates an existing one based on pr_url.
+    pub fn upsert_pr(&self, pr: &crate::types::PrRecord) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO prs (
+                pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+                title, description, author, head_branch, base_branch, status,
+                created_at, updated_at, merged_at, closed_at,
+                approvals_count, changes_requested_count, comments_count, last_review_at,
+                time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                files_changed, lines_added, lines_removed
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+            )
+            ON CONFLICT(pr_url) DO UPDATE SET
+                github_repo = excluded.github_repo,
+                pr_number = excluded.pr_number,
+                attempt_id = COALESCE(excluded.attempt_id, prs.attempt_id),
+                issue_id = COALESCE(excluded.issue_id, prs.issue_id),
+                issue_source = COALESCE(excluded.issue_source, prs.issue_source),
+                title = COALESCE(excluded.title, prs.title),
+                description = COALESCE(excluded.description, prs.description),
+                author = COALESCE(excluded.author, prs.author),
+                head_branch = COALESCE(excluded.head_branch, prs.head_branch),
+                base_branch = COALESCE(excluded.base_branch, prs.base_branch),
+                status = excluded.status,
+                updated_at = datetime('now'),
+                merged_at = COALESCE(excluded.merged_at, prs.merged_at),
+                closed_at = COALESCE(excluded.closed_at, prs.closed_at),
+                approvals_count = excluded.approvals_count,
+                changes_requested_count = excluded.changes_requested_count,
+                comments_count = excluded.comments_count,
+                last_review_at = COALESCE(excluded.last_review_at, prs.last_review_at),
+                time_to_first_review_mins = COALESCE(excluded.time_to_first_review_mins, prs.time_to_first_review_mins),
+                time_to_merge_mins = COALESCE(excluded.time_to_merge_mins, prs.time_to_merge_mins),
+                review_cycles = excluded.review_cycles,
+                files_changed = COALESCE(excluded.files_changed, prs.files_changed),
+                lines_added = COALESCE(excluded.lines_added, prs.lines_added),
+                lines_removed = COALESCE(excluded.lines_removed, prs.lines_removed)
+            "#,
+            params![
+                pr.pr_url,
+                pr.github_repo,
+                pr.pr_number,
+                pr.attempt_id,
+                pr.issue_id,
+                pr.issue_source,
+                pr.title,
+                pr.description,
+                pr.author,
+                pr.head_branch,
+                pr.base_branch,
+                pr.status,
+                pr.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                pr.updated_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.merged_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.closed_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.approvals_count,
+                pr.changes_requested_count,
+                pr.comments_count,
+                pr.last_review_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.time_to_first_review_mins,
+                pr.time_to_merge_mins,
+                pr.review_cycles,
+                pr.files_changed,
+                pr.lines_added,
+                pr.lines_removed,
+            ],
+        )?;
+
+        // Get the id (either inserted or existing)
+        let id: i64 = conn.query_row(
+            "SELECT id FROM prs WHERE pr_url = ?",
+            params![pr.pr_url],
+            |row| row.get(0),
+        )?;
+
+        tracing::info!(
+            pr_url = %pr.pr_url,
+            status = %pr.status,
+            id = id,
+            "PR record upserted"
+        );
+
+        Ok(id)
+    }
+
+    /// Get a PR record by URL.
+    pub fn get_pr(&self, pr_url: &str) -> Result<Option<crate::types::PrRecord>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+                   title, description, author, head_branch, base_branch, status,
+                   created_at, updated_at, merged_at, closed_at,
+                   approvals_count, changes_requested_count, comments_count, last_review_at,
+                   time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                   files_changed, lines_added, lines_removed
+            FROM prs WHERE pr_url = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![pr_url], Self::row_to_pr_record).ok();
+        Ok(result)
+    }
+
+    /// Get all open PRs.
+    pub fn get_open_prs(&self) -> Result<Vec<crate::types::PrRecord>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+                   title, description, author, head_branch, base_branch, status,
+                   created_at, updated_at, merged_at, closed_at,
+                   approvals_count, changes_requested_count, comments_count, last_review_at,
+                   time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                   files_changed, lines_added, lines_removed
+            FROM prs WHERE status = 'open'
+            ORDER BY created_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], Self::row_to_pr_record)?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Get PR analytics.
+    pub fn get_pr_analytics(&self) -> Result<crate::types::PrAnalytics> {
+        let conn = self.acquire_lock()?;
+
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM prs", [], |row| row.get(0))?;
+        let open: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM prs WHERE status = 'open'",
+            [],
+            |row| row.get(0),
+        )?;
+        let merged: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM prs WHERE status = 'merged'",
+            [],
+            |row| row.get(0),
+        )?;
+        let closed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM prs WHERE status = 'closed'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let avg_time_to_first_review_mins: Option<f64> = conn.query_row(
+            "SELECT AVG(time_to_first_review_mins) FROM prs WHERE time_to_first_review_mins IS NOT NULL",
+            [],
+            |row| row.get(0),
+        ).ok();
+
+        let avg_time_to_merge_mins: Option<f64> = conn.query_row(
+            "SELECT AVG(time_to_merge_mins) FROM prs WHERE time_to_merge_mins IS NOT NULL",
+            [],
+            |row| row.get(0),
+        ).ok();
+
+        let avg_review_cycles: Option<f64> = conn.query_row(
+            "SELECT AVG(review_cycles) FROM prs",
+            [],
+            |row| row.get(0),
+        ).ok();
+
+        let merge_rate = if merged + closed > 0 {
+            Some(merged as f64 / (merged + closed) as f64)
+        } else {
+            None
+        };
+
+        // Get counts by repository
+        let mut by_repo = HashMap::new();
+        let mut stmt = conn.prepare("SELECT github_repo, COUNT(*) FROM prs GROUP BY github_repo")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows.flatten() {
+            by_repo.insert(row.0, row.1);
+        }
+
+        Ok(crate::types::PrAnalytics {
+            total,
+            open,
+            merged,
+            closed,
+            avg_time_to_first_review_mins,
+            avg_time_to_merge_mins,
+            avg_review_cycles,
+            merge_rate,
+            by_repo,
+        })
+    }
+
+    /// Update PR status.
+    pub fn update_pr_status(&self, pr_url: &str, status: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let (merged_at, closed_at) = match status {
+            "merged" => (Some(now.clone()), None),
+            "closed" => (None, Some(now.clone())),
+            _ => (None, None),
+        };
+
+        conn.execute(
+            r#"
+            UPDATE prs SET
+                status = ?1,
+                updated_at = ?2,
+                merged_at = COALESCE(?3, merged_at),
+                closed_at = COALESCE(?4, closed_at)
+            WHERE pr_url = ?5
+            "#,
+            params![status, now, merged_at, closed_at, pr_url],
+        )?;
+
+        tracing::info!(
+            pr_url = %pr_url,
+            status = status,
+            "PR status updated"
+        );
+
+        Ok(())
+    }
+
+    fn row_to_pr_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::PrRecord> {
+        Ok(crate::types::PrRecord {
+            id: row.get(0)?,
+            pr_url: row.get(1)?,
+            github_repo: row.get(2)?,
+            pr_number: row.get(3)?,
+            attempt_id: row.get(4)?,
+            issue_id: row.get(5)?,
+            issue_source: row.get(6)?,
+            title: row.get(7)?,
+            description: row.get(8)?,
+            author: row.get(9)?,
+            head_branch: row.get(10)?,
+            base_branch: row.get(11)?,
+            status: row.get(12)?,
+            created_at: Self::parse_datetime(&row.get::<_, String>(13)?),
+            updated_at: Self::parse_optional_datetime(row.get(14)?),
+            merged_at: Self::parse_optional_datetime(row.get(15)?),
+            closed_at: Self::parse_optional_datetime(row.get(16)?),
+            approvals_count: row.get(17)?,
+            changes_requested_count: row.get(18)?,
+            comments_count: row.get(19)?,
+            last_review_at: Self::parse_optional_datetime(row.get(20)?),
+            time_to_first_review_mins: row.get(21)?,
+            time_to_merge_mins: row.get(22)?,
+            review_cycles: row.get(23)?,
+            files_changed: row.get(24)?,
+            lines_added: row.get(25)?,
+            lines_removed: row.get(26)?,
+        })
+    }
 }
 
 /// An indexed repository stored in the database.
@@ -2362,6 +2843,30 @@ pub struct StoredDependency {
     pub downstream: String,
     pub dep_type: String,
     pub created_at: String,
+}
+
+/// Diagnostic counts for all major tables.
+///
+/// Used by the `claudear diag db` command to verify database state.
+#[derive(Debug, Clone)]
+pub struct DiagnosticCounts {
+    pub fix_attempts: i64,
+    pub fix_attempts_by_status: HashMap<String, i64>,
+    pub activity_log: i64,
+    pub claude_executions: i64,
+    pub pr_reviews: i64,
+    pub pr_review_states: i64,
+    pub issue_embeddings: i64,
+    pub similar_issues: i64,
+    pub repositories: i64,
+    pub repo_files: i64,
+    pub inference_attempts: i64,
+    pub error_patterns: i64,
+    pub processing_metrics: i64,
+    pub feedback_outcomes: i64,
+    pub prs: i64,
+    /// Recent fix attempts (source, issue_id, short_id, status) - up to 5
+    pub recent_fix_attempts: Vec<(String, String, String, String)>,
 }
 
 #[cfg(test)]

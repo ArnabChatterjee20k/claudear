@@ -558,6 +558,165 @@ impl PrReviewRecord {
     }
 }
 
+/// PR lifecycle tracking record.
+///
+/// Tracks comprehensive information about a PR from creation to merge/close.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrRecord {
+    /// Database ID.
+    pub id: i64,
+    /// Full PR URL.
+    pub pr_url: String,
+    /// GitHub repository (owner/repo).
+    pub github_repo: String,
+    /// PR number.
+    pub pr_number: i64,
+
+    /// Reference to fix_attempts table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<i64>,
+    /// Original issue ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_id: Option<String>,
+    /// Original issue source (linear, sentry).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_source: Option<String>,
+
+    /// PR title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// PR description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// PR author.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Head branch name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_branch: Option<String>,
+    /// Base branch name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+
+    /// PR status: open, merged, closed.
+    pub status: String,
+    /// When the PR was created.
+    pub created_at: DateTime<Utc>,
+    /// When the PR was last updated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    /// When the PR was merged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<DateTime<Utc>>,
+    /// When the PR was closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<DateTime<Utc>>,
+
+    /// Number of approvals.
+    pub approvals_count: i32,
+    /// Number of changes_requested reviews.
+    pub changes_requested_count: i32,
+    /// Number of comments.
+    pub comments_count: i32,
+    /// When the last review was submitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_review_at: Option<DateTime<Utc>>,
+
+    /// Minutes from PR creation to first review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_review_mins: Option<i64>,
+    /// Minutes from PR creation to merge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_merge_mins: Option<i64>,
+    /// Number of review cycles.
+    pub review_cycles: i32,
+
+    /// Number of files changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_changed: Option<i64>,
+    /// Lines added.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines_added: Option<i64>,
+    /// Lines removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines_removed: Option<i64>,
+}
+
+impl PrRecord {
+    /// Create a new PR record.
+    pub fn new(pr_url: impl Into<String>, github_repo: impl Into<String>, pr_number: i64) -> Self {
+        Self {
+            id: 0,
+            pr_url: pr_url.into(),
+            github_repo: github_repo.into(),
+            pr_number,
+            attempt_id: None,
+            issue_id: None,
+            issue_source: None,
+            title: None,
+            description: None,
+            author: None,
+            head_branch: None,
+            base_branch: None,
+            status: "open".to_string(),
+            created_at: Utc::now(),
+            updated_at: None,
+            merged_at: None,
+            closed_at: None,
+            approvals_count: 0,
+            changes_requested_count: 0,
+            comments_count: 0,
+            last_review_at: None,
+            time_to_first_review_mins: None,
+            time_to_merge_mins: None,
+            review_cycles: 0,
+            files_changed: None,
+            lines_added: None,
+            lines_removed: None,
+        }
+    }
+
+    /// Create a PR record with issue linkage.
+    pub fn for_issue(
+        pr_url: impl Into<String>,
+        github_repo: impl Into<String>,
+        pr_number: i64,
+        issue_source: impl Into<String>,
+        issue_id: impl Into<String>,
+    ) -> Self {
+        let mut record = Self::new(pr_url, github_repo, pr_number);
+        record.issue_source = Some(issue_source.into());
+        record.issue_id = Some(issue_id.into());
+        record
+    }
+}
+
+/// Aggregate PR analytics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrAnalytics {
+    /// Total number of PRs.
+    pub total: i64,
+    /// Number of open PRs.
+    pub open: i64,
+    /// Number of merged PRs.
+    pub merged: i64,
+    /// Number of closed PRs (without merge).
+    pub closed: i64,
+
+    /// Average time to first review in minutes.
+    pub avg_time_to_first_review_mins: Option<f64>,
+    /// Average time to merge in minutes.
+    pub avg_time_to_merge_mins: Option<f64>,
+    /// Average review cycles per PR.
+    pub avg_review_cycles: Option<f64>,
+
+    /// Merge rate (merged / (merged + closed)).
+    pub merge_rate: Option<f64>,
+
+    /// PRs by repository.
+    pub by_repo: HashMap<String, i64>,
+}
+
 /// Issue embedding for similarity search.
 #[derive(Debug, Clone)]
 pub struct IssueEmbedding {
