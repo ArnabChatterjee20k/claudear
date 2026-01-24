@@ -81,7 +81,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-mockall = "0.13"
+mockall = "0.14"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
