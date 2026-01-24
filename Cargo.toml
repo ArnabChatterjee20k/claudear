@@ -67,7 +67,7 @@ regex-lite = "0.1"
 
 # File system utilities
 walkdir = "2"
-dirs = "5"
+dirs = "6"
 
 # URL encoding
 urlencoding = "2"
