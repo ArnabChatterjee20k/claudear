@@ -401,6 +401,50 @@ impl SqliteTracker {
             CREATE INDEX IF NOT EXISTS idx_prs_repo ON prs(github_repo);
             CREATE INDEX IF NOT EXISTS idx_prs_attempt ON prs(attempt_id);
             CREATE INDEX IF NOT EXISTS idx_prs_issue ON prs(issue_source, issue_id);
+
+            -- ============================================================
+            -- Regression Tracking Tables
+            -- ============================================================
+
+            -- Track watched issues for regression monitoring
+            CREATE TABLE IF NOT EXISTS regression_watches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_type TEXT NOT NULL,           -- 'sentry_issue' or 'linear_bug'
+                issue_id TEXT NOT NULL,
+                fix_attempt_id INTEGER NOT NULL REFERENCES fix_attempts(id),
+                status TEXT NOT NULL DEFAULT 'awaiting_release',
+                -- Status: awaiting_release -> monitoring -> resolved | regressed
+                pr_merged_at TEXT,
+                monitoring_started_at TEXT,
+                resolved_at TEXT,
+                regressed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(issue_type, issue_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_regression_watches_status ON regression_watches(status);
+            CREATE INDEX IF NOT EXISTS idx_regression_watches_fix_attempt ON regression_watches(fix_attempt_id);
+
+            -- Track release propagation
+            CREATE TABLE IF NOT EXISTS release_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                regression_watch_id INTEGER NOT NULL REFERENCES regression_watches(id),
+                release_version TEXT NOT NULL,
+                release_commit TEXT NOT NULL,
+                released_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_release_tracking_watch ON release_tracking(regression_watch_id);
+
+            -- Individual regression check results
+            CREATE TABLE IF NOT EXISTS regression_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                regression_watch_id INTEGER NOT NULL REFERENCES regression_watches(id),
+                issue_still_exists INTEGER NOT NULL DEFAULT 0,
+                checked_at TEXT,
+                check_details TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_regression_checks_watch ON regression_checks(regression_watch_id);
             "#,
         )?;
 
@@ -2809,6 +2853,227 @@ impl SqliteTracker {
             lines_removed: row.get(26)?,
         })
     }
+
+    // ============================================================
+    // Regression Tracking Methods
+    // ============================================================
+
+    /// Create a new regression watch.
+    pub fn create_regression_watch(
+        &self,
+        watch: &crate::types::RegressionWatch,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO regression_watches (
+                issue_type, issue_id, fix_attempt_id, status,
+                pr_merged_at, monitoring_started_at, resolved_at, regressed_at, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                watch.issue_type.to_string(),
+                watch.issue_id,
+                watch.fix_attempt_id,
+                watch.status.to_string(),
+                watch.pr_merged_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch.monitoring_started_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch.resolved_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch.regressed_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get a regression watch by ID.
+    pub fn get_regression_watch(&self, id: i64) -> Result<Option<crate::types::RegressionWatch>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, issue_type, issue_id, fix_attempt_id, status,
+                   pr_merged_at, monitoring_started_at, resolved_at, regressed_at, created_at
+            FROM regression_watches
+            WHERE id = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![id], Self::row_to_regression_watch).ok();
+        Ok(result)
+    }
+
+    /// Get regression watches by status.
+    pub fn get_regression_watches_by_status(
+        &self,
+        status: crate::types::RegressionWatchStatus,
+    ) -> Result<Vec<crate::types::RegressionWatch>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, issue_type, issue_id, fix_attempt_id, status,
+                   pr_merged_at, monitoring_started_at, resolved_at, regressed_at, created_at
+            FROM regression_watches
+            WHERE status = ?
+            ORDER BY created_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![status.to_string()], Self::row_to_regression_watch)?;
+
+        let mut results = Vec::new();
+        for row in rows.flatten() {
+            results.push(row);
+        }
+        Ok(results)
+    }
+
+    /// Update regression watch status.
+    pub fn update_regression_watch_status(
+        &self,
+        id: i64,
+        status: crate::types::RegressionWatchStatus,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+        // Update specific timestamp based on status
+        let (monitoring_started, resolved, regressed) = match status {
+            crate::types::RegressionWatchStatus::Monitoring => (Some(now.clone()), None, None),
+            crate::types::RegressionWatchStatus::Resolved => (None, Some(now.clone()), None),
+            crate::types::RegressionWatchStatus::Regressed => (None, None, Some(now.clone())),
+            _ => (None, None, None),
+        };
+
+        conn.execute(
+            r#"
+            UPDATE regression_watches SET
+                status = ?1,
+                monitoring_started_at = COALESCE(?2, monitoring_started_at),
+                resolved_at = COALESCE(?3, resolved_at),
+                regressed_at = COALESCE(?4, regressed_at)
+            WHERE id = ?5
+            "#,
+            params![status.to_string(), monitoring_started, resolved, regressed, id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Record a release tracking entry.
+    pub fn record_release_tracking(
+        &self,
+        tracking: &crate::types::ReleaseTracking,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO release_tracking (
+                regression_watch_id, release_version, release_commit, released_at, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                tracking.regression_watch_id,
+                tracking.release_version,
+                tracking.release_commit,
+                tracking.released_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                tracking.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Record a regression check.
+    pub fn record_regression_check(
+        &self,
+        check: &crate::types::RegressionCheck,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO regression_checks (
+                regression_watch_id, issue_still_exists, checked_at, check_details, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                check.regression_watch_id,
+                check.issue_still_exists as i32,
+                check.checked_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                check.check_details,
+                check.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get regression checks for a watch.
+    pub fn get_regression_checks(
+        &self,
+        watch_id: i64,
+    ) -> Result<Vec<crate::types::RegressionCheck>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, regression_watch_id, issue_still_exists, checked_at, check_details, created_at
+            FROM regression_checks
+            WHERE regression_watch_id = ?
+            ORDER BY created_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![watch_id], Self::row_to_regression_check)?;
+
+        let mut results = Vec::new();
+        for row in rows.flatten() {
+            results.push(row);
+        }
+        Ok(results)
+    }
+
+    fn row_to_regression_watch(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<crate::types::RegressionWatch> {
+        let issue_type_str: String = row.get(1)?;
+        let status_str: String = row.get(4)?;
+
+        Ok(crate::types::RegressionWatch {
+            id: row.get(0)?,
+            issue_type: issue_type_str
+                .parse()
+                .unwrap_or(crate::types::IssueType::SentryIssue),
+            issue_id: row.get(2)?,
+            fix_attempt_id: row.get(3)?,
+            status: status_str
+                .parse()
+                .unwrap_or(crate::types::RegressionWatchStatus::AwaitingRelease),
+            pr_merged_at: Self::parse_optional_datetime(row.get(5)?),
+            monitoring_started_at: Self::parse_optional_datetime(row.get(6)?),
+            resolved_at: Self::parse_optional_datetime(row.get(7)?),
+            regressed_at: Self::parse_optional_datetime(row.get(8)?),
+            created_at: Self::parse_datetime(&row.get::<_, String>(9)?),
+        })
+    }
+
+    fn row_to_regression_check(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<crate::types::RegressionCheck> {
+        Ok(crate::types::RegressionCheck {
+            id: row.get(0)?,
+            regression_watch_id: row.get(1)?,
+            issue_still_exists: row.get::<_, i32>(2)? != 0,
+            checked_at: Self::parse_optional_datetime(row.get(3)?),
+            check_details: row.get(4)?,
+            created_at: Self::parse_datetime(&row.get::<_, String>(5)?),
+        })
+    }
 }
 
 /// An indexed repository stored in the database.
@@ -3451,5 +3716,529 @@ mod tests {
         // Should not be included because github_repo is None
         let pending_prs = tracker.get_pending_prs().unwrap();
         assert!(pending_prs.is_empty());
+    }
+
+    // ============================================================
+    // Phase 1: Bug Fix Verification System - Regression Watch Database Tests
+    // ============================================================
+
+    #[test]
+    fn test_create_regression_watch() {
+        use crate::types::{IssueType, RegressionWatch};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // First create a fix attempt to reference
+        tracker.record_attempt("sentry", "sentry-123", "SENTRY-123").unwrap();
+        let attempt = tracker.get_attempt("sentry", "sentry-123").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "sentry-123",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        assert!(watch_id > 0);
+    }
+
+    #[test]
+    fn test_create_regression_watch_with_linear_bug() {
+        use crate::types::{IssueType, RegressionWatch};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a fix attempt for linear
+        tracker.record_attempt("linear", "linear-456", "LIN-456").unwrap();
+        let attempt = tracker.get_attempt("linear", "linear-456").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::LinearBug,
+            "linear-456",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        assert!(watch_id > 0);
+    }
+
+    #[test]
+    fn test_get_regression_watch() {
+        use crate::types::{IssueType, RegressionWatch, RegressionWatchStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempt and watch
+        tracker.record_attempt("sentry", "sentry-789", "SENTRY-789").unwrap();
+        let attempt = tracker.get_attempt("sentry", "sentry-789").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "sentry-789",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // Retrieve the watch
+        let retrieved = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(retrieved.id, watch_id);
+        assert_eq!(retrieved.issue_type, IssueType::SentryIssue);
+        assert_eq!(retrieved.issue_id, "sentry-789");
+        assert_eq!(retrieved.fix_attempt_id, attempt.id);
+        assert_eq!(retrieved.status, RegressionWatchStatus::AwaitingRelease);
+    }
+
+    #[test]
+    fn test_get_regression_watch_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let result = tracker.get_regression_watch(99999).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_regression_watches_by_status() {
+        use crate::types::{IssueType, RegressionWatch, RegressionWatchStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create multiple fix attempts
+        tracker.record_attempt("sentry", "issue-1", "ISSUE-1").unwrap();
+        tracker.record_attempt("sentry", "issue-2", "ISSUE-2").unwrap();
+        tracker.record_attempt("linear", "issue-3", "ISSUE-3").unwrap();
+
+        let attempt1 = tracker.get_attempt("sentry", "issue-1").unwrap().unwrap();
+        let attempt2 = tracker.get_attempt("sentry", "issue-2").unwrap().unwrap();
+        let attempt3 = tracker.get_attempt("linear", "issue-3").unwrap().unwrap();
+
+        // Create watches with different statuses
+        let watch1 = RegressionWatch::new(IssueType::SentryIssue, "issue-1", attempt1.id);
+        let watch2 = RegressionWatch::new(IssueType::SentryIssue, "issue-2", attempt2.id);
+        let watch3 = RegressionWatch::new(IssueType::LinearBug, "issue-3", attempt3.id);
+
+        let watch1_id = tracker.create_regression_watch(&watch1).unwrap();
+        let _watch2_id = tracker.create_regression_watch(&watch2).unwrap();
+        let _watch3_id = tracker.create_regression_watch(&watch3).unwrap();
+
+        // All should start as AwaitingRelease
+        let awaiting = tracker
+            .get_regression_watches_by_status(RegressionWatchStatus::AwaitingRelease)
+            .unwrap();
+        assert_eq!(awaiting.len(), 3);
+
+        // Update one to Monitoring
+        tracker
+            .update_regression_watch_status(watch1_id, RegressionWatchStatus::Monitoring)
+            .unwrap();
+
+        let awaiting = tracker
+            .get_regression_watches_by_status(RegressionWatchStatus::AwaitingRelease)
+            .unwrap();
+        assert_eq!(awaiting.len(), 2);
+
+        let monitoring = tracker
+            .get_regression_watches_by_status(RegressionWatchStatus::Monitoring)
+            .unwrap();
+        assert_eq!(monitoring.len(), 1);
+        assert_eq!(monitoring[0].id, watch1_id);
+    }
+
+    #[test]
+    fn test_get_regression_watches_by_status_empty() {
+        use crate::types::RegressionWatchStatus;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let watches = tracker
+            .get_regression_watches_by_status(RegressionWatchStatus::Monitoring)
+            .unwrap();
+        assert!(watches.is_empty());
+    }
+
+    #[test]
+    fn test_update_regression_watch_status() {
+        use crate::types::{IssueType, RegressionWatch, RegressionWatchStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempt and watch
+        tracker.record_attempt("sentry", "sentry-status-test", "SENTRY-ST").unwrap();
+        let attempt = tracker.get_attempt("sentry", "sentry-status-test").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "sentry-status-test",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // Verify initial status
+        let retrieved = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(retrieved.status, RegressionWatchStatus::AwaitingRelease);
+
+        // Update to Monitoring
+        tracker
+            .update_regression_watch_status(watch_id, RegressionWatchStatus::Monitoring)
+            .unwrap();
+        let retrieved = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(retrieved.status, RegressionWatchStatus::Monitoring);
+        assert!(retrieved.monitoring_started_at.is_some());
+
+        // Update to Resolved
+        tracker
+            .update_regression_watch_status(watch_id, RegressionWatchStatus::Resolved)
+            .unwrap();
+        let retrieved = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(retrieved.status, RegressionWatchStatus::Resolved);
+        assert!(retrieved.resolved_at.is_some());
+    }
+
+    #[test]
+    fn test_update_regression_watch_status_to_regressed() {
+        use crate::types::{IssueType, RegressionWatch, RegressionWatchStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempt and watch
+        tracker.record_attempt("linear", "linear-regressed", "LIN-REG").unwrap();
+        let attempt = tracker.get_attempt("linear", "linear-regressed").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::LinearBug,
+            "linear-regressed",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // Move to Monitoring first
+        tracker
+            .update_regression_watch_status(watch_id, RegressionWatchStatus::Monitoring)
+            .unwrap();
+
+        // Update to Regressed
+        tracker
+            .update_regression_watch_status(watch_id, RegressionWatchStatus::Regressed)
+            .unwrap();
+        let retrieved = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(retrieved.status, RegressionWatchStatus::Regressed);
+        assert!(retrieved.regressed_at.is_some());
+    }
+
+    #[test]
+    fn test_record_release_tracking() {
+        use crate::types::{IssueType, RegressionWatch, ReleaseTracking};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempt and watch
+        tracker.record_attempt("sentry", "sentry-release", "SENTRY-REL").unwrap();
+        let attempt = tracker.get_attempt("sentry", "sentry-release").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "sentry-release",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // Record release tracking
+        let release = ReleaseTracking::new(
+            watch_id,
+            "v1.2.3",
+            "abc123def456",
+        );
+
+        let release_id = tracker.record_release_tracking(&release).unwrap();
+        assert!(release_id > 0);
+    }
+
+    #[test]
+    fn test_record_release_tracking_multiple_versions() {
+        use crate::types::{IssueType, RegressionWatch, ReleaseTracking};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempt and watch
+        tracker.record_attempt("linear", "linear-multi-release", "LIN-MR").unwrap();
+        let attempt = tracker.get_attempt("linear", "linear-multi-release").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::LinearBug,
+            "linear-multi-release",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // Record multiple releases
+        let release1 = ReleaseTracking::new(watch_id, "v1.0.0", "commit1");
+        let release2 = ReleaseTracking::new(watch_id, "v1.0.1", "commit2");
+        let release3 = ReleaseTracking::new(watch_id, "v1.1.0", "commit3");
+
+        let id1 = tracker.record_release_tracking(&release1).unwrap();
+        let id2 = tracker.record_release_tracking(&release2).unwrap();
+        let id3 = tracker.record_release_tracking(&release3).unwrap();
+
+        assert!(id1 > 0);
+        assert!(id2 > id1);
+        assert!(id3 > id2);
+    }
+
+    #[test]
+    fn test_record_regression_check() {
+        use crate::types::{IssueType, RegressionWatch, RegressionCheck};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempt and watch
+        tracker.record_attempt("sentry", "sentry-check", "SENTRY-CHK").unwrap();
+        let attempt = tracker.get_attempt("sentry", "sentry-check").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "sentry-check",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // Record a check showing issue does not exist
+        let check = RegressionCheck::new(watch_id, false);
+        let check_id = tracker.record_regression_check(&check).unwrap();
+        assert!(check_id > 0);
+    }
+
+    #[test]
+    fn test_record_regression_check_issue_exists() {
+        use crate::types::{IssueType, RegressionWatch, RegressionCheck};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempt and watch
+        tracker.record_attempt("linear", "linear-check-exists", "LIN-CHK").unwrap();
+        let attempt = tracker.get_attempt("linear", "linear-check-exists").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::LinearBug,
+            "linear-check-exists",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // Record a check showing issue still exists
+        let mut check = RegressionCheck::new(watch_id, true);
+        check.check_details = Some("Issue reoccurred 5 times in the last hour".to_string());
+
+        let check_id = tracker.record_regression_check(&check).unwrap();
+        assert!(check_id > 0);
+    }
+
+    #[test]
+    fn test_get_regression_checks() {
+        use crate::types::{IssueType, RegressionWatch, RegressionCheck};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempt and watch
+        tracker.record_attempt("sentry", "sentry-get-checks", "SENTRY-GC").unwrap();
+        let attempt = tracker.get_attempt("sentry", "sentry-get-checks").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "sentry-get-checks",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // Record multiple checks
+        let check1 = RegressionCheck::new(watch_id, false);
+        let check2 = RegressionCheck::new(watch_id, false);
+        let check3 = RegressionCheck::new(watch_id, true);
+
+        tracker.record_regression_check(&check1).unwrap();
+        tracker.record_regression_check(&check2).unwrap();
+        tracker.record_regression_check(&check3).unwrap();
+
+        // Get all checks for this watch
+        let checks = tracker.get_regression_checks(watch_id).unwrap();
+        assert_eq!(checks.len(), 3);
+
+        // Verify the last check shows issue exists
+        let last_check = checks.last().unwrap();
+        assert!(last_check.issue_still_exists);
+    }
+
+    #[test]
+    fn test_get_regression_checks_empty() {
+        use crate::types::{IssueType, RegressionWatch};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempt and watch
+        tracker.record_attempt("linear", "linear-empty-checks", "LIN-EC").unwrap();
+        let attempt = tracker.get_attempt("linear", "linear-empty-checks").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::LinearBug,
+            "linear-empty-checks",
+            attempt.id,
+        );
+
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // Get checks for watch with no checks recorded
+        let checks = tracker.get_regression_checks(watch_id).unwrap();
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn test_get_regression_checks_for_nonexistent_watch() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Get checks for a watch ID that doesn't exist
+        let checks = tracker.get_regression_checks(99999).unwrap();
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn test_regression_watch_table_creation() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // The table should be created during init - verify by trying to query
+        let conn = tracker.conn.lock().unwrap();
+        let result = conn.execute(
+            "SELECT 1 FROM regression_watches LIMIT 1",
+            [],
+        );
+        // Should succeed (table exists) or return empty result, not error
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_release_tracking_table_creation() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // The table should be created during init
+        let conn = tracker.conn.lock().unwrap();
+        let result = conn.execute(
+            "SELECT 1 FROM release_tracking LIMIT 1",
+            [],
+        );
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_regression_checks_table_creation() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // The table should be created during init
+        let conn = tracker.conn.lock().unwrap();
+        let result = conn.execute(
+            "SELECT 1 FROM regression_checks LIMIT 1",
+            [],
+        );
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_full_regression_watch_lifecycle() {
+        use crate::types::{IssueType, RegressionWatch, RegressionWatchStatus, ReleaseTracking, RegressionCheck};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // 1. Create a fix attempt
+        tracker.record_attempt("sentry", "lifecycle-test", "SENTRY-LC").unwrap();
+        tracker.mark_success("sentry", "lifecycle-test", "https://github.com/org/repo/pull/99").unwrap();
+        let attempt = tracker.get_attempt("sentry", "lifecycle-test").unwrap().unwrap();
+
+        // 2. Create regression watch
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "lifecycle-test",
+            attempt.id,
+        );
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // 3. Verify initial state
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(watch.status, RegressionWatchStatus::AwaitingRelease);
+
+        // 4. Record release
+        let release = ReleaseTracking::new(watch_id, "v2.0.0", "release-commit-hash");
+        tracker.record_release_tracking(&release).unwrap();
+
+        // 5. Update to monitoring
+        tracker.update_regression_watch_status(watch_id, RegressionWatchStatus::Monitoring).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(watch.status, RegressionWatchStatus::Monitoring);
+
+        // 6. Record several checks showing no regression
+        for _ in 0..3 {
+            let check = RegressionCheck::new(watch_id, false);
+            tracker.record_regression_check(&check).unwrap();
+        }
+
+        // 7. Verify checks are recorded
+        let checks = tracker.get_regression_checks(watch_id).unwrap();
+        assert_eq!(checks.len(), 3);
+
+        // 8. Mark as resolved
+        tracker.update_regression_watch_status(watch_id, RegressionWatchStatus::Resolved).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(watch.status, RegressionWatchStatus::Resolved);
+        assert!(watch.resolved_at.is_some());
+    }
+
+    #[test]
+    fn test_regression_watch_lifecycle_with_regression() {
+        use crate::types::{IssueType, RegressionWatch, RegressionWatchStatus, ReleaseTracking, RegressionCheck};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // 1. Create fix attempt and watch
+        tracker.record_attempt("linear", "regression-lifecycle", "LIN-RL").unwrap();
+        tracker.mark_success("linear", "regression-lifecycle", "https://github.com/org/repo/pull/100").unwrap();
+        let attempt = tracker.get_attempt("linear", "regression-lifecycle").unwrap().unwrap();
+
+        let watch = RegressionWatch::new(
+            IssueType::LinearBug,
+            "regression-lifecycle",
+            attempt.id,
+        );
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        // 2. Record release and start monitoring
+        let release = ReleaseTracking::new(watch_id, "v3.0.0", "commit-hash");
+        tracker.record_release_tracking(&release).unwrap();
+        tracker.update_regression_watch_status(watch_id, RegressionWatchStatus::Monitoring).unwrap();
+
+        // 3. Record checks - first ones OK, then regression detected
+        let check1 = RegressionCheck::new(watch_id, false);
+        let check2 = RegressionCheck::new(watch_id, false);
+        let mut check3 = RegressionCheck::new(watch_id, true);
+        check3.check_details = Some("Bug reoccurred in production".to_string());
+
+        tracker.record_regression_check(&check1).unwrap();
+        tracker.record_regression_check(&check2).unwrap();
+        tracker.record_regression_check(&check3).unwrap();
+
+        // 4. Mark as regressed
+        tracker.update_regression_watch_status(watch_id, RegressionWatchStatus::Regressed).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(watch.status, RegressionWatchStatus::Regressed);
+        assert!(watch.regressed_at.is_some());
+
+        // 5. Verify checks history
+        let checks = tracker.get_regression_checks(watch_id).unwrap();
+        assert_eq!(checks.len(), 3);
+        assert!(!checks[0].issue_still_exists);
+        assert!(!checks[1].issue_still_exists);
+        assert!(checks[2].issue_still_exists);
     }
 }

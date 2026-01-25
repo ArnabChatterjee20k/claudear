@@ -958,6 +958,201 @@ pub struct AnalyticsSummary {
     pub success_rate_by_source: HashMap<String, f64>,
 }
 
+// ============================================================
+// Regression Tracking Types
+// ============================================================
+
+/// Status of a regression watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RegressionWatchStatus {
+    /// Waiting for the fix to be included in a release.
+    #[default]
+    AwaitingRelease,
+    /// Release detected, actively monitoring for regressions.
+    Monitoring,
+    /// No regression detected after monitoring period, issue resolved.
+    Resolved,
+    /// Regression detected, fix failed.
+    Regressed,
+}
+
+impl std::fmt::Display for RegressionWatchStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AwaitingRelease => write!(f, "awaiting_release"),
+            Self::Monitoring => write!(f, "monitoring"),
+            Self::Resolved => write!(f, "resolved"),
+            Self::Regressed => write!(f, "regressed"),
+        }
+    }
+}
+
+impl std::str::FromStr for RegressionWatchStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "awaiting_release" => Ok(Self::AwaitingRelease),
+            "monitoring" => Ok(Self::Monitoring),
+            "resolved" => Ok(Self::Resolved),
+            "regressed" => Ok(Self::Regressed),
+            _ => Err(format!("Unknown regression watch status: {}", s)),
+        }
+    }
+}
+
+/// Type of issue being watched for regression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueType {
+    /// Issue originated from Sentry.
+    SentryIssue,
+    /// Issue from Linear marked as a bug.
+    LinearBug,
+}
+
+impl std::fmt::Display for IssueType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SentryIssue => write!(f, "sentry_issue"),
+            Self::LinearBug => write!(f, "linear_bug"),
+        }
+    }
+}
+
+impl std::str::FromStr for IssueType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sentry_issue" => Ok(Self::SentryIssue),
+            "linear_bug" => Ok(Self::LinearBug),
+            _ => Err(format!("Unknown issue type: {}", s)),
+        }
+    }
+}
+
+/// A watch for regression after a bug fix is merged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegressionWatch {
+    /// Database ID.
+    pub id: i64,
+    /// Type of issue (SentryIssue or LinearBug).
+    pub issue_type: IssueType,
+    /// Issue ID from the source.
+    pub issue_id: String,
+    /// Reference to the fix attempt.
+    pub fix_attempt_id: i64,
+    /// Current status of the watch.
+    pub status: RegressionWatchStatus,
+    /// When the PR was merged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_merged_at: Option<DateTime<Utc>>,
+    /// When regression monitoring started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitoring_started_at: Option<DateTime<Utc>>,
+    /// When the issue was resolved (after 24h of no regression).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<DateTime<Utc>>,
+    /// When a regression was detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regressed_at: Option<DateTime<Utc>>,
+    /// When the watch was created.
+    pub created_at: DateTime<Utc>,
+}
+
+impl RegressionWatch {
+    /// Create a new regression watch.
+    pub fn new(
+        issue_type: IssueType,
+        issue_id: impl Into<String>,
+        fix_attempt_id: i64,
+    ) -> Self {
+        Self {
+            id: 0,
+            issue_type,
+            issue_id: issue_id.into(),
+            fix_attempt_id,
+            status: RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+/// Tracking of a release that may contain a fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseTracking {
+    /// Database ID.
+    pub id: i64,
+    /// Reference to the regression watch.
+    pub regression_watch_id: i64,
+    /// Release version/tag.
+    pub release_version: String,
+    /// Commit SHA of the release.
+    pub release_commit: String,
+    /// When the release was detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<DateTime<Utc>>,
+    /// When this tracking entry was created.
+    pub created_at: DateTime<Utc>,
+}
+
+impl ReleaseTracking {
+    /// Create a new release tracking entry.
+    pub fn new(
+        regression_watch_id: i64,
+        release_version: impl Into<String>,
+        release_commit: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: 0,
+            regression_watch_id,
+            release_version: release_version.into(),
+            release_commit: release_commit.into(),
+            released_at: Some(Utc::now()),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+/// A single regression check result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegressionCheck {
+    /// Database ID.
+    pub id: i64,
+    /// Reference to the regression watch.
+    pub regression_watch_id: i64,
+    /// Whether the issue still exists (regression detected).
+    pub issue_still_exists: bool,
+    /// When the check was performed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<DateTime<Utc>>,
+    /// Detailed findings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_details: Option<String>,
+    /// When this check was created.
+    pub created_at: DateTime<Utc>,
+}
+
+impl RegressionCheck {
+    /// Create a new regression check.
+    pub fn new(regression_watch_id: i64, issue_still_exists: bool) -> Self {
+        Self {
+            id: 0,
+            regression_watch_id,
+            issue_still_exists,
+            checked_at: Some(Utc::now()),
+            check_details: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,6 +1703,354 @@ mod tests {
         assert!(debug_str.contains("Issue"));
     }
 
+    // ============================================================
+    // Phase 1: Bug Fix Verification System - RegressionWatchStatus Tests
+    // ============================================================
+
+    #[test]
+    fn test_regression_watch_status_display() {
+        assert_eq!(RegressionWatchStatus::AwaitingRelease.to_string(), "awaiting_release");
+        assert_eq!(RegressionWatchStatus::Monitoring.to_string(), "monitoring");
+        assert_eq!(RegressionWatchStatus::Resolved.to_string(), "resolved");
+        assert_eq!(RegressionWatchStatus::Regressed.to_string(), "regressed");
+    }
+
+    #[test]
+    fn test_regression_watch_status_from_str() {
+        assert_eq!(
+            "awaiting_release".parse::<RegressionWatchStatus>().unwrap(),
+            RegressionWatchStatus::AwaitingRelease
+        );
+        assert_eq!(
+            "monitoring".parse::<RegressionWatchStatus>().unwrap(),
+            RegressionWatchStatus::Monitoring
+        );
+        assert_eq!(
+            "resolved".parse::<RegressionWatchStatus>().unwrap(),
+            RegressionWatchStatus::Resolved
+        );
+        assert_eq!(
+            "regressed".parse::<RegressionWatchStatus>().unwrap(),
+            RegressionWatchStatus::Regressed
+        );
+    }
+
+    #[test]
+    fn test_regression_watch_status_from_str_case_insensitive() {
+        assert_eq!(
+            "AWAITING_RELEASE".parse::<RegressionWatchStatus>().unwrap(),
+            RegressionWatchStatus::AwaitingRelease
+        );
+        assert_eq!(
+            "Monitoring".parse::<RegressionWatchStatus>().unwrap(),
+            RegressionWatchStatus::Monitoring
+        );
+    }
+
+    #[test]
+    fn test_regression_watch_status_from_str_invalid() {
+        assert!("invalid".parse::<RegressionWatchStatus>().is_err());
+        assert!("".parse::<RegressionWatchStatus>().is_err());
+    }
+
+    #[test]
+    fn test_regression_watch_status_default() {
+        assert_eq!(RegressionWatchStatus::default(), RegressionWatchStatus::AwaitingRelease);
+    }
+
+    #[test]
+    fn test_regression_watch_status_serde() {
+        let status = RegressionWatchStatus::Monitoring;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"monitoring\"");
+        let parsed: RegressionWatchStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, RegressionWatchStatus::Monitoring);
+    }
+
+    #[test]
+    fn test_regression_watch_status_serde_all_variants() {
+        let statuses = vec![
+            RegressionWatchStatus::AwaitingRelease,
+            RegressionWatchStatus::Monitoring,
+            RegressionWatchStatus::Resolved,
+            RegressionWatchStatus::Regressed,
+        ];
+
+        for status in statuses {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: RegressionWatchStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, status);
+        }
+    }
+
+    // ============================================================
+    // Phase 1: Bug Fix Verification System - IssueType Tests
+    // ============================================================
+
+    #[test]
+    fn test_issue_type_display() {
+        assert_eq!(IssueType::SentryIssue.to_string(), "sentry_issue");
+        assert_eq!(IssueType::LinearBug.to_string(), "linear_bug");
+    }
+
+    #[test]
+    fn test_issue_type_from_str() {
+        assert_eq!(
+            "sentry_issue".parse::<IssueType>().unwrap(),
+            IssueType::SentryIssue
+        );
+        assert_eq!(
+            "linear_bug".parse::<IssueType>().unwrap(),
+            IssueType::LinearBug
+        );
+    }
+
+    #[test]
+    fn test_issue_type_from_str_case_insensitive() {
+        assert_eq!(
+            "SENTRY_ISSUE".parse::<IssueType>().unwrap(),
+            IssueType::SentryIssue
+        );
+        assert_eq!(
+            "Linear_Bug".parse::<IssueType>().unwrap(),
+            IssueType::LinearBug
+        );
+    }
+
+    #[test]
+    fn test_issue_type_from_str_invalid() {
+        assert!("invalid".parse::<IssueType>().is_err());
+        assert!("github_issue".parse::<IssueType>().is_err());
+    }
+
+    #[test]
+    fn test_issue_type_serde() {
+        let issue_type = IssueType::SentryIssue;
+        let json = serde_json::to_string(&issue_type).unwrap();
+        assert_eq!(json, "\"sentry_issue\"");
+        let parsed: IssueType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, IssueType::SentryIssue);
+    }
+
+    #[test]
+    fn test_issue_type_serde_all_variants() {
+        let types = vec![IssueType::SentryIssue, IssueType::LinearBug];
+
+        for issue_type in types {
+            let json = serde_json::to_string(&issue_type).unwrap();
+            let parsed: IssueType = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, issue_type);
+        }
+    }
+
+    // ============================================================
+    // Phase 1: Bug Fix Verification System - RegressionWatch Tests
+    // ============================================================
+
+    #[test]
+    fn test_regression_watch_new() {
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "sentry-123",
+            1,
+        );
+
+        assert_eq!(watch.issue_type, IssueType::SentryIssue);
+        assert_eq!(watch.issue_id, "sentry-123");
+        assert_eq!(watch.fix_attempt_id, 1);
+        assert_eq!(watch.status, RegressionWatchStatus::AwaitingRelease);
+        assert!(watch.pr_merged_at.is_none());
+        assert!(watch.monitoring_started_at.is_none());
+        assert!(watch.resolved_at.is_none());
+        assert!(watch.regressed_at.is_none());
+    }
+
+    #[test]
+    fn test_regression_watch_serde() {
+        let watch = RegressionWatch::new(
+            IssueType::LinearBug,
+            "linear-456",
+            2,
+        );
+
+        let json = serde_json::to_string(&watch).unwrap();
+        let parsed: RegressionWatch = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.issue_type, watch.issue_type);
+        assert_eq!(parsed.issue_id, watch.issue_id);
+        assert_eq!(parsed.fix_attempt_id, watch.fix_attempt_id);
+        assert_eq!(parsed.status, watch.status);
+    }
+
+    #[test]
+    fn test_regression_watch_clone() {
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "sentry-789",
+            3,
+        );
+
+        let cloned = watch.clone();
+        assert_eq!(cloned.issue_type, watch.issue_type);
+        assert_eq!(cloned.issue_id, watch.issue_id);
+        assert_eq!(cloned.fix_attempt_id, watch.fix_attempt_id);
+    }
+
+    #[test]
+    fn test_regression_watch_debug() {
+        let watch = RegressionWatch::new(
+            IssueType::SentryIssue,
+            "sentry-123",
+            1,
+        );
+        let debug_str = format!("{:?}", watch);
+        assert!(debug_str.contains("RegressionWatch"));
+    }
+
+    // ============================================================
+    // Phase 1: Bug Fix Verification System - ReleaseTracking Tests
+    // ============================================================
+
+    #[test]
+    fn test_release_tracking_new() {
+        let tracking = ReleaseTracking::new(
+            1,
+            "v1.2.3",
+            "abc123def",
+        );
+
+        assert_eq!(tracking.regression_watch_id, 1);
+        assert_eq!(tracking.release_version, "v1.2.3");
+        assert_eq!(tracking.release_commit, "abc123def");
+        assert!(tracking.released_at.is_some());
+    }
+
+    #[test]
+    fn test_release_tracking_serde() {
+        let tracking = ReleaseTracking::new(
+            2,
+            "v2.0.0",
+            "def456abc",
+        );
+
+        let json = serde_json::to_string(&tracking).unwrap();
+        let parsed: ReleaseTracking = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.regression_watch_id, tracking.regression_watch_id);
+        assert_eq!(parsed.release_version, tracking.release_version);
+        assert_eq!(parsed.release_commit, tracking.release_commit);
+    }
+
+    #[test]
+    fn test_release_tracking_clone() {
+        let tracking = ReleaseTracking::new(
+            3,
+            "v3.0.0",
+            "xyz789",
+        );
+
+        let cloned = tracking.clone();
+        assert_eq!(cloned.regression_watch_id, tracking.regression_watch_id);
+        assert_eq!(cloned.release_version, tracking.release_version);
+    }
+
+    #[test]
+    fn test_release_tracking_debug() {
+        let tracking = ReleaseTracking::new(
+            1,
+            "v1.0.0",
+            "commit123",
+        );
+        let debug_str = format!("{:?}", tracking);
+        assert!(debug_str.contains("ReleaseTracking"));
+    }
+
+    // ============================================================
+    // Phase 1: Bug Fix Verification System - RegressionCheck Tests
+    // ============================================================
+
+    #[test]
+    fn test_regression_check_new() {
+        let check = RegressionCheck::new(1, false);
+
+        assert_eq!(check.regression_watch_id, 1);
+        assert!(!check.issue_still_exists);
+        assert!(check.checked_at.is_some());
+        assert!(check.check_details.is_none());
+    }
+
+    #[test]
+    fn test_regression_check_with_details() {
+        let mut check = RegressionCheck::new(2, true);
+        check.check_details = Some("Issue reoccurred in production".to_string());
+
+        assert!(check.issue_still_exists);
+        assert_eq!(
+            check.check_details,
+            Some("Issue reoccurred in production".to_string())
+        );
+    }
+
+    #[test]
+    fn test_regression_check_serde() {
+        let mut check = RegressionCheck::new(3, false);
+        check.check_details = Some("No occurrences found".to_string());
+
+        let json = serde_json::to_string(&check).unwrap();
+        let parsed: RegressionCheck = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.regression_watch_id, check.regression_watch_id);
+        assert_eq!(parsed.issue_still_exists, check.issue_still_exists);
+        assert_eq!(parsed.check_details, check.check_details);
+    }
+
+    #[test]
+    fn test_regression_check_clone() {
+        let check = RegressionCheck::new(4, true);
+
+        let cloned = check.clone();
+        assert_eq!(cloned.regression_watch_id, check.regression_watch_id);
+        assert_eq!(cloned.issue_still_exists, check.issue_still_exists);
+    }
+
+    #[test]
+    fn test_regression_check_debug() {
+        let check = RegressionCheck::new(1, false);
+        let debug_str = format!("{:?}", check);
+        assert!(debug_str.contains("RegressionCheck"));
+    }
+
+    // ============================================================
+    // Phase 1: Status Transition Tests
+    // ============================================================
+
+    #[test]
+    fn test_regression_watch_status_transitions() {
+        // Valid transition: AwaitingRelease -> Monitoring
+        let mut watch = RegressionWatch::new(IssueType::SentryIssue, "issue-1", 1);
+        assert_eq!(watch.status, RegressionWatchStatus::AwaitingRelease);
+
+        watch.status = RegressionWatchStatus::Monitoring;
+        watch.monitoring_started_at = Some(chrono::Utc::now());
+        assert_eq!(watch.status, RegressionWatchStatus::Monitoring);
+
+        // Valid transition: Monitoring -> Resolved
+        watch.status = RegressionWatchStatus::Resolved;
+        watch.resolved_at = Some(chrono::Utc::now());
+        assert_eq!(watch.status, RegressionWatchStatus::Resolved);
+    }
+
+    #[test]
+    fn test_regression_watch_status_regressed_transition() {
+        // Valid transition: Monitoring -> Regressed
+        let mut watch = RegressionWatch::new(IssueType::LinearBug, "issue-2", 2);
+        watch.status = RegressionWatchStatus::Monitoring;
+        watch.monitoring_started_at = Some(chrono::Utc::now());
+
+        watch.status = RegressionWatchStatus::Regressed;
+        watch.regressed_at = Some(chrono::Utc::now());
+        assert_eq!(watch.status, RegressionWatchStatus::Regressed);
+    }
     // Tests for validate_issue_id
 
     #[test]
