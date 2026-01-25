@@ -2854,6 +2854,23 @@ impl SqliteTracker {
         })
     }
 
+    /// Get a fix attempt by its ID.
+    pub fn get_attempt_by_id(&self, id: i64) -> Result<Option<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at
+            FROM fix_attempts
+            WHERE id = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![id], Self::row_to_fix_attempt).ok();
+        Ok(result)
+    }
+
     // ============================================================
     // Regression Tracking Methods
     // ============================================================
