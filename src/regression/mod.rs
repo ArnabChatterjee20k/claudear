@@ -5,6 +5,8 @@
 
 mod monitor;
 mod scheduler;
+mod sentry;
 
-pub use monitor::{RegressionChecker, RegressionResult};
-pub use scheduler::{RegressionScheduler, RegressionSchedulerConfig};
+pub use monitor::{CompositeChecker, NoOpChecker, RegressionChecker, RegressionResult};
+pub use scheduler::{CheckCycleResult, RegressionScheduler, RegressionSchedulerConfig};
+pub use sentry::{SentryRegressionChecker, SentryRegressionConfig};

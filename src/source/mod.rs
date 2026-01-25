@@ -1,7 +1,7 @@
 //! Issue source implementations.
 
 mod linear;
-mod sentry;
+pub mod sentry;
 
 pub use linear::LinearSource;
 pub use sentry::SentrySource;
