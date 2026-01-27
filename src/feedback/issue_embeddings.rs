@@ -157,8 +157,8 @@ impl IssueEmbeddingService {
         let text = build_embedding_text(issue);
         let query_embedding = self.embedding_client.embed(&text).await?;
 
-        // Get all embeddings from the database for this source
-        let stored_embeddings = self.tracker.get_all_embeddings(Some(source))?;
+        // Get embeddings from the database for this source (with default pagination)
+        let stored_embeddings = self.tracker.get_all_embeddings(Some(source), None, None)?;
 
         if stored_embeddings.is_empty() {
             return Ok(Vec::new());

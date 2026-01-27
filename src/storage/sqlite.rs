@@ -67,6 +67,39 @@ impl SqliteTracker {
 
     fn init(&self) -> Result<()> {
         let conn = self.acquire_lock()?;
+
+        // === Performance PRAGMAs ===
+        // These settings optimize SQLite for better throughput in our use case:
+        // - Concurrent reads/writes from webhook server and watcher
+        // - Moderate write workload with analytics/metrics
+        // - BLOB storage for embeddings
+        conn.execute_batch(
+            r#"
+            -- WAL mode: biggest win for concurrent reads + writes
+            -- Note: In-memory DBs will stay in "memory" mode which is fine
+            PRAGMA journal_mode = WAL;
+
+            -- Don't wait for fsync on every commit (safe with WAL)
+            PRAGMA synchronous = NORMAL;
+
+            -- 64MB cache (default is 2MB) - keeps hot pages in RAM
+            PRAGMA cache_size = -65536;
+
+            -- Memory-map up to 256MB of the DB file for faster BLOB access
+            PRAGMA mmap_size = 268435456;
+
+            -- Store temp tables in memory
+            PRAGMA temp_store = MEMORY;
+
+            -- Timeout instead of immediate SQLITE_BUSY (5 seconds)
+            PRAGMA busy_timeout = 5000;
+
+            -- Enable foreign key enforcement
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
+
+        // === Schema Creation ===
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS fix_attempts (
@@ -83,6 +116,7 @@ impl SqliteTracker {
                 merged_at TEXT,
                 resolved_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
+                issue_labels TEXT,  -- JSON array of labels for bug detection
                 UNIQUE(source, issue_id)
             );
 
@@ -227,6 +261,23 @@ impl SqliteTracker {
                 actionable_feedback TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_pr_reviews_attempt ON pr_reviews(attempt_id);
+
+            -- PR review comments - individual review comments for tracking
+            CREATE TABLE IF NOT EXISTS pr_review_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                github_comment_id INTEGER NOT NULL UNIQUE,
+                pr_url TEXT NOT NULL,
+                review_id INTEGER REFERENCES pr_reviews(id),
+                path TEXT NOT NULL,
+                position INTEGER,
+                line INTEGER,
+                body TEXT NOT NULL,
+                author TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                html_url TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_pr_review_comments_pr ON pr_review_comments(pr_url);
 
             -- Issue embeddings - vector embeddings for similarity
             CREATE TABLE IF NOT EXISTS issue_embeddings (
@@ -477,6 +528,10 @@ impl SqliteTracker {
                 "fix_attempts.last_retry_at",
                 "ALTER TABLE fix_attempts ADD COLUMN last_retry_at TEXT",
             ),
+            (
+                "fix_attempts.issue_labels",
+                "ALTER TABLE fix_attempts ADD COLUMN issue_labels TEXT",
+            ),
             // repositories migrations (unified table)
             (
                 "repositories.default_branch",
@@ -505,6 +560,10 @@ impl SqliteTracker {
             }
         }
 
+        // Update query planner statistics after schema creation
+        // This helps SQLite make better query planning decisions
+        conn.execute("ANALYZE", [])?;
+
         Ok(())
     }
 
@@ -514,7 +573,15 @@ impl SqliteTracker {
             .or_else(|_| {
                 chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").map(|dt| dt.and_utc())
             })
-            .unwrap_or_else(|_| Utc::now())
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    component = "sqlite",
+                    input = %s,
+                    error = %e,
+                    "Failed to parse datetime, falling back to current time - this may indicate data corruption"
+                );
+                Utc::now()
+            })
     }
 
     fn parse_optional_datetime(s: Option<String>) -> Option<DateTime<Utc>> {
@@ -523,7 +590,7 @@ impl SqliteTracker {
 
     /// Parse a GitHub PR URL to extract repo and PR number.
     /// Supports: https://github.com/owner/repo/pull/123
-    fn parse_pr_url(url: &str) -> Option<(String, i64)> {
+    pub fn parse_pr_url(url: &str) -> Option<(String, i64)> {
         // Reject excessively long URLs to prevent ReDoS and memory issues
         if url.len() > MAX_PR_URL_LENGTH {
             return None;
@@ -545,7 +612,7 @@ impl FixAttemptTracker for SqliteTracker {
             }
         };
         let mut stmt =
-            match conn.prepare("SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ?") {
+            match conn.prepare_cached("SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ?") {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to prepare statement in has_attempted");
@@ -563,7 +630,7 @@ impl FixAttemptTracker for SqliteTracker {
                 return HashSet::new();
             }
         };
-        let mut stmt = match conn.prepare("SELECT issue_id FROM fix_attempts WHERE source = ?") {
+        let mut stmt = match conn.prepare_cached("SELECT issue_id FROM fix_attempts WHERE source = ?") {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to prepare statement in get_attempted_issue_ids");
@@ -596,22 +663,42 @@ impl FixAttemptTracker for SqliteTracker {
     }
 
     fn record_attempt(&self, source: &str, issue_id: &str, short_id: &str) -> Result<()> {
+        self.record_attempt_with_labels(source, issue_id, short_id, &[])
+    }
+
+    fn record_attempt_with_labels(
+        &self,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+        labels: &[String],
+    ) -> Result<()> {
         tracing::info!(
             source = source,
             issue_id = issue_id,
             short_id = short_id,
-            "Recording fix attempt"
+            labels_count = labels.len(),
+            "Recording fix attempt with labels"
         );
         let conn = self.acquire_lock()?;
+
+        // Serialize labels to JSON
+        let labels_json = if labels.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(labels).unwrap_or_default())
+        };
+
         let rows_affected = conn.execute(
             r#"
-            INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at)
-            VALUES (?, ?, ?, 'pending', datetime('now'))
+            INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, issue_labels)
+            VALUES (?, ?, ?, 'pending', datetime('now'), ?)
             ON CONFLICT(source, issue_id) DO UPDATE SET
                 short_id = excluded.short_id,
-                attempted_at = datetime('now')
+                attempted_at = datetime('now'),
+                issue_labels = COALESCE(excluded.issue_labels, fix_attempts.issue_labels)
             "#,
-            params![source, issue_id, short_id],
+            params![source, issue_id, short_id, labels_json],
         )?;
         tracing::info!(
             source = source,
@@ -632,9 +719,18 @@ impl FixAttemptTracker for SqliteTracker {
         let conn = self.acquire_lock()?;
 
         // Parse PR URL to extract GitHub repo and PR number
-        let (github_repo, github_pr_number) = Self::parse_pr_url(pr_url)
-            .map(|(r, n)| (Some(r), Some(n)))
-            .unwrap_or((None, None));
+        let (github_repo, github_pr_number) = match Self::parse_pr_url(pr_url) {
+            Some((repo, pr_num)) => (Some(repo), Some(pr_num)),
+            None => {
+                tracing::warn!(
+                    pr_url = pr_url,
+                    source = source,
+                    issue_id = issue_id,
+                    "Failed to parse PR URL - PR tracking may not work correctly"
+                );
+                (None, None)
+            }
+        };
 
         let rows_affected = conn.execute(
             r#"
@@ -753,11 +849,11 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn get_attempt(&self, source: &str, issue_id: &str) -> Result<Option<FixAttempt>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at
+                   retry_count, last_retry_at, issue_labels
             FROM fix_attempts
             WHERE source = ? AND issue_id = ?
             "#,
@@ -772,11 +868,11 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn get_attempts_by_status(&self, status: FixAttemptStatus) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at
+                   retry_count, last_retry_at, issue_labels
             FROM fix_attempts
             WHERE status = ?
             ORDER BY attempted_at DESC
@@ -795,11 +891,11 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn get_pending_prs(&self) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at
+                   retry_count, last_retry_at, issue_labels
             FROM fix_attempts
             WHERE status = 'success' AND pr_url IS NOT NULL AND github_repo IS NOT NULL
             ORDER BY attempted_at DESC
@@ -817,11 +913,11 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn get_attempt_by_pr_url(&self, pr_url: &str) -> Result<Option<FixAttempt>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at
+                   retry_count, last_retry_at, issue_labels
             FROM fix_attempts
             WHERE pr_url = ?
             "#,
@@ -884,11 +980,11 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn get_retryable_issues(&self, max_retries: u32) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at
+                   retry_count, last_retry_at, issue_labels
             FROM fix_attempts
             WHERE (status = 'failed' OR status = 'closed')
               AND COALESCE(retry_count, 0) < ?
@@ -928,7 +1024,7 @@ impl FixAttemptTracker for SqliteTracker {
         let mut stats = FixAttemptStats::default();
 
         // Overall stats
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             r#"
             SELECT status, COUNT(*) as count
             FROM fix_attempts
@@ -961,7 +1057,7 @@ impl FixAttemptTracker for SqliteTracker {
         }
 
         // Stats by source
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             r#"
             SELECT source, status, COUNT(*) as count
             FROM fix_attempts
@@ -1057,6 +1153,61 @@ impl SqliteTracker {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Record multiple activities in a single transaction for better performance.
+    ///
+    /// This is more efficient than calling `record_activity` in a loop because:
+    /// - Single transaction reduces fsync overhead
+    /// - Prepared statement is reused across all inserts
+    pub fn record_activities_batch(&self, entries: &[ActivityLogEntry]) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = self.acquire_lock()?;
+        conn.execute("BEGIN IMMEDIATE", [])?;
+
+        let result = (|| {
+            let mut stmt = conn.prepare_cached(
+                r#"
+                INSERT INTO activity_log (timestamp, activity_type, source, issue_id, short_id, message, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )?;
+
+            for entry in entries {
+                let metadata_json = entry.metadata.as_ref().map(|m| m.to_string());
+                stmt.execute(params![
+                    entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    entry.activity_type,
+                    entry.source,
+                    entry.issue_id,
+                    entry.short_id,
+                    entry.message,
+                    metadata_json,
+                ])?;
+            }
+            Ok(entries.len())
+        })();
+
+        match result {
+            Ok(count) => {
+                conn.execute("COMMIT", [])?;
+                Ok(count)
+            }
+            Err(e) => {
+                if let Err(rollback_err) = conn.execute("ROLLBACK", []) {
+                    tracing::error!(
+                        component = "sqlite",
+                        original_error = %e,
+                        rollback_error = %rollback_err,
+                        "Failed to rollback transaction after batch activity insert error"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Get recent activities, optionally filtered by source.
     pub fn get_recent_activities(
         &self,
@@ -1146,8 +1297,14 @@ impl SqliteTracker {
     /// Convert a database row to a FixAttempt.
     /// Expects columns in order: id, source, issue_id, short_id, attempted_at, pr_url,
     /// github_repo, github_pr_number, status, error_message, merged_at, resolved_at,
-    /// retry_count, last_retry_at
+    /// retry_count, last_retry_at, issue_labels
     fn row_to_fix_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<FixAttempt> {
+        // Parse issue_labels from JSON string
+        let issue_labels: Vec<String> = row
+            .get::<_, Option<String>>(14)?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
         Ok(FixAttempt {
             id: row.get(0)?,
             source: row.get(1)?,
@@ -1166,6 +1323,7 @@ impl SqliteTracker {
             resolved_at: Self::parse_optional_datetime(row.get(11)?),
             retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
             last_retry_at: Self::parse_optional_datetime(row.get(13)?),
+            issue_labels,
         })
     }
 
@@ -1324,6 +1482,200 @@ impl SqliteTracker {
         Ok(reviews)
     }
 
+    // ================================================================
+    // PR Review State Persistence Methods
+    // ================================================================
+
+    /// Save or update a PR review state for persistence.
+    ///
+    /// Uses upsert semantics - creates new record or updates existing based on pr_url.
+    pub fn save_pr_review_state(&self, state: &crate::github::PrReviewState) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO pr_review_states (
+                pr_url, repo, pr_number, issue_id, source,
+                last_review_id, last_review_time, last_comment_id, last_comment_time,
+                is_active, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
+            ON CONFLICT(pr_url) DO UPDATE SET
+                repo = excluded.repo,
+                pr_number = excluded.pr_number,
+                issue_id = excluded.issue_id,
+                source = excluded.source,
+                last_review_id = excluded.last_review_id,
+                last_review_time = excluded.last_review_time,
+                last_comment_id = excluded.last_comment_id,
+                last_comment_time = excluded.last_comment_time,
+                is_active = excluded.is_active
+            "#,
+            params![
+                state.pr_url,
+                state.repo,
+                state.pr_number,
+                state.issue_id,
+                state.source,
+                state.last_review_id,
+                state.last_review_time,
+                state.last_comment_id,
+                state.last_comment_time,
+                state.is_active as i32,
+            ],
+        )?;
+
+        tracing::debug!(
+            pr_url = %state.pr_url,
+            is_active = state.is_active,
+            "PR review state saved"
+        );
+
+        Ok(())
+    }
+
+    /// Get all active PR review states for restoration on startup.
+    pub fn get_active_pr_review_states(&self) -> Result<Vec<crate::github::PrReviewState>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT pr_url, repo, pr_number, issue_id, source,
+                   last_review_id, last_review_time, last_comment_id, last_comment_time,
+                   is_active
+            FROM pr_review_states
+            WHERE is_active = 1
+            ORDER BY created_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], Self::row_to_pr_review_state)?;
+
+        let mut results = Vec::new();
+        for row in rows.flatten() {
+            results.push(row);
+        }
+
+        tracing::debug!(count = results.len(), "Retrieved active PR review states");
+
+        Ok(results)
+    }
+
+    /// Deactivate a PR review state (mark as no longer being watched).
+    pub fn deactivate_pr_review_state(&self, pr_url: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        let rows_affected = conn.execute(
+            "UPDATE pr_review_states SET is_active = 0 WHERE pr_url = ?",
+            params![pr_url],
+        )?;
+
+        tracing::debug!(
+            pr_url = %pr_url,
+            rows_affected = rows_affected,
+            "PR review state deactivated"
+        );
+
+        Ok(())
+    }
+
+    /// Record a PR review comment for persistence.
+    pub fn record_pr_review_comment(
+        &self,
+        pr_url: &str,
+        comment: &crate::github::PrReviewComment,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO pr_review_comments (
+                github_comment_id, pr_url, review_id, path, position, line,
+                body, author, created_at, updated_at, html_url
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(github_comment_id) DO UPDATE SET
+                body = excluded.body,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                comment.id,
+                pr_url,
+                comment.pull_request_review_id,
+                comment.path,
+                comment.position,
+                comment.line,
+                comment.body,
+                comment.user.login,
+                comment.created_at,
+                comment.updated_at,
+                comment.html_url,
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get all comments for a specific PR.
+    pub fn get_comments_for_pr(&self, pr_url: &str) -> Result<Vec<StoredPrReviewComment>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, github_comment_id, pr_url, review_id, path, position, line,
+                   body, author, created_at, updated_at, html_url
+            FROM pr_review_comments
+            WHERE pr_url = ?
+            ORDER BY created_at ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![pr_url], Self::row_to_stored_pr_review_comment)?;
+
+        let mut results = Vec::new();
+        for row in rows.flatten() {
+            results.push(row);
+        }
+
+        Ok(results)
+    }
+
+    /// Convert a database row to a StoredPrReviewComment.
+    /// Expects columns: id, github_comment_id, pr_url, review_id, path, position, line,
+    /// body, author, created_at, updated_at, html_url
+    fn row_to_stored_pr_review_comment(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<StoredPrReviewComment> {
+        Ok(StoredPrReviewComment {
+            id: row.get(0)?,
+            github_comment_id: row.get(1)?,
+            pr_url: row.get(2)?,
+            review_id: row.get(3)?,
+            path: row.get(4)?,
+            position: row.get(5)?,
+            line: row.get(6)?,
+            body: row.get(7)?,
+            author: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+            html_url: row.get(11)?,
+        })
+    }
+
+    /// Convert a database row to a PrReviewState.
+    /// Expects columns: pr_url, repo, pr_number, issue_id, source,
+    /// last_review_id, last_review_time, last_comment_id, last_comment_time, is_active
+    fn row_to_pr_review_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::github::PrReviewState> {
+        Ok(crate::github::PrReviewState {
+            pr_url: row.get(0)?,
+            repo: row.get(1)?,
+            pr_number: row.get(2)?,
+            issue_id: row.get(3)?,
+            source: row.get(4)?,
+            last_review_id: row.get(5)?,
+            last_review_time: row.get(6)?,
+            last_comment_id: row.get(7)?,
+            last_comment_time: row.get(8)?,
+            is_active: row.get::<_, i32>(9)? != 0,
+        })
+    }
+
     /// Store an issue embedding.
     pub fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
         let conn = self.acquire_lock()?;
@@ -1395,9 +1747,28 @@ impl SqliteTracker {
         Ok(result)
     }
 
-    /// Get all embeddings, optionally filtered by source.
-    pub fn get_all_embeddings(&self, source: Option<&str>) -> Result<Vec<IssueEmbedding>> {
+    /// Get embeddings with pagination support to prevent memory exhaustion.
+    ///
+    /// # Arguments
+    /// * `source` - Optional filter by source
+    /// * `limit` - Maximum number of embeddings to return (defaults to 1000, max 10000)
+    /// * `offset` - Number of records to skip for pagination (defaults to 0)
+    ///
+    /// # Returns
+    /// A vector of embeddings, limited to prevent unbounded memory usage.
+    pub fn get_all_embeddings(
+        &self,
+        source: Option<&str>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<IssueEmbedding>> {
         let conn = self.acquire_lock()?;
+
+        // Enforce reasonable limits to prevent memory exhaustion
+        const DEFAULT_LIMIT: usize = 1000;
+        const MAX_LIMIT: usize = 10000;
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+        let offset = offset.unwrap_or(0);
 
         let query = match source {
             Some(_) => {
@@ -1406,6 +1777,7 @@ impl SqliteTracker {
                 FROM issue_embeddings
                 WHERE source = ?
                 ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
             "#
             }
             None => {
@@ -1413,6 +1785,7 @@ impl SqliteTracker {
                 SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at
                 FROM issue_embeddings
                 ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
             "#
             }
         };
@@ -1452,8 +1825,8 @@ impl SqliteTracker {
         };
 
         let rows = match source {
-            Some(s) => stmt.query_map(params![s], row_mapper)?,
-            None => stmt.query_map([], row_mapper)?,
+            Some(s) => stmt.query_map(params![s, limit as i64, offset as i64], row_mapper)?,
+            None => stmt.query_map(params![limit as i64, offset as i64], row_mapper)?,
         };
 
         // Collect results, propagating any errors from corrupted embeddings
@@ -1557,6 +1930,59 @@ impl SqliteTracker {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Record multiple metrics in a single transaction for better performance.
+    ///
+    /// This is more efficient than calling `record_metric` in a loop because:
+    /// - Single transaction reduces fsync overhead
+    /// - Prepared statement is reused across all inserts
+    pub fn record_metrics_batch(&self, metrics: &[ProcessingMetric]) -> Result<usize> {
+        if metrics.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = self.acquire_lock()?;
+        conn.execute("BEGIN IMMEDIATE", [])?;
+
+        let result = (|| {
+            let mut stmt = conn.prepare_cached(
+                r#"
+                INSERT INTO processing_metrics (timestamp, metric_name, metric_value, source, tags)
+                VALUES (?, ?, ?, ?, ?)
+                "#,
+            )?;
+
+            for metric in metrics {
+                let tags_json = metric.tags.as_ref().map(|t| t.to_string());
+                stmt.execute(params![
+                    metric.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    metric.metric_name,
+                    metric.metric_value,
+                    metric.source,
+                    tags_json,
+                ])?;
+            }
+            Ok(metrics.len())
+        })();
+
+        match result {
+            Ok(count) => {
+                conn.execute("COMMIT", [])?;
+                Ok(count)
+            }
+            Err(e) => {
+                if let Err(rollback_err) = conn.execute("ROLLBACK", []) {
+                    tracing::error!(
+                        component = "sqlite",
+                        original_error = %e,
+                        rollback_error = %rollback_err,
+                        "Failed to rollback transaction after batch metrics insert error"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Get metrics by name within a time range.
@@ -1878,12 +2304,16 @@ impl SqliteTracker {
     pub fn prune_old_activities(&self, days_to_keep: i64) -> Result<usize> {
         let conn = self.acquire_lock()?;
 
+        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
+        // This is safer than building strings in SQL even though days_to_keep is already i64
+        let modifier = format!("-{} days", days_to_keep.abs());
+
         let deleted = conn.execute(
             r#"
             DELETE FROM activity_log
-            WHERE timestamp < datetime('now', ? || ' days')
+            WHERE timestamp < datetime('now', ?)
             "#,
-            params![format!("-{}", days_to_keep)],
+            params![modifier],
         )?;
 
         Ok(deleted)
@@ -1893,12 +2323,15 @@ impl SqliteTracker {
     pub fn prune_old_metrics(&self, days_to_keep: i64) -> Result<usize> {
         let conn = self.acquire_lock()?;
 
+        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
+        let modifier = format!("-{} days", days_to_keep.abs());
+
         let deleted = conn.execute(
             r#"
             DELETE FROM processing_metrics
-            WHERE timestamp < datetime('now', ? || ' days')
+            WHERE timestamp < datetime('now', ?)
             "#,
-            params![format!("-{}", days_to_keep)],
+            params![modifier],
         )?;
 
         Ok(deleted)
@@ -2359,6 +2792,7 @@ impl SqliteTracker {
     // ================================================================
 
     /// Record an inference attempt.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_inference_attempt(
         &self,
         issue_id: &str,
@@ -2477,6 +2911,53 @@ impl SqliteTracker {
                 none: no_match as usize,
             },
         })
+    }
+
+    /// Get recent inference history.
+    ///
+    /// Returns the most recent inference attempts, sorted by creation time (newest first).
+    pub fn get_inference_history(&self, limit: usize) -> Result<Vec<InferenceHistoryEntry>> {
+        let conn = self.acquire_lock()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT
+                ia.id,
+                ia.issue_id,
+                ia.issue_source,
+                ia.extracted_keywords,
+                r.name as repo_name,
+                ia.confidence,
+                ia.inference_reason,
+                ia.was_correct,
+                ia.inference_duration_ms,
+                ia.created_at
+            FROM inference_attempts ia
+            LEFT JOIN repositories r ON ia.inferred_repo_id = r.id
+            ORDER BY ia.created_at DESC
+            LIMIT ?",
+        )?;
+
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(InferenceHistoryEntry {
+                id: row.get(0)?,
+                issue_id: row.get(1)?,
+                issue_source: row.get(2)?,
+                extracted_keywords: row.get(3)?,
+                inferred_repo_name: row.get(4)?,
+                confidence: row.get(5)?,
+                inference_reason: row.get(6)?,
+                was_correct: row.get(7)?,
+                duration_ms: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+
+        Ok(entries)
     }
 
     /// Get diagnostic counts for all major tables.
@@ -2861,7 +3342,7 @@ impl SqliteTracker {
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at
+                   retry_count, last_retry_at, issue_labels
             FROM fix_attempts
             WHERE id = ?
             "#,
@@ -3131,6 +3612,48 @@ pub struct ConfidenceBreakdown {
     pub medium: usize,
     pub low: usize,
     pub none: usize,
+}
+
+/// A single inference attempt from the history.
+#[derive(Debug, Clone)]
+pub struct InferenceHistoryEntry {
+    /// Unique ID of the inference attempt.
+    pub id: i64,
+    /// Issue ID that was being processed.
+    pub issue_id: String,
+    /// Source of the issue (e.g., "linear", "sentry").
+    pub issue_source: String,
+    /// Keywords extracted from the issue.
+    pub extracted_keywords: Option<String>,
+    /// Inferred repository name (if matched).
+    pub inferred_repo_name: Option<String>,
+    /// Confidence level ("high", "medium", "low", or None).
+    pub confidence: Option<String>,
+    /// Reason for the inference decision.
+    pub inference_reason: Option<String>,
+    /// Whether the inference was correct (if feedback provided).
+    pub was_correct: Option<bool>,
+    /// Duration of the inference in milliseconds.
+    pub duration_ms: Option<i64>,
+    /// When this inference was recorded.
+    pub created_at: String,
+}
+
+/// A stored PR review comment from the database.
+#[derive(Debug, Clone)]
+pub struct StoredPrReviewComment {
+    pub id: i64,
+    pub github_comment_id: i64,
+    pub pr_url: String,
+    pub review_id: Option<i64>,
+    pub path: String,
+    pub position: Option<i64>,
+    pub line: Option<i64>,
+    pub body: String,
+    pub author: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
 }
 
 /// A repository stored in the database.
@@ -4257,5 +4780,366 @@ mod tests {
         assert!(!checks[0].issue_still_exists);
         assert!(!checks[1].issue_still_exists);
         assert!(checks[2].issue_still_exists);
+    }
+
+    #[test]
+    fn test_pragma_settings_applied() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let conn = tracker.acquire_lock().unwrap();
+
+        // Verify WAL mode is enabled (note: in-memory DBs may not support WAL, so we check for memory or wal)
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        // In-memory databases use "memory" journal mode, file-based would use "wal"
+        assert!(
+            journal_mode == "memory" || journal_mode == "wal",
+            "Expected journal_mode to be 'memory' or 'wal', got '{}'",
+            journal_mode
+        );
+
+        // Verify synchronous is NORMAL (1)
+        let synchronous: i32 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "Expected synchronous=1 (NORMAL)");
+
+        // Verify cache_size is set (negative means KB)
+        let cache_size: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache_size, -65536, "Expected cache_size=-65536 (64MB)");
+
+        // Verify temp_store is MEMORY (2)
+        let temp_store: i32 = conn
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(temp_store, 2, "Expected temp_store=2 (MEMORY)");
+
+        // Verify busy_timeout is set
+        let busy_timeout: i32 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000, "Expected busy_timeout=5000");
+
+        // Verify foreign_keys is ON (1)
+        let foreign_keys: i32 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "Expected foreign_keys=1 (ON)");
+    }
+
+    #[test]
+    fn test_batch_record_activities() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let entries = vec![
+            ActivityLogEntry {
+                id: 0,
+                timestamp: Utc::now(),
+                activity_type: "test".to_string(),
+                source: Some("linear".to_string()),
+                issue_id: Some("1".to_string()),
+                short_id: Some("LIN-1".to_string()),
+                message: "Test activity 1".to_string(),
+                metadata: None,
+            },
+            ActivityLogEntry {
+                id: 0,
+                timestamp: Utc::now(),
+                activity_type: "test".to_string(),
+                source: Some("linear".to_string()),
+                issue_id: Some("2".to_string()),
+                short_id: Some("LIN-2".to_string()),
+                message: "Test activity 2".to_string(),
+                metadata: None,
+            },
+            ActivityLogEntry {
+                id: 0,
+                timestamp: Utc::now(),
+                activity_type: "test".to_string(),
+                source: Some("sentry".to_string()),
+                issue_id: Some("3".to_string()),
+                short_id: Some("SENTRY-3".to_string()),
+                message: "Test activity 3".to_string(),
+                metadata: None,
+            },
+        ];
+
+        let count = tracker.record_activities_batch(&entries).unwrap();
+        assert_eq!(count, 3);
+
+        let activities = tracker.get_recent_activities(10, None).unwrap();
+        assert_eq!(activities.len(), 3);
+    }
+
+    #[test]
+    fn test_batch_record_activities_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let entries: Vec<ActivityLogEntry> = vec![];
+
+        let count = tracker.record_activities_batch(&entries).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_batch_record_metrics() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let metrics = vec![
+            ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: "issues_processed".to_string(),
+                metric_value: 10.0,
+                source: Some("linear".to_string()),
+                tags: None,
+            },
+            ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: "issues_processed".to_string(),
+                metric_value: 5.0,
+                source: Some("sentry".to_string()),
+                tags: None,
+            },
+            ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: "fix_duration_secs".to_string(),
+                metric_value: 120.5,
+                source: Some("linear".to_string()),
+                tags: None,
+            },
+        ];
+
+        let count = tracker.record_metrics_batch(&metrics).unwrap();
+        assert_eq!(count, 3);
+
+        let fetched = tracker.get_metrics("issues_processed", None, 10).unwrap();
+        assert_eq!(fetched.len(), 2);
+    }
+
+    #[test]
+    fn test_batch_record_metrics_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let metrics: Vec<ProcessingMetric> = vec![];
+
+        let count = tracker.record_metrics_batch(&metrics).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ================================================================
+    // PR Review State Persistence Tests
+    // ================================================================
+
+    #[test]
+    fn test_save_and_get_pr_review_states() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a PR review state
+        let state = crate::github::PrReviewState::new(
+            "https://github.com/owner/repo/pull/123",
+            "owner/repo",
+            123,
+            "issue-1",
+            "linear",
+        );
+
+        // Save it
+        tracker.save_pr_review_state(&state).unwrap();
+
+        // Retrieve active states
+        let states = tracker.get_active_pr_review_states().unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].pr_url, "https://github.com/owner/repo/pull/123");
+        assert_eq!(states[0].repo, "owner/repo");
+        assert_eq!(states[0].pr_number, 123);
+        assert_eq!(states[0].issue_id, "issue-1");
+        assert_eq!(states[0].source, "linear");
+        assert!(states[0].is_active);
+    }
+
+    #[test]
+    fn test_pr_review_state_update() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create and save initial state
+        let mut state = crate::github::PrReviewState::new(
+            "https://github.com/owner/repo/pull/456",
+            "owner/repo",
+            456,
+            "issue-2",
+            "sentry",
+        );
+        tracker.save_pr_review_state(&state).unwrap();
+
+        // Update the state with review info
+        state.last_review_id = Some(999);
+        state.last_review_time = Some("2024-01-15T10:00:00Z".to_string());
+        state.last_comment_id = Some(888);
+        state.last_comment_time = Some("2024-01-15T11:00:00Z".to_string());
+        tracker.save_pr_review_state(&state).unwrap();
+
+        // Verify the update
+        let states = tracker.get_active_pr_review_states().unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].last_review_id, Some(999));
+        assert_eq!(states[0].last_review_time, Some("2024-01-15T10:00:00Z".to_string()));
+        assert_eq!(states[0].last_comment_id, Some(888));
+        assert_eq!(states[0].last_comment_time, Some("2024-01-15T11:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_deactivate_pr_review_state() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create and save two states
+        let state1 = crate::github::PrReviewState::new(
+            "https://github.com/owner/repo/pull/1",
+            "owner/repo",
+            1,
+            "issue-1",
+            "linear",
+        );
+        let state2 = crate::github::PrReviewState::new(
+            "https://github.com/owner/repo/pull/2",
+            "owner/repo",
+            2,
+            "issue-2",
+            "linear",
+        );
+        tracker.save_pr_review_state(&state1).unwrap();
+        tracker.save_pr_review_state(&state2).unwrap();
+
+        // Verify both are active
+        let states = tracker.get_active_pr_review_states().unwrap();
+        assert_eq!(states.len(), 2);
+
+        // Deactivate one
+        tracker.deactivate_pr_review_state(&state1.pr_url).unwrap();
+
+        // Verify only one remains active
+        let states = tracker.get_active_pr_review_states().unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].pr_url, "https://github.com/owner/repo/pull/2");
+    }
+
+    #[test]
+    fn test_record_pr_review_comment() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let comment = crate::github::PrReviewComment {
+            id: 12345,
+            path: "src/main.rs".to_string(),
+            position: Some(10),
+            original_position: None,
+            body: "Consider using a const here".to_string(),
+            user: crate::github::GitHubUser {
+                id: 1,
+                login: "reviewer1".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: "https://github.com/owner/repo/pull/1#comment-12345".to_string(),
+            pull_request_review_id: None, // None since we haven't created a review
+            start_line: None,
+            line: Some(42),
+            side: Some("RIGHT".to_string()),
+        };
+
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        tracker.record_pr_review_comment(pr_url, &comment).unwrap();
+
+        // Retrieve and verify
+        let comments = tracker.get_comments_for_pr(pr_url).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].github_comment_id, 12345);
+        assert_eq!(comments[0].path, "src/main.rs");
+        assert_eq!(comments[0].body, "Consider using a const here");
+        assert_eq!(comments[0].author, "reviewer1");
+        assert_eq!(comments[0].line, Some(42));
+    }
+
+    #[test]
+    fn test_get_comments_for_pr() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let pr_url = "https://github.com/owner/repo/pull/42";
+
+        // Create multiple comments
+        for i in 1..=3 {
+            let comment = crate::github::PrReviewComment {
+                id: i * 100,
+                path: format!("src/file{}.rs", i),
+                position: Some(i),
+                original_position: None,
+                body: format!("Comment {}", i),
+                user: crate::github::GitHubUser {
+                    id: i,
+                    login: format!("reviewer{}", i),
+                    user_type: Some("User".to_string()),
+                },
+                created_at: format!("2024-01-15T10:0{}:00Z", i),
+                updated_at: format!("2024-01-15T10:0{}:00Z", i),
+                html_url: format!("https://github.com/owner/repo/pull/42#comment-{}", i * 100),
+                pull_request_review_id: None,
+                start_line: None,
+                line: Some(i),
+                side: None,
+            };
+            tracker.record_pr_review_comment(pr_url, &comment).unwrap();
+        }
+
+        let comments = tracker.get_comments_for_pr(pr_url).unwrap();
+        assert_eq!(comments.len(), 3);
+
+        // Verify ordering by created_at ASC
+        assert_eq!(comments[0].github_comment_id, 100);
+        assert_eq!(comments[1].github_comment_id, 200);
+        assert_eq!(comments[2].github_comment_id, 300);
+    }
+
+    #[test]
+    fn test_pr_review_comment_upsert() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let comment = crate::github::PrReviewComment {
+            id: 999,
+            path: "src/main.rs".to_string(),
+            position: None,
+            original_position: None,
+            body: "Original comment".to_string(),
+            user: crate::github::GitHubUser {
+                id: 1,
+                login: "author".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: "https://github.com/owner/repo/pull/1#comment-999".to_string(),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+
+        tracker.record_pr_review_comment(pr_url, &comment).unwrap();
+
+        // Update the comment (same id, different body)
+        let updated_comment = crate::github::PrReviewComment {
+            body: "Updated comment body".to_string(),
+            updated_at: "2024-01-15T11:00:00Z".to_string(),
+            ..comment
+        };
+        tracker.record_pr_review_comment(pr_url, &updated_comment).unwrap();
+
+        // Should still have only one comment
+        let comments = tracker.get_comments_for_pr(pr_url).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "Updated comment body");
+        assert_eq!(comments[0].updated_at, "2024-01-15T11:00:00Z");
     }
 }

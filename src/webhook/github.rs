@@ -109,13 +109,29 @@ impl GitHubWebhookHandler {
 
     /// Process a webhook payload.
     ///
+    /// SECURITY: This method verifies the webhook signature before processing.
+    /// The raw_payload must be the exact bytes received from GitHub (before JSON parsing)
+    /// to ensure signature verification is accurate.
+    ///
     /// Returns Ok(true) if the event was processed, Ok(false) if it was ignored,
     /// or an error if processing failed.
     pub async fn process_webhook(
         &self,
+        raw_payload: &[u8],
         payload: &serde_json::Value,
         headers: &HashMap<String, String>,
     ) -> Result<bool> {
+        // CRITICAL: Verify signature before processing any webhook data
+        if !self.verify_signature(raw_payload, headers) {
+            tracing::warn!(
+                source = "github",
+                "Webhook signature verification failed - rejecting request"
+            );
+            return Err(crate::error::Error::Webhook(
+                "Invalid webhook signature".to_string(),
+            ));
+        }
+
         let event_type = match Self::get_event_type(headers) {
             Some(t) => t,
             None => {

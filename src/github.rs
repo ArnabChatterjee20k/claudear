@@ -2,8 +2,8 @@
 
 use crate::config::GitHubConfig;
 use crate::error::{Error, Result};
-use crate::storage::FixAttemptTracker;
-use crate::types::{FixAttempt, PrReviewRecord};
+use crate::storage::{FixAttemptTracker, SqliteTracker};
+use crate::types::{FixAttempt, IssueType, PrReviewRecord, RegressionWatch};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -165,6 +165,11 @@ impl<H: HttpClient> GitHubClient<H> {
     /// Check if configured (has token).
     pub fn is_enabled(&self) -> bool {
         self.config.token.is_some()
+    }
+
+    /// Get the review trigger tag (e.g., "/claudear").
+    pub fn review_trigger(&self) -> &str {
+        &self.config.review_trigger
     }
 
     /// Build standard GitHub API headers.
@@ -330,6 +335,10 @@ pub struct PrMonitor<H: HttpClient = ReqwestHttpClient> {
     github: GitHubClient<H>,
     tracker: Arc<dyn FixAttemptTracker>,
     auto_resolve: bool,
+    /// Optional SQLite tracker for regression watching.
+    /// When set, merged PRs for bug issues will create regression watches
+    /// instead of auto-resolving.
+    regression_tracker: Option<Arc<SqliteTracker>>,
 }
 
 impl PrMonitor<ReqwestHttpClient> {
@@ -343,6 +352,22 @@ impl PrMonitor<ReqwestHttpClient> {
             github,
             tracker,
             auto_resolve,
+            regression_tracker: None,
+        }
+    }
+
+    /// Create a new PR monitor with regression tracking enabled.
+    pub fn with_regression_tracking(
+        github: GitHubClient,
+        tracker: Arc<dyn FixAttemptTracker>,
+        auto_resolve: bool,
+        regression_tracker: Arc<SqliteTracker>,
+    ) -> Self {
+        Self {
+            github,
+            tracker,
+            auto_resolve,
+            regression_tracker: Some(regression_tracker),
         }
     }
 }
@@ -358,6 +383,25 @@ impl<H: HttpClient> PrMonitor<H> {
             github,
             tracker,
             auto_resolve,
+            regression_tracker: None,
+        }
+    }
+
+    /// Determine if a fix attempt is for a bug-type issue.
+    ///
+    /// Bug-type issues are:
+    /// - All Sentry issues (always bugs)
+    /// - Linear issues with a "bug" label (check metadata if available)
+    fn is_bug_type(&self, attempt: &FixAttempt) -> bool {
+        attempt.is_bug()
+    }
+
+    /// Get the issue type for a fix attempt.
+    fn get_issue_type(&self, attempt: &FixAttempt) -> IssueType {
+        match attempt.source.as_str() {
+            "sentry" => IssueType::SentryIssue,
+            "linear" => IssueType::LinearBug,
+            _ => IssueType::SentryIssue, // Default fallback
         }
     }
 
@@ -426,13 +470,77 @@ impl<H: HttpClient> PrMonitor<H> {
                 }));
                 let _ = self.tracker.record_activity(&activity);
 
+                // Determine if we should start regression tracking instead of auto-resolving
+                let is_bug = self.is_bug_type(attempt);
+                let regression_watch_id = if is_bug {
+                    if let Some(ref regression_tracker) = self.regression_tracker {
+                        // Create a regression watch for bug-type issues
+                        let issue_type = self.get_issue_type(attempt);
+                        let mut watch =
+                            RegressionWatch::new(issue_type, &attempt.issue_id, attempt.id);
+                        watch.pr_merged_at = Some(chrono::Utc::now());
+
+                        match regression_tracker.create_regression_watch(&watch) {
+                            Ok(watch_id) => {
+                                tracing::info!(
+                                    source = "github",
+                                    issue_id = %attempt.issue_id,
+                                    watch_id = watch_id,
+                                    "Created regression watch for bug fix"
+                                );
+
+                                // Log activity for regression watch creation
+                                let watch_activity = crate::types::ActivityLogEntry::new(
+                                    "regression_watch_created",
+                                    format!(
+                                        "Started regression monitoring for {} after PR merge",
+                                        attempt.short_id
+                                    ),
+                                )
+                                .with_source(attempt.source.clone())
+                                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                                .with_metadata(serde_json::json!({
+                                    "watch_id": watch_id,
+                                    "issue_type": issue_type.to_string(),
+                                    "pr_url": pr_url
+                                }));
+                                let _ = self.tracker.record_activity(&watch_activity);
+
+                                Some(watch_id)
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    source = "github",
+                                    issue_id = %attempt.issue_id,
+                                    error = %e,
+                                    "Failed to create regression watch"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // For bugs with regression tracking, don't auto-resolve yet
+                // The issue will be resolved after 24 hours of no regressions
+                let should_resolve = if regression_watch_id.is_some() {
+                    false // Don't auto-resolve, regression monitoring will handle it
+                } else {
+                    self.auto_resolve
+                };
+
                 Ok(Some(PrStatusUpdate {
                     source: attempt.source.clone(),
                     issue_id: attempt.issue_id.clone(),
                     short_id: attempt.short_id.clone(),
                     pr_url,
                     new_status: PrStatus::Merged,
-                    should_resolve: self.auto_resolve,
+                    should_resolve,
+                    regression_watch_id,
                 }))
             }
             PrStatus::Closed => {
@@ -467,6 +575,7 @@ impl<H: HttpClient> PrMonitor<H> {
                     pr_url,
                     new_status: PrStatus::Closed,
                     should_resolve: false,
+                    regression_watch_id: None,
                 }))
             }
             PrStatus::Open => Ok(None),
@@ -484,6 +593,9 @@ pub struct PrStatusUpdate {
     pub new_status: PrStatus,
     /// Whether the issue should be resolved on the source.
     pub should_resolve: bool,
+    /// If set, a regression watch was created for this bug fix.
+    /// The issue won't be auto-resolved until regression monitoring completes.
+    pub regression_watch_id: Option<i64>,
 }
 
 /// State for tracking PR reviews.
@@ -618,6 +730,8 @@ pub struct ReviewWatcher<H: HttpClient = ReqwestHttpClient> {
     states: std::sync::RwLock<std::collections::HashMap<String, PrReviewState>>,
     /// Optional tracker for recording reviews to the database
     tracker: Option<Arc<dyn FixAttemptTracker>>,
+    /// Optional sqlite tracker for persisting review states
+    sqlite_tracker: Option<Arc<SqliteTracker>>,
 }
 
 impl ReviewWatcher<ReqwestHttpClient> {
@@ -627,6 +741,7 @@ impl ReviewWatcher<ReqwestHttpClient> {
             github,
             states: std::sync::RwLock::new(std::collections::HashMap::new()),
             tracker: None,
+            sqlite_tracker: None,
         }
     }
 
@@ -636,6 +751,21 @@ impl ReviewWatcher<ReqwestHttpClient> {
             github,
             states: std::sync::RwLock::new(std::collections::HashMap::new()),
             tracker: Some(tracker),
+            sqlite_tracker: None,
+        }
+    }
+
+    /// Create a new review watcher with a sqlite tracker for state persistence.
+    pub fn with_sqlite_tracker(
+        github: GitHubClient,
+        tracker: Arc<dyn FixAttemptTracker>,
+        sqlite_tracker: Option<Arc<SqliteTracker>>,
+    ) -> Self {
+        Self {
+            github,
+            states: std::sync::RwLock::new(std::collections::HashMap::new()),
+            tracker: Some(tracker),
+            sqlite_tracker,
         }
     }
 }
@@ -647,6 +777,7 @@ impl<H: HttpClient> ReviewWatcher<H> {
             github,
             states: std::sync::RwLock::new(std::collections::HashMap::new()),
             tracker: None,
+            sqlite_tracker: None,
         }
     }
 
@@ -659,6 +790,7 @@ impl<H: HttpClient> ReviewWatcher<H> {
             github,
             states: std::sync::RwLock::new(std::collections::HashMap::new()),
             tracker: Some(tracker),
+            sqlite_tracker: None,
         }
     }
 
@@ -669,13 +801,43 @@ impl<H: HttpClient> ReviewWatcher<H> {
 
     /// Start watching a PR for reviews.
     pub fn watch_pr(&self, state: PrReviewState) {
-        let mut states = self.states.write().unwrap();
+        // Persist to database first if sqlite_tracker is available
+        if let Some(ref sqlite) = self.sqlite_tracker {
+            if let Err(e) = sqlite.save_pr_review_state(&state) {
+                tracing::warn!(
+                    component = "review_watcher",
+                    pr_url = %state.pr_url,
+                    error = %e,
+                    "Failed to persist PR review state to database"
+                );
+            }
+        }
+
+        let mut states = self.states.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+            poisoned.into_inner()
+        });
         states.insert(state.pr_url.clone(), state);
     }
 
     /// Stop watching a PR.
     pub fn unwatch_pr(&self, pr_url: &str) {
-        let mut states = self.states.write().unwrap();
+        // Deactivate in database first if sqlite_tracker is available
+        if let Some(ref sqlite) = self.sqlite_tracker {
+            if let Err(e) = sqlite.deactivate_pr_review_state(pr_url) {
+                tracing::warn!(
+                    component = "review_watcher",
+                    pr_url = %pr_url,
+                    error = %e,
+                    "Failed to deactivate PR review state in database"
+                );
+            }
+        }
+
+        let mut states = self.states.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+            poisoned.into_inner()
+        });
         if let Some(state) = states.get_mut(pr_url) {
             state.is_active = false;
         }
@@ -683,19 +845,28 @@ impl<H: HttpClient> ReviewWatcher<H> {
 
     /// Get the state for a PR.
     pub fn get_state(&self, pr_url: &str) -> Option<PrReviewState> {
-        let states = self.states.read().unwrap();
+        let states = self.states.read().unwrap_or_else(|poisoned| {
+            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+            poisoned.into_inner()
+        });
         states.get(pr_url).cloned()
     }
 
     /// Get all active states.
     pub fn get_active_states(&self) -> Vec<PrReviewState> {
-        let states = self.states.read().unwrap();
+        let states = self.states.read().unwrap_or_else(|poisoned| {
+            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+            poisoned.into_inner()
+        });
         states.values().filter(|s| s.is_active).cloned().collect()
     }
 
     /// Load states from storage.
     pub fn load_states(&self, states_vec: Vec<PrReviewState>) {
-        let mut states = self.states.write().unwrap();
+        let mut states = self.states.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+            poisoned.into_inner()
+        });
         for state in states_vec {
             if state.is_active {
                 states.insert(state.pr_url.clone(), state);
@@ -705,7 +876,10 @@ impl<H: HttpClient> ReviewWatcher<H> {
 
     /// Get all states for persistence.
     pub fn get_all_states(&self) -> Vec<PrReviewState> {
-        let states = self.states.read().unwrap();
+        let states = self.states.read().unwrap_or_else(|poisoned| {
+            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+            poisoned.into_inner()
+        });
         states.values().cloned().collect()
     }
 
@@ -716,7 +890,10 @@ impl<H: HttpClient> ReviewWatcher<H> {
         }
 
         let states_to_check: Vec<PrReviewState> = {
-            let states = self.states.read().unwrap();
+            let states = self.states.read().unwrap_or_else(|poisoned| {
+                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+                poisoned.into_inner()
+            });
             states.values().filter(|s| s.is_active).cloned().collect()
         };
 
@@ -828,10 +1005,25 @@ impl<H: HttpClient> ReviewWatcher<H> {
             });
 
             // Update state
-            let mut states = self.states.write().unwrap();
+            let mut states = self.states.write().unwrap_or_else(|poisoned| {
+                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+                poisoned.into_inner()
+            });
             if let Some(s) = states.get_mut(&state.pr_url) {
                 s.last_review_id = Some(review.id);
                 s.last_review_time = review.submitted_at.clone();
+
+                // Persist state update to database
+                if let Some(ref sqlite) = self.sqlite_tracker {
+                    if let Err(e) = sqlite.save_pr_review_state(s) {
+                        tracing::warn!(
+                            component = "review_watcher",
+                            pr_url = %s.pr_url,
+                            error = %e,
+                            "Failed to persist PR review state update"
+                        );
+                    }
+                }
             }
         }
 
@@ -845,7 +1037,10 @@ impl<H: HttpClient> ReviewWatcher<H> {
             )
             .await?;
 
-        // Filter out comments we've already processed
+        // Get the review trigger (e.g., "/claudear")
+        let trigger = self.github.review_trigger();
+
+        // Filter out comments we've already processed and apply trigger filter
         let new_comments: Vec<_> = comments
             .into_iter()
             .filter(|c| {
@@ -856,15 +1051,54 @@ impl<H: HttpClient> ReviewWatcher<H> {
                 }
             })
             .filter(|c| c.user.user_type.as_deref() != Some("Bot"))
+            .filter(|c| {
+                // If trigger is empty, process all comments
+                // Otherwise, only process comments containing the trigger
+                if trigger.is_empty() {
+                    true
+                } else {
+                    c.body.to_lowercase().contains(&trigger.to_lowercase())
+                }
+            })
             .collect();
 
         if !new_comments.is_empty() {
+            // Record comments to database
+            if let Some(ref sqlite) = self.sqlite_tracker {
+                for comment in &new_comments {
+                    if let Err(e) = sqlite.record_pr_review_comment(&state.pr_url, comment) {
+                        tracing::warn!(
+                            component = "review_watcher",
+                            pr_url = %state.pr_url,
+                            comment_id = comment.id,
+                            error = %e,
+                            "Failed to record PR review comment"
+                        );
+                    }
+                }
+            }
+
             // Update state with latest comment
             if let Some(latest) = new_comments.iter().max_by_key(|c| c.id) {
-                let mut states = self.states.write().unwrap();
+                let mut states = self.states.write().unwrap_or_else(|poisoned| {
+                    tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+                    poisoned.into_inner()
+                });
                 if let Some(s) = states.get_mut(&state.pr_url) {
                     s.last_comment_id = Some(latest.id);
                     s.last_comment_time = Some(latest.updated_at.clone());
+
+                    // Persist state update to database
+                    if let Some(ref sqlite) = self.sqlite_tracker {
+                        if let Err(e) = sqlite.save_pr_review_state(s) {
+                            tracing::warn!(
+                                component = "review_watcher",
+                                pr_url = %s.pr_url,
+                                error = %e,
+                                "Failed to persist PR review state update"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -1023,6 +1257,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1043,6 +1279,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1063,6 +1301,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1079,6 +1319,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1100,6 +1342,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1134,6 +1378,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1155,6 +1401,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1185,6 +1433,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1212,6 +1462,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1240,6 +1492,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1263,6 +1517,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1287,6 +1543,8 @@ mod tests {
             token: Some("my_secret_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1322,6 +1580,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1359,6 +1619,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1390,6 +1652,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1421,6 +1685,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1447,7 +1713,7 @@ mod tests {
             "https://api.github.com/repos/owner/repo/pulls/1/comments",
             200,
             r#"[
-                {"id": 1, "path": "file.rs", "body": "Fix this", "user": {"id": 123, "login": "user", "type": "User"}, "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z", "html_url": "url"}
+                {"id": 1, "path": "file.rs", "body": "/claudear Fix this", "user": {"id": 123, "login": "user", "type": "User"}, "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z", "html_url": "url"}
             ]"#,
         );
 
@@ -1455,6 +1721,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1467,7 +1735,7 @@ mod tests {
         match &events[0] {
             ReviewEvent::CommentsAdded { comments, .. } => {
                 assert_eq!(comments.len(), 1);
-                assert_eq!(comments[0].body, "Fix this");
+                assert_eq!(comments[0].body, "/claudear Fix this");
             }
             _ => panic!("Expected CommentsAdded event"),
         }
@@ -1493,6 +1761,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1519,6 +1789,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::new(config);
         assert!(client.is_enabled());
@@ -1684,6 +1956,8 @@ mod tests {
             token: Some("test".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -1707,6 +1981,8 @@ mod tests {
             token: Some("test".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -1729,6 +2005,8 @@ mod tests {
             token: Some("test".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -1760,6 +2038,8 @@ mod tests {
             token: Some("my_token".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::new(config);
         assert_eq!(client.token(), Some("my_token"));
@@ -1869,11 +2149,13 @@ mod tests {
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
             new_status: PrStatus::Merged,
             should_resolve: true,
+            regression_watch_id: None,
         };
 
         assert_eq!(update.source, "linear");
         assert_eq!(update.new_status, PrStatus::Merged);
         assert!(update.should_resolve);
+        assert!(update.regression_watch_id.is_none());
     }
 
     #[test]
@@ -1939,6 +2221,8 @@ mod tests {
             token: Some("test".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client_enabled = GitHubClient::new(config_enabled);
         let watcher_enabled = ReviewWatcher::new(client_enabled);
@@ -2074,11 +2358,13 @@ mod tests {
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
             new_status: PrStatus::Merged,
             should_resolve: true,
+            regression_watch_id: Some(42),
         };
 
         let cloned = update.clone();
         assert_eq!(cloned.source, "linear");
         assert_eq!(cloned.new_status, PrStatus::Merged);
+        assert_eq!(cloned.regression_watch_id, Some(42));
     }
 
     #[test]
@@ -2090,6 +2376,7 @@ mod tests {
             pr_url: "url".to_string(),
             new_status: PrStatus::Closed,
             should_resolve: false,
+            regression_watch_id: None,
         };
         let debug = format!("{:?}", update);
         assert!(debug.contains("sentry"));
@@ -2134,6 +2421,8 @@ mod tests {
             token: Some("test".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -2250,6 +2539,8 @@ mod tests {
             token: Some("test".to_string()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -2302,6 +2593,8 @@ mod tests {
             token: Some("test_token".to_string()),
             poll_interval_ms: 30000,
             auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
         };
         let client = GitHubClient::new(config);
         assert!(client.is_enabled());
@@ -2342,5 +2635,131 @@ mod tests {
         let pr: PullRequest = serde_json::from_str(json).unwrap();
         assert!(pr.merged);
         assert_eq!(pr.state, "closed");
+    }
+
+    #[test]
+    fn test_pr_status_update_with_regression_watch() {
+        let update = PrStatusUpdate {
+            source: "sentry".to_string(),
+            issue_id: "issue-1".to_string(),
+            short_id: "SENTRY-1".to_string(),
+            pr_url: "https://github.com/org/repo/pull/1".to_string(),
+            new_status: PrStatus::Merged,
+            should_resolve: false, // Should be false when regression watch is active
+            regression_watch_id: Some(123),
+        };
+
+        assert!(!update.should_resolve);
+        assert_eq!(update.regression_watch_id, Some(123));
+    }
+
+    #[test]
+    fn test_is_bug_type_sentry() {
+        let mock = MockHttpClient::new();
+        let config = GitHubConfig::default();
+        let github_client = GitHubClient::with_http_client(config, mock);
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let monitor = PrMonitor::with_http_client(
+            github_client,
+            tracker.clone() as Arc<dyn FixAttemptTracker>,
+            true,
+        );
+
+        // Sentry issues should always be bugs
+        let sentry_attempt = FixAttempt {
+            id: 1,
+            issue_id: "sentry-issue-1".to_string(),
+            short_id: "SENTRY-1".to_string(),
+            source: "sentry".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: crate::types::FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+        };
+        assert!(monitor.is_bug_type(&sentry_attempt));
+
+        // Linear issues are not bugs by default (would need label check)
+        let linear_attempt = FixAttempt {
+            id: 2,
+            issue_id: "linear-issue-1".to_string(),
+            short_id: "LIN-1".to_string(),
+            source: "linear".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: crate::types::FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+        };
+        assert!(!monitor.is_bug_type(&linear_attempt));
+    }
+
+    #[test]
+    fn test_get_issue_type() {
+        let mock = MockHttpClient::new();
+        let config = GitHubConfig::default();
+        let github_client = GitHubClient::with_http_client(config, mock);
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let monitor = PrMonitor::with_http_client(
+            github_client,
+            tracker.clone() as Arc<dyn FixAttemptTracker>,
+            true,
+        );
+
+        let sentry_attempt = FixAttempt {
+            id: 1,
+            issue_id: "sentry-issue-1".to_string(),
+            short_id: "SENTRY-1".to_string(),
+            source: "sentry".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: crate::types::FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+        };
+        assert_eq!(
+            monitor.get_issue_type(&sentry_attempt),
+            crate::types::IssueType::SentryIssue
+        );
+
+        let linear_attempt = FixAttempt {
+            id: 2,
+            issue_id: "linear-issue-1".to_string(),
+            short_id: "LIN-1".to_string(),
+            source: "linear".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: crate::types::FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+        };
+        assert_eq!(
+            monitor.get_issue_type(&linear_attempt),
+            crate::types::IssueType::LinearBug
+        );
     }
 }
