@@ -18,10 +18,18 @@ use axum::{
     Router,
 };
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tower::limit::ConcurrencyLimitLayer;
+
+/// Maximum time a processing entry can remain in the set before automatic cleanup (1 hour).
+/// This prevents unbounded memory growth if a task fails to clean up properly.
+const PROCESSING_ENTRY_TTL_SECS: u64 = 3600;
+
+/// Maximum number of entries in the processing set before forced cleanup.
+const MAX_PROCESSING_ENTRIES: usize = 1000;
 
 /// State shared across handlers.
 struct AppState {
@@ -32,7 +40,9 @@ struct AppState {
     sqlite_tracker: Option<Arc<SqliteTracker>>,
     inferrer: Option<RepoInferrer>,
     claude: ClaudeRunner,
-    processing: RwLock<HashSet<String>>,
+    /// Tracks currently processing webhooks with timestamps for TTL-based cleanup.
+    /// Key: processing key (source:issue_id), Value: timestamp when processing started.
+    processing: RwLock<HashMap<String, Instant>>,
 }
 
 /// HTTP server for webhooks.
@@ -105,7 +115,7 @@ impl WebhookServer {
             tracker: self.tracker,
             sqlite_tracker: self.sqlite_tracker,
             inferrer: self.inferrer,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         // Concurrency limit: max 10 concurrent webhook processing
@@ -302,16 +312,57 @@ async fn webhook_handler(
         );
     }
 
-    // Check if currently processing
+    // Check if currently processing AND atomically mark as processing if not
+    // This prevents race conditions where two webhooks pass the check simultaneously
     let processing_key = format!("{}:{}", source_name, issue.id);
     {
-        let processing = state.processing.read().await;
-        if processing.contains(&processing_key) {
+        let mut processing = state.processing.write().await;
+
+        // Clean up stale entries to prevent unbounded memory growth
+        let now = Instant::now();
+        let ttl = std::time::Duration::from_secs(PROCESSING_ENTRY_TTL_SECS);
+        processing.retain(|_, started_at| now.duration_since(*started_at) < ttl);
+
+        // If still too many entries after TTL cleanup, remove oldest entries
+        if processing.len() >= MAX_PROCESSING_ENTRIES {
+            tracing::warn!(
+                count = processing.len(),
+                "Processing set at capacity, forcing cleanup of oldest entries"
+            );
+            // Find and remove the oldest half of entries
+            let mut entries: Vec<_> = processing.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            entries.sort_by_key(|(_, v)| *v);
+            let to_remove = entries.len() / 2;
+            for (key, _) in entries.into_iter().take(to_remove) {
+                processing.remove(&key);
+            }
+        }
+
+        if processing.contains_key(&processing_key) {
             return (
                 StatusCode::OK,
                 Json(json!({ "status": "ignored", "reason": "Already processing" })),
             );
         }
+        // Atomically insert with timestamp while we hold the write lock
+        processing.insert(processing_key.clone(), Instant::now());
+    }
+
+    // Record attempt synchronously BEFORE spawning background task
+    // This prevents TOCTOU race between has_attempted check and record_attempt
+    let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
+    if let Err(e) = state
+        .tracker
+        .record_attempt_with_labels(&source_name, &issue.id, &issue.short_id, &labels)
+    {
+        // Remove from processing on failure
+        let mut processing = state.processing.write().await;
+        processing.remove(&processing_key);
+        tracing::error!(source = source_name.as_str(), error = %e, "Failed to record attempt");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "reason": "Failed to record attempt" })),
+        );
     }
 
     // Accept and process in background
@@ -320,7 +371,7 @@ async fn webhook_handler(
     let handler_clone = Arc::clone(handler);
 
     tokio::spawn(async move {
-        if let Err(e) = process_issue(state_clone, handler_clone, issue, match_result).await {
+        if let Err(e) = process_issue(state_clone, handler_clone, issue, match_result, processing_key).await {
             tracing::error!(source = source_name.as_str(), error = %e, "Error processing webhook");
         }
     });
@@ -339,9 +390,9 @@ async fn process_issue(
     handler: Arc<dyn WebhookHandler>,
     issue: Issue,
     match_result: crate::types::MatchResult,
+    processing_key: String,
 ) -> Result<()> {
     let source_name = handler.source_name();
-    let processing_key = format!("{}:{}", source_name, issue.id);
 
     tracing::info!(short_id = %issue.short_id, title = %issue.title, "Processing webhook issue");
     tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
@@ -357,20 +408,16 @@ async fn process_issue(
         RepoResolution::Resolved { project_dir, .. } => project_dir,
         RepoResolution::Skip { reason } => {
             tracing::debug!(short_id = %issue.short_id, reason = %reason, "Skipping issue");
+            // Clean up processing flag before returning
+            let mut processing = state.processing.write().await;
+            processing.remove(&processing_key);
+            // Mark as failed so it won't be retried (skip is intentional)
+            state.tracker.mark_failed(source_name, &issue.id, &format!("Skipped: {}", reason))?;
             return Ok(());
         }
     };
 
-    // Mark as processing
-    {
-        let mut processing = state.processing.write().await;
-        processing.insert(processing_key.clone());
-    }
-
-    // Record attempt
-    state
-        .tracker
-        .record_attempt(source_name, &issue.id, &issue.short_id)?;
+    // Note: processing flag and attempt already recorded by handle_webhook before spawning
 
     let result = async {
         // Notify start
@@ -457,7 +504,8 @@ async fn process_issue(
 mod tests {
     use super::*;
     use crate::config::{
-        DiscordConfig, EmailConfig, GitHubConfig, PushConfig, RetryConfig, SmsConfig,
+        DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig, RegressionConfig,
+        RetryConfig, SmsConfig,
     };
     use crate::notifier::Notifier;
     use crate::reports::Report;
@@ -581,9 +629,11 @@ mod tests {
             sms: SmsConfig::default(),
             push: PushConfig::default(),
             github: GitHubConfig::default(),
+            github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),
             linear: None,
             sentry: None,
+            regression: RegressionConfig::default(),
         }
     }
 
@@ -731,14 +781,15 @@ mod tests {
     }
 
     #[test]
-    fn test_app_state_processing_set_is_hashset() {
-        // Verify that processing uses HashSet semantics
-        let mut set = HashSet::new();
-        set.insert("key1".to_string());
-        set.insert("key1".to_string()); // duplicate
+    fn test_app_state_processing_map_uniqueness() {
+        // Verify that processing map has unique keys
+        let mut map: HashMap<String, Instant> = HashMap::new();
+        let time1 = Instant::now();
+        map.insert("key1".to_string(), time1);
+        map.insert("key1".to_string(), time1); // duplicate key
 
-        // HashSet should only contain one entry
-        assert_eq!(set.len(), 1);
+        // HashMap should only contain one entry for the same key
+        assert_eq!(map.len(), 1);
     }
 
     #[test]
@@ -779,20 +830,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rwlock_processing_set() {
-        // Test RwLock behavior for concurrent access
-        let processing: RwLock<HashSet<String>> = RwLock::new(HashSet::new());
+    async fn test_rwlock_processing_map() {
+        // Test RwLock behavior for concurrent access with HashMap
+        let processing: RwLock<HashMap<String, Instant>> = RwLock::new(HashMap::new());
 
         // Write
         {
             let mut write_guard = processing.write().await;
-            write_guard.insert("test".to_string());
+            write_guard.insert("test".to_string(), Instant::now());
         }
 
         // Read
         {
             let read_guard = processing.read().await;
-            assert!(read_guard.contains("test"));
+            assert!(read_guard.contains_key("test"));
             assert_eq!(read_guard.len(), 1);
         }
 
@@ -805,7 +856,7 @@ mod tests {
         // Verify removed
         {
             let read_guard = processing.read().await;
-            assert!(!read_guard.contains("test"));
+            assert!(!read_guard.contains_key("test"));
         }
     }
 
@@ -834,7 +885,7 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let Json(response) = health_handler(State(state)).await;
@@ -852,9 +903,9 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let mut processing_set = HashSet::new();
-        processing_set.insert("linear:issue1".to_string());
-        processing_set.insert("sentry:issue2".to_string());
+        let mut processing_set = HashMap::new();
+        processing_set.insert("linear:issue1".to_string(), Instant::now());
+        processing_set.insert("sentry:issue2".to_string(), Instant::now());
 
         let state = Arc::new(AppState {
             claude: ClaudeRunner::new(
@@ -902,7 +953,7 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -969,7 +1020,7 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -1011,7 +1062,7 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -1075,7 +1126,7 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -1149,7 +1200,7 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -1195,7 +1246,7 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -1226,8 +1277,8 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         // Mark issue as being processed
-        let mut processing = HashSet::new();
-        processing.insert("test:1".to_string());
+        let mut processing = HashMap::new();
+        processing.insert("test:1".to_string(), Instant::now());
 
         let state = Arc::new(AppState {
             claude: ClaudeRunner::new(
@@ -1285,7 +1336,7 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -1350,7 +1401,7 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -1462,12 +1513,41 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(HashMap::new()),
         });
 
         let Json(response) = health_handler(State(state)).await;
 
         assert_eq!(response["status"], "ok");
         assert!(response["handlers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_processing_ttl_constants() {
+        // Verify TTL constants are reasonable
+        assert!(PROCESSING_ENTRY_TTL_SECS >= 60); // At least 1 minute
+        assert!(PROCESSING_ENTRY_TTL_SECS <= 7200); // At most 2 hours
+        assert!(MAX_PROCESSING_ENTRIES >= 100); // Reasonable capacity
+    }
+
+    #[test]
+    fn test_processing_map_retain_semantics() {
+        // Test that retain works correctly for TTL cleanup
+        let mut map: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+
+        // Insert some entries
+        map.insert("key1".to_string(), now);
+        map.insert("key2".to_string(), now);
+        map.insert("key3".to_string(), now);
+
+        assert_eq!(map.len(), 3);
+
+        // Retain all (nothing expired yet since we just created them)
+        let ttl = std::time::Duration::from_secs(3600);
+        map.retain(|_, started_at| now.duration_since(*started_at) < ttl);
+
+        // All should still be present
+        assert_eq!(map.len(), 3);
     }
 }

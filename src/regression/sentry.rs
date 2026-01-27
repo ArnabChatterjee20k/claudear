@@ -86,31 +86,53 @@ impl<H: SentryHttpClient> RegressionChecker for SentryRegressionChecker<H> {
             }
         };
 
-        // Check if issue was resolved - if status is not "resolved", it's a regression
-        if issue.status != "resolved" && issue.status != "ignored" {
-            let event_count: i64 = issue.count.parse().unwrap_or(0);
-
-            if event_count >= self.config.event_threshold as i64 {
-                return Ok(RegressionResult::regression(format!(
-                    "Sentry issue {} has {} events and status '{}' after fix",
-                    issue.short_id, event_count, issue.status
-                )));
+        // Parse event count once, with proper error handling
+        // Using u64 since event counts are always non-negative
+        let event_count: u64 = match issue.count.parse() {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!(
+                    issue_id = %issue.short_id,
+                    raw_count = %issue.count,
+                    error = %e,
+                    "Failed to parse Sentry event count, defaulting to 0"
+                );
+                0
             }
+        };
+
+        // Check if issue status indicates an active problem
+        let is_active = issue.status != "resolved" && issue.status != "ignored";
+
+        // For active (unresolved) issues with events above threshold, it's a regression
+        if is_active && event_count >= u64::from(self.config.event_threshold) {
+            return Ok(RegressionResult::regression(format!(
+                "Sentry issue {} has {} events and status '{}' after fix",
+                issue.short_id, event_count, issue.status
+            )));
         }
 
-        // Check last seen date - if events occurred after monitoring started
-        if let Some(monitoring_started) = watch.monitoring_started_at {
-            // Parse the last_seen timestamp
-            if let Ok(last_seen) = chrono::DateTime::parse_from_rfc3339(&issue.last_seen) {
-                if last_seen.with_timezone(&chrono::Utc) > monitoring_started {
-                    let event_count: i64 = issue.count.parse().unwrap_or(0);
-                    return Ok(RegressionResult::regression(format!(
-                        "Sentry issue {} had activity at {} (after monitoring started at {}), {} total events",
-                        issue.short_id,
-                        last_seen.format("%Y-%m-%d %H:%M"),
-                        monitoring_started.format("%Y-%m-%d %H:%M"),
-                        event_count
-                    )));
+        // Check last seen date - but only for active issues
+        // For resolved/ignored issues, the last_seen timestamp might be from before
+        // the issue was resolved, so we shouldn't use it to determine regression.
+        if is_active {
+            if let Some(monitoring_started) = watch.monitoring_started_at {
+                if let Ok(last_seen) = chrono::DateTime::parse_from_rfc3339(&issue.last_seen) {
+                    if last_seen.with_timezone(&chrono::Utc) > monitoring_started {
+                        return Ok(RegressionResult::regression(format!(
+                            "Sentry issue {} had activity at {} (after monitoring started at {}), {} total events",
+                            issue.short_id,
+                            last_seen.format("%Y-%m-%d %H:%M"),
+                            monitoring_started.format("%Y-%m-%d %H:%M"),
+                            event_count
+                        )));
+                    }
+                } else {
+                    tracing::warn!(
+                        issue_id = %issue.short_id,
+                        last_seen = %issue.last_seen,
+                        "Failed to parse Sentry last_seen timestamp"
+                    );
                 }
             }
         }
@@ -118,7 +140,7 @@ impl<H: SentryHttpClient> RegressionChecker for SentryRegressionChecker<H> {
         Ok(RegressionResult {
             regression_detected: false,
             details: Some(format!(
-                "Sentry issue {} is {} with no new events",
+                "Sentry issue {} is {} with no new events since monitoring started",
                 issue.short_id, issue.status
             )),
         })
@@ -224,15 +246,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_regression_when_new_events_after_monitoring() {
-        // Use a recent timestamp (in the future to ensure it's after monitoring_started)
+        // Test that an unresolved issue with lastSeen after monitoring_started triggers regression
+        // Use a count below threshold to test the lastSeen check path
         let future_time = Utc::now() + Duration::hours(1);
         let body = format!(
             r#"{{
                 "id": "789",
                 "shortId": "TEST-789",
                 "title": "Test Error",
-                "count": "10",
-                "status": "resolved",
+                "count": "0",
+                "status": "unresolved",
                 "lastSeen": "{}"
             }}"#,
             future_time.to_rfc3339()
@@ -247,6 +270,57 @@ mod tests {
         let result = checker.check_regression(&watch).await.unwrap();
         assert!(result.regression_detected);
         assert!(result.details.unwrap().contains("had activity"));
+    }
+
+    #[tokio::test]
+    async fn test_regression_when_unresolved_with_high_event_count() {
+        // Test that an unresolved issue with events above threshold triggers regression
+        let body = r#"{
+            "id": "791",
+            "shortId": "TEST-791",
+            "title": "Test Error",
+            "count": "10",
+            "status": "unresolved",
+            "lastSeen": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let mock = MockSentryClient::new(200, body);
+
+        let checker = SentryRegressionChecker::new(create_config(), mock);
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "791", 1);
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        assert!(result.regression_detected);
+        assert!(result.details.unwrap().contains("10 events"));
+    }
+
+    #[tokio::test]
+    async fn test_no_regression_for_resolved_issue_with_old_activity() {
+        // Resolved issues should not trigger regression based on lastSeen
+        // even if lastSeen is after monitoring started (the activity may have occurred
+        // before the issue was manually resolved)
+        let future_time = Utc::now() + Duration::hours(1);
+        let body = format!(
+            r#"{{
+                "id": "790",
+                "shortId": "TEST-790",
+                "title": "Test Error",
+                "count": "10",
+                "status": "resolved",
+                "lastSeen": "{}"
+            }}"#,
+            future_time.to_rfc3339()
+        );
+
+        let mock = MockSentryClient::new(200, &body);
+
+        let checker = SentryRegressionChecker::new(create_config(), mock);
+        let mut watch = RegressionWatch::new(IssueType::SentryIssue, "790", 1);
+        watch.monitoring_started_at = Some(Utc::now());
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        // Resolved issues should NOT trigger regression based on lastSeen alone
+        assert!(!result.regression_detected);
     }
 
     #[tokio::test]

@@ -25,6 +25,15 @@ pub fn update_env_file(path: &Path, updates: &HashMap<String, String>) -> Result
     fs::write(path, updated_content)
         .map_err(|e| Error::config(format!("Failed to write .env file at {:?}: {}", path, e)))?;
 
+    // Set restrictive permissions on the .env file (owner read/write only)
+    // since it may contain secrets like webhook secrets and API tokens
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, perms).ok();
+    }
+
     Ok(())
 }
 
