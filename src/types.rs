@@ -315,6 +315,43 @@ pub struct FixAttempt {
     /// When the last retry was attempted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_retry_at: Option<DateTime<Utc>>,
+    /// Labels from the issue (for bug detection).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issue_labels: Vec<String>,
+}
+
+impl FixAttempt {
+    /// Check if this fix attempt is for a bug (based on labels).
+    ///
+    /// Returns true if:
+    /// - Source is "sentry" (all Sentry issues are bugs)
+    /// - Issue has a label indicating it's a bug (e.g., "bug", "defect", "error")
+    pub fn is_bug(&self) -> bool {
+        // Sentry issues are always bugs
+        if self.source == "sentry" {
+            return true;
+        }
+
+        // Check for common bug labels
+        const BUG_LABELS: &[&str] = &[
+            "bug",
+            "defect",
+            "error",
+            "fix",
+            "hotfix",
+            "regression",
+            "issue",
+            "problem",
+            "incident",
+            "crash",
+            "broken",
+        ];
+
+        self.issue_labels.iter().any(|label| {
+            let lower = label.to_lowercase();
+            BUG_LABELS.iter().any(|bug_label| lower.contains(bug_label))
+        })
+    }
 }
 
 /// Statistics about fix attempts.
@@ -1477,6 +1514,7 @@ mod tests {
             merged_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         };
 
         // Verify fields
@@ -1503,6 +1541,7 @@ mod tests {
             merged_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         };
 
         assert_eq!(

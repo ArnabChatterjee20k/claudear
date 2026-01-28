@@ -31,6 +31,15 @@ pub trait FixAttemptTracker: Send + Sync {
     /// Record a new fix attempt (pending status).
     fn record_attempt(&self, source: &str, issue_id: &str, short_id: &str) -> Result<()>;
 
+    /// Record a new fix attempt with labels (pending status).
+    fn record_attempt_with_labels(
+        &self,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+        labels: &[String],
+    ) -> Result<()>;
+
     /// Update a fix attempt with success and PR URL.
     fn mark_success(&self, source: &str, issue_id: &str, pr_url: &str) -> Result<()>;
 
