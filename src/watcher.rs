@@ -3,8 +3,9 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::feedback::{format_similar_issues_context, IssueEmbeddingService};
-use crate::github::ReviewWatcher;
+use crate::github::{PrReviewState, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
+use crate::retry::RetryManager;
 use crate::notifier::Notifier;
 use crate::repo::RepoIndex;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
@@ -509,10 +510,13 @@ impl Watcher {
                     let mut seeded = 0;
                     for issue in issues {
                         if !self.tracker.has_attempted(source.name(), &issue.id) {
-                            self.tracker.record_attempt(
+                            // Extract labels from issue metadata for bug detection
+                            let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
+                            self.tracker.record_attempt_with_labels(
                                 source.name(),
                                 &issue.id,
                                 &issue.short_id,
+                                &labels,
                             )?;
                             self.tracker.mark_failed(
                                 source.name(),
@@ -554,6 +558,85 @@ impl Watcher {
         for source in &self.sources {
             if let Err(e) = self.poll_source(source).await {
                 tracing::error!(component = "watcher", source = source.name(), error = %e, "Error polling");
+            }
+        }
+
+        // Process any ready retries
+        if !self.dry_run {
+            if let Err(e) = self.process_ready_retries().await {
+                tracing::error!(component = "watcher", error = %e, "Error processing retries");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process any issues that are ready for retry.
+    async fn process_ready_retries(&self) -> Result<()> {
+        let retry_manager = RetryManager::new(self.config.retry.clone(), self.tracker.clone());
+        let ready = retry_manager.get_ready_retries()?;
+
+        if ready.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            component = "watcher",
+            count = ready.len(),
+            "Processing ready retries"
+        );
+
+        for attempt in ready {
+            // Check if we're still running
+            if !self.is_running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Check if this issue is already being processed
+            let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
+            {
+                let processing = self.processing.read().await;
+                if processing.contains(&processing_key) {
+                    tracing::debug!(
+                        short_id = %attempt.short_id,
+                        "Issue already being processed, skipping retry"
+                    );
+                    continue;
+                }
+            }
+
+            // Wait for concurrency slot
+            while self.active_processing.load(Ordering::SeqCst) >= self.config.max_concurrent {
+                if !self.is_running.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+
+            tracing::info!(
+                component = "watcher",
+                source = %attempt.source,
+                short_id = %attempt.short_id,
+                retry_count = attempt.retry_count,
+                "Retrying issue"
+            );
+
+            // Prepare for retry (resets status to pending, clears PR info)
+            retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
+
+            // Trigger the issue processing
+            if let Err(e) = self.trigger_issue(&attempt.source, &attempt.issue_id).await {
+                tracing::error!(
+                    component = "watcher",
+                    short_id = %attempt.short_id,
+                    error = %e,
+                    "Failed to trigger retry"
+                );
+            }
+
+            // Add delay between retries
+            if self.config.processing_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
             }
         }
 
@@ -784,9 +867,11 @@ impl Watcher {
             }
         };
 
+        // Extract labels from issue metadata for bug detection
+        let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
         if let Err(e) = self
             .tracker
-            .record_attempt(source.name(), &issue.id, &issue.short_id)
+            .record_attempt_with_labels(source.name(), &issue.id, &issue.short_id, &labels)
         {
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
@@ -853,6 +938,28 @@ impl Watcher {
                     if let Some(ref embedding_service) = self.issue_embedding_service {
                         if let Err(e) = embedding_service.embed_issue(&issue, source.name()).await {
                             tracing::warn!(error = %e, "Failed to store issue embedding");
+                        }
+                    }
+
+                    // Register PR for review watching
+                    if let Some(ref review_watcher) = self.review_watcher {
+                        if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(pr_url) {
+                            let state = PrReviewState::new(
+                                pr_url,
+                                &repo,
+                                pr_number,
+                                &issue.id,
+                                source.name(),
+                            );
+                            review_watcher.watch_pr(state);
+                            tracing::info!(
+                                component = "review_watcher",
+                                pr_url = %pr_url,
+                                repo = %repo,
+                                pr_number = pr_number,
+                                issue_id = %issue.id,
+                                "PR registered for review watching"
+                            );
                         }
                     }
 
@@ -1274,9 +1381,11 @@ mod tests {
             sms: crate::config::SmsConfig::default(),
             push: crate::config::PushConfig::default(),
             github: crate::config::GitHubConfig::default(),
+            github_app: crate::config::GitHubAppConfig::default(),
             retry: crate::config::RetryConfig::default(),
             linear: None,
             sentry: None,
+            regression: crate::config::RegressionConfig::default(),
         }
     }
 
