@@ -7,4 +7,4 @@ mod github;
 mod tracker;
 
 pub use github::ReleaseClient;
-pub use tracker::ReleaseTracker;
+pub use tracker::{ReleaseTracker, ReleaseTrackerConfig};

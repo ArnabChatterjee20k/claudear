@@ -98,17 +98,32 @@ impl<C: RegressionChecker> RegressionScheduler<C> {
         let now = Utc::now();
         let hours_since_start = (now - monitoring_started).num_hours() as u32;
 
-        // Check if enough time has passed since monitoring started
-        let expected_checks = hours_since_start / self.config.check_interval_hours;
-        if check_number > expected_checks + 1 {
-            // Not time for next check yet
+        // Calculate the maximum number of checks for the monitoring window
+        let max_checks =
+            self.config.monitoring_duration_hours / self.config.check_interval_hours;
+
+        // Check if we've already completed all checks
+        if check_number > max_checks {
+            // Already completed monitoring, should not happen but handle gracefully
+            tracing::warn!(
+                watch_id = watch.id,
+                check_number = check_number,
+                max_checks = max_checks,
+                "Watch has exceeded maximum check count, skipping"
+            );
             return Ok(None);
         }
 
-        // Check if we've exceeded the monitoring window
-        let max_checks =
-            self.config.monitoring_duration_hours / self.config.check_interval_hours;
-        let is_final_check = check_number >= max_checks;
+        // Check if enough time has passed since monitoring started for this check number.
+        // Check N should happen after (N * check_interval_hours) hours have elapsed.
+        // e.g., check 1 after 1 hour, check 2 after 2 hours, etc.
+        let required_hours = check_number * self.config.check_interval_hours;
+        if hours_since_start < required_hours {
+            // Not time for this check yet
+            return Ok(None);
+        }
+
+        let is_final_check = check_number == max_checks;
 
         // Perform the regression check
         let regression_result = self.checker.check_regression(watch).await?;
@@ -256,16 +271,15 @@ mod tests {
             .unwrap();
         let attempt = tracker.get_attempt("sentry", "issue-1").unwrap().unwrap();
 
-        // Create a watch in monitoring state
+        // Create a watch in monitoring state with monitoring_started_at set 2 hours ago
+        // so that check 1 (requires 1 hour elapsed) will be due
         let mut watch = RegressionWatch::new(IssueType::SentryIssue, "issue-1", attempt.id);
         watch.status = RegressionWatchStatus::Monitoring;
         watch.monitoring_started_at = Some(Utc::now() - Duration::hours(2));
         let watch_id = tracker.create_regression_watch(&watch).unwrap();
 
-        // Update status to monitoring (sets monitoring_started_at)
-        tracker
-            .update_regression_watch_status(watch_id, RegressionWatchStatus::Monitoring)
-            .unwrap();
+        // Note: Don't call update_regression_watch_status here as it would reset
+        // monitoring_started_at to now, which would make the check not due yet
 
         let checker = MockChecker::new(false);
         let scheduler = RegressionScheduler::new(
@@ -300,16 +314,15 @@ mod tests {
             .unwrap();
         let attempt = tracker.get_attempt("linear", "issue-2").unwrap().unwrap();
 
-        // Create a watch in monitoring state
+        // Create a watch in monitoring state with monitoring_started_at set 2 hours ago
+        // so that check 1 (requires 1 hour elapsed) will be due
         let mut watch = RegressionWatch::new(IssueType::LinearBug, "issue-2", attempt.id);
         watch.status = RegressionWatchStatus::Monitoring;
         watch.monitoring_started_at = Some(Utc::now() - Duration::hours(2));
         let watch_id = tracker.create_regression_watch(&watch).unwrap();
 
-        // Update status to monitoring
-        tracker
-            .update_regression_watch_status(watch_id, RegressionWatchStatus::Monitoring)
-            .unwrap();
+        // Note: Don't call update_regression_watch_status here as it would reset
+        // monitoring_started_at to now, which would make the check not due yet
 
         let checker = MockChecker::new(true); // Will detect regression
         let scheduler = RegressionScheduler::new(
