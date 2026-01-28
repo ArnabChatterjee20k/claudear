@@ -281,7 +281,10 @@ fn save_credentials(creds: &ManifestConversionResponse, base_url: &str) -> Resul
     // Save private key to PEM file
     let pem_path = "github-app-key.pem";
     fs::write(pem_path, &creds.pem).map_err(|e| {
-        Error::config(format!("Failed to write private key to {}: {}", pem_path, e))
+        Error::config(format!(
+            "Failed to write private key to {}: {}",
+            pem_path, e
+        ))
     })?;
 
     // Set restrictive permissions on the PEM file (Unix only)
@@ -296,10 +299,19 @@ fn save_credentials(creds: &ManifestConversionResponse, base_url: &str) -> Resul
     let env_path = Path::new(".env");
     let mut updates = HashMap::new();
     updates.insert("GITHUB_APP_ID".to_string(), creds.id.to_string());
-    updates.insert("GITHUB_APP_PRIVATE_KEY_PATH".to_string(), pem_path.to_string());
-    updates.insert("GITHUB_APP_WEBHOOK_SECRET".to_string(), creds.webhook_secret.clone());
+    updates.insert(
+        "GITHUB_APP_PRIVATE_KEY_PATH".to_string(),
+        pem_path.to_string(),
+    );
+    updates.insert(
+        "GITHUB_APP_WEBHOOK_SECRET".to_string(),
+        creds.webhook_secret.clone(),
+    );
     updates.insert("GITHUB_APP_CLIENT_ID".to_string(), creds.client_id.clone());
-    updates.insert("GITHUB_APP_CLIENT_SECRET".to_string(), creds.client_secret.clone());
+    updates.insert(
+        "GITHUB_APP_CLIENT_SECRET".to_string(),
+        creds.client_secret.clone(),
+    );
     updates.insert("GITHUB_APP_BASE_URL".to_string(), base_url.to_string());
 
     update_env_file(env_path, &updates)?;

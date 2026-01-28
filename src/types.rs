@@ -1101,11 +1101,7 @@ pub struct RegressionWatch {
 
 impl RegressionWatch {
     /// Create a new regression watch.
-    pub fn new(
-        issue_type: IssueType,
-        issue_id: impl Into<String>,
-        fix_attempt_id: i64,
-    ) -> Self {
+    pub fn new(issue_type: IssueType, issue_id: impl Into<String>, fix_attempt_id: i64) -> Self {
         Self {
             id: 0,
             issue_type,
@@ -1748,7 +1744,10 @@ mod tests {
 
     #[test]
     fn test_regression_watch_status_display() {
-        assert_eq!(RegressionWatchStatus::AwaitingRelease.to_string(), "awaiting_release");
+        assert_eq!(
+            RegressionWatchStatus::AwaitingRelease.to_string(),
+            "awaiting_release"
+        );
         assert_eq!(RegressionWatchStatus::Monitoring.to_string(), "monitoring");
         assert_eq!(RegressionWatchStatus::Resolved.to_string(), "resolved");
         assert_eq!(RegressionWatchStatus::Regressed.to_string(), "regressed");
@@ -1794,7 +1793,10 @@ mod tests {
 
     #[test]
     fn test_regression_watch_status_default() {
-        assert_eq!(RegressionWatchStatus::default(), RegressionWatchStatus::AwaitingRelease);
+        assert_eq!(
+            RegressionWatchStatus::default(),
+            RegressionWatchStatus::AwaitingRelease
+        );
     }
 
     #[test]
@@ -1888,11 +1890,7 @@ mod tests {
 
     #[test]
     fn test_regression_watch_new() {
-        let watch = RegressionWatch::new(
-            IssueType::SentryIssue,
-            "sentry-123",
-            1,
-        );
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "sentry-123", 1);
 
         assert_eq!(watch.issue_type, IssueType::SentryIssue);
         assert_eq!(watch.issue_id, "sentry-123");
@@ -1906,11 +1904,7 @@ mod tests {
 
     #[test]
     fn test_regression_watch_serde() {
-        let watch = RegressionWatch::new(
-            IssueType::LinearBug,
-            "linear-456",
-            2,
-        );
+        let watch = RegressionWatch::new(IssueType::LinearBug, "linear-456", 2);
 
         let json = serde_json::to_string(&watch).unwrap();
         let parsed: RegressionWatch = serde_json::from_str(&json).unwrap();
@@ -1923,11 +1917,7 @@ mod tests {
 
     #[test]
     fn test_regression_watch_clone() {
-        let watch = RegressionWatch::new(
-            IssueType::SentryIssue,
-            "sentry-789",
-            3,
-        );
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "sentry-789", 3);
 
         let cloned = watch.clone();
         assert_eq!(cloned.issue_type, watch.issue_type);
@@ -1937,11 +1927,7 @@ mod tests {
 
     #[test]
     fn test_regression_watch_debug() {
-        let watch = RegressionWatch::new(
-            IssueType::SentryIssue,
-            "sentry-123",
-            1,
-        );
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "sentry-123", 1);
         let debug_str = format!("{:?}", watch);
         assert!(debug_str.contains("RegressionWatch"));
     }
@@ -1952,11 +1938,7 @@ mod tests {
 
     #[test]
     fn test_release_tracking_new() {
-        let tracking = ReleaseTracking::new(
-            1,
-            "v1.2.3",
-            "abc123def",
-        );
+        let tracking = ReleaseTracking::new(1, "v1.2.3", "abc123def");
 
         assert_eq!(tracking.regression_watch_id, 1);
         assert_eq!(tracking.release_version, "v1.2.3");
@@ -1966,11 +1948,7 @@ mod tests {
 
     #[test]
     fn test_release_tracking_serde() {
-        let tracking = ReleaseTracking::new(
-            2,
-            "v2.0.0",
-            "def456abc",
-        );
+        let tracking = ReleaseTracking::new(2, "v2.0.0", "def456abc");
 
         let json = serde_json::to_string(&tracking).unwrap();
         let parsed: ReleaseTracking = serde_json::from_str(&json).unwrap();
@@ -1982,11 +1960,7 @@ mod tests {
 
     #[test]
     fn test_release_tracking_clone() {
-        let tracking = ReleaseTracking::new(
-            3,
-            "v3.0.0",
-            "xyz789",
-        );
+        let tracking = ReleaseTracking::new(3, "v3.0.0", "xyz789");
 
         let cloned = tracking.clone();
         assert_eq!(cloned.regression_watch_id, tracking.regression_watch_id);
@@ -1995,11 +1969,7 @@ mod tests {
 
     #[test]
     fn test_release_tracking_debug() {
-        let tracking = ReleaseTracking::new(
-            1,
-            "v1.0.0",
-            "commit123",
-        );
+        let tracking = ReleaseTracking::new(1, "v1.0.0", "commit123");
         let debug_str = format!("{:?}", tracking);
         assert!(debug_str.contains("ReleaseTracking"));
     }

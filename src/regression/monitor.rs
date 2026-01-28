@@ -66,9 +66,7 @@ impl RegressionChecker for CompositeChecker {
             crate::types::IssueType::SentryIssue => {
                 self.sentry_checker.check_regression(watch).await
             }
-            crate::types::IssueType::LinearBug => {
-                self.linear_checker.check_regression(watch).await
-            }
+            crate::types::IssueType::LinearBug => self.linear_checker.check_regression(watch).await,
         }
     }
 }

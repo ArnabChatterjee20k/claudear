@@ -99,8 +99,7 @@ impl<C: RegressionChecker> RegressionScheduler<C> {
         let hours_since_start = (now - monitoring_started).num_hours() as u32;
 
         // Calculate the maximum number of checks for the monitoring window
-        let max_checks =
-            self.config.monitoring_duration_hours / self.config.check_interval_hours;
+        let max_checks = self.config.monitoring_duration_hours / self.config.check_interval_hours;
 
         // Check if we've already completed all checks
         if check_number > max_checks {
@@ -180,10 +179,7 @@ impl<C: RegressionChecker> RegressionScheduler<C> {
             if let Some(started) = watch.monitoring_started_at {
                 // Get existing checks
                 let checks = self.tracker.get_regression_checks(watch.id)?;
-                let last_check_at = checks
-                    .first()
-                    .and_then(|c| c.checked_at)
-                    .unwrap_or(started);
+                let last_check_at = checks.first().and_then(|c| c.checked_at).unwrap_or(started);
 
                 // Check if enough time has passed
                 if now - last_check_at >= check_interval {
@@ -248,11 +244,8 @@ mod tests {
     async fn test_check_monitoring_watches_empty() {
         let tracker = create_test_tracker();
         let checker = MockChecker::new(false);
-        let scheduler = RegressionScheduler::new(
-            checker,
-            tracker,
-            RegressionSchedulerConfig::default(),
-        );
+        let scheduler =
+            RegressionScheduler::new(checker, tracker, RegressionSchedulerConfig::default());
 
         let results = scheduler.check_monitoring_watches().await.unwrap();
         assert!(results.is_empty());
@@ -265,7 +258,9 @@ mod tests {
         let tracker = create_test_tracker();
 
         // Create a fix attempt
-        tracker.record_attempt("sentry", "issue-1", "SENTRY-1").unwrap();
+        tracker
+            .record_attempt("sentry", "issue-1", "SENTRY-1")
+            .unwrap();
         tracker
             .mark_success("sentry", "issue-1", "https://github.com/org/repo/pull/42")
             .unwrap();
@@ -308,7 +303,9 @@ mod tests {
         let tracker = create_test_tracker();
 
         // Create a fix attempt
-        tracker.record_attempt("linear", "issue-2", "LIN-2").unwrap();
+        tracker
+            .record_attempt("linear", "issue-2", "LIN-2")
+            .unwrap();
         tracker
             .mark_success("linear", "issue-2", "https://github.com/org/repo/pull/43")
             .unwrap();
@@ -352,7 +349,9 @@ mod tests {
         let tracker = create_test_tracker();
 
         // Create a fix attempt
-        tracker.record_attempt("sentry", "issue-3", "SENTRY-3").unwrap();
+        tracker
+            .record_attempt("sentry", "issue-3", "SENTRY-3")
+            .unwrap();
         tracker
             .mark_success("sentry", "issue-3", "https://github.com/org/repo/pull/44")
             .unwrap();
@@ -398,7 +397,9 @@ mod tests {
         let tracker = create_test_tracker();
 
         // Create a fix attempt
-        tracker.record_attempt("sentry", "issue-4", "SENTRY-4").unwrap();
+        tracker
+            .record_attempt("sentry", "issue-4", "SENTRY-4")
+            .unwrap();
         tracker
             .mark_success("sentry", "issue-4", "https://github.com/org/repo/pull/45")
             .unwrap();

@@ -127,11 +127,7 @@ impl<H: HttpClient> ReleaseClient<H> {
     }
 
     /// Get a specific release by tag.
-    pub async fn get_release_by_tag(
-        &self,
-        repo: &str,
-        tag: &str,
-    ) -> Result<Option<GitHubRelease>> {
+    pub async fn get_release_by_tag(&self, repo: &str, tag: &str) -> Result<Option<GitHubRelease>> {
         let url = format!(
             "https://api.github.com/repos/{}/releases/tags/{}",
             repo, tag
@@ -234,8 +230,8 @@ impl<H: HttpClient> ReleaseClient<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::github::HttpResponse;
+    use async_trait::async_trait;
 
     struct MockHttpClient {
         response: HttpResponse,
@@ -360,7 +356,10 @@ mod tests {
         );
 
         let client = ReleaseClient::with_http_client("test-token", mock);
-        let release = client.get_release_by_tag("org/repo", "v1.0.0").await.unwrap();
+        let release = client
+            .get_release_by_tag("org/repo", "v1.0.0")
+            .await
+            .unwrap();
 
         assert!(release.is_some());
         assert_eq!(release.unwrap().tag_name, "v1.0.0");
@@ -371,7 +370,10 @@ mod tests {
         let mock = MockHttpClient::new(404, r#"{"message": "Not Found"}"#);
 
         let client = ReleaseClient::with_http_client("test-token", mock);
-        let release = client.get_release_by_tag("org/repo", "v9.9.9").await.unwrap();
+        let release = client
+            .get_release_by_tag("org/repo", "v9.9.9")
+            .await
+            .unwrap();
 
         assert!(release.is_none());
     }
@@ -394,10 +396,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_commit_in_release_false() {
-        let mock = MockHttpClient::new(
-            200,
-            r#"{"status": "ahead", "ahead_by": 3, "behind_by": 0}"#,
-        );
+        let mock =
+            MockHttpClient::new(200, r#"{"status": "ahead", "ahead_by": 3, "behind_by": 0}"#);
 
         let client = ReleaseClient::with_http_client("test-token", mock);
         let result = client
@@ -423,10 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_pr_merge_commit_not_merged() {
-        let mock = MockHttpClient::new(
-            200,
-            r#"{"merged": false, "merge_commit_sha": null}"#,
-        );
+        let mock = MockHttpClient::new(200, r#"{"merged": false, "merge_commit_sha": null}"#);
 
         let client = ReleaseClient::with_http_client("test-token", mock);
         let sha = client.get_pr_merge_commit("org/repo", 42).await.unwrap();

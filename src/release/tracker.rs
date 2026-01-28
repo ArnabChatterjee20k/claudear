@@ -127,8 +127,10 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
                     self.tracker.record_release_tracking(&tracking)?;
 
                     // Transition the watch to monitoring status
-                    self.tracker
-                        .update_regression_watch_status(watch.id, RegressionWatchStatus::Monitoring)?;
+                    self.tracker.update_regression_watch_status(
+                        watch.id,
+                        RegressionWatchStatus::Monitoring,
+                    )?;
 
                     tracing::info!(
                         watch_id = watch.id,
@@ -203,8 +205,12 @@ mod tests {
     fn test_release_tracker_config_default() {
         let config = ReleaseTrackerConfig::default();
         assert_eq!(config.target_repos.len(), 2);
-        assert!(config.target_repos.contains(&"appwrite-labs/cloud".to_string()));
-        assert!(config.target_repos.contains(&"appwrite-labs/edge".to_string()));
+        assert!(config
+            .target_repos
+            .contains(&"appwrite-labs/cloud".to_string()));
+        assert!(config
+            .target_repos
+            .contains(&"appwrite-labs/edge".to_string()));
         assert_eq!(config.poll_interval_ms, 300_000);
     }
 
@@ -213,11 +219,8 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let mock = MockHttpClient::new(vec![]);
         let client = ReleaseClient::with_http_client("test-token", mock);
-        let release_tracker = ReleaseTracker::with_http_client(
-            client,
-            tracker,
-            ReleaseTrackerConfig::default(),
-        );
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
 
         let result = release_tracker.check_pending_watches().await.unwrap();
         assert!(result.is_empty());
@@ -228,7 +231,9 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         // Create a fix attempt first
-        tracker.record_attempt("sentry", "issue-1", "SENTRY-1").unwrap();
+        tracker
+            .record_attempt("sentry", "issue-1", "SENTRY-1")
+            .unwrap();
         tracker
             .mark_success("sentry", "issue-1", "https://github.com/org/repo/pull/42")
             .unwrap();
@@ -262,7 +267,10 @@ mod tests {
                 }"#,
             ),
             // is_commit_in_release
-            (200, r#"{"status": "behind", "ahead_by": 0, "behind_by": 5}"#),
+            (
+                200,
+                r#"{"status": "behind", "ahead_by": 0, "behind_by": 5}"#,
+            ),
         ]);
 
         let client = ReleaseClient::with_http_client("test-token", mock);

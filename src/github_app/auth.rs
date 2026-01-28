@@ -77,9 +77,10 @@ impl GitHubAppAuth {
     ///
     /// The JWT is valid for 10 minutes (maximum allowed by GitHub).
     pub fn generate_jwt(&self) -> Result<String> {
-        let app_id = self.config.app_id.ok_or_else(|| {
-            Error::config("GitHub App ID not configured")
-        })?;
+        let app_id = self
+            .config
+            .app_id
+            .ok_or_else(|| Error::config("GitHub App ID not configured"))?;
 
         let private_key_pem = self.config.load_private_key()?;
 
@@ -116,7 +117,10 @@ impl GitHubAppAuth {
     /// Get a cached installation token if it's still valid.
     pub fn get_cached_token(&self, installation_id: i64) -> Option<CachedToken> {
         let cache = self.token_cache.read().ok()?;
-        cache.get(&installation_id).filter(|t| t.is_valid()).cloned()
+        cache
+            .get(&installation_id)
+            .filter(|t| t.is_valid())
+            .cloned()
     }
 
     /// Cache an installation token.
@@ -142,8 +146,13 @@ impl GitHubAppAuth {
 
     /// Parse an installation token response from GitHub.
     pub fn parse_token_response(&self, response_body: &str) -> Result<CachedToken> {
-        let response: InstallationTokenResponse = serde_json::from_str(response_body)
-            .map_err(|e| Error::config(format!("Failed to parse installation token response: {}", e)))?;
+        let response: InstallationTokenResponse =
+            serde_json::from_str(response_body).map_err(|e| {
+                Error::config(format!(
+                    "Failed to parse installation token response: {}",
+                    e
+                ))
+            })?;
 
         let expires_at = chrono::DateTime::parse_from_rfc3339(&response.expires_at)
             .map_err(|e| Error::config(format!("Failed to parse token expiration: {}", e)))?
@@ -219,7 +228,11 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     fn create_test_config(with_key: bool) -> GitHubAppConfig {
         GitHubAppConfig {
             app_id: Some(12345),
-            private_key: if with_key { Some(TEST_PRIVATE_KEY.to_string()) } else { None },
+            private_key: if with_key {
+                Some(TEST_PRIVATE_KEY.to_string())
+            } else {
+                None
+            },
             private_key_path: None,
             webhook_secret: Some("test_secret".to_string()),
             installation_id: Some(67890),
@@ -345,7 +358,10 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         let auth = GitHubAppAuth::new(config);
 
         let url = auth.installation_token_url(12345);
-        assert_eq!(url, "https://api.github.com/app/installations/12345/access_tokens");
+        assert_eq!(
+            url,
+            "https://api.github.com/app/installations/12345/access_tokens"
+        );
     }
 
     #[test]

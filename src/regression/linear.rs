@@ -91,7 +91,11 @@ pub struct LinearRegressionChecker<H: HttpClient = ReqwestHttpClient> {
 
 impl LinearRegressionChecker<ReqwestHttpClient> {
     /// Create a new Linear regression checker.
-    pub fn new(config: LinearRegressionConfig, keywords: Vec<String>, original_issue_text: String) -> Self {
+    pub fn new(
+        config: LinearRegressionConfig,
+        keywords: Vec<String>,
+        original_issue_text: String,
+    ) -> Self {
         Self {
             config,
             http: ReqwestHttpClient::new(),
@@ -227,7 +231,10 @@ impl<H: HttpClient> LinearRegressionChecker<H> {
             );
 
             let headers = vec![
-                ("Authorization", format!("Bearer {}", self.config.github_token)),
+                (
+                    "Authorization",
+                    format!("Bearer {}", self.config.github_token),
+                ),
                 ("Accept", "application/vnd.github+json".to_string()),
                 ("User-Agent", "claudear".to_string()),
                 ("X-GitHub-Api-Version", "2022-11-28".to_string()),
@@ -246,11 +253,7 @@ impl<H: HttpClient> LinearRegressionChecker<H> {
         let mut similar_issues = Vec::new();
         for issue in all_issues {
             // Combine title and body for semantic comparison
-            let issue_text = format!(
-                "{}\n{}",
-                issue.title,
-                issue.body.as_deref().unwrap_or("")
-            );
+            let issue_text = format!("{}\n{}", issue.title, issue.body.as_deref().unwrap_or(""));
 
             let similarity = self.check_similarity(&issue_text).await?;
 
@@ -310,7 +313,10 @@ impl<H: HttpClient> LinearRegressionChecker<H> {
             );
 
             let headers = vec![
-                ("Authorization", format!("Bearer {}", self.config.github_token)),
+                (
+                    "Authorization",
+                    format!("Bearer {}", self.config.github_token),
+                ),
                 ("Accept", "application/vnd.github+json".to_string()),
                 ("User-Agent", "claudear".to_string()),
                 ("X-GitHub-Api-Version", "2022-11-28".to_string()),
@@ -325,7 +331,9 @@ impl<H: HttpClient> LinearRegressionChecker<H> {
                         .items
                         .into_iter()
                         .filter(|issue| {
-                            if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&issue.created_at) {
+                            if let Ok(created) =
+                                chrono::DateTime::parse_from_rfc3339(&issue.created_at)
+                            {
                                 created.with_timezone(&chrono::Utc) > since
                             } else {
                                 false
@@ -335,11 +343,8 @@ impl<H: HttpClient> LinearRegressionChecker<H> {
 
                     // Then apply semantic similarity
                     for issue in new_issues {
-                        let issue_text = format!(
-                            "{}\n{}",
-                            issue.title,
-                            issue.body.as_deref().unwrap_or("")
-                        );
+                        let issue_text =
+                            format!("{}\n{}", issue.title, issue.body.as_deref().unwrap_or(""));
 
                         let similarity = self.check_similarity(&issue_text).await?;
 
@@ -390,8 +395,10 @@ impl<H: HttpClient> LinearRegressionChecker<H> {
 
                     if similarity >= self.config.similarity_threshold as f32 {
                         matches.push(SimilarityMatch {
-                            url: format!("https://appwrite.io/threads#{}",
-                                title.to_lowercase().replace(' ', "-")),
+                            url: format!(
+                                "https://appwrite.io/threads#{}",
+                                title.to_lowercase().replace(' ', "-")
+                            ),
                             title: title.clone(),
                             similarity,
                         });
@@ -436,8 +443,18 @@ impl<H: HttpClient> LinearRegressionChecker<H> {
 
         // Simple extraction: look for <article>, <div class="thread">, or similar patterns
         // Use case-insensitive search on the original string to avoid UTF-8 byte offset issues
-        let title_patterns = ["<h2>", "<h3>", "<H2>", "<H3>", "<article", "<Article", "<ARTICLE",
-                              "<div class=\"thread", "<div class=\"post", "<DIV class=\"thread"];
+        let title_patterns = [
+            "<h2>",
+            "<h3>",
+            "<H2>",
+            "<H3>",
+            "<article",
+            "<Article",
+            "<ARTICLE",
+            "<div class=\"thread",
+            "<div class=\"post",
+            "<DIV class=\"thread",
+        ];
 
         for pattern in title_patterns {
             if let Some(start) = html.find(pattern) {
@@ -519,7 +536,14 @@ impl<H: HttpClient> RegressionChecker for LinearRegressionChecker<H> {
         if !similar_issues.is_empty() {
             let issue_links: Vec<String> = similar_issues
                 .iter()
-                .map(|m| format!("{} (similarity: {:.0}%) - {}", m.url, m.similarity * 100.0, m.title))
+                .map(|m| {
+                    format!(
+                        "{} (similarity: {:.0}%) - {}",
+                        m.url,
+                        m.similarity * 100.0,
+                        m.title
+                    )
+                })
                 .collect();
 
             return Ok(RegressionResult::regression(format!(
@@ -534,7 +558,14 @@ impl<H: HttpClient> RegressionChecker for LinearRegressionChecker<H> {
         if !thread_matches.is_empty() {
             let thread_links: Vec<String> = thread_matches
                 .iter()
-                .map(|m| format!("{} (similarity: {:.0}%) - {}", m.url, m.similarity * 100.0, m.title))
+                .map(|m| {
+                    format!(
+                        "{} (similarity: {:.0}%) - {}",
+                        m.url,
+                        m.similarity * 100.0,
+                        m.title
+                    )
+                })
                 .collect();
 
             return Ok(RegressionResult::regression(format!(
@@ -620,10 +651,7 @@ mod tests {
     async fn test_no_regression_when_no_issues() {
         let mock = MockHttpClient::new(vec![
             // GitHub search - empty results
-            (
-                200,
-                r#"{"total_count": 0, "items": []}"#,
-            ),
+            (200, r#"{"total_count": 0, "items": []}"#),
             // Threads check - no matches
             (200, "<html><body>No relevant content</body></html>"),
         ]);
@@ -838,7 +866,8 @@ mod tests {
             MockHttpClient::new(vec![]),
         );
 
-        let html = "<html><body><h2>Thread Title</h2>This is the content of the thread</body></html>";
+        let html =
+            "<html><body><h2>Thread Title</h2>This is the content of the thread</body></html>";
         let sections = checker.extract_thread_sections(html);
 
         assert!(!sections.is_empty());

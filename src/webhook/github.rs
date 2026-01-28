@@ -156,10 +156,7 @@ impl GitHubWebhookHandler {
 
     /// Handle a pull_request_review.submitted event.
     async fn handle_review_submitted(&self, payload: &serde_json::Value) -> Result<bool> {
-        let action = payload
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
         if action != "submitted" {
             tracing::debug!(
@@ -258,10 +255,7 @@ impl GitHubWebhookHandler {
 
     /// Handle a pull_request_review_comment.created event.
     async fn handle_review_comment(&self, payload: &serde_json::Value) -> Result<bool> {
-        let action = payload
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
         if action != "created" {
             tracing::debug!(
@@ -359,7 +353,10 @@ impl GitHubWebhookHandler {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string(),
-                user_type: u.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                user_type: u
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
             })
             .unwrap_or(GitHubUser {
                 id: 0,
@@ -401,7 +398,10 @@ impl GitHubWebhookHandler {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string(),
-                user_type: u.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                user_type: u
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
             })
             .unwrap_or(GitHubUser {
                 id: 0,
@@ -534,7 +534,10 @@ mod tests {
         let mut headers = HashMap::new();
         assert!(GitHubWebhookHandler::get_event_type(&headers).is_none());
 
-        headers.insert("x-github-event".to_string(), "pull_request_review".to_string());
+        headers.insert(
+            "x-github-event".to_string(),
+            "pull_request_review".to_string(),
+        );
         assert_eq!(
             GitHubWebhookHandler::get_event_type(&headers),
             Some("pull_request_review")

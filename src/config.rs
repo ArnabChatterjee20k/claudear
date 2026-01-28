@@ -1770,8 +1770,12 @@ linear:
         assert_eq!(config.sentry_event_threshold, 1);
         assert!((config.similarity_threshold - 0.75).abs() < 0.01);
         assert_eq!(config.target_repos.len(), 2);
-        assert!(config.target_repos.contains(&"appwrite-labs/cloud".to_string()));
-        assert!(config.target_repos.contains(&"appwrite-labs/edge".to_string()));
+        assert!(config
+            .target_repos
+            .contains(&"appwrite-labs/cloud".to_string()));
+        assert!(config
+            .target_repos
+            .contains(&"appwrite-labs/edge".to_string()));
         assert!(config.github_token.is_none());
         assert_eq!(config.github_search_repos.len(), 3);
     }
@@ -1870,8 +1874,10 @@ regression:
 
     #[test]
     fn test_github_app_config_load_private_key_inline() {
-        let mut config = GitHubAppConfig::default();
-        config.private_key = Some("test-key-content".to_string());
+        let config = GitHubAppConfig {
+            private_key: Some("test-key-content".to_string()),
+            ..Default::default()
+        };
 
         let key = config.load_private_key().unwrap();
         assert_eq!(key, "test-key-content");
@@ -1882,7 +1888,10 @@ regression:
         let config = GitHubAppConfig::default();
         let result = config.load_private_key();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No GitHub App private key"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No GitHub App private key"));
     }
 
     #[test]
@@ -1978,19 +1987,13 @@ work_dir: /tmp/repos
             || {
                 let config = Config::load(file.path()).unwrap();
                 assert_eq!(config.github_app.app_id, Some(12345));
-                assert_eq!(
-                    config.github_app.private_key,
-                    Some("test-key".to_string())
-                );
+                assert_eq!(config.github_app.private_key, Some("test-key".to_string()));
                 assert_eq!(
                     config.github_app.webhook_secret,
                     Some("webhook-secret".to_string())
                 );
                 assert_eq!(config.github_app.installation_id, Some(67890));
-                assert_eq!(
-                    config.github_app.client_id,
-                    Some("client-id".to_string())
-                );
+                assert_eq!(config.github_app.client_id, Some("client-id".to_string()));
                 assert_eq!(
                     config.github_app.client_secret,
                     Some("client-secret".to_string())
