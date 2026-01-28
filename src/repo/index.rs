@@ -232,9 +232,11 @@ impl RepoIndex {
 
 /// Expand ~ to home directory.
 fn expand_path(path: &str) -> PathBuf {
-    if path.starts_with('~') {
+    if let Some(stripped) = path.strip_prefix('~') {
         if let Some(home) = dirs::home_dir() {
-            return home.join(path.strip_prefix("~/").unwrap_or(&path[1..]));
+            // Strip the leading / if present (e.g., ~/foo -> foo, ~ -> empty)
+            let suffix = stripped.strip_prefix('/').unwrap_or(stripped);
+            return home.join(suffix);
         }
     }
     PathBuf::from(path)
