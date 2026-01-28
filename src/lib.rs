@@ -32,6 +32,7 @@ pub mod env_writer;
 pub mod error;
 pub mod feedback;
 pub mod github;
+pub mod github_app;
 pub mod inference;
 pub mod ipc;
 pub mod notifier;
@@ -60,6 +61,10 @@ pub use feedback::{
 pub use github::{
     GitHubClient, GitHubUser, PrMonitor, PrReview, PrReviewComment, PrReviewState, PrStatus,
     PrStatusUpdate, ReviewEvent, ReviewWatcher,
+};
+pub use github_app::{
+    AppManifest, AppPermissions, CachedToken, GitHubAppAuth, GitHubAppClient, HookAttributes,
+    SetupState,
 };
 pub use inference::{
     resolve_repo_for_issue, Confidence, InferredRepo, IssueContext, RepoInferrer, RepoResolution,

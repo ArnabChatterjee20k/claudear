@@ -55,12 +55,18 @@ pub struct Config {
     pub push: PushConfig,
     /// GitHub configuration for PR monitoring.
     pub github: GitHubConfig,
+    /// GitHub App configuration for App-based authentication.
+    #[serde(default)]
+    pub github_app: GitHubAppConfig,
     /// Retry configuration.
     pub retry: RetryConfig,
     /// Linear source configuration.
     pub linear: Option<LinearConfig>,
     /// Sentry source configuration.
     pub sentry: Option<SentryConfig>,
+    /// Regression monitoring configuration.
+    #[serde(default)]
+    pub regression: RegressionConfig,
 }
 
 impl Default for Config {
@@ -83,9 +89,11 @@ impl Default for Config {
             sms: SmsConfig::default(),
             push: PushConfig::default(),
             github: GitHubConfig::default(),
+            github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),
             linear: None,
             sentry: None,
+            regression: RegressionConfig::default(),
         }
     }
 }
@@ -171,7 +179,7 @@ pub struct PushConfig {
 }
 
 /// GitHub configuration for PR monitoring.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GitHubConfig {
     /// GitHub personal access token.
@@ -180,6 +188,88 @@ pub struct GitHubConfig {
     pub poll_interval_ms: u64,
     /// Whether to auto-resolve issues when PRs merge.
     pub auto_resolve_on_merge: bool,
+    /// Webhook secret for verifying GitHub webhook signatures.
+    pub webhook_secret: Option<String>,
+    /// Trigger tag for review comments (e.g., "/claudear" or "@mybot").
+    /// Comments must contain this tag to trigger Claude.
+    /// Set to empty string to respond to all comments.
+    pub review_trigger: String,
+}
+
+impl Default for GitHubConfig {
+    fn default() -> Self {
+        Self {
+            token: None,
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: false,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+        }
+    }
+}
+
+/// GitHub App authentication mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GitHubAuthMode {
+    /// Personal Access Token (classic mode).
+    #[default]
+    Token,
+    /// GitHub App with JWT authentication.
+    App,
+}
+
+/// GitHub App configuration for App-based authentication.
+///
+/// This is used for self-hosted deployments where users create their own
+/// GitHub App via the manifest flow.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitHubAppConfig {
+    /// GitHub App ID (assigned by GitHub when the App is created).
+    pub app_id: Option<i64>,
+    /// Path to the private key PEM file.
+    pub private_key_path: Option<PathBuf>,
+    /// Inline private key PEM content (alternative to file).
+    pub private_key: Option<String>,
+    /// Webhook secret for verifying GitHub webhook signatures.
+    pub webhook_secret: Option<String>,
+    /// Installation ID (auto-detected if not set).
+    pub installation_id: Option<i64>,
+    /// OAuth Client ID (for user authorization flows).
+    pub client_id: Option<String>,
+    /// OAuth Client Secret.
+    pub client_secret: Option<String>,
+    /// Public base URL for the manifest flow.
+    pub base_url: Option<String>,
+}
+
+impl GitHubAppConfig {
+    /// Check if the GitHub App is configured with minimum required fields.
+    pub fn is_configured(&self) -> bool {
+        self.app_id.is_some() && (self.private_key_path.is_some() || self.private_key.is_some())
+    }
+
+    /// Load the private key from file or inline content.
+    pub fn load_private_key(&self) -> Result<String> {
+        if let Some(key) = &self.private_key {
+            return Ok(key.clone());
+        }
+
+        if let Some(path) = &self.private_key_path {
+            let content = fs::read_to_string(path).map_err(|e| {
+                Error::config(format!(
+                    "Failed to read GitHub App private key from '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            return Ok(content);
+        }
+
+        Err(Error::config(
+            "No GitHub App private key configured (set private_key or private_key_path)",
+        ))
+    }
 }
 
 /// Linear source configuration.
@@ -314,6 +404,51 @@ impl Default for SentryConfig {
             min_event_count: 10,
             escalation_threshold_percent: 50,
             client_secret: None,
+        }
+    }
+}
+
+/// Configuration for bug fix regression monitoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RegressionConfig {
+    /// Whether regression monitoring is enabled.
+    pub enabled: bool,
+    /// How often to check for regressions (in hours).
+    pub check_interval_hours: u32,
+    /// Total monitoring duration after release (in hours).
+    pub monitoring_duration_hours: u32,
+    /// Minimum Sentry events to trigger regression detection.
+    pub sentry_event_threshold: u32,
+    /// Semantic similarity threshold for matching issues (0.0-1.0).
+    pub similarity_threshold: f64,
+    /// Target repositories that signal a release is live.
+    /// When a fix is included in a release of these repos, monitoring starts.
+    pub target_repos: Vec<String>,
+    /// GitHub token for searching issues (uses github.token if not set).
+    pub github_token: Option<String>,
+    /// Repositories to search for similar issues.
+    pub github_search_repos: Vec<String>,
+}
+
+impl Default for RegressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_hours: 1,
+            monitoring_duration_hours: 24,
+            sentry_event_threshold: 1,
+            similarity_threshold: 0.75,
+            target_repos: vec![
+                "appwrite-labs/cloud".to_string(),
+                "appwrite-labs/edge".to_string(),
+            ],
+            github_token: None,
+            github_search_repos: vec![
+                "appwrite/appwrite".to_string(),
+                "appwrite/sdk-for-web".to_string(),
+                "appwrite/sdk-for-flutter".to_string(),
+            ],
         }
     }
 }
@@ -521,6 +656,41 @@ impl Config {
         if let Ok(v) = env::var("GITHUB_AUTO_RESOLVE_ON_MERGE") {
             self.github.auto_resolve_on_merge = v.to_lowercase() == "true" || v == "1";
         }
+        if let Ok(v) = env::var("GITHUB_WEBHOOK_SECRET") {
+            self.github.webhook_secret = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("GITHUB_REVIEW_TRIGGER") {
+            self.github.review_trigger = v;
+        }
+
+        // GitHub App
+        if let Some(v) = env::var("GITHUB_APP_ID").ok().and_then(|v| v.parse().ok()) {
+            self.github_app.app_id = Some(v);
+        }
+        if let Ok(v) = env::var("GITHUB_APP_PRIVATE_KEY_PATH") {
+            self.github_app.private_key_path = Some(v).filter(|s| !s.is_empty()).map(PathBuf::from);
+        }
+        if let Ok(v) = env::var("GITHUB_APP_PRIVATE_KEY") {
+            self.github_app.private_key = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("GITHUB_APP_WEBHOOK_SECRET") {
+            self.github_app.webhook_secret = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Some(v) = env::var("GITHUB_APP_INSTALLATION_ID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.github_app.installation_id = Some(v);
+        }
+        if let Ok(v) = env::var("GITHUB_APP_CLIENT_ID") {
+            self.github_app.client_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("GITHUB_APP_CLIENT_SECRET") {
+            self.github_app.client_secret = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("GITHUB_APP_BASE_URL") {
+            self.github_app.base_url = Some(v).filter(|s| !s.is_empty());
+        }
 
         // Retry
         if let Some(v) = env::var("RETRY_MAX_RETRIES")
@@ -682,7 +852,23 @@ impl Config {
 
     /// Check if GitHub PR monitoring is enabled.
     pub fn is_github_enabled(&self) -> bool {
-        self.github.token.is_some()
+        self.github.token.is_some() || self.github_app.is_configured()
+    }
+
+    /// Determine the GitHub authentication mode to use.
+    ///
+    /// Returns `App` if GitHub App is configured, otherwise `Token`.
+    pub fn github_auth_mode(&self) -> GitHubAuthMode {
+        if self.github_app.is_configured() {
+            GitHubAuthMode::App
+        } else {
+            GitHubAuthMode::Token
+        }
+    }
+
+    /// Check if GitHub App is configured.
+    pub fn is_github_app_configured(&self) -> bool {
+        self.github_app.is_configured()
     }
 }
 
@@ -743,6 +929,14 @@ mod tests {
         "GITHUB_TOKEN",
         "GITHUB_POLL_INTERVAL_MS",
         "GITHUB_AUTO_RESOLVE_ON_MERGE",
+        "GITHUB_APP_ID",
+        "GITHUB_APP_PRIVATE_KEY_PATH",
+        "GITHUB_APP_PRIVATE_KEY",
+        "GITHUB_APP_WEBHOOK_SECRET",
+        "GITHUB_APP_INSTALLATION_ID",
+        "GITHUB_APP_CLIENT_ID",
+        "GITHUB_APP_CLIENT_SECRET",
+        "GITHUB_APP_BASE_URL",
         "RETRY_MAX_RETRIES",
         "RETRY_BASE_DELAY_MS",
         "RETRY_MAX_DELAY_MS",
@@ -1565,5 +1759,247 @@ linear:
         assert!(yaml.contains("max_retries"));
         assert!(yaml.contains("base_delay_ms"));
         assert!(yaml.contains("max_delay_ms"));
+    }
+
+    #[test]
+    fn test_regression_config_default() {
+        let config = RegressionConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.check_interval_hours, 1);
+        assert_eq!(config.monitoring_duration_hours, 24);
+        assert_eq!(config.sentry_event_threshold, 1);
+        assert!((config.similarity_threshold - 0.75).abs() < 0.01);
+        assert_eq!(config.target_repos.len(), 2);
+        assert!(config.target_repos.contains(&"appwrite-labs/cloud".to_string()));
+        assert!(config.target_repos.contains(&"appwrite-labs/edge".to_string()));
+        assert!(config.github_token.is_none());
+        assert_eq!(config.github_search_repos.len(), 3);
+    }
+
+    #[test]
+    fn test_regression_config_serialization() {
+        let config = RegressionConfig::default();
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("enabled"));
+        assert!(yaml.contains("check_interval_hours"));
+        assert!(yaml.contains("monitoring_duration_hours"));
+        assert!(yaml.contains("sentry_event_threshold"));
+        assert!(yaml.contains("similarity_threshold"));
+        assert!(yaml.contains("target_repos"));
+    }
+
+    #[test]
+    fn test_regression_config_deserialization() {
+        let yaml = r#"
+enabled: true
+check_interval_hours: 2
+monitoring_duration_hours: 48
+sentry_event_threshold: 5
+similarity_threshold: 0.8
+target_repos:
+  - custom/repo
+github_search_repos:
+  - org/repo1
+  - org/repo2
+"#;
+        let config: RegressionConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.check_interval_hours, 2);
+        assert_eq!(config.monitoring_duration_hours, 48);
+        assert_eq!(config.sentry_event_threshold, 5);
+        assert!((config.similarity_threshold - 0.8).abs() < 0.01);
+        assert_eq!(config.target_repos, vec!["custom/repo"]);
+        assert_eq!(config.github_search_repos.len(), 2);
+    }
+
+    #[test]
+    fn test_config_includes_regression() {
+        let config = Config::default();
+        assert!(config.regression.enabled);
+        assert_eq!(config.regression.check_interval_hours, 1);
+    }
+
+    #[test]
+    fn test_config_regression_from_yaml() {
+        let yaml = r#"
+work_dir: /tmp/test
+regression:
+  enabled: false
+  check_interval_hours: 4
+  monitoring_duration_hours: 12
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert!(!config.regression.enabled);
+        assert_eq!(config.regression.check_interval_hours, 4);
+        assert_eq!(config.regression.monitoring_duration_hours, 12);
+        // Defaults should apply for unspecified fields
+        assert_eq!(config.regression.sentry_event_threshold, 1);
+    }
+
+    #[test]
+    fn test_github_app_config_default() {
+        let config = GitHubAppConfig::default();
+        assert!(config.app_id.is_none());
+        assert!(config.private_key_path.is_none());
+        assert!(config.private_key.is_none());
+        assert!(config.webhook_secret.is_none());
+        assert!(config.installation_id.is_none());
+        assert!(config.client_id.is_none());
+        assert!(config.client_secret.is_none());
+        assert!(config.base_url.is_none());
+    }
+
+    #[test]
+    fn test_github_app_config_is_configured() {
+        let mut config = GitHubAppConfig::default();
+        assert!(!config.is_configured());
+
+        // Just app_id is not enough
+        config.app_id = Some(12345);
+        assert!(!config.is_configured());
+
+        // app_id + private_key_path is enough
+        config.private_key_path = Some(PathBuf::from("/path/to/key.pem"));
+        assert!(config.is_configured());
+
+        // app_id + private_key (inline) is also enough
+        config.private_key_path = None;
+        config.private_key = Some("-----BEGIN RSA PRIVATE KEY-----".to_string());
+        assert!(config.is_configured());
+    }
+
+    #[test]
+    fn test_github_app_config_load_private_key_inline() {
+        let mut config = GitHubAppConfig::default();
+        config.private_key = Some("test-key-content".to_string());
+
+        let key = config.load_private_key().unwrap();
+        assert_eq!(key, "test-key-content");
+    }
+
+    #[test]
+    fn test_github_app_config_load_private_key_missing() {
+        let config = GitHubAppConfig::default();
+        let result = config.load_private_key();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No GitHub App private key"));
+    }
+
+    #[test]
+    fn test_github_auth_mode_default() {
+        assert_eq!(GitHubAuthMode::default(), GitHubAuthMode::Token);
+    }
+
+    #[test]
+    fn test_config_github_auth_mode_token() {
+        let config = Config::default();
+        assert_eq!(config.github_auth_mode(), GitHubAuthMode::Token);
+    }
+
+    #[test]
+    fn test_config_github_auth_mode_app() {
+        let mut config = Config::default();
+        config.github_app.app_id = Some(12345);
+        config.github_app.private_key = Some("test-key".to_string());
+        assert_eq!(config.github_auth_mode(), GitHubAuthMode::App);
+    }
+
+    #[test]
+    fn test_is_github_enabled_with_token() {
+        let mut config = Config::default();
+        assert!(!config.is_github_enabled());
+
+        config.github.token = Some("ghp_test".to_string());
+        assert!(config.is_github_enabled());
+    }
+
+    #[test]
+    fn test_is_github_enabled_with_app() {
+        let mut config = Config::default();
+        assert!(!config.is_github_enabled());
+
+        config.github_app.app_id = Some(12345);
+        config.github_app.private_key = Some("test-key".to_string());
+        assert!(config.is_github_enabled());
+    }
+
+    #[test]
+    fn test_github_app_config_from_yaml() {
+        let yaml = r#"
+work_dir: /tmp/test
+github_app:
+  app_id: 12345
+  private_key_path: /path/to/key.pem
+  webhook_secret: secret123
+  installation_id: 67890
+  client_id: Iv1.abc123
+  client_secret: secret456
+  base_url: https://example.com
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert_eq!(config.github_app.app_id, Some(12345));
+        assert_eq!(
+            config.github_app.private_key_path,
+            Some(PathBuf::from("/path/to/key.pem"))
+        );
+        assert_eq!(
+            config.github_app.webhook_secret,
+            Some("secret123".to_string())
+        );
+        assert_eq!(config.github_app.installation_id, Some(67890));
+        assert_eq!(config.github_app.client_id, Some("Iv1.abc123".to_string()));
+        assert_eq!(
+            config.github_app.client_secret,
+            Some("secret456".to_string())
+        );
+        assert_eq!(
+            config.github_app.base_url,
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_env_override_github_app() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("GITHUB_APP_ID", "12345"),
+                ("GITHUB_APP_PRIVATE_KEY", "test-key"),
+                ("GITHUB_APP_WEBHOOK_SECRET", "webhook-secret"),
+                ("GITHUB_APP_INSTALLATION_ID", "67890"),
+                ("GITHUB_APP_CLIENT_ID", "client-id"),
+                ("GITHUB_APP_CLIENT_SECRET", "client-secret"),
+                ("GITHUB_APP_BASE_URL", "https://example.com"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.github_app.app_id, Some(12345));
+                assert_eq!(
+                    config.github_app.private_key,
+                    Some("test-key".to_string())
+                );
+                assert_eq!(
+                    config.github_app.webhook_secret,
+                    Some("webhook-secret".to_string())
+                );
+                assert_eq!(config.github_app.installation_id, Some(67890));
+                assert_eq!(
+                    config.github_app.client_id,
+                    Some("client-id".to_string())
+                );
+                assert_eq!(
+                    config.github_app.client_secret,
+                    Some("client-secret".to_string())
+                );
+                assert_eq!(
+                    config.github_app.base_url,
+                    Some("https://example.com".to_string())
+                );
+            },
+        );
     }
 }
