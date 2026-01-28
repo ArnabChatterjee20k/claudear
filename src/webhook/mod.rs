@@ -1,6 +1,7 @@
 //! Webhook handlers and HTTP server.
 
 mod configurator;
+mod github;
 mod linear;
 mod linear_api;
 mod sentry;
@@ -8,6 +9,7 @@ mod sentry_api;
 mod server;
 
 pub use configurator::{print_setup_result, WebhookConfigurator, WebhookSetupResult};
+pub use github::GitHubWebhookHandler;
 pub use linear::LinearWebhookHandler;
 pub use linear_api::{LinearApiClient, WebhookRegistration};
 pub use sentry::SentryWebhookHandler;
