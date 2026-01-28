@@ -104,11 +104,12 @@ impl RetryManager {
                     );
                     Ok(RetryDecision::CannotFix)
                 } else {
-                    // Schedule retry
-                    self.tracker.increment_retry(source, issue_id)?;
+                    // Schedule retry - don't increment retry_count here, that's done in prepare_retry()
+                    // when the retry is actually executed. retry_count represents "retries initiated".
                     self.tracker.mark_failed(source, issue_id, error)?;
 
-                    let delay = self.get_delay(new_retry_count);
+                    // Use current retry_count for delay calculation (0 = waiting for first retry, 1 = waiting for second, etc.)
+                    let delay = self.get_delay(attempt.retry_count);
                     let next_retry_time =
                         Utc::now() + ChronoDuration::milliseconds(delay.as_millis() as i64);
 
@@ -260,6 +261,7 @@ mod tests {
             resolved_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         };
         assert!(manager.should_retry(&failed));
 
@@ -311,6 +313,7 @@ mod tests {
             resolved_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         };
         assert!(manager.should_retry(&attempt));
 
@@ -334,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_failure_increments_retry() {
+    fn test_handle_failure_schedules_retry() {
         let tracker = create_test_tracker();
         let config = RetryConfig {
             max_retries: 2,
@@ -348,20 +351,23 @@ mod tests {
             .mark_failed("linear", "123", "First failure")
             .unwrap();
 
-        // Handle failure - should schedule retry
+        // Handle failure - should schedule retry but NOT increment retry_count
+        // (retry_count is incremented by prepare_retry when the retry is actually executed)
         let decision = manager
             .handle_failure("linear", "123", "Second failure")
             .unwrap();
         match decision {
             RetryDecision::Retry { retry_count, .. } => {
+                // retry_count in decision = next retry number (1 = first retry)
                 assert_eq!(retry_count, 1);
             }
             _ => panic!("Expected Retry decision"),
         }
 
-        // Check that retry count was incremented
+        // Check that retry count was NOT incremented in handle_failure
+        // (will be incremented by prepare_retry)
         let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
-        assert_eq!(attempt.retry_count, 1);
+        assert_eq!(attempt.retry_count, 0);
     }
 
     #[test]
@@ -450,6 +456,7 @@ mod tests {
             resolved_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         };
 
         assert!(manager.get_next_retry_time(&attempt).is_none());
@@ -480,6 +487,7 @@ mod tests {
             resolved_at: None,
             retry_count: 2,
             last_retry_at: Some(base_time),
+            issue_labels: vec![],
         };
 
         let next_retry = manager.get_next_retry_time(&attempt).unwrap();
@@ -516,6 +524,7 @@ mod tests {
             resolved_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         };
 
         assert!(!manager.is_ready_for_retry(&attempt));
@@ -546,6 +555,7 @@ mod tests {
             resolved_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         };
 
         assert!(!manager.is_ready_for_retry(&attempt));
@@ -576,6 +586,7 @@ mod tests {
             resolved_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         };
 
         assert!(manager.is_ready_for_retry(&attempt));
