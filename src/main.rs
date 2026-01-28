@@ -4,12 +4,18 @@ use clap::{Parser, Subcommand};
 use claudear::{
     api::ApiServer,
     config::Config,
-    github::{GitHubClient, PrMonitor, PrStatus},
+    github::{GitHubClient, PrMonitor, PrStatus, ReviewWatcher},
     ipc::{default_socket_path, is_daemon_running, print_response, IpcClient, IpcServer},
     notifier::{
         CompositeNotifier, ConsoleNotifier, DiscordNotifier, EmailNotifier, Notifier, PushNotifier,
         SmsNotifier,
     },
+    regression::{
+        CompositeChecker, LinearRegressionChecker, LinearRegressionConfig, NoOpChecker,
+        RegressionScheduler, RegressionSchedulerConfig, SentryRegressionChecker,
+        SentryRegressionConfig,
+    },
+    release::{ReleaseTracker, ReleaseTrackerConfig},
     repo::{DependencyType, RepoIndex, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
@@ -25,7 +31,7 @@ use claudear::{
 use serde_json::json;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[derive(Parser)]
 #[command(name = "claudear")]
@@ -35,6 +41,10 @@ struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "claudear.yaml")]
     config: String,
+
+    /// Directory for log files (with daily rotation). Set to empty string to disable file logging.
+    #[arg(long, env = "CLAUDEAR_LOG_DIR", default_value = "./logs")]
+    log_dir: std::path::PathBuf,
 
     #[command(subcommand)]
     command: Commands,
@@ -352,10 +362,107 @@ enum DiagCommands {
     Db,
 }
 
-fn init_logging() {
+/// Initialize logging with both console and file output.
+/// Returns a guard that must be kept alive for the duration of the program.
+fn init_logging(log_dir: Option<&std::path::Path>) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    fmt().with_env_filter(filter).with_target(false).init();
+    // Console layer - always enabled
+    let console_layer = fmt::layer()
+        .with_target(false)
+        .with_writer(std::io::stdout);
+
+    // File layer - optional, with daily rotation
+    if let Some(dir) = log_dir {
+        // Create log directory if it doesn't exist
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("Warning: Failed to create log directory {:?}: {}", dir, e);
+            // Fall back to console-only logging
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(console_layer)
+                .init();
+            return None;
+        }
+
+        // Create file appender with daily rotation
+        let file_appender = tracing_appender::rolling::daily(dir, "claudear.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        let file_layer = fmt::layer()
+            .with_target(true)
+            .with_ansi(false)  // No ANSI colors in file
+            .with_writer(non_blocking);
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(console_layer)
+            .with(file_layer)
+            .init();
+
+        tracing::info!("Logging to file: {}/claudear.log", dir.display());
+        Some(guard)
+    } else {
+        // Console-only logging
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(console_layer)
+            .init();
+        None
+    }
+}
+
+/// Create a ReviewWatcher if GitHub is configured.
+fn create_review_watcher(
+    config: &Config,
+    tracker: Arc<dyn FixAttemptTracker>,
+    sqlite_tracker: Arc<SqliteTracker>,
+) -> Option<Arc<ReviewWatcher>> {
+    if !config.is_github_enabled() {
+        tracing::debug!("GitHub not configured, ReviewWatcher disabled");
+        return None;
+    }
+
+    let github_client = GitHubClient::new(config.github.clone());
+    if !github_client.is_enabled() {
+        tracing::debug!("GitHub client not enabled, ReviewWatcher disabled");
+        return None;
+    }
+
+    let review_watcher = ReviewWatcher::with_sqlite_tracker(
+        github_client,
+        tracker,
+        Some(sqlite_tracker.clone()),
+    );
+
+    // Restore states from database
+    match sqlite_tracker.get_active_pr_review_states() {
+        Ok(states) => {
+            let count = states.len();
+            if count > 0 {
+                review_watcher.load_states(states);
+                tracing::info!(
+                    component = "review_watcher",
+                    count = count,
+                    "Restored PR review states from database"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                component = "review_watcher",
+                error = %e,
+                "Failed to restore PR review states from database"
+            );
+        }
+    }
+
+    tracing::info!(
+        component = "review_watcher",
+        "ReviewWatcher enabled for PR review tracking"
+    );
+
+    Some(Arc::new(review_watcher))
 }
 
 fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
@@ -441,11 +548,195 @@ fn create_tracker(config: &Config) -> (Arc<dyn FixAttemptTracker>, Arc<SqliteTra
     (tracker.clone(), tracker)
 }
 
+/// Start the regression monitoring background tasks.
+///
+/// This runs two background tasks:
+/// 1. ReleaseTracker: Checks if fixes have been included in releases and transitions watches to Monitoring
+/// 2. RegressionScheduler: Runs hourly checks on watches in Monitoring state
+///
+/// Returns a join handle that can be used to stop the monitoring.
+fn start_regression_monitoring(
+    config: &Config,
+    sqlite_tracker: Arc<SqliteTracker>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.regression.enabled {
+        tracing::info!("Regression monitoring disabled in configuration");
+        return None;
+    }
+
+    // Get GitHub token (from regression config or fall back to github config)
+    let github_token = config
+        .regression
+        .github_token
+        .clone()
+        .or_else(|| config.github.token.clone());
+
+    let github_token = match github_token {
+        Some(token) if !token.is_empty() => token,
+        _ => {
+            tracing::warn!("No GitHub token configured, regression monitoring disabled");
+            return None;
+        }
+    };
+
+    // Create release tracker config
+    let release_config = ReleaseTrackerConfig {
+        target_repos: config.regression.target_repos.clone(),
+        poll_interval_ms: config.regression.check_interval_hours as u64 * 60 * 60 * 1000, // Convert hours to ms
+    };
+
+    // Create scheduler config
+    let scheduler_config = RegressionSchedulerConfig {
+        check_interval_hours: config.regression.check_interval_hours,
+        monitoring_duration_hours: config.regression.monitoring_duration_hours,
+        sentry_event_threshold: config.regression.sentry_event_threshold,
+        similarity_threshold: config.regression.similarity_threshold,
+    };
+
+    // Create the sentry regression checker if sentry is configured
+    let sentry_checker: Box<dyn claudear::regression::RegressionChecker> =
+        if let Some(ref sentry_config) = config.sentry {
+            if sentry_config.enabled && !sentry_config.auth_token.is_empty() {
+                let sentry_regression_config = SentryRegressionConfig {
+                    auth_token: sentry_config.auth_token.clone(),
+                    org_slug: sentry_config.org_slug.clone(),
+                    event_threshold: config.regression.sentry_event_threshold,
+                };
+                // Use the public HTTP client
+                let http_client = claudear::source::sentry::ReqwestSentryClient::new();
+                Box::new(SentryRegressionChecker::new(sentry_regression_config, http_client))
+            } else {
+                Box::new(NoOpChecker)
+            }
+        } else {
+            Box::new(NoOpChecker)
+        };
+
+    // Create the linear regression checker
+    // NOTE: LinearRegressionChecker requires per-issue keywords for effective similarity matching.
+    // Currently we create it with empty keywords, which means it will only check appwrite.io/threads
+    // and won't be able to search GitHub issues effectively. A future improvement would be to
+    // store issue keywords in the regression_watches table and load them during each check.
+    let linear_checker: Box<dyn claudear::regression::RegressionChecker> = {
+        let linear_regression_config = LinearRegressionConfig {
+            github_token: github_token.clone(),
+            github_repos: config.regression.github_search_repos.clone(),
+            similarity_threshold: config.regression.similarity_threshold,
+        };
+        tracing::warn!(
+            "Linear regression checker initialized without issue-specific keywords. \
+             GitHub issue search will be limited. Only thread similarity checking will work."
+        );
+        Box::new(LinearRegressionChecker::new(
+            linear_regression_config,
+            vec![],
+            String::new(),
+        ))
+    };
+
+    // Create composite checker
+    let composite_checker = CompositeChecker::new(sentry_checker, linear_checker);
+
+    // Create release tracker and scheduler
+    let release_tracker = ReleaseTracker::with_config(
+        github_token,
+        sqlite_tracker.clone(),
+        release_config,
+    );
+
+    let scheduler = RegressionScheduler::new(
+        composite_checker,
+        sqlite_tracker.clone(),
+        scheduler_config.clone(),
+    );
+
+    let check_interval_hours = scheduler_config.check_interval_hours;
+
+    // Start background task
+    let handle = tokio::spawn(async move {
+        let mut release_check_interval = interval(Duration::from_secs(300)); // Check for releases every 5 minutes
+        let mut regression_check_interval =
+            interval(Duration::from_secs(check_interval_hours as u64 * 60 * 60)); // Hourly regression checks
+
+        tracing::info!(
+            component = "regression_monitor",
+            check_interval_hours = check_interval_hours,
+            "Regression monitoring started"
+        );
+
+        loop {
+            tokio::select! {
+                _ = release_check_interval.tick() => {
+                    // Check for releases and transition watches to Monitoring
+                    match release_tracker.check_pending_watches().await {
+                        Ok(transitioned) => {
+                            if !transitioned.is_empty() {
+                                tracing::info!(
+                                    component = "regression_monitor",
+                                    count = transitioned.len(),
+                                    "Transitioned watches to monitoring state"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                component = "regression_monitor",
+                                error = %e,
+                                "Error checking for releases"
+                            );
+                        }
+                    }
+                }
+                _ = regression_check_interval.tick() => {
+                    // Run regression checks on watches in Monitoring state
+                    match scheduler.check_monitoring_watches().await {
+                        Ok(results) => {
+                            for result in &results {
+                                if result.regression_detected {
+                                    tracing::warn!(
+                                        component = "regression_monitor",
+                                        watch_id = result.watch_id,
+                                        check_number = result.check_number,
+                                        "Regression detected!"
+                                    );
+                                } else if result.is_final_check {
+                                    tracing::info!(
+                                        component = "regression_monitor",
+                                        watch_id = result.watch_id,
+                                        "Final check complete, no regression"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                component = "regression_monitor",
+                                error = %e,
+                                "Error running regression checks"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Some(handle)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging();
-
     let cli = Cli::parse();
+
+    // Initialize logging (must keep _guard alive for file logging to work)
+    // Empty path disables file logging
+    let log_dir = if cli.log_dir.as_os_str().is_empty() {
+        None
+    } else {
+        Some(cli.log_dir.as_path())
+    };
+    let _log_guard = init_logging(log_dir);
+
     let config_path = cli.config.clone();
 
     // Load and validate config from YAML file
@@ -967,11 +1258,72 @@ async fn main() -> anyhow::Result<()> {
             }
 
             InferenceCommands::History { limit } => {
-                // TODO: Add a method to fetch inference history from DB
-                // For now, just show the stats
-                println!("\nRecent Inference Attempts (last {}):", limit);
-                println!("  (History listing not yet implemented)");
-                println!("\n  Use 'claudear inference stats' to see aggregate statistics.");
+                let history = db_tracker.get_inference_history(*limit)?;
+
+                if history.is_empty() {
+                    println!("\nNo inference attempts recorded yet.");
+                    println!("  Run 'claudear process' to start processing issues.");
+                } else {
+                    println!("\nRecent Inference Attempts (last {}):\n", history.len());
+
+                    for entry in &history {
+                        let status = match entry.was_correct {
+                            Some(true) => "✓ correct",
+                            Some(false) => "✗ incorrect",
+                            None => "? pending",
+                        };
+
+                        let repo_display = entry
+                            .inferred_repo_name
+                            .as_deref()
+                            .unwrap_or("(no match)");
+
+                        let confidence_display = entry
+                            .confidence
+                            .as_deref()
+                            .unwrap_or("none");
+
+                        let duration_display = entry
+                            .duration_ms
+                            .map(|ms| format!("{}ms", ms))
+                            .unwrap_or_else(|| "-".to_string());
+
+                        println!(
+                            "  #{} [{}] {} → {} ({}) [{}]",
+                            entry.id,
+                            entry.issue_source,
+                            entry.issue_id,
+                            repo_display,
+                            confidence_display,
+                            status
+                        );
+
+                        if let Some(ref reason) = entry.inference_reason {
+                            // Truncate long reasons
+                            let truncated = if reason.len() > 60 {
+                                format!("{}...", &reason[..57])
+                            } else {
+                                reason.clone()
+                            };
+                            println!("      Reason: {}", truncated);
+                        }
+
+                        if let Some(ref keywords) = entry.extracted_keywords {
+                            // Truncate long keyword lists
+                            let truncated = if keywords.len() > 50 {
+                                format!("{}...", &keywords[..47])
+                            } else {
+                                keywords.clone()
+                            };
+                            println!("      Keywords: {}", truncated);
+                        }
+
+                        println!("      Time: {} | Duration: {}", entry.created_at, duration_display);
+                        println!();
+                    }
+
+                    println!("  Use 'claudear inference feedback <id> --correct/--incorrect' to provide feedback.");
+                }
             }
 
             InferenceCommands::Feedback {
@@ -1110,6 +1462,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Repository inference enabled");
         }
 
+        // Create ReviewWatcher for PR review tracking
+        let review_watcher =
+            create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+
         // Create watcher if polling is enabled
         let watcher = if enable_polling {
             Some(Arc::new(Watcher::new(WatcherOptions {
@@ -1120,7 +1476,7 @@ async fn main() -> anyhow::Result<()> {
                 sqlite_tracker: Some(sqlite_tracker.clone()),
                 inferrer: inferrer.clone(),
                 embedding_client: None,
-                review_watcher: None,
+                review_watcher,
                 issue_embedding_service: None,
                 dry_run: false,
             })))
@@ -1171,6 +1527,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("  Poll interval: {}ms", poll_interval);
         }
 
+        // Start regression monitoring background task
+        let regression_handle = start_regression_monitoring(&config, sqlite_tracker.clone());
+        if regression_handle.is_some() {
+            tracing::info!("  Regression monitoring: enabled");
+        }
+
         // Shutdown signal handler with graceful drain
         let watcher_for_shutdown = watcher.clone();
         let tracker_for_shutdown = tracker.clone();
@@ -1193,6 +1555,16 @@ async fn main() -> anyhow::Result<()> {
             let activity = ActivityLogEntry::new("watcher_stopped", "Watcher daemon stopped")
                 .with_source("system".to_string());
             tracker_for_shutdown.record_activity(&activity).ok();
+        };
+
+        // Abort regression monitoring on shutdown
+        let regression_shutdown = {
+            let handle = regression_handle;
+            async move {
+                if let Some(h) = handle {
+                    h.abort();
+                }
+            }
         };
 
         // Build the unified HTTP server with dashboard API + webhooks
@@ -1257,7 +1629,10 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!("Polling error: {}", e);
                 }
             }
-            _ = shutdown => {}
+            _ = shutdown => {
+                // Stop regression monitoring
+                regression_shutdown.await;
+            }
         }
 
         return Ok(());
@@ -1514,6 +1889,10 @@ async fn main() -> anyhow::Result<()> {
         // Build inferrer for retry processing
         let inferrer = Watcher::build_inferrer(&config)?;
 
+        // Create ReviewWatcher for PR review tracking
+        let review_watcher =
+            create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+
         let watcher = Watcher::new(WatcherOptions {
             config: config.clone(),
             sources,
@@ -1522,7 +1901,7 @@ async fn main() -> anyhow::Result<()> {
             sqlite_tracker: Some(sqlite_tracker.clone()),
             inferrer,
             embedding_client: None,
-            review_watcher: None,
+            review_watcher,
             issue_embedding_service: None,
             dry_run: false,
         });
@@ -1753,6 +2132,10 @@ async fn main() -> anyhow::Result<()> {
             let (inferrer, embedding_client) =
                 Watcher::build_inferrer_with_embeddings(&config).await?;
 
+            // Create ReviewWatcher for PR review tracking
+            let review_watcher =
+                create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+
             let watcher = Watcher::new(WatcherOptions {
                 config: config.clone(),
                 sources,
@@ -1761,7 +2144,7 @@ async fn main() -> anyhow::Result<()> {
                 sqlite_tracker: Some(sqlite_tracker.clone()),
                 inferrer,
                 embedding_client,
-                review_watcher: None,
+                review_watcher,
                 issue_embedding_service: None,
                 dry_run,
             });
