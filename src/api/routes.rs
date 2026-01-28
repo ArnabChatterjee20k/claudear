@@ -405,7 +405,8 @@ fn get_attempts(tracker: &Arc<dyn FixAttemptTracker>, limit: Option<usize>) -> V
 mod tests {
     use super::*;
     use crate::config::{
-        DiscordConfig, EmailConfig, GitHubConfig, PushConfig, RetryConfig, SmsConfig,
+        DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig, RegressionConfig,
+        RetryConfig, SmsConfig,
     };
     use crate::storage::SqliteTracker;
     use axum::body::Body;
@@ -432,9 +433,11 @@ mod tests {
             sms: SmsConfig::default(),
             push: PushConfig::default(),
             github: GitHubConfig::default(),
+            github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),
             linear: None,
             sentry: None,
+            regression: RegressionConfig::default(),
         }
     }
 
@@ -630,6 +633,7 @@ mod tests {
             merged_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         };
 
         let summary = attempt_to_summary(&attempt);
@@ -925,6 +929,7 @@ mod tests {
             merged_at: None,
             retry_count: 2,
             last_retry_at: Some(chrono::Utc::now()),
+            issue_labels: vec![],
         };
 
         let summary = attempt_to_summary(&attempt);

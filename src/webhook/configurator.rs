@@ -278,9 +278,11 @@ mod tests {
             sms: crate::config::SmsConfig::default(),
             push: crate::config::PushConfig::default(),
             github: crate::config::GitHubConfig::default(),
+            github_app: crate::config::GitHubAppConfig::default(),
             retry: crate::config::RetryConfig::default(),
             linear: None,
             sentry: None,
+            regression: crate::config::RegressionConfig::default(),
         }
     }
 

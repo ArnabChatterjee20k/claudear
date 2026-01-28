@@ -297,6 +297,7 @@ mod tests {
             merged_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         }
     }
 
@@ -490,6 +491,7 @@ mod tests {
             error_type: None,
             learnings: None,
             keywords: vec!["test".to_string()],
+            embedding: None,
             created_at: chrono::Utc::now(),
         };
 
