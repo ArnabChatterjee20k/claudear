@@ -351,9 +351,10 @@ async fn webhook_handler(
     // Record attempt synchronously BEFORE spawning background task
     // This prevents TOCTOU race between has_attempted check and record_attempt
     let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
-    if let Err(e) = state
-        .tracker
-        .record_attempt_with_labels(&source_name, &issue.id, &issue.short_id, &labels)
+    if let Err(e) =
+        state
+            .tracker
+            .record_attempt_with_labels(&source_name, &issue.id, &issue.short_id, &labels)
     {
         // Remove from processing on failure
         let mut processing = state.processing.write().await;
@@ -371,7 +372,15 @@ async fn webhook_handler(
     let handler_clone = Arc::clone(handler);
 
     tokio::spawn(async move {
-        if let Err(e) = process_issue(state_clone, handler_clone, issue, match_result, processing_key).await {
+        if let Err(e) = process_issue(
+            state_clone,
+            handler_clone,
+            issue,
+            match_result,
+            processing_key,
+        )
+        .await
+        {
             tracing::error!(source = source_name.as_str(), error = %e, "Error processing webhook");
         }
     });
@@ -412,7 +421,9 @@ async fn process_issue(
             let mut processing = state.processing.write().await;
             processing.remove(&processing_key);
             // Mark as failed so it won't be retried (skip is intentional)
-            state.tracker.mark_failed(source_name, &issue.id, &format!("Skipped: {}", reason))?;
+            state
+                .tracker
+                .mark_failed(source_name, &issue.id, &format!("Skipped: {}", reason))?;
             return Ok(());
         }
     };
@@ -1525,9 +1536,11 @@ mod tests {
     #[test]
     fn test_processing_ttl_constants() {
         // Verify TTL constants are reasonable
-        assert!(PROCESSING_ENTRY_TTL_SECS >= 60); // At least 1 minute
-        assert!(PROCESSING_ENTRY_TTL_SECS <= 7200); // At most 2 hours
-        assert!(MAX_PROCESSING_ENTRIES >= 100); // Reasonable capacity
+        const {
+            assert!(PROCESSING_ENTRY_TTL_SECS >= 60); // At least 1 minute
+            assert!(PROCESSING_ENTRY_TTL_SECS <= 7200); // At most 2 hours
+            assert!(MAX_PROCESSING_ENTRIES >= 100); // Reasonable capacity
+        }
     }
 
     #[test]

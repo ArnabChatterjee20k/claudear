@@ -238,7 +238,9 @@ mod tests {
         );
         assert!(!manifest.public);
         assert_eq!(manifest.default_events.len(), 4);
-        assert!(manifest.default_events.contains(&"pull_request".to_string()));
+        assert!(manifest
+            .default_events
+            .contains(&"pull_request".to_string()));
     }
 
     #[test]
@@ -282,9 +284,13 @@ mod tests {
     #[test]
     fn test_app_manifest_github_org_url() {
         let manifest = AppManifest::generate("https://example.com", None);
-        let url = manifest.github_org_manifest_url("my-org", "test_state").unwrap();
+        let url = manifest
+            .github_org_manifest_url("my-org", "test_state")
+            .unwrap();
 
-        assert!(url.starts_with("https://github.com/organizations/my-org/settings/apps/new?manifest="));
+        assert!(
+            url.starts_with("https://github.com/organizations/my-org/settings/apps/new?manifest=")
+        );
         assert!(url.contains("state=test_state"));
     }
 

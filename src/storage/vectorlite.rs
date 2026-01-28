@@ -47,7 +47,7 @@ pub fn load_vectorlite_extension(conn: &Connection, extension_path: &Path) -> Re
     // Load vectorlite
     // SAFETY: We only load the vectorlite extension from trusted paths
     unsafe {
-        conn.load_extension(extension_path, None)
+        conn.load_extension(extension_path, None::<&str>)
             .map_err(|e| Error::Other(format!("Failed to load vectorlite extension: {}", e)))?;
     }
 

@@ -364,13 +364,13 @@ enum DiagCommands {
 
 /// Initialize logging with both console and file output.
 /// Returns a guard that must be kept alive for the duration of the program.
-fn init_logging(log_dir: Option<&std::path::Path>) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+fn init_logging(
+    log_dir: Option<&std::path::Path>,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Console layer - always enabled
-    let console_layer = fmt::layer()
-        .with_target(false)
-        .with_writer(std::io::stdout);
+    let console_layer = fmt::layer().with_target(false).with_writer(std::io::stdout);
 
     // File layer - optional, with daily rotation
     if let Some(dir) = log_dir {
@@ -391,7 +391,7 @@ fn init_logging(log_dir: Option<&std::path::Path>) -> Option<tracing_appender::n
 
         let file_layer = fmt::layer()
             .with_target(true)
-            .with_ansi(false)  // No ANSI colors in file
+            .with_ansi(false) // No ANSI colors in file
             .with_writer(non_blocking);
 
         tracing_subscriber::registry()
@@ -429,11 +429,8 @@ fn create_review_watcher(
         return None;
     }
 
-    let review_watcher = ReviewWatcher::with_sqlite_tracker(
-        github_client,
-        tracker,
-        Some(sqlite_tracker.clone()),
-    );
+    let review_watcher =
+        ReviewWatcher::with_sqlite_tracker(github_client, tracker, Some(sqlite_tracker.clone()));
 
     // Restore states from database
     match sqlite_tracker.get_active_pr_review_states() {
@@ -604,7 +601,10 @@ fn start_regression_monitoring(
                 };
                 // Use the public HTTP client
                 let http_client = claudear::source::sentry::ReqwestSentryClient::new();
-                Box::new(SentryRegressionChecker::new(sentry_regression_config, http_client))
+                Box::new(SentryRegressionChecker::new(
+                    sentry_regression_config,
+                    http_client,
+                ))
             } else {
                 Box::new(NoOpChecker)
             }
@@ -638,11 +638,8 @@ fn start_regression_monitoring(
     let composite_checker = CompositeChecker::new(sentry_checker, linear_checker);
 
     // Create release tracker and scheduler
-    let release_tracker = ReleaseTracker::with_config(
-        github_token,
-        sqlite_tracker.clone(),
-        release_config,
-    );
+    let release_tracker =
+        ReleaseTracker::with_config(github_token, sqlite_tracker.clone(), release_config);
 
     let scheduler = RegressionScheduler::new(
         composite_checker,
@@ -1273,15 +1270,10 @@ async fn main() -> anyhow::Result<()> {
                             None => "? pending",
                         };
 
-                        let repo_display = entry
-                            .inferred_repo_name
-                            .as_deref()
-                            .unwrap_or("(no match)");
+                        let repo_display =
+                            entry.inferred_repo_name.as_deref().unwrap_or("(no match)");
 
-                        let confidence_display = entry
-                            .confidence
-                            .as_deref()
-                            .unwrap_or("none");
+                        let confidence_display = entry.confidence.as_deref().unwrap_or("none");
 
                         let duration_display = entry
                             .duration_ms
@@ -1318,7 +1310,10 @@ async fn main() -> anyhow::Result<()> {
                             println!("      Keywords: {}", truncated);
                         }
 
-                        println!("      Time: {} | Duration: {}", entry.created_at, duration_display);
+                        println!(
+                            "      Time: {} | Duration: {}",
+                            entry.created_at, duration_display
+                        );
                         println!();
                     }
 

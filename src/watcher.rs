@@ -5,9 +5,9 @@ use crate::error::Result;
 use crate::feedback::{format_similar_issues_context, IssueEmbeddingService};
 use crate::github::{PrReviewState, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
-use crate::retry::RetryManager;
 use crate::notifier::Notifier;
 use crate::repo::RepoIndex;
+use crate::retry::RetryManager;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::source::IssueSource;
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
@@ -511,7 +511,8 @@ impl Watcher {
                     for issue in issues {
                         if !self.tracker.has_attempted(source.name(), &issue.id) {
                             // Extract labels from issue metadata for bug detection
-                            let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
+                            let labels: Vec<String> =
+                                issue.get_metadata("labels").unwrap_or_default();
                             self.tracker.record_attempt_with_labels(
                                 source.name(),
                                 &issue.id,
@@ -869,10 +870,12 @@ impl Watcher {
 
         // Extract labels from issue metadata for bug detection
         let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
-        if let Err(e) = self
-            .tracker
-            .record_attempt_with_labels(source.name(), &issue.id, &issue.short_id, &labels)
-        {
+        if let Err(e) = self.tracker.record_attempt_with_labels(
+            source.name(),
+            &issue.id,
+            &issue.short_id,
+            &labels,
+        ) {
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
 
