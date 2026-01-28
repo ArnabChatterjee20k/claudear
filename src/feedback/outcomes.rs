@@ -1,6 +1,7 @@
 //! Outcome tracking for fix attempts.
 
 use crate::error::Result;
+use crate::feedback::cosine_similarity;
 use crate::types::{FixAttempt, Issue};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -68,8 +69,11 @@ pub struct FixOutcome {
     pub error_type: Option<String>,
     /// AI-generated learnings from this outcome.
     pub learnings: Option<String>,
-    /// Keywords extracted from the issue.
+    /// Keywords extracted from the issue (fallback for similarity when no embedding).
     pub keywords: Vec<String>,
+    /// Embedding vector for semantic similarity (optional - computed async).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
     /// When this outcome was recorded.
     pub created_at: DateTime<Utc>,
 }
@@ -99,8 +103,14 @@ impl FixOutcome {
                 .map(|e| Self::categorize_error(e)),
             learnings: None,
             keywords,
+            embedding: None, // Set async via set_embedding()
             created_at: Utc::now(),
         }
+    }
+
+    /// Set the embedding vector for this outcome.
+    pub fn set_embedding(&mut self, embedding: Vec<f32>) {
+        self.embedding = Some(embedding);
     }
 
     /// Extract keywords from title and description.
@@ -141,44 +151,58 @@ impl FixOutcome {
         }
     }
 
-    /// Calculate text similarity score with another outcome (0.0 to 1.0).
+    /// Calculate semantic similarity score with another outcome (0.0 to 1.0).
+    ///
+    /// Uses cosine similarity on embeddings when available, falls back to
+    /// Jaccard similarity on keywords otherwise.
     pub fn similarity(&self, other: &FixOutcome) -> f64 {
-        // Use keyword overlap as a simple similarity metric
-        let self_keywords: std::collections::HashSet<_> = self.keywords.iter().collect();
-        let other_keywords: std::collections::HashSet<_> = other.keywords.iter().collect();
+        // Use embedding-based cosine similarity if both have embeddings
+        if let (Some(ref self_emb), Some(ref other_emb)) = (&self.embedding, &other.embedding) {
+            return cosine_similarity(self_emb, other_emb) as f64;
+        }
 
-        if self_keywords.is_empty() || other_keywords.is_empty() {
+        // Fallback to keyword-based Jaccard similarity
+        self.keyword_similarity(&other.keywords)
+    }
+
+    /// Calculate semantic similarity with an issue (for finding similar past issues).
+    ///
+    /// Uses cosine similarity on embeddings when available (requires issue_embedding),
+    /// falls back to Jaccard similarity on keywords otherwise.
+    pub fn similarity_to_issue(&self, issue: &Issue) -> f64 {
+        let description = issue.description.as_deref().unwrap_or("");
+        let issue_keywords = Self::extract_keywords(&issue.title, description);
+        self.keyword_similarity(&issue_keywords)
+    }
+
+    /// Calculate similarity with an issue using a pre-computed embedding.
+    ///
+    /// This is the preferred method when embeddings are available.
+    pub fn similarity_to_embedding(&self, issue_embedding: &[f32]) -> f64 {
+        if let Some(ref self_emb) = self.embedding {
+            cosine_similarity(self_emb, issue_embedding) as f64
+        } else {
+            0.0 // No embedding available, can't compute similarity
+        }
+    }
+
+    /// Keyword-based Jaccard similarity (fallback when no embeddings).
+    fn keyword_similarity(&self, other_keywords: &[String]) -> f64 {
+        let self_keywords: std::collections::HashSet<_> = self.keywords.iter().collect();
+        let other_keywords_set: std::collections::HashSet<&String> =
+            other_keywords.iter().collect();
+
+        if self_keywords.is_empty() || other_keywords_set.is_empty() {
             return 0.0;
         }
 
-        let intersection = self_keywords.intersection(&other_keywords).count() as f64;
-        let union = self_keywords.union(&other_keywords).count() as f64;
+        let intersection = self_keywords.intersection(&other_keywords_set).count() as f64;
+        let union = self_keywords.union(&other_keywords_set).count() as f64;
 
         if union == 0.0 {
             0.0
         } else {
             intersection / union // Jaccard similarity
-        }
-    }
-
-    /// Calculate text similarity with an issue (for finding similar past issues).
-    pub fn similarity_to_issue(&self, issue: &Issue) -> f64 {
-        let description = issue.description.as_deref().unwrap_or("");
-        let issue_keywords = Self::extract_keywords(&issue.title, description);
-        let self_keywords: std::collections::HashSet<_> = self.keywords.iter().collect();
-        let other_keywords: std::collections::HashSet<&String> = issue_keywords.iter().collect();
-
-        if self_keywords.is_empty() || other_keywords.is_empty() {
-            return 0.0;
-        }
-
-        let intersection = self_keywords.intersection(&other_keywords).count() as f64;
-        let union = self_keywords.union(&other_keywords).count() as f64;
-
-        if union == 0.0 {
-            0.0
-        } else {
-            intersection / union
         }
     }
 }
@@ -319,7 +343,15 @@ impl OutcomeTracker {
         Ok(id)
     }
 
-    /// Find similar past outcomes for an issue.
+    /// Set embedding for an outcome by ID.
+    pub fn set_embedding(&mut self, id: i64, embedding: Vec<f32>) -> Result<()> {
+        if let Some(outcome) = self.outcomes.iter_mut().find(|o| o.id == id) {
+            outcome.set_embedding(embedding);
+        }
+        Ok(())
+    }
+
+    /// Find similar past outcomes for an issue using keyword similarity (fallback).
     pub fn find_similar(
         &self,
         issue: &Issue,
@@ -336,6 +368,32 @@ impl OutcomeTracker {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         scored.into_iter().take(limit).map(|(o, _)| o).collect()
+    }
+
+    /// Find similar past outcomes using semantic embedding similarity.
+    ///
+    /// This is the preferred method when embeddings are available.
+    /// Returns outcomes sorted by similarity (highest first).
+    pub fn find_similar_by_embedding(
+        &self,
+        issue_embedding: &[f32],
+        limit: usize,
+        min_similarity: f64,
+    ) -> Vec<(&FixOutcome, f64)> {
+        let mut scored: Vec<_> = self
+            .outcomes
+            .iter()
+            .filter(|o| o.embedding.is_some()) // Only compare with outcomes that have embeddings
+            .map(|o| {
+                let similarity = o.similarity_to_embedding(issue_embedding);
+                (o, similarity)
+            })
+            .filter(|(_, score)| *score >= min_similarity)
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        scored.into_iter().take(limit).collect()
     }
 
     /// Get outcomes by result.
@@ -434,6 +492,7 @@ mod tests {
             merged_at: None,
             retry_count: 0,
             last_retry_at: None,
+            issue_labels: vec![],
         }
     }
 
@@ -998,5 +1057,161 @@ mod tests {
 
         let parsed: Outcome = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, Outcome::Merged);
+    }
+
+    #[test]
+    fn test_embedding_similarity() {
+        let issue = create_test_issue("Test", "Test");
+        let attempt = create_test_attempt();
+
+        let mut outcome1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let mut outcome2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+
+        // Set similar embeddings
+        outcome1.set_embedding(vec![1.0, 0.0, 0.0]);
+        outcome2.set_embedding(vec![0.9, 0.1, 0.0]);
+
+        // Should use cosine similarity when embeddings are available
+        let similarity = outcome1.similarity(&outcome2);
+        assert!(similarity > 0.9); // High similarity
+        assert!(similarity <= 1.0);
+    }
+
+    #[test]
+    fn test_embedding_similarity_orthogonal() {
+        let issue = create_test_issue("Test", "Test");
+        let attempt = create_test_attempt();
+
+        let mut outcome1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let mut outcome2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+
+        // Set orthogonal embeddings
+        outcome1.set_embedding(vec![1.0, 0.0, 0.0]);
+        outcome2.set_embedding(vec![0.0, 1.0, 0.0]);
+
+        let similarity = outcome1.similarity(&outcome2);
+        assert!(similarity < 0.1); // Very low similarity (orthogonal vectors)
+    }
+
+    #[test]
+    fn test_embedding_similarity_fallback_to_keywords() {
+        let issue = create_test_issue("Database error", "PostgreSQL connection fails");
+        let attempt = create_test_attempt();
+
+        let mut outcome1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let outcome2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+
+        // Only outcome1 has embedding, so should fall back to keywords
+        outcome1.set_embedding(vec![1.0, 0.0, 0.0]);
+
+        let similarity = outcome1.similarity(&outcome2);
+        // Should use keyword-based similarity since outcome2 has no embedding
+        assert!(similarity > 0.0); // Same keywords
+    }
+
+    #[test]
+    fn test_similarity_to_embedding() {
+        let issue = create_test_issue("Test", "Test");
+        let attempt = create_test_attempt();
+
+        let mut outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        outcome.set_embedding(vec![1.0, 0.0, 0.0]);
+
+        let query_embedding = vec![0.9, 0.1, 0.0];
+        let similarity = outcome.similarity_to_embedding(&query_embedding);
+
+        assert!(similarity > 0.9);
+        assert!(similarity <= 1.0);
+    }
+
+    #[test]
+    fn test_similarity_to_embedding_no_embedding() {
+        let issue = create_test_issue("Test", "Test");
+        let attempt = create_test_attempt();
+
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        // No embedding set
+
+        let query_embedding = vec![1.0, 0.0, 0.0];
+        let similarity = outcome.similarity_to_embedding(&query_embedding);
+
+        assert_eq!(similarity, 0.0); // No embedding, returns 0
+    }
+
+    #[test]
+    fn test_find_similar_by_embedding() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+
+        // Create outcomes with embeddings
+        let issue1 = create_test_issue("Database error", "PostgreSQL");
+        let mut outcome1 = FixOutcome::from_attempt(&attempt, &issue1, "p", Outcome::Merged);
+        outcome1.set_embedding(vec![1.0, 0.0, 0.0]); // Similar to query
+        let id1 = tracker.record(outcome1).unwrap();
+        tracker.set_embedding(id1, vec![1.0, 0.0, 0.0]).unwrap();
+
+        let issue2 = create_test_issue("CSS issue", "Styling");
+        let mut outcome2 = FixOutcome::from_attempt(&attempt, &issue2, "p", Outcome::Closed);
+        outcome2.set_embedding(vec![0.0, 1.0, 0.0]); // Orthogonal to query
+        let id2 = tracker.record(outcome2).unwrap();
+        tracker.set_embedding(id2, vec![0.0, 1.0, 0.0]).unwrap();
+
+        // Query embedding similar to outcome1
+        let query = vec![0.95, 0.05, 0.0];
+        let similar = tracker.find_similar_by_embedding(&query, 10, 0.5);
+
+        // Should find outcome1 but not outcome2
+        assert_eq!(similar.len(), 1);
+        assert!(similar[0].1 > 0.9); // High similarity
+    }
+
+    #[test]
+    fn test_set_embedding_via_tracker() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let id = tracker.record(outcome).unwrap();
+
+        // Set embedding via tracker
+        tracker.set_embedding(id, vec![1.0, 2.0, 3.0]).unwrap();
+
+        // Verify embedding was set
+        let stored = &tracker.all()[0];
+        assert!(stored.embedding.is_some());
+        assert_eq!(stored.embedding.as_ref().unwrap(), &vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_fix_outcome_serde_with_embedding() {
+        let issue = create_test_issue("Test", "Test");
+        let attempt = create_test_attempt();
+
+        let mut outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        outcome.set_embedding(vec![1.0, 2.0, 3.0]);
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&outcome).unwrap();
+        let parsed: FixOutcome = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.embedding, Some(vec![1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn test_fix_outcome_serde_without_embedding() {
+        let issue = create_test_issue("Test", "Test");
+        let attempt = create_test_attempt();
+
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        // No embedding set
+
+        // Serialize - embedding should be skipped (skip_serializing_if = "Option::is_none")
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(!json.contains("embedding"));
+
+        // Deserialize
+        let parsed: FixOutcome = serde_json::from_str(&json).unwrap();
+        assert!(parsed.embedding.is_none());
     }
 }
