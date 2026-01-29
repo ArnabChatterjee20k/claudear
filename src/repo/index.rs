@@ -4,6 +4,7 @@
 //! This enables issue-to-repository inference by matching file paths and names.
 
 use crate::error::Result;
+use crate::github::GitHubClient;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -21,6 +22,8 @@ pub struct IndexedRepo {
     pub files: Vec<String>,
     /// Default branch name.
     pub default_branch: String,
+    /// Whether this repo needs to be cloned (API-discovered repos).
+    pub needs_clone: bool,
 }
 
 impl IndexedRepo {
@@ -34,6 +37,30 @@ impl IndexedRepo {
             github_url,
             files: Vec::new(),
             default_branch: "main".to_string(),
+            needs_clone: false,
+        }
+    }
+
+    /// Create a remote repository discovered via GitHub API.
+    ///
+    /// These repos don't exist locally yet and need to be cloned before use.
+    pub fn remote(
+        name: impl Into<String>,
+        github_url: impl Into<String>,
+        default_branch: impl Into<String>,
+        work_dir: &Path,
+    ) -> Self {
+        let name = name.into();
+        // Extract repo name from full_name (org/repo)
+        let repo_name = name.split('/').last().unwrap_or(&name);
+        let path = work_dir.join(repo_name);
+        Self {
+            name,
+            path,
+            github_url: github_url.into(),
+            files: Vec::new(),
+            default_branch: default_branch.into(),
+            needs_clone: true,
         }
     }
 
@@ -152,6 +179,99 @@ impl RepoIndex {
         Ok(index)
     }
 
+    /// Build an index by fetching repositories from GitHub API.
+    ///
+    /// This is used when `auto_discover_paths` is empty but `known_orgs` and
+    /// a GitHub token are configured. Repos discovered this way need to be
+    /// cloned before they can be used.
+    ///
+    /// # Arguments
+    /// * `known_orgs` - GitHub organization names to fetch repos from
+    /// * `client` - GitHub API client with token configured
+    /// * `work_dir` - Directory where repos will be cloned to
+    ///
+    /// # Returns
+    /// A populated RepoIndex with remote repositories (needs_clone=true).
+    pub async fn build_from_github(
+        known_orgs: &[String],
+        client: &GitHubClient,
+        work_dir: &Path,
+    ) -> Result<Self> {
+        let mut index = Self::new();
+
+        for org in known_orgs {
+            tracing::info!(org = %org, "Fetching repositories from GitHub API");
+
+            match client.list_org_repos(org).await {
+                Ok(repos) => {
+                    for repo in repos {
+                        let indexed = IndexedRepo::remote(
+                            &repo.full_name,
+                            &repo.clone_url,
+                            &repo.default_branch,
+                            work_dir,
+                        );
+
+                        tracing::debug!(
+                            repo = %repo.full_name,
+                            path = %indexed.path.display(),
+                            "Added remote repository to index"
+                        );
+
+                        index.add_repo(indexed);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(org = %org, error = %e, "Failed to fetch repos from org");
+                }
+            }
+        }
+
+        tracing::info!(
+            count = index.repos.len(),
+            "Repository index built from GitHub API"
+        );
+
+        Ok(index)
+    }
+
+    /// Build an index using the best available method.
+    ///
+    /// This chooses the discovery method based on configuration:
+    /// 1. If `auto_discover_paths` is not empty → use local filesystem scan
+    /// 2. Else if GitHub token is configured + `known_orgs` not empty → use API
+    /// 3. Else → return empty index
+    ///
+    /// # Arguments
+    /// * `known_orgs` - GitHub organization names
+    /// * `auto_discover_paths` - Local paths to scan for repos
+    /// * `github_client` - Optional GitHub API client
+    /// * `work_dir` - Directory where repos will be cloned to (for API discovery)
+    pub async fn build_with_fallback(
+        known_orgs: &[String],
+        auto_discover_paths: &[String],
+        github_client: Option<&GitHubClient>,
+        work_dir: &Path,
+    ) -> Result<Self> {
+        // Strategy 1: Local filesystem scan (preferred when paths are configured)
+        if !auto_discover_paths.is_empty() {
+            tracing::info!("Building repo index from local filesystem");
+            return Self::build(known_orgs, auto_discover_paths);
+        }
+
+        // Strategy 2: GitHub API discovery
+        if let Some(client) = github_client {
+            if client.is_enabled() && !known_orgs.is_empty() {
+                tracing::info!("Building repo index from GitHub API (no auto_discover_paths configured)");
+                return Self::build_from_github(known_orgs, client, work_dir).await;
+            }
+        }
+
+        // Strategy 3: Empty index
+        tracing::info!("No discovery method available, returning empty index");
+        Ok(Self::new())
+    }
+
     /// Add a repository to the index.
     pub fn add_repo(&mut self, repo: IndexedRepo) {
         // Index all files for fast lookup
@@ -176,7 +296,12 @@ impl RepoIndex {
             return self.repos.get(repo_name);
         }
 
-        // Try basename match
+        // Try vendor path extraction (e.g., /usr/src/code/vendor/utopia-php/database/src/... -> utopia-php/database)
+        if let Some(repo) = self.find_by_vendor_path(filename) {
+            return Some(repo);
+        }
+
+        // Try basename match (last resort - can match wrong repo if filename is common)
         let basename = Path::new(filename)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -184,6 +309,27 @@ impl RepoIndex {
 
         if let Some(repo_name) = self.file_index.get(&basename) {
             return self.repos.get(repo_name);
+        }
+
+        None
+    }
+
+    /// Extract repository name from vendor paths.
+    ///
+    /// Vendor paths follow the pattern: .../vendor/{org}/{repo}/...
+    /// This extracts {org}/{repo} and looks it up in the index.
+    fn find_by_vendor_path(&self, filename: &str) -> Option<&IndexedRepo> {
+        // Look for /vendor/ in the path
+        let vendor_idx = filename.find("/vendor/")?;
+        let after_vendor = &filename[vendor_idx + 8..]; // Skip "/vendor/"
+
+        // Split the remainder to get org/repo
+        let parts: Vec<&str> = after_vendor.split('/').collect();
+        if parts.len() >= 2 {
+            let repo_name = format!("{}/{}", parts[0], parts[1]);
+            if let Some(repo) = self.repos.get(&repo_name) {
+                return Some(repo);
+            }
         }
 
         None
@@ -500,5 +646,112 @@ mod tests {
         index.add_repo(repo2);
 
         assert_eq!(index.total_files(), 3);
+    }
+
+    #[test]
+    fn test_find_by_vendor_path() {
+        let mut index = RepoIndex::new();
+
+        // Add utopia-php/database repo
+        let mut repo1 = IndexedRepo::new("utopia-php/database", "/path1");
+        repo1.files = vec!["src/Database/Adapter/Pool.php".to_string()];
+        index.add_repo(repo1);
+
+        // Add appwrite/appwrite repo with a file that has the same basename
+        let mut repo2 = IndexedRepo::new("appwrite/appwrite", "/path2");
+        repo2.files = vec!["src/Appwrite/PubSub/Adapter/Pool.php".to_string()];
+        index.add_repo(repo2);
+
+        // Vendor path should match utopia-php/database, NOT appwrite/appwrite
+        let vendor_path =
+            "/usr/src/code/vendor/utopia-php/database/src/Database/Adapter/Pool.php";
+        let found = index.find_by_file(vendor_path);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "utopia-php/database");
+    }
+
+    #[test]
+    fn test_find_by_vendor_path_not_indexed() {
+        let mut index = RepoIndex::new();
+
+        // Only add appwrite/appwrite repo
+        let mut repo = IndexedRepo::new("appwrite/appwrite", "/path");
+        repo.files = vec!["src/Appwrite/PubSub/Adapter/Pool.php".to_string()];
+        index.add_repo(repo);
+
+        // Vendor path for utopia-php/database (not in index) should fall back to basename match
+        let vendor_path =
+            "/usr/src/code/vendor/utopia-php/database/src/Database/Adapter/Pool.php";
+        let found = index.find_by_file(vendor_path);
+        assert!(found.is_some());
+        // Falls back to basename match since utopia-php/database isn't indexed
+        assert_eq!(found.unwrap().name, "appwrite/appwrite");
+    }
+
+    #[test]
+    fn test_indexed_repo_new_needs_clone_false() {
+        let repo = IndexedRepo::new("test/repo", "/path/to/repo");
+        assert!(!repo.needs_clone);
+        assert_eq!(repo.default_branch, "main");
+    }
+
+    #[test]
+    fn test_indexed_repo_remote() {
+        let work_dir = PathBuf::from("/home/user/repos");
+        let repo = IndexedRepo::remote(
+            "test-org/my-repo",
+            "https://github.com/test-org/my-repo.git",
+            "develop",
+            &work_dir,
+        );
+
+        assert_eq!(repo.name, "test-org/my-repo");
+        assert_eq!(repo.github_url, "https://github.com/test-org/my-repo.git");
+        assert_eq!(repo.default_branch, "develop");
+        assert_eq!(repo.path, work_dir.join("my-repo"));
+        assert!(repo.needs_clone);
+        assert!(repo.files.is_empty());
+    }
+
+    #[test]
+    fn test_indexed_repo_remote_extracts_repo_name() {
+        let work_dir = PathBuf::from("/var/repos");
+
+        // Test with full_name format "org/repo"
+        let repo = IndexedRepo::remote(
+            "appwrite/console",
+            "https://github.com/appwrite/console.git",
+            "main",
+            &work_dir,
+        );
+        assert_eq!(repo.path, work_dir.join("console"));
+
+        // Test with simple name (no slash)
+        let repo2 = IndexedRepo::remote(
+            "simple-repo",
+            "https://github.com/org/simple-repo.git",
+            "main",
+            &work_dir,
+        );
+        assert_eq!(repo2.path, work_dir.join("simple-repo"));
+    }
+
+    #[test]
+    fn test_repo_index_add_remote_repo() {
+        let mut index = RepoIndex::new();
+        let work_dir = PathBuf::from("/repos");
+
+        let repo = IndexedRepo::remote(
+            "test-org/test-repo",
+            "https://github.com/test-org/test-repo.git",
+            "main",
+            &work_dir,
+        );
+        index.add_repo(repo);
+
+        assert_eq!(index.len(), 1);
+        let found = index.get("test-org/test-repo").unwrap();
+        assert!(found.needs_clone);
+        assert_eq!(found.github_url, "https://github.com/test-org/test-repo.git");
     }
 }

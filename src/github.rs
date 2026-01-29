@@ -115,6 +115,27 @@ pub struct GitHubUser {
     pub user_type: Option<String>,
 }
 
+/// A repository from the GitHub API (organization repos endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgRepo {
+    /// Repository ID.
+    pub id: i64,
+    /// Full name (org/repo).
+    pub full_name: String,
+    /// Repository name (without org).
+    pub name: String,
+    /// Default branch name.
+    pub default_branch: String,
+    /// Clone URL (HTTPS).
+    pub clone_url: String,
+    /// HTML URL.
+    pub html_url: String,
+    /// Whether the repo is private.
+    pub private: bool,
+    /// Whether the repo is archived.
+    pub archived: bool,
+}
+
 /// A GitHub PR review comment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrReviewComment {
@@ -319,6 +340,66 @@ impl<H: HttpClient> GitHubClient<H> {
     /// Get the GitHub token (if configured).
     pub fn token(&self) -> Option<&str> {
         self.config.token.as_deref()
+    }
+
+    /// List all repositories for an organization.
+    ///
+    /// Paginates through all results (100 per page) and returns all repos.
+    /// Excludes archived repositories.
+    pub async fn list_org_repos(&self, org: &str) -> Result<Vec<OrgRepo>> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let mut all_repos = Vec::new();
+        let mut page = 1;
+        const PER_PAGE: usize = 100;
+
+        loop {
+            let url = format!(
+                "https://api.github.com/orgs/{}/repos?per_page={}&page={}",
+                org, PER_PAGE, page
+            );
+            let headers = self.build_headers(token);
+
+            let response = self.http.get(&url, headers).await?;
+
+            if response.is_not_found() {
+                return Err(Error::Other(format!("Organization not found: {}", org)));
+            }
+
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "GitHub API error ({}): {}",
+                    response.status, response.body
+                )));
+            }
+
+            let repos: Vec<OrgRepo> = response.json()?;
+            let count = repos.len();
+
+            // Filter out archived repos
+            let active_repos: Vec<OrgRepo> = repos.into_iter().filter(|r| !r.archived).collect();
+            all_repos.extend(active_repos);
+
+            // If we got fewer than per_page, we've reached the end
+            if count < PER_PAGE {
+                break;
+            }
+
+            page += 1;
+
+            // Safety limit to prevent infinite loops
+            if page > 100 {
+                tracing::warn!(org = %org, "Hit pagination limit (100 pages) for org repos");
+                break;
+            }
+        }
+
+        tracing::info!(org = %org, count = all_repos.len(), "Fetched organization repositories");
+        Ok(all_repos)
     }
 }
 
@@ -2761,5 +2842,157 @@ mod tests {
             monitor.get_issue_type(&linear_attempt),
             crate::types::IssueType::LinearBug
         );
+    }
+
+    #[test]
+    fn test_org_repo_deserialization() {
+        let json = r#"{
+            "id": 123,
+            "full_name": "test-org/test-repo",
+            "name": "test-repo",
+            "default_branch": "main",
+            "clone_url": "https://github.com/test-org/test-repo.git",
+            "html_url": "https://github.com/test-org/test-repo",
+            "private": false,
+            "archived": false
+        }"#;
+
+        let repo: OrgRepo = serde_json::from_str(json).unwrap();
+        assert_eq!(repo.id, 123);
+        assert_eq!(repo.full_name, "test-org/test-repo");
+        assert_eq!(repo.name, "test-repo");
+        assert_eq!(repo.default_branch, "main");
+        assert_eq!(repo.clone_url, "https://github.com/test-org/test-repo.git");
+        assert!(!repo.private);
+        assert!(!repo.archived);
+    }
+
+    #[test]
+    fn test_org_repo_deserialization_with_develop_branch() {
+        let json = r#"{
+            "id": 456,
+            "full_name": "my-org/my-repo",
+            "name": "my-repo",
+            "default_branch": "develop",
+            "clone_url": "https://github.com/my-org/my-repo.git",
+            "html_url": "https://github.com/my-org/my-repo",
+            "private": true,
+            "archived": false
+        }"#;
+
+        let repo: OrgRepo = serde_json::from_str(json).unwrap();
+        assert_eq!(repo.default_branch, "develop");
+        assert!(repo.private);
+    }
+
+    #[tokio::test]
+    async fn test_list_org_repos_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/orgs/test-org/repos?per_page=100&page=1",
+            200,
+            r#"[
+                {
+                    "id": 1,
+                    "full_name": "test-org/repo1",
+                    "name": "repo1",
+                    "default_branch": "main",
+                    "clone_url": "https://github.com/test-org/repo1.git",
+                    "html_url": "https://github.com/test-org/repo1",
+                    "private": false,
+                    "archived": false
+                },
+                {
+                    "id": 2,
+                    "full_name": "test-org/repo2",
+                    "name": "repo2",
+                    "default_branch": "develop",
+                    "clone_url": "https://github.com/test-org/repo2.git",
+                    "html_url": "https://github.com/test-org/repo2",
+                    "private": false,
+                    "archived": false
+                }
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let repos = client.list_org_repos("test-org").await.unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].full_name, "test-org/repo1");
+        assert_eq!(repos[1].full_name, "test-org/repo2");
+    }
+
+    #[tokio::test]
+    async fn test_list_org_repos_filters_archived() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/orgs/test-org/repos?per_page=100&page=1",
+            200,
+            r#"[
+                {
+                    "id": 1,
+                    "full_name": "test-org/active-repo",
+                    "name": "active-repo",
+                    "default_branch": "main",
+                    "clone_url": "https://github.com/test-org/active-repo.git",
+                    "html_url": "https://github.com/test-org/active-repo",
+                    "private": false,
+                    "archived": false
+                },
+                {
+                    "id": 2,
+                    "full_name": "test-org/archived-repo",
+                    "name": "archived-repo",
+                    "default_branch": "main",
+                    "clone_url": "https://github.com/test-org/archived-repo.git",
+                    "html_url": "https://github.com/test-org/archived-repo",
+                    "private": false,
+                    "archived": true
+                }
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let repos = client.list_org_repos("test-org").await.unwrap();
+        // Archived repos should be filtered out
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].full_name, "test-org/active-repo");
+    }
+
+    #[tokio::test]
+    async fn test_list_org_repos_org_not_found() {
+        let mock = MockHttpClient::new();
+        // No mock response added, so it will return 404
+
+        let config = GitHubConfig {
+            token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let result = client.list_org_repos("nonexistent-org").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_list_org_repos_no_token() {
+        let mock = MockHttpClient::new();
+        let config = GitHubConfig::default(); // No token
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let result = client.list_org_repos("test-org").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("token"));
     }
 }

@@ -24,6 +24,12 @@ pub enum RepoResolution {
         project_dir: PathBuf,
         /// Database ID of the repo (for analytics).
         repo_id: Option<i64>,
+        /// Whether the repository needs to be cloned (API-discovered repos).
+        needs_clone: bool,
+        /// GitHub URL for cloning (only set when needs_clone is true).
+        github_url: Option<String>,
+        /// Default branch name (only set when needs_clone is true).
+        default_branch: Option<String>,
     },
     /// Could not resolve - processing should be skipped.
     Skip {
@@ -44,6 +50,30 @@ impl RepoResolution {
     /// Returns true if resolution was successful.
     pub fn is_resolved(&self) -> bool {
         matches!(self, RepoResolution::Resolved { .. })
+    }
+
+    /// Returns true if the resolved repo needs to be cloned.
+    pub fn needs_clone(&self) -> bool {
+        match self {
+            RepoResolution::Resolved { needs_clone, .. } => *needs_clone,
+            RepoResolution::Skip { .. } => false,
+        }
+    }
+
+    /// Returns the GitHub URL if the repo needs cloning.
+    pub fn github_url(&self) -> Option<&str> {
+        match self {
+            RepoResolution::Resolved { github_url, .. } => github_url.as_deref(),
+            RepoResolution::Skip { .. } => None,
+        }
+    }
+
+    /// Returns the default branch if the repo needs cloning.
+    pub fn default_branch(&self) -> Option<&str> {
+        match self {
+            RepoResolution::Resolved { default_branch, .. } => default_branch.as_deref(),
+            RepoResolution::Skip { .. } => None,
+        }
     }
 }
 
@@ -120,6 +150,17 @@ pub fn resolve_repo_for_issue_with_embedding(
                     RepoResolution::Resolved {
                         project_dir: inferred.repo.path.clone(),
                         repo_id,
+                        needs_clone: inferred.repo.needs_clone,
+                        github_url: if inferred.repo.needs_clone {
+                            Some(inferred.repo.github_url.clone())
+                        } else {
+                            None
+                        },
+                        default_branch: if inferred.repo.needs_clone {
+                            Some(inferred.repo.default_branch.clone())
+                        } else {
+                            None
+                        },
                     }
                 }
                 None => {

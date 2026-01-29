@@ -1459,8 +1459,11 @@ async fn main() -> anyhow::Result<()> {
         }
         let mode_str = modes.join("+");
 
+        // Create GitHub client for API-based repo discovery
+        let github_client = GitHubClient::new(config.github.clone());
+
         // Build repository inferrer for issue-to-repo mapping
-        let inferrer = Watcher::build_inferrer(&config)?;
+        let inferrer = Watcher::build_inferrer(&config, Some(&github_client)).await?;
         if inferrer.is_some() {
             tracing::info!("Repository inference enabled");
         }
@@ -1889,8 +1892,11 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("No sources were initialized");
         }
 
+        // Create GitHub client for API-based repo discovery
+        let github_client = GitHubClient::new(config.github.clone());
+
         // Build inferrer for retry processing
-        let inferrer = Watcher::build_inferrer(&config)?;
+        let inferrer = Watcher::build_inferrer(&config, Some(&github_client)).await?;
 
         // Create ReviewWatcher for PR review tracking
         let review_watcher =
@@ -2094,8 +2100,11 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("No webhook handlers were registered");
             }
 
+            // Create GitHub client for API-based repo discovery
+            let github_client = GitHubClient::new(config.github.clone());
+
             // Build inferrer for repo inference
-            let inferrer = WebhookServer::build_inferrer(&config)?;
+            let inferrer = WebhookServer::build_inferrer(&config, Some(&github_client)).await?;
 
             let server = WebhookServer::new(
                 config,
@@ -2131,9 +2140,12 @@ async fn main() -> anyhow::Result<()> {
 
             let dry_run = matches!(cli.command, Commands::DryRun);
 
+            // Create GitHub client for API-based repo discovery
+            let github_client = GitHubClient::new(config.github.clone());
+
             // Build inferrer for repo inference (with embeddings for semantic matching)
             let (inferrer, embedding_client) =
-                Watcher::build_inferrer_with_embeddings(&config).await?;
+                Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
 
             // Create ReviewWatcher for PR review tracking
             let review_watcher =

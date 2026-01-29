@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::Notifier;
-use crate::repo::RepoIndex;
+use crate::repo::{GitOps, RepoIndex};
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::storage::{FixAttemptTracker, SqliteTracker};
 use crate::types::{validate_issue_id, ActivityLogEntry, Issue};
@@ -79,13 +79,38 @@ impl WebhookServer {
     }
 
     /// Build a repository inferrer from config.
-    pub fn build_inferrer(config: &Config) -> Result<Option<RepoInferrer>> {
-        if config.known_orgs.is_empty() || config.auto_discover_paths.is_empty() {
-            tracing::info!("No known_orgs or auto_discover_paths configured, inference disabled");
+    ///
+    /// This uses the fallback mechanism: if `auto_discover_paths` is configured,
+    /// it scans the local filesystem. Otherwise, if a GitHub token is configured,
+    /// it fetches repos via the GitHub API.
+    pub async fn build_inferrer(
+        config: &Config,
+        github_client: Option<&crate::github::GitHubClient>,
+    ) -> Result<Option<RepoInferrer>> {
+        if config.known_orgs.is_empty() {
+            tracing::info!("No known_orgs configured, inference disabled");
             return Ok(None);
         }
 
-        let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+        // Check if we have any discovery method available
+        let has_local_paths = !config.auto_discover_paths.is_empty();
+        let has_github_client = github_client.map(|c| c.is_enabled()).unwrap_or(false);
+
+        if !has_local_paths && !has_github_client {
+            tracing::info!(
+                "No auto_discover_paths configured and no GitHub token available, inference disabled"
+            );
+            return Ok(None);
+        }
+
+        let index = RepoIndex::build_with_fallback(
+            &config.known_orgs,
+            &config.auto_discover_paths,
+            github_client,
+            &config.work_dir,
+        )
+        .await?;
+
         if index.is_empty() {
             tracing::warn!("Repository index is empty, no repos discovered");
             return Ok(None);
@@ -413,8 +438,8 @@ async fn process_issue(
         state.sqlite_tracker.as_ref(),
     );
 
-    let project_dir = match resolution {
-        RepoResolution::Resolved { project_dir, .. } => project_dir,
+    let project_dir = match &resolution {
+        RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
         RepoResolution::Skip { reason } => {
             tracing::debug!(short_id = %issue.short_id, reason = %reason, "Skipping issue");
             // Clean up processing flag before returning
@@ -427,6 +452,44 @@ async fn process_issue(
             return Ok(());
         }
     };
+
+    // Clone-on-demand: if the repo was discovered via API and doesn't exist locally, clone it
+    if resolution.needs_clone() {
+        if let (Some(github_url), Some(default_branch)) =
+            (resolution.github_url(), resolution.default_branch())
+        {
+            tracing::info!(
+                short_id = %issue.short_id,
+                repo_path = %project_dir.display(),
+                github_url = %github_url,
+                "Repository not cloned locally, cloning now"
+            );
+
+            if let Err(e) =
+                GitOps::ensure_repo_at_path(&project_dir, github_url, default_branch).await
+            {
+                tracing::error!(
+                    short_id = %issue.short_id,
+                    error = %e,
+                    "Failed to clone repository, skipping issue"
+                );
+                // Clean up processing flag before returning
+                let mut processing = state.processing.write().await;
+                processing.remove(&processing_key);
+                // Mark as failed
+                state
+                    .tracker
+                    .mark_failed(source_name, &issue.id, &format!("Clone failed: {}", e))?;
+                return Ok(());
+            }
+
+            tracing::info!(
+                short_id = %issue.short_id,
+                repo_path = %project_dir.display(),
+                "Repository cloned successfully"
+            );
+        }
+    }
 
     // Note: processing flag and attempt already recorded by handle_webhook before spawning
 
