@@ -105,6 +105,14 @@ enum Commands {
         /// Polling interval in milliseconds
         #[arg(default_value = "300000")]
         interval: u64,
+
+        /// HTTP port for dashboard API
+        #[arg(long, default_value = "3100")]
+        port: u16,
+
+        /// Disable dashboard API
+        #[arg(long)]
+        no_dashboard: bool,
     },
 
     /// Start webhook server for real-time events
@@ -2131,6 +2139,7 @@ async fn main() -> anyhow::Result<()> {
             let review_watcher =
                 create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
 
+            let tracker_for_api = tracker.clone();
             let watcher = Watcher::new(WatcherOptions {
                 config: config.clone(),
                 sources,
@@ -2167,7 +2176,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                Commands::Poll { interval } => {
+                Commands::Poll {
+                    interval,
+                    port,
+                    no_dashboard,
+                } => {
                     let shutdown = async {
                         tokio::signal::ctrl_c()
                             .await
@@ -2176,9 +2189,20 @@ async fn main() -> anyhow::Result<()> {
                         watcher_ref.stop();
                     };
 
-                    tokio::select! {
-                        result = watcher.start(Some(interval)) => result?,
-                        _ = shutdown => {}
+                    if no_dashboard {
+                        tokio::select! {
+                            result = watcher.start(Some(interval)) => result?,
+                            _ = shutdown => {}
+                        }
+                    } else {
+                        tracing::info!("Dashboard API available at http://localhost:{}", port);
+                        let api_server =
+                            ApiServer::with_port(config.clone(), tracker_for_api.clone(), port);
+                        tokio::select! {
+                            result = watcher.start(Some(interval)) => result?,
+                            result = api_server.start() => result?,
+                            _ = shutdown => {}
+                        }
                     }
                 }
 
