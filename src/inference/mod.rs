@@ -22,14 +22,14 @@ pub enum RepoResolution {
     Resolved {
         /// Path to the repository.
         project_dir: PathBuf,
+        /// Repository name (org/repo format).
+        repo_name: String,
         /// Database ID of the repo (for analytics).
         repo_id: Option<i64>,
-        /// Whether the repository needs to be cloned (API-discovered repos).
-        needs_clone: bool,
-        /// GitHub URL for cloning (only set when needs_clone is true).
-        github_url: Option<String>,
-        /// Default branch name (only set when needs_clone is true).
-        default_branch: Option<String>,
+        /// GitHub URL for the repository.
+        github_url: String,
+        /// Default branch name.
+        default_branch: String,
     },
     /// Could not resolve - processing should be skipped.
     Skip {
@@ -52,26 +52,26 @@ impl RepoResolution {
         matches!(self, RepoResolution::Resolved { .. })
     }
 
-    /// Returns true if the resolved repo needs to be cloned.
-    pub fn needs_clone(&self) -> bool {
-        match self {
-            RepoResolution::Resolved { needs_clone, .. } => *needs_clone,
-            RepoResolution::Skip { .. } => false,
-        }
-    }
-
-    /// Returns the GitHub URL if the repo needs cloning.
+    /// Returns the GitHub URL if resolved.
     pub fn github_url(&self) -> Option<&str> {
         match self {
-            RepoResolution::Resolved { github_url, .. } => github_url.as_deref(),
+            RepoResolution::Resolved { github_url, .. } => Some(github_url),
             RepoResolution::Skip { .. } => None,
         }
     }
 
-    /// Returns the default branch if the repo needs cloning.
+    /// Returns the default branch if resolved.
     pub fn default_branch(&self) -> Option<&str> {
         match self {
-            RepoResolution::Resolved { default_branch, .. } => default_branch.as_deref(),
+            RepoResolution::Resolved { default_branch, .. } => Some(default_branch),
+            RepoResolution::Skip { .. } => None,
+        }
+    }
+
+    /// Returns the repository name if resolved.
+    pub fn repo_name(&self) -> Option<&str> {
+        match self {
+            RepoResolution::Resolved { repo_name, .. } => Some(repo_name),
             RepoResolution::Skip { .. } => None,
         }
     }
@@ -149,18 +149,10 @@ pub fn resolve_repo_for_issue_with_embedding(
 
                     RepoResolution::Resolved {
                         project_dir: inferred.repo.path.clone(),
+                        repo_name: inferred.repo.name.clone(),
                         repo_id,
-                        needs_clone: inferred.repo.needs_clone,
-                        github_url: if inferred.repo.needs_clone {
-                            Some(inferred.repo.github_url.clone())
-                        } else {
-                            None
-                        },
-                        default_branch: if inferred.repo.needs_clone {
-                            Some(inferred.repo.default_branch.clone())
-                        } else {
-                            None
-                        },
+                        github_url: inferred.repo.github_url.clone(),
+                        default_branch: inferred.repo.default_branch.clone(),
                     }
                 }
                 None => {
@@ -506,6 +498,107 @@ impl RepoInferrer {
 
         tracing::info!("Added embeddings for {} new repositories", new_count);
         Ok(new_count)
+    }
+
+    /// Index files for a repository that was just cloned.
+    ///
+    /// Call this after cloning a repo to update the in-memory file index.
+    /// Returns the number of files indexed.
+    pub fn index_cloned_repo(&self, repo_name: &str) -> crate::error::Result<usize> {
+        let mut index = self
+            .index
+            .write()
+            .map_err(|e| crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))?;
+
+        match index.index_repo_files(repo_name) {
+            Some(count) => {
+                tracing::info!(
+                    repo = %repo_name,
+                    files = count,
+                    "Indexed files for cloned repository"
+                );
+                Ok(count)
+            }
+            None => {
+                tracing::warn!(repo = %repo_name, "Repository not found in index");
+                Ok(0)
+            }
+        }
+    }
+
+    /// Get a repository from the index by name.
+    pub fn get_repo(&self, repo_name: &str) -> Option<IndexedRepo> {
+        let index = self.index.read().ok()?;
+        index.get(repo_name).cloned()
+    }
+
+    /// Clone all API-discovered repos and index their files.
+    ///
+    /// Clones repos in parallel using `parallelism` workers.
+    /// Returns the number of repos successfully cloned and indexed.
+    pub async fn clone_and_index_all(&self, parallelism: usize) -> crate::error::Result<usize> {
+        use crate::repo::GitOps;
+        use futures::stream::{self, StreamExt};
+
+        // Get repos that need cloning
+        let repos_to_clone: Vec<_> = {
+            let index = self
+                .index
+                .read()
+                .map_err(|e| crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))?;
+            index
+                .list()
+                .into_iter()
+                .filter(|r| !r.path.exists())
+                .map(|r| {
+                    (
+                        r.name.clone(),
+                        r.path.clone(),
+                        r.github_url.clone(),
+                        r.default_branch.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        if repos_to_clone.is_empty() {
+            return Ok(0);
+        }
+
+        tracing::info!(
+            count = repos_to_clone.len(),
+            parallelism = parallelism,
+            "Cloning API-discovered repositories"
+        );
+
+        // Clone in parallel
+        let results: Vec<_> = stream::iter(repos_to_clone)
+            .map(|(name, path, github_url, default_branch)| async move {
+                tracing::info!(repo = %name, path = %path.display(), "Cloning repository");
+                match GitOps::ensure_repo_at_path(&path, &github_url, &default_branch).await {
+                    Ok(()) => Some(name),
+                    Err(e) => {
+                        tracing::error!(repo = %name, error = %e, "Failed to clone repository");
+                        None
+                    }
+                }
+            })
+            .buffer_unordered(parallelism)
+            .collect()
+            .await;
+
+        // Index files for successfully cloned repos
+        let cloned_repos: Vec<_> = results.into_iter().flatten().collect();
+        let cloned_count = cloned_repos.len();
+
+        for repo_name in cloned_repos {
+            if let Err(e) = self.index_cloned_repo(&repo_name) {
+                tracing::warn!(repo = %repo_name, error = %e, "Failed to index cloned repo files");
+            }
+        }
+
+        tracing::info!(count = cloned_count, "Finished cloning repositories");
+        Ok(cloned_count)
     }
 
     /// Find the best matching repository using semantic similarity.

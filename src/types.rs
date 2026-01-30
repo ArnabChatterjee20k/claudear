@@ -1049,6 +1049,16 @@ pub enum IssueType {
     LinearBug,
 }
 
+impl IssueType {
+    /// Get the source name for this issue type (used for retry lookups).
+    pub fn source_name(&self) -> &'static str {
+        match self {
+            Self::SentryIssue => "sentry",
+            Self::LinearBug => "linear",
+        }
+    }
+}
+
 impl std::fmt::Display for IssueType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

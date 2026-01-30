@@ -424,11 +424,17 @@ pub struct RegressionConfig {
     pub similarity_threshold: f64,
     /// Target repositories that signal a release is live.
     /// When a fix is included in a release of these repos, monitoring starts.
+    /// The dependency graph is used to trace how fixes flow to these targets.
     pub target_repos: Vec<String>,
     /// GitHub token for searching issues (uses github.token if not set).
     pub github_token: Option<String>,
     /// Repositories to search for similar issues.
     pub github_search_repos: Vec<String>,
+    /// Package name overrides when repo name differs from package name.
+    /// Maps repo name (e.g., "utopia-php/database") to package name (e.g., "utopia-php/database").
+    /// Only needed when they differ; same-name packages are auto-detected.
+    #[serde(default)]
+    pub package_names: std::collections::HashMap<String, String>,
 }
 
 impl Default for RegressionConfig {
@@ -439,16 +445,10 @@ impl Default for RegressionConfig {
             monitoring_duration_hours: 24,
             sentry_event_threshold: 1,
             similarity_threshold: 0.75,
-            target_repos: vec![
-                "appwrite-labs/cloud".to_string(),
-                "appwrite-labs/edge".to_string(),
-            ],
+            target_repos: Vec::new(),
             github_token: None,
-            github_search_repos: vec![
-                "appwrite/appwrite".to_string(),
-                "appwrite/sdk-for-web".to_string(),
-                "appwrite/sdk-for-flutter".to_string(),
-            ],
+            github_search_repos: Vec::new(),
+            package_names: std::collections::HashMap::new(),
         }
     }
 }
@@ -1769,15 +1769,12 @@ linear:
         assert_eq!(config.monitoring_duration_hours, 24);
         assert_eq!(config.sentry_event_threshold, 1);
         assert!((config.similarity_threshold - 0.75).abs() < 0.01);
-        assert_eq!(config.target_repos.len(), 2);
-        assert!(config
-            .target_repos
-            .contains(&"appwrite-labs/cloud".to_string()));
-        assert!(config
-            .target_repos
-            .contains(&"appwrite-labs/edge".to_string()));
+        // target_repos and github_search_repos should be empty by default
+        // (configured in YAML, not hardcoded)
+        assert!(config.target_repos.is_empty());
         assert!(config.github_token.is_none());
-        assert_eq!(config.github_search_repos.len(), 3);
+        assert!(config.github_search_repos.is_empty());
+        assert!(config.package_names.is_empty());
     }
 
     #[test]

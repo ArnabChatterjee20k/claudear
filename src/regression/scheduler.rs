@@ -47,6 +47,10 @@ pub struct CheckCycleResult {
     pub is_final_check: bool,
     /// New status if changed.
     pub new_status: Option<RegressionWatchStatus>,
+    /// Issue type (for retry triggering).
+    pub issue_type: crate::types::IssueType,
+    /// Issue ID (for retry triggering).
+    pub issue_id: String,
 }
 
 /// Schedules and runs regression checks.
@@ -162,6 +166,8 @@ impl<C: RegressionChecker> RegressionScheduler<C> {
             regression_detected: regression_result.regression_detected,
             is_final_check,
             new_status,
+            issue_type: watch.issue_type,
+            issue_id: watch.issue_id.clone(),
         }))
     }
 

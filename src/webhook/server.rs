@@ -453,41 +453,62 @@ async fn process_issue(
         }
     };
 
-    // Clone-on-demand: if the repo was discovered via API and doesn't exist locally, clone it
-    if resolution.needs_clone() {
-        if let (Some(github_url), Some(default_branch)) =
-            (resolution.github_url(), resolution.default_branch())
-        {
-            tracing::info!(
-                short_id = %issue.short_id,
-                repo_path = %project_dir.display(),
-                github_url = %github_url,
-                "Repository not cloned locally, cloning now"
-            );
+    // Ensure repo is up to date: pull latest changes
+    if let (Some(github_url), Some(default_branch), Some(repo_name)) = (
+        resolution.github_url(),
+        resolution.default_branch(),
+        resolution.repo_name(),
+    ) {
+        tracing::info!(
+            short_id = %issue.short_id,
+            repo = %repo_name,
+            "Pulling latest changes"
+        );
 
-            if let Err(e) =
-                GitOps::ensure_repo_at_path(&project_dir, github_url, default_branch).await
-            {
-                tracing::error!(
+        if let Err(e) = GitOps::ensure_repo_at_path(&project_dir, github_url, default_branch).await
+        {
+            tracing::error!(
+                short_id = %issue.short_id,
+                repo = %repo_name,
+                error = %e,
+                "Failed to update repository, skipping issue"
+            );
+            // Clean up processing flag before returning
+            let mut processing = state.processing.write().await;
+            processing.remove(&processing_key);
+            // Mark as failed
+            state.tracker.mark_failed(
+                source_name,
+                &issue.id,
+                &format!("Git pull failed: {}", e),
+            )?;
+            return Ok(());
+        }
+
+        // Re-index files and sync to database
+        if let Some(inferrer) = &state.inferrer {
+            if let Err(e) = inferrer.index_cloned_repo(repo_name) {
+                tracing::warn!(
                     short_id = %issue.short_id,
+                    repo = %repo_name,
                     error = %e,
-                    "Failed to clone repository, skipping issue"
+                    "Failed to re-index repository files"
                 );
-                // Clean up processing flag before returning
-                let mut processing = state.processing.write().await;
-                processing.remove(&processing_key);
-                // Mark as failed
-                state
-                    .tracker
-                    .mark_failed(source_name, &issue.id, &format!("Clone failed: {}", e))?;
-                return Ok(());
             }
 
-            tracing::info!(
-                short_id = %issue.short_id,
-                repo_path = %project_dir.display(),
-                "Repository cloned successfully"
-            );
+            // Sync updated files to database
+            if let (Some(repo), Some(tracker)) =
+                (inferrer.get_repo(repo_name), &state.sqlite_tracker)
+            {
+                if let Err(e) = tracker.sync_repo_files(&repo) {
+                    tracing::warn!(
+                        short_id = %issue.short_id,
+                        repo = %repo_name,
+                        error = %e,
+                        "Failed to sync repository files to database"
+                    );
+                }
+            }
         }
     }
 

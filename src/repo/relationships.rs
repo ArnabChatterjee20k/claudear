@@ -262,6 +262,16 @@ impl DependencyGraph {
         false
     }
 
+    /// Get the dependency type for the first hop from a repo.
+    ///
+    /// Returns the type of dependency between the given repo and its first dependant.
+    pub fn get_first_hop_dependency_type(&self, repo: &str) -> Option<DependencyType> {
+        self.downstream_deps
+            .get(repo)
+            .and_then(|deps| deps.first())
+            .map(|dep| dep.dep_type)
+    }
+
     /// Get the dependency graph as a printable string.
     pub fn to_string_tree(&self, root: Option<&str>) -> String {
         let mut output = String::new();

@@ -159,6 +159,11 @@ impl RetryManager {
         self.handle_failure(source, issue_id, "PR was closed without merging")
     }
 
+    /// Handle a regression being detected - triggers retry logic.
+    pub fn handle_regression(&self, source: &str, issue_id: &str) -> Result<RetryDecision> {
+        self.handle_failure(source, issue_id, "Regression detected after merge")
+    }
+
     /// Get all attempts that are ready to be retried now.
     pub fn get_ready_retries(&self) -> Result<Vec<FixAttempt>> {
         let retryable = self.tracker.get_retryable_issues(self.config.max_retries)?;

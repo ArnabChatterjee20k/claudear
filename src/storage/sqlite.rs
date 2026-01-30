@@ -2710,6 +2710,42 @@ impl SqliteTracker {
         Ok(())
     }
 
+    /// Sync a single repository's files to the database.
+    ///
+    /// Clears existing files and saves the new file list.
+    pub fn sync_repo_files(&self, repo: &crate::repo::IndexedRepo) -> Result<()> {
+        let path_str = repo.path.to_string_lossy();
+
+        // Save/update the repo entry
+        let repo_id = self.save_indexed_repo(
+            &repo.name,
+            &path_str,
+            Some(&repo.github_url),
+            &repo.default_branch,
+            repo.files.len(),
+        )?;
+
+        // Clear and re-save files
+        self.clear_repo_files(repo_id)?;
+
+        if !repo.files.is_empty() {
+            let files_with_types: Vec<(String, Option<String>)> = repo
+                .files
+                .iter()
+                .map(|f| {
+                    let file_type = std::path::Path::new(f)
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_string());
+                    (f.clone(), file_type)
+                })
+                .collect();
+
+            self.save_repo_files(repo_id, &files_with_types)?;
+        }
+
+        Ok(())
+    }
+
     /// Get an indexed repository by name.
     pub fn get_indexed_repo(&self, name: &str) -> Result<Option<StoredIndexedRepo>> {
         let conn = self.acquire_lock()?;

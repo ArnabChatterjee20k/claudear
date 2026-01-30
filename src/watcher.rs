@@ -282,6 +282,18 @@ impl Watcher {
 
         tracing::info!("");
 
+        // Clone any API-discovered repos that aren't local yet
+        if let Some(inferrer) = &self.inferrer {
+            let parallelism = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            match inferrer.clone_and_index_all(parallelism).await {
+                Ok(0) => {} // No repos to clone
+                Ok(n) => tracing::info!("Cloned and indexed {} repositories", n),
+                Err(e) => tracing::warn!("Error cloning repositories: {}", e),
+            }
+        }
+
         // Sync repository index to database (includes file lists)
         // Use spawn_blocking since sync_repos_to_db performs blocking I/O
         let inferrer = self.inferrer.clone();
@@ -916,40 +928,60 @@ impl Watcher {
             }
         };
 
-        // Clone-on-demand: if the repo was discovered via API and doesn't exist locally, clone it
-        if resolution.needs_clone() {
-            if let (Some(github_url), Some(default_branch)) =
-                (resolution.github_url(), resolution.default_branch())
-            {
-                tracing::info!(
-                    short_id = %issue.short_id,
-                    repo_path = %project_dir.display(),
-                    github_url = %github_url,
-                    "Repository not cloned locally, cloning now"
-                );
+        // Ensure repo is up to date: pull latest changes
+        if let (Some(github_url), Some(default_branch), Some(repo_name)) = (
+            resolution.github_url(),
+            resolution.default_branch(),
+            resolution.repo_name(),
+        ) {
+            tracing::info!(
+                short_id = %issue.short_id,
+                repo = %repo_name,
+                "Pulling latest changes"
+            );
 
-                if let Err(e) =
-                    GitOps::ensure_repo_at_path(&project_dir, github_url, default_branch).await
+            if let Err(e) =
+                GitOps::ensure_repo_at_path(&project_dir, github_url, default_branch).await
+            {
+                tracing::error!(
+                    short_id = %issue.short_id,
+                    repo = %repo_name,
+                    error = %e,
+                    "Failed to pull repository, skipping issue"
+                );
+                // Clean up processing state before returning
                 {
-                    tracing::error!(
+                    let mut processing = self.processing.write().await;
+                    processing.remove(&processing_key);
+                }
+                self.active_processing.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+
+            // Re-index files and sync to database
+            if let Some(inferrer) = &self.inferrer {
+                if let Err(e) = inferrer.index_cloned_repo(repo_name) {
+                    tracing::warn!(
                         short_id = %issue.short_id,
+                        repo = %repo_name,
                         error = %e,
-                        "Failed to clone repository, skipping issue"
+                        "Failed to re-index repository files"
                     );
-                    // Clean up processing state before returning
-                    {
-                        let mut processing = self.processing.write().await;
-                        processing.remove(&processing_key);
-                    }
-                    self.active_processing.fetch_sub(1, Ordering::SeqCst);
-                    return;
                 }
 
-                tracing::info!(
-                    short_id = %issue.short_id,
-                    repo_path = %project_dir.display(),
-                    "Repository cloned successfully"
-                );
+                // Sync updated files to database
+                if let Some(tracker) = &self.sqlite_tracker {
+                    if let Some(repo) = inferrer.get_repo(repo_name) {
+                        if let Err(e) = tracker.sync_repo_files(&repo) {
+                            tracing::warn!(
+                                short_id = %issue.short_id,
+                                repo = %repo_name,
+                                error = %e,
+                                "Failed to sync repository files to database"
+                            );
+                        }
+                    }
+                }
             }
         }
 

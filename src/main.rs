@@ -270,11 +270,11 @@ enum ReposCommands {
         github_url: Option<String>,
     },
 
-    /// Sync repository index to database (paths and optionally files)
+    /// Sync repository index to database (paths and files)
     Sync {
-        /// Also sync file lists (can be slow for large codebases)
+        /// Skip syncing file lists (faster but limits inference accuracy)
         #[arg(long, default_value = "false")]
-        files: bool,
+        skip_files: bool,
     },
 }
 
@@ -368,6 +368,28 @@ enum ReportCommands {
 enum DiagCommands {
     /// Show database table counts and recent operations
     Db,
+
+    /// Show the dependency graph used for release tracking
+    ReleaseGraph,
+
+    /// Check if a PR's fix would be detected in a target release (dry-run)
+    ReleaseCheck {
+        /// Repository (owner/repo format)
+        repo: String,
+        /// PR number
+        pr: i64,
+        /// Target repository to check against (optional, uses config targets if not specified)
+        #[arg(long)]
+        target: Option<String>,
+    },
+
+    /// Show the dependency path from source to target repo
+    ReleasePath {
+        /// Source repository (where fix was made)
+        source: String,
+        /// Target repository (where release happens)
+        target: String,
+    },
 }
 
 /// Initialize logging with both console and file output.
@@ -559,10 +581,13 @@ fn create_tracker(config: &Config) -> (Arc<dyn FixAttemptTracker>, Arc<SqliteTra
 /// 1. ReleaseTracker: Checks if fixes have been included in releases and transitions watches to Monitoring
 /// 2. RegressionScheduler: Runs hourly checks on watches in Monitoring state
 ///
+/// When a regression is detected, automatically triggers a retry of the fix attempt.
+///
 /// Returns a join handle that can be used to stop the monitoring.
 fn start_regression_monitoring(
     config: &Config,
     sqlite_tracker: Arc<SqliteTracker>,
+    tracker: Arc<dyn FixAttemptTracker>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.regression.enabled {
         tracing::info!("Regression monitoring disabled in configuration");
@@ -584,10 +609,11 @@ fn start_regression_monitoring(
         }
     };
 
-    // Create release tracker config
+    // Create release tracker config (uses default dependency chains for transitive tracking)
     let release_config = ReleaseTrackerConfig {
         target_repos: config.regression.target_repos.clone(),
         poll_interval_ms: config.regression.check_interval_hours as u64 * 60 * 60 * 1000, // Convert hours to ms
+        ..Default::default()
     };
 
     // Create scheduler config
@@ -657,6 +683,9 @@ fn start_regression_monitoring(
 
     let check_interval_hours = scheduler_config.check_interval_hours;
 
+    // Create retry manager for triggering retries on regression
+    let retry_manager = RetryManager::new(config.retry.clone(), tracker);
+
     // Start background task
     let handle = tokio::spawn(async move {
         let mut release_check_interval = interval(Duration::from_secs(300)); // Check for releases every 5 minutes
@@ -702,13 +731,35 @@ fn start_regression_monitoring(
                                         component = "regression_monitor",
                                         watch_id = result.watch_id,
                                         check_number = result.check_number,
-                                        "Regression detected!"
+                                        issue_id = %result.issue_id,
+                                        "Regression detected! Triggering retry."
                                     );
+
+                                    // Trigger retry for the regressed issue
+                                    let source = result.issue_type.source_name();
+                                    match retry_manager.handle_regression(source, &result.issue_id) {
+                                        Ok(decision) => {
+                                            tracing::info!(
+                                                component = "regression_monitor",
+                                                issue_id = %result.issue_id,
+                                                decision = ?decision,
+                                                "Retry scheduled for regressed issue"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                component = "regression_monitor",
+                                                issue_id = %result.issue_id,
+                                                error = %e,
+                                                "Failed to schedule retry for regressed issue"
+                                            );
+                                        }
+                                    }
                                 } else if result.is_final_check {
                                     tracing::info!(
                                         component = "regression_monitor",
                                         watch_id = result.watch_id,
-                                        "Final check complete, no regression"
+                                        "Final check complete, no regression - issue resolved"
                                     );
                                 }
                             }
@@ -1195,7 +1246,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            ReposCommands::Sync { files } => {
+            ReposCommands::Sync { skip_files } => {
                 use claudear::repo::RepoIndex;
 
                 println!("\nSyncing repository index to database...");
@@ -1217,17 +1268,17 @@ async fn main() -> anyhow::Result<()> {
                     index.total_files()
                 );
 
-                // Sync to database
-                let synced = db_tracker.sync_from_index(&index, *files)?;
+                // Sync to database (includes files by default)
+                let sync_files = !*skip_files;
+                let synced = db_tracker.sync_from_index(&index, sync_files)?;
 
                 println!("\nSynced {} repository paths to database", synced);
-                if *files {
-                    println!("  Including file lists (this may have taken a while)");
+                if sync_files {
                     // Show stats after file sync
                     let stats = db_tracker.get_index_stats()?;
-                    println!("  Total files in database: {}", stats.file_count);
+                    println!("  Including {} files in database", stats.file_count);
                 } else {
-                    println!("\nRun with --files to also sync file lists (slower)");
+                    println!("  Skipped file lists (use without --skip-files for full indexing)");
                 }
             }
         }
@@ -1407,6 +1458,165 @@ async fn main() -> anyhow::Result<()> {
                     println!("  3. Verify the watcher is processing issues (check activity_log)");
                 }
             }
+
+            DiagCommands::ReleaseGraph => {
+                use claudear::repo::RepoRelationships;
+
+                let relationships = RepoRelationships::with_defaults();
+                println!("\n=== Dependency Graph for Release Tracking ===\n");
+                println!("{}", relationships.print_tree(None));
+
+                println!("Target repos (from config):");
+                if config.regression.target_repos.is_empty() {
+                    println!("  (none configured - set regression.target_repos in config)");
+                } else {
+                    for repo in &config.regression.target_repos {
+                        println!("  - {}", repo);
+                    }
+                }
+            }
+
+            DiagCommands::ReleasePath { source, target } => {
+                use claudear::repo::RepoRelationships;
+
+                let relationships = RepoRelationships::with_defaults();
+                let graph = relationships.get_graph();
+
+                println!("\n=== Dependency Path: {} → {} ===\n", source, target);
+
+                if graph.depends_on(target, source) {
+                    println!(
+                        "✓ Path exists: {} depends on {} (directly or transitively)",
+                        target, source
+                    );
+
+                    // Show direct dependants of source
+                    let dependants = relationships.get_dependants(source);
+                    if !dependants.is_empty() {
+                        println!("\nDirect dependants of {}:", source);
+                        for dep in &dependants {
+                            let dep_type = graph
+                                .get_first_hop_dependency_type(source)
+                                .map(|t| format!("{:?}", t))
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            println!("  → {} ({})", dep.name, dep_type);
+                        }
+                    }
+
+                    // Show what lock file would be checked
+                    if let Some(dep_type) = graph.get_first_hop_dependency_type(source) {
+                        let lock_file = match dep_type {
+                            claudear::repo::DependencyType::Composer => "composer.lock",
+                            claudear::repo::DependencyType::Npm => "package-lock.json",
+                            claudear::repo::DependencyType::GitSubmodule => {
+                                "(commit ancestry check)"
+                            }
+                            claudear::repo::DependencyType::Manual => "(release_after check)",
+                        };
+                        println!("\nVerification method: {:?} → {}", dep_type, lock_file);
+                    }
+                } else {
+                    println!("✗ No path found: {} does not depend on {}", target, source);
+                    println!("\nHint: Check if the dependency is defined in RepoRelationships::seed_appwrite_defaults()");
+                }
+            }
+
+            DiagCommands::ReleaseCheck { repo, pr, target } => {
+                use claudear::release::ReleaseClient;
+
+                let github_token = config
+                    .github
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("GitHub token not configured"))?;
+
+                let client = ReleaseClient::new(github_token);
+
+                println!("\n=== Release Check: {}/#{} ===\n", repo, pr);
+
+                // Get PR details
+                match client.get_pr_details(repo, *pr).await? {
+                    Some(pr_details) => {
+                        println!(
+                            "PR #{}: {}",
+                            pr_details.number,
+                            if pr_details.merged {
+                                "MERGED"
+                            } else {
+                                "NOT MERGED"
+                            }
+                        );
+                        if let Some(ref merged_at) = pr_details.merged_at {
+                            println!("Merged at: {}", merged_at);
+                        }
+                        if let Some(ref sha) = pr_details.merge_commit_sha {
+                            println!("Merge commit: {}", sha);
+                        }
+
+                        if !pr_details.merged {
+                            println!("\n⚠ PR is not merged yet - cannot check release inclusion");
+                            return Ok(());
+                        }
+
+                        // Determine target repos to check
+                        let targets: Vec<String> = if let Some(t) = target {
+                            vec![t.clone()]
+                        } else if !config.regression.target_repos.is_empty() {
+                            config.regression.target_repos.clone()
+                        } else {
+                            println!("\n⚠ No target repos configured. Use --target or set regression.target_repos");
+                            return Ok(());
+                        };
+
+                        // Check each target
+                        for target_repo in &targets {
+                            println!("\n--- Checking target: {} ---", target_repo);
+
+                            // Get latest release
+                            match client.get_latest_release(target_repo).await? {
+                                Some(release) => {
+                                    println!(
+                                        "Latest release: {} ({})",
+                                        release.tag_name,
+                                        release.published_at.as_deref().unwrap_or("no date")
+                                    );
+
+                                    // Check if commit is in release
+                                    if let Some(ref sha) = pr_details.merge_commit_sha {
+                                        let in_release = client
+                                            .is_commit_in_release(
+                                                target_repo,
+                                                sha,
+                                                &release.tag_name,
+                                            )
+                                            .await?;
+
+                                        if in_release {
+                                            println!(
+                                                "✓ Merge commit {} IS in release {}",
+                                                &sha[..7],
+                                                release.tag_name
+                                            );
+                                        } else {
+                                            println!(
+                                                "✗ Merge commit {} is NOT in release {}",
+                                                &sha[..7],
+                                                release.tag_name
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    println!("No releases found in {}", target_repo);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        println!("PR #{} not found in {}", pr, repo);
+                    }
+                }
+            }
         }
 
         return Ok(());
@@ -1534,7 +1744,8 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Start regression monitoring background task
-        let regression_handle = start_regression_monitoring(&config, sqlite_tracker.clone());
+        let regression_handle =
+            start_regression_monitoring(&config, sqlite_tracker.clone(), tracker.clone());
         if regression_handle.is_some() {
             tracing::info!("  Regression monitoring: enabled");
         }
