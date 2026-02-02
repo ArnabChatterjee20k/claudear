@@ -54,7 +54,7 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 subtle = "2"
-rand = "0.8"
+rand = "0.9"
 
 # JWT for GitHub App authentication
 jsonwebtoken = "9"
