@@ -574,7 +574,6 @@ impl RepoInferrer {
         // Clone in parallel
         let results: Vec<_> = stream::iter(repos_to_clone)
             .map(|(name, path, github_url, default_branch)| async move {
-                tracing::info!(repo = %name, path = %path.display(), "Cloning repository");
                 match GitOps::ensure_repo_at_path(&path, &github_url, &default_branch).await {
                     Ok(()) => Some(name),
                     Err(e) => {

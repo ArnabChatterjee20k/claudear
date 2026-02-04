@@ -128,6 +128,9 @@ pub struct OrgRepo {
     pub default_branch: String,
     /// Clone URL (HTTPS).
     pub clone_url: String,
+    /// SSH URL for cloning.
+    #[serde(default)]
+    pub ssh_url: String,
     /// HTML URL.
     pub html_url: String,
     /// Whether the repo is private.
@@ -1340,6 +1343,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1362,6 +1366,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1384,6 +1389,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1402,6 +1408,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1425,6 +1432,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1461,6 +1469,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1484,6 +1493,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1516,6 +1526,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1545,6 +1556,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1575,6 +1587,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1600,6 +1613,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1626,6 +1640,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1663,6 +1678,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1702,6 +1718,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1735,6 +1752,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1768,6 +1786,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1804,6 +1823,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1844,6 +1864,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
         let watcher = ReviewWatcher::with_http_client(client);
@@ -1872,6 +1893,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::new(config);
         assert!(client.is_enabled());
@@ -2039,6 +2061,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -2064,6 +2087,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -2088,6 +2112,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -2121,6 +2146,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::new(config);
         assert_eq!(client.token(), Some("my_token"));
@@ -2304,6 +2330,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client_enabled = GitHubClient::new(config_enabled);
         let watcher_enabled = ReviewWatcher::new(client_enabled);
@@ -2504,6 +2531,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -2622,6 +2650,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::new(config);
         let watcher = ReviewWatcher::new(client);
@@ -2676,6 +2705,7 @@ mod tests {
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         };
         let client = GitHubClient::new(config);
         assert!(client.is_enabled());

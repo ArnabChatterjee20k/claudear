@@ -194,6 +194,10 @@ pub struct GitHubConfig {
     /// Comments must contain this tag to trigger Claude.
     /// Set to empty string to respond to all comments.
     pub review_trigger: String,
+    /// Use SSH URLs for cloning instead of HTTPS.
+    /// Set to true if you have SSH keys configured for GitHub.
+    #[serde(default)]
+    pub use_ssh: bool,
 }
 
 impl Default for GitHubConfig {
@@ -204,6 +208,7 @@ impl Default for GitHubConfig {
             auto_resolve_on_merge: false,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         }
     }
 }

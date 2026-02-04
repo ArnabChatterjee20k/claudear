@@ -185,6 +185,7 @@ impl RepoIndex {
     /// * `known_orgs` - GitHub organization names to fetch repos from
     /// * `client` - GitHub API client with token configured
     /// * `work_dir` - Directory where repos will be cloned to
+    /// * `use_ssh` - Whether to use SSH URLs for cloning
     ///
     /// # Returns
     /// A populated RepoIndex with API-discovered repositories.
@@ -192,6 +193,7 @@ impl RepoIndex {
         known_orgs: &[String],
         client: &GitHubClient,
         work_dir: &Path,
+        use_ssh: bool,
     ) -> Result<Self> {
         let mut index = Self::new();
 
@@ -201,9 +203,14 @@ impl RepoIndex {
             match client.list_org_repos(org).await {
                 Ok(repos) => {
                     for repo in repos {
+                        let clone_url = if use_ssh {
+                            &repo.ssh_url
+                        } else {
+                            &repo.clone_url
+                        };
                         let indexed = IndexedRepo::from_api(
                             &repo.full_name,
-                            &repo.clone_url,
+                            clone_url,
                             &repo.default_branch,
                             work_dir,
                         );
@@ -243,11 +250,13 @@ impl RepoIndex {
     /// * `auto_discover_paths` - Local paths to scan for repos
     /// * `github_client` - Optional GitHub API client
     /// * `work_dir` - Directory where repos will be cloned to (for API discovery)
+    /// * `use_ssh` - Whether to use SSH URLs for cloning
     pub async fn build_with_fallback(
         known_orgs: &[String],
         auto_discover_paths: &[String],
         github_client: Option<&GitHubClient>,
         work_dir: &Path,
+        use_ssh: bool,
     ) -> Result<Self> {
         // Strategy 1: Local filesystem scan (preferred when paths are configured)
         if !auto_discover_paths.is_empty() {
@@ -261,7 +270,7 @@ impl RepoIndex {
                 tracing::info!(
                     "Building repo index from GitHub API (no auto_discover_paths configured)"
                 );
-                return Self::build_from_github(known_orgs, client, work_dir).await;
+                return Self::build_from_github(known_orgs, client, work_dir, use_ssh).await;
             }
         }
 

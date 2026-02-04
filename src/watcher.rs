@@ -113,6 +113,7 @@ impl Watcher {
             &config.auto_discover_paths,
             github_client,
             &config.work_dir,
+            config.github.use_ssh,
         )
         .await?;
 
@@ -166,6 +167,7 @@ impl Watcher {
             &config.auto_discover_paths,
             github_client,
             &config.work_dir,
+            config.github.use_ssh,
         )
         .await?;
 

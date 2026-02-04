@@ -463,6 +463,7 @@ mod tests {
             auto_resolve_on_merge: false,
             webhook_secret: webhook_secret.map(|s| s.to_string()),
             review_trigger: "/claudear".to_string(),
+            use_ssh: false,
         }
     }
 
