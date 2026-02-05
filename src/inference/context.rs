@@ -20,6 +20,19 @@ static REPO_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r"(?:^|[\s:,(`])([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)(?:$|[\s,):`])").ok()
 });
 
+/// Regex to extract vendor package names from PHP paths (e.g., vendor/org/package/)
+static VENDOR_PHP_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"vendor/([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)/").ok());
+
+/// Regex to extract package names from node_modules paths (e.g., node_modules/@org/package/)
+static VENDOR_NODE_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"node_modules/(@[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+|[a-zA-Z0-9_.-]+)/").ok()
+});
+
+/// Regex to extract Go module paths (e.g., github.com/org/repo)
+static VENDOR_GO_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?:vendor/)?github\.com/([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)/").ok());
+
 static CLASS_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r"\b([A-Z][a-zA-Z0-9]+(?:Controller|Service|Handler|Manager|Repository|Factory|Provider|Module|Component|Middleware))\b").ok()
 });
@@ -63,12 +76,30 @@ impl IssueContext {
     /// - `metadata.filename` - direct file path
     /// - `metadata.function` - function name
     /// - `culprit` - often "file in function" format
+    /// - `project` - Sentry project name (maps to top-level repo)
     pub fn from_sentry(issue: &Issue) -> Self {
         let mut context = Self::new();
+
+        // Strategy 0: Use Sentry project name to infer top-level repo
+        // Sentry projects map 1:1 with top-level repos.
+        // Project names like "cloud-staging" or "cloud-production" should map to "cloud"
+        if let Some(project) = issue.metadata.get("project").and_then(|v| v.as_str()) {
+            let normalized = normalize_project_name(project);
+            if !normalized.is_empty() {
+                // Add as a potential repo reference (will be matched against known repos)
+                context.repos.push(normalized.clone());
+
+                // Also add with common org prefixes to try matching org/repo format
+                // The inferrer will need to fuzzy match these
+                context.keywords.push(format!("repo:{}", normalized));
+            }
+        }
 
         // Extract filename from metadata
         if let Some(filename) = issue.metadata.get("filename").and_then(|v| v.as_str()) {
             context.filenames.push(filename.to_string());
+            // Also extract vendor packages from the filename path
+            extract_vendor_packages(&mut context, filename);
         }
 
         // Extract function from metadata
@@ -83,10 +114,12 @@ impl IssueContext {
             if parts.len() >= 2 {
                 context.filenames.push(parts[0].trim().to_string());
                 context.functions.push(parts[1].trim().to_string());
+                extract_vendor_packages(&mut context, parts[0].trim());
             } else if !parts.is_empty() {
                 // Could be just a file path
                 if looks_like_path(parts[0]) {
                     context.filenames.push(parts[0].trim().to_string());
+                    extract_vendor_packages(&mut context, parts[0].trim());
                 }
             }
         }
@@ -192,6 +225,84 @@ fn looks_like_path(s: &str) -> bool {
     s.contains('/') || s.contains('\\') || s.contains('.') && !s.starts_with('.')
 }
 
+/// Normalize a Sentry project name to a potential repository name.
+///
+/// Strips common environment suffixes like "-staging", "-production", "-dev", "-prod".
+/// Examples:
+/// - "cloud-staging" -> "cloud"
+/// - "cloud-production" -> "cloud"
+/// - "my-api-dev" -> "my-api"
+/// - "console" -> "console"
+fn normalize_project_name(project: &str) -> String {
+    let suffixes = [
+        "-staging",
+        "-production",
+        "-prod",
+        "-dev",
+        "-development",
+        "-test",
+        "-qa",
+        "-uat",
+        "-preview",
+        "-canary",
+    ];
+
+    let mut normalized = project.to_lowercase();
+    for suffix in &suffixes {
+        if let Some(stripped) = normalized.strip_suffix(suffix) {
+            normalized = stripped.to_string();
+            break;
+        }
+    }
+    normalized
+}
+
+/// Extract vendor/dependency package names from file paths.
+///
+/// Parses paths like:
+/// - PHP: `/vendor/utopia-php/database/src/...` -> `utopia-php/database`
+/// - Node: `/node_modules/@scope/package/...` -> `@scope/package`
+/// - Go: `/vendor/github.com/org/repo/...` -> `org/repo`
+fn extract_vendor_packages(context: &mut IssueContext, path: &str) {
+    // PHP vendor packages (composer)
+    if let Some(re) = VENDOR_PHP_RE.as_ref() {
+        for cap in re.captures_iter(path) {
+            if let Some(m) = cap.get(1) {
+                let package = m.as_str();
+                // Add as potential repo reference
+                context.repos.push(package.to_string());
+            }
+        }
+    }
+
+    // Node.js packages
+    if let Some(re) = VENDOR_NODE_RE.as_ref() {
+        for cap in re.captures_iter(path) {
+            if let Some(m) = cap.get(1) {
+                let package = m.as_str();
+                // Node scoped packages like @scope/package - convert to repo format
+                let repo_name = package.trim_start_matches('@').replace('/', "-");
+                if package.starts_with('@') {
+                    // For scoped packages, use the full name as-is (without @)
+                    context
+                        .repos
+                        .push(package.trim_start_matches('@').to_string());
+                }
+                context.repos.push(repo_name);
+            }
+        }
+    }
+
+    // Go modules from github.com
+    if let Some(re) = VENDOR_GO_RE.as_ref() {
+        for cap in re.captures_iter(path) {
+            if let Some(m) = cap.get(1) {
+                context.repos.push(m.as_str().to_string());
+            }
+        }
+    }
+}
+
 /// Extract file paths and function names from stack trace text.
 fn extract_from_stacktrace(context: &mut IssueContext, stacktrace: &str) {
     // Common stack trace file patterns
@@ -200,12 +311,17 @@ fn extract_from_stacktrace(context: &mut IssueContext, stacktrace: &str) {
     // PHP: #0 /path/to/file.php(123): function_name()
     // Java: at package.Class.method(File.java:123)
 
+    // Collect file paths to extract vendor packages from
+    let mut collected_paths: Vec<String> = Vec::new();
+
     // Python style
     let python_re = Regex::new(r#"File "([^"]+\.py)""#).ok();
     if let Some(re) = python_re {
         for cap in re.captures_iter(stacktrace) {
             if let Some(m) = cap.get(1) {
-                context.filenames.push(m.as_str().to_string());
+                let path = m.as_str().to_string();
+                context.filenames.push(path.clone());
+                collected_paths.push(path);
             }
         }
     }
@@ -215,17 +331,21 @@ fn extract_from_stacktrace(context: &mut IssueContext, stacktrace: &str) {
     if let Some(re) = node_re {
         for cap in re.captures_iter(stacktrace) {
             if let Some(m) = cap.get(1) {
-                context.filenames.push(m.as_str().to_string());
+                let path = m.as_str().to_string();
+                context.filenames.push(path.clone());
+                collected_paths.push(path);
             }
         }
     }
 
-    // PHP style
-    let php_re = Regex::new(r"(/[^(]+\.php)\((\d+)\)").ok();
+    // PHP style - captures paths like /usr/src/code/vendor/utopia-php/database/src/...
+    let php_re = Regex::new(r"(/[^\s(]+\.php)(?:\((\d+)\))?").ok();
     if let Some(re) = php_re {
         for cap in re.captures_iter(stacktrace) {
             if let Some(m) = cap.get(1) {
-                context.filenames.push(m.as_str().to_string());
+                let path = m.as_str().to_string();
+                context.filenames.push(path.clone());
+                collected_paths.push(path);
             }
         }
     }
@@ -235,7 +355,9 @@ fn extract_from_stacktrace(context: &mut IssueContext, stacktrace: &str) {
     if let Some(re) = java_re {
         for cap in re.captures_iter(stacktrace) {
             if let Some(m) = cap.get(1) {
-                context.filenames.push(m.as_str().to_string());
+                let path = m.as_str().to_string();
+                context.filenames.push(path.clone());
+                collected_paths.push(path);
             }
         }
     }
@@ -245,7 +367,9 @@ fn extract_from_stacktrace(context: &mut IssueContext, stacktrace: &str) {
     if let Some(re) = go_re {
         for cap in re.captures_iter(stacktrace) {
             if let Some(m) = cap.get(1) {
-                context.filenames.push(m.as_str().to_string());
+                let path = m.as_str().to_string();
+                context.filenames.push(path.clone());
+                collected_paths.push(path);
             }
         }
     }
@@ -255,9 +379,16 @@ fn extract_from_stacktrace(context: &mut IssueContext, stacktrace: &str) {
     if let Some(re) = rust_re {
         for cap in re.captures_iter(stacktrace) {
             if let Some(m) = cap.get(1) {
-                context.filenames.push(m.as_str().to_string());
+                let path = m.as_str().to_string();
+                context.filenames.push(path.clone());
+                collected_paths.push(path);
             }
         }
+    }
+
+    // Extract vendor/dependency packages from all collected paths
+    for path in &collected_paths {
+        extract_vendor_packages(context, path);
     }
 
     // Extract function names from "at function" or "in function" patterns
@@ -547,6 +678,83 @@ mod tests {
         assert!(looks_like_path("file.py"));
         assert!(!looks_like_path(".hidden"));
         assert!(!looks_like_path("nopathhere"));
+    }
+
+    #[test]
+    fn test_normalize_project_name() {
+        assert_eq!(normalize_project_name("cloud-staging"), "cloud");
+        assert_eq!(normalize_project_name("cloud-production"), "cloud");
+        assert_eq!(normalize_project_name("cloud-prod"), "cloud");
+        assert_eq!(normalize_project_name("my-api-dev"), "my-api");
+        assert_eq!(normalize_project_name("console"), "console");
+        assert_eq!(normalize_project_name("Cloud-Staging"), "cloud");
+    }
+
+    #[test]
+    fn test_extract_vendor_packages_php() {
+        let mut context = IssueContext::new();
+        extract_vendor_packages(
+            &mut context,
+            "/usr/src/code/vendor/utopia-php/database/src/Database/Adapter/SQL.php",
+        );
+
+        assert!(context.repos.contains(&"utopia-php/database".to_string()));
+    }
+
+    #[test]
+    fn test_extract_vendor_packages_multiple() {
+        let mut context = IssueContext::new();
+
+        // Extract from multiple paths
+        extract_vendor_packages(
+            &mut context,
+            "/app/vendor/utopia-php/database/src/Database.php",
+        );
+        extract_vendor_packages(&mut context, "/app/vendor/utopia-php/pools/src/Pool.php");
+        extract_vendor_packages(&mut context, "/app/vendor/utopia-php/queue/src/Server.php");
+
+        assert!(context.repos.contains(&"utopia-php/database".to_string()));
+        assert!(context.repos.contains(&"utopia-php/pools".to_string()));
+        assert!(context.repos.contains(&"utopia-php/queue".to_string()));
+    }
+
+    #[test]
+    fn test_sentry_project_extraction() {
+        let mut issue = create_test_issue("sentry", "MySQL error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("cloud-staging"));
+
+        let context = IssueContext::from_sentry(&issue);
+
+        // Should extract normalized project name as a repo reference
+        assert!(context.repos.contains(&"cloud".to_string()));
+    }
+
+    #[test]
+    fn test_sentry_stacktrace_vendor_extraction() {
+        let mut issue = create_test_issue("sentry", "MySQL server has gone away", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("cloud-staging"));
+        issue.metadata.insert(
+            "stacktrace".to_string(),
+            json!(
+                r#"
+                /usr/src/code/vendor/utopia-php/database/src/Database/Adapter/SQL.php in __call at line 393
+                /usr/src/code/vendor/utopia-php/database/src/Database/Adapter/Pool.php in getDocument at line 59
+                /usr/src/code/vendor/utopia-php/pools/src/Pools/Pool.php in closure at line 230
+                "#
+            ),
+        );
+
+        let context = IssueContext::from_sentry(&issue);
+
+        // Should extract project name
+        assert!(context.repos.contains(&"cloud".to_string()));
+        // Should extract vendor packages from stack trace
+        assert!(context.repos.contains(&"utopia-php/database".to_string()));
+        assert!(context.repos.contains(&"utopia-php/pools".to_string()));
     }
 
     #[test]

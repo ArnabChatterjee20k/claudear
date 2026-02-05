@@ -600,6 +600,132 @@ impl RepoInferrer {
         Ok(cloned_count)
     }
 
+    /// Find a repository by Sentry project name.
+    ///
+    /// Sentry projects map 1:1 with top-level repos. This function tries to match
+    /// a project name like "cloud-staging" or "console-production" to a repo.
+    ///
+    /// Matching strategies:
+    /// 1. Exact match (project name == repo name after stripping org)
+    /// 2. Project name ends with repo name (e.g., "cloud-staging" matches "appwrite/cloud")
+    /// 3. Repo name ends with project name (e.g., "appwrite/cloud" matches "cloud")
+    fn find_repo_by_project_name(&self, index: &RepoIndex, project: &str) -> Option<IndexedRepo> {
+        // Normalize: strip environment suffixes like -staging, -production, etc.
+        let suffixes = [
+            "-staging",
+            "-production",
+            "-prod",
+            "-dev",
+            "-development",
+            "-test",
+            "-qa",
+            "-uat",
+            "-preview",
+            "-canary",
+        ];
+
+        let mut normalized = project.to_lowercase();
+        for suffix in &suffixes {
+            if let Some(stripped) = normalized.strip_suffix(suffix) {
+                normalized = stripped.to_string();
+                break;
+            }
+        }
+
+        let repos = index.list();
+
+        // Try to find a repo whose simple name matches the normalized project name
+        for repo in &repos {
+            // Get the repo name without org prefix (e.g., "appwrite/cloud" -> "cloud")
+            let repo_simple = repo
+                .name
+                .split('/')
+                .next_back()
+                .unwrap_or(&repo.name)
+                .to_lowercase();
+
+            if repo_simple == normalized {
+                tracing::debug!(
+                    project = %project,
+                    normalized = %normalized,
+                    repo = %repo.name,
+                    "Matched project to repo by simple name"
+                );
+                return Some((*repo).clone());
+            }
+        }
+
+        // Try fuzzy match: check if normalized project name is contained in repo name
+        for repo in &repos {
+            let repo_lower = repo.name.to_lowercase();
+            if repo_lower.contains(&normalized)
+                || normalized.contains(repo_lower.split('/').next_back().unwrap_or(&repo_lower))
+            {
+                tracing::debug!(
+                    project = %project,
+                    normalized = %normalized,
+                    repo = %repo.name,
+                    "Matched project to repo by fuzzy match"
+                );
+                return Some((*repo).clone());
+            }
+        }
+
+        None
+    }
+
+    /// Find a repository by partial name match.
+    ///
+    /// This handles cases where the extracted repo reference is partial:
+    /// - "utopia-php/database" should match "utopia-php/database" in index
+    /// - "database" could match "utopia-php/database" if it's the only match
+    fn find_repo_by_partial_name(&self, index: &RepoIndex, name: &str) -> Option<IndexedRepo> {
+        let repos = index.list();
+        let name_lower = name.to_lowercase();
+
+        // First, try exact match on the simple name (after org)
+        let mut matches: Vec<_> = repos
+            .iter()
+            .filter(|r| {
+                let simple = r
+                    .name
+                    .split('/')
+                    .next_back()
+                    .unwrap_or(&r.name)
+                    .to_lowercase();
+                simple == name_lower
+            })
+            .collect();
+
+        // If exactly one match, return it
+        if matches.len() == 1 {
+            return Some((*matches[0]).clone());
+        }
+
+        // If no exact matches, try contains matching
+        if matches.is_empty() {
+            matches = repos
+                .iter()
+                .filter(|r| {
+                    let name_lower_repo = r.name.to_lowercase();
+                    name_lower_repo.contains(&name_lower)
+                        || name_lower.contains(
+                            name_lower_repo
+                                .split('/')
+                                .next_back()
+                                .unwrap_or(&name_lower_repo),
+                        )
+                })
+                .collect();
+
+            if matches.len() == 1 {
+                return Some((*matches[0]).clone());
+            }
+        }
+
+        None
+    }
+
     /// Find the best matching repository using semantic similarity.
     fn find_by_embedding(
         &self,
@@ -632,6 +758,7 @@ impl RepoInferrer {
     /// Infer the target repository for an issue.
     ///
     /// Tries multiple strategies in order of confidence:
+    /// 0. Sentry project name matching (for Sentry issues)
     /// 1. Explicit repository reference (org/repo format)
     /// 2. Direct file path match
     /// 3. Fuzzy file search
@@ -654,8 +781,31 @@ impl RepoInferrer {
             "Extracted issue context"
         );
 
+        // Strategy 0: Sentry project name matching
+        // Sentry projects map 1:1 with top-level repos.
+        // Try to find a repo whose name ends with the project name.
+        if issue.source == "sentry" {
+            if let Some(project) = issue.metadata.get("project").and_then(|v| v.as_str()) {
+                if let Some(repo) = self.find_repo_by_project_name(&index, project) {
+                    tracing::info!(
+                        issue_id = %issue.short_id,
+                        repo = %repo.name,
+                        project = %project,
+                        "High confidence match: Sentry project name"
+                    );
+                    return Some(InferredRepo {
+                        repo: repo.clone(),
+                        confidence: Confidence::High,
+                        reason: format!("Sentry project: {} -> {}", project, repo.name),
+                        matched_file: None,
+                    });
+                }
+            }
+        }
+
         // Strategy 1: Explicit repository reference (e.g., "utopia-php/database")
         for repo_ref in &context.repos {
+            // First try exact match
             if let Some(repo) = index.get(repo_ref) {
                 tracing::info!(
                     issue_id = %issue.short_id,
@@ -666,6 +816,22 @@ impl RepoInferrer {
                     repo: repo.clone(),
                     confidence: Confidence::High,
                     reason: format!("Explicit repo reference: {}", repo_ref),
+                    matched_file: None,
+                });
+            }
+
+            // Try partial match (repo name contains the reference or vice versa)
+            if let Some(repo) = self.find_repo_by_partial_name(&index, repo_ref) {
+                tracing::info!(
+                    issue_id = %issue.short_id,
+                    repo = %repo.name,
+                    reference = %repo_ref,
+                    "High confidence match: partial repo reference"
+                );
+                return Some(InferredRepo {
+                    repo: repo.clone(),
+                    confidence: Confidence::High,
+                    reason: format!("Partial repo reference: {} -> {}", repo_ref, repo.name),
                     matched_file: None,
                 });
             }
@@ -1055,5 +1221,128 @@ mod tests {
 
         // Can access the index count
         assert_eq!(inferrer.repo_count(), 2);
+    }
+
+    fn create_test_index_with_cloud() -> RepoIndex {
+        let mut index = RepoIndex::new();
+
+        let mut cloud = IndexedRepo::new("appwrite/cloud", "/path/cloud");
+        cloud.files = vec![
+            "src/Appwrite/Cloud/Platform/Modules/Billing/Workers/TeamAggregation.php".to_string(),
+            "src/Appwrite/Cloud/Platform/Modules/Usage/Workers/UsageAggregation.php".to_string(),
+        ];
+        index.add_repo(cloud);
+
+        let mut database = IndexedRepo::new("utopia-php/database", "/path/database");
+        database.files = vec![
+            "src/Database/Adapter/SQL.php".to_string(),
+            "src/Database/Adapter/Pool.php".to_string(),
+            "src/Database/Database.php".to_string(),
+        ];
+        index.add_repo(database);
+
+        let mut database_proxy =
+            IndexedRepo::new("utopia-php/database-proxy", "/path/database-proxy");
+        database_proxy.files = vec!["src/Proxy/Server.php".to_string()];
+        index.add_repo(database_proxy);
+
+        index
+    }
+
+    #[test]
+    fn test_infer_from_sentry_project_name() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "MySQL server has gone away", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("cloud-staging"));
+
+        let result = inferrer.infer(&issue);
+
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert_eq!(inferred.repo.name, "appwrite/cloud");
+        assert_eq!(inferred.confidence, Confidence::High);
+        assert!(inferred.reason.contains("Sentry project"));
+    }
+
+    #[test]
+    fn test_infer_from_vendor_package_in_stacktrace() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        // Issue without project metadata, but with a stacktrace mentioning vendor/utopia-php/database
+        let mut issue = create_test_issue("sentry", "SQL Error", "");
+        issue.metadata.insert(
+            "stacktrace".to_string(),
+            json!(
+                r#"
+                /usr/src/code/vendor/utopia-php/database/src/Database/Adapter/SQL.php in __call at line 393
+                "#
+            ),
+        );
+
+        let result = inferrer.infer(&issue);
+
+        // Should match utopia-php/database, NOT database-proxy
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert_eq!(inferred.repo.name, "utopia-php/database");
+    }
+
+    #[test]
+    fn test_infer_prefers_sentry_project_over_vendor() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        // Issue with both project name and vendor packages in stacktrace
+        // Sentry project should take precedence
+        let mut issue = create_test_issue("sentry", "MySQL server has gone away", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("cloud-staging"));
+        issue.metadata.insert(
+            "stacktrace".to_string(),
+            json!(
+                r#"
+                /usr/src/code/vendor/utopia-php/database/src/Database/Adapter/SQL.php in __call at line 393
+                "#
+            ),
+        );
+
+        let result = inferrer.infer(&issue);
+
+        // Should match appwrite/cloud (from project name), not utopia-php/database
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert_eq!(inferred.repo.name, "appwrite/cloud");
+        assert!(inferred.reason.contains("Sentry project"));
+    }
+
+    #[test]
+    fn test_infer_does_not_match_similar_repo_names() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        // Make sure "utopia-php/database" doesn't accidentally match "utopia-php/database-proxy"
+        let mut issue = create_test_issue("sentry", "SQL Error", "");
+        issue.metadata.insert(
+            "stacktrace".to_string(),
+            json!(
+                r#"
+                /usr/src/code/vendor/utopia-php/database/src/Database/Adapter/SQL.php in __call at line 393
+                "#
+            ),
+        );
+
+        let result = inferrer.infer(&issue);
+
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        // Should be database, NOT database-proxy
+        assert_eq!(inferred.repo.name, "utopia-php/database");
+        assert_ne!(inferred.repo.name, "utopia-php/database-proxy");
     }
 }
