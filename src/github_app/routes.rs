@@ -57,8 +57,8 @@ impl SetupState {
 /// Generate a cryptographically secure random CSRF token.
 fn generate_csrf_token() -> String {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 32] = rng.gen();
+    let mut rng = rand::rng();
+    let bytes: [u8; 32] = rng.random();
     hex::encode(bytes)
 }
 
