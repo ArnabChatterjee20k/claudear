@@ -25,7 +25,10 @@ tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 rusqlite = { version = "0.38", features = ["bundled", "load_extension"] }
 
 # Embeddings
-fastembed = "5"
+fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls"] }
+
+# ORT runtime (download binaries with rustls instead of native-tls)
+ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "tls-rustls"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -60,7 +63,7 @@ rand = "0.10"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # GraphQL for Linear
-graphql_client = { version = "0.16", features = ["reqwest"] }
+graphql_client = { version = "0.16", features = ["reqwest-rustls"] }
 
 # Async utilities
 futures = "0.3"
