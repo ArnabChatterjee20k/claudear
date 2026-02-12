@@ -17,9 +17,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset_name: claudear-linux-amd64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            asset_name: claudear-linux-amd64-musl
           - os: macos-latest
             target: x86_64-apple-darwin
             asset_name: claudear-macos-amd64
@@ -34,10 +31,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install musl tools (Linux musl)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y musl-tools
 
       - name: Cache cargo registry
         uses: actions/cache@v5

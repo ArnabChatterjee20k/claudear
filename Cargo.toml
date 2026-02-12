@@ -107,7 +107,7 @@ strip = true
 
 [package.metadata.deb]
 maintainer = "Claudear Contributors"
-copyright = "2024"
+copyright = "2025"
 license-file = ["LICENSE", "0"]
 extended-description = """\
 A high-performance unified watcher service that monitors issue trackers \
