@@ -5,51 +5,61 @@ A high-performance unified watcher service written in Rust that monitors issue t
 ## Features
 
 - **Multi-Source Support**: Monitor Linear issues and Sentry errors from a single service
+- **Repository Auto-Discovery**: Automatically discovers and indexes repositories from known GitHub organizations
+- **Intelligent Issue Routing**: Infers the target repository from stack traces, file paths, and issue content
+- **Daemon Mode**: Full background daemon with IPC control (start/stop/pause/resume/status)
 - **PR Merge Tracking**: Automatically track when PRs are merged and resolve issues
 - **Automatic Retries**: Exponential backoff retry logic for failed attempts
 - **Custom Prompt Templates**: Use AGENT.md for project-specific Claude instructions
-- **Analytics Dashboard**: Real-time web UI with statistics, attempt history, and source metrics
-- **Scheduled Reports**: Automated daily/weekly status reports via notifications
-- **Multi-Repository Support**: Dependency tracking and cascading change detection
-- **AI Feedback Loop**: Learn from past outcomes to improve future prompts
+- **Configurable Claude Models**: Choose between Sonnet, Opus, Haiku, or any model ID
+- **Analytics Dashboard**: Real-time Svelte web UI with statistics, attempt history, and source metrics
+- **Scheduled Reports**: Automated daily/weekly/monthly status reports via notifications
+- **Multi-Repository Cascading**: Dependency tracking with automatic cascading fix propagation
+- **AI Feedback Loop**: Embedding-based similarity matching to learn from past outcomes
+- **Regression Monitoring**: Post-fix verification to detect regressions on Linear and Sentry
+- **Release Tracking**: Dependency-aware release detection and path analysis
 - **Multiple Notification Channels**: Discord, Email (SMTP), SMS (Twilio), Push (Pushover)
-- **Webhook Support**: Real-time event processing via webhooks
+- **Webhook Support**: Real-time event processing via webhooks with auto-configuration
 - **SQLite Tracking**: Persistent tracking of fix attempts with full history
-- **Priority-Based Processing**: Urgent/escalating issues are processed first
-- **Rate Limiting**: Configurable concurrent processing and delays
-- **Extensible Architecture**: Easy to add new sources and notifiers
+- **Per-Source Rate Limiting**: Configurable concurrent processing and delays per source
+- **Extensible Architecture**: Trait-based design makes it easy to add new sources, notifiers, and storage backends
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                            Claudear                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                       │
-│  │  Linear  │  │  Sentry  │  │  GitHub  │  ← Sources            │
-│  │  Source  │  │  Source  │  │ (Monitor)│    (IssueSource)      │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘                       │
-│       │             │             │                              │
-│       └──────┬──────┴──────┬──────┘                              │
-│              │             │                                     │
-│              ▼             ▼                                     │
-│       ┌────────────────────────┐                                │
-│       │        Watcher         │  ← Core orchestrator           │
-│       │  (polls, matches,      │                                │
-│       │   coordinates)         │                                │
-│       └───────────┬────────────┘                                │
-│                   │                                              │
-│    ┌──────────────┼──────────────────────┐                      │
-│    │              │              │       │                       │
-│    ▼              ▼              ▼       ▼                       │
-│ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐                 │
-│ │ Claude  │ │ SQLite  │ │Notifiers│ │   PR    │                 │
-│ │ Runner  │ │ Tracker │ │(Discord,│ │ Monitor │                 │
-│ │         │ │         │ │Email,..)│ │         │                 │
-│ └─────────┘ └─────────┘ └─────────┘ └─────────┘                 │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                               Claudear                                   │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                               │
+│  │  Linear  │  │  Sentry  │  │  GitHub  │  ← Sources (IssueSource)      │
+│  │  Source  │  │  Source  │  │ Webhooks │                                │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                               │
+│       │             │             │                                      │
+│       └──────┬──────┴──────┬──────┘                                      │
+│              │             │                                             │
+│              ▼             ▼                                             │
+│       ┌────────────────────────┐     ┌──────────────┐                   │
+│       │        Watcher         │────>│  Repo Index  │                   │
+│       │  (polls, matches,      │     │  (inference,  │                   │
+│       │   coordinates)         │     │  discovery)   │                   │
+│       └───────────┬────────────┘     └──────────────┘                   │
+│                   │                                                      │
+│    ┌──────────────┼──────────────────────┬───────────────┐              │
+│    │              │              │       │               │               │
+│    ▼              ▼              ▼       ▼               ▼               │
+│ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌───────────┐         │
+│ │ Claude  │ │ SQLite  │ │Notifiers│ │   PR    │ │ Feedback  │         │
+│ │ Runner  │ │ Tracker │ │(Discord,│ │ Monitor │ │ Analyzer  │         │
+│ │         │ │         │ │Email,..)│ │         │ │(embeddings)│         │
+│ └─────────┘ └─────────┘ └─────────┘ └─────────┘ └───────────┘         │
+│                                                                          │
+│ ┌─────────────┐ ┌──────────────┐ ┌──────────────┐ ┌────────────┐       │
+│ │  Regression │ │   Release    │ │     IPC      │ │  Cascade   │       │
+│ │  Monitor    │ │   Tracker    │ │ (daemon ctl) │ │  Engine    │       │
+│ └─────────────┘ └──────────────┘ └──────────────┘ └────────────┘       │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Installation
@@ -127,14 +137,20 @@ All configuration values can be overridden by environment variables. This is use
 - CI/CD environments
 
 Environment variable names follow this pattern:
-- `PROJECT_DIR` for `project_dir`
 - `LINEAR_API_KEY` for `linear.api_key`
 - `SENTRY_AUTH_TOKEN` for `sentry.auth_token`
+- `GITHUB_TOKEN` for `github.token`
 
 ### Minimal Configuration
 
 ```yaml
-project_dir: /path/to/your/project
+work_dir: ~/.claudear/repos
+
+known_orgs:
+  - your-github-org
+
+auto_discover_paths:
+  - ~/projects
 
 linear:
   api_key: lin_api_xxxx
@@ -148,15 +164,19 @@ See `claudear.example.yaml` for a complete configuration file with all options d
 
 | Section | Description |
 |---------|-------------|
-| `project_dir` | Path to the project for Claude to work on (REQUIRED) |
-| `linear` | Linear integration settings (API key, trigger labels/states) |
-| `sentry` | Sentry integration settings (auth token, org slug) |
+| `work_dir` | Working directory where repositories are cloned (REQUIRED) |
+| `known_orgs` | GitHub organizations to track for auto-discovery |
+| `auto_discover_paths` | Local paths to scan for repository clones |
+| `claude` | Claude CLI settings (model, instructions, permissions) |
+| `embeddings` | Local embedding model for similarity search (nomic, minilm, bge) |
+| `linear` | Linear integration (API key, trigger labels/states, per-source rate limits) |
+| `sentry` | Sentry integration (auth token, org slug, escalation thresholds) |
 | `github` | GitHub PR monitoring (token, auto-resolve on merge) |
+| `retry` | Retry configuration (max retries, backoff delays) |
 | `discord` | Discord notification webhook |
 | `email` | SMTP email notifications |
 | `sms` | Twilio SMS notifications |
 | `push` | Pushover push notifications |
-| `retry` | Retry configuration (max retries, backoff delays) |
 
 ## Usage
 
@@ -167,7 +187,38 @@ See `claudear.example.yaml` for a complete configuration file with all options d
 claudear seed
 ```
 
-### Polling Mode
+### Daemon Mode
+
+The recommended way to run Claudear in production. Starts a background daemon with IPC control.
+
+```bash
+# Start the daemon with polling, webhooks, and dashboard
+claudear start --port 3100 --poll
+
+# Start with custom polling interval (ms)
+claudear start --poll --poll-interval 60000
+
+# Start without webhooks or dashboard
+claudear start --poll --no-webhooks --no-dashboard
+
+# Check daemon status
+claudear status
+
+# Pause processing (stops picking up new issues)
+claudear pause
+
+# Resume processing
+claudear resume
+
+# View recent activity
+claudear activity
+claudear activity 50    # Show last 50 entries
+
+# Stop the daemon
+claudear stop
+```
+
+### Polling Mode (Foreground)
 
 ```bash
 # Poll all enabled sources (default 5 minute interval)
@@ -175,6 +226,9 @@ claudear poll
 
 # Poll with custom interval (in milliseconds)
 claudear poll 60000
+
+# Poll with dashboard on custom port
+claudear poll --port 8080
 ```
 
 ### Webhook Mode
@@ -211,41 +265,23 @@ claudear webhook --setup-webhooks --base-url https://... --env-file /path/to/.en
 4. Writes secrets to your `.env` file (`LINEAR_WEBHOOK_SECRET`, `SENTRY_CLIENT_SECRET`)
 5. Starts the webhook server with the configured secrets
 
-**Example workflow:**
-
-```bash
-# 1. Set up your .env with API keys
-echo "LINEAR_API_KEY=lin_api_xxxxx" >> .env
-
-# 2. Run with auto-configuration
-claudear webhook --setup-webhooks --base-url https://my-server.example.com:3100
-
-# Output:
-# === Webhook Configuration Complete ===
-#
-# Linear:
-#   Status: Configured
-#   Webhook ID: abc123
-#   Secret: lin_...xyz (saved to .env)
-```
-
 **Notes:**
-- Linear webhooks are created at the organization level (or team-scoped if `LINEAR_TEAM_ID` is set)
-- Sentry webhooks are created for each project in `SENTRY_PROJECT_SLUGS`
+- Linear webhooks are created at the organization level (or team-scoped if `team_id` is set)
+- Sentry webhooks are created for each project in `sentry.project_slugs`
 - If a webhook with the same URL already exists, configuration will fail (delete it manually first)
 - Secrets are automatically quoted if they contain special characters
 
-### PR Monitoring
+### PR Management
 
 ```bash
+# List all tracked PRs
+claudear prs list
+
 # Check pending PRs once
-claudear monitor-prs
+claudear prs monitor
 
 # Run continuously
-claudear monitor-prs --continuous
-
-# List all tracked PRs
-claudear list-prs
+claudear prs monitor --continuous
 ```
 
 ### Manual Operations
@@ -271,10 +307,10 @@ claudear sources
 
 ```bash
 # List issues eligible for retry
-claudear list-retries
+claudear retries list
 
 # Process all ready retries now
-claudear process-retries
+claudear retries process
 ```
 
 ### Dashboard
@@ -310,17 +346,17 @@ API endpoints available:
 
 ```bash
 # Preview a report (daily, weekly, or monthly)
-claudear report-preview daily
-claudear report-preview weekly
+claudear report preview daily
+claudear report preview weekly
 
 # Generate and send a report immediately
-claudear report-send daily
+claudear report send daily
 
-# Start the report scheduler (background daemon)
-claudear report-scheduler --daily --hour 9
+# Start the report scheduler (background)
+claudear report schedule --daily --hour 9
 
 # Start with both daily and weekly reports
-claudear report-scheduler --daily --weekly --hour 9
+claudear report schedule --daily --weekly --hour 9
 ```
 
 Reports include:
@@ -334,62 +370,108 @@ Reports are sent via all configured notification channels (Discord, Email, SMS, 
 
 ### Multi-Repository Support
 
-Track dependencies between repositories and understand cascading changes.
+Claudear auto-discovers repositories from configured GitHub organizations and tracks dependencies between them for cascading fix propagation.
 
 ```bash
-# List tracked repositories
-claudear repos-list
+# Auto-discover repositories from configured paths
+claudear repos discover
+claudear repos discover --paths ~/projects ~/work --save
 
-# Add a repository
-claudear repos-add my-app --path /path/to/my-app --github-url myorg/my-app
+# List all indexed repositories
+claudear repos list
+
+# Build/refresh the file index
+claudear repos index
+claudear repos index --force
+
+# Search files across all repos
+claudear repos search "auth middleware"
+
+# Show index statistics
+claudear repos stats
+
+# Sync repository data to database
+claudear repos sync
 
 # Link repositories (upstream -> downstream)
-claudear repos-link my-lib my-app --dep-type npm
+claudear repos link my-lib my-app --dep-type npm
 
 # View the dependency graph
-claudear repos-graph
+claudear repos graph
 
 # View from a specific root
-claudear repos-graph --root my-lib
+claudear repos graph --root my-lib
 
 # See what cascades from a change
-claudear repos-cascade my-lib
+claudear repos cascade my-lib
 ```
 
-**Default Appwrite relationships are pre-configured:**
-- `utopia-*` -> `appwrite` -> `cloud`
+When changes are made to an upstream repository, the cascade engine automatically identifies and propagates fixes to downstream repositories using BFS dependency traversal.
 
-When changes are made to an upstream repository, the tool can identify which downstream repositories may need updates.
+### Inference Analytics
+
+Track how accurately Claudear routes issues to the correct repository.
+
+```bash
+# Show inference success rates by confidence level
+claudear inference stats
+
+# View recent inference attempts
+claudear inference history
+claudear inference history --limit 50
+
+# Provide feedback on an inference (for learning)
+claudear inference feedback 42 --correct
+claudear inference feedback 43 --actual-repo my-other-repo
+```
 
 ### AI Feedback Loop
 
-The feedback system learns from past fix attempts to improve future prompts.
+The feedback system uses local embedding models (fastembed) to learn from past fix attempts and improve future prompts.
 
-**Features:**
+**How it works:**
 - Tracks outcomes of all fix attempts (merged, closed, failed)
-- Extracts keywords and patterns from issues
-- Finds similar past issues using text similarity
-- Generates suggestions based on successful and failed attempts
-- Enhances prompts with learnings from similar issues
+- Generates vector embeddings for issue content using local models (nomic, minilm, bge)
+- Finds similar past issues using embedding similarity
+- Extracts keywords and patterns from successful/failed attempts
+- Enhances future prompts with learnings from similar issues
 
-**Usage in code:**
-```rust
-use claudear::feedback::{FeedbackAnalyzer, Outcome};
+**No external services required** - all embedding computation runs locally via ONNX Runtime.
 
-let mut analyzer = FeedbackAnalyzer::new();
+### Regression Monitoring
 
-// Record an outcome
-analyzer.record_outcome(&attempt, &issue, "prompt used", Outcome::Merged)?;
+Post-fix verification that monitors for regressions after fixes are deployed.
 
-// Add learnings
-analyzer.add_learnings(outcome_id, "Check null values in API responses")?;
+- Runs hourly checks on Linear and Sentry for 24 hours after a fix
+- Detects if fixed issues re-open or error rates spike
+- Configurable checkers per source type
+- Composable checker architecture
 
-// Find similar issues and get suggestions for a new issue
-let similar = analyzer.find_similar(&new_issue);
-let suggestions = analyzer.suggest_improvements(&new_issue);
+### Release Tracking
 
-// Generate enhanced prompt
-let enhanced_prompt = analyzer.enhance_prompt("Fix this bug", &new_issue);
+Dependency-aware release detection to track when fixes land in production.
+
+```bash
+# Show the release dependency graph
+claudear diag release-graph
+
+# Check if a PR's fix is in a target release
+claudear diag release-check owner/repo 42 --target owner/target-repo
+
+# Show the dependency path from source to target
+claudear diag release-path owner/source-repo owner/target-repo
+```
+
+### Diagnostics
+
+```bash
+# Show database table counts and recent operations
+claudear diag db
+
+# Release tracking diagnostics (see above)
+claudear diag release-graph
+claudear diag release-check <repo> <pr> [--target <repo>]
+claudear diag release-path <source> <target>
 ```
 
 ### Dry Run Mode
@@ -454,18 +536,27 @@ You can customize Claude's behavior by creating an `AGENT.md` file in your proje
 - Update documentation as needed
 ```
 
-When the watcher detects an AGENT.md file, it will include these instructions in the prompt:
+### Claude Configuration
 
+You can also configure Claude's behavior globally via `claudear.yaml`:
+
+```yaml
+claude:
+  # Model to use (sonnet, opus, haiku, or full model ID)
+  model: sonnet
+
+  # Custom instructions appended to the system prompt
+  instructions: "Always write tests. Follow existing code style."
+
+  # Tool permissions granted without prompting
+  permissions:
+    - "Bash(git *)"
+    - "Read"
+    - "Edit"
+
+  # Skip all permission prompts (default: true)
+  skip_permissions: true
 ```
-[Contents of AGENT.md]
-
----
-
-Fix the following Linear issue:
-...
-```
-
-This allows you to customize Claude's behavior for your specific project without modifying the watcher code.
 
 ## Running as a Service
 
@@ -483,15 +574,9 @@ Create `~/Library/LaunchAgents/com.claudear.plist`:
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/claudear</string>
-        <string>poll</string>
+        <string>start</string>
+        <string>--poll</string>
     </array>
-    <key>WorkingDirectory</key>
-    <string>/Users/YOUR_USER/Local/your-project</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PROJECT_DIR</key>
-        <string>/Users/YOUR_USER/Local/your-project</string>
-    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -522,9 +607,7 @@ After=network.target
 [Service]
 Type=simple
 User=YOUR_USER
-WorkingDirectory=/home/YOUR_USER/Local/your-project
-ExecStart=/usr/local/bin/claudear poll
-Environment=PROJECT_DIR=/home/YOUR_USER/Local/your-project
+ExecStart=/usr/local/bin/claudear start --poll
 Restart=on-failure
 RestartSec=10
 
@@ -568,6 +651,9 @@ cargo test config::tests
 
 # Run a specific test
 cargo test test_exponential_backoff_delay
+
+# Run all checks (format, lint, test)
+make check
 ```
 
 ### Linting
@@ -577,8 +663,48 @@ cargo test test_exponential_backoff_delay
 cargo fmt --check
 
 # Run clippy
-cargo clippy
+cargo clippy -- -D warnings
 ```
+
+### Dashboard Development
+
+The dashboard is a Svelte web application.
+
+```bash
+# Install dependencies
+make dashboard
+
+# Start dev server
+make dashboard-dev
+
+# Build for production
+make dashboard-build
+
+# Run dashboard tests
+make dashboard-test
+```
+
+### Makefile Targets
+
+Run `make help` for a full list. Key targets:
+
+| Target | Description |
+|--------|-------------|
+| `make build` | Debug build |
+| `make build-release` | Release build (optimized, LTO, stripped) |
+| `make install` | Install to /usr/local/bin |
+| `make test` | Run Rust tests |
+| `make test-all` | Run Rust + dashboard tests |
+| `make lint` | Run clippy linter |
+| `make fmt` | Format code |
+| `make check` | Format + lint + test |
+| `make dashboard-dev` | Start dashboard dev server |
+| `make dashboard-build` | Build dashboard for production |
+| `make docker` | Build and start Docker services |
+| `make docker-dev` | Start development Docker environment |
+| `make release-deb` | Build .deb package |
+| `make db-reset` | Reset SQLite database |
+| `make db-backup` | Backup SQLite database |
 
 ## Docker
 
@@ -643,11 +769,6 @@ The project includes GitHub Actions workflows for:
   - Publishes Docker image to GHCR
   - Publishes to Homebrew tap
   - Builds and publishes Debian packages to APT repository
-
-- **Security** (`security.yml`): Runs weekly and on main
-  - Cargo audit for vulnerabilities
-  - Cargo deny for license/dependency checks
-  - Dependency review for PRs
 
 ### Creating a Release
 
