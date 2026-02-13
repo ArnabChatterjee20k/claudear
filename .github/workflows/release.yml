@@ -226,6 +226,7 @@ jobs:
           GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
         run: |
           # Copy new packages
+          mkdir -p apt-repo/pool/main
           cp debs/*.deb apt-repo/pool/main/
 
           cd apt-repo
