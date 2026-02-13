@@ -267,6 +267,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
         assert!(manager.should_retry(&failed));
 
@@ -319,6 +321,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
         assert!(manager.should_retry(&attempt));
 
@@ -462,6 +466,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
 
         assert!(manager.get_next_retry_time(&attempt).is_none());
@@ -493,6 +499,8 @@ mod tests {
             retry_count: 2,
             last_retry_at: Some(base_time),
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
 
         let next_retry = manager.get_next_retry_time(&attempt).unwrap();
@@ -530,6 +538,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
 
         assert!(!manager.is_ready_for_retry(&attempt));
@@ -561,6 +571,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
 
         assert!(!manager.is_ready_for_retry(&attempt));
@@ -592,6 +604,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
 
         assert!(manager.is_ready_for_retry(&attempt));

@@ -604,8 +604,8 @@ async fn process_issue(
 mod tests {
     use super::*;
     use crate::config::{
-        ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig,
-        RegressionConfig, RetryConfig, SmsConfig,
+        CascadeConfig, ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig,
+        PushConfig, RegressionConfig, RetryConfig, SmsConfig,
     };
     use crate::notifier::Notifier;
     use crate::reports::Report;
@@ -735,6 +735,7 @@ mod tests {
             linear: None,
             sentry: None,
             regression: RegressionConfig::default(),
+            cascade: CascadeConfig::default(),
         }
     }
 

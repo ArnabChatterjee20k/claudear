@@ -1682,6 +1682,27 @@ async fn main() -> anyhow::Result<()> {
         let review_watcher =
             create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
 
+        // Build dependency graph for cascade support
+        let relationships = if config.cascade.enabled {
+            let mut rels = RepoRelationships::with_defaults();
+            let db_deps = sqlite_tracker.list_all_dependencies().unwrap_or_default();
+            for dep in db_deps {
+                if let Some(dep_type) = DependencyType::parse(&dep.dep_type) {
+                    rels.add_dependency(&dep.upstream, &dep.downstream, dep_type, None).ok();
+                }
+            }
+            Some(rels)
+        } else {
+            None
+        };
+
+        // Create GitHub client for cascade PR merge checking
+        let github_client_for_watcher = if config.cascade.enabled && config.is_github_enabled() {
+            Some(GitHubClient::new(config.github.clone()))
+        } else {
+            None
+        };
+
         // Create watcher if polling is enabled
         let watcher = if enable_polling {
             Some(Arc::new(Watcher::new(WatcherOptions {
@@ -1694,6 +1715,8 @@ async fn main() -> anyhow::Result<()> {
                 embedding_client: None,
                 review_watcher,
                 issue_embedding_service: None,
+                relationships,
+                github_client: github_client_for_watcher,
                 dry_run: false,
             })))
         } else {
@@ -2123,6 +2146,8 @@ async fn main() -> anyhow::Result<()> {
             embedding_client: None,
             review_watcher,
             issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
             dry_run: false,
         });
 
@@ -2373,6 +2398,8 @@ async fn main() -> anyhow::Result<()> {
                 embedding_client,
                 review_watcher,
                 issue_embedding_service: None,
+                relationships: None,
+                github_client: None,
                 dry_run,
             });
 

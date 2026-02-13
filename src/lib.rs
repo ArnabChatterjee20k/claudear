@@ -49,7 +49,7 @@ pub mod types;
 pub mod watcher;
 pub mod webhook;
 
-pub use config::{Config, RetryConfig};
+pub use config::{CascadeConfig, Config, RetryConfig};
 pub use discord::{DiscordClient, ThreadManager, ThreadState};
 pub use error::{Error, Result};
 pub use feedback::{
@@ -67,7 +67,8 @@ pub use github_app::{
     SetupState,
 };
 pub use inference::{
-    resolve_repo_for_issue, Confidence, InferredRepo, IssueContext, RepoInferrer, RepoResolution,
+    resolve_repo_for_cascade, resolve_repo_for_issue, Confidence, InferredRepo, IssueContext,
+    RepoInferrer, RepoResolution,
 };
 pub use ipc::{
     default_socket_path, is_daemon_running, print_response, IpcClient, IpcCommand, IpcData,

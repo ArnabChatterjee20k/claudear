@@ -284,6 +284,7 @@ mod tests {
             linear: None,
             sentry: None,
             regression: crate::config::RegressionConfig::default(),
+            cascade: crate::config::CascadeConfig::default(),
         }
     }
 

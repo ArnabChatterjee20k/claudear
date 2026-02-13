@@ -406,7 +406,7 @@ mod tests {
     use super::*;
     use crate::config::{
         ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig,
-        RegressionConfig, RetryConfig, SmsConfig,
+        CascadeConfig, RegressionConfig, RetryConfig, SmsConfig,
     };
     use crate::storage::SqliteTracker;
     use axum::body::Body;
@@ -439,6 +439,7 @@ mod tests {
             linear: None,
             sentry: None,
             regression: RegressionConfig::default(),
+            cascade: CascadeConfig::default(),
         }
     }
 
@@ -635,6 +636,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
 
         let summary = attempt_to_summary(&attempt);
@@ -931,6 +934,8 @@ mod tests {
             retry_count: 2,
             last_retry_at: Some(chrono::Utc::now()),
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
 
         let summary = attempt_to_summary(&attempt);
