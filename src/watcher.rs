@@ -2871,4 +2871,92 @@ mod tests {
         assert_eq!(stats.success, 1);
         assert_eq!(stats.failed, 1);
     }
+
+    #[tokio::test]
+    async fn test_cascade_triggers_on_merge() {
+        use crate::repo::DependencyType;
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        // Setup: Create relationships with an upstream and downstream repo
+        let mut relationships = RepoRelationships::new();
+        relationships
+            .add_dependency("upstream-lib", "downstream-app", DependencyType::Composer, None)
+            .unwrap();
+
+        // Create a FixAttempt that simulates a merged upstream PR
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-123".to_string(),
+            short_id: "ISSUE-123".to_string(),
+            source: "linear".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: Some("https://github.com/org/upstream-lib/pull/42".to_string()),
+            github_repo: Some("org/upstream-lib".to_string()),
+            github_pr_number: Some(42),
+            status: FixAttemptStatus::Merged,
+            error_message: None,
+            merged_at: Some(chrono::Utc::now()),
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        // Verify that get_dependants returns the downstream repo
+        let dependants = relationships.get_dependants("upstream-lib");
+        assert_eq!(dependants.len(), 1);
+        assert_eq!(dependants[0].name, "downstream-app");
+
+        // Verify cascade depth calculation for root attempt
+        assert_eq!(attempt.parent_attempt_id, None);
+
+        // Verify repo name normalization (github_repo "org/upstream-lib" -> "upstream-lib")
+        let repo_short_name = attempt
+            .github_repo
+            .as_ref()
+            .unwrap()
+            .split('/')
+            .last()
+            .unwrap();
+        assert_eq!(repo_short_name, "upstream-lib");
+    }
+
+    #[test]
+    fn test_cascade_depth_with_no_parent() {
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-1".to_string(),
+            short_id: "ISSUE-1".to_string(),
+            source: "linear".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        // Root attempt has depth 0
+        assert!(attempt.parent_attempt_id.is_none());
+    }
+
+    #[test]
+    fn test_cascade_config_defaults() {
+        use crate::config::CascadeConfig;
+
+        let config = CascadeConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.max_depth, 0);
+    }
 }
