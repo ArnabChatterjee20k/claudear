@@ -545,6 +545,15 @@ impl SqliteTracker {
                 "repositories.last_indexed_at",
                 "ALTER TABLE repositories ADD COLUMN last_indexed_at TEXT",
             ),
+            // cascade support
+            (
+                "fix_attempts.parent_attempt_id",
+                "ALTER TABLE fix_attempts ADD COLUMN parent_attempt_id INTEGER REFERENCES fix_attempts(id)",
+            ),
+            (
+                "fix_attempts.cascade_repo",
+                "ALTER TABLE fix_attempts ADD COLUMN cascade_repo TEXT",
+            ),
         ];
 
         for (column_name, sql) in migrations {
@@ -559,6 +568,11 @@ impl SqliteTracker {
                 }
             }
         }
+
+        // Cascade index (safe to run multiple times)
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_fix_attempts_parent ON fix_attempts(parent_attempt_id);",
+        )?;
 
         // Update query planner statistics after schema creation
         // This helps SQLite make better query planning decisions
@@ -3393,6 +3407,87 @@ impl SqliteTracker {
 
         let result = stmt.query_row(params![id], Self::row_to_fix_attempt).ok();
         Ok(result)
+    }
+
+    // ============================================================
+    // Cascade Methods
+    // ============================================================
+
+    /// Record a cascade fix attempt linked to a parent attempt.
+    pub fn record_cascade_attempt(
+        &self,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+        parent_attempt_id: i64,
+        cascade_repo: &str,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        // Check if this cascade already exists
+        let exists: bool = conn
+            .prepare_cached(
+                "SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ?",
+            )?
+            .exists(params![source, issue_id, cascade_repo])?;
+
+        if exists {
+            tracing::info!(
+                source = source,
+                issue_id = issue_id,
+                cascade_repo = cascade_repo,
+                "Cascade attempt already exists, skipping"
+            );
+            let id: i64 = conn.query_row(
+                "SELECT id FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ?",
+                params![source, issue_id, cascade_repo],
+                |row| row.get(0),
+            )?;
+            return Ok(id);
+        }
+
+        conn.execute(
+            r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, parent_attempt_id, cascade_repo)
+               VALUES (?, ?, ?, 'pending', datetime('now'), ?, ?)"#,
+            params![source, issue_id, short_id, parent_attempt_id, cascade_repo],
+        )?;
+
+        let id = conn.last_insert_rowid();
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            cascade_repo = cascade_repo,
+            parent_attempt_id = parent_attempt_id,
+            attempt_id = id,
+            "Recorded cascade fix attempt"
+        );
+        Ok(id)
+    }
+
+    /// Update a cascade attempt's PR info.
+    pub fn update_attempt_pr(
+        &self,
+        attempt_id: i64,
+        pr_url: &str,
+        github_repo: &str,
+        pr_number: i64,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE fix_attempts SET pr_url = ?, github_repo = ?, github_pr_number = ?, status = 'success' WHERE id = ?",
+            params![pr_url, github_repo, pr_number, attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a cascade attempt as failed.
+    pub fn mark_cascade_failed(&self, attempt_id: i64, error: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE fix_attempts SET status = 'failed', error_message = ? WHERE id = ?",
+            params![error, attempt_id],
+        )?;
+        Ok(())
     }
 
     // ============================================================

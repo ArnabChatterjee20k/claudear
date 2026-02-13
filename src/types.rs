@@ -1528,6 +1528,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
 
         // Verify fields
@@ -1555,6 +1557,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
 
         assert_eq!(
