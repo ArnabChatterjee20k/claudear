@@ -240,12 +240,11 @@ jobs:
 
           cd apt-repo
 
-          # Generate Packages file
           mkdir -p dists/stable/main/binary-amd64
           mkdir -p dists/stable/main/binary-arm64
 
-          dpkg-scanpackages --arch amd64 pool/ > dists/stable/main/binary-amd64/Packages
-          dpkg-scanpackages --arch arm64 pool/ > dists/stable/main/binary-arm64/Packages
+          dpkg-scanpackages --multiversion --arch amd64 pool/ > dists/stable/main/binary-amd64/Packages
+          dpkg-scanpackages --multiversion --arch arm64 pool/ > dists/stable/main/binary-arm64/Packages
 
           gzip -k -f dists/stable/main/binary-amd64/Packages
           gzip -k -f dists/stable/main/binary-arm64/Packages
