@@ -8,7 +8,7 @@ When a fix lands in an upstream repository (e.g., `utopia-database`), downstream
 
 - **Trigger**: On PR merge (not creation) — avoids wasted work if upstream is rejected
 - **Depth**: Full transitive cascade via BFS through dependency graph
-- **Task**: Context-aware — downstream Claude agent receives upstream diff + original issue context
+- **Task**: Context-aware — downstream Claude agent receives upstream PR link and fetches details itself
 - **Schema**: Child attempts linked via `parent_attempt_id` on `fix_attempts`
 
 ## Architecture
@@ -18,9 +18,8 @@ PR merged in repo X (detected by PrMonitor)
   → Look up X in DependencyGraph
   → For each direct dependent Y:
     → Create child fix_attempt (parent_attempt_id = X's attempt)
-    → Fetch upstream PR diff via GitHub API
-    → Build cascade prompt (issue context + diff + instructions)
-    → Spawn Claude runner in repo Y
+    → Build cascade prompt (issue context + upstream PR link)
+    → Spawn Claude runner in repo Y (Claude fetches PR diff itself)
     → Register new PR for review watching
     → When Y's PR merges → repeat for Y's dependents
 ```
@@ -42,15 +41,6 @@ New index: `CREATE INDEX idx_fix_attempts_parent ON fix_attempts(parent_attempt_
 
 Root attempts have `cascade_repo = NULL`. Child attempts set `cascade_repo` to the target repo name (e.g., `appwrite/appwrite`). SQLite treats NULL as distinct in UNIQUE, so the original constraint behavior is preserved for root attempts.
 
-## New: GitHubClient::get_pr_diff
-
-```rust
-pub async fn get_pr_diff(&self, repo: &str, pr_number: u64) -> Result<String>
-```
-
-- Uses `Accept: application/vnd.github.v3.diff` header
-- Truncates to configurable max size (default 50KB)
-
 ## Watcher Changes
 
 ### New field
@@ -65,22 +55,21 @@ pub struct Watcher {
 ### New method: trigger_cascade
 
 ```rust
-async fn trigger_cascade(&self, attempt: &FixAttempt, update: &PrStatusUpdate) -> Result<()>
+async fn trigger_cascade(&self, attempt: &FixAttempt, pr_url: &str) -> Result<()>
 ```
 
 1. Get `github_repo` from attempt
 2. Normalize repo name for dependency graph lookup
 3. Call `relationships.get_dependants(repo_name)` for direct dependents
 4. For each dependent:
-   a. Fetch upstream PR diff
-   b. Create child `fix_attempt` with `parent_attempt_id`
-   c. Build cascade prompt
-   d. Run Claude in dependent repo directory
-   e. Register resulting PR for review watching
+   a. Create child `fix_attempt` with `parent_attempt_id`
+   b. Build cascade prompt with upstream PR link
+   c. Run Claude in dependent repo directory (Claude inspects PR itself)
+   d. Register resulting PR for review watching
 
 ### Integration point
 
-Called from `main.rs` in the PrMonitor merge handling block (line ~1897), right after the existing merge processing.
+Called from `main.rs` in the PrMonitor merge handling block (line ~1897), right after the existing merge processing. Also called from the daemon's watcher poll loop via `check_pr_merges_and_cascade`.
 
 ## Cascade Prompt Template
 
@@ -88,10 +77,12 @@ Called from `main.rs` in the PrMonitor merge handling block (line ~1897), right 
 A dependency has been updated in {upstream_repo}.
 
 ## Original Issue
-{issue_title}: {issue_description}
+[{short_id}] {source} issue that was fixed upstream.
 
-## Upstream Changes (PR #{pr_number} in {upstream_repo})
-{truncated_diff}
+## Upstream PR
+{upstream_pr_url}
+
+Review the upstream PR above to understand what changed.
 
 ## Your Task
 This repository ({downstream_repo}) depends on {upstream_repo} via {dep_type}.
@@ -100,6 +91,8 @@ Review the upstream changes and make any necessary adaptations:
 - Adapt to any API changes
 - Update tests that exercise the changed functionality
 - Ensure the project builds and tests pass
+
+Create a PR with your changes.
 ```
 
 ## Configuration
@@ -107,16 +100,15 @@ Review the upstream changes and make any necessary adaptations:
 ```yaml
 cascade:
   enabled: true           # Master switch
-  max_diff_size: 51200    # Max bytes of upstream diff to include (50KB)
   max_depth: 0            # 0 = unlimited transitive cascade
 ```
 
 ## Files to Modify
 
-1. `src/storage/sqlite.rs` — Schema migration, new query methods
-2. `src/types.rs` — Add `parent_attempt_id` and `cascade_repo` to `FixAttempt`
-3. `src/github.rs` — Add `get_pr_diff()` to `GitHubClient`
+1. `src/types.rs` — Add `parent_attempt_id` and `cascade_repo` to `FixAttempt`
+2. `src/storage/sqlite.rs` — Schema migration, new query methods
+3. `src/config.rs` — Add `CascadeConfig` struct
 4. `src/watcher.rs` — Add `RepoRelationships` field, `trigger_cascade` method
-5. `src/config.rs` — Add `CascadeConfig` struct
-6. `src/main.rs` — Wire up relationships to watcher, call `trigger_cascade` on merge
-7. `src/storage/mod.rs` — Extend `FixAttemptTracker` trait if needed
+5. `src/main.rs` — Wire up relationships to watcher, call `trigger_cascade` on merge
+6. `src/inference/mod.rs` — Add `resolve_repo_for_cascade` function
+7. `src/lib.rs` — Export new types
