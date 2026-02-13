@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::feedback::{format_similar_issues_context, IssueEmbeddingService};
+use crate::feedback::{format_similar_issues_context, FeedbackAnalyzer, FixOutcome, IssueEmbeddingService, Outcome};
 use crate::github::{GitHubClient, PrReviewState, PrStatus, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::Notifier;
@@ -58,6 +58,8 @@ pub struct Watcher {
     active_processing: AtomicUsize,
     /// Counter for review poll intervals (check reviews every N poll cycles)
     review_poll_counter: AtomicUsize,
+    /// Feedback analyzer for learning from past outcomes
+    feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
 }
 
 impl Watcher {
@@ -90,6 +92,7 @@ impl Watcher {
             processing: RwLock::new(HashSet::new()),
             active_processing: AtomicUsize::new(0),
             review_poll_counter: AtomicUsize::new(0),
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
         }
     }
 
@@ -363,6 +366,20 @@ impl Watcher {
                 tracing::warn!("Sync task panicked: {}", e);
             }
             _ => {}
+        }
+
+        // Warm-start: load feedback outcomes from DB for learning
+        if let Some(ref sqlite_tracker) = self.sqlite_tracker {
+            match sqlite_tracker.get_feedback_outcomes(None, 1000) {
+                Ok(outcomes) if !outcomes.is_empty() => {
+                    let count = outcomes.len();
+                    let mut analyzer = self.feedback_analyzer.lock().await;
+                    analyzer.load_outcomes(outcomes);
+                    tracing::info!(count = count, "Loaded feedback outcomes for learning");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "Failed to load feedback outcomes"),
+            }
         }
 
         self.is_running.store(true, Ordering::SeqCst);
@@ -1055,6 +1072,10 @@ Create a PR with your changes."#,
                 Ok(PrStatus::Merged) => {
                     self.tracker
                         .mark_merged(&attempt.source, &attempt.issue_id)?;
+
+                    // Record feedback outcome
+                    self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged).await;
+
                     let pr_url = attempt.pr_url.as_deref().unwrap_or("");
                     if let Err(e) = self.trigger_cascade(attempt, pr_url).await {
                         tracing::error!(
@@ -1065,7 +1086,12 @@ Create a PR with your changes."#,
                         );
                     }
                 }
-                Ok(_) => {} // Still open or closed
+                Ok(PrStatus::Closed) => {
+                    self.tracker
+                        .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    self.record_feedback_outcome_from_attempt(attempt, Outcome::Closed).await;
+                }
+                Ok(_) => {} // Still open
                 Err(e) => {
                     tracing::debug!(
                         short_id = %attempt.short_id,
@@ -1410,6 +1436,13 @@ Create a PR with your changes."#,
             }
 
             let prompt = self.claude.build_prompt_for_issue(&issue, &context, &project_dir);
+
+            // Enhance prompt with learnings from past outcomes
+            let prompt = {
+                let analyzer = self.feedback_analyzer.lock().await;
+                analyzer.enhance_prompt(&prompt, &issue)
+            };
+
             let claude_result = self.claude.execute_with_attempt(&prompt, Some(&issue), attempt_id, &project_dir).await?;
 
             if claude_result.success {
@@ -1476,6 +1509,11 @@ Create a PR with your changes."#,
                     )?;
                     self.notifier.notify_completed(&issue).await?;
 
+                    // Record feedback outcome
+                    if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
+                        self.record_feedback_outcome(&attempt, &issue, &prompt, Outcome::Failed).await;
+                    }
+
                     // Log processing_completed activity without PR
                     let activity = ActivityLogEntry::new(
                         "processing_completed",
@@ -1495,6 +1533,11 @@ Create a PR with your changes."#,
                 self.tracker.mark_failed(source.name(), &issue.id, error)?;
                 self.notifier.notify_failed(&issue, error).await?;
 
+                // Record feedback outcome
+                if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
+                    self.record_feedback_outcome(&attempt, &issue, &prompt, Outcome::Failed).await;
+                }
+
                 // Record error pattern for analytics
                 self.record_error_pattern(source.name(), &issue.id, error);
             }
@@ -1510,6 +1553,11 @@ Create a PR with your changes."#,
                 .tracker
                 .mark_failed(source.name(), &issue.id, &error_str);
             let _ = self.notifier.notify_failed(&issue, &error_str).await;
+
+            // Record feedback outcome
+            if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
+                self.record_feedback_outcome_from_attempt(&attempt, Outcome::Failed).await;
+            }
 
             // Record error pattern for analytics
             self.record_error_pattern(source.name(), &issue.id, &error_str);
@@ -1537,6 +1585,56 @@ Create a PR with your changes."#,
         if let Err(e) = self.tracker.record_error_pattern(&pattern) {
             tracing::warn!(error = %e, "Failed to record error pattern");
         }
+    }
+
+    /// Record a feedback outcome to both DB and in-memory analyzer.
+    async fn record_feedback_outcome(
+        &self,
+        attempt: &crate::types::FixAttempt,
+        issue: &Issue,
+        prompt: &str,
+        outcome: Outcome,
+    ) {
+        let fix_outcome = FixOutcome::from_attempt(attempt, issue, prompt, outcome);
+
+        // Store to DB
+        if let Err(e) = self.tracker.store_feedback_outcome(&fix_outcome) {
+            tracing::warn!(error = %e, "Failed to store feedback outcome to DB");
+        }
+
+        // Store in-memory for prompt enhancement
+        let mut analyzer = self.feedback_analyzer.lock().await;
+        if let Err(e) = analyzer.record_outcome(attempt, issue, prompt, outcome) {
+            tracing::warn!(error = %e, "Failed to record feedback outcome in memory");
+        }
+    }
+
+    /// Record a feedback outcome from an attempt (when we lack the Issue object).
+    /// Reconstructs a minimal Issue from attempt data and retrieves prompt from executions.
+    async fn record_feedback_outcome_from_attempt(
+        &self,
+        attempt: &crate::types::FixAttempt,
+        outcome: Outcome,
+    ) {
+        let issue = Issue::new(
+            &attempt.issue_id,
+            &attempt.short_id,
+            format!("Issue {}", attempt.short_id),
+            String::new(),
+            &attempt.source,
+        );
+
+        // Try to get the prompt from the most recent execution
+        let prompt = self
+            .sqlite_tracker
+            .as_ref()
+            .and_then(|t| t.get_executions_for_attempt(attempt.id).ok())
+            .and_then(|execs| execs.into_iter().next())
+            .and_then(|exec| exec.prompt_used)
+            .unwrap_or_default();
+
+        self.record_feedback_outcome(attempt, &issue, &prompt, outcome)
+            .await;
     }
 
     /// Manually trigger processing for a specific issue.
@@ -1643,6 +1741,9 @@ Create a PR with your changes."#,
                                 &format!("PR auto-closed: source issue is now {}", status),
                             )
                             .await;
+
+                        // Record feedback outcome
+                        self.record_feedback_outcome_from_attempt(&attempt, Outcome::Closed).await;
 
                         if let Some(ref url) = attempt.pr_url {
                             auto_closed.push(url.clone());
