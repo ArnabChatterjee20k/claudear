@@ -856,7 +856,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE source = ? AND issue_id = ?
             "#,
@@ -875,7 +875,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE status = ?
             ORDER BY attempted_at DESC
@@ -898,7 +898,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE status = 'success' AND pr_url IS NOT NULL AND github_repo IS NOT NULL
             ORDER BY attempted_at DESC
@@ -920,7 +920,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE pr_url = ?
             "#,
@@ -987,7 +987,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE (status = 'failed' OR status = 'closed')
               AND COALESCE(retry_count, 0) < ?
@@ -1300,7 +1300,7 @@ impl SqliteTracker {
     /// Convert a database row to a FixAttempt.
     /// Expects columns in order: id, source, issue_id, short_id, attempted_at, pr_url,
     /// github_repo, github_pr_number, status, error_message, merged_at, resolved_at,
-    /// retry_count, last_retry_at, issue_labels
+    /// retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
     fn row_to_fix_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<FixAttempt> {
         // Parse issue_labels from JSON string
         let issue_labels: Vec<String> = row
@@ -1327,6 +1327,8 @@ impl SqliteTracker {
             retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
             last_retry_at: Self::parse_optional_datetime(row.get(13)?),
             issue_labels,
+            parent_attempt_id: row.get::<_, Option<i64>>(15).ok().flatten(),
+            cascade_repo: row.get::<_, Option<String>>(16).ok().flatten(),
         })
     }
 
@@ -3383,7 +3385,7 @@ impl SqliteTracker {
             r#"
             SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
                    github_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE id = ?
             "#,

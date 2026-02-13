@@ -318,6 +318,13 @@ pub struct FixAttempt {
     /// Labels from the issue (for bug detection).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issue_labels: Vec<String>,
+    /// Parent attempt ID for cascade chains. NULL for root attempts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_attempt_id: Option<i64>,
+    /// Target repository for cascade attempts (e.g., "appwrite/appwrite").
+    /// NULL for root attempts (original issue fix).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cascade_repo: Option<String>,
 }
 
 impl FixAttempt {
