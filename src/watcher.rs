@@ -566,6 +566,276 @@ impl Watcher {
         Ok(())
     }
 
+    /// Trigger cascade processing for downstream repos after a PR is merged.
+    ///
+    /// Looks up the merged repo in the dependency graph and spawns Claude
+    /// in each direct dependent repo with context about the upstream changes.
+    pub async fn trigger_cascade(
+        &self,
+        attempt: &crate::types::FixAttempt,
+        pr_url: &str,
+    ) -> Result<()> {
+        let relationships = match &self.relationships {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        if !self.config.cascade.enabled {
+            return Ok(());
+        }
+
+        let github_repo = match &attempt.github_repo {
+            Some(r) => r.clone(),
+            None => return Ok(()),
+        };
+
+        if attempt.github_pr_number.is_none() {
+            return Ok(());
+        }
+
+        // Check cascade depth limit
+        if self.config.cascade.max_depth > 0 {
+            let depth = self.get_cascade_depth(attempt);
+            if depth >= self.config.cascade.max_depth {
+                tracing::info!(
+                    short_id = %attempt.short_id,
+                    depth = depth,
+                    max_depth = self.config.cascade.max_depth,
+                    "Cascade depth limit reached, stopping"
+                );
+                return Ok(());
+            }
+        }
+
+        // Normalize repo name for dependency graph lookup
+        // github_repo is "owner/repo", graph uses short names like "appwrite"
+        let repo_short_name = github_repo
+            .split('/')
+            .last()
+            .unwrap_or(&github_repo);
+
+        let dependants = relationships.get_dependants(repo_short_name);
+        if dependants.is_empty() {
+            tracing::debug!(
+                repo = %github_repo,
+                short_name = %repo_short_name,
+                "No downstream dependants found for cascade"
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            repo = %github_repo,
+            dependants = dependants.len(),
+            "Triggering cascade for downstream repos"
+        );
+
+        let upstream_pr_url = pr_url.to_string();
+        let graph = relationships.get_graph();
+
+        for dependant in dependants {
+            let dep_type = graph
+                .get_first_hop_dependency_type(repo_short_name)
+                .map(|t| t.as_str())
+                .unwrap_or("unknown");
+
+            if let Err(e) = self
+                .cascade_to_repo(
+                    attempt,
+                    &dependant.name,
+                    &github_repo,
+                    &upstream_pr_url,
+                    dep_type,
+                )
+                .await
+            {
+                tracing::error!(
+                    upstream = %github_repo,
+                    downstream = %dependant.name,
+                    error = %e,
+                    "Failed to cascade to downstream repo"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the cascade depth of an attempt (0 for root, 1 for first cascade, etc.)
+    fn get_cascade_depth(&self, attempt: &crate::types::FixAttempt) -> usize {
+        let mut depth = 0;
+        let mut current_parent = attempt.parent_attempt_id;
+
+        while let Some(parent_id) = current_parent {
+            depth += 1;
+            match self.sqlite_tracker.as_ref().and_then(|t| {
+                t.get_attempt_by_id(parent_id).ok().flatten()
+            }) {
+                Some(parent) => current_parent = parent.parent_attempt_id,
+                None => break,
+            }
+        }
+
+        depth
+    }
+
+    /// Execute a cascade fix in a single downstream repo.
+    async fn cascade_to_repo(
+        &self,
+        parent_attempt: &crate::types::FixAttempt,
+        downstream_repo_name: &str,
+        upstream_repo: &str,
+        upstream_pr_url: &str,
+        dep_type: &str,
+    ) -> Result<()> {
+        tracing::info!(
+            upstream = %upstream_repo,
+            downstream = %downstream_repo_name,
+            parent_id = parent_attempt.id,
+            "Cascading to downstream repo"
+        );
+
+        // Resolve the downstream repo's local path
+        let resolution = crate::inference::resolve_repo_for_cascade(
+            self.inferrer.as_ref(),
+            downstream_repo_name,
+        );
+
+        let (project_dir, github_url, default_branch) = match resolution {
+            crate::inference::RepoResolution::Resolved {
+                project_dir,
+                github_url,
+                default_branch,
+                ..
+            } => (project_dir, github_url, default_branch),
+            crate::inference::RepoResolution::Skip { reason } => {
+                tracing::warn!(
+                    downstream = %downstream_repo_name,
+                    reason = %reason,
+                    "Cannot cascade — downstream repo not available"
+                );
+                return Ok(());
+            }
+        };
+
+        // Record cascade attempt
+        let sqlite = match &self.sqlite_tracker {
+            Some(t) => t,
+            None => {
+                tracing::warn!("No SQLite tracker available for cascade tracking");
+                return Ok(());
+            }
+        };
+
+        let attempt_id = sqlite.record_cascade_attempt(
+            &parent_attempt.source,
+            &parent_attempt.issue_id,
+            &parent_attempt.short_id,
+            parent_attempt.id,
+            &github_url,
+        )?;
+
+        // Ensure the downstream repo is up to date
+        if let Err(e) = GitOps::ensure_repo_at_path(&project_dir, &github_url, &default_branch).await {
+            tracing::warn!(
+                downstream = %downstream_repo_name,
+                error = %e,
+                "Failed to ensure repo is up to date, continuing anyway"
+            );
+        }
+
+        // Build the cascade prompt
+        let prompt = format!(
+            r#"A dependency has been updated in {upstream_repo}.
+
+## Original Issue
+[{short_id}] {source} issue that was fixed upstream.
+
+## Upstream PR
+{upstream_pr_url}
+
+Review the upstream PR above to understand what changed.
+
+## Your Task
+This repository ({downstream_repo_name}) depends on {upstream_repo} via {dep_type}.
+Review the upstream changes and make any necessary adaptations:
+- Update dependency version if needed
+- Adapt to any API changes
+- Update tests that exercise the changed functionality
+- Ensure the project builds and tests pass
+
+Create a PR with your changes."#,
+            upstream_repo = upstream_repo,
+            short_id = parent_attempt.short_id,
+            source = parent_attempt.source,
+            upstream_pr_url = upstream_pr_url,
+            downstream_repo_name = downstream_repo_name,
+            dep_type = dep_type,
+        );
+
+        // Run Claude
+        let result = self
+            .claude
+            .execute_with_attempt(&prompt, None, Some(attempt_id), &project_dir)
+            .await?;
+
+        if result.success {
+            if let Some(ref pr_url) = result.pr_url {
+                tracing::info!(
+                    downstream = %downstream_repo_name,
+                    pr_url = %pr_url,
+                    "Cascade PR created"
+                );
+
+                // Update the cascade attempt with PR details
+                if let Some((repo, pr_num)) = SqliteTracker::parse_pr_url(pr_url) {
+                    sqlite.update_attempt_pr(attempt_id, pr_url, &repo, pr_num)?;
+                }
+
+                // Register for review watching — this enables recursive cascade
+                if let Some(ref review_watcher) = self.review_watcher {
+                    if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(pr_url) {
+                        let state = PrReviewState::new(
+                            pr_url,
+                            &repo,
+                            pr_number,
+                            &parent_attempt.issue_id,
+                            &parent_attempt.source,
+                        );
+                        review_watcher.watch_pr(state);
+                        tracing::info!(
+                            component = "cascade",
+                            pr_url = %pr_url,
+                            "Cascade PR registered for review watching"
+                        );
+                    }
+                }
+
+                // Log activity
+                let activity = ActivityLogEntry::new(
+                    "cascade_pr_created",
+                    format!(
+                        "Cascade PR created in {} for upstream {}",
+                        downstream_repo_name, upstream_repo
+                    ),
+                )
+                .with_source(parent_attempt.source.clone())
+                .with_issue(parent_attempt.issue_id.clone(), parent_attempt.short_id.clone());
+                self.tracker.record_activity(&activity).ok();
+            }
+        } else {
+            let error = result.error.unwrap_or_else(|| "Unknown error".to_string());
+            tracing::warn!(
+                downstream = %downstream_repo_name,
+                error = %error,
+                "Cascade fix failed"
+            );
+            sqlite.mark_cascade_failed(attempt_id, &error)?;
+        }
+
+        Ok(())
+    }
+
     /// Seed the tracker with existing issues.
     pub async fn seed(&self) -> Result<SeedResult> {
         tracing::info!("");
