@@ -324,6 +324,10 @@ pub struct LinearConfig {
     pub project_id: Option<String>,
     /// Webhook signature verification secret.
     pub webhook_secret: Option<String>,
+    /// Maximum issues to process per poll cycle for this source (overrides global).
+    pub max_issues_per_cycle: Option<usize>,
+    /// Maximum concurrent issue processing for this source (overrides global).
+    pub max_concurrent: Option<usize>,
 }
 
 impl Default for LinearConfig {
@@ -336,6 +340,8 @@ impl Default for LinearConfig {
             team_id: None,
             project_id: None,
             webhook_secret: None,
+            max_issues_per_cycle: None,
+            max_concurrent: None,
         }
     }
 }
@@ -424,6 +430,10 @@ pub struct SentryConfig {
     pub escalation_threshold_percent: u32,
     /// Webhook client secret for signature verification.
     pub client_secret: Option<String>,
+    /// Maximum issues to process per poll cycle for this source (overrides global).
+    pub max_issues_per_cycle: Option<usize>,
+    /// Maximum concurrent issue processing for this source (overrides global).
+    pub max_concurrent: Option<usize>,
 }
 
 impl Default for SentryConfig {
@@ -438,6 +448,8 @@ impl Default for SentryConfig {
             min_event_count: 10,
             escalation_threshold_percent: 50,
             client_secret: None,
+            max_issues_per_cycle: None,
+            max_concurrent: None,
         }
     }
 }
@@ -807,6 +819,18 @@ impl Config {
             if let Ok(v) = env::var("LINEAR_WEBHOOK_SECRET") {
                 linear.webhook_secret = Some(v).filter(|s| !s.is_empty());
             }
+            if let Some(v) = env::var("LINEAR_MAX_ISSUES_PER_CYCLE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                linear.max_issues_per_cycle = Some(v);
+            }
+            if let Some(v) = env::var("LINEAR_MAX_CONCURRENT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                linear.max_concurrent = Some(v);
+            }
         }
     }
 
@@ -861,6 +885,18 @@ impl Config {
             }
             if let Ok(v) = env::var("SENTRY_CLIENT_SECRET") {
                 sentry.client_secret = Some(v).filter(|s| !s.is_empty());
+            }
+            if let Some(v) = env::var("SENTRY_MAX_ISSUES_PER_CYCLE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                sentry.max_issues_per_cycle = Some(v);
+            }
+            if let Some(v) = env::var("SENTRY_MAX_CONCURRENT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                sentry.max_concurrent = Some(v);
             }
         }
     }
@@ -924,6 +960,42 @@ impl Config {
     pub fn is_github_app_configured(&self) -> bool {
         self.github_app.is_configured()
     }
+
+    /// Get the max issues per cycle for a specific source.
+    /// Uses the source-specific value if set, otherwise falls back to the global value.
+    pub fn max_issues_per_cycle_for(&self, source_name: &str) -> usize {
+        match source_name {
+            "linear" => self
+                .linear
+                .as_ref()
+                .and_then(|c| c.max_issues_per_cycle)
+                .unwrap_or(self.max_issues_per_cycle),
+            "sentry" => self
+                .sentry
+                .as_ref()
+                .and_then(|c| c.max_issues_per_cycle)
+                .unwrap_or(self.max_issues_per_cycle),
+            _ => self.max_issues_per_cycle,
+        }
+    }
+
+    /// Get the max concurrent processing for a specific source.
+    /// Uses the source-specific value if set, otherwise falls back to the global value.
+    pub fn max_concurrent_for(&self, source_name: &str) -> usize {
+        match source_name {
+            "linear" => self
+                .linear
+                .as_ref()
+                .and_then(|c| c.max_concurrent)
+                .unwrap_or(self.max_concurrent),
+            "sentry" => self
+                .sentry
+                .as_ref()
+                .and_then(|c| c.max_concurrent)
+                .unwrap_or(self.max_concurrent),
+            _ => self.max_concurrent,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -955,6 +1027,8 @@ mod tests {
         "LINEAR_TEAM_ID",
         "LINEAR_PROJECT_ID",
         "LINEAR_WEBHOOK_SECRET",
+        "LINEAR_MAX_ISSUES_PER_CYCLE",
+        "LINEAR_MAX_CONCURRENT",
         "SENTRY_AUTH_TOKEN",
         "SENTRY_ORG_SLUG",
         "SENTRY_ENABLED",
@@ -963,6 +1037,8 @@ mod tests {
         "SENTRY_MIN_EVENT_COUNT",
         "SENTRY_ESCALATION_THRESHOLD",
         "SENTRY_CLIENT_SECRET",
+        "SENTRY_MAX_ISSUES_PER_CYCLE",
+        "SENTRY_MAX_CONCURRENT",
         "DISCORD_WEBHOOK_URL",
         "DISCORD_USER_ID",
         "SMTP_HOST",
@@ -1598,6 +1674,136 @@ linear:
         assert_eq!(config.top_issues_period, TopIssuesPeriod::OneDay);
         assert_eq!(config.min_event_count, 10);
         assert_eq!(config.escalation_threshold_percent, 50);
+    }
+
+    #[test]
+    fn test_per_source_max_issues_falls_back_to_global() {
+        let config = Config {
+            max_issues_per_cycle: 7,
+            linear: Some(LinearConfig {
+                api_key: "key".into(),
+                ..Default::default()
+            }),
+            sentry: Some(SentryConfig {
+                auth_token: "tok".into(),
+                org_slug: "org".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.max_issues_per_cycle_for("linear"), 7);
+        assert_eq!(config.max_issues_per_cycle_for("sentry"), 7);
+        assert_eq!(config.max_issues_per_cycle_for("unknown"), 7);
+    }
+
+    #[test]
+    fn test_per_source_max_issues_overrides_global() {
+        let config = Config {
+            max_issues_per_cycle: 5,
+            linear: Some(LinearConfig {
+                api_key: "key".into(),
+                max_issues_per_cycle: Some(3),
+                ..Default::default()
+            }),
+            sentry: Some(SentryConfig {
+                auth_token: "tok".into(),
+                org_slug: "org".into(),
+                max_issues_per_cycle: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
+        assert_eq!(config.max_issues_per_cycle_for("sentry"), 2);
+        assert_eq!(config.max_issues_per_cycle_for("unknown"), 5);
+    }
+
+    #[test]
+    fn test_per_source_max_concurrent_falls_back_to_global() {
+        let config = Config {
+            max_concurrent: 4,
+            linear: Some(LinearConfig {
+                api_key: "key".into(),
+                ..Default::default()
+            }),
+            sentry: Some(SentryConfig {
+                auth_token: "tok".into(),
+                org_slug: "org".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.max_concurrent_for("linear"), 4);
+        assert_eq!(config.max_concurrent_for("sentry"), 4);
+        assert_eq!(config.max_concurrent_for("unknown"), 4);
+    }
+
+    #[test]
+    fn test_per_source_max_concurrent_overrides_global() {
+        let config = Config {
+            max_concurrent: 8,
+            linear: Some(LinearConfig {
+                api_key: "key".into(),
+                max_concurrent: Some(2),
+                ..Default::default()
+            }),
+            sentry: Some(SentryConfig {
+                auth_token: "tok".into(),
+                org_slug: "org".into(),
+                max_concurrent: Some(6),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.max_concurrent_for("linear"), 2);
+        assert_eq!(config.max_concurrent_for("sentry"), 6);
+        assert_eq!(config.max_concurrent_for("unknown"), 8);
+    }
+
+    #[test]
+    fn test_per_source_config_from_yaml() {
+        let yaml = r#"
+work_dir: /tmp/repos
+max_issues_per_cycle: 5
+max_concurrent: 8
+linear:
+  api_key: lin_key
+  max_issues_per_cycle: 3
+  max_concurrent: 2
+sentry:
+  auth_token: sentry_tok
+  org_slug: org
+  max_issues_per_cycle: 2
+  max_concurrent: 6
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
+        assert_eq!(config.max_issues_per_cycle_for("sentry"), 2);
+        assert_eq!(config.max_concurrent_for("linear"), 2);
+        assert_eq!(config.max_concurrent_for("sentry"), 6);
+    }
+
+    #[test]
+    fn test_per_source_config_partial_override() {
+        let yaml = r#"
+work_dir: /tmp/repos
+max_issues_per_cycle: 5
+max_concurrent: 8
+linear:
+  api_key: lin_key
+  max_issues_per_cycle: 3
+sentry:
+  auth_token: sentry_tok
+  org_slug: org
+  max_concurrent: 6
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        // Linear overrides issues but not concurrent
+        assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
+        assert_eq!(config.max_concurrent_for("linear"), 8);
+        // Sentry overrides concurrent but not issues
+        assert_eq!(config.max_issues_per_cycle_for("sentry"), 5);
+        assert_eq!(config.max_concurrent_for("sentry"), 6);
     }
 
     #[test]

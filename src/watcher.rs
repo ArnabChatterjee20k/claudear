@@ -267,10 +267,24 @@ impl Watcher {
         tracing::info!("  Known orgs: {}", self.config.known_orgs.len());
         tracing::info!("  Poll interval: {}ms", poll_interval);
         tracing::info!(
-            "  Max issues per cycle: {}",
+            "  Max issues per cycle: {} (global)",
             self.config.max_issues_per_cycle
         );
-        tracing::info!("  Max concurrent: {}", self.config.max_concurrent);
+        tracing::info!("  Max concurrent: {} (global)", self.config.max_concurrent);
+        for source in &self.sources {
+            let src_max_issues = self.config.max_issues_per_cycle_for(source.name());
+            let src_max_concurrent = self.config.max_concurrent_for(source.name());
+            if src_max_issues != self.config.max_issues_per_cycle
+                || src_max_concurrent != self.config.max_concurrent
+            {
+                tracing::info!(
+                    "    {}: max_issues={}, max_concurrent={}",
+                    source.name(),
+                    src_max_issues,
+                    src_max_concurrent
+                );
+            }
+        }
         tracing::info!("  Processing delay: {}ms", self.config.processing_delay_ms);
         tracing::info!(
             "  Sources: {}",
@@ -672,8 +686,9 @@ impl Watcher {
                 }
             }
 
-            // Wait for concurrency slot
-            while self.active_processing.load(Ordering::SeqCst) >= self.config.max_concurrent {
+            // Wait for concurrency slot (per-source limit)
+            let retry_max_concurrent = self.config.max_concurrent_for(&attempt.source);
+            while self.active_processing.load(Ordering::SeqCst) >= retry_max_concurrent {
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -756,16 +771,17 @@ impl Watcher {
         // Sort by priority
         self.sort_by_priority(&mut candidates);
 
-        // Apply max issues per cycle limit
+        // Apply per-source max issues per cycle limit (falls back to global)
+        let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
         let to_process: Vec<_> = candidates
             .into_iter()
-            .take(self.config.max_issues_per_cycle)
+            .take(source_max_issues)
             .collect();
 
         let to_process_count = to_process.len();
         let skipped = to_process
             .len()
-            .saturating_sub(self.config.max_issues_per_cycle);
+            .saturating_sub(source_max_issues);
         if skipped > 0 {
             tracing::info!(
                 source = source.name(),
@@ -844,14 +860,15 @@ impl Watcher {
             self.notifier.notify_urgent_issues(&urgent_issues).await?;
         }
 
-        // Process issues with rate limiting
+        // Process issues with rate limiting (per-source concurrency limit)
+        let source_max_concurrent = self.config.max_concurrent_for(source.name());
         for (i, (issue, match_result)) in to_process.into_iter().enumerate() {
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
 
-            // Wait for concurrency slot
-            while self.active_processing.load(Ordering::SeqCst) >= self.config.max_concurrent {
+            // Wait for concurrency slot (per-source limit)
+            while self.active_processing.load(Ordering::SeqCst) >= source_max_concurrent {
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -864,7 +881,7 @@ impl Watcher {
             this.process_issue(source_clone, issue, match_result).await;
 
             // Add delay between starting new issues
-            if i < self.config.max_issues_per_cycle - 1 && self.config.processing_delay_ms > 0 {
+            if i < source_max_issues - 1 && self.config.processing_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
             }
         }

@@ -328,6 +328,7 @@ mod tests {
             team_id: None,
             project_id: None,
             webhook_secret: None, // No secret
+            ..Default::default()
         });
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
         assert!(configurator.needs_configuration());
@@ -344,6 +345,7 @@ mod tests {
             team_id: None,
             project_id: None,
             webhook_secret: Some("secret".to_string()), // Has secret
+            ..Default::default()
         });
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
         assert!(!configurator.needs_configuration());

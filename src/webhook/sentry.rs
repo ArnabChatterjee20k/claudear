@@ -334,6 +334,7 @@ mod tests {
             min_event_count: 10,
             escalation_threshold_percent: 50,
             client_secret: Some("test_secret".to_string()),
+            ..Default::default()
         }
     }
 
