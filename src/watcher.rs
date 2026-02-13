@@ -287,6 +287,21 @@ impl Watcher {
                 .join(", ")
         );
 
+        if self.config.cascade.enabled {
+            tracing::info!("  Cascade: enabled");
+            if self.config.cascade.max_depth > 0 {
+                tracing::info!("    Max depth: {}", self.config.cascade.max_depth);
+            } else {
+                tracing::info!("    Max depth: unlimited");
+            }
+            if let Some(ref rels) = self.relationships {
+                let repo_count = rels.list_repositories().len();
+                tracing::info!("    Repos in dependency graph: {}", repo_count);
+            }
+        } else {
+            tracing::info!("  Cascade: disabled");
+        }
+
         if self.dry_run {
             tracing::warn!("");
             tracing::warn!("  DRY RUN MODE - No issues will be processed");
@@ -614,7 +629,7 @@ impl Watcher {
         // github_repo is "owner/repo", graph uses short names like "appwrite"
         let repo_short_name = github_repo
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or(&github_repo);
 
         let dependants = relationships.get_dependants(repo_short_name);

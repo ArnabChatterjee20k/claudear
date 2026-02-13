@@ -132,22 +132,13 @@ impl Default for Config {
 }
 
 /// Configuration for multi-repo cascade chaining.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CascadeConfig {
     /// Whether cascade chaining is enabled.
     pub enabled: bool,
     /// Maximum cascade depth (0 = unlimited).
     pub max_depth: usize,
-}
-
-impl Default for CascadeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_depth: 0,
-        }
-    }
 }
 
 /// Retry configuration for failed fix attempts.
