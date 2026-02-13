@@ -58,8 +58,6 @@ pub struct Watcher {
     is_running: AtomicBool,
     processing: RwLock<HashSet<String>>,
     active_processing: AtomicUsize,
-    /// Counter for review poll intervals (check reviews every N poll cycles)
-    review_poll_counter: AtomicUsize,
     /// Feedback analyzer for learning from past outcomes
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
 }
@@ -93,7 +91,6 @@ impl Watcher {
             is_running: AtomicBool::new(false),
             processing: RwLock::new(HashSet::new()),
             active_processing: AtomicUsize::new(0),
-            review_poll_counter: AtomicUsize::new(0),
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
         }
     }
@@ -416,12 +413,9 @@ impl Watcher {
                     tracing::debug!(error = %e, "Error checking for auto-close PRs");
                 }
 
-                // Check for PR reviews (every 3rd poll cycle)
-                let review_count = self.review_poll_counter.fetch_add(1, Ordering::SeqCst);
-                if review_count.is_multiple_of(3) {
-                    if let Err(e) = self.check_reviews().await {
-                        tracing::debug!(error = %e, "Error checking for PR reviews");
-                    }
+                // Check for PR reviews
+                if let Err(e) = self.check_reviews().await {
+                    tracing::debug!(error = %e, "Error checking for PR reviews");
                 }
 
                 // Poll for new issues
