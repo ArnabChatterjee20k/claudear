@@ -794,10 +794,7 @@ impl ReviewEvent {
                     }
                 }
                 if !inline_comments.is_empty() {
-                    summary.push_str(&format!(
-                        "\nInline comments ({}):\n",
-                        inline_comments.len()
-                    ));
+                    summary.push_str(&format!("\nInline comments ({}):\n", inline_comments.len()));
                     for comment in inline_comments {
                         summary.push_str(&format!("- `{}`", comment.path));
                         if let Some(line) = comment.line {
@@ -1224,8 +1221,7 @@ impl<H: HttpClient> ReviewWatcher<H> {
                     } = event
                     {
                         for comment in inline_comments {
-                            if let Err(e) =
-                                sqlite.record_pr_review_comment(&state.pr_url, comment)
+                            if let Err(e) = sqlite.record_pr_review_comment(&state.pr_url, comment)
                             {
                                 tracing::warn!(
                                     component = "review_watcher",
