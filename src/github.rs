@@ -740,6 +740,8 @@ pub enum ReviewEvent {
         repo: String,
         pr_number: i64,
         review: PrReview,
+        /// Inline comments submitted as part of this review.
+        inline_comments: Vec<PrReviewComment>,
     },
     /// New review comments were added.
     CommentsAdded {
@@ -776,7 +778,11 @@ impl ReviewEvent {
     /// Get a summary of feedback for the agent.
     pub fn get_feedback_summary(&self) -> String {
         match self {
-            ReviewEvent::ReviewSubmitted { review, .. } => {
+            ReviewEvent::ReviewSubmitted {
+                review,
+                inline_comments,
+                ..
+            } => {
                 let mut summary = format!(
                     "Review from @{} ({})\n",
                     review.user.login,
@@ -785,6 +791,19 @@ impl ReviewEvent {
                 if let Some(body) = &review.body {
                     if !body.is_empty() {
                         summary.push_str(&format!("\nReview comment:\n{}\n", body));
+                    }
+                }
+                if !inline_comments.is_empty() {
+                    summary.push_str(&format!(
+                        "\nInline comments ({}):\n",
+                        inline_comments.len()
+                    ));
+                    for comment in inline_comments {
+                        summary.push_str(&format!("- `{}`", comment.path));
+                        if let Some(line) = comment.line {
+                            summary.push_str(&format!(" (line {})", line));
+                        }
+                        summary.push_str(&format!(": {}\n", comment.body));
                     }
                 }
                 summary
@@ -1060,6 +1079,10 @@ impl<H: HttpClient> ReviewWatcher<H> {
             )
             .await?;
 
+        // Collect review IDs we're processing this cycle so we can
+        // attach their inline comments directly to the review event.
+        let mut processed_review_ids: Vec<i64> = Vec::new();
+
         for review in reviews {
             // Skip reviews we've already processed
             if let Some(last_id) = state.last_review_id {
@@ -1081,11 +1104,14 @@ impl<H: HttpClient> ReviewWatcher<H> {
             // Record the review to the database for analytics
             self.record_review_to_db(state, &review);
 
+            processed_review_ids.push(review.id);
+
             events.push(ReviewEvent::ReviewSubmitted {
                 pr_url: state.pr_url.clone(),
                 repo: state.repo.clone(),
                 pr_number: state.pr_number,
                 review: review.clone(),
+                inline_comments: Vec::new(), // populated below
             });
 
             // Update state
@@ -1124,7 +1150,7 @@ impl<H: HttpClient> ReviewWatcher<H> {
         // Get the review trigger (e.g., "/claudear")
         let trigger = self.github.review_trigger();
 
-        // Filter out comments we've already processed and apply trigger filter
+        // Filter out comments we've already processed
         let new_comments: Vec<_> = comments
             .into_iter()
             .filter(|c| {
@@ -1135,9 +1161,43 @@ impl<H: HttpClient> ReviewWatcher<H> {
                 }
             })
             .filter(|c| c.user.user_type.as_deref() != Some("Bot"))
+            .collect();
+
+        // Attach inline comments to their parent review events (these bypass
+        // the trigger filter since they were submitted as part of the review).
+        // Standalone comments (not part of a review we just processed) still
+        // require the trigger.
+        let mut attached_comment_ids: std::collections::HashSet<i64> =
+            std::collections::HashSet::new();
+
+        for comment in &new_comments {
+            if let Some(review_id) = comment.pull_request_review_id {
+                if processed_review_ids.contains(&review_id) {
+                    // Find the matching review event and attach this comment
+                    for event in &mut events {
+                        if let ReviewEvent::ReviewSubmitted {
+                            review,
+                            inline_comments,
+                            ..
+                        } = event
+                        {
+                            if review.id == review_id {
+                                inline_comments.push(comment.clone());
+                                attached_comment_ids.insert(comment.id);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Standalone comments: not attached to a review we just processed,
+        // must match the trigger filter
+        let standalone_comments: Vec<_> = new_comments
+            .into_iter()
+            .filter(|c| !attached_comment_ids.contains(&c.id))
             .filter(|c| {
-                // If trigger is empty, process all comments
-                // Otherwise, only process comments containing the trigger
                 if trigger.is_empty() {
                     true
                 } else {
@@ -1146,10 +1206,39 @@ impl<H: HttpClient> ReviewWatcher<H> {
             })
             .collect();
 
-        if !new_comments.is_empty() {
-            // Record comments to database
+        // Combine all new comments (attached + standalone) for state tracking
+        let all_new_comment_ids: Vec<i64> = attached_comment_ids
+            .iter()
+            .copied()
+            .chain(standalone_comments.iter().map(|c| c.id))
+            .collect();
+
+        if !all_new_comment_ids.is_empty() {
+            // Record all new comments to database
             if let Some(ref sqlite) = self.sqlite_tracker {
-                for comment in &new_comments {
+                // Re-collect for recording: attached comments are already in events,
+                // standalone comments are in standalone_comments
+                for event in &events {
+                    if let ReviewEvent::ReviewSubmitted {
+                        inline_comments, ..
+                    } = event
+                    {
+                        for comment in inline_comments {
+                            if let Err(e) =
+                                sqlite.record_pr_review_comment(&state.pr_url, comment)
+                            {
+                                tracing::warn!(
+                                    component = "review_watcher",
+                                    pr_url = %state.pr_url,
+                                    comment_id = comment.id,
+                                    error = %e,
+                                    "Failed to record PR review comment"
+                                );
+                            }
+                        }
+                    }
+                }
+                for comment in &standalone_comments {
                     if let Err(e) = sqlite.record_pr_review_comment(&state.pr_url, comment) {
                         tracing::warn!(
                             component = "review_watcher",
@@ -1163,34 +1252,61 @@ impl<H: HttpClient> ReviewWatcher<H> {
             }
 
             // Update state with latest comment
-            if let Some(latest) = new_comments.iter().max_by_key(|c| c.id) {
-                let mut states = self.states.write().unwrap_or_else(|poisoned| {
-                    tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-                    poisoned.into_inner()
-                });
-                if let Some(s) = states.get_mut(&state.pr_url) {
-                    s.last_comment_id = Some(latest.id);
-                    s.last_comment_time = Some(latest.updated_at.clone());
-
-                    // Persist state update to database
-                    if let Some(ref sqlite) = self.sqlite_tracker {
-                        if let Err(e) = sqlite.save_pr_review_state(s) {
-                            tracing::warn!(
-                                component = "review_watcher",
-                                pr_url = %s.pr_url,
-                                error = %e,
-                                "Failed to persist PR review state update"
-                            );
+            let max_id = all_new_comment_ids.iter().copied().max().unwrap();
+            let latest_time = {
+                let mut latest: Option<String> = None;
+                for event in &events {
+                    if let ReviewEvent::ReviewSubmitted {
+                        inline_comments, ..
+                    } = event
+                    {
+                        for c in inline_comments {
+                            if c.id == max_id {
+                                latest = Some(c.updated_at.clone());
+                            }
                         }
                     }
                 }
-            }
+                if latest.is_none() {
+                    for c in &standalone_comments {
+                        if c.id == max_id {
+                            latest = Some(c.updated_at.clone());
+                        }
+                    }
+                }
+                latest
+            };
 
+            let mut states = self.states.write().unwrap_or_else(|poisoned| {
+                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+                poisoned.into_inner()
+            });
+            if let Some(s) = states.get_mut(&state.pr_url) {
+                s.last_comment_id = Some(max_id);
+                if let Some(t) = latest_time {
+                    s.last_comment_time = Some(t);
+                }
+
+                // Persist state update to database
+                if let Some(ref sqlite) = self.sqlite_tracker {
+                    if let Err(e) = sqlite.save_pr_review_state(s) {
+                        tracing::warn!(
+                            component = "review_watcher",
+                            pr_url = %s.pr_url,
+                            error = %e,
+                            "Failed to persist PR review state update"
+                        );
+                    }
+                }
+            }
+        }
+
+        if !standalone_comments.is_empty() {
             events.push(ReviewEvent::CommentsAdded {
                 pr_url: state.pr_url.clone(),
                 repo: state.repo.clone(),
                 pr_number: state.pr_number,
-                comments: new_comments,
+                comments: standalone_comments,
             });
         }
 
@@ -1936,6 +2052,7 @@ mod tests {
             repo: "test/test".to_string(),
             pr_number: 1,
             review,
+            inline_comments: vec![],
         };
 
         assert_eq!(event.pr_url(), "https://github.com/test/pull/1");
@@ -1974,6 +2091,7 @@ mod tests {
             repo: "repo".to_string(),
             pr_number: 1,
             review: approved_review,
+            inline_comments: vec![],
         };
 
         let changes_event = ReviewEvent::ReviewSubmitted {
@@ -1981,6 +2099,7 @@ mod tests {
             repo: "repo".to_string(),
             pr_number: 1,
             review: changes_requested,
+            inline_comments: vec![],
         };
 
         // Approved reviews don't require action
@@ -2009,6 +2128,7 @@ mod tests {
             repo: "repo".to_string(),
             pr_number: 1,
             review,
+            inline_comments: vec![],
         };
 
         let summary = event.get_feedback_summary();
@@ -2190,6 +2310,7 @@ mod tests {
             repo: "repo".to_string(),
             pr_number: 1,
             review,
+            inline_comments: vec![],
         };
 
         assert!(event.requires_action());
@@ -2215,6 +2336,7 @@ mod tests {
             repo: "repo".to_string(),
             pr_number: 1,
             review,
+            inline_comments: vec![],
         };
 
         assert!(!event.requires_action());
@@ -2362,6 +2484,7 @@ mod tests {
             repo: "repo".to_string(),
             pr_number: 1,
             review,
+            inline_comments: vec![],
         };
 
         let summary = event.get_feedback_summary();
@@ -2625,6 +2748,7 @@ mod tests {
             repo: "repo".to_string(),
             pr_number: 1,
             review,
+            inline_comments: vec![],
         };
 
         let cloned = event.clone();
@@ -2682,6 +2806,7 @@ mod tests {
             repo: "repo".to_string(),
             pr_number: 1,
             review,
+            inline_comments: vec![],
         };
 
         let debug = format!("{:?}", event);
