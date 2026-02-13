@@ -95,6 +95,9 @@ pub struct Config {
     /// Regression monitoring configuration.
     #[serde(default)]
     pub regression: RegressionConfig,
+    /// Cascade configuration for multi-repo chaining.
+    #[serde(default)]
+    pub cascade: CascadeConfig,
 }
 
 impl Default for Config {
@@ -123,6 +126,26 @@ impl Default for Config {
             linear: None,
             sentry: None,
             regression: RegressionConfig::default(),
+            cascade: CascadeConfig::default(),
+        }
+    }
+}
+
+/// Configuration for multi-repo cascade chaining.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CascadeConfig {
+    /// Whether cascade chaining is enabled.
+    pub enabled: bool,
+    /// Maximum cascade depth (0 = unlimited).
+    pub max_depth: usize,
+}
+
+impl Default for CascadeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_depth: 0,
         }
     }
 }
