@@ -2955,7 +2955,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .split('/')
-            .last()
+            .next_back()
             .unwrap();
         assert_eq!(repo_short_name, "upstream-lib");
     }
