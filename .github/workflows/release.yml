@@ -136,6 +136,7 @@ jobs:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${{ github.repository_owner }}/homebrew-tap.git
+          mkdir -p homebrew-tap/Formula
           cp claudear.rb homebrew-tap/Formula/
           cd homebrew-tap
           git config user.name "github-actions[bot]"
@@ -166,7 +167,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Install cargo-deb
         run: cargo install cargo-deb
