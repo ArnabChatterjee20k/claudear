@@ -87,6 +87,28 @@ embeddings:
   # cache_dir: ~/.cache/fastembed
 
 # ============================================
+# Claude Configuration
+# ============================================
+
+claude:
+  # Model to use (default: Claude CLI default)
+  # Options: sonnet, opus, haiku, or full model ID (e.g., claude-sonnet-4-5-20250929)
+  # model: sonnet
+
+  # Custom instructions appended to Claude's system prompt
+  # instructions: "Always write tests. Follow existing code style."
+
+  # Tool permissions granted without prompting (--allowedTools)
+  # See: https://docs.anthropic.com/en/docs/claude-code/settings
+  # permissions:
+  #   - "Bash(git *)"
+  #   - "Read"
+  #   - "Edit"
+
+  # Skip all permission prompts (default: true)
+  skip_permissions: true
+
+# ============================================
 # Discord Notifications (Optional)
 # ============================================
 

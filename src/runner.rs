@@ -18,12 +18,24 @@ use tokio::process::Command;
 pub struct ClaudeRunnerConfig {
     /// Timeout for Claude process execution in seconds (default: 21600 = 6 hours).
     pub timeout_secs: u64,
+    /// Model to use (e.g., sonnet, opus, haiku, or full model ID).
+    pub model: Option<String>,
+    /// Custom instructions appended to Claude's system prompt.
+    pub instructions: Option<String>,
+    /// Tool permissions granted without prompting (--allowedTools).
+    pub permissions: Vec<String>,
+    /// Skip all permission prompts (default: true for backwards compat).
+    pub skip_permissions: bool,
 }
 
 impl Default for ClaudeRunnerConfig {
     fn default() -> Self {
         Self {
             timeout_secs: 21600, // 6 hours default
+            model: None,
+            instructions: None,
+            permissions: Vec::new(),
+            skip_permissions: true,
         }
     }
 }
@@ -220,7 +232,12 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         }
         execution.prompt_used = Some(prompt.to_string());
         execution.prompt_hash = Some(Self::hash_prompt(prompt));
-        execution.model_version = Some("claude-code".to_string());
+        execution.model_version = Some(
+            self.config
+                .model
+                .clone()
+                .unwrap_or_else(|| "claude-code".to_string()),
+        );
         execution.working_directory = Some(project_dir.display().to_string());
 
         tracing::info!(
@@ -243,8 +260,26 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         }));
         self.tracker.record_activity(&activity).ok();
 
+        let mut args = vec!["--print".to_string()];
+        if self.config.skip_permissions {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+        if let Some(ref model) = self.config.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+        if let Some(ref instructions) = self.config.instructions {
+            args.push("--append-system-prompt".to_string());
+            args.push(instructions.clone());
+        }
+        for perm in &self.config.permissions {
+            args.push("--allowedTools".to_string());
+            args.push(perm.clone());
+        }
+        args.push(prompt.to_string());
+
         let mut child = Command::new("claude")
-            .args(["--print", "--dangerously-skip-permissions", prompt])
+            .args(&args)
             .current_dir(project_dir)
             .envs(env)
             .stdout(Stdio::piped())
@@ -699,7 +734,10 @@ mod tests {
 
     #[test]
     fn test_claude_runner_config_debug() {
-        let config = ClaudeRunnerConfig { timeout_secs: 3600 };
+        let config = ClaudeRunnerConfig {
+            timeout_secs: 3600,
+            ..Default::default()
+        };
         let debug = format!("{:?}", config);
         assert!(debug.contains("timeout_secs"));
     }
@@ -837,9 +875,13 @@ mod tests {
 
     #[test]
     fn test_claude_runner_config_clone() {
-        let config = ClaudeRunnerConfig { timeout_secs: 3600 };
+        let config = ClaudeRunnerConfig {
+            timeout_secs: 3600,
+            ..Default::default()
+        };
         let cloned = config.clone();
         assert_eq!(cloned.timeout_secs, config.timeout_secs);
+        assert_eq!(cloned.skip_permissions, config.skip_permissions);
     }
 
     #[test]

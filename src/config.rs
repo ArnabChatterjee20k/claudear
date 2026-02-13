@@ -12,6 +12,32 @@ use std::path::{Path, PathBuf};
 /// Default config file name.
 pub const DEFAULT_CONFIG_FILE: &str = "claudear.yaml";
 
+/// Claude CLI configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClaudeConfig {
+    /// Model to use (e.g., sonnet, opus, haiku, or full model ID).
+    pub model: Option<String>,
+    /// Custom instructions appended to Claude's system prompt.
+    pub instructions: Option<String>,
+    /// Tool permissions granted without prompting (--allowedTools).
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    /// Skip all permission prompts (default: true for backwards compat).
+    pub skip_permissions: bool,
+}
+
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            instructions: None,
+            permissions: Vec::new(),
+            skip_permissions: true,
+        }
+    }
+}
+
 /// Main configuration for the application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -45,6 +71,8 @@ pub struct Config {
     pub ipc_timeout_secs: u64,
     /// Claude process execution timeout in seconds (default: 21600 = 6 hours).
     pub claude_timeout_secs: u64,
+    /// Claude CLI configuration.
+    pub claude: ClaudeConfig,
     /// Discord configuration.
     pub discord: DiscordConfig,
     /// Email configuration.
@@ -84,6 +112,7 @@ impl Default for Config {
             max_activity_entries: 10_000,
             ipc_timeout_secs: 30,
             claude_timeout_secs: 21600, // 6 hours
+            claude: ClaudeConfig::default(),
             discord: DiscordConfig::default(),
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
@@ -585,6 +614,26 @@ impl Config {
             self.claude_timeout_secs = v;
         }
 
+        // Claude CLI
+        if let Ok(v) = env::var("CLAUDE_MODEL") {
+            if !v.is_empty() {
+                self.claude.model = Some(v);
+            }
+        }
+        if let Ok(v) = env::var("CLAUDE_INSTRUCTIONS") {
+            if !v.is_empty() {
+                self.claude.instructions = Some(v);
+            }
+        }
+        if let Ok(v) = env::var("CLAUDE_PERMISSIONS") {
+            if !v.is_empty() {
+                self.claude.permissions = v.split(',').map(|s| s.trim().to_string()).collect();
+            }
+        }
+        if let Ok(v) = env::var("CLAUDE_SKIP_PERMISSIONS") {
+            self.claude.skip_permissions = v.to_lowercase() == "true" || v == "1";
+        }
+
         // Discord
         if let Ok(v) = env::var("DISCORD_WEBHOOK_URL") {
             self.discord.webhook_url = Some(v).filter(|s| !s.is_empty());
@@ -945,6 +994,10 @@ mod tests {
         "RETRY_MAX_RETRIES",
         "RETRY_BASE_DELAY_MS",
         "RETRY_MAX_DELAY_MS",
+        "CLAUDE_MODEL",
+        "CLAUDE_INSTRUCTIONS",
+        "CLAUDE_PERMISSIONS",
+        "CLAUDE_SKIP_PERMISSIONS",
     ];
 
     fn with_env<F, R>(vars: &[(&str, &str)], f: F) -> R
@@ -2006,5 +2059,127 @@ work_dir: /tmp/repos
                 );
             },
         );
+    }
+
+    #[test]
+    fn test_claude_config_default() {
+        let config = ClaudeConfig::default();
+        assert!(config.model.is_none());
+        assert!(config.instructions.is_none());
+        assert!(config.permissions.is_empty());
+        assert!(config.skip_permissions);
+    }
+
+    #[test]
+    fn test_config_default_includes_claude() {
+        let config = Config::default();
+        assert!(config.claude.model.is_none());
+        assert!(config.claude.instructions.is_none());
+        assert!(config.claude.permissions.is_empty());
+        assert!(config.claude.skip_permissions);
+    }
+
+    #[test]
+    fn test_claude_config_from_yaml() {
+        let yaml = r#"
+work_dir: /tmp/test
+claude:
+  model: sonnet
+  instructions: "Always write tests."
+  permissions:
+    - "Bash(git *)"
+    - "Read"
+  skip_permissions: false
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert_eq!(config.claude.model, Some("sonnet".to_string()));
+        assert_eq!(
+            config.claude.instructions,
+            Some("Always write tests.".to_string())
+        );
+        assert_eq!(config.claude.permissions, vec!["Bash(git *)", "Read"]);
+        assert!(!config.claude.skip_permissions);
+    }
+
+    #[test]
+    fn test_claude_config_yaml_defaults() {
+        let yaml = r#"
+work_dir: /tmp/test
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert!(config.claude.model.is_none());
+        assert!(config.claude.instructions.is_none());
+        assert!(config.claude.permissions.is_empty());
+        assert!(config.claude.skip_permissions);
+    }
+
+    #[test]
+    fn test_env_override_claude_model() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(&[("CLAUDE_MODEL", "opus")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert_eq!(config.claude.model, Some("opus".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_env_override_claude_instructions() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(&[("CLAUDE_INSTRUCTIONS", "Be concise.")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert_eq!(config.claude.instructions, Some("Be concise.".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_env_override_claude_permissions() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(&[("CLAUDE_PERMISSIONS", "Bash(git *), Read, Edit")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert_eq!(
+                config.claude.permissions,
+                vec!["Bash(git *)", "Read", "Edit"]
+            );
+        });
+    }
+
+    #[test]
+    fn test_env_override_claude_skip_permissions() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(&[("CLAUDE_SKIP_PERMISSIONS", "false")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(!config.claude.skip_permissions);
+        });
+    }
+
+    #[test]
+    fn test_env_override_claude_skip_permissions_true() {
+        let yaml = r#"
+work_dir: /tmp/repos
+claude:
+  skip_permissions: false
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(&[("CLAUDE_SKIP_PERMISSIONS", "1")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(config.claude.skip_permissions);
+        });
     }
 }

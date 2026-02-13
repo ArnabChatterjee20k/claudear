@@ -273,6 +273,7 @@ mod tests {
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
             claude_timeout_secs: 21600,
+            claude: crate::config::ClaudeConfig::default(),
             discord: crate::config::DiscordConfig::default(),
             email: crate::config::EmailConfig::default(),
             sms: crate::config::SmsConfig::default(),
