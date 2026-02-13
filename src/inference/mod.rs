@@ -96,9 +96,7 @@ pub fn resolve_repo_for_cascade(
         }
     };
 
-    match inferrer.with_index(|index| {
-        Ok(index.get(repo_name).cloned())
-    }) {
+    match inferrer.with_index(|index| Ok(index.get(repo_name).cloned())) {
         Ok(Some(repo)) => RepoResolution::Resolved {
             project_dir: repo.path,
             repo_name: repo.name,

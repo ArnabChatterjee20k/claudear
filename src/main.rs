@@ -1688,7 +1688,8 @@ async fn main() -> anyhow::Result<()> {
             let db_deps = sqlite_tracker.list_all_dependencies().unwrap_or_default();
             for dep in db_deps {
                 if let Some(dep_type) = DependencyType::parse(&dep.dep_type) {
-                    rels.add_dependency(&dep.upstream, &dep.downstream, dep_type, None).ok();
+                    rels.add_dependency(&dep.upstream, &dep.downstream, dep_type, None)
+                        .ok();
                 }
             }
             Some(rels)

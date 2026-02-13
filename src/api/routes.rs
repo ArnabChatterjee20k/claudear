@@ -405,8 +405,8 @@ fn get_attempts(tracker: &Arc<dyn FixAttemptTracker>, limit: Option<usize>) -> V
 mod tests {
     use super::*;
     use crate::config::{
-        ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig,
-        CascadeConfig, RegressionConfig, RetryConfig, SmsConfig,
+        CascadeConfig, ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig,
+        PushConfig, RegressionConfig, RetryConfig, SmsConfig,
     };
     use crate::storage::SqliteTracker;
     use axum::body::Body;

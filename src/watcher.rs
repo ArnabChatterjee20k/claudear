@@ -641,10 +641,7 @@ impl Watcher {
 
         // Normalize repo name for dependency graph lookup
         // github_repo is "owner/repo", graph uses short names like "appwrite"
-        let repo_short_name = github_repo
-            .split('/')
-            .next_back()
-            .unwrap_or(&github_repo);
+        let repo_short_name = github_repo.split('/').next_back().unwrap_or(&github_repo);
 
         let dependants = relationships.get_dependants(repo_short_name);
         if dependants.is_empty() {
@@ -700,9 +697,11 @@ impl Watcher {
 
         while let Some(parent_id) = current_parent {
             depth += 1;
-            match self.sqlite_tracker.as_ref().and_then(|t| {
-                t.get_attempt_by_id(parent_id).ok().flatten()
-            }) {
+            match self
+                .sqlite_tracker
+                .as_ref()
+                .and_then(|t| t.get_attempt_by_id(parent_id).ok().flatten())
+            {
                 Some(parent) => current_parent = parent.parent_attempt_id,
                 None => break,
             }
@@ -768,7 +767,9 @@ impl Watcher {
         )?;
 
         // Ensure the downstream repo is up to date
-        if let Err(e) = GitOps::ensure_repo_at_path(&project_dir, &github_url, &default_branch).await {
+        if let Err(e) =
+            GitOps::ensure_repo_at_path(&project_dir, &github_url, &default_branch).await
+        {
             tracing::warn!(
                 downstream = %downstream_repo_name,
                 error = %e,
@@ -852,7 +853,10 @@ Create a PR with your changes."#,
                     ),
                 )
                 .with_source(parent_attempt.source.clone())
-                .with_issue(parent_attempt.issue_id.clone(), parent_attempt.short_id.clone());
+                .with_issue(
+                    parent_attempt.issue_id.clone(),
+                    parent_attempt.short_id.clone(),
+                );
                 self.tracker.record_activity(&activity).ok();
             }
         } else {
@@ -1049,7 +1053,8 @@ Create a PR with your changes."#,
 
             match github_client.get_pr_status(repo, pr_number).await {
                 Ok(PrStatus::Merged) => {
-                    self.tracker.mark_merged(&attempt.source, &attempt.issue_id)?;
+                    self.tracker
+                        .mark_merged(&attempt.source, &attempt.issue_id)?;
                     let pr_url = attempt.pr_url.as_deref().unwrap_or("");
                     if let Err(e) = self.trigger_cascade(attempt, pr_url).await {
                         tracing::error!(
@@ -1122,15 +1127,10 @@ Create a PR with your changes."#,
 
         // Apply per-source max issues per cycle limit (falls back to global)
         let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
-        let to_process: Vec<_> = candidates
-            .into_iter()
-            .take(source_max_issues)
-            .collect();
+        let to_process: Vec<_> = candidates.into_iter().take(source_max_issues).collect();
 
         let to_process_count = to_process.len();
-        let skipped = to_process
-            .len()
-            .saturating_sub(source_max_issues);
+        let skipped = to_process.len().saturating_sub(source_max_issues);
         if skipped > 0 {
             tracing::info!(
                 source = source.name(),
@@ -2912,7 +2912,12 @@ mod tests {
         // Setup: Create relationships with an upstream and downstream repo
         let mut relationships = RepoRelationships::new();
         relationships
-            .add_dependency("upstream-lib", "downstream-app", DependencyType::Composer, None)
+            .add_dependency(
+                "upstream-lib",
+                "downstream-app",
+                DependencyType::Composer,
+                None,
+            )
             .unwrap();
 
         // Create a FixAttempt that simulates a merged upstream PR
