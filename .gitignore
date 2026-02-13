@@ -14,3 +14,4 @@ claudear.yaml
 .idea
 .fastembed_cache
 logs
+.worktrees/
