@@ -333,6 +333,14 @@ impl OutcomeTracker {
         }
     }
 
+    /// Load outcomes from persistent storage (e.g. DB hydration on startup).
+    pub fn load(&mut self, outcomes: Vec<FixOutcome>) {
+        if let Some(max_id) = outcomes.iter().map(|o| o.id).max() {
+            self.next_id = max_id + 1;
+        }
+        self.outcomes = outcomes;
+    }
+
     /// Record a new outcome.
     pub fn record(&mut self, mut outcome: FixOutcome) -> Result<i64> {
         outcome.id = self.next_id;
@@ -1198,6 +1206,34 @@ mod tests {
         let parsed: FixOutcome = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed.embedding, Some(vec![1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn test_outcome_tracker_load() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        // Create outcomes with pre-set IDs (as if loaded from DB)
+        let mut o1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        o1.id = 10;
+        let mut o2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Failed);
+        o2.id = 20;
+
+        tracker.load(vec![o1, o2]);
+
+        assert_eq!(tracker.all().len(), 2);
+
+        // next_id should continue from max loaded id
+        let new_id = tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Closed,
+            ))
+            .unwrap();
+        assert_eq!(new_id, 21);
     }
 
     #[test]

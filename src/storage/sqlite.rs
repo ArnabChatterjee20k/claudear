@@ -2,6 +2,7 @@
 
 use super::FixAttemptTracker;
 use crate::error::Result;
+use crate::feedback::{FixOutcome, Outcome};
 use crate::types::{
     ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
     FixAttemptStatus, IssueEmbedding, PrReviewRecord, ProcessingMetric, PromptExperiment,
@@ -1144,6 +1145,18 @@ impl FixAttemptTracker for SqliteTracker {
     fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
         SqliteTracker::get_analytics_summary(self)
     }
+
+    fn store_feedback_outcome(&self, outcome: &FixOutcome) -> Result<i64> {
+        SqliteTracker::store_feedback_outcome(self, outcome)
+    }
+
+    fn get_feedback_outcomes(&self, source: Option<&str>, limit: usize) -> Result<Vec<FixOutcome>> {
+        SqliteTracker::get_feedback_outcomes(self, source, limit)
+    }
+
+    fn get_feedback_outcome_by_attempt(&self, attempt_id: i64) -> Result<Option<FixOutcome>> {
+        SqliteTracker::get_feedback_outcome_by_attempt(self, attempt_id)
+    }
 }
 
 impl SqliteTracker {
@@ -1929,6 +1942,114 @@ impl SqliteTracker {
         }
 
         Ok(patterns)
+    }
+
+    /// Store a feedback outcome to the database.
+    pub fn store_feedback_outcome(&self, outcome: &FixOutcome) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let keywords_json = serde_json::to_string(&outcome.keywords).unwrap_or_default();
+
+        conn.execute(
+            r#"
+            INSERT INTO feedback_outcomes (attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                outcome.attempt_id,
+                outcome.source,
+                outcome.issue_id,
+                outcome.issue_text,
+                outcome.prompt_used,
+                outcome.outcome.as_str(),
+                outcome.error_type,
+                outcome.learnings,
+                keywords_json,
+                outcome.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Retrieve feedback outcomes with optional source filter.
+    pub fn get_feedback_outcomes(
+        &self,
+        source: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FixOutcome>> {
+        let conn = self.acquire_lock()?;
+
+        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match source {
+            Some(s) => (
+                r#"
+                SELECT id, attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at
+                FROM feedback_outcomes
+                WHERE source = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+                vec![Box::new(s.to_string()), Box::new(limit as i64)],
+            ),
+            None => (
+                r#"
+                SELECT id, attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at
+                FROM feedback_outcomes
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+                vec![Box::new(limit as i64)],
+            ),
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), Self::row_to_fix_outcome)?;
+
+        let mut outcomes = Vec::new();
+        for row in rows.flatten() {
+            outcomes.push(row);
+        }
+        Ok(outcomes)
+    }
+
+    /// Get a single feedback outcome by attempt ID.
+    pub fn get_feedback_outcome_by_attempt(&self, attempt_id: i64) -> Result<Option<FixOutcome>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at
+            FROM feedback_outcomes
+            WHERE attempt_id = ?
+            LIMIT 1
+            "#,
+        )?;
+
+        let mut rows = stmt.query_map(params![attempt_id], Self::row_to_fix_outcome)?;
+        Ok(rows.next().and_then(|r| r.ok()))
+    }
+
+    /// Map a database row to a FixOutcome.
+    fn row_to_fix_outcome(row: &rusqlite::Row) -> rusqlite::Result<FixOutcome> {
+        let outcome_str: String = row.get(6)?;
+        let keywords_str: Option<String> = row.get(9)?;
+        let created_at_str: String = row.get(10)?;
+
+        Ok(FixOutcome {
+            id: row.get(0)?,
+            attempt_id: row.get(1)?,
+            source: row.get(2)?,
+            issue_id: row.get(3)?,
+            issue_text: row.get(4)?,
+            prompt_used: row.get(5)?,
+            outcome: Outcome::parse(&outcome_str).unwrap_or(Outcome::Failed),
+            error_type: row.get(7)?,
+            learnings: row.get(8)?,
+            keywords: keywords_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+            embedding: None,
+            created_at: Self::parse_datetime(&created_at_str),
+        })
     }
 
     /// Record a processing metric.
@@ -5328,5 +5449,110 @@ mod tests {
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].body, "Updated comment body");
         assert_eq!(comments[0].updated_at, "2024-01-15T11:00:00Z");
+    }
+
+    #[test]
+    fn test_store_and_retrieve_feedback_outcome() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
+
+        let attempt = tracker.get_attempt("linear", "issue-1").unwrap().unwrap();
+
+        let outcome = FixOutcome {
+            id: 0,
+            attempt_id: attempt.id,
+            source: "linear".to_string(),
+            issue_id: "issue-1".to_string(),
+            issue_text: "Database timeout\n\nConnection fails".to_string(),
+            prompt_used: "Fix the timeout".to_string(),
+            outcome: crate::feedback::Outcome::Merged,
+            error_type: None,
+            learnings: Some("Check connection pool".to_string()),
+            keywords: vec!["database".to_string(), "timeout".to_string()],
+            embedding: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let id = tracker.store_feedback_outcome(&outcome).unwrap();
+        assert!(id > 0);
+
+        // Retrieve by attempt
+        let retrieved = tracker
+            .get_feedback_outcome_by_attempt(attempt.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.source, "linear");
+        assert_eq!(retrieved.issue_id, "issue-1");
+        assert_eq!(retrieved.outcome, crate::feedback::Outcome::Merged);
+        assert_eq!(
+            retrieved.learnings,
+            Some("Check connection pool".to_string())
+        );
+        assert_eq!(
+            retrieved.keywords,
+            vec!["database".to_string(), "timeout".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_get_feedback_outcomes_with_source_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "issue-2", "SENT-2")
+            .unwrap();
+
+        let attempt1 = tracker.get_attempt("linear", "issue-1").unwrap().unwrap();
+        let attempt2 = tracker.get_attempt("sentry", "issue-2").unwrap().unwrap();
+
+        let outcome1 = FixOutcome {
+            id: 0,
+            attempt_id: attempt1.id,
+            source: "linear".to_string(),
+            issue_id: "issue-1".to_string(),
+            issue_text: "Linear issue".to_string(),
+            prompt_used: "prompt".to_string(),
+            outcome: crate::feedback::Outcome::Merged,
+            error_type: None,
+            learnings: None,
+            keywords: vec![],
+            embedding: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let outcome2 = FixOutcome {
+            id: 0,
+            attempt_id: attempt2.id,
+            source: "sentry".to_string(),
+            issue_id: "issue-2".to_string(),
+            issue_text: "Sentry issue".to_string(),
+            prompt_used: "prompt".to_string(),
+            outcome: crate::feedback::Outcome::Failed,
+            error_type: Some("timeout".to_string()),
+            learnings: None,
+            keywords: vec![],
+            embedding: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        tracker.store_feedback_outcome(&outcome1).unwrap();
+        tracker.store_feedback_outcome(&outcome2).unwrap();
+
+        // All outcomes
+        let all = tracker.get_feedback_outcomes(None, 100).unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Filter by source
+        let linear_only = tracker.get_feedback_outcomes(Some("linear"), 100).unwrap();
+        assert_eq!(linear_only.len(), 1);
+        assert_eq!(linear_only[0].source, "linear");
+
+        let sentry_only = tracker.get_feedback_outcomes(Some("sentry"), 100).unwrap();
+        assert_eq!(sentry_only.len(), 1);
+        assert_eq!(sentry_only[0].outcome, crate::feedback::Outcome::Failed);
     }
 }

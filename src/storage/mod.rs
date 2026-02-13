@@ -14,6 +14,7 @@ pub use sqlite::{
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite, VectorStoreConfig};
 
 use crate::error::Result;
+use crate::feedback::FixOutcome;
 use crate::types::{
     ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
     FixAttemptStatus, PrReviewRecord, ProcessingMetric,
@@ -118,5 +119,24 @@ pub trait FixAttemptTracker: Send + Sync {
     /// Get analytics summary.
     fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
         Ok(AnalyticsSummary::default())
+    }
+
+    /// Store a feedback outcome.
+    fn store_feedback_outcome(&self, _outcome: &FixOutcome) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Get feedback outcomes with optional source filter.
+    fn get_feedback_outcomes(
+        &self,
+        _source: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<FixOutcome>> {
+        Ok(Vec::new())
+    }
+
+    /// Get a feedback outcome by attempt ID.
+    fn get_feedback_outcome_by_attempt(&self, _attempt_id: i64) -> Result<Option<FixOutcome>> {
+        Ok(None)
     }
 }

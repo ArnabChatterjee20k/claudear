@@ -66,6 +66,11 @@ impl FeedbackAnalyzer {
         }
     }
 
+    /// Load outcomes from persistent storage (e.g. DB hydration on startup).
+    pub fn load_outcomes(&mut self, outcomes: Vec<FixOutcome>) {
+        self.tracker.load(outcomes);
+    }
+
     /// Record an outcome.
     pub fn record_outcome(
         &mut self,
@@ -540,6 +545,30 @@ mod tests {
 
         let enhanced = analyzer.enhance_prompt("Base prompt", &issue);
         assert_eq!(enhanced, "Base prompt");
+    }
+
+    #[test]
+    fn test_load_outcomes_and_find_similar() {
+        let mut analyzer = FeedbackAnalyzer::new();
+
+        // Build outcomes as if loaded from DB
+        let issue = create_test_issue(
+            "Database connection timeout",
+            "PostgreSQL connection fails",
+            "linear",
+        );
+        let attempt = create_test_attempt("linear");
+        let mut outcome =
+            FixOutcome::from_attempt(&attempt, &issue, "Fix the timeout", Outcome::Merged);
+        outcome.id = 5;
+
+        analyzer.load_outcomes(vec![outcome]);
+
+        // Should find it when searching for similar
+        let search = create_test_issue("Database timeout error", "PostgreSQL times out", "linear");
+        let similar = analyzer.find_similar(&search);
+        assert!(!similar.is_empty());
+        assert_eq!(similar[0].outcome.id, 5);
     }
 
     #[test]
