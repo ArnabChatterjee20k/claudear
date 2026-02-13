@@ -132,6 +132,10 @@ impl WebhookServer {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: self.config.claude_timeout_secs,
+                    model: self.config.claude.model.clone(),
+                    instructions: self.config.claude.instructions.clone(),
+                    permissions: self.config.claude.permissions.clone(),
+                    skip_permissions: self.config.claude.skip_permissions,
                 },
                 self.tracker.clone(),
             ),
@@ -600,8 +604,8 @@ async fn process_issue(
 mod tests {
     use super::*;
     use crate::config::{
-        DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig, RegressionConfig,
-        RetryConfig, SmsConfig,
+        ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig,
+        RegressionConfig, RetryConfig, SmsConfig,
     };
     use crate::notifier::Notifier;
     use crate::reports::Report;
@@ -720,6 +724,7 @@ mod tests {
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
             claude_timeout_secs: 21600,
+            claude: ClaudeConfig::default(),
             discord: DiscordConfig::default(),
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
@@ -972,6 +977,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1007,6 +1013,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1040,6 +1047,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1107,6 +1115,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1149,6 +1158,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1213,6 +1223,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1287,6 +1298,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1333,6 +1345,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1380,6 +1393,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1423,6 +1437,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1488,6 +1503,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),
@@ -1600,6 +1616,7 @@ mod tests {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
                 },
                 tracker.clone(),
             ),

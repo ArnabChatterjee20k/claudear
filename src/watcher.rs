@@ -63,6 +63,10 @@ impl Watcher {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: options.config.claude_timeout_secs,
+                    model: options.config.claude.model.clone(),
+                    instructions: options.config.claude.instructions.clone(),
+                    permissions: options.config.claude.permissions.clone(),
+                    skip_permissions: options.config.claude.skip_permissions,
                 },
                 options.tracker.clone(),
             ),
@@ -1498,6 +1502,7 @@ mod tests {
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
             claude_timeout_secs: 21600,
+            claude: crate::config::ClaudeConfig::default(),
             discord: crate::config::DiscordConfig::default(),
             email: crate::config::EmailConfig::default(),
             sms: crate::config::SmsConfig::default(),

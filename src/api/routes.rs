@@ -405,8 +405,8 @@ fn get_attempts(tracker: &Arc<dyn FixAttemptTracker>, limit: Option<usize>) -> V
 mod tests {
     use super::*;
     use crate::config::{
-        DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig, RegressionConfig,
-        RetryConfig, SmsConfig,
+        ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig,
+        RegressionConfig, RetryConfig, SmsConfig,
     };
     use crate::storage::SqliteTracker;
     use axum::body::Body;
@@ -428,6 +428,7 @@ mod tests {
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
             claude_timeout_secs: 21600,
+            claude: ClaudeConfig::default(),
             discord: DiscordConfig::default(),
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
