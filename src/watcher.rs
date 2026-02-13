@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::feedback::{format_similar_issues_context, IssueEmbeddingService};
-use crate::github::{PrReviewState, ReviewWatcher};
+use crate::github::{GitHubClient, PrReviewState, PrStatus, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::Notifier;
 use crate::repo::{GitOps, RepoIndex, RepoRelationships};
@@ -34,6 +34,7 @@ pub struct WatcherOptions {
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub relationships: Option<RepoRelationships>,
+    pub github_client: Option<GitHubClient>,
     pub dry_run: bool,
 }
 
@@ -49,6 +50,7 @@ pub struct Watcher {
     review_watcher: Option<Arc<ReviewWatcher>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     relationships: Option<RepoRelationships>,
+    github_client: Option<GitHubClient>,
     claude: ClaudeRunner,
     dry_run: bool,
     is_running: AtomicBool,
@@ -82,6 +84,7 @@ impl Watcher {
             review_watcher: options.review_watcher,
             issue_embedding_service: options.issue_embedding_service,
             relationships: options.relationships,
+            github_client: options.github_client,
             dry_run: options.dry_run,
             is_running: AtomicBool::new(false),
             processing: RwLock::new(HashSet::new()),
@@ -908,6 +911,13 @@ Create a PR with your changes."#,
             }
         }
 
+        // Check for PR merges and trigger cascades
+        if !self.dry_run {
+            if let Err(e) = self.check_pr_merges_and_cascade().await {
+                tracing::error!(component = "watcher", error = %e, "Error checking PR merges for cascade");
+            }
+        }
+
         Ok(())
     }
 
@@ -977,6 +987,57 @@ Create a PR with your changes."#,
             // Add delay between retries
             if self.config.processing_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check for merged PRs and trigger cascade processing.
+    async fn check_pr_merges_and_cascade(&self) -> Result<()> {
+        let github_client = match &self.github_client {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        if !self.config.cascade.enabled {
+            return Ok(());
+        }
+
+        // Get all successful attempts with PRs that haven't been merged yet
+        let pending_prs = self.tracker.get_pending_prs()?;
+
+        for attempt in &pending_prs {
+            let repo = match &attempt.github_repo {
+                Some(r) => r,
+                None => continue,
+            };
+            let pr_number = match attempt.github_pr_number {
+                Some(n) => n,
+                None => continue,
+            };
+
+            match github_client.get_pr_status(repo, pr_number).await {
+                Ok(PrStatus::Merged) => {
+                    self.tracker.mark_merged(&attempt.source, &attempt.issue_id)?;
+                    let pr_url = attempt.pr_url.as_deref().unwrap_or("");
+                    if let Err(e) = self.trigger_cascade(attempt, pr_url).await {
+                        tracing::error!(
+                            component = "cascade",
+                            short_id = %attempt.short_id,
+                            error = %e,
+                            "Failed to trigger cascade after merge"
+                        );
+                    }
+                }
+                Ok(_) => {} // Still open or closed
+                Err(e) => {
+                    tracing::debug!(
+                        short_id = %attempt.short_id,
+                        error = %e,
+                        "Failed to check PR status"
+                    );
+                }
             }
         }
 
@@ -1807,6 +1868,7 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             relationships: None,
+            github_client: None,
             dry_run,
         })
     }
@@ -2081,6 +2143,7 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             relationships: None,
+            github_client: None,
             dry_run: true,
         };
 
@@ -2612,6 +2675,7 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             relationships: None,
+            github_client: None,
             dry_run: false,
         });
 
@@ -2690,6 +2754,7 @@ mod tests {
             review_watcher: None,
             issue_embedding_service: None,
             relationships: None,
+            github_client: None,
             dry_run: true,
         });
 
