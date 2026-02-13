@@ -552,9 +552,14 @@ mod tests {
         let mut analyzer = FeedbackAnalyzer::new();
 
         // Build outcomes as if loaded from DB
-        let issue = create_test_issue("Database connection timeout", "PostgreSQL connection fails", "linear");
+        let issue = create_test_issue(
+            "Database connection timeout",
+            "PostgreSQL connection fails",
+            "linear",
+        );
         let attempt = create_test_attempt("linear");
-        let mut outcome = FixOutcome::from_attempt(&attempt, &issue, "Fix the timeout", Outcome::Merged);
+        let mut outcome =
+            FixOutcome::from_attempt(&attempt, &issue, "Fix the timeout", Outcome::Merged);
         outcome.id = 5;
 
         analyzer.load_outcomes(vec![outcome]);

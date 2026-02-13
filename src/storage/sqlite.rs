@@ -2001,7 +2001,8 @@ impl SqliteTracker {
         };
 
         let mut stmt = conn.prepare(sql)?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let rows = stmt.query_map(params_refs.as_slice(), Self::row_to_fix_outcome)?;
 
         let mut outcomes = Vec::new();
@@ -2012,10 +2013,7 @@ impl SqliteTracker {
     }
 
     /// Get a single feedback outcome by attempt ID.
-    pub fn get_feedback_outcome_by_attempt(
-        &self,
-        attempt_id: i64,
-    ) -> Result<Option<FixOutcome>> {
+    pub fn get_feedback_outcome_by_attempt(&self, attempt_id: i64) -> Result<Option<FixOutcome>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
@@ -5456,7 +5454,9 @@ mod tests {
     #[test]
     fn test_store_and_retrieve_feedback_outcome() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.record_attempt("linear", "issue-1", "LIN-1").unwrap();
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
 
         let attempt = tracker.get_attempt("linear", "issue-1").unwrap().unwrap();
 
@@ -5479,19 +5479,32 @@ mod tests {
         assert!(id > 0);
 
         // Retrieve by attempt
-        let retrieved = tracker.get_feedback_outcome_by_attempt(attempt.id).unwrap().unwrap();
+        let retrieved = tracker
+            .get_feedback_outcome_by_attempt(attempt.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.source, "linear");
         assert_eq!(retrieved.issue_id, "issue-1");
         assert_eq!(retrieved.outcome, crate::feedback::Outcome::Merged);
-        assert_eq!(retrieved.learnings, Some("Check connection pool".to_string()));
-        assert_eq!(retrieved.keywords, vec!["database".to_string(), "timeout".to_string()]);
+        assert_eq!(
+            retrieved.learnings,
+            Some("Check connection pool".to_string())
+        );
+        assert_eq!(
+            retrieved.keywords,
+            vec!["database".to_string(), "timeout".to_string()]
+        );
     }
 
     #[test]
     fn test_get_feedback_outcomes_with_source_filter() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        tracker.record_attempt("linear", "issue-1", "LIN-1").unwrap();
-        tracker.record_attempt("sentry", "issue-2", "SENT-2").unwrap();
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "issue-2", "SENT-2")
+            .unwrap();
 
         let attempt1 = tracker.get_attempt("linear", "issue-1").unwrap().unwrap();
         let attempt2 = tracker.get_attempt("sentry", "issue-2").unwrap().unwrap();

@@ -127,7 +127,11 @@ pub trait FixAttemptTracker: Send + Sync {
     }
 
     /// Get feedback outcomes with optional source filter.
-    fn get_feedback_outcomes(&self, _source: Option<&str>, _limit: usize) -> Result<Vec<FixOutcome>> {
+    fn get_feedback_outcomes(
+        &self,
+        _source: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<FixOutcome>> {
         Ok(Vec::new())
     }
 

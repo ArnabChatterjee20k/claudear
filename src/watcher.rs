@@ -2,7 +2,9 @@
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::feedback::{format_similar_issues_context, FeedbackAnalyzer, FixOutcome, IssueEmbeddingService, Outcome};
+use crate::feedback::{
+    format_similar_issues_context, FeedbackAnalyzer, FixOutcome, IssueEmbeddingService, Outcome,
+};
 use crate::github::{GitHubClient, PrReviewState, PrStatus, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::Notifier;
@@ -1074,7 +1076,8 @@ Create a PR with your changes."#,
                         .mark_merged(&attempt.source, &attempt.issue_id)?;
 
                     // Record feedback outcome
-                    self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged).await;
+                    self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
+                        .await;
 
                     let pr_url = attempt.pr_url.as_deref().unwrap_or("");
                     if let Err(e) = self.trigger_cascade(attempt, pr_url).await {
@@ -1089,7 +1092,8 @@ Create a PR with your changes."#,
                 Ok(PrStatus::Closed) => {
                     self.tracker
                         .mark_closed(&attempt.source, &attempt.issue_id)?;
-                    self.record_feedback_outcome_from_attempt(attempt, Outcome::Closed).await;
+                    self.record_feedback_outcome_from_attempt(attempt, Outcome::Closed)
+                        .await;
                 }
                 Ok(_) => {} // Still open
                 Err(e) => {
@@ -1556,7 +1560,8 @@ Create a PR with your changes."#,
 
             // Record feedback outcome
             if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
-                self.record_feedback_outcome_from_attempt(&attempt, Outcome::Failed).await;
+                self.record_feedback_outcome_from_attempt(&attempt, Outcome::Failed)
+                    .await;
             }
 
             // Record error pattern for analytics
@@ -1743,7 +1748,8 @@ Create a PR with your changes."#,
                             .await;
 
                         // Record feedback outcome
-                        self.record_feedback_outcome_from_attempt(&attempt, Outcome::Closed).await;
+                        self.record_feedback_outcome_from_attempt(&attempt, Outcome::Closed)
+                            .await;
 
                         if let Some(ref url) = attempt.pr_url {
                             auto_closed.push(url.clone());

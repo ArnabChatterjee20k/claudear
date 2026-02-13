@@ -1226,7 +1226,12 @@ mod tests {
 
         // next_id should continue from max loaded id
         let new_id = tracker
-            .record(FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Closed))
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Closed,
+            ))
             .unwrap();
         assert_eq!(new_id, 21);
     }
