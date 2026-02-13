@@ -1694,6 +1694,7 @@ async fn main() -> anyhow::Result<()> {
                 embedding_client: None,
                 review_watcher,
                 issue_embedding_service: None,
+                relationships: None,
                 dry_run: false,
             })))
         } else {
@@ -2123,6 +2124,7 @@ async fn main() -> anyhow::Result<()> {
             embedding_client: None,
             review_watcher,
             issue_embedding_service: None,
+            relationships: None,
             dry_run: false,
         });
 
@@ -2373,6 +2375,7 @@ async fn main() -> anyhow::Result<()> {
                 embedding_client,
                 review_watcher,
                 issue_embedding_service: None,
+                relationships: None,
                 dry_run,
             });
 

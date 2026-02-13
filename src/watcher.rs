@@ -6,7 +6,7 @@ use crate::feedback::{format_similar_issues_context, IssueEmbeddingService};
 use crate::github::{PrReviewState, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::Notifier;
-use crate::repo::{GitOps, RepoIndex};
+use crate::repo::{GitOps, RepoIndex, RepoRelationships};
 use crate::retry::RetryManager;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::source::IssueSource;
@@ -33,6 +33,7 @@ pub struct WatcherOptions {
     pub embedding_client: Option<crate::feedback::EmbeddingClient>,
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    pub relationships: Option<RepoRelationships>,
     pub dry_run: bool,
 }
 
@@ -47,6 +48,7 @@ pub struct Watcher {
     embedding_client: Option<crate::feedback::EmbeddingClient>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    relationships: Option<RepoRelationships>,
     claude: ClaudeRunner,
     dry_run: bool,
     is_running: AtomicBool,
@@ -79,6 +81,7 @@ impl Watcher {
             embedding_client: options.embedding_client,
             review_watcher: options.review_watcher,
             issue_embedding_service: options.issue_embedding_service,
+            relationships: options.relationships,
             dry_run: options.dry_run,
             is_running: AtomicBool::new(false),
             processing: RwLock::new(HashSet::new()),
@@ -1513,6 +1516,7 @@ mod tests {
             linear: None,
             sentry: None,
             regression: crate::config::RegressionConfig::default(),
+            cascade: crate::config::CascadeConfig::default(),
         }
     }
 
@@ -1532,6 +1536,7 @@ mod tests {
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
+            relationships: None,
             dry_run,
         })
     }
@@ -1805,6 +1810,7 @@ mod tests {
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
+            relationships: None,
             dry_run: true,
         };
 
@@ -2335,6 +2341,7 @@ mod tests {
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
+            relationships: None,
             dry_run: false,
         });
 
@@ -2412,6 +2419,7 @@ mod tests {
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
+            relationships: None,
             dry_run: true,
         });
 

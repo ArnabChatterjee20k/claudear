@@ -406,7 +406,7 @@ mod tests {
     use super::*;
     use crate::config::{
         ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig, PushConfig,
-        RegressionConfig, RetryConfig, SmsConfig,
+        CascadeConfig, RegressionConfig, RetryConfig, SmsConfig,
     };
     use crate::storage::SqliteTracker;
     use axum::body::Body;
@@ -439,6 +439,7 @@ mod tests {
             linear: None,
             sentry: None,
             regression: RegressionConfig::default(),
+            cascade: CascadeConfig::default(),
         }
     }
 
