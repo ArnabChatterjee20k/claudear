@@ -2135,10 +2135,7 @@ work_dir: /tmp/repos
 
         with_env(&[("CLAUDE_INSTRUCTIONS", "Be concise.")], || {
             let config = Config::load(file.path()).unwrap();
-            assert_eq!(
-                config.claude.instructions,
-                Some("Be concise.".to_string())
-            );
+            assert_eq!(config.claude.instructions, Some("Be concise.".to_string()));
         });
     }
 

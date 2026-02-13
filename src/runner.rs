@@ -233,7 +233,10 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         execution.prompt_used = Some(prompt.to_string());
         execution.prompt_hash = Some(Self::hash_prompt(prompt));
         execution.model_version = Some(
-            self.config.model.clone().unwrap_or_else(|| "claude-code".to_string()),
+            self.config
+                .model
+                .clone()
+                .unwrap_or_else(|| "claude-code".to_string()),
         );
         execution.working_directory = Some(project_dir.display().to_string());
 
