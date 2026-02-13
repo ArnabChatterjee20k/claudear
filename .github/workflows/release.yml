@@ -4,6 +4,10 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: write
+  packages: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -17,9 +21,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset_name: claudear-linux-amd64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            asset_name: claudear-macos-amd64
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_name: claudear-macos-arm64
@@ -119,7 +120,6 @@ jobs:
       - name: Calculate checksums
         id: checksums
         run: |
-          echo "sha256_macos_amd64=$(sha256sum assets/claudear-macos-amd64.tar.gz | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
           echo "sha256_macos_arm64=$(sha256sum assets/claudear-macos-arm64.tar.gz | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
           echo "sha256_linux_amd64=$(sha256sum assets/claudear-linux-amd64.tar.gz | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
 
@@ -127,7 +127,6 @@ jobs:
         run: |
           sed -e "s/{{VERSION}}/${{ steps.version.outputs.version }}/g" \
               -e "s/{{REPO_OWNER}}/${{ github.repository_owner }}/g" \
-              -e "s/{{SHA256_MACOS_AMD64}}/${{ steps.checksums.outputs.sha256_macos_amd64 }}/g" \
               -e "s/{{SHA256_MACOS_ARM64}}/${{ steps.checksums.outputs.sha256_macos_arm64 }}/g" \
               -e "s/{{SHA256_LINUX_AMD64}}/${{ steps.checksums.outputs.sha256_linux_amd64 }}/g" \
               .github/formula/claudear.rb.template > claudear.rb
