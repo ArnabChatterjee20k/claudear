@@ -333,6 +333,7 @@ mod tests {
             min_event_count: 10,
             escalation_threshold_percent: 50,
             client_secret: None,
+            ..Default::default()
         };
         let client = SentryApiClient::from_config(&config);
         assert_eq!(client.auth_token, "sentry_token");

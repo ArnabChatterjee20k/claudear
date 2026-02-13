@@ -2793,6 +2793,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
         assert!(monitor.is_bug_type(&sentry_attempt));
 
@@ -2813,6 +2815,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
         assert!(!monitor.is_bug_type(&linear_attempt));
     }
@@ -2845,6 +2849,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
         assert_eq!(
             monitor.get_issue_type(&sentry_attempt),
@@ -2867,6 +2873,8 @@ mod tests {
             retry_count: 0,
             last_retry_at: None,
             issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
         };
         assert_eq!(
             monitor.get_issue_type(&linear_attempt),

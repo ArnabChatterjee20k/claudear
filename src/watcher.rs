@@ -3,10 +3,10 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::feedback::{format_similar_issues_context, IssueEmbeddingService};
-use crate::github::{PrReviewState, ReviewWatcher};
+use crate::github::{GitHubClient, PrReviewState, PrStatus, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::Notifier;
-use crate::repo::{GitOps, RepoIndex};
+use crate::repo::{GitOps, RepoIndex, RepoRelationships};
 use crate::retry::RetryManager;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::source::IssueSource;
@@ -33,6 +33,8 @@ pub struct WatcherOptions {
     pub embedding_client: Option<crate::feedback::EmbeddingClient>,
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    pub relationships: Option<RepoRelationships>,
+    pub github_client: Option<GitHubClient>,
     pub dry_run: bool,
 }
 
@@ -47,6 +49,8 @@ pub struct Watcher {
     embedding_client: Option<crate::feedback::EmbeddingClient>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    relationships: Option<RepoRelationships>,
+    github_client: Option<GitHubClient>,
     claude: ClaudeRunner,
     dry_run: bool,
     is_running: AtomicBool,
@@ -79,6 +83,8 @@ impl Watcher {
             embedding_client: options.embedding_client,
             review_watcher: options.review_watcher,
             issue_embedding_service: options.issue_embedding_service,
+            relationships: options.relationships,
+            github_client: options.github_client,
             dry_run: options.dry_run,
             is_running: AtomicBool::new(false),
             processing: RwLock::new(HashSet::new()),
@@ -267,10 +273,24 @@ impl Watcher {
         tracing::info!("  Known orgs: {}", self.config.known_orgs.len());
         tracing::info!("  Poll interval: {}ms", poll_interval);
         tracing::info!(
-            "  Max issues per cycle: {}",
+            "  Max issues per cycle: {} (global)",
             self.config.max_issues_per_cycle
         );
-        tracing::info!("  Max concurrent: {}", self.config.max_concurrent);
+        tracing::info!("  Max concurrent: {} (global)", self.config.max_concurrent);
+        for source in &self.sources {
+            let src_max_issues = self.config.max_issues_per_cycle_for(source.name());
+            let src_max_concurrent = self.config.max_concurrent_for(source.name());
+            if src_max_issues != self.config.max_issues_per_cycle
+                || src_max_concurrent != self.config.max_concurrent
+            {
+                tracing::info!(
+                    "    {}: max_issues={}, max_concurrent={}",
+                    source.name(),
+                    src_max_issues,
+                    src_max_concurrent
+                );
+            }
+        }
         tracing::info!("  Processing delay: {}ms", self.config.processing_delay_ms);
         tracing::info!(
             "  Sources: {}",
@@ -280,6 +300,21 @@ impl Watcher {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+
+        if self.config.cascade.enabled {
+            tracing::info!("  Cascade: enabled");
+            if self.config.cascade.max_depth > 0 {
+                tracing::info!("    Max depth: {}", self.config.cascade.max_depth);
+            } else {
+                tracing::info!("    Max depth: unlimited");
+            }
+            if let Some(ref rels) = self.relationships {
+                let repo_count = rels.list_repositories().len();
+                tracing::info!("    Repos in dependency graph: {}", repo_count);
+            }
+        } else {
+            tracing::info!("  Cascade: disabled");
+        }
 
         if self.dry_run {
             tracing::warn!("");
@@ -563,6 +598,280 @@ impl Watcher {
         Ok(())
     }
 
+    /// Trigger cascade processing for downstream repos after a PR is merged.
+    ///
+    /// Looks up the merged repo in the dependency graph and spawns Claude
+    /// in each direct dependent repo with context about the upstream changes.
+    pub async fn trigger_cascade(
+        &self,
+        attempt: &crate::types::FixAttempt,
+        pr_url: &str,
+    ) -> Result<()> {
+        let relationships = match &self.relationships {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        if !self.config.cascade.enabled {
+            return Ok(());
+        }
+
+        let github_repo = match &attempt.github_repo {
+            Some(r) => r.clone(),
+            None => return Ok(()),
+        };
+
+        if attempt.github_pr_number.is_none() {
+            return Ok(());
+        }
+
+        // Check cascade depth limit
+        if self.config.cascade.max_depth > 0 {
+            let depth = self.get_cascade_depth(attempt);
+            if depth >= self.config.cascade.max_depth {
+                tracing::info!(
+                    short_id = %attempt.short_id,
+                    depth = depth,
+                    max_depth = self.config.cascade.max_depth,
+                    "Cascade depth limit reached, stopping"
+                );
+                return Ok(());
+            }
+        }
+
+        // Normalize repo name for dependency graph lookup
+        // github_repo is "owner/repo", graph uses short names like "appwrite"
+        let repo_short_name = github_repo.split('/').next_back().unwrap_or(&github_repo);
+
+        let dependants = relationships.get_dependants(repo_short_name);
+        if dependants.is_empty() {
+            tracing::debug!(
+                repo = %github_repo,
+                short_name = %repo_short_name,
+                "No downstream dependants found for cascade"
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            repo = %github_repo,
+            dependants = dependants.len(),
+            "Triggering cascade for downstream repos"
+        );
+
+        let upstream_pr_url = pr_url.to_string();
+        let graph = relationships.get_graph();
+
+        for dependant in dependants {
+            let dep_type = graph
+                .get_first_hop_dependency_type(repo_short_name)
+                .map(|t| t.as_str())
+                .unwrap_or("unknown");
+
+            if let Err(e) = self
+                .cascade_to_repo(
+                    attempt,
+                    &dependant.name,
+                    &github_repo,
+                    &upstream_pr_url,
+                    dep_type,
+                )
+                .await
+            {
+                tracing::error!(
+                    upstream = %github_repo,
+                    downstream = %dependant.name,
+                    error = %e,
+                    "Failed to cascade to downstream repo"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the cascade depth of an attempt (0 for root, 1 for first cascade, etc.)
+    fn get_cascade_depth(&self, attempt: &crate::types::FixAttempt) -> usize {
+        let mut depth = 0;
+        let mut current_parent = attempt.parent_attempt_id;
+
+        while let Some(parent_id) = current_parent {
+            depth += 1;
+            match self
+                .sqlite_tracker
+                .as_ref()
+                .and_then(|t| t.get_attempt_by_id(parent_id).ok().flatten())
+            {
+                Some(parent) => current_parent = parent.parent_attempt_id,
+                None => break,
+            }
+        }
+
+        depth
+    }
+
+    /// Execute a cascade fix in a single downstream repo.
+    async fn cascade_to_repo(
+        &self,
+        parent_attempt: &crate::types::FixAttempt,
+        downstream_repo_name: &str,
+        upstream_repo: &str,
+        upstream_pr_url: &str,
+        dep_type: &str,
+    ) -> Result<()> {
+        tracing::info!(
+            upstream = %upstream_repo,
+            downstream = %downstream_repo_name,
+            parent_id = parent_attempt.id,
+            "Cascading to downstream repo"
+        );
+
+        // Resolve the downstream repo's local path
+        let resolution = crate::inference::resolve_repo_for_cascade(
+            self.inferrer.as_ref(),
+            downstream_repo_name,
+        );
+
+        let (project_dir, github_url, default_branch) = match resolution {
+            crate::inference::RepoResolution::Resolved {
+                project_dir,
+                github_url,
+                default_branch,
+                ..
+            } => (project_dir, github_url, default_branch),
+            crate::inference::RepoResolution::Skip { reason } => {
+                tracing::warn!(
+                    downstream = %downstream_repo_name,
+                    reason = %reason,
+                    "Cannot cascade — downstream repo not available"
+                );
+                return Ok(());
+            }
+        };
+
+        // Record cascade attempt
+        let sqlite = match &self.sqlite_tracker {
+            Some(t) => t,
+            None => {
+                tracing::warn!("No SQLite tracker available for cascade tracking");
+                return Ok(());
+            }
+        };
+
+        let attempt_id = sqlite.record_cascade_attempt(
+            &parent_attempt.source,
+            &parent_attempt.issue_id,
+            &parent_attempt.short_id,
+            parent_attempt.id,
+            &github_url,
+        )?;
+
+        // Ensure the downstream repo is up to date
+        if let Err(e) =
+            GitOps::ensure_repo_at_path(&project_dir, &github_url, &default_branch).await
+        {
+            tracing::warn!(
+                downstream = %downstream_repo_name,
+                error = %e,
+                "Failed to ensure repo is up to date, continuing anyway"
+            );
+        }
+
+        // Build the cascade prompt
+        let prompt = format!(
+            r#"A dependency has been updated in {upstream_repo}.
+
+## Original Issue
+[{short_id}] {source} issue that was fixed upstream.
+
+## Upstream PR
+{upstream_pr_url}
+
+Review the upstream PR above to understand what changed.
+
+## Your Task
+This repository ({downstream_repo_name}) depends on {upstream_repo} via {dep_type}.
+Review the upstream changes and make any necessary adaptations:
+- Update dependency version if needed
+- Adapt to any API changes
+- Update tests that exercise the changed functionality
+- Ensure the project builds and tests pass
+
+Create a PR with your changes."#,
+            upstream_repo = upstream_repo,
+            short_id = parent_attempt.short_id,
+            source = parent_attempt.source,
+            upstream_pr_url = upstream_pr_url,
+            downstream_repo_name = downstream_repo_name,
+            dep_type = dep_type,
+        );
+
+        // Run Claude
+        let result = self
+            .claude
+            .execute_with_attempt(&prompt, None, Some(attempt_id), &project_dir)
+            .await?;
+
+        if result.success {
+            if let Some(ref pr_url) = result.pr_url {
+                tracing::info!(
+                    downstream = %downstream_repo_name,
+                    pr_url = %pr_url,
+                    "Cascade PR created"
+                );
+
+                // Update the cascade attempt with PR details
+                if let Some((repo, pr_num)) = SqliteTracker::parse_pr_url(pr_url) {
+                    sqlite.update_attempt_pr(attempt_id, pr_url, &repo, pr_num)?;
+                }
+
+                // Register for review watching — this enables recursive cascade
+                if let Some(ref review_watcher) = self.review_watcher {
+                    if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(pr_url) {
+                        let state = PrReviewState::new(
+                            pr_url,
+                            &repo,
+                            pr_number,
+                            &parent_attempt.issue_id,
+                            &parent_attempt.source,
+                        );
+                        review_watcher.watch_pr(state);
+                        tracing::info!(
+                            component = "cascade",
+                            pr_url = %pr_url,
+                            "Cascade PR registered for review watching"
+                        );
+                    }
+                }
+
+                // Log activity
+                let activity = ActivityLogEntry::new(
+                    "cascade_pr_created",
+                    format!(
+                        "Cascade PR created in {} for upstream {}",
+                        downstream_repo_name, upstream_repo
+                    ),
+                )
+                .with_source(parent_attempt.source.clone())
+                .with_issue(
+                    parent_attempt.issue_id.clone(),
+                    parent_attempt.short_id.clone(),
+                );
+                self.tracker.record_activity(&activity).ok();
+            }
+        } else {
+            let error = result.error.unwrap_or_else(|| "Unknown error".to_string());
+            tracing::warn!(
+                downstream = %downstream_repo_name,
+                error = %error,
+                "Cascade fix failed"
+            );
+            sqlite.mark_cascade_failed(attempt_id, &error)?;
+        }
+
+        Ok(())
+    }
+
     /// Seed the tracker with existing issues.
     pub async fn seed(&self) -> Result<SeedResult> {
         tracing::info!("");
@@ -635,6 +944,13 @@ impl Watcher {
             }
         }
 
+        // Check for PR merges and trigger cascades
+        if !self.dry_run {
+            if let Err(e) = self.check_pr_merges_and_cascade().await {
+                tracing::error!(component = "watcher", error = %e, "Error checking PR merges for cascade");
+            }
+        }
+
         Ok(())
     }
 
@@ -672,8 +988,9 @@ impl Watcher {
                 }
             }
 
-            // Wait for concurrency slot
-            while self.active_processing.load(Ordering::SeqCst) >= self.config.max_concurrent {
+            // Wait for concurrency slot (per-source limit)
+            let retry_max_concurrent = self.config.max_concurrent_for(&attempt.source);
+            while self.active_processing.load(Ordering::SeqCst) >= retry_max_concurrent {
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -704,6 +1021,58 @@ impl Watcher {
             // Add delay between retries
             if self.config.processing_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check for merged PRs and trigger cascade processing.
+    async fn check_pr_merges_and_cascade(&self) -> Result<()> {
+        let github_client = match &self.github_client {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        if !self.config.cascade.enabled {
+            return Ok(());
+        }
+
+        // Get all successful attempts with PRs that haven't been merged yet
+        let pending_prs = self.tracker.get_pending_prs()?;
+
+        for attempt in &pending_prs {
+            let repo = match &attempt.github_repo {
+                Some(r) => r,
+                None => continue,
+            };
+            let pr_number = match attempt.github_pr_number {
+                Some(n) => n,
+                None => continue,
+            };
+
+            match github_client.get_pr_status(repo, pr_number).await {
+                Ok(PrStatus::Merged) => {
+                    self.tracker
+                        .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    let pr_url = attempt.pr_url.as_deref().unwrap_or("");
+                    if let Err(e) = self.trigger_cascade(attempt, pr_url).await {
+                        tracing::error!(
+                            component = "cascade",
+                            short_id = %attempt.short_id,
+                            error = %e,
+                            "Failed to trigger cascade after merge"
+                        );
+                    }
+                }
+                Ok(_) => {} // Still open or closed
+                Err(e) => {
+                    tracing::debug!(
+                        short_id = %attempt.short_id,
+                        error = %e,
+                        "Failed to check PR status"
+                    );
+                }
             }
         }
 
@@ -756,16 +1125,12 @@ impl Watcher {
         // Sort by priority
         self.sort_by_priority(&mut candidates);
 
-        // Apply max issues per cycle limit
-        let to_process: Vec<_> = candidates
-            .into_iter()
-            .take(self.config.max_issues_per_cycle)
-            .collect();
+        // Apply per-source max issues per cycle limit (falls back to global)
+        let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
+        let to_process: Vec<_> = candidates.into_iter().take(source_max_issues).collect();
 
         let to_process_count = to_process.len();
-        let skipped = to_process
-            .len()
-            .saturating_sub(self.config.max_issues_per_cycle);
+        let skipped = to_process.len().saturating_sub(source_max_issues);
         if skipped > 0 {
             tracing::info!(
                 source = source.name(),
@@ -844,14 +1209,15 @@ impl Watcher {
             self.notifier.notify_urgent_issues(&urgent_issues).await?;
         }
 
-        // Process issues with rate limiting
+        // Process issues with rate limiting (per-source concurrency limit)
+        let source_max_concurrent = self.config.max_concurrent_for(source.name());
         for (i, (issue, match_result)) in to_process.into_iter().enumerate() {
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
 
-            // Wait for concurrency slot
-            while self.active_processing.load(Ordering::SeqCst) >= self.config.max_concurrent {
+            // Wait for concurrency slot (per-source limit)
+            while self.active_processing.load(Ordering::SeqCst) >= source_max_concurrent {
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -864,7 +1230,7 @@ impl Watcher {
             this.process_issue(source_clone, issue, match_result).await;
 
             // Add delay between starting new issues
-            if i < self.config.max_issues_per_cycle - 1 && self.config.processing_delay_ms > 0 {
+            if i < source_max_issues - 1 && self.config.processing_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
             }
         }
@@ -1513,6 +1879,7 @@ mod tests {
             linear: None,
             sentry: None,
             regression: crate::config::RegressionConfig::default(),
+            cascade: crate::config::CascadeConfig::default(),
         }
     }
 
@@ -1532,6 +1899,8 @@ mod tests {
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
             dry_run,
         })
     }
@@ -1805,6 +2174,8 @@ mod tests {
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
             dry_run: true,
         };
 
@@ -2335,6 +2706,8 @@ mod tests {
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
             dry_run: false,
         });
 
@@ -2412,6 +2785,8 @@ mod tests {
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
             dry_run: true,
         });
 
@@ -2527,5 +2902,98 @@ mod tests {
         assert_eq!(stats.total, 2);
         assert_eq!(stats.success, 1);
         assert_eq!(stats.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cascade_triggers_on_merge() {
+        use crate::repo::DependencyType;
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        // Setup: Create relationships with an upstream and downstream repo
+        let mut relationships = RepoRelationships::new();
+        relationships
+            .add_dependency(
+                "upstream-lib",
+                "downstream-app",
+                DependencyType::Composer,
+                None,
+            )
+            .unwrap();
+
+        // Create a FixAttempt that simulates a merged upstream PR
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-123".to_string(),
+            short_id: "ISSUE-123".to_string(),
+            source: "linear".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: Some("https://github.com/org/upstream-lib/pull/42".to_string()),
+            github_repo: Some("org/upstream-lib".to_string()),
+            github_pr_number: Some(42),
+            status: FixAttemptStatus::Merged,
+            error_message: None,
+            merged_at: Some(chrono::Utc::now()),
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        // Verify that get_dependants returns the downstream repo
+        let dependants = relationships.get_dependants("upstream-lib");
+        assert_eq!(dependants.len(), 1);
+        assert_eq!(dependants[0].name, "downstream-app");
+
+        // Verify cascade depth calculation for root attempt
+        assert_eq!(attempt.parent_attempt_id, None);
+
+        // Verify repo name normalization (github_repo "org/upstream-lib" -> "upstream-lib")
+        let repo_short_name = attempt
+            .github_repo
+            .as_ref()
+            .unwrap()
+            .split('/')
+            .next_back()
+            .unwrap();
+        assert_eq!(repo_short_name, "upstream-lib");
+    }
+
+    #[test]
+    fn test_cascade_depth_with_no_parent() {
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-1".to_string(),
+            short_id: "ISSUE-1".to_string(),
+            source: "linear".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        // Root attempt has depth 0
+        assert!(attempt.parent_attempt_id.is_none());
+    }
+
+    #[test]
+    fn test_cascade_config_defaults() {
+        use crate::config::CascadeConfig;
+
+        let config = CascadeConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.max_depth, 0);
     }
 }

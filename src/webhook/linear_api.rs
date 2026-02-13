@@ -360,6 +360,7 @@ mod tests {
             team_id: None,
             project_id: None,
             webhook_secret: None,
+            ..Default::default()
         };
         let client = LinearApiClient::from_config(&config);
         assert_eq!(client.api_key, "lin_config_key");

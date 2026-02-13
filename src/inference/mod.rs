@@ -81,6 +81,38 @@ impl RepoResolution {
 ///
 /// This is the shared entry point for repo resolution used by both the watcher
 /// and webhook server. It handles:
+/// Resolve a repository path for cascade processing.
+/// Unlike issue-based resolution, this looks up a repo directly by name.
+pub fn resolve_repo_for_cascade(
+    inferrer: Option<&RepoInferrer>,
+    repo_name: &str,
+) -> RepoResolution {
+    let inferrer = match inferrer {
+        Some(i) => i,
+        None => {
+            return RepoResolution::Skip {
+                reason: "No inferrer available".to_string(),
+            }
+        }
+    };
+
+    match inferrer.with_index(|index| Ok(index.get(repo_name).cloned())) {
+        Ok(Some(repo)) => RepoResolution::Resolved {
+            project_dir: repo.path,
+            repo_name: repo.name,
+            repo_id: None,
+            github_url: repo.github_url,
+            default_branch: repo.default_branch,
+        },
+        Ok(None) => RepoResolution::Skip {
+            reason: format!("Repository '{}' not found in index", repo_name),
+        },
+        Err(e) => RepoResolution::Skip {
+            reason: format!("Index error: {}", e),
+        },
+    }
+}
+
 /// - Inferring the repository using the inference engine
 /// - Recording analytics for the inference attempt
 /// - Logging activity for the attempt

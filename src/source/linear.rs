@@ -947,6 +947,7 @@ mod tests {
             team_id: None,
             project_id: None,
             webhook_secret: None,
+            ..Default::default()
         }
     }
 
@@ -1092,6 +1093,7 @@ mod tests {
             team_id: None,
             project_id: None,
             webhook_secret: None,
+            ..Default::default()
         };
         let source = LinearSource::new(config);
 
@@ -1119,6 +1121,7 @@ mod tests {
             team_id: None,
             project_id: None,
             webhook_secret: None,
+            ..Default::default()
         };
         let source = LinearSource::new(config);
 
@@ -1333,6 +1336,7 @@ mod tests {
             team_id: Some("team_123".to_string()),
             project_id: Some("project_456".to_string()),
             webhook_secret: Some("secret".to_string()),
+            ..Default::default()
         };
         let source = LinearSource::new(config);
 

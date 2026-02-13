@@ -302,6 +302,7 @@ mod tests {
             team_id: None,
             project_id: None,
             webhook_secret: Some("test_secret".to_string()),
+            ..Default::default()
         }
     }
 

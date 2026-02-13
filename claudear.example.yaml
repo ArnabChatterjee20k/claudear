@@ -151,6 +151,10 @@ linear:
   # Set via LINEAR_WEBHOOK_SECRET env var for security
   webhook_secret: ""
 
+  # Per-source rate limiting (overrides global values if set)
+  # max_issues_per_cycle: 3
+  # max_concurrent: 2
+
 # ============================================
 # Sentry Configuration
 # ============================================
@@ -185,6 +189,10 @@ sentry:
   # Optional: Webhook client secret for signature verification
   # Set via SENTRY_CLIENT_SECRET env var for security
   client_secret: ""
+
+  # Per-source rate limiting (overrides global values if set)
+  # max_issues_per_cycle: 2
+  # max_concurrent: 4
 
 # ============================================
 # GitHub PR Monitoring (Optional)

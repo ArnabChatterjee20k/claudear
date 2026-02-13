@@ -1259,6 +1259,7 @@ mod tests {
             min_event_count: 10,
             escalation_threshold_percent: 50,
             client_secret: None,
+            ..Default::default()
         }
     }
 
@@ -1546,6 +1547,7 @@ mod tests {
             min_event_count: 5,
             escalation_threshold_percent: 25,
             client_secret: Some("secret".to_string()),
+            ..Default::default()
         };
         let source = SentrySource::new(config);
         assert_eq!(source.name(), "sentry");
@@ -1563,6 +1565,7 @@ mod tests {
             min_event_count: 10,
             escalation_threshold_percent: 50,
             client_secret: None,
+            ..Default::default()
         };
         let source = SentrySource::new(config);
 
@@ -1597,6 +1600,7 @@ mod tests {
             min_event_count: 10,
             escalation_threshold_percent: 50,
             client_secret: None,
+            ..Default::default()
         };
         let source = SentrySource::new(config);
 
