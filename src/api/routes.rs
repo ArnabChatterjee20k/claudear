@@ -1235,6 +1235,25 @@ mod tests {
         assert_eq!(summary.status, "failed");
     }
 
+    #[tokio::test]
+    async fn test_unauthenticated_returns_401() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let router = create_api_router(config, tracker).layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn test_source_summary_zero_values() {
         let summary = SourceSummary {
