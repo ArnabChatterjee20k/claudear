@@ -546,6 +546,11 @@ impl Config {
         // Apply environment variable overrides
         config.apply_env_overrides();
 
+        // Resolve instructions_file if set
+        let config_dir = path.parent().unwrap_or(Path::new("."));
+        let resolved_instructions = config.resolve_instructions_file(config_dir)?;
+        config.claude.instructions = resolved_instructions;
+
         // Validate project directory configuration
         config.validate_project_config()?;
 
@@ -2412,16 +2417,23 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_claude_instructions_file() {
-        let yaml = r#"
-work_dir: /tmp/repos
-"#;
-        let file = create_temp_yaml(yaml);
+        let dir = tempfile::tempdir().unwrap();
+        let instructions_path = dir.path().join("my-instructions.md");
+        fs::write(&instructions_path, "File content.").unwrap();
 
-        with_env(&[("CLAUDE_INSTRUCTIONS_FILE", "./my-instructions.md")], || {
-            let config = Config::load(file.path()).unwrap();
+        let config_path = dir.path().join("claudear.yaml");
+        fs::write(&config_path, "work_dir: /tmp/repos\n").unwrap();
+
+        with_env(&[("CLAUDE_INSTRUCTIONS_FILE", "my-instructions.md")], || {
+            let config = Config::load(&config_path).unwrap();
             assert_eq!(
                 config.claude.instructions_file,
-                Some("./my-instructions.md".to_string())
+                Some("my-instructions.md".to_string())
+            );
+            // After load, instructions should contain resolved file content
+            assert_eq!(
+                config.claude.instructions,
+                Some("File content.".to_string())
             );
         });
     }
@@ -2553,5 +2565,25 @@ claude:
         let config = Config::from_yaml(yaml).unwrap();
         let resolved = config.resolve_instructions_file(dir.path()).unwrap();
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn test_load_resolves_instructions_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions_path = dir.path().join("my-instructions.md");
+        fs::write(&instructions_path, "Instructions from file.").unwrap();
+
+        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"my-instructions.md\"\n  instructions: \"And inline.\"";
+        let config_path = dir.path().join("claudear.yaml");
+        fs::write(&config_path, &yaml).unwrap();
+
+        with_env(&[], || {
+            let config = Config::load(&config_path).unwrap();
+            // After load, instructions should be the merged result
+            assert_eq!(
+                config.claude.instructions,
+                Some("Instructions from file.\nAnd inline.".to_string())
+            );
+        });
     }
 }
