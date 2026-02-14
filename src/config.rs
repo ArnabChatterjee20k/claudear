@@ -575,6 +575,9 @@ impl Config {
         let resolved_instructions = config.resolve_instructions_file(config_dir)?;
         config.claude.instructions = resolved_instructions;
 
+        // Resolve user slug references in global notification configs
+        config.resolve_user_slugs();
+
         // Validate project directory configuration
         config.validate_project_config()?;
 
@@ -645,6 +648,60 @@ impl Config {
             (None, Some(inline)) => Ok(Some(inline.clone())),
             (None, None) => Ok(None),
         }
+    }
+
+    /// Resolve user slug references in global notification configs.
+    ///
+    /// If a field like `discord.user_id` matches a key in `users`,
+    /// replace it with the user's actual channel-specific ID.
+    pub fn resolve_user_slugs(&mut self) {
+        // Resolve discord.user_id
+        if let Some(ref user_id) = self.discord.user_id {
+            if let Some(user) = self.users.get(user_id) {
+                if let Some(ref discord_id) = user.discord_id {
+                    self.discord.user_id = Some(discord_id.clone());
+                }
+            }
+        }
+
+        // Resolve email.to_addresses
+        let resolved_emails: Vec<String> = self
+            .email
+            .to_addresses
+            .iter()
+            .map(|addr| {
+                if let Some(user) = self.users.get(addr) {
+                    user.email.clone().unwrap_or_else(|| addr.clone())
+                } else {
+                    addr.clone()
+                }
+            })
+            .collect();
+        self.email.to_addresses = resolved_emails;
+
+        // Resolve push.user_key
+        if let Some(ref user_key) = self.push.user_key {
+            if let Some(user) = self.users.get(user_key) {
+                if let Some(ref push_key) = user.push_user_key {
+                    self.push.user_key = Some(push_key.clone());
+                }
+            }
+        }
+
+        // Resolve sms.to_numbers
+        let resolved_numbers: Vec<String> = self
+            .sms
+            .to_numbers
+            .iter()
+            .map(|num| {
+                if let Some(user) = self.users.get(num) {
+                    user.sms_number.clone().unwrap_or_else(|| num.clone())
+                } else {
+                    num.clone()
+                }
+            })
+            .collect();
+        self.sms.to_numbers = resolved_numbers;
     }
 
     /// Apply environment variable overrides to the config.
@@ -2651,5 +2708,88 @@ users:
     fn test_users_config_default_empty() {
         let config = Config::default();
         assert!(config.users.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_user_slug_in_discord_config() {
+        let yaml = r#"
+users:
+  jake:
+    discord_id: "123456789"
+    email: "jake@example.com"
+discord:
+  webhook_url: "https://discord.com/api/webhooks/123/abc"
+  user_id: "jake"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.resolve_user_slugs();
+        assert_eq!(config.discord.user_id.as_deref(), Some("123456789"));
+    }
+
+    #[test]
+    fn test_resolve_user_slug_not_found_keeps_raw_value() {
+        let yaml = r#"
+users:
+  jake:
+    discord_id: "123456789"
+discord:
+  webhook_url: "https://discord.com/api/webhooks/123/abc"
+  user_id: "999888777"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.resolve_user_slugs();
+        assert_eq!(config.discord.user_id.as_deref(), Some("999888777"));
+    }
+
+    #[test]
+    fn test_resolve_user_slug_in_email_config() {
+        let yaml = r#"
+users:
+  jake:
+    email: "jake@resolved.com"
+email:
+  smtp_host: "smtp.example.com"
+  to_addresses:
+    - "jake"
+    - "other@example.com"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.resolve_user_slugs();
+        assert_eq!(
+            config.email.to_addresses,
+            vec!["jake@resolved.com", "other@example.com"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_user_slug_in_push_config() {
+        let yaml = r#"
+users:
+  jake:
+    push_user_key: "resolved_push_key"
+push:
+  api_token: "token"
+  user_key: "jake"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.resolve_user_slugs();
+        assert_eq!(config.push.user_key.as_deref(), Some("resolved_push_key"));
+    }
+
+    #[test]
+    fn test_resolve_user_slug_in_sms_config() {
+        let yaml = r#"
+users:
+  jake:
+    sms_number: "+1234567890"
+sms:
+  account_sid: "sid"
+  to_numbers:
+    - "jake"
+    - "+9876543210"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.resolve_user_slugs();
+        assert_eq!(config.sms.to_numbers, vec!["+1234567890", "+9876543210"]);
     }
 }
