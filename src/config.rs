@@ -578,6 +578,46 @@ impl Config {
         Ok(config)
     }
 
+    /// Resolve `claude.instructions_file` by reading the file and combining
+    /// with inline `claude.instructions`.
+    ///
+    /// - `config_dir`: directory containing the config file (for relative path resolution)
+    /// - File content comes first, then inline instructions appended with a newline
+    /// - Returns `None` if neither field is set
+    /// - Returns error if the file path is set but the file cannot be read
+    pub fn resolve_instructions_file(&self, config_dir: &Path) -> Result<Option<String>> {
+        let file_content = if let Some(ref file_path) = self.claude.instructions_file {
+            let path = Path::new(file_path);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                config_dir.join(path)
+            };
+            let content = fs::read_to_string(&resolved).map_err(|e| {
+                Error::config(format!(
+                    "Failed to read instructions file '{}': {}",
+                    resolved.display(),
+                    e
+                ))
+            })?;
+            let trimmed = content.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        } else {
+            None
+        };
+
+        match (file_content, &self.claude.instructions) {
+            (Some(file), Some(inline)) => Ok(Some(format!("{}\n{}", file, inline))),
+            (Some(file), None) => Ok(Some(file)),
+            (None, Some(inline)) => Ok(Some(inline.clone())),
+            (None, None) => Ok(None),
+        }
+    }
+
     /// Apply environment variable overrides to the config.
     /// Environment variables take precedence over YAML values.
     fn apply_env_overrides(&mut self) {
@@ -2428,5 +2468,90 @@ claude:
             let config = Config::load(file.path()).unwrap();
             assert!(config.claude.skip_permissions);
         });
+    }
+
+    #[test]
+    fn test_resolve_instructions_file_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions_path = dir.path().join("instructions.md");
+        fs::write(&instructions_path, "Be helpful and concise.").unwrap();
+
+        let yaml = format!(
+            "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"{}\"",
+            instructions_path.display()
+        );
+        let config = Config::from_yaml(&yaml).unwrap();
+        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+        assert_eq!(resolved, Some("Be helpful and concise.".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_instructions_file_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions_path = dir.path().join("my-instructions.md");
+        fs::write(&instructions_path, "Write tests first.").unwrap();
+
+        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"my-instructions.md\"";
+        let config = Config::from_yaml(yaml).unwrap();
+        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+        assert_eq!(resolved, Some("Write tests first.".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_instructions_file_combines_with_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions_path = dir.path().join("base.md");
+        fs::write(&instructions_path, "Base instructions from file.").unwrap();
+
+        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"base.md\"\n  instructions: \"Plus inline.\"";
+        let config = Config::from_yaml(yaml).unwrap();
+        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+        assert_eq!(
+            resolved,
+            Some("Base instructions from file.\nPlus inline.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_instructions_file_inline_only() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions: \"Just inline.\"";
+        let config = Config::from_yaml(yaml).unwrap();
+        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+        assert_eq!(resolved, Some("Just inline.".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_instructions_file_neither_set() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let yaml = "work_dir: /tmp/repos";
+        let config = Config::from_yaml(yaml).unwrap();
+        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn test_resolve_instructions_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"nonexistent.md\"";
+        let config = Config::from_yaml(yaml).unwrap();
+        let result = config.resolve_instructions_file(dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nonexistent.md"));
+    }
+
+    #[test]
+    fn test_resolve_instructions_file_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions_path = dir.path().join("empty.md");
+        fs::write(&instructions_path, "").unwrap();
+
+        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"empty.md\"";
+        let config = Config::from_yaml(yaml).unwrap();
+        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+        assert_eq!(resolved, None);
     }
 }
