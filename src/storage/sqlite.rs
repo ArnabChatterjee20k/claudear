@@ -7073,4 +7073,1596 @@ mod tests {
             .unwrap();
         assert_eq!(success_count, 1);
     }
+
+    // ---------------------------------------------------------------
+    // Activity log operations
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_activity_returns_positive_id() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let entry = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "issue_received".to_string(),
+            source: Some("linear".to_string()),
+            issue_id: Some("abc-123".to_string()),
+            short_id: Some("LIN-1".to_string()),
+            message: "New issue received".to_string(),
+            metadata: None,
+        };
+
+        let id = tracker.record_activity(&entry).unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn test_record_activity_with_metadata() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let meta = serde_json::json!({"priority": "high", "assignee": "alice"});
+        let entry = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "processing_started".to_string(),
+            source: Some("sentry".to_string()),
+            issue_id: Some("evt-1".to_string()),
+            short_id: None,
+            message: "Processing started".to_string(),
+            metadata: Some(meta.clone()),
+        };
+
+        tracker.record_activity(&entry).unwrap();
+        let activities = tracker.get_recent_activities(10, None).unwrap();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].metadata.as_ref().unwrap()["priority"], "high");
+    }
+
+    #[test]
+    fn test_get_recent_activities_empty_db() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let activities = tracker.get_recent_activities(10, None).unwrap();
+        assert!(activities.is_empty());
+    }
+
+    #[test]
+    fn test_get_recent_activities_respects_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for i in 0..5 {
+            let entry = ActivityLogEntry {
+                id: 0,
+                timestamp: Utc::now(),
+                activity_type: "test".to_string(),
+                source: Some("linear".to_string()),
+                issue_id: Some(format!("issue-{}", i)),
+                short_id: None,
+                message: format!("Activity {}", i),
+                metadata: None,
+            };
+            tracker.record_activity(&entry).unwrap();
+        }
+
+        let activities = tracker.get_recent_activities(3, None).unwrap();
+        assert_eq!(activities.len(), 3);
+    }
+
+    #[test]
+    fn test_get_recent_activities_source_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let sources = ["linear", "sentry", "linear"];
+        for (i, source) in sources.iter().enumerate() {
+            let entry = ActivityLogEntry {
+                id: 0,
+                timestamp: Utc::now(),
+                activity_type: "test".to_string(),
+                source: Some(source.to_string()),
+                issue_id: Some(format!("issue-{}", i)),
+                short_id: None,
+                message: format!("Activity {}", i),
+                metadata: None,
+            };
+            tracker.record_activity(&entry).unwrap();
+        }
+
+        let linear_only = tracker.get_recent_activities(10, Some("linear")).unwrap();
+        assert_eq!(linear_only.len(), 2);
+
+        let sentry_only = tracker.get_recent_activities(10, Some("sentry")).unwrap();
+        assert_eq!(sentry_only.len(), 1);
+
+        let github_only = tracker.get_recent_activities(10, Some("github")).unwrap();
+        assert!(github_only.is_empty());
+    }
+
+    #[test]
+    fn test_get_recent_activities_ordered_desc() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let timestamps = [
+            chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            chrono::DateTime::parse_from_rfc3339("2024-06-15T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            chrono::DateTime::parse_from_rfc3339("2024-03-10T06:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ];
+        for (i, ts) in timestamps.iter().enumerate() {
+            let entry = ActivityLogEntry {
+                id: 0,
+                timestamp: *ts,
+                activity_type: "test".to_string(),
+                source: None,
+                issue_id: Some(format!("{}", i)),
+                short_id: None,
+                message: format!("ts {}", i),
+                metadata: None,
+            };
+            tracker.record_activity(&entry).unwrap();
+        }
+
+        let activities = tracker.get_recent_activities(10, None).unwrap();
+        assert_eq!(activities.len(), 3);
+        // Most recent first
+        assert!(activities[0].timestamp >= activities[1].timestamp);
+        assert!(activities[1].timestamp >= activities[2].timestamp);
+    }
+
+    #[test]
+    fn test_get_activities_for_issue() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for i in 0..3 {
+            let entry = ActivityLogEntry {
+                id: 0,
+                timestamp: Utc::now(),
+                activity_type: format!("step_{}", i),
+                source: Some("linear".to_string()),
+                issue_id: Some("target-issue".to_string()),
+                short_id: Some("LIN-1".to_string()),
+                message: format!("Step {}", i),
+                metadata: None,
+            };
+            tracker.record_activity(&entry).unwrap();
+        }
+        // Different issue
+        let other = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "test".to_string(),
+            source: Some("linear".to_string()),
+            issue_id: Some("other-issue".to_string()),
+            short_id: None,
+            message: "Other".to_string(),
+            metadata: None,
+        };
+        tracker.record_activity(&other).unwrap();
+
+        let activities = tracker
+            .get_activities_for_issue("linear", "target-issue")
+            .unwrap();
+        assert_eq!(activities.len(), 3);
+
+        let empty = tracker
+            .get_activities_for_issue("linear", "nonexistent")
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_record_activities_batch_inserts_all() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let entries: Vec<ActivityLogEntry> = (0..10)
+            .map(|i| ActivityLogEntry {
+                id: 0,
+                timestamp: Utc::now(),
+                activity_type: "batch_test".to_string(),
+                source: Some("linear".to_string()),
+                issue_id: Some(format!("issue-{}", i)),
+                short_id: None,
+                message: format!("Batch entry {}", i),
+                metadata: None,
+            })
+            .collect();
+
+        let count = tracker.record_activities_batch(&entries).unwrap();
+        assert_eq!(count, 10);
+
+        let activities = tracker.get_recent_activities(100, None).unwrap();
+        assert_eq!(activities.len(), 10);
+    }
+
+    // ---------------------------------------------------------------
+    // PR review tracking
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_pr_review_and_retrieve() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-1").unwrap().unwrap();
+
+        let review = PrReviewRecord {
+            id: 0,
+            attempt_id: Some(attempt.id),
+            pr_url: "https://github.com/org/repo/pull/10".to_string(),
+            reviewer: Some("alice".to_string()),
+            review_state: Some("approved".to_string()),
+            submitted_at: Some(Utc::now()),
+            body: Some("Looks good!".to_string()),
+            sentiment: Some("positive".to_string()),
+            actionable_feedback: None,
+        };
+
+        let id = tracker.record_pr_review(&review).unwrap();
+        assert!(id > 0);
+
+        let reviews = tracker.get_reviews_for_attempt(attempt.id).unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].reviewer, Some("alice".to_string()));
+        assert_eq!(reviews[0].review_state, Some("approved".to_string()));
+        assert_eq!(reviews[0].body, Some("Looks good!".to_string()));
+        assert_eq!(reviews[0].sentiment, Some("positive".to_string()));
+    }
+
+    #[test]
+    fn test_multiple_reviews_per_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-1").unwrap().unwrap();
+
+        let reviewers = ["alice", "bob", "charlie"];
+        let states = ["approved", "changes_requested", "commented"];
+
+        for (reviewer, state) in reviewers.iter().zip(states.iter()) {
+            let review = PrReviewRecord {
+                id: 0,
+                attempt_id: Some(attempt.id),
+                pr_url: "https://github.com/org/repo/pull/10".to_string(),
+                reviewer: Some(reviewer.to_string()),
+                review_state: Some(state.to_string()),
+                submitted_at: Some(Utc::now()),
+                body: None,
+                sentiment: None,
+                actionable_feedback: None,
+            };
+            tracker.record_pr_review(&review).unwrap();
+        }
+
+        let reviews = tracker.get_reviews_for_attempt(attempt.id).unwrap();
+        assert_eq!(reviews.len(), 3);
+    }
+
+    #[test]
+    fn test_get_reviews_for_nonexistent_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let reviews = tracker.get_reviews_for_attempt(9999).unwrap();
+        assert!(reviews.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Embedding storage
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_store_and_retrieve_embedding() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let embedding = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "emb-1".to_string(),
+            short_id: Some("LIN-1".to_string()),
+            title: Some("Fix login bug".to_string()),
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            embedding_model: Some("text-embedding-3-small".to_string()),
+            created_at: Utc::now(),
+        };
+
+        let id = tracker.store_embedding(&embedding).unwrap();
+        assert!(id > 0);
+
+        let retrieved = tracker.get_embedding("linear", "emb-1").unwrap().unwrap();
+        assert_eq!(retrieved.source, "linear");
+        assert_eq!(retrieved.issue_id, "emb-1");
+        assert_eq!(retrieved.short_id, Some("LIN-1".to_string()));
+        assert_eq!(retrieved.title, Some("Fix login bug".to_string()));
+        assert_eq!(retrieved.embedding.len(), 4);
+        assert!((retrieved.embedding[0] - 0.1).abs() < f32::EPSILON);
+        assert!((retrieved.embedding[3] - 0.4).abs() < f32::EPSILON);
+        assert_eq!(
+            retrieved.embedding_model,
+            Some("text-embedding-3-small".to_string())
+        );
+    }
+
+    #[test]
+    fn test_store_embedding_upsert_updates_on_conflict() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let original = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "emb-1".to_string(),
+            short_id: Some("LIN-1".to_string()),
+            title: Some("Original title".to_string()),
+            embedding: vec![1.0, 2.0],
+            embedding_model: Some("model-v1".to_string()),
+            created_at: Utc::now(),
+        };
+        tracker.store_embedding(&original).unwrap();
+
+        let updated = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "emb-1".to_string(),
+            short_id: Some("LIN-1".to_string()),
+            title: Some("Original title".to_string()),
+            embedding: vec![3.0, 4.0, 5.0],
+            embedding_model: Some("model-v2".to_string()),
+            created_at: Utc::now(),
+        };
+        tracker.store_embedding(&updated).unwrap();
+
+        let retrieved = tracker.get_embedding("linear", "emb-1").unwrap().unwrap();
+        assert_eq!(retrieved.embedding.len(), 3);
+        assert!((retrieved.embedding[0] - 3.0).abs() < f32::EPSILON);
+        assert_eq!(retrieved.embedding_model, Some("model-v2".to_string()));
+    }
+
+    #[test]
+    fn test_get_embedding_nonexistent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker.get_embedding("linear", "nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_all_embeddings_pagination() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for i in 0..5 {
+            let emb = IssueEmbedding {
+                id: 0,
+                source: "linear".to_string(),
+                issue_id: format!("emb-{}", i),
+                short_id: None,
+                title: None,
+                embedding: vec![i as f32],
+                embedding_model: None,
+                created_at: Utc::now(),
+            };
+            tracker.store_embedding(&emb).unwrap();
+        }
+
+        let page1 = tracker.get_all_embeddings(None, Some(2), Some(0)).unwrap();
+        assert_eq!(page1.len(), 2);
+
+        let page2 = tracker.get_all_embeddings(None, Some(2), Some(2)).unwrap();
+        assert_eq!(page2.len(), 2);
+
+        let all = tracker.get_all_embeddings(None, Some(100), None).unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn test_get_all_embeddings_source_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let sources = ["linear", "sentry", "linear"];
+        for (i, source) in sources.iter().enumerate() {
+            let emb = IssueEmbedding {
+                id: 0,
+                source: source.to_string(),
+                issue_id: format!("emb-{}", i),
+                short_id: None,
+                title: None,
+                embedding: vec![1.0],
+                embedding_model: None,
+                created_at: Utc::now(),
+            };
+            tracker.store_embedding(&emb).unwrap();
+        }
+
+        let linear = tracker
+            .get_all_embeddings(Some("linear"), Some(100), None)
+            .unwrap();
+        assert_eq!(linear.len(), 2);
+
+        let sentry = tracker
+            .get_all_embeddings(Some("sentry"), Some(100), None)
+            .unwrap();
+        assert_eq!(sentry.len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Feedback outcomes
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_store_feedback_outcome_with_all_fields() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-fb", "LIN-FB")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-fb").unwrap().unwrap();
+
+        let outcome = FixOutcome {
+            id: 0,
+            attempt_id: attempt.id,
+            source: "linear".to_string(),
+            issue_id: "issue-fb".to_string(),
+            issue_text: "Null pointer in handler".to_string(),
+            prompt_used: "Fix the null pointer".to_string(),
+            outcome: crate::feedback::Outcome::CannotFix,
+            error_type: Some("null_reference".to_string()),
+            learnings: Some("Check for null before access".to_string()),
+            keywords: vec![
+                "null".to_string(),
+                "pointer".to_string(),
+                "handler".to_string(),
+            ],
+            embedding: None,
+            created_at: Utc::now(),
+        };
+
+        let id = tracker.store_feedback_outcome(&outcome).unwrap();
+        assert!(id > 0);
+
+        let retrieved = tracker
+            .get_feedback_outcome_by_attempt(attempt.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.outcome, crate::feedback::Outcome::CannotFix);
+        assert_eq!(retrieved.error_type, Some("null_reference".to_string()));
+        assert_eq!(retrieved.keywords.len(), 3);
+        assert!(retrieved.keywords.contains(&"null".to_string()));
+    }
+
+    #[test]
+    fn test_get_feedback_outcome_by_attempt_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker.get_feedback_outcome_by_attempt(9999).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_feedback_outcomes_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for i in 0..5 {
+            tracker
+                .record_attempt("linear", &format!("issue-{}", i), &format!("LIN-{}", i))
+                .unwrap();
+            let attempt = tracker
+                .get_attempt("linear", &format!("issue-{}", i))
+                .unwrap()
+                .unwrap();
+            let outcome = FixOutcome {
+                id: 0,
+                attempt_id: attempt.id,
+                source: "linear".to_string(),
+                issue_id: format!("issue-{}", i),
+                issue_text: "text".to_string(),
+                prompt_used: "prompt".to_string(),
+                outcome: crate::feedback::Outcome::Merged,
+                error_type: None,
+                learnings: None,
+                keywords: vec![],
+                embedding: None,
+                created_at: Utc::now(),
+            };
+            tracker.store_feedback_outcome(&outcome).unwrap();
+        }
+
+        let limited = tracker.get_feedback_outcomes(None, 3).unwrap();
+        assert_eq!(limited.len(), 3);
+    }
+
+    #[test]
+    fn test_get_feedback_outcomes_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let outcomes = tracker.get_feedback_outcomes(None, 100).unwrap();
+        assert!(outcomes.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Q&A knowledge
+    // ---------------------------------------------------------------
+
+    fn make_qa_entry(
+        source: &str,
+        repo: Option<&str>,
+        issue_id: &str,
+        question: &str,
+        answer: &str,
+        correlation_id: &str,
+    ) -> QaKnowledgeEntry {
+        let now = Utc::now();
+        QaKnowledgeEntry {
+            id: 0,
+            source: source.to_string(),
+            repo: repo.map(|r| r.to_string()),
+            issue_id: issue_id.to_string(),
+            short_id: format!("LIN-{}", issue_id),
+            question_text: question.to_string(),
+            question_norm: crate::qa::normalize_text(question),
+            question_embedding: None,
+            answer_text: answer.to_string(),
+            answer_norm: crate::qa::normalize_text(answer),
+            answer_embedding: None,
+            channel: "discord".to_string(),
+            responder: Some("user@example.com".to_string()),
+            correlation_id: correlation_id.to_string(),
+            asked_at: now,
+            answered_at: now,
+            success_count: 0,
+            failure_count: 0,
+            last_used_at: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_store_qa_knowledge_returns_positive_id() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let entry = make_qa_entry(
+            "linear",
+            Some("org/repo"),
+            "1",
+            "How to deploy?",
+            "Run deploy script",
+            "c1",
+        );
+        let id = tracker.store_qa_knowledge(&entry).unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn test_store_qa_knowledge_with_metadata() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut entry = make_qa_entry(
+            "linear",
+            Some("org/repo"),
+            "1",
+            "How to deploy?",
+            "Run deploy script",
+            "c1",
+        );
+        entry.metadata = Some(serde_json::json!({"category": "deployment"}));
+
+        let id = tracker.store_qa_knowledge(&entry).unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn test_record_qa_usage_and_update_stats() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-qa", "LIN-QA")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-qa").unwrap().unwrap();
+
+        let entry = make_qa_entry(
+            "linear",
+            Some("org/repo"),
+            "issue-qa",
+            "How to fix it?",
+            "Reset the cache",
+            "c-qa",
+        );
+        let qa_id = tracker.store_qa_knowledge(&entry).unwrap();
+
+        // Record usage
+        let usage_id = tracker
+            .record_qa_usage(attempt.id, qa_id, "auto_applied", 0.95)
+            .unwrap();
+        assert!(usage_id > 0);
+
+        // Update outcome stats directly
+        tracker.update_qa_outcome_stats(qa_id, true).unwrap();
+        tracker.update_qa_outcome_stats(qa_id, true).unwrap();
+        tracker.update_qa_outcome_stats(qa_id, false).unwrap();
+
+        let conn = tracker.acquire_lock().unwrap();
+        let (sc, fc): (i64, i64) = conn
+            .query_row(
+                "SELECT success_count, failure_count FROM qa_knowledge WHERE id = ?1",
+                params![qa_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sc, 2);
+        assert_eq!(fc, 1);
+    }
+
+    #[test]
+    fn test_find_similar_qa_scoped_no_results() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let matches = tracker
+            .find_similar_qa_scoped(
+                "linear",
+                Some("org/repo"),
+                "completely unique query",
+                None,
+                0.8,
+                5,
+            )
+            .unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_find_similar_qa_global_no_results() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let matches = tracker
+            .find_similar_qa_global("completely unique query", None, 0.8, 5)
+            .unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_find_similar_qa_scoped_exact_match() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let question = "What branch should I use for hotfixes?";
+        let entry = make_qa_entry(
+            "linear",
+            Some("org/repo"),
+            "1",
+            question,
+            "Use the hotfix branch",
+            "c1",
+        );
+        tracker.store_qa_knowledge(&entry).unwrap();
+
+        let question_norm = crate::qa::normalize_text(question);
+        let matches = tracker
+            .find_similar_qa_scoped("linear", Some("org/repo"), &question_norm, None, 0.8, 5)
+            .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].entry.answer_text, "Use the hotfix branch");
+    }
+
+    #[test]
+    fn test_find_similar_qa_global_exact_match() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let question = "What branch should I use for hotfixes?";
+        let entry = make_qa_entry(
+            "linear",
+            Some("org/repo"),
+            "1",
+            question,
+            "Use the hotfix branch",
+            "c1",
+        );
+        tracker.store_qa_knowledge(&entry).unwrap();
+
+        let question_norm = crate::qa::normalize_text(question);
+        let matches = tracker
+            .find_similar_qa_global(&question_norm, None, 0.8, 5)
+            .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].entry.answer_text, "Use the hotfix branch");
+    }
+
+    #[test]
+    fn test_record_qa_usage_upsert() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-upsert", "LIN-U")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "issue-upsert")
+            .unwrap()
+            .unwrap();
+
+        let entry = make_qa_entry("linear", Some("org/repo"), "issue-upsert", "Q?", "A.", "cu");
+        let qa_id = tracker.store_qa_knowledge(&entry).unwrap();
+
+        // First insert
+        tracker
+            .record_qa_usage(attempt.id, qa_id, "asked", 0.8)
+            .unwrap();
+        // Upsert with updated usage_type
+        tracker
+            .record_qa_usage(attempt.id, qa_id, "auto_applied", 0.95)
+            .unwrap();
+
+        // Should not fail; ON CONFLICT updates
+        let conn = tracker.acquire_lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM qa_usage WHERE attempt_id = ?1 AND qa_id = ?2",
+                params![attempt.id, qa_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Experiment tracking
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_save_and_get_active_experiments() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let exp = PromptExperiment::new("test-exp", "control", "Fix {{issue}}", "hash123");
+        let id = tracker.save_experiment(&exp).unwrap();
+        assert!(id > 0);
+
+        let active = tracker.get_active_experiments().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].experiment_name, "test-exp");
+        assert_eq!(active[0].variant, "control");
+        assert!(active[0].active);
+    }
+
+    #[test]
+    fn test_save_inactive_experiment_not_in_active_list() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut exp = PromptExperiment::new("disabled-exp", "variant_a", "template", "hash");
+        exp.active = false;
+        tracker.save_experiment(&exp).unwrap();
+
+        let active = tracker.get_active_experiments().unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn test_update_experiment_stats_success() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let exp = PromptExperiment::new("stats-exp", "control", "template", "hash");
+        let id = tracker.save_experiment(&exp).unwrap();
+
+        tracker
+            .update_experiment_stats(id, true, Some(2.5))
+            .unwrap();
+        tracker
+            .update_experiment_stats(id, true, Some(3.5))
+            .unwrap();
+        tracker.update_experiment_stats(id, false, None).unwrap();
+
+        let active = tracker.get_active_experiments().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].success_count, 2);
+        assert_eq!(active[0].failure_count, 1);
+        assert!(active[0].avg_time_to_merge.is_some());
+    }
+
+    #[test]
+    fn test_multiple_experiment_variants() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let variants = ["control", "variant_a", "variant_b"];
+        for variant in &variants {
+            let exp = PromptExperiment::new(
+                "multi-exp",
+                *variant,
+                "template",
+                format!("hash-{}", variant),
+            );
+            tracker.save_experiment(&exp).unwrap();
+        }
+
+        let active = tracker.get_active_experiments().unwrap();
+        assert_eq!(active.len(), 3);
+    }
+
+    #[test]
+    fn test_get_active_experiments_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let active = tracker.get_active_experiments().unwrap();
+        assert!(active.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Repository storage
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_upsert_and_get_repository() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let id = tracker
+            .upsert_repository(
+                "org/my-repo",
+                Some("/path/to/repo"),
+                Some("https://github.com/org/my-repo"),
+            )
+            .unwrap();
+        assert!(id > 0);
+
+        let repo = tracker.get_repository("org/my-repo").unwrap().unwrap();
+        assert_eq!(repo.name, "org/my-repo");
+        assert_eq!(repo.path, Some("/path/to/repo".to_string()));
+        assert_eq!(repo.github_url, "https://github.com/org/my-repo");
+    }
+
+    #[test]
+    fn test_upsert_repository_conflict_updates() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .upsert_repository(
+                "org/repo",
+                Some("/old/path"),
+                Some("https://github.com/org/repo"),
+            )
+            .unwrap();
+
+        // Upsert again with new path
+        tracker
+            .upsert_repository(
+                "org/repo",
+                Some("/new/path"),
+                Some("https://github.com/org/repo-updated"),
+            )
+            .unwrap();
+
+        let repo = tracker.get_repository("org/repo").unwrap().unwrap();
+        assert_eq!(repo.path, Some("/new/path".to_string()));
+        assert_eq!(repo.github_url, "https://github.com/org/repo-updated");
+    }
+
+    #[test]
+    fn test_upsert_repository_defaults() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // No path or github_url
+        tracker.upsert_repository("org/repo", None, None).unwrap();
+
+        let repo = tracker.get_repository("org/repo").unwrap().unwrap();
+        assert_eq!(repo.name, "org/repo");
+        // github_url defaults to name
+        assert_eq!(repo.github_url, "org/repo");
+        // Empty path stored as empty string, filtered to None
+        assert!(repo.path.is_none());
+    }
+
+    #[test]
+    fn test_get_repository_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker.get_repository("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_list_repositories() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.upsert_repository("b-repo", None, None).unwrap();
+        tracker.upsert_repository("a-repo", None, None).unwrap();
+        tracker.upsert_repository("c-repo", None, None).unwrap();
+
+        let repos = tracker.list_repositories().unwrap();
+        assert_eq!(repos.len(), 3);
+        // Ordered by name
+        assert_eq!(repos[0].name, "a-repo");
+        assert_eq!(repos[1].name, "b-repo");
+        assert_eq!(repos[2].name, "c-repo");
+    }
+
+    #[test]
+    fn test_add_dependency_and_get_dependencies() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .add_dependency("upstream-lib", "downstream-app", "runtime")
+            .unwrap();
+
+        let deps = tracker.get_dependencies("downstream-app").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].upstream, "upstream-lib");
+        assert_eq!(deps[0].downstream, "downstream-app");
+        assert_eq!(deps[0].dep_type, "runtime");
+    }
+
+    #[test]
+    fn test_add_dependency_creates_repos() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Repos should not exist yet
+        assert!(tracker.get_repository("lib-a").unwrap().is_none());
+        assert!(tracker.get_repository("app-b").unwrap().is_none());
+
+        tracker.add_dependency("lib-a", "app-b", "build").unwrap();
+
+        // Both repos should now exist
+        assert!(tracker.get_repository("lib-a").unwrap().is_some());
+        assert!(tracker.get_repository("app-b").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_add_dependency_upsert_type() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.add_dependency("lib", "app", "runtime").unwrap();
+        tracker.add_dependency("lib", "app", "build").unwrap();
+
+        let deps = tracker.get_dependencies("app").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].dep_type, "build");
+    }
+
+    #[test]
+    fn test_get_dependents() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .add_dependency("core-lib", "app-a", "runtime")
+            .unwrap();
+        tracker
+            .add_dependency("core-lib", "app-b", "runtime")
+            .unwrap();
+        tracker
+            .add_dependency("other-lib", "app-a", "build")
+            .unwrap();
+
+        let dependents = tracker.get_dependents("core-lib").unwrap();
+        assert_eq!(dependents.len(), 2);
+    }
+
+    #[test]
+    fn test_list_all_dependencies() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.add_dependency("lib-a", "app-1", "runtime").unwrap();
+        tracker.add_dependency("lib-b", "app-1", "build").unwrap();
+        tracker.add_dependency("lib-a", "app-2", "runtime").unwrap();
+
+        let all = tracker.list_all_dependencies().unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_clear_repositories() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.add_dependency("lib", "app", "runtime").unwrap();
+        assert!(!tracker.list_repositories().unwrap().is_empty());
+
+        tracker.clear_repositories().unwrap();
+        assert!(tracker.list_repositories().unwrap().is_empty());
+        assert!(tracker.list_all_dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_all_dependants_transitive() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // core -> mid -> leaf
+        tracker.add_dependency("core", "mid", "runtime").unwrap();
+        tracker.add_dependency("mid", "leaf", "runtime").unwrap();
+
+        let all = tracker.get_all_dependants("core").unwrap();
+        assert_eq!(all.len(), 2);
+        // First level: mid at depth 1
+        let mid_entry = all.iter().find(|(name, _)| name == "mid");
+        assert!(mid_entry.is_some());
+        assert_eq!(mid_entry.unwrap().1, 1);
+        // Second level: leaf at depth 2
+        let leaf_entry = all.iter().find(|(name, _)| name == "leaf");
+        assert!(leaf_entry.is_some());
+        assert_eq!(leaf_entry.unwrap().1, 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Execution logging
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_and_get_execution() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "exec-issue", "LIN-E")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "exec-issue")
+            .unwrap()
+            .unwrap();
+
+        let mut execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+        execution.prompt_used = Some("Fix the bug".to_string());
+        execution.model_version = Some("claude-3.5-sonnet".to_string());
+        execution.working_directory = Some("/home/user/repo".to_string());
+        execution.git_branch = Some("fix/issue-123".to_string());
+        execution.exit_code = Some(0);
+        execution.files_changed = Some(3);
+        execution.lines_added = Some(50);
+        execution.lines_removed = Some(10);
+
+        let id = tracker.record_execution(&execution).unwrap();
+        assert!(id > 0);
+
+        let executions = tracker.get_executions_for_attempt(attempt.id).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].attempt_id, Some(attempt.id));
+        assert_eq!(executions[0].prompt_used, Some("Fix the bug".to_string()));
+        assert_eq!(
+            executions[0].model_version,
+            Some("claude-3.5-sonnet".to_string())
+        );
+        assert_eq!(executions[0].exit_code, Some(0));
+        assert_eq!(executions[0].files_changed, Some(3));
+        assert_eq!(executions[0].lines_added, Some(50));
+        assert_eq!(executions[0].lines_removed, Some(10));
+    }
+
+    #[test]
+    fn test_multiple_executions_per_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "multi-exec", "LIN-ME")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "multi-exec")
+            .unwrap()
+            .unwrap();
+
+        for i in 0..3 {
+            let mut execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+            execution.exit_code = Some(i);
+            tracker.record_execution(&execution).unwrap();
+        }
+
+        let executions = tracker.get_executions_for_attempt(attempt.id).unwrap();
+        assert_eq!(executions.len(), 3);
+    }
+
+    #[test]
+    fn test_get_executions_for_nonexistent_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let executions = tracker.get_executions_for_attempt(9999).unwrap();
+        assert!(executions.is_empty());
+    }
+
+    #[test]
+    fn test_record_execution_with_timed_out() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut execution = ClaudeExecution::new();
+        execution.timed_out = true;
+        execution.exit_code = None;
+
+        let id = tracker.record_execution(&execution).unwrap();
+        assert!(id > 0);
+
+        // Verify timed_out round-trips (attempt_id is None so use get via raw query)
+        let conn = tracker.acquire_lock().unwrap();
+        let timed_out: i32 = conn
+            .query_row(
+                "SELECT timed_out FROM claude_executions WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(timed_out, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // parse_pr_url helper
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_parse_pr_url_github_standard() {
+        let result = SqliteTracker::parse_pr_url("https://github.com/owner/repo/pull/42");
+        assert_eq!(result, Some(("owner/repo".to_string(), 42)));
+    }
+
+    #[test]
+    fn test_parse_pr_url_github_with_trailing_slash() {
+        // The regex won't match trailing content after the number
+        let result = SqliteTracker::parse_pr_url("https://github.com/my-org/my-repo/pull/123");
+        assert_eq!(result, Some(("my-org/my-repo".to_string(), 123)));
+    }
+
+    #[test]
+    fn test_parse_pr_url_non_github() {
+        let result = SqliteTracker::parse_pr_url("https://gitlab.com/owner/repo/merge_requests/1");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_pr_url_invalid() {
+        assert_eq!(SqliteTracker::parse_pr_url("not-a-url"), None);
+        assert_eq!(SqliteTracker::parse_pr_url(""), None);
+    }
+
+    #[test]
+    fn test_parse_pr_url_too_long() {
+        let long_url = format!(
+            "https://github.com/{}/pull/1",
+            "a".repeat(MAX_PR_URL_LENGTH)
+        );
+        let result = SqliteTracker::parse_pr_url(&long_url);
+        assert_eq!(result, None);
+    }
+
+    // ---------------------------------------------------------------
+    // Attempt lifecycle
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_attempt_full_lifecycle_to_merged() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // 1. Record attempt
+        tracker
+            .record_attempt("linear", "lifecycle-1", "LIN-LC1")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "lifecycle-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Pending);
+
+        // 2. Mark success with PR
+        tracker
+            .mark_success(
+                "linear",
+                "lifecycle-1",
+                "https://github.com/org/repo/pull/99",
+            )
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "lifecycle-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Success);
+        assert_eq!(attempt.github_repo, Some("org/repo".to_string()));
+        assert_eq!(attempt.github_pr_number, Some(99));
+
+        // 3. Mark merged
+        tracker.mark_merged("linear", "lifecycle-1").unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "lifecycle-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Merged);
+        assert!(attempt.merged_at.is_some());
+    }
+
+    #[test]
+    fn test_attempt_lifecycle_fail_retry_succeed() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker
+            .record_attempt("linear", "retry-issue", "LIN-R1")
+            .unwrap();
+
+        // Fail
+        tracker
+            .mark_failed("linear", "retry-issue", "Build error")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "retry-issue")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Failed);
+        assert_eq!(attempt.error_message, Some("Build error".to_string()));
+
+        // Increment retry count, then prepare for retry
+        tracker.increment_retry("linear", "retry-issue").unwrap();
+        tracker.prepare_for_retry("linear", "retry-issue").unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "retry-issue")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Pending);
+        assert_eq!(attempt.retry_count, 1);
+
+        // Succeed
+        tracker
+            .mark_success(
+                "linear",
+                "retry-issue",
+                "https://github.com/org/repo/pull/50",
+            )
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "retry-issue")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Success);
+    }
+
+    #[test]
+    fn test_record_attempt_with_labels() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let labels = vec!["bug".to_string(), "high-priority".to_string()];
+        tracker
+            .record_attempt_with_labels("linear", "labeled-1", "LIN-L1", &labels)
+            .unwrap();
+
+        let attempt = tracker.get_attempt("linear", "labeled-1").unwrap().unwrap();
+        assert_eq!(attempt.issue_labels.len(), 2);
+        assert!(attempt.issue_labels.contains(&"bug".to_string()));
+        assert!(attempt.issue_labels.contains(&"high-priority".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // Error patterns
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_and_get_error_patterns() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let now = Utc::now();
+        let pattern = ErrorPattern {
+            id: 0,
+            pattern_hash: "hash-1".to_string(),
+            error_type: Some("build_failure".to_string()),
+            error_message: Some("undefined reference to main".to_string()),
+            first_seen: now,
+            last_seen: now,
+            occurrence_count: 1,
+            sources: Some(vec!["linear".to_string()]),
+            example_issue_ids: Some(vec!["issue-1".to_string()]),
+            resolution_hints: Some("Check linker flags".to_string()),
+        };
+
+        let id = tracker.record_error_pattern(&pattern).unwrap();
+        assert!(id > 0);
+
+        let patterns = tracker.get_error_patterns(10).unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].pattern_hash, "hash-1");
+        assert_eq!(patterns[0].error_type, Some("build_failure".to_string()));
+        assert_eq!(patterns[0].sources, Some(vec!["linear".to_string()]));
+    }
+
+    #[test]
+    fn test_error_pattern_upsert_increments_count() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let now = Utc::now();
+        let pattern = ErrorPattern {
+            id: 0,
+            pattern_hash: "hash-dup".to_string(),
+            error_type: Some("timeout".to_string()),
+            error_message: None,
+            first_seen: now,
+            last_seen: now,
+            occurrence_count: 1,
+            sources: None,
+            example_issue_ids: None,
+            resolution_hints: None,
+        };
+
+        tracker.record_error_pattern(&pattern).unwrap();
+        tracker.record_error_pattern(&pattern).unwrap();
+        tracker.record_error_pattern(&pattern).unwrap();
+
+        let patterns = tracker.get_error_patterns(10).unwrap();
+        assert_eq!(patterns.len(), 1);
+        // Initial insert (1) + 2 upserts (each adds 1)
+        assert_eq!(patterns[0].occurrence_count, 3);
+    }
+
+    #[test]
+    fn test_get_error_patterns_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let patterns = tracker.get_error_patterns(10).unwrap();
+        assert!(patterns.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Processing metrics
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_and_get_metric() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let metric = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "queue_depth".to_string(),
+            metric_value: 42.0,
+            source: Some("linear".to_string()),
+            tags: Some(serde_json::json!({"region": "us-east-1"})),
+        };
+
+        let id = tracker.record_metric(&metric).unwrap();
+        assert!(id > 0);
+
+        let metrics = tracker.get_metrics("queue_depth", None, 10).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!((metrics[0].metric_value - 42.0).abs() < f64::EPSILON);
+        assert_eq!(metrics[0].source, Some("linear".to_string()));
+        assert!(metrics[0].tags.is_some());
+    }
+
+    #[test]
+    fn test_get_metrics_with_time_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let old_ts = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let recent_ts = Utc::now();
+
+        let old_metric = ProcessingMetric {
+            id: 0,
+            timestamp: old_ts,
+            metric_name: "test_metric".to_string(),
+            metric_value: 1.0,
+            source: None,
+            tags: None,
+        };
+        let recent_metric = ProcessingMetric {
+            id: 0,
+            timestamp: recent_ts,
+            metric_name: "test_metric".to_string(),
+            metric_value: 2.0,
+            source: None,
+            tags: None,
+        };
+
+        tracker.record_metric(&old_metric).unwrap();
+        tracker.record_metric(&recent_metric).unwrap();
+
+        let since = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let filtered = tracker.get_metrics("test_metric", Some(since), 10).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert!((filtered[0].metric_value - 2.0).abs() < f64::EPSILON);
+    }
+
+    // ---------------------------------------------------------------
+    // Similar issues
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_store_and_find_similar_issues() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let similar = SimilarIssue::new("issue-a", "issue-b", 0.95);
+        let id = tracker.store_similar_issue(&similar).unwrap();
+        assert!(id > 0);
+
+        let results = tracker.find_similar_issues("issue-a", 0.8, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].similar_issue_id, "issue-b");
+        assert!((results[0].similarity_score - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_find_similar_issues_min_score_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .store_similar_issue(&SimilarIssue::new("src", "high", 0.95))
+            .unwrap();
+        tracker
+            .store_similar_issue(&SimilarIssue::new("src", "low", 0.5))
+            .unwrap();
+
+        let high_only = tracker.find_similar_issues("src", 0.9, 10).unwrap();
+        assert_eq!(high_only.len(), 1);
+        assert_eq!(high_only[0].similar_issue_id, "high");
+
+        let all = tracker.find_similar_issues("src", 0.0, 10).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_similar_issue_upsert() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .store_similar_issue(&SimilarIssue::new("a", "b", 0.7))
+            .unwrap();
+        tracker
+            .store_similar_issue(&SimilarIssue::new("a", "b", 0.9))
+            .unwrap();
+
+        let results = tracker.find_similar_issues("a", 0.0, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!((results[0].similarity_score - 0.9).abs() < f64::EPSILON);
+    }
+
+    // ---------------------------------------------------------------
+    // Analytics summary and success rate
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_success_rate_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let rate = tracker.get_success_rate().unwrap();
+        assert!((rate - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_get_success_rate_mixed() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "s1", "L1").unwrap();
+        tracker
+            .mark_success("linear", "s1", "https://github.com/o/r/pull/1")
+            .unwrap();
+        tracker.record_attempt("linear", "s2", "L2").unwrap();
+        tracker.mark_failed("linear", "s2", "error").unwrap();
+
+        let rate = tracker.get_success_rate().unwrap();
+        assert!((rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_get_analytics_summary() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "a1", "L1").unwrap();
+        tracker
+            .mark_success("linear", "a1", "https://github.com/o/r/pull/1")
+            .unwrap();
+        tracker.mark_merged("linear", "a1").unwrap();
+
+        tracker.record_attempt("sentry", "a2", "S1").unwrap();
+        tracker.mark_failed("sentry", "a2", "build error").unwrap();
+
+        let summary = tracker.get_analytics_summary().unwrap();
+        assert_eq!(summary.total_processed, 2);
+        assert_eq!(summary.total_successful, 1);
+        assert_eq!(summary.total_merged, 1);
+        assert!((summary.success_rate - 0.5).abs() < f64::EPSILON);
+        assert!(summary.success_rate_by_source.contains_key("linear"));
+        assert!(summary.success_rate_by_source.contains_key("sentry"));
+    }
+
+    #[test]
+    fn test_get_analytics_summary_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let summary = tracker.get_analytics_summary().unwrap();
+        assert_eq!(summary.total_processed, 0);
+        assert!((summary.success_rate - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ---------------------------------------------------------------
+    // Pruning
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_prune_old_activities() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Insert an old activity via raw SQL
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            conn.execute(
+                "INSERT INTO activity_log (timestamp, activity_type, message) VALUES ('2020-01-01 00:00:00', 'old', 'old entry')",
+                [],
+            ).unwrap();
+        }
+        // Insert a recent one
+        let entry = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "recent".to_string(),
+            source: None,
+            issue_id: None,
+            short_id: None,
+            message: "recent entry".to_string(),
+            metadata: None,
+        };
+        tracker.record_activity(&entry).unwrap();
+
+        let deleted = tracker.prune_old_activities(30).unwrap();
+        assert_eq!(deleted, 1);
+
+        let remaining = tracker.get_recent_activities(100, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].activity_type, "recent");
+    }
+
+    #[test]
+    fn test_prune_old_metrics() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            conn.execute(
+                "INSERT INTO processing_metrics (timestamp, metric_name, metric_value) VALUES ('2020-01-01 00:00:00', 'old_metric', 1.0)",
+                [],
+            ).unwrap();
+        }
+        let recent = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "new_metric".to_string(),
+            metric_value: 2.0,
+            source: None,
+            tags: None,
+        };
+        tracker.record_metric(&recent).unwrap();
+
+        let deleted = tracker.prune_old_metrics(30).unwrap();
+        assert_eq!(deleted, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Channel cursor
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_set_channel_cursor() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Initially empty
+        let cursor = tracker
+            .get_channel_cursor("discord", "last_message_id")
+            .unwrap();
+        assert!(cursor.is_none());
+
+        // Set cursor
+        tracker
+            .set_channel_cursor("discord", "last_message_id", "msg-123")
+            .unwrap();
+        let cursor = tracker
+            .get_channel_cursor("discord", "last_message_id")
+            .unwrap();
+        assert_eq!(cursor, Some("msg-123".to_string()));
+
+        // Update cursor (upsert)
+        tracker
+            .set_channel_cursor("discord", "last_message_id", "msg-456")
+            .unwrap();
+        let cursor = tracker
+            .get_channel_cursor("discord", "last_message_id")
+            .unwrap();
+        assert_eq!(cursor, Some("msg-456".to_string()));
+    }
+
+    #[test]
+    fn test_channel_cursor_different_keys() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .set_channel_cursor("discord", "cursor_a", "val-a")
+            .unwrap();
+        tracker
+            .set_channel_cursor("discord", "cursor_b", "val-b")
+            .unwrap();
+
+        assert_eq!(
+            tracker.get_channel_cursor("discord", "cursor_a").unwrap(),
+            Some("val-a".to_string())
+        );
+        assert_eq!(
+            tracker.get_channel_cursor("discord", "cursor_b").unwrap(),
+            Some("val-b".to_string())
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // get_attempt_by_id
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_attempt_by_id() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "by-id-issue", "LIN-BI")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "by-id-issue")
+            .unwrap()
+            .unwrap();
+
+        let by_id = tracker.get_attempt_by_id(attempt.id).unwrap().unwrap();
+        assert_eq!(by_id.issue_id, "by-id-issue");
+        assert_eq!(by_id.source, "linear");
+    }
+
+    #[test]
+    fn test_get_attempt_by_id_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker.get_attempt_by_id(99999).unwrap();
+        assert!(result.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Embedding helper functions
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_embedding_to_blob_and_back() {
+        let original = vec![1.0f32, 2.5, -(std::f32::consts::PI), 0.0];
+        let blob = SqliteTracker::embedding_to_blob(Some(&original));
+        assert!(blob.is_some());
+
+        let restored = SqliteTracker::blob_to_embedding(blob);
+        assert!(restored.is_some());
+        let restored = restored.unwrap();
+        assert_eq!(restored.len(), 4);
+        assert!((restored[0] - 1.0).abs() < f32::EPSILON);
+        assert!((restored[2] - (-std::f32::consts::PI)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_embedding_to_blob_none() {
+        let blob = SqliteTracker::embedding_to_blob(None);
+        assert!(blob.is_none());
+
+        let restored = SqliteTracker::blob_to_embedding(None);
+        assert!(restored.is_none());
+    }
 }

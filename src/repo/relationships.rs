@@ -866,4 +866,134 @@ mod tests {
         assert!(dep_names.contains(&"utopia-http"));
         assert!(dep_names.contains(&"utopia-cache"));
     }
+
+    #[test]
+    fn test_print_tree_no_root_finds_all_roots() {
+        let mut manager = RepoRelationships::new();
+
+        // Create two independent trees
+        manager.add_repository(Repository::new("root-a"));
+        manager.add_repository(Repository::new("child-a"));
+        manager.add_repository(Repository::new("root-b"));
+        manager.add_repository(Repository::new("child-b"));
+
+        manager
+            .add_dependency("root-a", "child-a", DependencyType::Manual, None)
+            .unwrap();
+        manager
+            .add_dependency("root-b", "child-b", DependencyType::Manual, None)
+            .unwrap();
+
+        // Print with no root to discover all root nodes
+        let tree = manager.print_tree(None);
+        assert!(tree.contains("root-a"));
+        assert!(tree.contains("child-a"));
+        assert!(tree.contains("root-b"));
+        assert!(tree.contains("child-b"));
+    }
+
+    #[test]
+    fn test_print_subtree_cycle_shows_cycle_marker() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("x"));
+        graph.add_repository(Repository::new("y"));
+
+        graph.add_dependency(Dependency {
+            upstream: "x".to_string(),
+            downstream: "y".to_string(),
+            dep_type: DependencyType::Manual,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+        graph.add_dependency(Dependency {
+            upstream: "y".to_string(),
+            downstream: "x".to_string(),
+            dep_type: DependencyType::Manual,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+
+        let tree = graph.to_string_tree(Some("x"));
+        // The cycle detection should produce "(cycle)" in the output
+        assert!(tree.contains("(cycle)"));
+    }
+
+    #[test]
+    fn test_add_dependency_auto_creates_repos() {
+        let mut manager = RepoRelationships::new();
+        // Neither repo exists yet
+        assert!(manager.get_repository("new-upstream").is_none());
+        assert!(manager.get_repository("new-downstream").is_none());
+
+        manager
+            .add_dependency("new-upstream", "new-downstream", DependencyType::Npm, None)
+            .unwrap();
+
+        // Both should now exist
+        assert!(manager.get_repository("new-upstream").is_some());
+        assert!(manager.get_repository("new-downstream").is_some());
+
+        // And the dependency should be recorded
+        let deps = manager.get_dependants("new-upstream");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "new-downstream");
+    }
+
+    #[test]
+    fn test_get_all_dependants_with_diamond_dependency() {
+        let mut manager = RepoRelationships::new();
+        // Diamond: A -> B, A -> C, B -> D, C -> D
+        manager.add_repository(Repository::new("A"));
+        manager.add_repository(Repository::new("B"));
+        manager.add_repository(Repository::new("C"));
+        manager.add_repository(Repository::new("D"));
+
+        manager
+            .add_dependency("A", "B", DependencyType::Npm, None)
+            .unwrap();
+        manager
+            .add_dependency("A", "C", DependencyType::Npm, None)
+            .unwrap();
+        manager
+            .add_dependency("B", "D", DependencyType::Npm, None)
+            .unwrap();
+        manager
+            .add_dependency("C", "D", DependencyType::Npm, None)
+            .unwrap();
+
+        let all = manager.get_all_dependants("A");
+        let names: Vec<_> = all.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"B"));
+        assert!(names.contains(&"C"));
+        assert!(names.contains(&"D"));
+        // D should appear only once despite two paths
+        assert_eq!(names.iter().filter(|&&n| n == "D").count(), 1);
+    }
+
+    #[test]
+    fn test_get_first_hop_dependency_type_none() {
+        let graph = DependencyGraph::new();
+        assert!(graph.get_first_hop_dependency_type("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_depends_on_self_returns_false() {
+        let mut manager = RepoRelationships::new();
+        manager.add_repository(Repository::new("self-repo"));
+
+        // A repo does not depend on itself
+        assert!(!manager.get_graph().depends_on("self-repo", "self-repo"));
+    }
+
+    #[test]
+    fn test_with_defaults_matches_appwrite_defaults() {
+        let defaults = RepoRelationships::with_defaults();
+        let appwrite = RepoRelationships::with_appwrite_defaults();
+
+        // Both should have the same set of repositories
+        assert_eq!(
+            defaults.list_repositories().len(),
+            appwrite.list_repositories().len()
+        );
+    }
 }

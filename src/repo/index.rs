@@ -775,4 +775,228 @@ mod tests {
             "https://github.com/test-org/test-repo.git"
         );
     }
+
+    #[test]
+    fn test_indexed_repo_with_default_branch() {
+        let repo = IndexedRepo::new("test/repo", "/path").with_default_branch("develop");
+        assert_eq!(repo.default_branch, "develop");
+    }
+
+    #[test]
+    fn test_indexed_repo_has_file_case_insensitive() {
+        let mut repo = IndexedRepo::new("test/repo", "/path");
+        repo.files = vec!["src/MyClass.php".to_string()];
+
+        assert!(repo.has_file("myclass.php"));
+        assert!(repo.has_file("MYCLASS.PHP"));
+    }
+
+    #[test]
+    fn test_indexed_repo_find_files_no_match() {
+        let mut repo = IndexedRepo::new("test/repo", "/path");
+        repo.files = vec!["src/main.rs".to_string()];
+
+        let results = repo.find_files("nonexistent");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_indexed_repo_find_files_case_insensitive() {
+        let mut repo = IndexedRepo::new("test/repo", "/path");
+        repo.files = vec![
+            "src/MyComponent.tsx".to_string(),
+            "src/myHelper.ts".to_string(),
+        ];
+
+        let results = repo.find_files("MY");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_repo_index_list() {
+        let mut index = RepoIndex::new();
+
+        let repo1 = IndexedRepo::new("org/repo1", "/path1");
+        let repo2 = IndexedRepo::new("org/repo2", "/path2");
+        index.add_repo(repo1);
+        index.add_repo(repo2);
+
+        let list = index.list();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_repo_index_search_files_no_results() {
+        let mut index = RepoIndex::new();
+
+        let mut repo = IndexedRepo::new("org/repo", "/path");
+        repo.files = vec!["src/main.rs".to_string()];
+        index.add_repo(repo);
+
+        let results = index.search_files("nonexistent_query");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_repo_index_index_repo_files_not_found() {
+        let mut index = RepoIndex::new();
+        let result = index.index_repo_files("nonexistent/repo");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_repo_index_index_repo_files_with_real_dir() {
+        let temp = TempDir::new().unwrap();
+
+        // Create a non-hidden subdirectory to use as the repo root
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("file1.rs"), "fn main() {}").unwrap();
+        std::fs::write(repo_dir.join("file2.rs"), "fn test() {}").unwrap();
+
+        let mut index = RepoIndex::new();
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        index.add_repo(repo);
+
+        let count = index.index_repo_files("test/repo");
+        assert!(count.is_some());
+        assert!(count.unwrap() >= 2);
+
+        // Verify the repo is still accessible after re-indexing
+        let repo = index.get("test/repo").unwrap();
+        assert!(repo.files.len() >= 2);
+    }
+
+    #[test]
+    fn test_find_by_vendor_path_no_vendor_in_path() {
+        let mut index = RepoIndex::new();
+        let mut repo = IndexedRepo::new("org/repo", "/path");
+        repo.files = vec!["src/Pool.php".to_string()];
+        index.add_repo(repo);
+
+        // Path without /vendor/ should not match via vendor path
+        let result = index.find_by_vendor_path("/usr/src/code/src/Pool.php");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_by_vendor_path_insufficient_parts() {
+        let mut index = RepoIndex::new();
+        let mut repo = IndexedRepo::new("org/repo", "/path");
+        repo.files = vec!["src/file.php".to_string()];
+        index.add_repo(repo);
+
+        // Vendor path with only one segment after /vendor/
+        let result = index.find_by_vendor_path("/usr/src/code/vendor/singlepart");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_by_file_no_basename_match() {
+        let index = RepoIndex::new();
+        let result = index.find_by_file("totally_unknown_file.xyz");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_expand_path_just_tilde() {
+        let expanded = expand_path("~");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expanded, home);
+        }
+    }
+
+    #[test]
+    fn test_expand_path_relative() {
+        let expanded = expand_path("relative/path");
+        assert_eq!(expanded, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_parse_repo_name_ssh_no_git_extension() {
+        let name = parse_repo_name_from_url("git@github.com:org/repo");
+        assert_eq!(name, Some("org/repo".to_string()));
+    }
+
+    #[test]
+    fn test_parse_repo_name_not_github() {
+        let name = parse_repo_name_from_url("https://gitlab.com/org/repo.git");
+        // Does not contain "github.com" and not SSH format, so None
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn test_parse_repo_name_invalid_ssh_format() {
+        let name = parse_repo_name_from_url("git@github.com");
+        // No colon separator for repo path
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn test_parse_repo_name_empty_url() {
+        let name = parse_repo_name_from_url("");
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn test_repo_index_add_repo_indexes_basenames() {
+        let mut index = RepoIndex::new();
+
+        let mut repo = IndexedRepo::new("org/myrepo", "/path");
+        repo.files = vec![
+            "src/nested/deep/file.rs".to_string(),
+            "tests/test_module.rs".to_string(),
+        ];
+        index.add_repo(repo);
+
+        // Should be findable by basename
+        let found = index.find_by_file("file.rs");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "org/myrepo");
+
+        let found = index.find_by_file("test_module.rs");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "org/myrepo");
+    }
+
+    #[test]
+    fn test_index_files_skips_hidden_and_build_dirs() {
+        let temp = TempDir::new().unwrap();
+
+        // Use a non-hidden subdirectory as repo root (TempDir names may start with '.')
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+
+        // Create a visible file
+        std::fs::write(repo_dir.join("visible.rs"), "fn main() {}").unwrap();
+
+        // Create a hidden directory with a file
+        std::fs::create_dir(repo_dir.join(".hidden")).unwrap();
+        std::fs::write(repo_dir.join(".hidden/secret.rs"), "// hidden").unwrap();
+
+        // Create a node_modules directory
+        std::fs::create_dir(repo_dir.join("node_modules")).unwrap();
+        std::fs::write(repo_dir.join("node_modules/pkg.js"), "// npm").unwrap();
+
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        let indexed = index_files(repo);
+
+        // Should only contain the visible file
+        assert_eq!(indexed.files.len(), 1);
+        assert!(indexed.files.iter().any(|f| f.contains("visible.rs")));
+    }
+
+    #[test]
+    fn test_total_files_empty_index() {
+        let index = RepoIndex::new();
+        assert_eq!(index.total_files(), 0);
+    }
+
+    #[test]
+    fn test_indexed_repo_empty_files() {
+        let repo = IndexedRepo::new("test/repo", "/path");
+        assert!(repo.files.is_empty());
+        assert!(!repo.has_file("anything.rs"));
+        assert!(repo.find_files("anything").is_empty());
+    }
 }

@@ -2951,4 +2951,571 @@ sms:
         config.resolve_user_slugs();
         assert_eq!(config.sms.to_numbers, vec!["+1234567890", "+9876543210"]);
     }
+
+    #[test]
+    fn test_env_override_imap_settings() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("IMAP_HOST", "imap.example.com"),
+                ("IMAP_PORT", "143"),
+                ("IMAP_USERNAME", "user@example.com"),
+                ("IMAP_PASSWORD", "secret"),
+                ("IMAP_TLS", "false"),
+                ("IMAP_FOLDER", "Junk"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.email.imap_host, Some("imap.example.com".to_string()));
+                assert_eq!(config.email.imap_port, 143);
+                assert_eq!(
+                    config.email.imap_username,
+                    Some("user@example.com".to_string())
+                );
+                assert_eq!(config.email.imap_password, Some("secret".to_string()));
+                assert!(!config.email.imap_use_tls);
+                assert_eq!(config.email.imap_folder, "Junk");
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_ask_config() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("ASK_ENABLED", "false"),
+                ("ASK_WAIT_TIMEOUT_SECS", "600"),
+                ("ASK_POLL_INTERVAL_SECS", "30"),
+                ("ASK_MAX_ROUNDS", "5"),
+                ("ASK_SEMANTIC_THRESHOLD_SCOPED", "0.90"),
+                ("ASK_SEMANTIC_THRESHOLD_GLOBAL", "0.95"),
+                ("ASK_MAX_REUSE_CANDIDATES", "10"),
+                ("ASK_BEST_EFFORT_ON_TIMEOUT", "false"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert!(!config.ask.enabled);
+                assert_eq!(config.ask.wait_timeout_secs, 600);
+                assert_eq!(config.ask.poll_interval_secs, 30);
+                assert_eq!(config.ask.max_rounds_per_attempt, 5);
+                assert!((config.ask.semantic_threshold_scoped - 0.90).abs() < 0.01);
+                assert!((config.ask.semantic_threshold_global - 0.95).abs() < 0.01);
+                assert_eq!(config.ask.max_reuse_candidates, 10);
+                assert!(!config.ask.best_effort_on_timeout);
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_sms_settings() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("TWILIO_ACCOUNT_SID", "AC_test"),
+                ("TWILIO_AUTH_TOKEN", "auth_tok"),
+                ("TWILIO_FROM_NUMBER", "+15551234567"),
+                ("TWILIO_TO_NUMBERS", "+15559876543, +15551111111"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.sms.account_sid, Some("AC_test".to_string()));
+                assert_eq!(config.sms.auth_token, Some("auth_tok".to_string()));
+                assert_eq!(config.sms.from_number, Some("+15551234567".to_string()));
+                assert_eq!(config.sms.to_numbers, vec!["+15559876543", "+15551111111"]);
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_push_settings() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("PUSHOVER_API_TOKEN", "api_tok"),
+                ("PUSHOVER_USER_KEY", "user_key"),
+                ("PUSHOVER_DEVICE", "myphone"),
+                ("PUSHOVER_PRIORITY", "2"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.push.api_token, Some("api_tok".to_string()));
+                assert_eq!(config.push.user_key, Some("user_key".to_string()));
+                assert_eq!(config.push.device, Some("myphone".to_string()));
+                assert_eq!(config.push.priority, Some(2));
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_retry_settings() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("RETRY_MAX_RETRIES", "5"),
+                ("RETRY_BASE_DELAY_MS", "30000"),
+                ("RETRY_MAX_DELAY_MS", "7200000"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.retry.max_retries, 5);
+                assert_eq!(config.retry.base_delay_ms, 30000);
+                assert_eq!(config.retry.max_delay_ms, 7200000);
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_linear_trigger_labels_and_states() {
+        let yaml = r#"
+work_dir: /tmp/repos
+linear:
+  api_key: yaml_key
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("LINEAR_TRIGGER_LABELS", "urgent, critical"),
+                ("LINEAR_TRIGGER_STATES", "in_progress, review"),
+                ("LINEAR_TEAM_ID", "team_abc"),
+                ("LINEAR_PROJECT_ID", "proj_xyz"),
+                ("LINEAR_WEBHOOK_SECRET", "my_secret"),
+                ("LINEAR_MAX_ISSUES_PER_CYCLE", "3"),
+                ("LINEAR_MAX_CONCURRENT", "2"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                let linear = config.linear.unwrap();
+                assert_eq!(linear.trigger_labels, vec!["urgent", "critical"]);
+                assert_eq!(linear.trigger_states, vec!["in_progress", "review"]);
+                assert_eq!(linear.team_id, Some("team_abc".to_string()));
+                assert_eq!(linear.project_id, Some("proj_xyz".to_string()));
+                assert_eq!(linear.webhook_secret, Some("my_secret".to_string()));
+                assert_eq!(linear.max_issues_per_cycle, Some(3));
+                assert_eq!(linear.max_concurrent, Some(2));
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_linear_enabled_flag() {
+        let yaml = r#"
+work_dir: /tmp/repos
+linear:
+  api_key: key
+  enabled: true
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(&[("LINEAR_ENABLED", "false")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(!config.linear.as_ref().unwrap().enabled);
+        });
+    }
+
+    #[test]
+    fn test_env_override_sentry_detailed() {
+        let yaml = r#"
+work_dir: /tmp/repos
+sentry:
+  auth_token: yaml_token
+  org_slug: yaml-org
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("SENTRY_ENABLED", "false"),
+                ("SENTRY_PROJECT_SLUGS", "web, api, worker"),
+                ("SENTRY_TOP_ISSUES_COUNT", "25"),
+                ("SENTRY_TOP_ISSUES_PERIOD", "7d"),
+                ("SENTRY_MIN_EVENT_COUNT", "50"),
+                ("SENTRY_ESCALATION_THRESHOLD", "75"),
+                ("SENTRY_CLIENT_SECRET", "sentry_secret"),
+                ("SENTRY_MAX_ISSUES_PER_CYCLE", "10"),
+                ("SENTRY_MAX_CONCURRENT", "4"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                let sentry = config.sentry.unwrap();
+                assert!(!sentry.enabled);
+                assert_eq!(sentry.project_slugs, vec!["web", "api", "worker"]);
+                assert_eq!(sentry.top_issues_count, 25);
+                assert_eq!(sentry.top_issues_period, TopIssuesPeriod::OneWeek);
+                assert_eq!(sentry.min_event_count, 50);
+                assert_eq!(sentry.escalation_threshold_percent, 75);
+                assert_eq!(sentry.client_secret, Some("sentry_secret".to_string()));
+                assert_eq!(sentry.max_issues_per_cycle, Some(10));
+                assert_eq!(sentry.max_concurrent, Some(4));
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_additional_core_settings() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("MAX_CONCURRENT", "4"),
+                ("PROCESSING_DELAY_MS", "1000"),
+                ("DB_PATH", "/custom/db.sqlite"),
+                ("MAX_ACTIVITY_ENTRIES", "50000"),
+                ("IPC_TIMEOUT_SECS", "60"),
+                ("CLAUDE_TIMEOUT_SECS", "3600"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.max_concurrent, 4);
+                assert_eq!(config.processing_delay_ms, 1000);
+                assert_eq!(config.db_path, PathBuf::from("/custom/db.sqlite"));
+                assert_eq!(config.max_activity_entries, 50000);
+                assert_eq!(config.ipc_timeout_secs, 60);
+                assert_eq!(config.claude_timeout_secs, 3600);
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_empty_values_ignored() {
+        let yaml = r#"
+work_dir: /tmp/repos
+discord:
+  webhook_url: "https://keep-this.url"
+linear:
+  api_key: keep_key
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("WORK_DIR", ""),
+                ("KNOWN_ORGS", ""),
+                ("DISCORD_WEBHOOK_URL", ""),
+                ("LINEAR_API_KEY", ""),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                // Empty WORK_DIR should not override
+                assert_eq!(config.work_dir, PathBuf::from("/tmp/repos"));
+                // Empty KNOWN_ORGS should not override
+                assert!(config.known_orgs.is_empty());
+                // Empty DISCORD_WEBHOOK_URL should set to None
+                assert!(config.discord.webhook_url.is_none());
+                // Empty LINEAR_API_KEY should not create config
+                assert_eq!(config.linear.as_ref().unwrap().api_key, "keep_key");
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_github_webhook_secret_and_review_trigger() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("GITHUB_WEBHOOK_SECRET", "gh_secret"),
+                ("GITHUB_REVIEW_TRIGGER", "@mybot"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.github.webhook_secret, Some("gh_secret".to_string()));
+                assert_eq!(config.github.review_trigger, "@mybot");
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_email_smtp_settings() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("SMTP_HOST", "smtp.gmail.com"),
+                ("SMTP_PORT", "465"),
+                ("SMTP_USERNAME", "user@gmail.com"),
+                ("SMTP_PASSWORD", "app_password"),
+                ("EMAIL_FROM", "sender@gmail.com"),
+                ("EMAIL_TO", "admin@test.com, dev@test.com"),
+                ("SMTP_TLS", "true"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.email.smtp_host, Some("smtp.gmail.com".to_string()));
+                assert_eq!(config.email.smtp_port, 465);
+                assert_eq!(
+                    config.email.smtp_username,
+                    Some("user@gmail.com".to_string())
+                );
+                assert_eq!(config.email.smtp_password, Some("app_password".to_string()));
+                assert_eq!(
+                    config.email.from_address,
+                    Some("sender@gmail.com".to_string())
+                );
+                assert_eq!(
+                    config.email.to_addresses,
+                    vec!["admin@test.com", "dev@test.com"]
+                );
+                assert!(config.email.use_tls);
+            },
+        );
+    }
+
+    #[test]
+    fn test_ask_config_default() {
+        let config = AskConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.wait_timeout_secs, 900);
+        assert_eq!(config.poll_interval_secs, 15);
+        assert_eq!(config.max_rounds_per_attempt, 2);
+        assert!((config.semantic_threshold_scoped - 0.82).abs() < 0.01);
+        assert!((config.semantic_threshold_global - 0.88).abs() < 0.01);
+        assert_eq!(config.max_reuse_candidates, 3);
+        assert!(config.best_effort_on_timeout);
+    }
+
+    #[test]
+    fn test_cascade_config_default() {
+        let config = CascadeConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.max_depth, 0);
+    }
+
+    #[test]
+    fn test_cascade_config_from_yaml() {
+        let yaml = r#"
+work_dir: /tmp/test
+cascade:
+  enabled: true
+  max_depth: 3
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert!(config.cascade.enabled);
+        assert_eq!(config.cascade.max_depth, 3);
+    }
+
+    #[test]
+    fn test_github_app_config_load_private_key_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("key.pem");
+        fs::write(
+            &key_path,
+            "-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----",
+        )
+        .unwrap();
+
+        let config = GitHubAppConfig {
+            private_key_path: Some(key_path),
+            ..Default::default()
+        };
+
+        let key = config.load_private_key().unwrap();
+        assert!(key.contains("BEGIN RSA PRIVATE KEY"));
+    }
+
+    #[test]
+    fn test_github_app_config_load_private_key_file_not_found() {
+        let config = GitHubAppConfig {
+            private_key_path: Some(PathBuf::from("/nonexistent/key.pem")),
+            ..Default::default()
+        };
+
+        let result = config.load_private_key();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Failed to read"));
+    }
+
+    #[test]
+    fn test_github_app_config_inline_key_takes_precedence() {
+        let config = GitHubAppConfig {
+            private_key: Some("inline-key".to_string()),
+            private_key_path: Some(PathBuf::from("/nonexistent/key.pem")),
+            ..Default::default()
+        };
+
+        let key = config.load_private_key().unwrap();
+        assert_eq!(key, "inline-key");
+    }
+
+    #[test]
+    fn test_env_override_discord_bot_and_channel() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[
+                ("DISCORD_BOT_TOKEN", "bot_token_123"),
+                ("DISCORD_CHANNEL_ID", "channel_456"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.discord.bot_token, Some("bot_token_123".to_string()));
+                assert_eq!(config.discord.channel_id, Some("channel_456".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_github_app_private_key_path() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(
+            &[("GITHUB_APP_PRIVATE_KEY_PATH", "/path/to/key.pem")],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(
+                    config.github_app.private_key_path,
+                    Some(PathBuf::from("/path/to/key.pem"))
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_email_config_default() {
+        let config = EmailConfig::default();
+        assert!(config.smtp_host.is_none());
+        assert_eq!(config.smtp_port, 587);
+        assert!(config.smtp_username.is_none());
+        assert!(config.smtp_password.is_none());
+        assert!(config.from_address.is_none());
+        assert!(config.to_addresses.is_empty());
+        assert!(config.use_tls);
+        assert!(config.imap_host.is_none());
+        assert_eq!(config.imap_port, 993);
+        assert!(config.imap_username.is_none());
+        assert!(config.imap_password.is_none());
+        assert!(config.imap_use_tls);
+        assert_eq!(config.imap_folder, "INBOX");
+    }
+
+    #[test]
+    fn test_github_config_default() {
+        let config = GitHubConfig::default();
+        assert!(config.token.is_none());
+        assert_eq!(config.poll_interval_ms, 60000);
+        assert!(!config.auto_resolve_on_merge);
+        assert!(config.webhook_secret.is_none());
+        assert_eq!(config.review_trigger, "/claudear");
+        assert!(!config.use_ssh);
+    }
+
+    #[test]
+    fn test_resolve_user_slug_user_has_no_channel_id() {
+        let yaml = r#"
+users:
+  jake:
+    linear_name: "Jake B"
+discord:
+  user_id: "jake"
+push:
+  user_key: "jake"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.resolve_user_slugs();
+        // User exists but has no discord_id, should keep slug
+        assert_eq!(config.discord.user_id.as_deref(), Some("jake"));
+        // User exists but has no push_user_key, should keep slug
+        assert_eq!(config.push.user_key.as_deref(), Some("jake"));
+    }
+
+    #[test]
+    fn test_resolve_user_slug_email_user_has_no_email() {
+        let yaml = r#"
+users:
+  jake:
+    linear_name: "Jake B"
+email:
+  to_addresses:
+    - "jake"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.resolve_user_slugs();
+        // User exists but has no email field, should keep the slug as-is
+        assert_eq!(config.email.to_addresses, vec!["jake"]);
+    }
+
+    #[test]
+    fn test_resolve_user_slug_sms_user_has_no_number() {
+        let yaml = r#"
+users:
+  jake:
+    linear_name: "Jake B"
+sms:
+  to_numbers:
+    - "jake"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.resolve_user_slugs();
+        // User exists but has no sms_number, should keep the slug as-is
+        assert_eq!(config.sms.to_numbers, vec!["jake"]);
+    }
+
+    #[test]
+    fn test_is_github_app_configured() {
+        let mut config = Config::default();
+        assert!(!config.is_github_app_configured());
+
+        config.github_app.app_id = Some(1);
+        config.github_app.private_key = Some("key".to_string());
+        assert!(config.is_github_app_configured());
+    }
+
+    #[test]
+    fn test_top_issues_period_serde_yaml_aliases() {
+        // Test that the serde aliases work in YAML
+        let period: TopIssuesPeriod = serde_yaml::from_str::<TopIssuesPeriod>(
+            &serde_yaml::to_string(&TopIssuesPeriod::OneHour).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(period, TopIssuesPeriod::OneHour);
+
+        // Test roundtrip of all variants
+        for variant in [
+            TopIssuesPeriod::OneHour,
+            TopIssuesPeriod::TwelveHours,
+            TopIssuesPeriod::OneDay,
+            TopIssuesPeriod::OneWeek,
+            TopIssuesPeriod::OneMonth,
+        ] {
+            let serialized = serde_yaml::to_string(&variant).unwrap();
+            let deserialized: TopIssuesPeriod = serde_yaml::from_str(&serialized).unwrap();
+            assert_eq!(variant, deserialized);
+        }
+    }
 }

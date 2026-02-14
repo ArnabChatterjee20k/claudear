@@ -356,6 +356,32 @@ impl<H: LinearHttpClient> LinearSource<H> {
     }
 }
 
+/// Build a context string from a Linear issue's metadata.
+/// This is a pure function extracted from the async trait method for testability.
+fn format_linear_context(issue: &Issue) -> String {
+    let mut context = format!("# Linear Issue: {}\n\n", issue.short_id);
+    context.push_str(&format!("**Title:** {}\n", issue.title));
+    context.push_str(&format!("**URL:** {}\n", issue.url));
+    context.push_str(&format!("**Priority:** {}\n", issue.priority));
+    context.push_str(&format!("**Status:** {}\n\n", issue.status));
+
+    if let Some(ref description) = issue.description {
+        context.push_str(&format!("## Description\n{}\n\n", description));
+    }
+
+    if let Some(team) = issue.get_metadata::<String>("team") {
+        context.push_str(&format!("**Team:** {}\n", team));
+    }
+    if let Some(project) = issue.get_metadata::<String>("project") {
+        context.push_str(&format!("**Project:** {}\n", project));
+    }
+    if let Some(assignee) = issue.get_metadata::<String>("assignee") {
+        context.push_str(&format!("**Assignee:** {}\n", assignee));
+    }
+
+    context
+}
+
 #[async_trait]
 impl<H: LinearHttpClient + 'static> IssueSource for LinearSource<H> {
     fn name(&self) -> &str {
@@ -459,27 +485,7 @@ impl<H: LinearHttpClient + 'static> IssueSource for LinearSource<H> {
     }
 
     async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
-        let mut context = format!("# Linear Issue: {}\n\n", issue.short_id);
-        context.push_str(&format!("**Title:** {}\n", issue.title));
-        context.push_str(&format!("**URL:** {}\n", issue.url));
-        context.push_str(&format!("**Priority:** {}\n", issue.priority));
-        context.push_str(&format!("**Status:** {}\n\n", issue.status));
-
-        if let Some(ref description) = issue.description {
-            context.push_str(&format!("## Description\n{}\n\n", description));
-        }
-
-        if let Some(team) = issue.get_metadata::<String>("team") {
-            context.push_str(&format!("**Team:** {}\n", team));
-        }
-        if let Some(project) = issue.get_metadata::<String>("project") {
-            context.push_str(&format!("**Project:** {}\n", project));
-        }
-        if let Some(assignee) = issue.get_metadata::<String>("assignee") {
-            context.push_str(&format!("**Assignee:** {}\n", assignee));
-        }
-
-        Ok(context)
+        Ok(format_linear_context(issue))
     }
 
     async fn get_issue(&self, issue_id: &str) -> Result<Issue> {
@@ -1791,5 +1797,1279 @@ mod tests {
         assert!(context.contains("Platform"));
         assert!(context.contains("Infrastructure"));
         assert!(context.contains("Alice Smith"));
+    }
+
+    #[test]
+    fn test_is_issue_terminal_various_inputs() {
+        assert!(LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "completed"
+        ));
+        assert!(LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "Completed"
+        ));
+        assert!(LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "COMPLETED"
+        ));
+        assert!(LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "canceled"
+        ));
+        assert!(LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "Canceled"
+        ));
+        assert!(LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "cancelled"
+        ));
+        assert!(LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "Cancelled"
+        ));
+        assert!(!LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "started"
+        ));
+        assert!(!LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "backlog"
+        ));
+        assert!(!LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "triage"
+        ));
+        assert!(!LinearSource::<ReqwestLinearClient>::is_issue_terminal(""));
+    }
+
+    #[test]
+    fn test_is_terminal_status_delegates_to_is_issue_terminal() {
+        let source = LinearSource::new(test_config());
+        assert!(source.is_terminal_status("completed"));
+        assert!(source.is_terminal_status("canceled"));
+        assert!(source.is_terminal_status("cancelled"));
+        assert!(!source.is_terminal_status("started"));
+        assert!(!source.is_terminal_status("backlog"));
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_returns_state_type() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{
+                "data": {
+                    "issue": {
+                        "id": "456",
+                        "identifier": "PROJ-456",
+                        "title": "Issue",
+                        "description": null,
+                        "url": "https://linear.app/456",
+                        "priority": 2,
+                        "createdAt": "2024-01-01T00:00:00Z",
+                        "updatedAt": "2024-01-02T00:00:00Z",
+                        "state": {"name": "Done", "type": "completed"},
+                        "labels": {"nodes": []},
+                        "team": null,
+                        "project": null,
+                        "assignee": null
+                    }
+                }
+            }"#,
+        );
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let status = source.get_issue_status("456").await.unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_unknown_when_no_state() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{
+                "data": {
+                    "issue": {
+                        "id": "789",
+                        "identifier": "PROJ-789",
+                        "title": "Issue",
+                        "description": null,
+                        "url": "https://linear.app/789",
+                        "priority": 0,
+                        "createdAt": "2024-01-01T00:00:00Z",
+                        "updatedAt": "2024-01-02T00:00:00Z",
+                        "state": null,
+                        "labels": {"nodes": []},
+                        "team": null,
+                        "project": null,
+                        "assignee": null
+                    }
+                }
+            }"#,
+        );
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let status = source.get_issue_status("789").await.unwrap();
+        assert_eq!(status, "unknown");
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_minimal_no_metadata() {
+        let source = LinearSource::new(test_config());
+
+        let issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "Simple Issue",
+            "https://linear.app/123",
+            "linear",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("PROJ-123"));
+        assert!(context.contains("Simple Issue"));
+        assert!(context.contains("https://linear.app/123"));
+        // Should not contain metadata sections
+        assert!(!context.contains("**Team:**"));
+        assert!(!context.contains("**Project:**"));
+        assert!(!context.contains("**Assignee:**"));
+        assert!(!context.contains("## Description"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_with_empty_team_id_string() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{
+                "data": {
+                    "issues": {
+                        "nodes": []
+                    }
+                }
+            }"#,
+        );
+
+        let mut config = test_config();
+        config.team_id = Some("".to_string()); // Empty string should be treated as not set
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_with_empty_project_id_string() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{
+                "data": {
+                    "issues": {
+                        "nodes": []
+                    }
+                }
+            }"#,
+        );
+
+        let mut config = test_config();
+        config.project_id = Some("".to_string()); // Empty string should be treated as not set
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_with_trigger_labels_in_filter() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{
+                "data": {
+                    "issues": {
+                        "nodes": []
+                    }
+                }
+            }"#,
+        );
+
+        let config = test_config(); // Has trigger_labels: auto-implement, claude
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+        assert!(issues.is_empty());
+
+        // Verify request was sent (the mock client records requests)
+        let requests = source.http.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "https://api.linear.app/graphql");
+    }
+
+    #[test]
+    fn test_http_response_json_parse_failure() {
+        let response = HttpResponse {
+            status: 200,
+            body: "not valid json".to_string(),
+        };
+        let result: Result<serde_json::Value> = response.json();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("JSON parse error"));
+    }
+
+    #[test]
+    fn test_http_response_boundary_status_codes() {
+        assert!(!HttpResponse {
+            status: 199,
+            body: String::new()
+        }
+        .is_success());
+        assert!(HttpResponse {
+            status: 200,
+            body: String::new()
+        }
+        .is_success());
+        assert!(HttpResponse {
+            status: 299,
+            body: String::new()
+        }
+        .is_success());
+        assert!(!HttpResponse {
+            status: 300,
+            body: String::new()
+        }
+        .is_success());
+    }
+
+    #[test]
+    fn test_map_issue_state_metadata_stored() {
+        let source = LinearSource::new(test_config());
+        let linear_issue = create_linear_issue(
+            "123",
+            "PROJ-123",
+            "Issue with state",
+            2,
+            "started",
+            "In Progress",
+            vec!["bug"],
+        );
+
+        let issue = source.map_issue(linear_issue);
+
+        let state_name: Option<String> = issue.get_metadata("state_name");
+        assert_eq!(state_name, Some("In Progress".to_string()));
+
+        let state_type: Option<String> = issue.get_metadata("state_type");
+        assert_eq!(state_type, Some("started".to_string()));
+    }
+
+    #[test]
+    fn test_map_issue_no_state_no_state_metadata() {
+        let source = LinearSource::new(test_config());
+        let linear_issue = LinearIssue {
+            id: "123".to_string(),
+            identifier: "TEST-1".to_string(),
+            title: "No state".to_string(),
+            description: None,
+            url: "https://linear.app/test".to_string(),
+            priority: 0,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-02T00:00:00Z".to_string(),
+            state: None,
+            labels: LabelsConnection { nodes: vec![] },
+            team: None,
+            project: None,
+            assignee: None,
+        };
+
+        let issue = source.map_issue(linear_issue);
+
+        let state_name: Option<String> = issue.get_metadata("state_name");
+        assert!(state_name.is_none());
+
+        let state_type: Option<String> = issue.get_metadata("state_type");
+        assert!(state_type.is_none());
+    }
+
+    #[test]
+    fn test_map_issue_team_and_project_metadata() {
+        let source = LinearSource::new(test_config());
+        let linear_issue =
+            create_linear_issue("123", "PROJ-123", "Issue", 2, "backlog", "Backlog", vec![]);
+
+        let issue = source.map_issue(linear_issue);
+
+        let team: Option<String> = issue.get_metadata("team");
+        assert_eq!(team, Some("Engineering".to_string()));
+
+        let team_id: Option<String> = issue.get_metadata("team_id");
+        assert_eq!(team_id, Some("team_123".to_string()));
+
+        let project: Option<String> = issue.get_metadata("project");
+        assert_eq!(project, Some("Backend".to_string()));
+
+        let project_id: Option<String> = issue.get_metadata("project_id");
+        assert_eq!(project_id, Some("proj_456".to_string()));
+
+        let assignee: Option<String> = issue.get_metadata("assignee");
+        assert_eq!(assignee, Some("John Doe".to_string()));
+    }
+
+    #[test]
+    fn test_matches_criteria_state_match_by_state_type() {
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "Fix bug",
+            "https://example.com",
+            "linear",
+        );
+        issue.set_metadata("labels", vec!["claude".to_string()]);
+        issue.set_metadata("state_name", "Custom State");
+        issue.set_metadata("state_type", "todo"); // Matches trigger_states
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+    }
+
+    #[test]
+    fn test_matches_criteria_no_state_name_still_checks_type() {
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "Fix bug",
+            "https://example.com",
+            "linear",
+        );
+        issue.set_metadata("labels", vec!["claude".to_string()]);
+        // Only set state_type, not state_name
+        issue.set_metadata("state_type", "backlog");
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_with_both_team_and_project_filter() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{
+                "data": {
+                    "issues": {
+                        "nodes": []
+                    }
+                }
+            }"#,
+        );
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        config.project_id = Some("proj-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_empty_trigger_labels_omits_labels_filter() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{
+                "data": {
+                    "issues": {
+                        "nodes": []
+                    }
+                }
+            }"#,
+        );
+
+        let mut config = test_config();
+        config.trigger_labels = vec![]; // Empty
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_with_description_only() {
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "Issue with desc",
+            "https://linear.app/123",
+            "linear",
+        );
+        issue.description = Some("Only a description, no other metadata".to_string());
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("## Description"));
+        assert!(context.contains("Only a description, no other metadata"));
+        assert!(!context.contains("**Team:**"));
+    }
+
+    #[test]
+    fn test_graphql_response_no_data_no_errors() {
+        let json = r#"{}"#;
+        let response: GraphQLResponse<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert!(response.data.is_none());
+        assert!(response.errors.is_none());
+    }
+
+    // --- New tests for coverage ---
+
+    /// Sequential mock HTTP client that returns queued responses in order.
+    pub struct SequentialMockLinearClient {
+        responses: Mutex<Vec<HttpResponse>>,
+        requests: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl SequentialMockLinearClient {
+        pub fn new(responses: Vec<(u16, &str)>) -> Self {
+            Self {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .rev() // Reverse so we can pop from the end
+                        .map(|(status, body)| HttpResponse {
+                            status,
+                            body: body.to_string(),
+                        })
+                        .collect(),
+                ),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LinearHttpClient for SequentialMockLinearClient {
+        async fn post(
+            &self,
+            url: &str,
+            _api_key: &str,
+            body: serde_json::Value,
+        ) -> Result<HttpResponse> {
+            self.requests.lock().unwrap().push((url.to_string(), body));
+            let mut responses = self.responses.lock().unwrap();
+            if let Some(response) = responses.pop() {
+                Ok(response)
+            } else {
+                Ok(HttpResponse {
+                    status: 500,
+                    body: "No more mock responses".to_string(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_success() {
+        // Exercises the full resolve_issue path (lines 498-597):
+        // 1. get_issue (to find team_id)
+        // 2. query team states (to find completed state)
+        // 3. update issue state
+        let mock = SequentialMockLinearClient::new(vec![
+            // Response 1: get_issue
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issue": {
+                            "id": "resolve-1",
+                            "identifier": "PROJ-R1",
+                            "title": "To Resolve",
+                            "description": null,
+                            "url": "https://linear.app/resolve-1",
+                            "priority": 2,
+                            "createdAt": "2024-01-01T00:00:00Z",
+                            "updatedAt": "2024-01-02T00:00:00Z",
+                            "state": {"name": "In Progress", "type": "started"},
+                            "labels": {"nodes": []},
+                            "team": {"id": "team-abc", "name": "Engineering"},
+                            "project": null,
+                            "assignee": null
+                        }
+                    }
+                }"#,
+            ),
+            // Response 2: team states query
+            (
+                200,
+                r#"{
+                    "data": {
+                        "team": {
+                            "states": {
+                                "nodes": [
+                                    {"id": "state-1", "name": "Backlog", "type": "backlog"},
+                                    {"id": "state-2", "name": "In Progress", "type": "started"},
+                                    {"id": "state-3", "name": "Done", "type": "completed"}
+                                ]
+                            }
+                        }
+                    }
+                }"#,
+            ),
+            // Response 3: issue update mutation
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueUpdate": {
+                            "success": true
+                        }
+                    }
+                }"#,
+            ),
+        ]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.resolve_issue("resolve-1").await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_no_team_id() {
+        // Issue has no team metadata, so resolve_issue should error (line 501-503).
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "issue": {
+                        "id": "no-team",
+                        "identifier": "PROJ-NT",
+                        "title": "No Team",
+                        "description": null,
+                        "url": "https://linear.app/no-team",
+                        "priority": 2,
+                        "createdAt": "2024-01-01T00:00:00Z",
+                        "updatedAt": "2024-01-02T00:00:00Z",
+                        "state": {"name": "Backlog", "type": "backlog"},
+                        "labels": {"nodes": []},
+                        "team": null,
+                        "project": null,
+                        "assignee": null
+                    }
+                }
+            }"#,
+        )]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.resolve_issue("no-team").await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("team_id"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_no_completed_state() {
+        // Team has no completed state (line 544-552).
+        let mock = SequentialMockLinearClient::new(vec![
+            // get_issue
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issue": {
+                            "id": "no-done",
+                            "identifier": "PROJ-ND",
+                            "title": "No Done State",
+                            "description": null,
+                            "url": "https://linear.app/no-done",
+                            "priority": 2,
+                            "createdAt": "2024-01-01T00:00:00Z",
+                            "updatedAt": "2024-01-02T00:00:00Z",
+                            "state": {"name": "In Progress", "type": "started"},
+                            "labels": {"nodes": []},
+                            "team": {"id": "team-xyz", "name": "Ops"},
+                            "project": null,
+                            "assignee": null
+                        }
+                    }
+                }"#,
+            ),
+            // team states - no completed state
+            (
+                200,
+                r#"{
+                    "data": {
+                        "team": {
+                            "states": {
+                                "nodes": [
+                                    {"id": "s1", "name": "Backlog", "type": "backlog"},
+                                    {"id": "s2", "name": "In Progress", "type": "started"}
+                                ]
+                            }
+                        }
+                    }
+                }"#,
+            ),
+        ]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.resolve_issue("no-done").await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("completed state"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_update_fails() {
+        // Issue update returns success: false (line 583-588).
+        let mock = SequentialMockLinearClient::new(vec![
+            // get_issue
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issue": {
+                            "id": "fail-update",
+                            "identifier": "PROJ-FU",
+                            "title": "Fail Update",
+                            "description": null,
+                            "url": "https://linear.app/fail-update",
+                            "priority": 2,
+                            "createdAt": "2024-01-01T00:00:00Z",
+                            "updatedAt": "2024-01-02T00:00:00Z",
+                            "state": {"name": "Todo", "type": "unstarted"},
+                            "labels": {"nodes": []},
+                            "team": {"id": "team-q", "name": "Team"},
+                            "project": null,
+                            "assignee": null
+                        }
+                    }
+                }"#,
+            ),
+            // team states
+            (
+                200,
+                r#"{
+                    "data": {
+                        "team": {
+                            "states": {
+                                "nodes": [
+                                    {"id": "s1", "name": "Done", "type": "completed"}
+                                ]
+                            }
+                        }
+                    }
+                }"#,
+            ),
+            // issue update - fails
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueUpdate": {
+                            "success": false
+                        }
+                    }
+                }"#,
+            ),
+        ]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.resolve_issue("fail-update").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to update issue state"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_update_null_payload() {
+        // Issue update returns null payload (line 583-586 unwrap_or(false)).
+        let mock = SequentialMockLinearClient::new(vec![
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issue": {
+                            "id": "null-upd",
+                            "identifier": "PROJ-NU",
+                            "title": "Null Update",
+                            "description": null,
+                            "url": "https://linear.app/null-upd",
+                            "priority": 2,
+                            "createdAt": "2024-01-01T00:00:00Z",
+                            "updatedAt": "2024-01-02T00:00:00Z",
+                            "state": {"name": "Todo", "type": "unstarted"},
+                            "labels": {"nodes": []},
+                            "team": {"id": "t1", "name": "T"},
+                            "project": null,
+                            "assignee": null
+                        }
+                    }
+                }"#,
+            ),
+            (
+                200,
+                r#"{
+                    "data": {
+                        "team": {
+                            "states": {
+                                "nodes": [{"id": "done-1", "name": "Done", "type": "completed"}]
+                            }
+                        }
+                    }
+                }"#,
+            ),
+            // issueUpdate is null
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueUpdate": null
+                    }
+                }"#,
+            ),
+        ]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.resolve_issue("null-upd").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to update issue state"));
+    }
+
+    #[tokio::test]
+    async fn test_add_comment_success() {
+        // Exercises the add_comment path (lines 600-634).
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "commentCreate": {
+                        "success": true
+                    }
+                }
+            }"#,
+        )]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source
+            .add_comment("issue-1", "This is a test comment")
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_add_comment_failure() {
+        // Comment creation returns success: false (line 629-630).
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "commentCreate": {
+                        "success": false
+                    }
+                }
+            }"#,
+        )]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.add_comment("issue-1", "This will fail").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to create comment"));
+    }
+
+    #[tokio::test]
+    async fn test_add_comment_null_payload() {
+        // commentCreate is null (line 629 unwrap_or(false)).
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "commentCreate": null
+                }
+            }"#,
+        )]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.add_comment("issue-1", "Null payload").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to create comment"));
+    }
+
+    #[tokio::test]
+    async fn test_add_comment_api_error() {
+        // API returns non-200 status (line 277-281 in graphql method).
+        let mock = SequentialMockLinearClient::new(vec![(500, "Internal Server Error")]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.add_comment("issue-1", "Error comment").await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_no_description() {
+        // Exercises the build_issue_context with no description (line 468 branch).
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "No Desc Issue",
+            "https://linear.app/123",
+            "linear",
+        );
+        issue.set_metadata("team", "Backend");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("PROJ-123"));
+        assert!(context.contains("No Desc Issue"));
+        assert!(!context.contains("## Description"));
+        assert!(context.contains("**Team:** Backend"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_with_team_only() {
+        // Exercises just the team metadata path (line 472-473).
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "t1",
+            "PROJ-T1",
+            "Team Only",
+            "https://linear.app/t1",
+            "linear",
+        );
+        issue.set_metadata("team", "Frontend");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("**Team:** Frontend"));
+        assert!(!context.contains("**Project:**"));
+        assert!(!context.contains("**Assignee:**"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_with_project_only() {
+        // Exercises just the project metadata path (line 475-476).
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "p1",
+            "PROJ-P1",
+            "Project Only",
+            "https://linear.app/p1",
+            "linear",
+        );
+        issue.set_metadata("project", "Infra");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(!context.contains("**Team:**"));
+        assert!(context.contains("**Project:** Infra"));
+        assert!(!context.contains("**Assignee:**"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_with_assignee_only() {
+        // Exercises just the assignee metadata path (line 478-479).
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "a1",
+            "PROJ-A1",
+            "Assignee Only",
+            "https://linear.app/a1",
+            "linear",
+        );
+        issue.set_metadata("assignee", "Bob");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(!context.contains("**Team:**"));
+        assert!(!context.contains("**Project:**"));
+        assert!(context.contains("**Assignee:** Bob"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_priority_and_status_display() {
+        // Exercises the priority and status formatting (lines 465-466).
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "ps1",
+            "PROJ-PS1",
+            "Priority Status",
+            "https://linear.app/ps1",
+            "linear",
+        );
+        issue.priority = IssuePriority::High;
+        issue.status = IssueStatus::InProgress;
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("**Priority:**"));
+        assert!(context.contains("**Status:**"));
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_api_error() {
+        // API error when getting a single issue (line 490).
+        let mock = SequentialMockLinearClient::new(vec![(500, "Bad Request")]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.get_issue("bad-id").await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_null_issue() {
+        // GraphQL returns null for issue (line 492-495).
+        let mock = SequentialMockLinearClient::new(vec![(200, r#"{"data": {"issue": null}}"#)]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.get_issue("missing-id").await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_started() {
+        // Exercises get_issue_status with "started" state type (lines 637-640).
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "issue": {
+                        "id": "status-1",
+                        "identifier": "PROJ-ST1",
+                        "title": "Started Issue",
+                        "description": null,
+                        "url": "https://linear.app/status-1",
+                        "priority": 2,
+                        "createdAt": "2024-01-01T00:00:00Z",
+                        "updatedAt": "2024-01-02T00:00:00Z",
+                        "state": {"name": "In Progress", "type": "started"},
+                        "labels": {"nodes": []},
+                        "team": null,
+                        "project": null,
+                        "assignee": null
+                    }
+                }
+            }"#,
+        )]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let status = source.get_issue_status("status-1").await.unwrap();
+        assert_eq!(status, "started");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_team_null_in_states_response() {
+        // Team states response returns null team (line 544-546 .and_then path).
+        let mock = SequentialMockLinearClient::new(vec![
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issue": {
+                            "id": "tn1",
+                            "identifier": "PROJ-TN1",
+                            "title": "Team Null States",
+                            "description": null,
+                            "url": "https://linear.app/tn1",
+                            "priority": 2,
+                            "createdAt": "2024-01-01T00:00:00Z",
+                            "updatedAt": "2024-01-02T00:00:00Z",
+                            "state": {"name": "Todo", "type": "unstarted"},
+                            "labels": {"nodes": []},
+                            "team": {"id": "team-null", "name": "Team"},
+                            "project": null,
+                            "assignee": null
+                        }
+                    }
+                }"#,
+            ),
+            // team is null in states response
+            (200, r#"{"data": {"team": null}}"#),
+        ]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.resolve_issue("tn1").await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("completed state"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_maps_multiple_issues() {
+        // Exercises the map over issue nodes (lines 406-411).
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            {
+                                "id": "1",
+                                "identifier": "T-1",
+                                "title": "First",
+                                "description": "Desc 1",
+                                "url": "https://linear.app/1",
+                                "priority": 1,
+                                "createdAt": "2024-01-01T00:00:00Z",
+                                "updatedAt": "2024-01-02T00:00:00Z",
+                                "state": {"name": "Backlog", "type": "backlog"},
+                                "labels": {"nodes": [{"name": "auto-implement"}]},
+                                "team": {"id": "t1", "name": "Eng"},
+                                "project": null,
+                                "assignee": null
+                            },
+                            {
+                                "id": "2",
+                                "identifier": "T-2",
+                                "title": "Second",
+                                "description": null,
+                                "url": "https://linear.app/2",
+                                "priority": 3,
+                                "createdAt": "2024-01-01T00:00:00Z",
+                                "updatedAt": "2024-01-03T00:00:00Z",
+                                "state": {"name": "Todo", "type": "unstarted"},
+                                "labels": {"nodes": []},
+                                "team": null,
+                                "project": {"id": "p1", "name": "Proj"},
+                                "assignee": {"name": "Alice"}
+                            }
+                        ]
+                    }
+                }
+            }"#,
+        )]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].id, "1");
+        assert_eq!(issues[0].short_id, "T-1");
+        assert_eq!(issues[0].priority, IssuePriority::Critical);
+        assert_eq!(issues[1].id, "2");
+        assert_eq!(issues[1].short_id, "T-2");
+        assert_eq!(issues[1].priority, IssuePriority::Medium);
+    }
+
+    #[test]
+    fn test_matches_criteria_no_state_metadata_with_trigger_states() {
+        // Exercises the branch where state_name/state_type are both None
+        // but trigger_states is non-empty (line 421-434).
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "No State",
+            "https://example.com",
+            "linear",
+        );
+        issue.set_metadata("labels", vec!["claude".to_string()]);
+        // No state_name or state_type set
+
+        let result = source.matches_criteria(&issue);
+        // Should not match because trigger_states is non-empty and state is "unknown"
+        assert!(!result.matches);
+        assert!(result.reason.contains("not in trigger states"));
+    }
+
+    #[test]
+    fn test_matches_criteria_empty_labels_on_issue_with_trigger_labels() {
+        // Issue has empty labels list but trigger_labels is non-empty (line 438-447).
+        let source = LinearSource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "No Labels",
+            "https://example.com",
+            "linear",
+        );
+        issue.set_metadata("labels", Vec::<String>::new());
+        issue.set_metadata("state_type", "backlog");
+
+        let result = source.matches_criteria(&issue);
+        assert!(!result.matches);
+        assert!(result.reason.contains("label"));
+    }
+
+    // ------------------------------------------------------------------
+    // Tests for extracted standalone functions (tarpaulin-traceable)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_format_linear_context_basic() {
+        let issue = Issue::new(
+            "100",
+            "PROJ-100",
+            "Basic Issue",
+            "https://linear.app/100",
+            "linear",
+        );
+
+        let context = format_linear_context(&issue);
+
+        assert!(context.contains("# Linear Issue: PROJ-100"));
+        assert!(context.contains("**Title:** Basic Issue"));
+        assert!(context.contains("**URL:** https://linear.app/100"));
+        assert!(context.contains("**Priority:**"));
+        assert!(context.contains("**Status:**"));
+        // No metadata set, so these should not appear
+        assert!(!context.contains("## Description"));
+        assert!(!context.contains("**Team:**"));
+        assert!(!context.contains("**Project:**"));
+        assert!(!context.contains("**Assignee:**"));
+    }
+
+    #[test]
+    fn test_format_linear_context_with_description() {
+        let mut issue = Issue::new(
+            "200",
+            "PROJ-200",
+            "Described Issue",
+            "https://linear.app/200",
+            "linear",
+        );
+        issue.description =
+            Some("This is a detailed description\nwith multiple lines.".to_string());
+
+        let context = format_linear_context(&issue);
+
+        assert!(context.contains("## Description"));
+        assert!(context.contains("This is a detailed description"));
+        assert!(context.contains("with multiple lines."));
+    }
+
+    #[test]
+    fn test_format_linear_context_with_all_metadata() {
+        let mut issue = Issue::new(
+            "300",
+            "PROJ-300",
+            "Full Issue",
+            "https://linear.app/300",
+            "linear",
+        );
+        issue.description = Some("Full description".to_string());
+        issue.set_metadata("team", "Platform");
+        issue.set_metadata("project", "Infrastructure");
+        issue.set_metadata("assignee", "Jane Doe");
+
+        let context = format_linear_context(&issue);
+
+        assert!(context.contains("**Team:** Platform"));
+        assert!(context.contains("**Project:** Infrastructure"));
+        assert!(context.contains("**Assignee:** Jane Doe"));
+        assert!(context.contains("## Description"));
+        assert!(context.contains("Full description"));
+    }
+
+    #[test]
+    fn test_format_linear_context_team_only() {
+        let mut issue = Issue::new(
+            "400",
+            "PROJ-400",
+            "Team Only",
+            "https://linear.app/400",
+            "linear",
+        );
+        issue.set_metadata("team", "Backend");
+
+        let context = format_linear_context(&issue);
+
+        assert!(context.contains("**Team:** Backend"));
+        assert!(!context.contains("**Project:**"));
+        assert!(!context.contains("**Assignee:**"));
+    }
+
+    #[test]
+    fn test_format_linear_context_project_only() {
+        let mut issue = Issue::new(
+            "500",
+            "PROJ-500",
+            "Project Only",
+            "https://linear.app/500",
+            "linear",
+        );
+        issue.set_metadata("project", "API v2");
+
+        let context = format_linear_context(&issue);
+
+        assert!(!context.contains("**Team:**"));
+        assert!(context.contains("**Project:** API v2"));
+        assert!(!context.contains("**Assignee:**"));
+    }
+
+    #[test]
+    fn test_format_linear_context_assignee_only() {
+        let mut issue = Issue::new(
+            "600",
+            "PROJ-600",
+            "Assigned Issue",
+            "https://linear.app/600",
+            "linear",
+        );
+        issue.set_metadata("assignee", "Alice");
+
+        let context = format_linear_context(&issue);
+
+        assert!(!context.contains("**Team:**"));
+        assert!(!context.contains("**Project:**"));
+        assert!(context.contains("**Assignee:** Alice"));
+    }
+
+    #[test]
+    fn test_format_linear_context_no_description() {
+        let issue = Issue::new(
+            "700",
+            "PROJ-700",
+            "No Desc",
+            "https://linear.app/700",
+            "linear",
+        );
+
+        let context = format_linear_context(&issue);
+
+        assert!(!context.contains("## Description"));
     }
 }

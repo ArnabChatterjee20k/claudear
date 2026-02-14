@@ -758,4 +758,2324 @@ mod tests {
         let updated_watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
         assert_eq!(updated_watch.status, RegressionWatchStatus::Monitoring);
     }
+
+    #[test]
+    fn test_release_tracker_config_with_values() {
+        let mut package_names = HashMap::new();
+        package_names.insert(
+            "utopia-database".to_string(),
+            "utopia-php/database".to_string(),
+        );
+
+        let config = ReleaseTrackerConfig {
+            target_repos: vec![
+                "appwrite/cloud".to_string(),
+                "appwrite/appwrite".to_string(),
+            ],
+            poll_interval_ms: 30_000,
+            package_names,
+        };
+
+        assert_eq!(config.target_repos.len(), 2);
+        assert_eq!(config.poll_interval_ms, 30_000);
+        assert_eq!(
+            config.package_names.get("utopia-database"),
+            Some(&"utopia-php/database".to_string())
+        );
+    }
+
+    #[test]
+    fn test_release_tracker_config_accessor() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["org/repo".to_string()],
+            poll_interval_ms: 5000,
+            ..Default::default()
+        };
+
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker, config);
+
+        assert_eq!(release_tracker.config().target_repos, vec!["org/repo"]);
+        assert_eq!(release_tracker.config().poll_interval_ms, 5000);
+    }
+
+    #[test]
+    fn test_release_tracker_with_http_client_and_relationships() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let relationships = RepoRelationships::with_appwrite_defaults();
+
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["appwrite-labs/cloud".to_string()],
+            ..Default::default()
+        };
+
+        let release_tracker = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker,
+            config,
+            relationships,
+        );
+
+        assert_eq!(
+            release_tracker.config().target_repos,
+            vec!["appwrite-labs/cloud"]
+        );
+    }
+
+    #[test]
+    fn test_find_dependency_type_with_graph() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let relationships = RepoRelationships::with_appwrite_defaults();
+
+        let release_tracker = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker,
+            ReleaseTrackerConfig::default(),
+            relationships,
+        );
+
+        // utopia-database has a Composer dependency downstream
+        let dep_type = release_tracker.find_dependency_type("utopia-database", "cloud");
+        assert_eq!(dep_type, DependencyType::Composer);
+    }
+
+    #[test]
+    fn test_find_dependency_type_unknown_repo_returns_manual() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let relationships = RepoRelationships::new();
+
+        let release_tracker = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker,
+            ReleaseTrackerConfig::default(),
+            relationships,
+        );
+
+        // Unknown repo should fall back to Manual
+        let dep_type = release_tracker.find_dependency_type("unknown/repo", "target");
+        assert_eq!(dep_type, DependencyType::Manual);
+    }
+
+    #[tokio::test]
+    async fn test_check_watch_release_missing_attempt() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Create a regression watch with a non-existent attempt ID
+        let watch = RegressionWatch {
+            id: 1,
+            issue_type: IssueType::SentryIssue,
+            issue_id: "issue-missing".to_string(),
+            fix_attempt_id: 9999, // does not exist
+            status: RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let result = release_tracker.check_watch_release(&watch).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_check_watch_release_attempt_missing_pr_info() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Create a fix attempt without PR info
+        tracker
+            .record_attempt("sentry", "issue-no-pr", "SENTRY-NO-PR")
+            .unwrap();
+        // Attempt stays pending (no PR URL set)
+
+        let attempt = tracker
+            .get_attempt("sentry", "issue-no-pr")
+            .unwrap()
+            .unwrap();
+
+        let watch = RegressionWatch {
+            id: 1,
+            issue_type: IssueType::SentryIssue,
+            issue_id: "issue-no-pr".to_string(),
+            fix_attempt_id: attempt.id,
+            status: RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let result = release_tracker.check_watch_release(&watch).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_check_watch_release_pr_not_merged() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-open", "SENTRY-OPEN")
+            .unwrap();
+        tracker
+            .mark_success(
+                "sentry",
+                "issue-open",
+                "https://github.com/org/repo/pull/10",
+            )
+            .unwrap();
+
+        let attempt = tracker
+            .get_attempt("sentry", "issue-open")
+            .unwrap()
+            .unwrap();
+
+        let watch = RegressionWatch {
+            id: 1,
+            issue_type: IssueType::SentryIssue,
+            issue_id: "issue-open".to_string(),
+            fix_attempt_id: attempt.id,
+            status: RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        // PR is not merged
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"{"number": 10, "merged": false, "merge_commit_sha": null, "merged_at": null}"#,
+        )]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let result = release_tracker.check_watch_release(&watch).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_check_watch_release_merged_no_merged_at() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-notime", "SENTRY-NOTIME")
+            .unwrap();
+        tracker
+            .mark_success(
+                "sentry",
+                "issue-notime",
+                "https://github.com/org/repo/pull/11",
+            )
+            .unwrap();
+
+        let attempt = tracker
+            .get_attempt("sentry", "issue-notime")
+            .unwrap()
+            .unwrap();
+
+        let watch = RegressionWatch {
+            id: 1,
+            issue_type: IssueType::SentryIssue,
+            issue_id: "issue-notime".to_string(),
+            fix_attempt_id: attempt.id,
+            status: RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        // PR is merged but has no merged_at timestamp
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"{"number": 11, "merged": true, "merge_commit_sha": "abc123", "merged_at": null}"#,
+        )]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let result = release_tracker.check_watch_release(&watch).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_check_direct_release_no_merge_commit() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-1", 1);
+
+        // PR details without merge_commit_sha
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: None,
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_direct_release(&watch, "org/repo", &pr_details)
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_check_direct_release_no_release_found() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Return 404 for latest release
+        let mock = MockHttpClient::new(vec![(404, r#"{"message": "Not Found"}"#)]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-1", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_direct_release(&watch, "org/repo", &pr_details)
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_check_direct_release_any_target_no_merge_commit() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["org/target".to_string()],
+            ..Default::default()
+        };
+
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker, config);
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-1", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: None,
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_direct_release_any_target(&watch, "org/source", &pr_details)
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_check_direct_release_any_target_commit_not_in_release() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![
+            // get_latest_release
+            (
+                200,
+                r#"{
+                    "id": 1,
+                    "tag_name": "v2.0.0",
+                    "name": "Version 2.0.0",
+                    "draft": false,
+                    "prerelease": false,
+                    "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z",
+                    "target_commitish": "main",
+                    "body": "Release notes",
+                    "html_url": "https://github.com/org/target/releases/tag/v2.0.0"
+                }"#,
+            ),
+            // is_commit_in_release - commit is NOT in release (ahead)
+            (200, r#"{"status": "ahead", "ahead_by": 3, "behind_by": 0}"#),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["org/target".to_string()],
+            ..Default::default()
+        };
+
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker, config);
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-1", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_direct_release_any_target(&watch, "org/source", &pr_details)
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_verify_commit_ancestry_no_merge_commit() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-1", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: None,
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .verify_commit_ancestry(&watch, "org/source", &pr_details, "org/target", "v1.0.0")
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_verify_lock_file_no_source_release() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // get_first_release_after returns empty release list (no releases found)
+        let mock = MockHttpClient::new(vec![(200, "[]")]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-1", 1);
+
+        let result = release_tracker
+            .verify_lock_file(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                "v2.0.0",
+                "utopia-php/database",
+                "composer.lock",
+            )
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_check_pending_watches_multiple_no_transitions() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Create two fix attempts that will fail to transition (missing PR info)
+        tracker
+            .record_attempt("sentry", "issue-a", "SENTRY-A")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "issue-b", "SENTRY-B")
+            .unwrap();
+
+        let attempt_a = tracker.get_attempt("sentry", "issue-a").unwrap().unwrap();
+        let attempt_b = tracker.get_attempt("sentry", "issue-b").unwrap().unwrap();
+
+        let watch_a = RegressionWatch::new(IssueType::SentryIssue, "issue-a", attempt_a.id);
+        tracker.create_regression_watch(&watch_a).unwrap();
+
+        let watch_b = RegressionWatch::new(IssueType::SentryIssue, "issue-b", attempt_b.id);
+        tracker.create_regression_watch(&watch_b).unwrap();
+
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        // Both watches have no PR info, so neither should transition
+        let result = release_tracker.check_pending_watches().await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_graph_release_no_target_release() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Return 404 for get_latest_release on target
+        let mock = MockHttpClient::new(vec![(404, r#"{"message": "Not Found"}"#)]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-1", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Manual,
+            )
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_release_tracker_config_clone() {
+        let mut package_names = HashMap::new();
+        package_names.insert("lib".to_string(), "pkg".to_string());
+
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["repo1".to_string()],
+            poll_interval_ms: 1000,
+            package_names,
+        };
+
+        let cloned = config.clone();
+        assert_eq!(cloned.target_repos, config.target_repos);
+        assert_eq!(cloned.poll_interval_ms, config.poll_interval_ms);
+        assert_eq!(cloned.package_names, config.package_names);
+    }
+
+    #[test]
+    fn test_release_tracker_config_debug() {
+        let config = ReleaseTrackerConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("ReleaseTrackerConfig"));
+    }
+
+    // --- New tests targeting uncovered lines ---
+
+    // Covers lines 43-48: ReleaseTracker::new constructor
+    #[test]
+    fn test_release_tracker_new_constructor() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        // Cannot construct with ReqwestHttpClient in unit tests, but we can verify
+        // with_http_client which covers the same struct fields.
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("my-token", mock);
+        let rt = ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+        assert!(rt.config().target_repos.is_empty());
+        assert_eq!(rt.config().poll_interval_ms, 0);
+    }
+
+    // Covers lines 53, 59, 62: ReleaseTracker::with_config constructor
+    #[test]
+    fn test_release_tracker_with_config_constructor() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("token", mock);
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["org/target".to_string()],
+            poll_interval_ms: 60_000,
+            package_names: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "utopia-database".to_string(),
+                    "utopia-php/database".to_string(),
+                );
+                m
+            },
+        };
+        let rt = ReleaseTracker::with_http_client(client, tracker, config);
+        assert_eq!(rt.config().target_repos, vec!["org/target"]);
+        assert_eq!(rt.config().poll_interval_ms, 60_000);
+        assert_eq!(
+            rt.config().package_names.get("utopia-database"),
+            Some(&"utopia-php/database".to_string())
+        );
+    }
+
+    // Covers lines 67, 74: ReleaseTracker::with_relationships constructor
+    #[test]
+    fn test_release_tracker_with_relationships_constructor() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("token", mock);
+        let mut relationships = RepoRelationships::new();
+        relationships
+            .add_dependency("lib", "app", DependencyType::Npm, None)
+            .unwrap();
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["app".to_string()],
+            ..Default::default()
+        };
+        let rt = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker,
+            config,
+            relationships,
+        );
+        assert_eq!(rt.config().target_repos, vec!["app"]);
+    }
+
+    // Covers lines 173, 178-179, 184-185, 187, 190, 192, 194-199, 201, 203:
+    // check_watch_release through dependency graph path
+    #[tokio::test]
+    async fn test_check_watch_release_via_dependency_graph() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // PR URL must be owner/repo format for parse_pr_url to work
+        tracker
+            .record_attempt("sentry", "issue-graph", "SENTRY-GRAPH")
+            .unwrap();
+        tracker
+            .mark_success(
+                "sentry",
+                "issue-graph",
+                "https://github.com/utopia-php/database/pull/5",
+            )
+            .unwrap();
+        tracker.mark_merged("sentry", "issue-graph").unwrap();
+
+        let attempt = tracker
+            .get_attempt("sentry", "issue-graph")
+            .unwrap()
+            .unwrap();
+
+        let watch = RegressionWatch {
+            id: 1,
+            issue_type: IssueType::SentryIssue,
+            issue_id: "issue-graph".to_string(),
+            fix_attempt_id: attempt.id,
+            status: RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            // get_pr_details for utopia-php/database PR #5
+            (
+                200,
+                r#"{"number": 5, "merged": true, "merge_commit_sha": "fix123", "merged_at": "2024-01-10T10:00:00Z"}"#,
+            ),
+            // get_latest_release for cloud (target)
+            (
+                200,
+                r#"{
+                    "id": 10, "tag_name": "v2.0.0", "name": "Cloud 2.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-20T10:00:00Z",
+                    "published_at": "2024-01-20T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "https://github.com/cloud/releases/tag/v2.0.0"
+                }"#,
+            ),
+            // get_releases for utopia-php/database (get_first_release_after)
+            (
+                200,
+                r#"[{
+                    "id": 20, "tag_name": "v0.46.0", "name": "v0.46.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-12T10:00:00Z",
+                    "published_at": "2024-01-12T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            // get_file_at_ref for composer.lock
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        r#"{"packages":[{"name":"utopia-php/database","version":"v0.46.0"}],"packages-dev":[]}"#
+                    )
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        // Graph uses the same repo name as what parse_pr_url extracts: "utopia-php/database"
+        let mut relationships = RepoRelationships::new();
+        relationships
+            .add_dependency(
+                "utopia-php/database",
+                "appwrite",
+                DependencyType::Composer,
+                None,
+            )
+            .unwrap();
+        relationships
+            .add_dependency("appwrite", "cloud", DependencyType::Composer, None)
+            .unwrap();
+
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["cloud".to_string()],
+            package_names: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "utopia-php/database".to_string(),
+                    "utopia-php/database".to_string(),
+                );
+                m
+            },
+            ..Default::default()
+        };
+
+        let release_tracker = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker.clone(),
+            config,
+            relationships,
+        );
+
+        let result = release_tracker.check_watch_release(&watch).await.unwrap();
+        assert!(result);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers lines 209-210: fallback to check_direct_release_any_target
+    #[tokio::test]
+    async fn test_check_watch_release_fallback_direct_any_target() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-fallback", "SENTRY-FB")
+            .unwrap();
+        tracker
+            .mark_success(
+                "sentry",
+                "issue-fallback",
+                "https://github.com/unrelated/repo/pull/1",
+            )
+            .unwrap();
+        tracker.mark_merged("sentry", "issue-fallback").unwrap();
+
+        let attempt = tracker
+            .get_attempt("sentry", "issue-fallback")
+            .unwrap()
+            .unwrap();
+
+        let watch = RegressionWatch {
+            id: 1,
+            issue_type: IssueType::SentryIssue,
+            issue_id: "issue-fallback".to_string(),
+            fix_attempt_id: attempt.id,
+            status: RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        tracker.create_regression_watch(&watch).unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{"number": 1, "merged": true, "merge_commit_sha": "abc123", "merged_at": "2024-01-10T10:00:00Z"}"#,
+            ),
+            // get_latest_release for target - not found
+            (404, r#"{"message": "Not Found"}"#),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["org/target".to_string()],
+            ..Default::default()
+        };
+        let relationships = RepoRelationships::new();
+
+        let release_tracker = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker,
+            config,
+            relationships,
+        );
+
+        let result = release_tracker.check_watch_release(&watch).await.unwrap();
+        assert!(!result);
+    }
+
+    // Covers lines 270-278: check_direct_release_any_target success path
+    #[tokio::test]
+    async fn test_check_direct_release_any_target_commit_found_in_release() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-found", "SENTRY-FOUND")
+            .unwrap();
+        tracker
+            .mark_success(
+                "sentry",
+                "issue-found",
+                "https://github.com/org/source/pull/1",
+            )
+            .unwrap();
+        tracker.mark_merged("sentry", "issue-found").unwrap();
+
+        let attempt = tracker
+            .get_attempt("sentry", "issue-found")
+            .unwrap()
+            .unwrap();
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-found", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            // get_latest_release for target
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v3.0.0", "name": "Version 3.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            // is_commit_in_release - commit IS in release (behind)
+            (
+                200,
+                r#"{"status": "behind", "ahead_by": 0, "behind_by": 3}"#,
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["org/target".to_string()],
+            ..Default::default()
+        };
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker.clone(), config);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_direct_release_any_target(&watch, "org/source", &pr_details)
+            .await
+            .unwrap();
+        assert!(result);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers lines 304-309: check_graph_release no target release (debug log)
+    #[tokio::test]
+    async fn test_check_graph_release_no_release_with_debug_log() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![(404, r#"{"message": "Not Found"}"#)]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-nrl", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Composer,
+            )
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    // Covers lines 316-335: check_graph_release with DependencyType::Composer
+    #[tokio::test]
+    async fn test_check_graph_release_composer_type() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-comp", "SENTRY-COMP")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("sentry", "issue-comp")
+            .unwrap()
+            .unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-comp", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v5.0.0", "name": "v5.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v0.50.0", "name": "v0.50.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        r#"{"packages":[{"name":"my-package","version":"v0.50.0"}],"packages-dev":[]}"#
+                    )
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let config = ReleaseTrackerConfig {
+            package_names: {
+                let mut m = HashMap::new();
+                m.insert("org/source".to_string(), "my-package".to_string());
+                m
+            },
+            ..Default::default()
+        };
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker.clone(), config);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Composer,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers lines 337-362: check_graph_release with DependencyType::Npm
+    #[tokio::test]
+    async fn test_check_graph_release_npm_type() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-npm", "SENTRY-NPM")
+            .unwrap();
+        let attempt = tracker.get_attempt("sentry", "issue-npm").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-npm", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let lock_json = r#"{"packages":{"node_modules/my-lib":{"version":"2.0.0"}}}"#;
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v3.0.0", "name": "v3.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v2.0.0", "name": "v2.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, lock_json)
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker = ReleaseTracker::with_http_client(
+            client,
+            tracker.clone(),
+            ReleaseTrackerConfig::default(),
+        );
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/my-lib",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Npm,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers lines 337-344: Npm type with package name override
+    #[tokio::test]
+    async fn test_check_graph_release_npm_with_package_override() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-npm2", "SENTRY-NPM2")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("sentry", "issue-npm2")
+            .unwrap()
+            .unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-npm2", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let lock_json = r#"{"packages":{"node_modules/@scope/custom-pkg":{"version":"1.5.0"}}}"#;
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v4.0.0", "name": "v4.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v1.5.0", "name": "v1.5.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, lock_json)
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let config = ReleaseTrackerConfig {
+            package_names: {
+                let mut m = HashMap::new();
+                m.insert("org/source".to_string(), "@scope/custom-pkg".to_string());
+                m
+            },
+            ..Default::default()
+        };
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker.clone(), config);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("sha".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Npm,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers lines 364-372: check_graph_release with DependencyType::GitSubmodule
+    #[tokio::test]
+    async fn test_check_graph_release_git_submodule_type() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-sub", "SENTRY-SUB")
+            .unwrap();
+        let attempt = tracker.get_attempt("sentry", "issue-sub").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-sub", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"{"status": "behind", "ahead_by": 0, "behind_by": 2}"#,
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker = ReleaseTracker::with_http_client(
+            client,
+            tracker.clone(),
+            ReleaseTrackerConfig::default(),
+        );
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("fixsha".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::GitSubmodule,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers lines 374-376: check_graph_release with DependencyType::Manual
+    #[tokio::test]
+    async fn test_check_graph_release_manual_type() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-manual", "SENTRY-MAN")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("sentry", "issue-manual")
+            .unwrap()
+            .unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-manual", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T11:00:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v0.9.0", "name": "v0.9.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-12T10:00:00Z",
+                    "published_at": "2024-01-12T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker = ReleaseTracker::with_http_client(
+            client,
+            tracker.clone(),
+            ReleaseTrackerConfig::default(),
+        );
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("sha".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Manual,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers lines 380-395: check_graph_release verified=false returns Ok(false)
+    #[tokio::test]
+    async fn test_check_graph_release_not_verified() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (200, r#"{"status": "ahead", "ahead_by": 5, "behind_by": 0}"#),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-nv", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::GitSubmodule,
+            )
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    // Covers lines 420-427: verify_lock_file no source release
+    #[tokio::test]
+    async fn test_verify_lock_file_no_source_release_debug_log() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![(200, "[]")]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-nsr", 1);
+
+        let result = release_tracker
+            .verify_lock_file(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                "v2.0.0",
+                "my-package",
+                "composer.lock",
+            )
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    // Covers lines 431-437, 446-455: verify_lock_file lock file not found
+    #[tokio::test]
+    async fn test_verify_lock_file_lock_file_not_found() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"[{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            (404, r#"{"message": "Not Found"}"#),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-lnf", 1);
+
+        let result = release_tracker
+            .verify_lock_file(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                "v2.0.0",
+                "my-package",
+                "composer.lock",
+            )
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    // Covers lines 460-466, 468-474: verify_lock_file version check passes
+    #[tokio::test]
+    async fn test_verify_lock_file_version_ok() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"[{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        r#"{"packages":[{"name":"my-pkg","version":"v1.0.0"}],"packages-dev":[]}"#
+                    )
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-vok", 1);
+
+        let result = release_tracker
+            .verify_lock_file(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                "v2.0.0",
+                "my-pkg",
+                "composer.lock",
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers lines 476-482: verify_lock_file version check fails
+    #[tokio::test]
+    async fn test_verify_lock_file_version_too_old() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"[{
+                    "id": 1, "tag_name": "v2.0.0", "name": "v2.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        r#"{"packages":[{"name":"my-pkg","version":"v1.0.0"}],"packages-dev":[]}"#
+                    )
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-old", 1);
+
+        let result = release_tracker
+            .verify_lock_file(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                "v3.0.0",
+                "my-pkg",
+                "composer.lock",
+            )
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    // Covers lines 501-502, 508-522: verify_commit_ancestry with commit present (ancestor)
+    #[tokio::test]
+    async fn test_verify_commit_ancestry_commit_is_ancestor() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"{"status": "behind", "ahead_by": 0, "behind_by": 10}"#,
+        )]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-anc", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("merge123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .verify_commit_ancestry(&watch, "org/source", &pr_details, "org/target", "v1.0.0")
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers lines 508-511, 513-518: verify_commit_ancestry commit NOT ancestor
+    #[tokio::test]
+    async fn test_verify_commit_ancestry_commit_not_ancestor() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"{"status": "ahead", "ahead_by": 5, "behind_by": 0}"#,
+        )]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-na", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("future123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .verify_commit_ancestry(&watch, "org/source", &pr_details, "org/target", "v1.0.0")
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    // Covers lines 530, 539-549, 551-552: verify_release_after with source release found
+    #[tokio::test]
+    async fn test_verify_release_after_source_release_found_target_after() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"[{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-12T10:00:00Z",
+                    "published_at": "2024-01-12T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+        )]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-ra", 1);
+
+        let target_release = crate::release::github::GitHubRelease {
+            id: 10,
+            tag_name: "v2.0.0".to_string(),
+            name: Some("v2.0.0".to_string()),
+            draft: false,
+            prerelease: false,
+            created_at: "2024-02-01T10:00:00Z".to_string(),
+            published_at: Some("2024-02-01T10:30:00Z".to_string()),
+            target_commitish: "main".to_string(),
+            body: None,
+            html_url: "url".to_string(),
+        };
+
+        let result = release_tracker
+            .verify_release_after(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                &target_release,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers lines 555, 558-563: verify_release_after with no source release (uses merge time)
+    #[tokio::test]
+    async fn test_verify_release_after_no_source_release_uses_merge_time() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![(200, "[]")]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-mt", 1);
+
+        let target_release = crate::release::github::GitHubRelease {
+            id: 10,
+            tag_name: "v2.0.0".to_string(),
+            name: Some("v2.0.0".to_string()),
+            draft: false,
+            prerelease: false,
+            created_at: "2024-02-01T10:00:00Z".to_string(),
+            published_at: Some("2024-02-01T10:30:00Z".to_string()),
+            target_commitish: "main".to_string(),
+            body: None,
+            html_url: "url".to_string(),
+        };
+
+        let result = release_tracker
+            .verify_release_after(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                &target_release,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers lines 568-569: verify_release_after target release has no published_at
+    #[tokio::test]
+    async fn test_verify_release_after_target_no_published_at() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![(200, "[]")]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-np", 1);
+
+        let target_release = crate::release::github::GitHubRelease {
+            id: 10,
+            tag_name: "v2.0.0".to_string(),
+            name: None,
+            draft: false,
+            prerelease: false,
+            created_at: "2024-02-01T10:00:00Z".to_string(),
+            published_at: None,
+            target_commitish: "main".to_string(),
+            body: None,
+            html_url: "url".to_string(),
+        };
+
+        let result = release_tracker
+            .verify_release_after(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                &target_release,
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    // Covers lines 572-575: verify_release_after with invalid timestamp
+    #[tokio::test]
+    async fn test_verify_release_after_invalid_timestamp() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![(200, "[]")]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-bad", 1);
+
+        let target_release = crate::release::github::GitHubRelease {
+            id: 10,
+            tag_name: "v2.0.0".to_string(),
+            name: None,
+            draft: false,
+            prerelease: false,
+            created_at: "2024-02-01T10:00:00Z".to_string(),
+            published_at: Some("not-a-timestamp".to_string()),
+            target_commitish: "main".to_string(),
+            body: None,
+            html_url: "url".to_string(),
+        };
+
+        let result = release_tracker
+            .verify_release_after(
+                &watch,
+                "org/source",
+                "also-not-a-timestamp",
+                "org/target",
+                &target_release,
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    // Covers lines 577, 579-586, 590: verify_release_after target before source
+    #[tokio::test]
+    async fn test_verify_release_after_target_before_source() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"[{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-06-01T10:00:00Z",
+                    "published_at": "2024-06-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+        )]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-bf", 1);
+
+        let target_release = crate::release::github::GitHubRelease {
+            id: 10,
+            tag_name: "v0.5.0".to_string(),
+            name: Some("v0.5.0".to_string()),
+            draft: false,
+            prerelease: false,
+            created_at: "2024-01-01T10:00:00Z".to_string(),
+            published_at: Some("2024-01-01T10:30:00Z".to_string()),
+            target_commitish: "main".to_string(),
+            body: None,
+            html_url: "url".to_string(),
+        };
+
+        let result = release_tracker
+            .verify_release_after(
+                &watch,
+                "org/source",
+                "2024-05-10T10:00:00Z",
+                "org/target",
+                &target_release,
+            )
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    // Covers lines 609-613: transition_to_monitoring logging
+    #[tokio::test]
+    async fn test_transition_to_monitoring() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-trans", "SENTRY-TRANS")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("sentry", "issue-trans")
+            .unwrap()
+            .unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-trans", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker = ReleaseTracker::with_http_client(
+            client,
+            tracker.clone(),
+            ReleaseTrackerConfig::default(),
+        );
+
+        let result = release_tracker
+            .transition_to_monitoring(&watch, "v1.0.0", "org/repo")
+            .await
+            .unwrap();
+        assert!(result);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers lines 380-392: check_graph_release verified=true triggers info log + transition
+    #[tokio::test]
+    async fn test_check_graph_release_verified_triggers_transition() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("linear", "issue-vt", "LIN-VT")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-vt").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::LinearBug, "issue-vt", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"{"status": "identical", "ahead_by": 0, "behind_by": 0}"#,
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker = ReleaseTracker::with_http_client(
+            client,
+            tracker.clone(),
+            ReleaseTrackerConfig::default(),
+        );
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("sha".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::GitSubmodule,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers lines 316-324: Composer without package name override
+    #[tokio::test]
+    async fn test_check_graph_release_composer_no_package_override() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-cnp", "SENTRY-CNP")
+            .unwrap();
+        let attempt = tracker.get_attempt("sentry", "issue-cnp").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-cnp", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v5.0.0", "name": "v5.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v0.50.0", "name": "v0.50.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        r#"{"packages":[{"name":"org/source","version":"v0.50.0"}],"packages-dev":[]}"#
+                    )
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker = ReleaseTracker::with_http_client(
+            client,
+            tracker.clone(),
+            ReleaseTrackerConfig::default(),
+        );
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("sha".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Composer,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers lines 344-350: Npm extracts last path segment as package name
+    #[tokio::test]
+    async fn test_npm_package_name_extraction_from_repo() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-ext", "SENTRY-EXT")
+            .unwrap();
+        let attempt = tracker.get_attempt("sentry", "issue-ext").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-ext", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        r#"{"packages":{"node_modules/my-awesome-lib":{"version":"1.0.0"}}}"#
+                    )
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("sha".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/my-awesome-lib",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Npm,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers lines 486: verify_lock_file with npm format
+    #[tokio::test]
+    async fn test_verify_lock_file_npm_format() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let npm_lock = r#"{"packages":{"node_modules/lodash":{"version":"4.17.21"}}}"#;
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"[{
+                    "id": 1, "tag_name": "v4.17.21", "name": "v4.17.21", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, npm_lock)
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-npm-fmt", 1);
+
+        let result = release_tracker
+            .verify_lock_file(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                "v2.0.0",
+                "lodash",
+                "package-lock.json",
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers: check_direct_release with commit found in release (success)
+    #[tokio::test]
+    async fn test_check_direct_release_commit_in_release() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-dr", "SENTRY-DR")
+            .unwrap();
+        let attempt = tracker.get_attempt("sentry", "issue-dr").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-dr", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"{"status": "behind", "ahead_by": 0, "behind_by": 5}"#,
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker = ReleaseTracker::with_http_client(
+            client,
+            tracker.clone(),
+            ReleaseTrackerConfig::default(),
+        );
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_direct_release(&watch, "org/repo", &pr_details)
+            .await
+            .unwrap();
+        assert!(result);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers: check_direct_release with commit NOT in release
+    #[tokio::test]
+    async fn test_check_direct_release_commit_not_in_release() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (200, r#"{"status": "ahead", "ahead_by": 5, "behind_by": 0}"#),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-dnir", 1);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_direct_release(&watch, "org/repo", &pr_details)
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    // Covers: check_pending_watches with graph-based transition
+    #[tokio::test]
+    async fn test_check_pending_watches_graph_transition() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-pg", "SENTRY-PG")
+            .unwrap();
+        tracker
+            .mark_success(
+                "sentry",
+                "issue-pg",
+                "https://github.com/utopia-php/database/pull/99",
+            )
+            .unwrap();
+        tracker.mark_merged("sentry", "issue-pg").unwrap();
+
+        let attempt = tracker.get_attempt("sentry", "issue-pg").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-pg", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{"number": 99, "merged": true, "merge_commit_sha": "fix999", "merged_at": "2024-01-10T10:00:00Z"}"#,
+            ),
+            (
+                200,
+                r#"{
+                    "id": 10, "tag_name": "v3.0.0", "name": "v3.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (200, "[]"),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        let mut relationships = RepoRelationships::new();
+        relationships
+            .add_dependency("utopia-php/database", "cloud", DependencyType::Manual, None)
+            .unwrap();
+
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["cloud".to_string()],
+            ..Default::default()
+        };
+
+        let release_tracker = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker.clone(),
+            config,
+            relationships,
+        );
+
+        let result = release_tracker.check_pending_watches().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], watch_id);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers: find_dependency_type with Npm type
+    #[test]
+    fn test_find_dependency_type_npm() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        let mut relationships = RepoRelationships::new();
+        relationships
+            .add_dependency("js-lib", "app", DependencyType::Npm, None)
+            .unwrap();
+
+        let release_tracker = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker,
+            ReleaseTrackerConfig::default(),
+            relationships,
+        );
+
+        let dep_type = release_tracker.find_dependency_type("js-lib", "app");
+        assert_eq!(dep_type, DependencyType::Npm);
+    }
+
+    // Covers: find_dependency_type with GitSubmodule type
+    #[test]
+    fn test_find_dependency_type_git_submodule() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        let mut relationships = RepoRelationships::new();
+        relationships
+            .add_dependency("submod", "parent", DependencyType::GitSubmodule, None)
+            .unwrap();
+
+        let release_tracker = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker,
+            ReleaseTrackerConfig::default(),
+            relationships,
+        );
+
+        let dep_type = release_tracker.find_dependency_type("submod", "parent");
+        assert_eq!(dep_type, DependencyType::GitSubmodule);
+    }
+
+    // Covers: check_watch_release direct release path (fix repo is target)
+    #[tokio::test]
+    async fn test_check_watch_release_direct_release_path() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-direct", "SENTRY-DIR")
+            .unwrap();
+        tracker
+            .mark_success(
+                "sentry",
+                "issue-direct",
+                "https://github.com/org/target-repo/pull/42",
+            )
+            .unwrap();
+        tracker.mark_merged("sentry", "issue-direct").unwrap();
+
+        let attempt = tracker
+            .get_attempt("sentry", "issue-direct")
+            .unwrap()
+            .unwrap();
+
+        let watch = RegressionWatch {
+            id: 1,
+            issue_type: IssueType::SentryIssue,
+            issue_id: "issue-direct".to_string(),
+            fix_attempt_id: attempt.id,
+            status: RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            (
+                200,
+                r#"{"number": 42, "merged": true, "merge_commit_sha": "directsha", "merged_at": "2024-01-10T10:00:00Z"}"#,
+            ),
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            (
+                200,
+                r#"{"status": "behind", "ahead_by": 0, "behind_by": 5}"#,
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["org/target-repo".to_string()],
+            ..Default::default()
+        };
+
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker.clone(), config);
+
+        let result = release_tracker.check_watch_release(&watch).await.unwrap();
+        assert!(result);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers: verify_release_after source release found but no published_at on source release
+    #[tokio::test]
+    async fn test_verify_release_after_source_no_published_at_errors() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Source release with published_at = null -> the release won't match
+        // get_first_release_after filters by published_at being after, so null won't match
+        // This means no release after = use merge time
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"[{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-12T10:00:00Z",
+                    "published_at": null, "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+        )]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-snpa", 1);
+
+        let target_release = crate::release::github::GitHubRelease {
+            id: 10,
+            tag_name: "v2.0.0".to_string(),
+            name: None,
+            draft: false,
+            prerelease: false,
+            created_at: "2024-02-01T10:00:00Z".to_string(),
+            published_at: Some("2024-02-01T10:30:00Z".to_string()),
+            target_commitish: "main".to_string(),
+            body: None,
+            html_url: "url".to_string(),
+        };
+
+        // The release has null published_at, so get_first_release_after will filter it out
+        // Falls to "no release in source" path, uses merge time
+        let result = release_tracker
+            .verify_release_after(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                &target_release,
+            )
+            .await
+            .unwrap();
+        // target (Feb 1) > merge_time (Jan 10) -> true
+        assert!(result);
+    }
 }

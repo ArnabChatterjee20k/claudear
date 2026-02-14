@@ -349,22 +349,149 @@ impl<H: SentryHttpClient> SentrySource<H> {
     }
 
     fn calculate_escalation_rate(&self, issue: &SentryApiIssue) -> Option<f64> {
-        let stats = issue.stats.as_ref()?.last_24h.as_ref()?;
-
-        if stats.len() < 4 {
-            return None;
-        }
-
-        let midpoint = stats.len() / 2;
-        let first_half: i64 = stats[..midpoint].iter().map(|(_, count)| count).sum();
-        let second_half: i64 = stats[midpoint..].iter().map(|(_, count)| count).sum();
-
-        if first_half == 0 {
-            return Some(if second_half > 0 { 100.0 } else { 0.0 });
-        }
-
-        Some(((second_half - first_half) as f64 / first_half as f64) * 100.0)
+        calculate_escalation_rate(issue)
     }
+}
+
+/// Build the metadata portion of a Sentry issue context string.
+/// This is a pure function extracted from the async trait method for testability.
+fn format_sentry_context(issue: &Issue) -> String {
+    let mut context = format!("# Sentry Issue: {}\n\n", issue.short_id);
+    context.push_str(&format!("**Title:** {}\n", issue.title));
+    context.push_str(&format!("**URL:** {}\n", issue.url));
+
+    if let Some(level) = issue.get_metadata::<String>("level") {
+        context.push_str(&format!("**Level:** {}\n", level));
+    }
+
+    context.push_str(&format!("**Status:** {}\n", issue.status));
+
+    if let Some(event_count) = issue.get_metadata::<i64>("event_count") {
+        context.push_str(&format!("**Event Count:** {}\n", event_count));
+    }
+    if let Some(user_count) = issue.get_metadata::<i64>("user_count") {
+        context.push_str(&format!("**User Count:** {}\n", user_count));
+    }
+    if let Some(project) = issue.get_metadata::<String>("project") {
+        context.push_str(&format!("**Project:** {}\n\n", project));
+    }
+
+    if let Some(culprit) = issue.get_metadata::<String>("culprit") {
+        if !culprit.is_empty() {
+            context.push_str(&format!("**Culprit:** {}\n\n", culprit));
+        }
+    }
+
+    // Error details
+    let error_type: Option<String> = issue.get_metadata("error_type");
+    let error_value: Option<String> = issue.get_metadata("error_value");
+    let filename: Option<String> = issue.get_metadata("filename");
+    let function: Option<String> = issue.get_metadata("function");
+
+    if error_type.is_some() || error_value.is_some() {
+        context.push_str("## Error Details\n");
+        if let Some(ref t) = error_type {
+            context.push_str(&format!("- **Type:** {}\n", t));
+        }
+        if let Some(ref v) = error_value {
+            context.push_str(&format!("- **Value:** {}\n", v));
+        }
+        if let Some(ref f) = filename {
+            context.push_str(&format!("- **File:** {}\n", f));
+        }
+        if let Some(ref f) = function {
+            context.push_str(&format!("- **Function:** {}\n", f));
+        }
+        context.push('\n');
+    }
+
+    context
+}
+
+/// Format event data (stack traces + tags) from a Sentry event into a context string.
+/// This is a pure function extracted from the async trait method for testability.
+fn format_sentry_event_context(event: &SentryEvent) -> String {
+    let mut context = String::new();
+
+    if let Some(ref entries) = event.entries {
+        if let Some(exception_entry) = entries.iter().find(|e| e.entry_type == "exception") {
+            if let Some(values) = exception_entry.data.get("values") {
+                if let Some(arr) = values.as_array() {
+                    context.push_str("## Stack Trace\n```\n");
+                    for exc in arr {
+                        if let (Some(exc_type), Some(exc_value)) =
+                            (exc.get("type"), exc.get("value"))
+                        {
+                            context.push_str(&format!(
+                                "{}: {}\n",
+                                exc_type.as_str().unwrap_or(""),
+                                exc_value.as_str().unwrap_or("")
+                            ));
+                        }
+                        if let Some(stacktrace) = exc.get("stacktrace") {
+                            if let Some(frames) = stacktrace.get("frames") {
+                                if let Some(frames_arr) = frames.as_array() {
+                                    for frame in frames_arr.iter().rev().take(10) {
+                                        let func = frame
+                                            .get("function")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("<anonymous>");
+                                        let file = frame
+                                            .get("filename")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("?");
+                                        let line = frame
+                                            .get("lineNo")
+                                            .and_then(|v| v.as_i64())
+                                            .unwrap_or(0);
+                                        let col = frame
+                                            .get("colNo")
+                                            .and_then(|v| v.as_i64())
+                                            .unwrap_or(0);
+                                        context.push_str(&format!(
+                                            "  at {} ({}:{}:{})\n",
+                                            func, file, line, col
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    context.push_str("```\n\n");
+                }
+            }
+        }
+    }
+
+    if let Some(ref tags) = event.tags {
+        context.push_str("## Tags\n");
+        for tag in tags.iter().take(20) {
+            context.push_str(&format!("- **{}:** {}\n", tag.key, tag.value));
+        }
+        context.push('\n');
+    }
+
+    context
+}
+
+/// Calculate the escalation rate for a Sentry issue from its 24h stats.
+/// Returns the percentage change between the first and second half of the stats period.
+fn calculate_escalation_rate(issue: &SentryApiIssue) -> Option<f64> {
+    let stats = issue.stats.as_ref()?.last_24h.as_ref()?;
+
+    if stats.len() < 4 {
+        return None;
+    }
+
+    let midpoint = stats.len() / 2;
+    let first_half: i64 = stats[..midpoint].iter().map(|(_, count)| count).sum();
+    let second_half: i64 = stats[midpoint..].iter().map(|(_, count)| count).sum();
+
+    if first_half == 0 {
+        return Some(if second_half > 0 { 100.0 } else { 0.0 });
+    }
+
+    Some(((second_half - first_half) as f64 / first_half as f64) * 100.0)
 }
 
 #[async_trait]
@@ -476,117 +603,11 @@ impl<H: SentryHttpClient + 'static> IssueSource for SentrySource<H> {
     }
 
     async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
-        let mut context = format!("# Sentry Issue: {}\n\n", issue.short_id);
-        context.push_str(&format!("**Title:** {}\n", issue.title));
-        context.push_str(&format!("**URL:** {}\n", issue.url));
+        let mut context = format_sentry_context(issue);
 
-        if let Some(level) = issue.get_metadata::<String>("level") {
-            context.push_str(&format!("**Level:** {}\n", level));
-        }
-
-        context.push_str(&format!("**Status:** {}\n", issue.status));
-
-        if let Some(event_count) = issue.get_metadata::<i64>("event_count") {
-            context.push_str(&format!("**Event Count:** {}\n", event_count));
-        }
-        if let Some(user_count) = issue.get_metadata::<i64>("user_count") {
-            context.push_str(&format!("**User Count:** {}\n", user_count));
-        }
-        if let Some(project) = issue.get_metadata::<String>("project") {
-            context.push_str(&format!("**Project:** {}\n\n", project));
-        }
-
-        if let Some(culprit) = issue.get_metadata::<String>("culprit") {
-            if !culprit.is_empty() {
-                context.push_str(&format!("**Culprit:** {}\n\n", culprit));
-            }
-        }
-
-        // Error details
-        let error_type: Option<String> = issue.get_metadata("error_type");
-        let error_value: Option<String> = issue.get_metadata("error_value");
-        let filename: Option<String> = issue.get_metadata("filename");
-        let function: Option<String> = issue.get_metadata("function");
-
-        if error_type.is_some() || error_value.is_some() {
-            context.push_str("## Error Details\n");
-            if let Some(ref t) = error_type {
-                context.push_str(&format!("- **Type:** {}\n", t));
-            }
-            if let Some(ref v) = error_value {
-                context.push_str(&format!("- **Value:** {}\n", v));
-            }
-            if let Some(ref f) = filename {
-                context.push_str(&format!("- **File:** {}\n", f));
-            }
-            if let Some(ref f) = function {
-                context.push_str(&format!("- **Function:** {}\n", f));
-            }
-            context.push('\n');
-        }
-
-        // Try to get stack trace from latest event
         match self.fetch_latest_event(&issue.id).await {
             Ok(event) => {
-                if let Some(entries) = event.entries {
-                    if let Some(exception_entry) =
-                        entries.iter().find(|e| e.entry_type == "exception")
-                    {
-                        if let Some(values) = exception_entry.data.get("values") {
-                            if let Some(arr) = values.as_array() {
-                                context.push_str("## Stack Trace\n```\n");
-                                for exc in arr {
-                                    if let (Some(exc_type), Some(exc_value)) =
-                                        (exc.get("type"), exc.get("value"))
-                                    {
-                                        context.push_str(&format!(
-                                            "{}: {}\n",
-                                            exc_type.as_str().unwrap_or(""),
-                                            exc_value.as_str().unwrap_or("")
-                                        ));
-                                    }
-                                    if let Some(stacktrace) = exc.get("stacktrace") {
-                                        if let Some(frames) = stacktrace.get("frames") {
-                                            if let Some(frames_arr) = frames.as_array() {
-                                                for frame in frames_arr.iter().rev().take(10) {
-                                                    let func = frame
-                                                        .get("function")
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("<anonymous>");
-                                                    let file = frame
-                                                        .get("filename")
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("?");
-                                                    let line = frame
-                                                        .get("lineNo")
-                                                        .and_then(|v| v.as_i64())
-                                                        .unwrap_or(0);
-                                                    let col = frame
-                                                        .get("colNo")
-                                                        .and_then(|v| v.as_i64())
-                                                        .unwrap_or(0);
-                                                    context.push_str(&format!(
-                                                        "  at {} ({}:{}:{})\n",
-                                                        func, file, line, col
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                context.push_str("```\n\n");
-                            }
-                        }
-                    }
-                }
-
-                if let Some(tags) = event.tags {
-                    context.push_str("## Tags\n");
-                    for tag in tags.iter().take(20) {
-                        context.push_str(&format!("- **{}:** {}\n", tag.key, tag.value));
-                    }
-                    context.push('\n');
-                }
+                context.push_str(&format_sentry_event_context(&event));
             }
             Err(e) => {
                 tracing::warn!(
@@ -2325,5 +2346,1566 @@ mod tests {
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
         assert_eq!(result.priority, MatchPriority::High);
+    }
+
+    #[test]
+    fn test_is_issue_resolved_various_inputs() {
+        assert!(SentrySource::<ReqwestSentryClient>::is_issue_resolved(
+            "resolved"
+        ));
+        assert!(SentrySource::<ReqwestSentryClient>::is_issue_resolved(
+            "Resolved"
+        ));
+        assert!(SentrySource::<ReqwestSentryClient>::is_issue_resolved(
+            "RESOLVED"
+        ));
+        assert!(SentrySource::<ReqwestSentryClient>::is_issue_resolved(
+            "ignored"
+        ));
+        assert!(SentrySource::<ReqwestSentryClient>::is_issue_resolved(
+            "Ignored"
+        ));
+        assert!(SentrySource::<ReqwestSentryClient>::is_issue_resolved(
+            "IGNORED"
+        ));
+        assert!(!SentrySource::<ReqwestSentryClient>::is_issue_resolved(
+            "unresolved"
+        ));
+        assert!(!SentrySource::<ReqwestSentryClient>::is_issue_resolved(
+            "open"
+        ));
+        assert!(!SentrySource::<ReqwestSentryClient>::is_issue_resolved(""));
+    }
+
+    #[test]
+    fn test_is_terminal_status() {
+        let source = SentrySource::new(test_config());
+        assert!(source.is_terminal_status("resolved"));
+        assert!(source.is_terminal_status("ignored"));
+        assert!(source.is_terminal_status("RESOLVED"));
+        assert!(!source.is_terminal_status("unresolved"));
+        assert!(!source.is_terminal_status("open"));
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_returns_formatted_status() {
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/123/",
+            200,
+            r#"{
+                "id": "123",
+                "shortId": "SENTRY-123",
+                "title": "Test Error",
+                "permalink": "https://sentry.io/issue/123",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "50",
+                "project": {"id": "1", "name": "Test", "slug": "test"},
+                "status": "resolved",
+                "level": "error"
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+        let status = source.get_issue_status("123").await.unwrap();
+        assert_eq!(status, "resolved");
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_event_fetch_failure() {
+        let mock = MockSentryClient::new();
+        // No mock for event endpoint means 404
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let mut issue = Issue::new(
+            "no-event",
+            "SENTRY-NO-EVENT",
+            "No Event Issue",
+            "https://sentry.io/issue/no-event",
+            "sentry",
+        );
+        issue.set_metadata("level", "error");
+        issue.set_metadata("event_count", 42i64);
+        issue.set_metadata("user_count", 5i64);
+        issue.set_metadata("project", "My Project");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        // Should still have basic info even if event fetch fails
+        assert!(context.contains("SENTRY-NO-EVENT"));
+        assert!(context.contains("No Event Issue"));
+        assert!(context.contains("error"));
+        assert!(context.contains("42"));
+        assert!(context.contains("5"));
+        assert!(context.contains("My Project"));
+        // Should NOT have stack trace or tags since event fetch failed
+        assert!(!context.contains("Stack Trace"));
+        assert!(!context.contains("Tags"));
+    }
+
+    #[test]
+    fn test_map_issue_sets_description_from_metadata_value() {
+        let source = SentrySource::new(test_config());
+        let api_issue = SentryApiIssue {
+            id: "desc-test".to_string(),
+            short_id: "DESC-1".to_string(),
+            title: "Error with description".to_string(),
+            culprit: None,
+            permalink: "https://sentry.io/desc-test".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "10".to_string(),
+            user_count: None,
+            project: SentryProject {
+                name: "Test".to_string(),
+                slug: "test".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "error".to_string(),
+            is_unhandled: None,
+            metadata: Some(SentryMetadata {
+                error_type: None,
+                value: Some("Cannot read property 'x' of null".to_string()),
+                filename: None,
+                function: None,
+            }),
+            stats: None,
+        };
+
+        let issue = source.map_issue(api_issue);
+        assert_eq!(
+            issue.description,
+            Some("Cannot read property 'x' of null".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_issue_no_metadata_description_is_none() {
+        let source = SentrySource::new(test_config());
+        let api_issue = SentryApiIssue {
+            id: "no-desc".to_string(),
+            short_id: "ND-1".to_string(),
+            title: "No desc".to_string(),
+            culprit: None,
+            permalink: "https://sentry.io/no-desc".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "5".to_string(),
+            user_count: None,
+            project: SentryProject {
+                name: "Test".to_string(),
+                slug: "test".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "info".to_string(),
+            is_unhandled: None,
+            metadata: None,
+            stats: None,
+        };
+
+        let issue = source.map_issue(api_issue);
+        assert!(issue.description.is_none());
+    }
+
+    #[test]
+    fn test_matches_criteria_no_escalation_rate_high_priority() {
+        let source = SentrySource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "SENTRY-123",
+            "Error",
+            "https://sentry.io/123",
+            "sentry",
+        );
+        issue.set_metadata("event_count", 100i64);
+        // No escalation_rate, no is_escalating
+        issue.priority = IssuePriority::High;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::High);
+        assert!(result.reason.contains("Top issue"));
+    }
+
+    #[test]
+    fn test_matches_criteria_no_escalation_rate_critical_priority() {
+        let source = SentrySource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "SENTRY-123",
+            "Fatal error",
+            "https://sentry.io/123",
+            "sentry",
+        );
+        issue.set_metadata("event_count", 100i64);
+        // No escalation_rate, no is_escalating
+        issue.priority = IssuePriority::Critical;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::High);
+    }
+
+    #[test]
+    fn test_matches_criteria_no_escalation_rate_low_priority() {
+        let source = SentrySource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "SENTRY-123",
+            "Info message",
+            "https://sentry.io/123",
+            "sentry",
+        );
+        issue.set_metadata("event_count", 100i64);
+        // No escalation_rate, no is_escalating
+        issue.priority = IssuePriority::Low;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Normal);
+        assert!(result.reason.contains("Top issue"));
+    }
+
+    #[test]
+    fn test_http_response_json_parse_failure() {
+        let response = HttpResponse {
+            status: 200,
+            body: "not json at all".to_string(),
+        };
+        let result: Result<serde_json::Value> = response.json();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("JSON parse error"));
+    }
+
+    #[test]
+    fn test_http_response_boundary_status_codes() {
+        // 199 is not success
+        assert!(!HttpResponse {
+            status: 199,
+            body: String::new()
+        }
+        .is_success());
+        // 200 is success
+        assert!(HttpResponse {
+            status: 200,
+            body: String::new()
+        }
+        .is_success());
+        // 299 is success
+        assert!(HttpResponse {
+            status: 299,
+            body: String::new()
+        }
+        .is_success());
+        // 300 is not success
+        assert!(!HttpResponse {
+            status: 300,
+            body: String::new()
+        }
+        .is_success());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_with_project_slugs() {
+        let mock = MockSentryClient::new();
+        let config = SentryConfig {
+            enabled: true,
+            auth_token: "test_token".to_string(),
+            org_slug: "test-org".to_string(),
+            project_slugs: vec!["frontend".to_string(), "backend".to_string()],
+            top_issues_count: 100,
+            top_issues_period: TopIssuesPeriod::OneDay,
+            min_event_count: 10,
+            escalation_threshold_percent: 50,
+            client_secret: None,
+            ..Default::default()
+        };
+
+        // The URL should include project filters
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved%20is%3Aescalating%20project%3Afrontend%20OR%20project%3Abackend&sort=date&limit=100",
+            200,
+            "[]",
+        );
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved%20project%3Afrontend%20OR%20project%3Abackend&sort=freq&limit=100&statsPeriod=24h",
+            200,
+            "[]",
+        );
+
+        let source = SentrySource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn test_calculate_escalation_rate_both_halves_zero_returns_zero() {
+        let source = SentrySource::new(test_config());
+
+        let issue = SentryApiIssue {
+            id: "1".to_string(),
+            short_id: "TEST-1".to_string(),
+            title: "Test".to_string(),
+            culprit: None,
+            permalink: "url".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "0".to_string(),
+            user_count: None,
+            project: SentryProject {
+                name: "Test".to_string(),
+                slug: "test".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "error".to_string(),
+            is_unhandled: None,
+            metadata: None,
+            stats: Some(SentryStats {
+                last_24h: Some(vec![(0, 0), (1, 0), (2, 0), (3, 0)]),
+            }),
+        };
+
+        let rate = source.calculate_escalation_rate(&issue).unwrap();
+        assert_eq!(rate, 0.0);
+    }
+
+    #[test]
+    fn test_calculate_escalation_rate_empty_last_24h() {
+        let source = SentrySource::new(test_config());
+
+        let issue = SentryApiIssue {
+            id: "1".to_string(),
+            short_id: "TEST-1".to_string(),
+            title: "Test".to_string(),
+            culprit: None,
+            permalink: "url".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "0".to_string(),
+            user_count: None,
+            project: SentryProject {
+                name: "Test".to_string(),
+                slug: "test".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "error".to_string(),
+            is_unhandled: None,
+            metadata: None,
+            stats: Some(SentryStats { last_24h: None }),
+        };
+
+        let rate = source.calculate_escalation_rate(&issue);
+        assert!(rate.is_none());
+    }
+
+    #[test]
+    fn test_matches_criteria_low_escalation_rate_medium_priority() {
+        let source = SentrySource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "SENTRY-123",
+            "Warning",
+            "https://sentry.io/123",
+            "sentry",
+        );
+        issue.set_metadata("event_count", 100i64);
+        issue.set_metadata("escalation_rate", 10.0); // Well below 50 threshold
+        issue.priority = IssuePriority::Medium;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Normal);
+        assert!(result.reason.contains("Top issue"));
+    }
+
+    // --- New tests for coverage ---
+
+    #[tokio::test]
+    async fn test_build_issue_context_stacktrace_missing_fields() {
+        // Exercises stacktrace frame rendering when function/filename/lineNo/colNo
+        // are missing and hit the unwrap_or defaults (lines 552-570).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/sf1/events/latest/",
+            200,
+            r#"{
+                "tags": [],
+                "entries": [{
+                    "type": "exception",
+                    "data": {
+                        "values": [{
+                            "type": "RuntimeError",
+                            "value": "something broke",
+                            "stacktrace": {
+                                "frames": [
+                                    {},
+                                    {"function": "myFunc", "filename": "src/lib.rs", "lineNo": 10, "colNo": 5},
+                                    {"filename": "other.rs"}
+                                ]
+                            }
+                        }]
+                    }
+                }]
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "sf1",
+            "SENTRY-SF1",
+            "Stack Frame Missing Fields",
+            "https://sentry.io/issue/sf1",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("Stack Trace"));
+        assert!(context.contains("RuntimeError: something broke"));
+        // Frame with missing function should render as <anonymous>
+        assert!(context.contains("<anonymous>"));
+        // Frame with all fields should render properly
+        assert!(context.contains("myFunc"));
+        assert!(context.contains("src/lib.rs:10:5"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_multiple_exception_values() {
+        // Exercises the loop over multiple exception values (lines 538-545).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/multi/events/latest/",
+            200,
+            r#"{
+                "entries": [{
+                    "type": "exception",
+                    "data": {
+                        "values": [
+                            {"type": "ValueError", "value": "bad value"},
+                            {"type": "IOError", "value": "disk full"}
+                        ]
+                    }
+                }]
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "multi",
+            "SENTRY-MULTI",
+            "Multiple Exceptions",
+            "https://sentry.io/issue/multi",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("ValueError: bad value"));
+        assert!(context.contains("IOError: disk full"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_exception_without_stacktrace() {
+        // An exception value that has type/value but no stacktrace key at all.
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/nostack/events/latest/",
+            200,
+            r#"{
+                "entries": [{
+                    "type": "exception",
+                    "data": {
+                        "values": [
+                            {"type": "KeyError", "value": "missing_key"}
+                        ]
+                    }
+                }]
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "nostack",
+            "SENTRY-NS",
+            "No Stacktrace",
+            "https://sentry.io/issue/nostack",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("KeyError: missing_key"));
+        // No "at " lines since there's no stacktrace
+        assert!(!context.contains("  at "));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_no_exception_entry() {
+        // Event has entries but none are "exception" type (lines 532-533).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/noexc/events/latest/",
+            200,
+            r#"{
+                "tags": [{"key": "env", "value": "staging"}],
+                "entries": [{
+                    "type": "message",
+                    "data": {"message": "hello"}
+                }]
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "noexc",
+            "SENTRY-NOEXC",
+            "Not an exception",
+            "https://sentry.io/issue/noexc",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        // Should still have tags, but no stack trace
+        assert!(!context.contains("Stack Trace"));
+        assert!(context.contains("env"));
+        assert!(context.contains("staging"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_only_error_value_no_type() {
+        // Tests the branch where error_value is Some but error_type is None (line 511).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/ev1/events/latest/",
+            200,
+            r#"{"entries": []}"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let mut issue = Issue::new(
+            "ev1",
+            "SENTRY-EV1",
+            "Error Value Only",
+            "https://sentry.io/issue/ev1",
+            "sentry",
+        );
+        issue.set_metadata("error_value", "something went wrong");
+        // No error_type set
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("## Error Details"));
+        assert!(context.contains("**Value:** something went wrong"));
+        assert!(!context.contains("**Type:**"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_only_error_type_no_value() {
+        // Tests the branch where error_type is Some but error_value is None.
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/et1/events/latest/",
+            200,
+            r#"{"entries": []}"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let mut issue = Issue::new(
+            "et1",
+            "SENTRY-ET1",
+            "Error Type Only",
+            "https://sentry.io/issue/et1",
+            "sentry",
+        );
+        issue.set_metadata("error_type", "NullPointerException");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("## Error Details"));
+        assert!(context.contains("**Type:** NullPointerException"));
+        assert!(!context.contains("**Value:**"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_error_details_with_filename_and_function() {
+        // Tests filename/function rendering in error details section (lines 519-524).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/ff1/events/latest/",
+            200,
+            r#"{"entries": []}"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let mut issue = Issue::new(
+            "ff1",
+            "SENTRY-FF1",
+            "With file and function",
+            "https://sentry.io/issue/ff1",
+            "sentry",
+        );
+        issue.set_metadata("error_type", "IOError");
+        issue.set_metadata("error_value", "permission denied");
+        issue.set_metadata("filename", "/opt/app/server.py");
+        issue.set_metadata("function", "open_connection");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("**File:** /opt/app/server.py"));
+        assert!(context.contains("**Function:** open_connection"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_no_error_details_section_when_none() {
+        // When neither error_type nor error_value is set, no "Error Details" section (line 511).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/ned/events/latest/",
+            200,
+            r#"{"entries": []}"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "ned",
+            "SENTRY-NED",
+            "No Error Details",
+            "https://sentry.io/issue/ned",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(!context.contains("## Error Details"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_with_user_count_and_event_count() {
+        // Exercises the user_count and event_count metadata rendering (lines 489-494).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/cnt1/events/latest/",
+            200,
+            r#"{"entries": []}"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let mut issue = Issue::new(
+            "cnt1",
+            "SENTRY-CNT",
+            "Counted Issue",
+            "https://sentry.io/issue/cnt1",
+            "sentry",
+        );
+        issue.set_metadata("level", "warning");
+        issue.set_metadata("event_count", 12345i64);
+        issue.set_metadata("user_count", 678i64);
+        issue.set_metadata("project", "Dashboard");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("**Level:** warning"));
+        assert!(context.contains("**Event Count:** 12345"));
+        assert!(context.contains("**User Count:** 678"));
+        assert!(context.contains("**Project:** Dashboard"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_with_non_empty_culprit() {
+        // Exercises the culprit rendering when non-empty (lines 499-502).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/culp/events/latest/",
+            200,
+            r#"{"entries": []}"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let mut issue = Issue::new(
+            "culp",
+            "SENTRY-CULP",
+            "Culprit Test",
+            "https://sentry.io/issue/culp",
+            "sentry",
+        );
+        issue.set_metadata("culprit", "src/handlers/auth.py:login");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("**Culprit:** src/handlers/auth.py:login"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_with_tags_limit() {
+        // Tests that up to 20 tags are rendered (line 585).
+        let mock = MockSentryClient::new();
+
+        let mut tags = Vec::new();
+        for i in 0..25 {
+            tags.push(format!(r#"{{"key": "tag{}", "value": "val{}"}}"#, i, i));
+        }
+        let tags_json = tags.join(",");
+        let body = format!(r#"{{"tags": [{}], "entries": []}}"#, tags_json);
+
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/tags-limit/events/latest/",
+            200,
+            &body,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "tags-limit",
+            "SENTRY-TAGS",
+            "Many Tags",
+            "https://sentry.io/issue/tags-limit",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("## Tags"));
+        // Should contain the first 20 tags
+        assert!(context.contains("tag0"));
+        assert!(context.contains("tag19"));
+        // Should NOT contain tag20 through tag24
+        assert!(!context.contains("tag20"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_no_entries_and_no_tags() {
+        // Event has neither entries nor tags.
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/empty-evt/events/latest/",
+            200,
+            r#"{}"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "empty-evt",
+            "SENTRY-EMPTY",
+            "Empty Event",
+            "https://sentry.io/issue/empty-evt",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("SENTRY-EMPTY"));
+        assert!(!context.contains("Stack Trace"));
+        assert!(!context.contains("## Tags"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_not_found_returns_error() {
+        // PUT to a non-mocked URL returns 404 from mock.
+        let mock = MockSentryClient::new();
+        // No mock_put registered for this URL
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+        let result = source.resolve_issue("nonexistent-id").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to resolve"));
+    }
+
+    #[test]
+    fn test_matches_criteria_low_escalation_rate_low_priority() {
+        // Exercises the else branch at line 456-460: escalation_rate present
+        // but below threshold, and priority is Low (not Critical/High).
+        let source = SentrySource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "SENTRY-123",
+            "Info",
+            "https://sentry.io/123",
+            "sentry",
+        );
+        issue.set_metadata("event_count", 100i64);
+        issue.set_metadata("escalation_rate", 20.0); // Below 50 threshold
+        issue.priority = IssuePriority::Low;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Normal);
+        assert!(result.reason.contains("Top issue by frequency"));
+    }
+
+    #[test]
+    fn test_matches_criteria_escalation_rate_at_threshold_high_priority_issue() {
+        // Exercises the Urgent branch when escalation_rate >= threshold.
+        let source = SentrySource::new(test_config());
+
+        let mut issue = Issue::new(
+            "123",
+            "SENTRY-123",
+            "Error",
+            "https://sentry.io/123",
+            "sentry",
+        );
+        issue.set_metadata("event_count", 100i64);
+        issue.set_metadata("escalation_rate", 60.0); // Above 50 threshold
+        issue.priority = IssuePriority::Low;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Urgent);
+        assert!(result.reason.contains("escalating"));
+        assert!(result.reason.contains("60.0%"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_escalating_error_still_returns_top() {
+        // When escalating issues fetch fails, top issues should still be returned (line 385-388).
+        let mock = MockSentryClient::new();
+        // Escalating endpoint returns error (500)
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved%20is%3Aescalating&sort=date&limit=100",
+            500,
+            "Server Error",
+        );
+        // Top issues endpoint returns valid data
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            200,
+            r#"[{
+                "id": "top-1",
+                "shortId": "TOP-1",
+                "title": "Top Error",
+                "permalink": "https://sentry.io/issue/top-1",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "200",
+                "project": {"name": "Test", "slug": "test"},
+                "status": "unresolved",
+                "level": "error"
+            }]"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].short_id, "TOP-1");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_both_escalating_and_top() {
+        // Exercises the full fetch_issues path: both escalating and top issues
+        // return results and they get deduped (lines 382-416).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved%20is%3Aescalating&sort=date&limit=100",
+            200,
+            r#"[{
+                "id": "esc-1",
+                "shortId": "ESC-1",
+                "title": "Escalating",
+                "permalink": "https://sentry.io/issue/esc-1",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "300",
+                "project": {"name": "Test", "slug": "test"},
+                "status": "unresolved",
+                "level": "error"
+            }]"#,
+        );
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            200,
+            r#"[{
+                "id": "top-2",
+                "shortId": "TOP-2",
+                "title": "Top Issue",
+                "permalink": "https://sentry.io/issue/top-2",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "150",
+                "project": {"name": "Test", "slug": "test"},
+                "status": "unresolved",
+                "level": "warning"
+            }]"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        assert_eq!(issues.len(), 2);
+        // Escalating should come first
+        assert_eq!(issues[0].short_id, "ESC-1");
+        assert_eq!(issues[1].short_id, "TOP-2");
+
+        // Verify the escalating one is marked as escalating
+        let is_escalating: bool = issues[0].get_metadata("is_escalating").unwrap_or(false);
+        assert!(is_escalating);
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_unresolved() {
+        // Exercises get_issue_status returning "open" for unresolved status (lines 635-638).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/unresolved-1/",
+            200,
+            r#"{
+                "id": "unresolved-1",
+                "shortId": "SENTRY-UR1",
+                "title": "Unresolved Error",
+                "permalink": "https://sentry.io/issue/unresolved-1",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "50",
+                "project": {"name": "Test", "slug": "test"},
+                "status": "unresolved",
+                "level": "error"
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+        let status = source.get_issue_status("unresolved-1").await.unwrap();
+        assert_eq!(status, "open");
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_ignored() {
+        // Exercises get_issue_status for ignored status (lines 635-638).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/ignored-1/",
+            200,
+            r#"{
+                "id": "ignored-1",
+                "shortId": "SENTRY-IG1",
+                "title": "Ignored Error",
+                "permalink": "https://sentry.io/issue/ignored-1",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "50",
+                "project": {"name": "Test", "slug": "test"},
+                "status": "ignored",
+                "level": "warning"
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+        let status = source.get_issue_status("ignored-1").await.unwrap();
+        assert_eq!(status, "ignored");
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_exception_values_missing_type_and_value() {
+        // Exception value where type/value keys exist but are not strings,
+        // exercising the as_str().unwrap_or("") paths (lines 544-545).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/null-exc/events/latest/",
+            200,
+            r#"{
+                "entries": [{
+                    "type": "exception",
+                    "data": {
+                        "values": [
+                            {"type": null, "value": null, "stacktrace": {"frames": []}}
+                        ]
+                    }
+                }]
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "null-exc",
+            "SENTRY-NULL",
+            "Null Exception Fields",
+            "https://sentry.io/issue/null-exc",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        // Should still render the stack trace section (even with empty values)
+        assert!(context.contains("Stack Trace"));
+        // Type and value are rendered as empty strings
+        assert!(context.contains(": \n"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_exception_no_values_key() {
+        // Exception data exists but has no "values" key (line 535).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/no-values/events/latest/",
+            200,
+            r#"{
+                "entries": [{
+                    "type": "exception",
+                    "data": {
+                        "mechanism": {"type": "generic"}
+                    }
+                }]
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "no-values",
+            "SENTRY-NV",
+            "No Values Key",
+            "https://sentry.io/issue/no-values",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        // Should not have stack trace since no "values" array
+        assert!(!context.contains("Stack Trace"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_exception_values_not_array() {
+        // Exception data "values" key is not an array (line 536).
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/values-str/events/latest/",
+            200,
+            r#"{
+                "entries": [{
+                    "type": "exception",
+                    "data": {
+                        "values": "not an array"
+                    }
+                }]
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+
+        let issue = Issue::new(
+            "values-str",
+            "SENTRY-VS",
+            "Values Not Array",
+            "https://sentry.io/issue/values-str",
+            "sentry",
+        );
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(!context.contains("Stack Trace"));
+    }
+
+    // ------------------------------------------------------------------
+    // Tests for extracted standalone functions (tarpaulin-traceable)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_format_sentry_context_basic() {
+        let issue = Issue::new(
+            "100",
+            "SENTRY-100",
+            "Basic Error",
+            "https://sentry.io/issue/100",
+            "sentry",
+        );
+
+        let context = format_sentry_context(&issue);
+
+        assert!(context.contains("# Sentry Issue: SENTRY-100"));
+        assert!(context.contains("**Title:** Basic Error"));
+        assert!(context.contains("**URL:** https://sentry.io/issue/100"));
+        assert!(context.contains("**Status:**"));
+        // No metadata set, so these should not appear
+        assert!(!context.contains("**Level:**"));
+        assert!(!context.contains("**Event Count:**"));
+        assert!(!context.contains("**User Count:**"));
+        assert!(!context.contains("**Project:**"));
+        assert!(!context.contains("**Culprit:**"));
+        assert!(!context.contains("## Error Details"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_with_all_metadata() {
+        let mut issue = Issue::new(
+            "200",
+            "SENTRY-200",
+            "Full Error",
+            "https://sentry.io/issue/200",
+            "sentry",
+        );
+        issue.set_metadata("level", "error");
+        issue.set_metadata("event_count", 1500i64);
+        issue.set_metadata("user_count", 42i64);
+        issue.set_metadata("project", "my-frontend");
+        issue.set_metadata("culprit", "src/index.js:handleSubmit");
+        issue.set_metadata("error_type", "ReferenceError");
+        issue.set_metadata("error_value", "x is not defined");
+        issue.set_metadata("filename", "src/index.js");
+        issue.set_metadata("function", "handleSubmit");
+
+        let context = format_sentry_context(&issue);
+
+        assert!(context.contains("**Level:** error"));
+        assert!(context.contains("**Event Count:** 1500"));
+        assert!(context.contains("**User Count:** 42"));
+        assert!(context.contains("**Project:** my-frontend"));
+        assert!(context.contains("**Culprit:** src/index.js:handleSubmit"));
+        assert!(context.contains("## Error Details"));
+        assert!(context.contains("- **Type:** ReferenceError"));
+        assert!(context.contains("- **Value:** x is not defined"));
+        assert!(context.contains("- **File:** src/index.js"));
+        assert!(context.contains("- **Function:** handleSubmit"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_empty_culprit_omitted() {
+        let mut issue = Issue::new(
+            "300",
+            "SENTRY-300",
+            "Warning",
+            "https://sentry.io/issue/300",
+            "sentry",
+        );
+        issue.set_metadata("culprit", "");
+
+        let context = format_sentry_context(&issue);
+
+        assert!(!context.contains("**Culprit:**"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_error_type_only() {
+        let mut issue = Issue::new(
+            "400",
+            "SENTRY-400",
+            "Type Only",
+            "https://sentry.io/issue/400",
+            "sentry",
+        );
+        issue.set_metadata("error_type", "SyntaxError");
+
+        let context = format_sentry_context(&issue);
+
+        assert!(context.contains("## Error Details"));
+        assert!(context.contains("- **Type:** SyntaxError"));
+        assert!(!context.contains("- **Value:**"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_error_value_only() {
+        let mut issue = Issue::new(
+            "500",
+            "SENTRY-500",
+            "Value Only",
+            "https://sentry.io/issue/500",
+            "sentry",
+        );
+        issue.set_metadata("error_value", "unexpected token");
+
+        let context = format_sentry_context(&issue);
+
+        assert!(context.contains("## Error Details"));
+        assert!(context.contains("- **Value:** unexpected token"));
+        assert!(!context.contains("- **Type:**"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_with_stack_trace() {
+        let event = SentryEvent {
+            tags: None,
+            entries: Some(vec![SentryEntry {
+                entry_type: "exception".to_string(),
+                data: serde_json::json!({
+                    "values": [{
+                        "type": "TypeError",
+                        "value": "Cannot read property 'x'",
+                        "stacktrace": {
+                            "frames": [
+                                {
+                                    "function": "innerFunc",
+                                    "filename": "lib.js",
+                                    "lineNo": 10,
+                                    "colNo": 5
+                                },
+                                {
+                                    "function": "outerFunc",
+                                    "filename": "app.js",
+                                    "lineNo": 42,
+                                    "colNo": 12
+                                }
+                            ]
+                        }
+                    }]
+                }),
+            }]),
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(context.contains("## Stack Trace"));
+        assert!(context.contains("TypeError: Cannot read property 'x'"));
+        // Frames are reversed (most recent first)
+        assert!(context.contains("at outerFunc (app.js:42:12)"));
+        assert!(context.contains("at innerFunc (lib.js:10:5)"));
+        assert!(context.contains("```"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_with_tags() {
+        let event = SentryEvent {
+            tags: Some(vec![
+                SentryTag {
+                    key: "browser".to_string(),
+                    value: "Chrome 120".to_string(),
+                },
+                SentryTag {
+                    key: "os".to_string(),
+                    value: "macOS".to_string(),
+                },
+                SentryTag {
+                    key: "environment".to_string(),
+                    value: "production".to_string(),
+                },
+            ]),
+            entries: None,
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(context.contains("## Tags"));
+        assert!(context.contains("- **browser:** Chrome 120"));
+        assert!(context.contains("- **os:** macOS"));
+        assert!(context.contains("- **environment:** production"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_empty_event() {
+        let event = SentryEvent {
+            tags: None,
+            entries: None,
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(context.is_empty());
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_no_exception_entry() {
+        let event = SentryEvent {
+            tags: None,
+            entries: Some(vec![SentryEntry {
+                entry_type: "message".to_string(),
+                data: serde_json::json!({"message": "hello"}),
+            }]),
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(!context.contains("Stack Trace"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_exception_no_values() {
+        let event = SentryEvent {
+            tags: None,
+            entries: Some(vec![SentryEntry {
+                entry_type: "exception".to_string(),
+                data: serde_json::json!({"other": "data"}),
+            }]),
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(!context.contains("Stack Trace"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_exception_values_not_array() {
+        let event = SentryEvent {
+            tags: None,
+            entries: Some(vec![SentryEntry {
+                entry_type: "exception".to_string(),
+                data: serde_json::json!({"values": "not an array"}),
+            }]),
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(!context.contains("Stack Trace"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_frame_missing_fields() {
+        let event = SentryEvent {
+            tags: None,
+            entries: Some(vec![SentryEntry {
+                entry_type: "exception".to_string(),
+                data: serde_json::json!({
+                    "values": [{
+                        "type": "Error",
+                        "value": "something failed",
+                        "stacktrace": {
+                            "frames": [
+                                {},
+                                {"function": "named"}
+                            ]
+                        }
+                    }]
+                }),
+            }]),
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(context.contains("## Stack Trace"));
+        // Frame with no fields should use defaults
+        assert!(context.contains("at <anonymous> (?:0:0)"));
+        assert!(context.contains("at named (?:0:0)"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_exception_no_stacktrace() {
+        let event = SentryEvent {
+            tags: None,
+            entries: Some(vec![SentryEntry {
+                entry_type: "exception".to_string(),
+                data: serde_json::json!({
+                    "values": [{
+                        "type": "Error",
+                        "value": "no trace"
+                    }]
+                }),
+            }]),
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(context.contains("## Stack Trace"));
+        assert!(context.contains("Error: no trace"));
+        assert!(!context.contains("at "));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_tags_truncated_to_20() {
+        let tags: Vec<SentryTag> = (0..25)
+            .map(|i| SentryTag {
+                key: format!("key_{}", i),
+                value: format!("value_{}", i),
+            })
+            .collect();
+
+        let event = SentryEvent {
+            tags: Some(tags),
+            entries: None,
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(context.contains("key_0"));
+        assert!(context.contains("key_19"));
+        assert!(!context.contains("key_20"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_multiple_exceptions() {
+        let event = SentryEvent {
+            tags: None,
+            entries: Some(vec![SentryEntry {
+                entry_type: "exception".to_string(),
+                data: serde_json::json!({
+                    "values": [
+                        {
+                            "type": "ValueError",
+                            "value": "inner error"
+                        },
+                        {
+                            "type": "RuntimeError",
+                            "value": "outer error",
+                            "stacktrace": {
+                                "frames": [{
+                                    "function": "main",
+                                    "filename": "run.py",
+                                    "lineNo": 1,
+                                    "colNo": 1
+                                }]
+                            }
+                        }
+                    ]
+                }),
+            }]),
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(context.contains("ValueError: inner error"));
+        assert!(context.contains("RuntimeError: outer error"));
+        assert!(context.contains("at main (run.py:1:1)"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_with_stack_trace_and_tags() {
+        let event = SentryEvent {
+            tags: Some(vec![SentryTag {
+                key: "env".to_string(),
+                value: "prod".to_string(),
+            }]),
+            entries: Some(vec![SentryEntry {
+                entry_type: "exception".to_string(),
+                data: serde_json::json!({
+                    "values": [{
+                        "type": "IOError",
+                        "value": "file not found",
+                        "stacktrace": {
+                            "frames": [{
+                                "function": "open_file",
+                                "filename": "io.rs",
+                                "lineNo": 99,
+                                "colNo": 3
+                            }]
+                        }
+                    }]
+                }),
+            }]),
+        };
+
+        let context = format_sentry_event_context(&event);
+
+        assert!(context.contains("## Stack Trace"));
+        assert!(context.contains("IOError: file not found"));
+        assert!(context.contains("at open_file (io.rs:99:3)"));
+        assert!(context.contains("## Tags"));
+        assert!(context.contains("- **env:** prod"));
+    }
+
+    #[test]
+    fn test_calculate_escalation_rate_standalone_fn() {
+        let issue = SentryApiIssue {
+            id: "1".to_string(),
+            short_id: "TEST-1".to_string(),
+            title: "Test".to_string(),
+            culprit: None,
+            permalink: "url".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "100".to_string(),
+            user_count: None,
+            project: SentryProject {
+                name: "Test".to_string(),
+                slug: "test".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "error".to_string(),
+            is_unhandled: None,
+            metadata: None,
+            stats: Some(SentryStats {
+                last_24h: Some(vec![(0, 10), (1, 10), (2, 30), (3, 40)]),
+            }),
+        };
+
+        let rate = calculate_escalation_rate(&issue);
+        assert!(rate.is_some());
+        assert!(rate.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_calculate_escalation_rate_standalone_no_stats() {
+        let issue = SentryApiIssue {
+            id: "2".to_string(),
+            short_id: "TEST-2".to_string(),
+            title: "Test".to_string(),
+            culprit: None,
+            permalink: "url".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "100".to_string(),
+            user_count: None,
+            project: SentryProject {
+                name: "Test".to_string(),
+                slug: "test".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "error".to_string(),
+            is_unhandled: None,
+            metadata: None,
+            stats: None,
+        };
+
+        assert!(calculate_escalation_rate(&issue).is_none());
+    }
+
+    #[test]
+    fn test_calculate_escalation_rate_standalone_insufficient() {
+        let issue = SentryApiIssue {
+            id: "3".to_string(),
+            short_id: "TEST-3".to_string(),
+            title: "Test".to_string(),
+            culprit: None,
+            permalink: "url".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "100".to_string(),
+            user_count: None,
+            project: SentryProject {
+                name: "Test".to_string(),
+                slug: "test".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "error".to_string(),
+            is_unhandled: None,
+            metadata: None,
+            stats: Some(SentryStats {
+                last_24h: Some(vec![(0, 10)]),
+            }),
+        };
+
+        assert!(calculate_escalation_rate(&issue).is_none());
     }
 }

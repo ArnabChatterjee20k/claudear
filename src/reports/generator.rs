@@ -567,4 +567,237 @@ mod tests {
         // Should contain UTC date format
         assert!(text.contains("UTC"));
     }
+
+    #[test]
+    fn test_generate_report_with_success_data() {
+        let (_temp, tracker) = create_test_tracker();
+
+        // Create a successful fix attempt
+        tracker
+            .record_attempt("sentry", "issue-1", "SENTRY-1")
+            .unwrap();
+        tracker
+            .mark_success("sentry", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+
+        assert!(report.issues_succeeded >= 1);
+        assert!(report.prs_created >= 1);
+    }
+
+    #[test]
+    fn test_generate_report_with_failed_data() {
+        let (_temp, tracker) = create_test_tracker();
+
+        tracker
+            .record_attempt("linear", "issue-2", "LIN-2")
+            .unwrap();
+        tracker
+            .mark_failed("linear", "issue-2", "Build failed")
+            .unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+
+        assert!(report.issues_failed >= 1);
+        assert!(report.failure_rate > 0.0);
+    }
+
+    #[test]
+    fn test_generate_report_with_merged_data() {
+        let (_temp, tracker) = create_test_tracker();
+
+        tracker
+            .record_attempt("sentry", "issue-3", "SENTRY-3")
+            .unwrap();
+        tracker
+            .mark_success("sentry", "issue-3", "https://github.com/org/repo/pull/3")
+            .unwrap();
+        tracker.mark_merged("sentry", "issue-3").unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+
+        assert!(report.prs_merged >= 1);
+        assert!(report.issues_succeeded >= 1);
+    }
+
+    #[test]
+    fn test_generate_report_with_closed_data() {
+        let (_temp, tracker) = create_test_tracker();
+
+        tracker
+            .record_attempt("sentry", "issue-4", "SENTRY-4")
+            .unwrap();
+        tracker
+            .mark_success("sentry", "issue-4", "https://github.com/org/repo/pull/4")
+            .unwrap();
+        tracker.mark_closed("sentry", "issue-4").unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+
+        assert!(report.prs_closed >= 1);
+    }
+
+    #[test]
+    fn test_generate_report_with_cannot_fix_data() {
+        let (_temp, tracker) = create_test_tracker();
+
+        tracker
+            .record_attempt("linear", "issue-5", "LIN-5")
+            .unwrap();
+        tracker
+            .mark_cannot_fix("linear", "issue-5", "Max retries reached")
+            .unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+
+        assert!(report.issues_cannot_fix >= 1);
+        assert!(report.issues_failed >= 1);
+    }
+
+    #[test]
+    fn test_generate_report_success_rate_calculation() {
+        let (_temp, tracker) = create_test_tracker();
+
+        // 2 successes and 1 failure = 66.7% success
+        tracker.record_attempt("sentry", "s1", "S-1").unwrap();
+        tracker
+            .mark_success("sentry", "s1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        tracker.record_attempt("sentry", "s2", "S-2").unwrap();
+        tracker
+            .mark_success("sentry", "s2", "https://github.com/org/repo/pull/2")
+            .unwrap();
+
+        tracker.record_attempt("sentry", "f1", "F-1").unwrap();
+        tracker.mark_failed("sentry", "f1", "Error").unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+
+        assert_eq!(report.issues_attempted, 3);
+        assert_eq!(report.issues_succeeded, 2);
+        assert_eq!(report.issues_failed, 1);
+        // Success rate should be approximately 66.7%
+        assert!((report.success_rate - 66.666).abs() < 1.0);
+        // Failure rate should be approximately 33.3%
+        assert!((report.failure_rate - 33.333).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_generate_report_by_source_breakdown() {
+        let (_temp, tracker) = create_test_tracker();
+
+        // One success from sentry, one failure from linear
+        tracker.record_attempt("sentry", "s1", "SENTRY-1").unwrap();
+        tracker
+            .mark_success("sentry", "s1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        tracker.record_attempt("linear", "l1", "LIN-1").unwrap();
+        tracker.mark_failed("linear", "l1", "Build failed").unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+
+        // Should have entries for both sources
+        assert!(report.by_source.contains_key("sentry"));
+        assert!(report.by_source.contains_key("linear"));
+
+        let sentry_report = &report.by_source["sentry"];
+        assert_eq!(sentry_report.succeeded, 1);
+        assert_eq!(sentry_report.failed, 0);
+
+        let linear_report = &report.by_source["linear"];
+        assert_eq!(linear_report.succeeded, 0);
+        assert_eq!(linear_report.failed, 1);
+    }
+
+    #[test]
+    fn test_format_text_with_source_data() {
+        let (_temp, tracker) = create_test_tracker();
+
+        tracker.record_attempt("sentry", "s1", "SENTRY-1").unwrap();
+        tracker
+            .mark_success("sentry", "s1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+        let text = report.format_text();
+
+        // Should contain the "By Source" section when there's source data
+        assert!(text.contains("By Source"));
+        assert!(text.contains("sentry"));
+    }
+
+    #[test]
+    fn test_format_text_without_source_data() {
+        let (_temp, tracker) = create_test_tracker();
+        let generator = ReportGenerator::new(tracker);
+
+        let report = generator.generate_daily().unwrap();
+        let text = report.format_text();
+
+        // Should NOT contain "By Source" when empty
+        assert!(!text.contains("By Source"));
+    }
+
+    #[test]
+    fn test_format_brief_with_data() {
+        let (_temp, tracker) = create_test_tracker();
+
+        tracker.record_attempt("sentry", "s1", "S-1").unwrap();
+        tracker
+            .mark_success("sentry", "s1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_merged("sentry", "s1").unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+        let brief = report.format_brief();
+
+        assert!(brief.contains("1 attempted"));
+        assert!(brief.contains("1 merged"));
+    }
+
+    #[test]
+    fn test_generate_report_pending_count() {
+        let (_temp, tracker) = create_test_tracker();
+
+        // Record a pending attempt
+        tracker
+            .record_attempt("sentry", "pending-1", "P-1")
+            .unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+
+        assert!(report.pending_count >= 1);
+    }
+
+    #[test]
+    fn test_generate_report_mixed_sources_merged() {
+        let (_temp, tracker) = create_test_tracker();
+
+        // Merged attempt from linear
+        tracker.record_attempt("linear", "m1", "LIN-M1").unwrap();
+        tracker
+            .mark_success("linear", "m1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_merged("linear", "m1").unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        let report = generator.generate_all_time().unwrap();
+
+        let linear_report = &report.by_source["linear"];
+        assert_eq!(linear_report.merged, 1);
+        assert_eq!(linear_report.succeeded, 1);
+    }
 }

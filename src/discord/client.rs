@@ -670,7 +670,7 @@ mod tests {
         mock.mock_get(
             "https://discord.com/api/v10/channels/123/messages?limit=10",
             200,
-            &format!("[{}]", mock_message_json()),
+            format!("[{}]", mock_message_json()),
         );
 
         let client = DiscordClient::with_http_client("token", mock).unwrap();

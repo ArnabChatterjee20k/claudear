@@ -567,4 +567,396 @@ mod tests {
         let freq_copy = freq;
         assert_eq!(freq, freq_copy);
     }
+
+    #[test]
+    fn test_frequency_to_str_all_days() {
+        assert_eq!(
+            ReportFrequency::Weekly(Weekday::Tue).to_str(),
+            "weekly-tuesday"
+        );
+        assert_eq!(
+            ReportFrequency::Weekly(Weekday::Wed).to_str(),
+            "weekly-wednesday"
+        );
+        assert_eq!(
+            ReportFrequency::Weekly(Weekday::Thu).to_str(),
+            "weekly-thursday"
+        );
+        assert_eq!(
+            ReportFrequency::Weekly(Weekday::Sat).to_str(),
+            "weekly-saturday"
+        );
+    }
+
+    #[test]
+    fn test_frequency_parse_mon_short() {
+        assert_eq!(
+            ReportFrequency::parse("weekly-mon"),
+            Some(ReportFrequency::Weekly(Weekday::Mon))
+        );
+    }
+
+    #[test]
+    fn test_frequency_parse_sun_variants() {
+        assert_eq!(
+            ReportFrequency::parse("weekly-sun"),
+            Some(ReportFrequency::Weekly(Weekday::Sun))
+        );
+        assert_eq!(
+            ReportFrequency::parse("weekly-sunday"),
+            Some(ReportFrequency::Weekly(Weekday::Sun))
+        );
+    }
+
+    #[test]
+    fn test_frequency_parse_monday_full() {
+        assert_eq!(
+            ReportFrequency::parse("weekly-monday"),
+            Some(ReportFrequency::Weekly(Weekday::Mon))
+        );
+    }
+
+    #[test]
+    fn test_next_run_weekly_same_day_before_target_hour() {
+        // Friday schedule, currently Friday before target hour
+        let schedule = ReportSchedule::weekly("test", Weekday::Fri, 14);
+        let now = Utc.with_ymd_and_hms(2024, 1, 19, 10, 0, 0).unwrap(); // Friday 10am
+        let next = schedule.next_run(now);
+        assert_eq!(next.weekday(), Weekday::Fri);
+        assert_eq!(next.hour(), 14);
+        assert_eq!(next.day(), 19); // Same day
+    }
+
+    #[test]
+    fn test_next_run_weekly_same_day_after_target_hour() {
+        // Friday schedule, currently Friday after target hour
+        let schedule = ReportSchedule::weekly("test", Weekday::Fri, 9);
+        let now = Utc.with_ymd_and_hms(2024, 1, 19, 15, 0, 0).unwrap(); // Friday 3pm
+        let next = schedule.next_run(now);
+        assert_eq!(next.weekday(), Weekday::Fri);
+        assert_eq!(next.hour(), 9);
+        assert_eq!(next.day(), 26); // Next Friday
+    }
+
+    #[test]
+    fn test_next_run_monthly_on_first_before_hour() {
+        let schedule = ReportSchedule::monthly("test", 14);
+        // On the 1st at 10am, target is 2pm
+        let now = Utc.with_ymd_and_hms(2024, 3, 1, 10, 0, 0).unwrap();
+        let next = schedule.next_run(now);
+        assert_eq!(next.day(), 1);
+        assert_eq!(next.month(), 3); // Same month
+        assert_eq!(next.hour(), 14);
+    }
+
+    #[test]
+    fn test_next_run_monthly_on_first_after_hour() {
+        let schedule = ReportSchedule::monthly("test", 9);
+        // On the 1st at 3pm, target is 9am (already past)
+        let now = Utc.with_ymd_and_hms(2024, 3, 1, 15, 0, 0).unwrap();
+        let next = schedule.next_run(now);
+        assert_eq!(next.day(), 1);
+        assert_eq!(next.month(), 4); // Next month
+        assert_eq!(next.hour(), 9);
+    }
+
+    #[test]
+    fn test_weekly_schedule_sent_long_ago_is_due() {
+        let mut schedule = ReportSchedule::weekly("test", Weekday::Mon, 9);
+        // Last sent 14 days ago
+        schedule.last_sent_at = Some(Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap());
+
+        // Monday Jan 15 at 9am
+        let now = Utc.with_ymd_and_hms(2024, 1, 15, 9, 0, 0).unwrap();
+        assert!(schedule.is_due(now));
+    }
+
+    #[test]
+    fn test_monthly_schedule_different_year() {
+        let mut schedule = ReportSchedule::monthly("test", 9);
+        // Last sent Dec 2023
+        schedule.last_sent_at = Some(Utc.with_ymd_and_hms(2023, 12, 1, 9, 0, 0).unwrap());
+
+        // Jan 1 2024 at 9am
+        let now = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        assert!(schedule.is_due(now));
+    }
+
+    #[test]
+    fn test_scheduler_add_and_get_schedules() {
+        use crate::storage::SqliteTracker;
+        use std::sync::Arc;
+
+        struct MockNotifier;
+
+        #[async_trait::async_trait]
+        impl crate::notifier::Notifier for MockNotifier {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            async fn notify_start(&self, _: &crate::types::Issue) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_success(
+                &self,
+                _: &crate::types::Issue,
+                _: &str,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_completed(&self, _: &crate::types::Issue) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_failed(
+                &self,
+                _: &crate::types::Issue,
+                _: &str,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_status(&self, _: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_urgent_issues(
+                &self,
+                _: &[crate::types::Issue],
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier: Arc<dyn crate::notifier::Notifier> = Arc::new(MockNotifier);
+
+        let mut scheduler = ReportScheduler::new(tracker, notifier);
+        assert!(scheduler.schedules().is_empty());
+
+        scheduler.add_schedule(ReportSchedule::daily("daily-report", 9));
+        scheduler.add_schedule(ReportSchedule::weekly("weekly-report", Weekday::Mon, 10));
+
+        assert_eq!(scheduler.schedules().len(), 2);
+        assert_eq!(scheduler.schedules()[0].name, "daily-report");
+        assert_eq!(scheduler.schedules()[1].name, "weekly-report");
+    }
+
+    #[test]
+    fn test_scheduler_preview() {
+        use crate::storage::SqliteTracker;
+        use std::sync::Arc;
+
+        struct MockNotifier;
+
+        #[async_trait::async_trait]
+        impl crate::notifier::Notifier for MockNotifier {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            async fn notify_start(&self, _: &crate::types::Issue) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_success(
+                &self,
+                _: &crate::types::Issue,
+                _: &str,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_completed(&self, _: &crate::types::Issue) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_failed(
+                &self,
+                _: &crate::types::Issue,
+                _: &str,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_status(&self, _: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_urgent_issues(
+                &self,
+                _: &[crate::types::Issue],
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier: Arc<dyn crate::notifier::Notifier> = Arc::new(MockNotifier);
+
+        let scheduler = ReportScheduler::new(tracker, notifier);
+
+        // Preview daily report
+        let report = scheduler.preview(ReportFrequency::Daily).unwrap();
+        assert!(report.period.contains("24 Hours"));
+
+        // Preview weekly report
+        let report = scheduler
+            .preview(ReportFrequency::Weekly(Weekday::Mon))
+            .unwrap();
+        assert!(report.period.contains("7 Days"));
+
+        // Preview monthly report
+        let report = scheduler.preview(ReportFrequency::Monthly).unwrap();
+        assert!(report.period.contains("30 Days"));
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_send_now() {
+        use crate::storage::SqliteTracker;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingNotifier {
+            call_count: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::notifier::Notifier for CountingNotifier {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            async fn notify_start(&self, _: &crate::types::Issue) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_success(
+                &self,
+                _: &crate::types::Issue,
+                _: &str,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_completed(&self, _: &crate::types::Issue) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_failed(
+                &self,
+                _: &crate::types::Issue,
+                _: &str,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_status(&self, _: &str) -> crate::error::Result<()> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn notify_urgent_issues(
+                &self,
+                _: &[crate::types::Issue],
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(CountingNotifier {
+            call_count: AtomicUsize::new(0),
+        });
+        let notifier_clone = Arc::clone(&notifier);
+        let notifier_trait: Arc<dyn crate::notifier::Notifier> = notifier;
+
+        let scheduler = ReportScheduler::new(tracker, notifier_trait);
+
+        let report = scheduler.send_now(ReportFrequency::Daily).await.unwrap();
+        assert!(report.period.contains("24 Hours"));
+        // notify_report calls notify_status by default
+        assert_eq!(notifier_clone.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_check_and_send_due_schedule() {
+        use crate::storage::SqliteTracker;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingNotifier {
+            call_count: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::notifier::Notifier for CountingNotifier {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            async fn notify_start(&self, _: &crate::types::Issue) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_success(
+                &self,
+                _: &crate::types::Issue,
+                _: &str,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_completed(&self, _: &crate::types::Issue) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_failed(
+                &self,
+                _: &crate::types::Issue,
+                _: &str,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn notify_status(&self, _: &str) -> crate::error::Result<()> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn notify_urgent_issues(
+                &self,
+                _: &[crate::types::Issue],
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(CountingNotifier {
+            call_count: AtomicUsize::new(0),
+        });
+        let notifier_clone = Arc::clone(&notifier);
+        let notifier_trait: Arc<dyn crate::notifier::Notifier> = notifier;
+
+        let mut scheduler = ReportScheduler::new(tracker, notifier_trait);
+
+        // Add a daily schedule at the current hour so it's due
+        let current_hour = Utc::now().hour();
+        scheduler.add_schedule(ReportSchedule::daily("auto-daily", current_hour));
+
+        let sent = scheduler.check_and_send().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], "auto-daily");
+        assert_eq!(notifier_clone.call_count.load(Ordering::SeqCst), 1);
+
+        // Calling again should not send (already sent today)
+        let sent = scheduler.check_and_send().await.unwrap();
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn test_next_run_weekly_different_day() {
+        // Schedule for Wednesday, currently Monday
+        let schedule = ReportSchedule::weekly("test", Weekday::Wed, 10);
+        let now = Utc.with_ymd_and_hms(2024, 1, 15, 8, 0, 0).unwrap(); // Monday
+        let next = schedule.next_run(now);
+        assert_eq!(next.weekday(), Weekday::Wed);
+        assert_eq!(next.hour(), 10);
+    }
 }

@@ -1467,4 +1467,657 @@ done"#;
         let output = "CLAUDEAR_QUESTION: {not valid json}";
         assert!(ClaudeRunner::extract_blocking_question(output).is_none());
     }
+
+    #[test]
+    fn test_extract_blocking_question_prefix_with_leading_whitespace() {
+        let output =
+            "  \t  CLAUDEAR_QUESTION: {\"question\":\"spaces before prefix\",\"options\":[]}";
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "spaces before prefix");
+    }
+
+    #[test]
+    fn test_extract_blocking_question_prefix_no_space_before_json() {
+        let output = "CLAUDEAR_QUESTION:{\"question\":\"no space before json\",\"options\":[]}";
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "no space before json");
+    }
+
+    #[test]
+    fn test_extract_blocking_question_multiple_lines_returns_first_valid() {
+        let output = r#"CLAUDEAR_QUESTION: {"question":"first question","options":[]}
+CLAUDEAR_QUESTION: {"question":"second question","options":[]}"#;
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "first question");
+    }
+
+    #[test]
+    fn test_extract_blocking_question_empty_string() {
+        assert!(ClaudeRunner::extract_blocking_question("").is_none());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_only_whitespace() {
+        assert!(ClaudeRunner::extract_blocking_question("   \n\t\n  ").is_none());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_only_required_field() {
+        let output = "CLAUDEAR_QUESTION: {\"question\":\"minimal question\"}";
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "minimal question");
+        assert!(parsed.context.is_none());
+        assert!(parsed.options.is_empty());
+        assert!(parsed.why.is_none());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_empty_options_array() {
+        let output = "CLAUDEAR_QUESTION: {\"question\":\"empty opts\",\"options\":[]}";
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert!(parsed.options.is_empty());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_unicode_in_question() {
+        let output = "CLAUDEAR_QUESTION: {\"question\":\"日本語テスト 🎉 résumé\",\"options\":[]}";
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "日本語テスト 🎉 résumé");
+    }
+
+    #[test]
+    fn test_extract_blocking_question_deep_in_multiline_output() {
+        let mut lines: Vec<String> = (0..150).map(|i| format!("log line {}", i)).collect();
+        lines.push(
+            "CLAUDEAR_QUESTION: {\"question\":\"deep question\",\"options\":[\"a\"]}".to_string(),
+        );
+        lines.push("more output".to_string());
+        let output = lines.join("\n");
+        let parsed = ClaudeRunner::extract_blocking_question(&output).unwrap();
+        assert_eq!(parsed.question, "deep question");
+        assert_eq!(parsed.options, vec!["a"]);
+    }
+
+    #[test]
+    fn test_extract_blocking_question_prefix_in_middle_of_line_does_not_match() {
+        let output =
+            "some text CLAUDEAR_QUESTION: {\"question\":\"should not match\",\"options\":[]}";
+        // strip_prefix on the trimmed line requires the prefix to be at the start
+        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_empty_json_object() {
+        let output = "CLAUDEAR_QUESTION: {}";
+        // `question` field is required — empty object should fail deserialization
+        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_prefix_followed_by_only_whitespace() {
+        let output = "CLAUDEAR_QUESTION:    ";
+        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_very_large_json_payload() {
+        let long_context = "x".repeat(5000);
+        let json = format!(
+            "{{\"question\":\"big question\",\"context\":\"{}\",\"options\":[]}}",
+            long_context
+        );
+        let output = format!("CLAUDEAR_QUESTION: {}", json);
+        let parsed = ClaudeRunner::extract_blocking_question(&output).unwrap();
+        assert_eq!(parsed.question, "big question");
+        assert_eq!(parsed.context.unwrap().len(), 5000);
+    }
+
+    #[test]
+    fn test_extract_blocking_question_special_characters_in_fields() {
+        let output = r#"CLAUDEAR_QUESTION: {"question":"What about <html> & \"quotes\"?","context":"path/to/file.rs","options":["a & b","c < d"],"why":"need to know \"this\""}"#;
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "What about <html> & \"quotes\"?");
+        assert_eq!(parsed.context.as_deref(), Some("path/to/file.rs"));
+        assert_eq!(parsed.options, vec!["a & b", "c < d"]);
+        assert_eq!(parsed.why.as_deref(), Some("need to know \"this\""));
+    }
+
+    #[test]
+    fn test_extract_blocking_question_newlines_inside_json_string_values() {
+        // JSON allows \n inside string values (escaped)
+        let output = r#"CLAUDEAR_QUESTION: {"question":"line1\nline2","options":["opt\none"]}"#;
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "line1\nline2");
+        assert_eq!(parsed.options, vec!["opt\none"]);
+    }
+
+    #[test]
+    fn test_append_question_protocol_already_contains_prefix() {
+        let prompt = format!("Do something.\n{} test", QUESTION_PROTOCOL_PREFIX);
+        let result = ClaudeRunner::append_question_protocol(&prompt);
+        assert_eq!(result, prompt);
+    }
+
+    #[test]
+    fn test_append_question_protocol_does_not_contain_prefix() {
+        let prompt = "Fix the bug in main.rs";
+        let result = ClaudeRunner::append_question_protocol(prompt);
+        assert!(result.starts_with(prompt));
+        assert!(result.contains(QUESTION_PROTOCOL_PREFIX));
+        assert!(result.contains("CLAUDEAR_QUESTION:"));
+    }
+
+    #[test]
+    fn test_append_question_protocol_empty_prompt() {
+        let result = ClaudeRunner::append_question_protocol("");
+        assert!(result.contains(QUESTION_PROTOCOL_PREFIX));
+    }
+
+    #[test]
+    fn test_append_question_protocol_prefix_embedded_in_word() {
+        // "CLAUDEAR_QUESTION:foo" still contains the prefix substring, so it should NOT re-append
+        let prompt = "CLAUDEAR_QUESTION:foo";
+        let result = ClaudeRunner::append_question_protocol(prompt);
+        assert_eq!(result, prompt);
+    }
+
+    #[test]
+    fn test_truncate_shorter_than_max() {
+        let s = "hello";
+        assert_eq!(ClaudeRunner::truncate(s, 100), "hello");
+    }
+
+    #[test]
+    fn test_truncate_exactly_at_max() {
+        let s = "hello";
+        assert_eq!(ClaudeRunner::truncate(s, 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_one_byte_over_max() {
+        let s = "abcdef";
+        // max_len=5 means we keep up to 2 chars (5-3=2) then "..."
+        let result = ClaudeRunner::truncate(s, 5);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 5 + 3); // truncated part + "..."
+        assert_eq!(result, "ab...");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_unicode_at_boundary() {
+        // 'é' is 2 bytes in UTF-8; the function must cut at a valid char boundary
+        let s = "aéb"; // bytes: a(1) + é(2) + b(1) = 4 bytes
+                       // max_len=3 -> end = 0, safe_end finds last char index <= 0 which is 'a' at index 0
+        let result = ClaudeRunner::truncate(s, 3);
+        assert!(result.ends_with("..."));
+        // Should not panic and should be valid UTF-8
+        assert_eq!(result, "..."); // end = 0, safe_end = 0
+    }
+
+    #[test]
+    fn test_truncate_empty_string_zero_max() {
+        assert_eq!(ClaudeRunner::truncate("", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_max_len_of_3() {
+        // max_len=3, end = 0, so safe_end = 0, result is "..."
+        let result = ClaudeRunner::truncate("abcdef", 3);
+        assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn test_truncate_max_len_of_2() {
+        // max_len=2, saturating_sub(3) = 0, safe_end = 0
+        let result = ClaudeRunner::truncate("abcdef", 2);
+        assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn test_truncate_very_long_string() {
+        let s = "a".repeat(10_000);
+        let result = ClaudeRunner::truncate(&s, 100);
+        assert!(result.ends_with("..."));
+        // 97 'a' chars + "..." = 100 total
+        assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn test_truncate_max_len_of_4() {
+        // max_len=4, end=1, safe_end=0 (char at index 0 is 'a', which is <= 1), actually 'a' is at 0 and 'b' at 1
+        let result = ClaudeRunner::truncate("abcdef", 4);
+        // end = 4-3 = 1, last char index <= 1 is 'b' at index 1
+        assert_eq!(result, "a...");
+    }
+
+    #[test]
+    fn test_sanitize_label_normal_alphanumeric() {
+        assert_eq!(ClaudeRunner::sanitize_label("hello123"), "hello123");
+    }
+
+    #[test]
+    fn test_sanitize_label_special_characters() {
+        assert_eq!(
+            ClaudeRunner::sanitize_label("hello world.foo/bar"),
+            "hello_world_foo_bar"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_label_empty() {
+        assert_eq!(ClaudeRunner::sanitize_label(""), "custom");
+    }
+
+    #[test]
+    fn test_sanitize_label_longer_than_64_chars() {
+        let label = "a".repeat(100);
+        let result = ClaudeRunner::sanitize_label(&label);
+        assert_eq!(result.len(), 64);
+        assert_eq!(result, "a".repeat(64));
+    }
+
+    #[test]
+    fn test_sanitize_label_unicode_characters() {
+        assert_eq!(ClaudeRunner::sanitize_label("café☕日本"), "caf____");
+    }
+
+    #[test]
+    fn test_sanitize_label_hyphens_and_underscores_preserved() {
+        assert_eq!(
+            ClaudeRunner::sanitize_label("my-label_name"),
+            "my-label_name"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_label_exactly_64_chars() {
+        let label = "b".repeat(64);
+        let result = ClaudeRunner::sanitize_label(&label);
+        assert_eq!(result.len(), 64);
+        assert_eq!(result, label);
+    }
+
+    #[test]
+    fn test_sanitize_label_all_special_chars_non_empty() {
+        // All chars replaced with '_', so result is non-empty
+        assert_eq!(ClaudeRunner::sanitize_label("@#$"), "___");
+    }
+
+    #[test]
+    fn test_compose_failure_message_both_empty() {
+        let msg = ClaudeRunner::compose_failure_message(1, "", "");
+        assert_eq!(msg, "Process exited with code 1");
+    }
+
+    #[test]
+    fn test_compose_failure_message_only_stderr() {
+        let msg = ClaudeRunner::compose_failure_message(1, "", "error occurred");
+        assert_eq!(msg, "error occurred");
+    }
+
+    #[test]
+    fn test_compose_failure_message_only_stdout() {
+        let msg = ClaudeRunner::compose_failure_message(1, "some output", "");
+        assert_eq!(msg, "Process exited with code 1. Output: some output");
+    }
+
+    #[test]
+    fn test_compose_failure_message_both_present_stderr_takes_priority() {
+        let msg = ClaudeRunner::compose_failure_message(1, "stdout text", "stderr text");
+        // When both present, stderr is returned (it is non-empty)
+        assert_eq!(msg, "stderr text");
+    }
+
+    #[test]
+    fn test_compose_failure_message_rate_limit_in_stderr() {
+        let msg = ClaudeRunner::compose_failure_message(1, "", "rate limit exceeded");
+        assert!(msg.starts_with("Claude rate limit hit:"));
+        assert!(msg.contains("rate limit"));
+    }
+
+    #[test]
+    fn test_compose_failure_message_rate_limit_in_stdout() {
+        let msg = ClaudeRunner::compose_failure_message(1, "429 too many requests", "");
+        assert!(msg.starts_with("Claude rate limit hit:"));
+    }
+
+    #[test]
+    fn test_compose_failure_message_rate_limit_in_combined() {
+        let msg = ClaudeRunner::compose_failure_message(1, "some output", "rate limit hit");
+        assert!(msg.starts_with("Claude rate limit hit:"));
+    }
+
+    #[test]
+    fn test_compose_failure_message_very_long_stderr_truncated() {
+        let long_stderr = "e".repeat(5000);
+        let msg = ClaudeRunner::compose_failure_message(1, "", &long_stderr);
+        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 3); // +3 for "..."
+        assert!(msg.ends_with("..."));
+    }
+
+    #[test]
+    fn test_compose_failure_message_whitespace_only_inputs() {
+        // Whitespace-only is trimmed to empty
+        let msg = ClaudeRunner::compose_failure_message(42, "   ", "  \n\t  ");
+        assert_eq!(msg, "Process exited with code 42");
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_rate_limit() {
+        assert!(ClaudeRunner::is_rate_limit_error("rate limit exceeded"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_ratelimit() {
+        assert!(ClaudeRunner::is_rate_limit_error("ratelimit error"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_too_many_requests() {
+        assert!(ClaudeRunner::is_rate_limit_error("too many requests"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_429() {
+        assert!(ClaudeRunner::is_rate_limit_error("HTTP 429 returned"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_quota_exceeded() {
+        assert!(ClaudeRunner::is_rate_limit_error("quota exceeded for api"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_resource_exhausted() {
+        assert!(ClaudeRunner::is_rate_limit_error("resource exhausted"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_retry_after() {
+        assert!(ClaudeRunner::is_rate_limit_error("retry-after: 30 seconds"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_try_again_later() {
+        assert!(ClaudeRunner::is_rate_limit_error("please try again later"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_case_insensitivity() {
+        assert!(ClaudeRunner::is_rate_limit_error("Rate Limit Exceeded"));
+        assert!(ClaudeRunner::is_rate_limit_error("RATE LIMIT"));
+        assert!(ClaudeRunner::is_rate_limit_error("RateLimit"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_empty_string() {
+        assert!(!ClaudeRunner::is_rate_limit_error(""));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_substring_match() {
+        assert!(ClaudeRunner::is_rate_limit_error(
+            "we hit a rate limit here"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_unrelated_message() {
+        assert!(!ClaudeRunner::is_rate_limit_error(
+            "compilation error in main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_is_hard_error_failed_to_spawn_claude() {
+        assert!(ClaudeRunner::is_hard_error(
+            "Failed to spawn claude: not found"
+        ));
+    }
+
+    #[test]
+    fn test_is_hard_error_failed_to_wait_for_claude() {
+        assert!(ClaudeRunner::is_hard_error("failed to wait for claude"));
+    }
+
+    #[test]
+    fn test_is_hard_error_failed_to_capture_stdout() {
+        assert!(ClaudeRunner::is_hard_error("failed to capture stdout"));
+    }
+
+    #[test]
+    fn test_is_hard_error_failed_to_capture_stderr() {
+        assert!(ClaudeRunner::is_hard_error("failed to capture stderr"));
+    }
+
+    #[test]
+    fn test_is_hard_error_process_timed_out() {
+        assert!(ClaudeRunner::is_hard_error("process timed out"));
+    }
+
+    #[test]
+    fn test_is_hard_error_timed_out_after() {
+        assert!(ClaudeRunner::is_hard_error("timed out after 3600 seconds"));
+    }
+
+    #[test]
+    fn test_is_hard_error_connection_reset() {
+        assert!(ClaudeRunner::is_hard_error("connection reset by peer"));
+    }
+
+    #[test]
+    fn test_is_hard_error_service_unavailable() {
+        assert!(ClaudeRunner::is_hard_error("503 service unavailable"));
+    }
+
+    #[test]
+    fn test_is_hard_error_internal_server_error() {
+        assert!(ClaudeRunner::is_hard_error("500 internal server error"));
+    }
+
+    #[test]
+    fn test_is_hard_error_network_error() {
+        assert!(ClaudeRunner::is_hard_error("network error: timeout"));
+    }
+
+    #[test]
+    fn test_is_hard_error_broken_pipe() {
+        assert!(ClaudeRunner::is_hard_error("broken pipe"));
+    }
+
+    #[test]
+    fn test_is_hard_error_rate_limit_is_also_hard() {
+        assert!(ClaudeRunner::is_hard_error("rate limit exceeded"));
+        assert!(ClaudeRunner::is_hard_error("429 too many requests"));
+    }
+
+    #[test]
+    fn test_is_hard_error_case_insensitivity() {
+        assert!(ClaudeRunner::is_hard_error("FAILED TO SPAWN CLAUDE"));
+        assert!(ClaudeRunner::is_hard_error("Connection Reset"));
+        assert!(ClaudeRunner::is_hard_error("Broken Pipe"));
+    }
+
+    #[test]
+    fn test_is_hard_error_empty_string() {
+        assert!(!ClaudeRunner::is_hard_error(""));
+    }
+
+    #[test]
+    fn test_is_hard_error_normal_error_is_not_hard() {
+        assert!(!ClaudeRunner::is_hard_error("tests failed"));
+        assert!(!ClaudeRunner::is_hard_error("compilation error"));
+        assert!(!ClaudeRunner::is_hard_error("undefined variable"));
+    }
+
+    #[test]
+    fn test_hash_prompt_deterministic() {
+        let h1 = ClaudeRunner::hash_prompt("same prompt");
+        let h2 = ClaudeRunner::hash_prompt("same prompt");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_prompt_different_prompts_different_hashes() {
+        let h1 = ClaudeRunner::hash_prompt("prompt one");
+        let h2 = ClaudeRunner::hash_prompt("prompt two");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_prompt_empty_produces_hash() {
+        let h = ClaudeRunner::hash_prompt("");
+        assert!(!h.is_empty());
+        assert_eq!(h.len(), 16);
+    }
+
+    #[test]
+    fn test_hash_prompt_length_is_16() {
+        let h = ClaudeRunner::hash_prompt("any prompt here");
+        assert_eq!(h.len(), 16);
+    }
+
+    #[test]
+    fn test_hash_prompt_only_hex_chars() {
+        let h = ClaudeRunner::hash_prompt("test");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_hash_prompt_unicode_works() {
+        let h = ClaudeRunner::hash_prompt("こんにちは 🌍");
+        assert_eq!(h.len(), 16);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_claude_execution_new_defaults() {
+        let exec = ClaudeExecution::new();
+        assert_eq!(exec.id, 0);
+        assert!(exec.attempt_id.is_none());
+        assert!(exec.completed_at.is_none());
+        assert!(exec.duration_secs.is_none());
+        assert!(exec.exit_code.is_none());
+        assert!(!exec.timed_out);
+        assert!(exec.stdout_preview.is_none());
+        assert!(exec.stderr_preview.is_none());
+        assert!(exec.stdout_log_path.is_none());
+        assert!(exec.stderr_log_path.is_none());
+        assert!(exec.prompt_used.is_none());
+        assert!(exec.prompt_hash.is_none());
+        assert!(exec.model_version.is_none());
+        assert!(exec.working_directory.is_none());
+        assert!(exec.git_branch.is_none());
+        assert!(exec.git_commit_before.is_none());
+        assert!(exec.git_commit_after.is_none());
+        assert!(exec.files_changed.is_none());
+        assert!(exec.lines_added.is_none());
+        assert!(exec.lines_removed.is_none());
+    }
+
+    #[test]
+    fn test_claude_execution_with_attempt_id() {
+        let exec = ClaudeExecution::new().with_attempt_id(42);
+        assert_eq!(exec.attempt_id, Some(42));
+    }
+
+    #[test]
+    fn test_claude_execution_complete_sets_fields() {
+        let mut exec = ClaudeExecution::new();
+        assert!(exec.completed_at.is_none());
+        assert!(exec.exit_code.is_none());
+        assert!(!exec.timed_out);
+
+        exec.complete(Some(0), false);
+        assert!(exec.completed_at.is_some());
+        assert!(exec.duration_secs.is_some());
+        assert_eq!(exec.exit_code, Some(0));
+        assert!(!exec.timed_out);
+    }
+
+    #[test]
+    fn test_claude_execution_complete_with_timeout() {
+        let mut exec = ClaudeExecution::new();
+        exec.complete(None, true);
+        assert!(exec.timed_out);
+        assert!(exec.exit_code.is_none());
+        assert!(exec.completed_at.is_some());
+        assert!(exec.duration_secs.is_some());
+    }
+
+    #[test]
+    fn test_claude_execution_complete_with_nonzero_exit() {
+        let mut exec = ClaudeExecution::new();
+        exec.complete(Some(1), false);
+        assert_eq!(exec.exit_code, Some(1));
+        assert!(!exec.timed_out);
+    }
+
+    #[test]
+    fn test_claude_execution_duration_is_non_negative() {
+        let mut exec = ClaudeExecution::new();
+        exec.complete(Some(0), false);
+        assert!(exec.duration_secs.unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn test_claude_execution_default_matches_new() {
+        let from_new = ClaudeExecution::new();
+        let from_default = ClaudeExecution::default();
+        assert_eq!(from_new.id, from_default.id);
+        assert_eq!(from_new.attempt_id, from_default.attempt_id);
+        assert_eq!(from_new.timed_out, from_default.timed_out);
+        assert_eq!(from_new.exit_code, from_default.exit_code);
+    }
+
+    #[test]
+    fn test_claude_runner_config_default_values() {
+        let config = ClaudeRunnerConfig::default();
+        assert_eq!(config.timeout_secs, 21600);
+        assert!(config.model.is_none());
+        assert!(config.instructions.is_none());
+        assert!(config.permissions.is_empty());
+        assert!(config.skip_permissions);
+    }
+
+    #[test]
+    fn test_claude_runner_config_custom_timeout() {
+        let config = ClaudeRunnerConfig {
+            timeout_secs: 60,
+            ..Default::default()
+        };
+        assert_eq!(config.timeout_secs, 60);
+        // Other fields remain at default
+        assert!(config.model.is_none());
+        assert!(config.skip_permissions);
+    }
+
+    #[test]
+    fn test_claude_runner_config_with_model() {
+        let config = ClaudeRunnerConfig {
+            model: Some("opus".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn test_claude_runner_config_with_permissions() {
+        let config = ClaudeRunnerConfig {
+            permissions: vec!["Bash".to_string(), "Read".to_string()],
+            skip_permissions: false,
+            ..Default::default()
+        };
+        assert_eq!(config.permissions.len(), 2);
+        assert!(!config.skip_permissions);
+    }
+
+    #[test]
+    fn test_claude_runner_config_with_instructions() {
+        let config = ClaudeRunnerConfig {
+            instructions: Some("Always write tests".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.instructions.as_deref(), Some("Always write tests"));
+    }
 }

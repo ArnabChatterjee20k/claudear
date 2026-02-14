@@ -515,4 +515,239 @@ mod tests {
             assert!(result.is_ok());
         }
     }
+
+    #[test]
+    fn test_source_emoji_empty_string() {
+        assert_eq!(PushNotifier::get_source_emoji(""), "\u{1F4CC}");
+    }
+
+    #[test]
+    fn test_source_emoji_mixed_case_github() {
+        assert_eq!(PushNotifier::get_source_emoji("GiThUb"), "\u{1F419}");
+    }
+
+    #[test]
+    fn test_source_emoji_with_whitespace_is_default() {
+        // Whitespace-padded source should not match
+        assert_eq!(PushNotifier::get_source_emoji(" linear "), "\u{1F4CC}");
+    }
+
+    #[test]
+    fn test_resolve_user_key_returns_config_when_no_issue() {
+        let config = PushConfig {
+            api_token: Some("token".to_string()),
+            user_key: Some("global-key".to_string()),
+            device: None,
+            priority: None,
+        };
+        let notifier = PushNotifier::new(config, empty_registry());
+        assert_eq!(
+            notifier.resolve_user_key(None),
+            Some("global-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_user_key_returns_config_when_no_resolved_user() {
+        let config = PushConfig {
+            api_token: Some("token".to_string()),
+            user_key: Some("global-key".to_string()),
+            device: None,
+            priority: None,
+        };
+        let notifier = PushNotifier::new(config, empty_registry());
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        assert_eq!(
+            notifier.resolve_user_key(Some(&issue)),
+            Some("global-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_user_key_uses_resolved_user_push_key() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                push_user_key: Some("jake-push-key".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = UserRegistry::new(users);
+        let config = PushConfig {
+            api_token: Some("token".to_string()),
+            user_key: Some("global-key".to_string()),
+            device: None,
+            priority: None,
+        };
+        let notifier = PushNotifier::new(config, registry);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+        assert_eq!(
+            notifier.resolve_user_key(Some(&issue)),
+            Some("jake-push-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_user_key_falls_back_when_user_has_no_push_key() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                push_user_key: None,
+                ..Default::default()
+            },
+        );
+        let registry = UserRegistry::new(users);
+        let config = PushConfig {
+            api_token: Some("token".to_string()),
+            user_key: Some("global-key".to_string()),
+            device: None,
+            priority: None,
+        };
+        let notifier = PushNotifier::new(config, registry);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+        assert_eq!(
+            notifier.resolve_user_key(Some(&issue)),
+            Some("global-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_user_key_none_when_config_has_no_key() {
+        let config = PushConfig {
+            api_token: Some("token".to_string()),
+            user_key: None,
+            device: None,
+            priority: None,
+        };
+        let notifier = PushNotifier::new(config, empty_registry());
+        assert_eq!(notifier.resolve_user_key(None), None);
+    }
+
+    #[test]
+    fn test_pushover_message_priority_negative_values() {
+        let msg = PushoverMessage {
+            token: "t".to_string(),
+            user: "u".to_string(),
+            message: "m".to_string(),
+            title: None,
+            url: None,
+            url_title: None,
+            priority: Some(-2),
+            device: None,
+            sound: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["priority"], -2);
+    }
+
+    #[test]
+    fn test_pushover_message_all_none_optional_fields() {
+        let msg = PushoverMessage {
+            token: "t".to_string(),
+            user: "u".to_string(),
+            message: "m".to_string(),
+            title: None,
+            url: None,
+            url_title: None,
+            priority: None,
+            device: None,
+            sound: None,
+        };
+        let json_str = serde_json::to_string(&msg).unwrap();
+        // None fields should be absent from JSON
+        assert!(!json_str.contains("title"));
+        assert!(!json_str.contains("url"));
+        assert!(!json_str.contains("url_title"));
+        assert!(!json_str.contains("priority"));
+        assert!(!json_str.contains("device"));
+        assert!(!json_str.contains("sound"));
+    }
+
+    // --- ask_question tests ---
+
+    #[tokio::test]
+    async fn test_ask_question_disabled_returns_ok() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-push-1".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which env?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+        };
+        let result = notifier.ask_question(&issue, &request).await;
+        assert!(result.is_ok());
+        let delivery = result.unwrap().unwrap();
+        assert_eq!(delivery.channel, "push");
+        assert!(delivery.target.is_none());
+        assert!(delivery.message_id.is_none());
+    }
+
+    #[test]
+    fn test_urgent_issues_singular_grammar() {
+        // Verify the format string produces correct singular
+        let count = 1;
+        let title = format!(
+            "\u{1F6A8} {} Urgent Issue{}",
+            count,
+            if count > 1 { "s" } else { "" }
+        );
+        assert!(title.contains("1 Urgent Issue"));
+        assert!(!title.contains("Issues"));
+    }
+
+    #[test]
+    fn test_urgent_issues_plural_grammar() {
+        let count = 5;
+        let title = format!(
+            "\u{1F6A8} {} Urgent Issue{}",
+            count,
+            if count > 1 { "s" } else { "" }
+        );
+        assert!(title.contains("5 Urgent Issues"));
+    }
+
+    #[test]
+    fn test_is_enabled_requires_both_fields() {
+        // Only api_token
+        let config = PushConfig {
+            api_token: Some("token".to_string()),
+            user_key: None,
+            device: None,
+            priority: None,
+        };
+        assert!(!PushNotifier::new(config, empty_registry()).is_enabled());
+
+        // Only user_key
+        let config = PushConfig {
+            api_token: None,
+            user_key: Some("key".to_string()),
+            device: None,
+            priority: None,
+        };
+        assert!(!PushNotifier::new(config, empty_registry()).is_enabled());
+
+        // Both present
+        let config = PushConfig {
+            api_token: Some("token".to_string()),
+            user_key: Some("key".to_string()),
+            device: None,
+            priority: None,
+        };
+        assert!(PushNotifier::new(config, empty_registry()).is_enabled());
+    }
 }

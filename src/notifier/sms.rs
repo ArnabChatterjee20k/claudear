@@ -898,4 +898,216 @@ mod tests {
         assert_eq!(response.status, 201);
         assert_eq!(response.body, "Created");
     }
+
+    #[test]
+    fn test_resolve_recipients_returns_config_numbers_when_no_issue() {
+        let config = SmsConfig {
+            account_sid: Some("sid".to_string()),
+            auth_token: Some("token".to_string()),
+            from_number: Some("+1000".to_string()),
+            to_numbers: vec!["+1111".to_string(), "+2222".to_string()],
+        };
+        let notifier = SmsNotifier::with_http_client(config, MockSmsClient::success());
+        let recipients = notifier.resolve_recipients(None);
+        assert_eq!(recipients, vec!["+1111".to_string(), "+2222".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_recipients_returns_config_numbers_when_no_resolved_user() {
+        let notifier = SmsNotifier::with_http_client(enabled_config(), MockSmsClient::success());
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let recipients = notifier.resolve_recipients(Some(&issue));
+        assert_eq!(recipients, vec!["+15559876543".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_recipients_uses_resolved_user_sms_number() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                sms_number: Some("+15550001111".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let notifier = SmsNotifier::with_http_client_and_registry(
+            enabled_config(),
+            MockSmsClient::success(),
+            registry,
+        );
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+        let recipients = notifier.resolve_recipients(Some(&issue));
+        assert_eq!(recipients, vec!["+15550001111".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_recipients_falls_back_when_user_has_no_sms() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                sms_number: None,
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let notifier = SmsNotifier::with_http_client_and_registry(
+            enabled_config(),
+            MockSmsClient::success(),
+            registry,
+        );
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+        let recipients = notifier.resolve_recipients(Some(&issue));
+        // Falls back to config to_numbers
+        assert_eq!(recipients, vec!["+15559876543".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_ask_question_message_contains_token() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Test Issue", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-sms-1".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which branch?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+        };
+        notifier.ask_question(&issue, &request).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("[CLAUDEAR-Q:tok-sms-1]"));
+        assert!(body.contains("LIN-1"));
+        assert!(body.contains("Which branch?"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_question_delivery_channel_is_sms() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-sms-2".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.channel, "sms");
+        assert!(delivery.target.is_none());
+        assert!(delivery.message_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_message_includes_source_and_title() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new(
+            "1",
+            "SEN-42",
+            "Memory leak in worker",
+            "https://sentry.io/42",
+            "sentry",
+        );
+        notifier.notify_start(&issue).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("SEN-42"));
+        assert!(body.contains("sentry"));
+        assert!(body.contains("Memory leak in worker"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_short_error_not_truncated() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+
+        notifier.notify_failed(&issue, "Short error").await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("Short error"));
+        assert!(!body.contains("..."));
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_exact_100_char_error_not_truncated() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+
+        let error = "x".repeat(100);
+        notifier.notify_failed(&issue, &error).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains(&error));
+        assert!(!body.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_send_sms_message_within_limit_not_truncated() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+
+        let message = "x".repeat(100);
+        notifier.notify_status(&message).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(!body.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_notify_routes_to_resolved_user_sms_number() {
+        let mock = MockSmsClient::success();
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                sms_number: Some("+15550009999".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let notifier = SmsNotifier::with_http_client_and_registry(enabled_config(), mock, registry);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+
+        notifier.notify_start(&issue).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let to_param = calls[0].3.iter().find(|(k, _)| k == "To").unwrap();
+        assert_eq!(to_param.1, "+15550009999");
+    }
 }
