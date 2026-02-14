@@ -1379,7 +1379,7 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(ref reason) = entry.inference_reason {
                             // Truncate long reasons
                             let truncated = if reason.len() > 60 {
-                                format!("{}...", &reason[..57])
+                                format!("{}...", &reason[..reason.floor_char_boundary(57)])
                             } else {
                                 reason.clone()
                             };
@@ -1389,7 +1389,7 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(ref keywords) = entry.extracted_keywords {
                             // Truncate long keyword lists
                             let truncated = if keywords.len() > 50 {
-                                format!("{}...", &keywords[..47])
+                                format!("{}...", &keywords[..keywords.floor_char_boundary(47)])
                             } else {
                                 keywords.clone()
                             };
@@ -2155,7 +2155,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 if let Some(ref error) = attempt.error_message {
                     let truncated = if error.len() > 60 {
-                        format!("{}...", &error[..60])
+                        format!("{}...", &error[..error.floor_char_boundary(57)])
                     } else {
                         error.clone()
                     };

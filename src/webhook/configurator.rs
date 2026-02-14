@@ -248,10 +248,13 @@ pub fn print_setup_result(result: &WebhookSetupResult) {
 }
 
 fn mask_secret(secret: &str) -> String {
-    if secret.len() <= 8 {
-        "*".repeat(secret.len())
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 8 {
+        "*".repeat(chars.len())
     } else {
-        format!("{}...{}", &secret[..4], &secret[secret.len() - 4..])
+        let prefix: String = chars[..4].iter().collect();
+        let suffix: String = chars[chars.len() - 4..].iter().collect();
+        format!("{}...{}", prefix, suffix)
     }
 }
 

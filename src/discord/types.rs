@@ -108,7 +108,7 @@ impl CreateThreadParams {
     pub fn public(name: impl Into<String>) -> Self {
         let name = name.into();
         let name = if name.len() > 100 {
-            name[..100].to_string()
+            name[..name.floor_char_boundary(100)].to_string()
         } else {
             name
         };
@@ -124,7 +124,7 @@ impl CreateThreadParams {
     pub fn private(name: impl Into<String>) -> Self {
         let name = name.into();
         let name = if name.len() > 100 {
-            name[..100].to_string()
+            name[..name.floor_char_boundary(100)].to_string()
         } else {
             name
         };
@@ -161,7 +161,7 @@ impl CreateMessageParams {
     pub fn text(content: impl Into<String>) -> Self {
         let content = content.into();
         let content = if content.len() > 2000 {
-            format!("{}...", &content[..1997])
+            format!("{}...", &content[..content.floor_char_boundary(1997)])
         } else {
             content
         };
@@ -176,7 +176,7 @@ impl CreateMessageParams {
     pub fn with_embed(content: impl Into<String>, embed: MessageEmbed) -> Self {
         let content = content.into();
         let content = if content.len() > 2000 {
-            format!("{}...", &content[..1997])
+            format!("{}...", &content[..content.floor_char_boundary(1997)])
         } else {
             content
         };
