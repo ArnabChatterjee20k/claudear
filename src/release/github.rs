@@ -29,26 +29,6 @@ pub struct GitHubRelease {
     pub html_url: String,
 }
 
-/// A GitHub commit.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct GitHubCommit {
-    /// Commit SHA.
-    pub sha: String,
-    /// Commit message.
-    pub commit: CommitDetails,
-    /// HTML URL to the commit.
-    pub html_url: String,
-}
-
-/// Commit details.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct CommitDetails {
-    /// Commit message.
-    pub message: String,
-}
-
 /// GitHub Release API client.
 pub struct ReleaseClient<H: HttpClient = ReqwestHttpClient> {
     token: String,

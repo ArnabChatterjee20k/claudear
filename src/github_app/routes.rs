@@ -8,7 +8,6 @@
 //! **Note**: These routes are NOT wired up by default. They will be registered
 //! in the webhook server when the feature is enabled.
 
-use crate::config::GitHubAppConfig;
 use crate::env_writer::update_env_file;
 use crate::error::{Error, Result};
 use crate::github_app::manifest::AppManifest;
@@ -473,21 +472,6 @@ GITHUB_APP_CLIENT_SECRET={}
         creds.client_secret,
         creds.pem
     )
-}
-
-/// Create a GitHubAppConfig from manifest conversion response.
-#[allow(dead_code)]
-fn config_from_credentials(creds: &ManifestConversionResponse) -> GitHubAppConfig {
-    GitHubAppConfig {
-        app_id: Some(creds.id),
-        private_key_path: Some("github-app-key.pem".into()),
-        private_key: None,
-        webhook_secret: Some(creds.webhook_secret.clone()),
-        installation_id: None,
-        client_id: Some(creds.client_id.clone()),
-        client_secret: Some(creds.client_secret.clone()),
-        base_url: None,
-    }
 }
 
 #[cfg(test)]
