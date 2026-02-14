@@ -10,6 +10,7 @@ use crate::types::{
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
@@ -1156,6 +1157,90 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn get_feedback_outcome_by_attempt(&self, attempt_id: i64) -> Result<Option<FixOutcome>> {
         SqliteTracker::get_feedback_outcome_by_attempt(self, attempt_id)
+    }
+
+    fn get_recent_activities_filtered(
+        &self,
+        limit: usize,
+        source_filter: Option<&str>,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        SqliteTracker::get_recent_activities(self, limit, source_filter)
+    }
+
+    fn get_attempt_by_id(&self, id: i64) -> Result<Option<FixAttempt>> {
+        SqliteTracker::get_attempt_by_id(self, id)
+    }
+
+    fn get_executions_for_attempt(&self, attempt_id: i64) -> Result<Vec<ClaudeExecution>> {
+        SqliteTracker::get_executions_for_attempt(self, attempt_id)
+    }
+
+    fn get_reviews_for_attempt(&self, attempt_id: i64) -> Result<Vec<PrReviewRecord>> {
+        SqliteTracker::get_reviews_for_attempt(self, attempt_id)
+    }
+
+    fn get_error_patterns(&self, limit: usize) -> Result<Vec<ErrorPattern>> {
+        SqliteTracker::get_error_patterns(self, limit)
+    }
+
+    fn get_metrics(
+        &self,
+        metric_name: &str,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<ProcessingMetric>> {
+        SqliteTracker::get_metrics(self, metric_name, since, limit)
+    }
+
+    fn get_open_prs(&self) -> Result<Vec<crate::types::PrRecord>> {
+        SqliteTracker::get_open_prs(self)
+    }
+
+    fn get_pr_analytics(&self) -> Result<crate::types::PrAnalytics> {
+        SqliteTracker::get_pr_analytics(self)
+    }
+
+    fn get_regression_watches_by_status(
+        &self,
+        status: crate::types::RegressionWatchStatus,
+    ) -> Result<Vec<crate::types::RegressionWatch>> {
+        SqliteTracker::get_regression_watches_by_status(self, status)
+    }
+
+    fn get_all_regression_watches(&self) -> Result<Vec<crate::types::RegressionWatch>> {
+        SqliteTracker::get_all_regression_watches(self)
+    }
+
+    fn get_regression_checks(&self, watch_id: i64) -> Result<Vec<crate::types::RegressionCheck>> {
+        SqliteTracker::get_regression_checks(self, watch_id)
+    }
+
+    fn get_active_experiments(&self) -> Result<Vec<PromptExperiment>> {
+        SqliteTracker::get_active_experiments(self)
+    }
+
+    fn list_indexed_repos(&self) -> Result<Vec<StoredIndexedRepo>> {
+        SqliteTracker::list_indexed_repos(self)
+    }
+
+    fn get_index_stats(&self) -> Result<IndexStats> {
+        SqliteTracker::get_index_stats(self)
+    }
+
+    fn list_all_dependencies(&self) -> Result<Vec<StoredDependency>> {
+        SqliteTracker::list_all_dependencies(self)
+    }
+
+    fn get_inference_stats(&self) -> Result<InferenceStats> {
+        SqliteTracker::get_inference_stats(self)
+    }
+
+    fn get_inference_history(&self, limit: usize) -> Result<Vec<InferenceHistoryEntry>> {
+        SqliteTracker::get_inference_history(self, limit)
+    }
+
+    fn list_prs(&self, status: Option<&str>, limit: usize) -> Result<Vec<crate::types::PrRecord>> {
+        SqliteTracker::list_prs(self, status, limit)
     }
 }
 
@@ -3449,6 +3534,51 @@ impl SqliteTracker {
         })
     }
 
+    /// List PRs with optional status filter and limit.
+    pub fn list_prs(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::types::PrRecord>> {
+        let conn = self.acquire_lock()?;
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
+            Some(s) => (
+                format!(
+                    r#"
+                    SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+                           title, description, author, head_branch, base_branch, status,
+                           created_at, updated_at, merged_at, closed_at,
+                           approvals_count, changes_requested_count, comments_count, last_review_at,
+                           time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                           files_changed, lines_added, lines_removed
+                    FROM prs WHERE status = ?1
+                    ORDER BY created_at DESC LIMIT {limit}
+                    "#
+                ),
+                vec![Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>],
+            ),
+            None => (
+                format!(
+                    r#"
+                    SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+                           title, description, author, head_branch, base_branch, status,
+                           created_at, updated_at, merged_at, closed_at,
+                           approvals_count, changes_requested_count, comments_count, last_review_at,
+                           time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                           files_changed, lines_added, lines_removed
+                    FROM prs ORDER BY created_at DESC LIMIT {limit}
+                    "#
+                ),
+                vec![],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), Self::row_to_pr_record)?;
+        Ok(rows.flatten().collect())
+    }
+
     /// Update PR status.
     pub fn update_pr_status(&self, pr_url: &str, status: &str) -> Result<()> {
         let conn = self.acquire_lock()?;
@@ -3694,6 +3824,22 @@ impl SqliteTracker {
         Ok(results)
     }
 
+    /// Get all regression watches.
+    pub fn get_all_regression_watches(&self) -> Result<Vec<crate::types::RegressionWatch>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, issue_type, issue_id, fix_attempt_id, status,
+                   pr_merged_at, monitoring_started_at, resolved_at, regressed_at, created_at
+            FROM regression_watches
+            ORDER BY created_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], Self::row_to_regression_watch)?;
+        Ok(rows.flatten().collect())
+    }
+
     /// Update regression watch status.
     pub fn update_regression_watch_status(
         &self,
@@ -3845,7 +3991,7 @@ impl SqliteTracker {
 }
 
 /// An indexed repository stored in the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StoredIndexedRepo {
     pub id: i64,
     pub name: String,
@@ -3858,7 +4004,7 @@ pub struct StoredIndexedRepo {
 }
 
 /// Index statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IndexStats {
     pub repo_count: usize,
     pub file_count: usize,
@@ -3866,7 +4012,7 @@ pub struct IndexStats {
 }
 
 /// Inference statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InferenceStats {
     pub total_attempts: usize,
     pub with_feedback: usize,
@@ -3876,7 +4022,7 @@ pub struct InferenceStats {
 }
 
 /// Breakdown by confidence level.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConfidenceBreakdown {
     pub high: usize,
     pub medium: usize,
@@ -3885,7 +4031,7 @@ pub struct ConfidenceBreakdown {
 }
 
 /// A single inference attempt from the history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InferenceHistoryEntry {
     /// Unique ID of the inference attempt.
     pub id: i64,
@@ -3910,7 +4056,7 @@ pub struct InferenceHistoryEntry {
 }
 
 /// A stored PR review comment from the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StoredPrReviewComment {
     pub id: i64,
     pub github_comment_id: i64,
@@ -3927,7 +4073,7 @@ pub struct StoredPrReviewComment {
 }
 
 /// A repository stored in the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StoredRepository {
     pub id: i64,
     pub name: String,
@@ -3937,7 +4083,7 @@ pub struct StoredRepository {
 }
 
 /// A dependency relationship stored in the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StoredDependency {
     pub id: i64,
     pub upstream: String,
@@ -3949,7 +4095,7 @@ pub struct StoredDependency {
 /// Diagnostic counts for all major tables.
 ///
 /// Used by the `claudear diag db` command to verify database state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticCounts {
     pub fix_attempts: i64,
     pub fix_attempts_by_status: HashMap<String, i64>,

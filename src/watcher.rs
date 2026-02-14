@@ -1981,6 +1981,7 @@ mod tests {
             sentry: None,
             regression: crate::config::RegressionConfig::default(),
             cascade: crate::config::CascadeConfig::default(),
+            users: std::collections::HashMap::new(),
         }
     }
 

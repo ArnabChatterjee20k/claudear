@@ -103,6 +103,9 @@ pub struct Config {
     /// Cascade configuration for multi-repo chaining.
     #[serde(default)]
     pub cascade: CascadeConfig,
+    /// User registry mapping slugs to source IDs and notification channel IDs.
+    #[serde(default)]
+    pub users: std::collections::HashMap<String, UserConfig>,
 }
 
 impl Default for Config {
@@ -132,6 +135,7 @@ impl Default for Config {
             sentry: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
+            users: std::collections::HashMap::new(),
         }
     }
 }
@@ -224,6 +228,26 @@ pub struct PushConfig {
     pub device: Option<String>,
     /// Priority level (-2 to 2).
     pub priority: Option<i8>,
+}
+
+/// Per-user configuration mapping source identifiers to notification channel IDs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserConfig {
+    /// User's display name in Linear (matched against issue assignee).
+    pub linear_name: Option<String>,
+    /// User's GitHub username (matched against PR author / issue assignee).
+    pub github_username: Option<String>,
+    /// User's Sentry username (matched against issue assignee).
+    pub sentry_username: Option<String>,
+    /// Discord user ID for mentions.
+    pub discord_id: Option<String>,
+    /// Email address for notifications.
+    pub email: Option<String>,
+    /// Pushover user key for push notifications.
+    pub push_user_key: Option<String>,
+    /// Phone number for SMS notifications.
+    pub sms_number: Option<String>,
 }
 
 /// GitHub configuration for PR monitoring.
@@ -2588,5 +2612,44 @@ claude:
                 Some("Instructions from file.\nAnd inline.".to_string())
             );
         });
+    }
+
+    #[test]
+    fn test_users_config_deserialize() {
+        let yaml = r#"
+users:
+  jake:
+    linear_name: "Jake Barnwell"
+    github_username: "jakebarnby"
+    sentry_username: "jake"
+    discord_id: "123456789"
+    email: "jake@example.com"
+    push_user_key: "pushover_key"
+    sms_number: "+1234567890"
+  alice:
+    linear_name: "Alice Smith"
+    github_username: "alicesmith"
+    discord_id: "987654321"
+    email: "alice@example.com"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.users.len(), 2);
+        let jake = &config.users["jake"];
+        assert_eq!(jake.linear_name.as_deref(), Some("Jake Barnwell"));
+        assert_eq!(jake.github_username.as_deref(), Some("jakebarnby"));
+        assert_eq!(jake.discord_id.as_deref(), Some("123456789"));
+        assert_eq!(jake.email.as_deref(), Some("jake@example.com"));
+        assert_eq!(jake.push_user_key.as_deref(), Some("pushover_key"));
+        assert_eq!(jake.sms_number.as_deref(), Some("+1234567890"));
+        let alice = &config.users["alice"];
+        assert_eq!(alice.linear_name.as_deref(), Some("Alice Smith"));
+        assert!(alice.push_user_key.is_none());
+        assert!(alice.sms_number.is_none());
+    }
+
+    #[test]
+    fn test_users_config_default_empty() {
+        let config = Config::default();
+        assert!(config.users.is_empty());
     }
 }
