@@ -9,7 +9,7 @@ pub use analytics::{
 };
 pub use sqlite::{
     ConfidenceBreakdown, DiagnosticCounts, IndexStats, InferenceHistoryEntry, InferenceStats,
-    SqliteTracker, StoredDependency, StoredIndexedRepo, StoredRepository,
+    SqliteTracker, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
 };
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite, VectorStoreConfig};
 

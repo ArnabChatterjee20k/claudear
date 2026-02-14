@@ -86,6 +86,10 @@ base64 = "0.22"
 # Semantic versioning
 semver = "1"
 
+# Authentication
+bcrypt = "0.17"
+tower-cookies = "0.10"
+
 # Email (SMTP)
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"] }
 
