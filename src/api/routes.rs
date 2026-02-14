@@ -191,10 +191,13 @@ async fn health_handler(_user: AuthUser, State(state): State<ApiState>) -> Json<
             status: "ok".to_string(),
             error: None,
         },
-        Err(e) => DatabaseStatus {
-            status: "error".to_string(),
-            error: Some(e.to_string()),
-        },
+        Err(e) => {
+            tracing::error!("Database health check failed: {}", e);
+            DatabaseStatus {
+                status: "error".to_string(),
+                error: Some("Database connection failed".to_string()),
+            }
+        }
     };
 
     let overall_status = if database.status == "ok" {
@@ -282,7 +285,7 @@ async fn attempts_handler(
     State(state): State<ApiState>,
     Query(query): Query<AttemptsQuery>,
 ) -> Result<Json<AttemptsResponse>, StatusCode> {
-    let page = query.page.unwrap_or(1);
+    let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
 
     // Get all attempts and filter
@@ -322,23 +325,12 @@ async fn attempt_detail_handler(
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<FixAttempt>, StatusCode> {
-    // We need to find the attempt by ID across all statuses
-    for status in [
-        FixAttemptStatus::Pending,
-        FixAttemptStatus::Success,
-        FixAttemptStatus::Failed,
-        FixAttemptStatus::Merged,
-        FixAttemptStatus::Closed,
-        FixAttemptStatus::CannotFix,
-    ] {
-        if let Ok(attempts) = state.tracker.get_attempts_by_status(status) {
-            if let Some(attempt) = attempts.into_iter().find(|a| a.id == id) {
-                return Ok(Json(attempt));
-            }
-        }
-    }
-
-    Err(StatusCode::NOT_FOUND)
+    state
+        .tracker
+        .get_attempt_by_id(id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn sources_handler(_user: AuthUser, State(state): State<ApiState>) -> Json<SourcesResponse> {

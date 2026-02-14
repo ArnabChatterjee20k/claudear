@@ -106,7 +106,6 @@ impl SqliteTracker {
     fn init(&self) -> Result<()> {
         let conn = self.acquire_lock()?;
 
-        // === Performance PRAGMAs ===
         // These settings optimize SQLite for better throughput in our use case:
         // - Concurrent reads/writes from webhook server and watcher
         // - Moderate write workload with analytics/metrics
@@ -137,7 +136,6 @@ impl SqliteTracker {
             "#,
         )?;
 
-        // === Schema Creation ===
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS fix_attempts (
@@ -1664,10 +1662,6 @@ impl SqliteTracker {
         Ok(reviews)
     }
 
-    // ================================================================
-    // PR Review State Persistence Methods
-    // ================================================================
-
     /// Save or update a PR review state for persistence.
     ///
     /// Uses upsert semantics - creates new record or updates existing based on pr_url.
@@ -1907,10 +1901,18 @@ impl SqliteTracker {
         let result = stmt
             .query_row(params![source, issue_id], |row| {
                 let embedding_bytes: Vec<u8> = row.get(5)?;
+                if !embedding_bytes.len().is_multiple_of(4) {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        5,
+                        "embedding".to_string(),
+                        rusqlite::types::Type::Blob,
+                    ));
+                }
                 let embedding: Vec<f32> = embedding_bytes
-                    .chunks(4)
+                    .chunks_exact(4)
                     .map(|chunk| {
-                        let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+                        let arr: [u8; 4] =
+                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
                         f32::from_le_bytes(arr)
                     })
                     .collect();
@@ -2429,12 +2431,14 @@ impl SqliteTracker {
 
         if let Some(ttm) = time_to_merge {
             // Update rolling average of time to merge
+            // Note: success_count was already incremented above, so we use
+            // (success_count - 1) for the old count and success_count for the new total
             conn.execute(
                 r#"
                 UPDATE prompt_experiments
                 SET avg_time_to_merge = CASE
                     WHEN avg_time_to_merge IS NULL THEN ?
-                    ELSE (avg_time_to_merge * success_count + ?) / (success_count + 1)
+                    ELSE (avg_time_to_merge * (success_count - 1) + ?) / success_count
                 END
                 WHERE id = ?
                 "#,
@@ -2906,10 +2910,6 @@ impl SqliteTracker {
         Ok(results)
     }
 
-    // ================================================================
-    // Indexed Repository Methods
-    // ================================================================
-
     /// Save an indexed repository to the database.
     pub fn save_indexed_repo(
         &self,
@@ -3114,10 +3114,6 @@ impl SqliteTracker {
             last_indexed_at: last_indexed,
         })
     }
-
-    // ================================================================
-    // Inference Tracking Methods
-    // ================================================================
 
     /// Record an inference attempt.
     #[allow(clippy::too_many_arguments)]
@@ -3395,10 +3391,6 @@ impl SqliteTracker {
         })
     }
 
-    // ================================================================
-    // PR Lifecycle Methods
-    // ================================================================
-
     /// Upsert a PR record.
     ///
     /// Creates a new record or updates an existing one based on pr_url.
@@ -3608,8 +3600,7 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
             Some(s) => (
-                format!(
-                    r#"
+                r#"
                     SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
                            title, description, author, head_branch, base_branch, status,
                            created_at, updated_at, merged_at, closed_at,
@@ -3617,24 +3608,26 @@ impl SqliteTracker {
                            time_to_first_review_mins, time_to_merge_mins, review_cycles,
                            files_changed, lines_added, lines_removed
                     FROM prs WHERE status = ?1
-                    ORDER BY created_at DESC LIMIT {limit}
-                    "#
-                ),
-                vec![Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>],
+                    ORDER BY created_at DESC LIMIT ?2
+                "#
+                .to_string(),
+                vec![
+                    Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>,
+                ],
             ),
             None => (
-                format!(
-                    r#"
+                r#"
                     SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
                            title, description, author, head_branch, base_branch, status,
                            created_at, updated_at, merged_at, closed_at,
                            approvals_count, changes_requested_count, comments_count, last_review_at,
                            time_to_first_review_mins, time_to_merge_mins, review_cycles,
                            files_changed, lines_added, lines_removed
-                    FROM prs ORDER BY created_at DESC LIMIT {limit}
-                    "#
-                ),
-                vec![],
+                    FROM prs ORDER BY created_at DESC LIMIT ?1
+                "#
+                .to_string(),
+                vec![Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>],
             ),
         };
         let mut stmt = conn.prepare(&sql)?;
@@ -3725,10 +3718,6 @@ impl SqliteTracker {
         Ok(result)
     }
 
-    // ============================================================
-    // Cascade Methods
-    // ============================================================
-
     /// Record a cascade fix attempt linked to a parent attempt.
     pub fn record_cascade_attempt(
         &self,
@@ -3805,10 +3794,6 @@ impl SqliteTracker {
         )?;
         Ok(())
     }
-
-    // ============================================================
-    // Regression Tracking Methods
-    // ============================================================
 
     /// Create a new regression watch.
     pub fn create_regression_watch(&self, watch: &crate::types::RegressionWatch) -> Result<i64> {
@@ -4888,10 +4873,6 @@ mod tests {
         assert!(pending_prs.is_empty());
     }
 
-    // ============================================================
-    // Phase 1: Bug Fix Verification System - Regression Watch Database Tests
-    // ============================================================
-
     #[test]
     fn test_create_regression_watch() {
         use crate::types::{IssueType, RegressionWatch};
@@ -5588,10 +5569,6 @@ mod tests {
         let count = tracker.record_metrics_batch(&metrics).unwrap();
         assert_eq!(count, 0);
     }
-
-    // ================================================================
-    // PR Review State Persistence Tests
-    // ================================================================
 
     #[test]
     fn test_save_and_get_pr_review_states() {

@@ -578,9 +578,7 @@ impl Watcher {
         };
 
         // Verify the issue exists before processing
-        let issues = source.fetch_issues().await?;
-        let issue_exists = issues.iter().any(|i| i.id == attempt.issue_id)
-            || source.get_issue(&attempt.issue_id).await.is_ok();
+        let issue_exists = source.get_issue(&attempt.issue_id).await.is_ok();
 
         if !issue_exists {
             tracing::warn!(
@@ -1155,10 +1153,11 @@ Create a PR with your changes."#,
 
         // Apply per-source max issues per cycle limit (falls back to global)
         let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
+        let candidates_count = candidates.len();
         let to_process: Vec<_> = candidates.into_iter().take(source_max_issues).collect();
 
         let to_process_count = to_process.len();
-        let skipped = to_process.len().saturating_sub(source_max_issues);
+        let skipped = candidates_count.saturating_sub(source_max_issues);
         if skipped > 0 {
             tracing::info!(
                 source = source.name(),
