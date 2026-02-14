@@ -52,11 +52,8 @@ impl GitHubWebhookHandler {
             }
         };
 
-        // GitHub uses lowercase header name
-        let signature = match headers
-            .get("x-hub-signature-256")
-            .or_else(|| headers.get("X-Hub-Signature-256"))
-        {
+        // Headers are lowercased by the webhook server
+        let signature = match headers.get("x-hub-signature-256") {
             Some(s) => s,
             None => {
                 tracing::warn!(source = "github", "Missing x-hub-signature-256 header");
@@ -100,11 +97,9 @@ impl GitHubWebhookHandler {
     }
 
     /// Get the event type from headers.
+    /// Headers are expected to be lowercased by the webhook server.
     pub fn get_event_type(headers: &HashMap<String, String>) -> Option<&str> {
-        headers
-            .get("x-github-event")
-            .or_else(|| headers.get("X-GitHub-Event"))
-            .map(|s| s.as_str())
+        headers.get("x-github-event").map(|s| s.as_str())
     }
 
     /// Process a webhook payload.
@@ -544,9 +539,10 @@ mod tests {
             Some("pull_request_review")
         );
 
+        // Headers are lowercased by the webhook server
         headers.clear();
         headers.insert(
-            "X-GitHub-Event".to_string(),
+            "x-github-event".to_string(),
             "pull_request_review_comment".to_string(),
         );
         assert_eq!(

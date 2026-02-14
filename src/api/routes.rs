@@ -1,5 +1,6 @@
 //! API route handlers for the dashboard.
 
+use super::auth::*;
 use crate::config::Config;
 use crate::storage::FixAttemptTracker;
 use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, RegressionWatchStatus};
@@ -71,6 +72,21 @@ pub fn create_api_router_with_dashboard(
         .route("/api/repos/dependencies", get(dependencies_handler))
         .route("/api/inference/stats", get(inference_stats_handler))
         .route("/api/inference/history", get(inference_history_handler))
+        // Auth routes
+        .route("/api/auth/login", axum::routing::post(login_handler))
+        .route("/api/auth/logout", axum::routing::post(logout_handler))
+        .route("/api/auth/me", axum::routing::get(me_handler))
+        // User CRUD routes
+        .route(
+            "/api/users",
+            axum::routing::get(list_users_handler).post(create_user_handler),
+        )
+        .route(
+            "/api/users/{id}",
+            axum::routing::get(get_user_handler)
+                .put(update_user_handler)
+                .delete(delete_user_handler),
+        )
         .with_state(state);
 
     // If dashboard directory is provided, serve static files
@@ -166,7 +182,7 @@ struct AttemptsQuery {
     per_page: Option<usize>,
 }
 
-async fn health_handler(State(state): State<ApiState>) -> Json<HealthResponse> {
+async fn health_handler(_user: AuthUser, State(state): State<ApiState>) -> Json<HealthResponse> {
     let uptime_secs = state.start_time.elapsed().as_secs();
 
     // Check database connectivity by attempting to get stats
@@ -175,10 +191,13 @@ async fn health_handler(State(state): State<ApiState>) -> Json<HealthResponse> {
             status: "ok".to_string(),
             error: None,
         },
-        Err(e) => DatabaseStatus {
-            status: "error".to_string(),
-            error: Some(e.to_string()),
-        },
+        Err(e) => {
+            tracing::error!("Database health check failed: {}", e);
+            DatabaseStatus {
+                status: "error".to_string(),
+                error: Some("Database connection failed".to_string()),
+            }
+        }
     };
 
     let overall_status = if database.status == "ok" {
@@ -195,7 +214,10 @@ async fn health_handler(State(state): State<ApiState>) -> Json<HealthResponse> {
     })
 }
 
-async fn stats_handler(State(state): State<ApiState>) -> Result<Json<FixAttemptStats>, StatusCode> {
+async fn stats_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+) -> Result<Json<FixAttemptStats>, StatusCode> {
     state
         .tracker
         .get_stats()
@@ -204,6 +226,7 @@ async fn stats_handler(State(state): State<ApiState>) -> Result<Json<FixAttemptS
 }
 
 async fn overview_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<OverviewResponse>, StatusCode> {
     let stats = state
@@ -258,10 +281,11 @@ async fn overview_handler(
 }
 
 async fn attempts_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<AttemptsQuery>,
 ) -> Result<Json<AttemptsResponse>, StatusCode> {
-    let page = query.page.unwrap_or(1);
+    let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
 
     // Get all attempts and filter
@@ -297,29 +321,19 @@ async fn attempts_handler(
 }
 
 async fn attempt_detail_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<FixAttempt>, StatusCode> {
-    // We need to find the attempt by ID across all statuses
-    for status in [
-        FixAttemptStatus::Pending,
-        FixAttemptStatus::Success,
-        FixAttemptStatus::Failed,
-        FixAttemptStatus::Merged,
-        FixAttemptStatus::Closed,
-        FixAttemptStatus::CannotFix,
-    ] {
-        if let Ok(attempts) = state.tracker.get_attempts_by_status(status) {
-            if let Some(attempt) = attempts.into_iter().find(|a| a.id == id) {
-                return Ok(Json(attempt));
-            }
-        }
-    }
-
-    Err(StatusCode::NOT_FOUND)
+    state
+        .tracker
+        .get_attempt_by_id(id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
-async fn sources_handler(State(state): State<ApiState>) -> Json<SourcesResponse> {
+async fn sources_handler(_user: AuthUser, State(state): State<ApiState>) -> Json<SourcesResponse> {
     let mut sources = Vec::new();
 
     if let Some(ref linear) = state.config.linear {
@@ -351,6 +365,7 @@ async fn sources_handler(State(state): State<ApiState>) -> Json<SourcesResponse>
 }
 
 async fn retries_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<RetriesResponse>, StatusCode> {
     use crate::retry::RetryManager;
@@ -478,6 +493,7 @@ struct AttemptDetailResponse {
 // ─── New handlers ──────────────────────────────────
 
 async fn attempt_full_detail_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<AttemptDetailResponse>, StatusCode> {
@@ -511,6 +527,7 @@ async fn attempt_full_detail_handler(
 }
 
 async fn activity_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<ActivityQuery>,
 ) -> Result<Json<Vec<crate::types::ActivityLogEntry>>, StatusCode> {
@@ -525,6 +542,7 @@ async fn activity_handler(
 }
 
 async fn analytics_summary_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::types::AnalyticsSummary>, StatusCode> {
     state
@@ -535,6 +553,7 @@ async fn analytics_summary_handler(
 }
 
 async fn metrics_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<MetricsQuery>,
 ) -> Result<Json<Vec<crate::types::ProcessingMetric>>, StatusCode> {
@@ -560,6 +579,7 @@ async fn metrics_handler(
 }
 
 async fn errors_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<ErrorsQuery>,
 ) -> Result<Json<Vec<crate::types::ErrorPattern>>, StatusCode> {
@@ -573,6 +593,7 @@ async fn errors_handler(
 }
 
 async fn prs_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<PrsQuery>,
 ) -> Result<Json<Vec<crate::types::PrRecord>>, StatusCode> {
@@ -586,6 +607,7 @@ async fn prs_handler(
 }
 
 async fn pr_analytics_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::types::PrAnalytics>, StatusCode> {
     state
@@ -596,6 +618,7 @@ async fn pr_analytics_handler(
 }
 
 async fn feedback_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<FeedbackQuery>,
 ) -> Result<Json<Vec<crate::feedback::FixOutcome>>, StatusCode> {
@@ -609,6 +632,7 @@ async fn feedback_handler(
 }
 
 async fn regressions_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<RegressionsQuery>,
 ) -> Result<Json<Vec<crate::types::RegressionWatch>>, StatusCode> {
@@ -631,6 +655,7 @@ async fn regressions_handler(
 }
 
 async fn regression_checks_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<Vec<crate::types::RegressionCheck>>, StatusCode> {
@@ -642,6 +667,7 @@ async fn regression_checks_handler(
 }
 
 async fn experiments_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<crate::types::PromptExperiment>>, StatusCode> {
     state
@@ -652,6 +678,7 @@ async fn experiments_handler(
 }
 
 async fn repos_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<crate::storage::StoredIndexedRepo>>, StatusCode> {
     state
@@ -662,6 +689,7 @@ async fn repos_handler(
 }
 
 async fn repo_stats_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::storage::IndexStats>, StatusCode> {
     state
@@ -672,6 +700,7 @@ async fn repo_stats_handler(
 }
 
 async fn dependencies_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<crate::storage::StoredDependency>>, StatusCode> {
     state
@@ -682,6 +711,7 @@ async fn dependencies_handler(
 }
 
 async fn inference_stats_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::storage::InferenceStats>, StatusCode> {
     state
@@ -692,6 +722,7 @@ async fn inference_stats_handler(
 }
 
 async fn inference_history_handler(
+    _user: AuthUser,
     State(state): State<ApiState>,
     Query(query): Query<InferenceHistoryQuery>,
 ) -> Result<Json<Vec<crate::storage::InferenceHistoryEntry>>, StatusCode> {
@@ -716,6 +747,7 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+    use tower_cookies::CookieManagerLayer;
 
     fn test_config() -> Config {
         Config {
@@ -751,19 +783,39 @@ mod tests {
         Arc::new(SqliteTracker::in_memory().unwrap())
     }
 
+    /// Create an authenticated test router with CookieManagerLayer and a session cookie.
+    /// Returns (router, session_cookie_value).
+    fn create_authenticated_router(tracker: &Arc<dyn FixAttemptTracker>) -> (Router, String) {
+        let config = test_config();
+
+        // Create a test user and session
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap(); // cost=4 for speed
+        db.create_user("test@example.com", &password_hash, "Test User", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let router = create_api_router(config, tracker.clone()).layer(CookieManagerLayer::new());
+
+        (router, token)
+    }
+
+    /// Build an authenticated GET request with the session cookie.
+    fn auth_get(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("cookie", format!("claudear_session={}", token))
+            .body(Body::empty())
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_health_endpoint() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/health", &token))
             .await
             .unwrap();
 
@@ -772,17 +824,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_endpoint() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/stats")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/stats", &token))
             .await
             .unwrap();
 
@@ -791,17 +837,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_overview_endpoint() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/stats/overview")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/stats/overview", &token))
             .await
             .unwrap();
 
@@ -810,17 +850,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_attempts_endpoint() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/attempts")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/attempts", &token))
             .await
             .unwrap();
 
@@ -829,17 +863,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_attempts_with_pagination() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/attempts?page=1&per_page=10")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/attempts?page=1&per_page=10", &token))
             .await
             .unwrap();
 
@@ -848,17 +876,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_attempts_with_filter() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/attempts?status=success&source=linear")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get(
+                "/api/attempts?status=success&source=linear",
+                &token,
+            ))
             .await
             .unwrap();
 
@@ -867,17 +892,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_attempt_detail_not_found() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/attempts/99999")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/attempts/99999", &token))
             .await
             .unwrap();
 
@@ -886,17 +905,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_sources_endpoint() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/sources")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/sources", &token))
             .await
             .unwrap();
 
@@ -905,17 +918,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_retries_endpoint() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/retries")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/retries", &token))
             .await
             .unwrap();
 
@@ -1114,17 +1121,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_404_for_unknown_endpoint() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/unknown")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/unknown", &token))
             .await
             .unwrap();
 
@@ -1133,17 +1134,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_response_content() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/health", &token))
             .await
             .unwrap();
 
@@ -1157,17 +1152,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_response_content() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/stats")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/stats", &token))
             .await
             .unwrap();
 
@@ -1178,17 +1167,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_attempts_response_content() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/attempts")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/attempts", &token))
             .await
             .unwrap();
 
@@ -1200,18 +1183,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_attempts_pagination_limits() {
-        let config = test_config();
         let tracker = create_test_tracker();
-        let router = create_api_router(config, tracker);
+        let (router, token) = create_authenticated_router(&tracker);
 
         // Test that per_page is capped at 100
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/attempts?per_page=200")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/attempts?per_page=200", &token))
             .await
             .unwrap();
 
@@ -1248,6 +1225,25 @@ mod tests {
         assert!(summary.pr_url.is_none());
         assert_eq!(summary.retry_count, 2);
         assert_eq!(summary.status, "failed");
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_returns_401() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let router = create_api_router(config, tracker).layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

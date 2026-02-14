@@ -183,7 +183,7 @@ pub struct DiscordConfig {
 }
 
 /// Email (SMTP) notification configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmailConfig {
     /// SMTP server host.
@@ -200,6 +200,20 @@ pub struct EmailConfig {
     pub to_addresses: Vec<String>,
     /// Use TLS (default: true).
     pub use_tls: bool,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            from_address: None,
+            to_addresses: Vec::new(),
+            use_tls: true,
+        }
+    }
 }
 
 /// SMS notification configuration (via Twilio).
@@ -2659,7 +2673,7 @@ claude:
 
         let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"my-instructions.md\"\n  instructions: \"And inline.\"";
         let config_path = dir.path().join("claudear.yaml");
-        fs::write(&config_path, &yaml).unwrap();
+        fs::write(&config_path, yaml).unwrap();
 
         with_env(&[], || {
             let config = Config::load(&config_path).unwrap();

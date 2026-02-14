@@ -29,26 +29,6 @@ pub struct GitHubRelease {
     pub html_url: String,
 }
 
-/// A GitHub commit.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct GitHubCommit {
-    /// Commit SHA.
-    pub sha: String,
-    /// Commit message.
-    pub commit: CommitDetails,
-    /// HTML URL to the commit.
-    pub html_url: String,
-}
-
-/// Commit details.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct CommitDetails {
-    /// Commit message.
-    pub message: String,
-}
-
 /// GitHub Release API client.
 pub struct ReleaseClient<H: HttpClient = ReqwestHttpClient> {
     token: String,
@@ -630,8 +610,15 @@ impl<H: HttpClient> ReleaseClient<H> {
                     semver::Version::parse(min_ver),
                 ) {
                     (Ok(lock_semver), Ok(min_semver)) => Ok(lock_semver >= min_semver),
-                    // Fall back to string comparison
-                    _ => Ok(lock_ver >= min_ver),
+                    // Fall back to string comparison (may be incorrect for multi-digit segments)
+                    _ => {
+                        tracing::warn!(
+                            lock_ver = lock_ver,
+                            min_ver = min_ver,
+                            "Non-semver version comparison, falling back to lexicographic"
+                        );
+                        Ok(lock_ver >= min_ver)
+                    }
                 }
             }
             None => Ok(false),

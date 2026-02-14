@@ -492,12 +492,21 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         format!("{:x}", result)[..16].to_string() // First 16 hex chars
     }
 
-    /// Truncate a string to max_len, adding "..." if truncated.
+    /// Truncate a string to approximately max_len bytes, adding "..." if truncated.
+    /// Ensures the cut happens at a valid UTF-8 char boundary.
     fn truncate(s: &str, max_len: usize) -> String {
         if s.len() <= max_len {
             s.to_string()
         } else {
-            format!("{}...", &s[..max_len.saturating_sub(3)])
+            let end = max_len.saturating_sub(3);
+            // Find the nearest char boundary at or before `end`
+            let safe_end = s
+                .char_indices()
+                .take_while(|(i, _)| *i <= end)
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            format!("{}...", &s[..safe_end])
         }
     }
 

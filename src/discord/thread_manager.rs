@@ -180,7 +180,10 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
         if let Some(review_body) = body {
             if !review_body.is_empty() {
                 let truncated = if review_body.len() > 1000 {
-                    format!("{}...", &review_body[..997])
+                    format!(
+                        "{}...",
+                        &review_body[..review_body.floor_char_boundary(997)]
+                    )
                 } else {
                     review_body.to_string()
                 };
@@ -214,7 +217,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
         };
 
         let truncated_comment = if comment.len() > 1000 {
-            format!("{}...", &comment[..997])
+            format!("{}...", &comment[..comment.floor_char_boundary(997)])
         } else {
             comment.to_string()
         };
@@ -331,7 +334,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
         };
 
         let truncated_error = if error.len() > 1000 {
-            format!("{}...", &error[..997])
+            format!("{}...", &error[..error.floor_char_boundary(997)])
         } else {
             error.to_string()
         };

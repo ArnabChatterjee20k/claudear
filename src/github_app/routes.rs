@@ -8,7 +8,6 @@
 //! **Note**: These routes are NOT wired up by default. They will be registered
 //! in the webhook server when the feature is enabled.
 
-use crate::config::GitHubAppConfig;
 use crate::env_writer::update_env_file;
 use crate::error::{Error, Result};
 use crate::github_app::manifest::AppManifest;
@@ -189,7 +188,7 @@ pub async fn github_setup_handler(
         Ok(url) => Ok(Redirect::temporary(&url)),
         Err(e) => Err(Html(format!(
             "<h1>Error</h1><p>Failed to generate manifest: {}</p>",
-            e
+            html_escape(&e.to_string())
         ))),
     }
 }
@@ -319,10 +318,19 @@ fn save_credentials(creds: &ManifestConversionResponse, base_url: &str) -> Resul
     Ok(())
 }
 
+/// Escape HTML special characters to prevent XSS.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 /// Generate HTML for the setup form.
 fn setup_form_html(error: Option<&str>) -> String {
     let error_html = error
-        .map(|e| format!(r#"<p style="color: red;">{}</p>"#, e))
+        .map(|e| format!(r#"<p style="color: red;">{}</p>"#, html_escape(e)))
         .unwrap_or_default();
 
     format!(
@@ -376,7 +384,8 @@ fn error_html(title: &str, message: &str) -> String {
     <p><a href="/github/setup">Try again</a></p>
 </body>
 </html>"#,
-        title, message
+        html_escape(title),
+        html_escape(message)
     )
 }
 
@@ -415,7 +424,10 @@ fn success_html(creds: &ManifestConversionResponse, base_url: &str) -> String {
     </ul>
 </body>
 </html>"#,
-        creds.name, creds.id, creds.html_url, base_url
+        html_escape(&creds.name),
+        creds.id,
+        html_escape(&creds.html_url),
+        html_escape(base_url)
     )
 }
 
@@ -461,33 +473,18 @@ GITHUB_APP_CLIENT_SECRET={}
     <pre>{}</pre>
 </body>
 </html>"#,
-        error,
-        creds.name,
+        html_escape(error),
+        html_escape(&creds.name),
         creds.id,
-        creds.client_id,
-        creds.html_url,
-        creds.html_url,
+        html_escape(&creds.client_id),
+        html_escape(&creds.html_url),
+        html_escape(&creds.html_url),
         creds.id,
-        creds.webhook_secret,
-        creds.client_id,
-        creds.client_secret,
-        creds.pem
+        html_escape(&creds.webhook_secret),
+        html_escape(&creds.client_id),
+        html_escape(&creds.client_secret),
+        html_escape(&creds.pem)
     )
-}
-
-/// Create a GitHubAppConfig from manifest conversion response.
-#[allow(dead_code)]
-fn config_from_credentials(creds: &ManifestConversionResponse) -> GitHubAppConfig {
-    GitHubAppConfig {
-        app_id: Some(creds.id),
-        private_key_path: Some("github-app-key.pem".into()),
-        private_key: None,
-        webhook_secret: Some(creds.webhook_secret.clone()),
-        installation_id: None,
-        client_id: Some(creds.client_id.clone()),
-        client_secret: Some(creds.client_secret.clone()),
-        base_url: None,
-    }
 }
 
 #[cfg(test)]

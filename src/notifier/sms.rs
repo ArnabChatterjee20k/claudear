@@ -139,7 +139,7 @@ impl<H: SmsHttpClient> SmsNotifier<H> {
 
         // Truncate message to SMS limit (160 chars for basic SMS, 1600 for modern)
         let truncated_body = if body.len() > 1500 {
-            format!("{}...", &body[..1497])
+            format!("{}...", &body[..body.floor_char_boundary(1497)])
         } else {
             body.to_string()
         };
@@ -207,7 +207,7 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
         // Truncate error for SMS
         let short_error = if error.len() > 100 {
-            format!("{}...", &error[..97])
+            format!("{}...", &error[..error.floor_char_boundary(97)])
         } else {
             error.to_string()
         };

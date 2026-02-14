@@ -78,7 +78,7 @@ impl PushNotifier {
 
         // Truncate message if too long (Pushover limit is 1024 chars for message)
         let truncated_message = if message.len() > 1000 {
-            format!("{}...", &message[..997])
+            format!("{}...", &message[..message.floor_char_boundary(997)])
         } else {
             message.to_string()
         };

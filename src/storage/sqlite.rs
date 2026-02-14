@@ -9,6 +9,8 @@ use crate::types::{
     SimilarIssue, SourceStats,
 };
 use chrono::{DateTime, Utc};
+use rand::RngExt;
+use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +25,40 @@ static PR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
 
 /// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
 const MAX_PR_URL_LENGTH: usize = 2048;
+
+/// A user row from the database.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserRow {
+    pub id: i64,
+    pub email: String,
+    #[serde(skip_serializing)]
+    pub password_hash: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl UserRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            email: row.get(1)?,
+            password_hash: row.get(2)?,
+            name: row.get(3)?,
+            role: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    }
+}
+
+/// Generate a cryptographically random session token (64 hex chars = 32 bytes).
+fn generate_session_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill(&mut bytes);
+    hex::encode(bytes)
+}
 
 /// SQLite-based fix attempt tracker for persistence.
 ///
@@ -70,7 +106,6 @@ impl SqliteTracker {
     fn init(&self) -> Result<()> {
         let conn = self.acquire_lock()?;
 
-        // === Performance PRAGMAs ===
         // These settings optimize SQLite for better throughput in our use case:
         // - Concurrent reads/writes from webhook server and watcher
         // - Moderate write workload with analytics/metrics
@@ -101,7 +136,6 @@ impl SqliteTracker {
             "#,
         )?;
 
-        // === Schema Creation ===
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS fix_attempts (
@@ -498,6 +532,31 @@ impl SqliteTracker {
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_regression_checks_watch ON regression_checks(regression_watch_id);
+
+            -- ============================================================
+            -- Authentication Tables
+            -- ============================================================
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'viewer',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
             "#,
         )?;
 
@@ -619,6 +678,10 @@ impl SqliteTracker {
 }
 
 impl FixAttemptTracker for SqliteTracker {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn has_attempted(&self, source: &str, issue_id: &str) -> bool {
         let conn = match self.conn.lock() {
             Ok(c) => c,
@@ -1599,10 +1662,6 @@ impl SqliteTracker {
         Ok(reviews)
     }
 
-    // ================================================================
-    // PR Review State Persistence Methods
-    // ================================================================
-
     /// Save or update a PR review state for persistence.
     ///
     /// Uses upsert semantics - creates new record or updates existing based on pr_url.
@@ -1842,10 +1901,18 @@ impl SqliteTracker {
         let result = stmt
             .query_row(params![source, issue_id], |row| {
                 let embedding_bytes: Vec<u8> = row.get(5)?;
+                if !embedding_bytes.len().is_multiple_of(4) {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        5,
+                        "embedding".to_string(),
+                        rusqlite::types::Type::Blob,
+                    ));
+                }
                 let embedding: Vec<f32> = embedding_bytes
-                    .chunks(4)
+                    .chunks_exact(4)
                     .map(|chunk| {
-                        let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+                        let arr: [u8; 4] =
+                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
                         f32::from_le_bytes(arr)
                     })
                     .collect();
@@ -2364,12 +2431,14 @@ impl SqliteTracker {
 
         if let Some(ttm) = time_to_merge {
             // Update rolling average of time to merge
+            // Note: success_count was already incremented above, so we use
+            // (success_count - 1) for the old count and success_count for the new total
             conn.execute(
                 r#"
                 UPDATE prompt_experiments
                 SET avg_time_to_merge = CASE
                     WHEN avg_time_to_merge IS NULL THEN ?
-                    ELSE (avg_time_to_merge * success_count + ?) / (success_count + 1)
+                    ELSE (avg_time_to_merge * (success_count - 1) + ?) / success_count
                 END
                 WHERE id = ?
                 "#,
@@ -2841,10 +2910,6 @@ impl SqliteTracker {
         Ok(results)
     }
 
-    // ================================================================
-    // Indexed Repository Methods
-    // ================================================================
-
     /// Save an indexed repository to the database.
     pub fn save_indexed_repo(
         &self,
@@ -3049,10 +3114,6 @@ impl SqliteTracker {
             last_indexed_at: last_indexed,
         })
     }
-
-    // ================================================================
-    // Inference Tracking Methods
-    // ================================================================
 
     /// Record an inference attempt.
     #[allow(clippy::too_many_arguments)]
@@ -3330,10 +3391,6 @@ impl SqliteTracker {
         })
     }
 
-    // ================================================================
-    // PR Lifecycle Methods
-    // ================================================================
-
     /// Upsert a PR record.
     ///
     /// Creates a new record or updates an existing one based on pr_url.
@@ -3543,8 +3600,7 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
             Some(s) => (
-                format!(
-                    r#"
+                r#"
                     SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
                            title, description, author, head_branch, base_branch, status,
                            created_at, updated_at, merged_at, closed_at,
@@ -3552,24 +3608,26 @@ impl SqliteTracker {
                            time_to_first_review_mins, time_to_merge_mins, review_cycles,
                            files_changed, lines_added, lines_removed
                     FROM prs WHERE status = ?1
-                    ORDER BY created_at DESC LIMIT {limit}
-                    "#
-                ),
-                vec![Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>],
+                    ORDER BY created_at DESC LIMIT ?2
+                "#
+                .to_string(),
+                vec![
+                    Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>,
+                ],
             ),
             None => (
-                format!(
-                    r#"
+                r#"
                     SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
                            title, description, author, head_branch, base_branch, status,
                            created_at, updated_at, merged_at, closed_at,
                            approvals_count, changes_requested_count, comments_count, last_review_at,
                            time_to_first_review_mins, time_to_merge_mins, review_cycles,
                            files_changed, lines_added, lines_removed
-                    FROM prs ORDER BY created_at DESC LIMIT {limit}
-                    "#
-                ),
-                vec![],
+                    FROM prs ORDER BY created_at DESC LIMIT ?1
+                "#
+                .to_string(),
+                vec![Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>],
             ),
         };
         let mut stmt = conn.prepare(&sql)?;
@@ -3660,10 +3718,6 @@ impl SqliteTracker {
         Ok(result)
     }
 
-    // ============================================================
-    // Cascade Methods
-    // ============================================================
-
     /// Record a cascade fix attempt linked to a parent attempt.
     pub fn record_cascade_attempt(
         &self,
@@ -3740,10 +3794,6 @@ impl SqliteTracker {
         )?;
         Ok(())
     }
-
-    // ============================================================
-    // Regression Tracking Methods
-    // ============================================================
 
     /// Create a new regression watch.
     pub fn create_regression_watch(&self, watch: &crate::types::RegressionWatch) -> Result<i64> {
@@ -3987,6 +4037,155 @@ impl SqliteTracker {
             check_details: row.get(4)?,
             created_at: Self::parse_datetime(&row.get::<_, String>(5)?),
         })
+    }
+
+    // ── User Management ─────────────────────────────────
+
+    pub fn create_user(
+        &self,
+        email: &str,
+        password_hash: &str,
+        name: &str,
+        role: &str,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO users (email, password_hash, name, role) VALUES (?1, ?2, ?3, ?4)",
+            params![email, password_hash, name, role],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_user_by_id(&self, id: i64) -> Result<Option<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, email, password_hash, name, role, created_at, updated_at FROM users WHERE id = ?1"
+        )?;
+        let user = stmt.query_row(params![id], UserRow::from_row).optional()?;
+        Ok(user)
+    }
+
+    pub fn get_user_by_email(&self, email: &str) -> Result<Option<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, email, password_hash, name, role, created_at, updated_at FROM users WHERE email = ?1"
+        )?;
+        let user = stmt
+            .query_row(params![email], UserRow::from_row)
+            .optional()?;
+        Ok(user)
+    }
+
+    pub fn list_users(&self) -> Result<Vec<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, email, password_hash, name, role, created_at, updated_at FROM users ORDER BY id"
+        )?;
+        let users = stmt
+            .query_map([], UserRow::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(users)
+    }
+
+    pub fn update_user(
+        &self,
+        id: i64,
+        email: Option<&str>,
+        password_hash: Option<&str>,
+        name: Option<&str>,
+        role: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let mut sets = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(e) = email {
+            sets.push("email = ?");
+            values.push(Box::new(e.to_string()));
+        }
+        if let Some(p) = password_hash {
+            sets.push("password_hash = ?");
+            values.push(Box::new(p.to_string()));
+        }
+        if let Some(n) = name {
+            sets.push("name = ?");
+            values.push(Box::new(n.to_string()));
+        }
+        if let Some(r) = role {
+            sets.push("role = ?");
+            values.push(Box::new(r.to_string()));
+        }
+
+        if sets.is_empty() {
+            return Ok(false);
+        }
+
+        sets.push("updated_at = datetime('now')");
+        values.push(Box::new(id));
+
+        let sql = format!("UPDATE users SET {} WHERE id = ?", sets.join(", "));
+        let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        let rows = conn.execute(&sql, params.as_slice())?;
+        Ok(rows > 0)
+    }
+
+    pub fn delete_user(&self, id: i64) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let rows = conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        Ok(rows > 0)
+    }
+
+    pub fn count_users(&self) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    // ── Session Management ──────────────────────────────
+
+    pub fn create_session(&self, user_id: i64, expires_at: &str) -> Result<String> {
+        let token = generate_session_token();
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO sessions (id, user_id, expires_at) VALUES (?1, ?2, ?3)",
+            params![token, user_id, expires_at],
+        )?;
+        Ok(token)
+    }
+
+    pub fn get_session_user(&self, token: &str) -> Result<Option<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.created_at, u.updated_at
+             FROM sessions s
+             JOIN users u ON s.user_id = u.id
+             WHERE s.id = ?1 AND s.expires_at > datetime('now')",
+        )?;
+        let user = stmt
+            .query_row(params![token], UserRow::from_row)
+            .optional()?;
+        Ok(user)
+    }
+
+    pub fn delete_session(&self, token: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![token])?;
+        Ok(())
+    }
+
+    pub fn cleanup_expired_sessions(&self) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let deleted = conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= datetime('now')",
+            [],
+        )?;
+        Ok(deleted)
+    }
+
+    pub fn delete_user_sessions(&self, user_id: i64) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
+        Ok(())
     }
 }
 
@@ -4673,10 +4872,6 @@ mod tests {
         let pending_prs = tracker.get_pending_prs().unwrap();
         assert!(pending_prs.is_empty());
     }
-
-    // ============================================================
-    // Phase 1: Bug Fix Verification System - Regression Watch Database Tests
-    // ============================================================
 
     #[test]
     fn test_create_regression_watch() {
@@ -5375,10 +5570,6 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    // ================================================================
-    // PR Review State Persistence Tests
-    // ================================================================
-
     #[test]
     fn test_save_and_get_pr_review_states() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -5700,5 +5891,162 @@ mod tests {
         let sentry_only = tracker.get_feedback_outcomes(Some("sentry"), 100).unwrap();
         assert_eq!(sentry_only.len(), 1);
         assert_eq!(sentry_only[0].outcome, crate::feedback::Outcome::Failed);
+    }
+
+    #[test]
+    fn test_create_and_get_user() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let id = tracker
+            .create_user("test@example.com", "$2b$12$hash", "Test User", "admin")
+            .unwrap();
+        assert!(id > 0);
+        let user = tracker.get_user_by_id(id).unwrap().unwrap();
+        assert_eq!(user.email, "test@example.com");
+        assert_eq!(user.name, "Test User");
+        assert_eq!(user.role, "admin");
+    }
+
+    #[test]
+    fn test_get_user_by_email() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .create_user("alice@example.com", "$2b$12$hash", "Alice", "viewer")
+            .unwrap();
+        let user = tracker
+            .get_user_by_email("alice@example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.name, "Alice");
+        let missing = tracker.get_user_by_email("nobody@example.com").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_list_users() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .create_user("a@test.com", "hash", "A", "admin")
+            .unwrap();
+        tracker
+            .create_user("b@test.com", "hash", "B", "viewer")
+            .unwrap();
+        let users = tracker.list_users().unwrap();
+        assert_eq!(users.len(), 2);
+    }
+
+    #[test]
+    fn test_update_user() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let id = tracker
+            .create_user("old@test.com", "hash", "Old Name", "viewer")
+            .unwrap();
+        tracker
+            .update_user(
+                id,
+                Some("new@test.com"),
+                None,
+                Some("New Name"),
+                Some("admin"),
+            )
+            .unwrap();
+        let user = tracker.get_user_by_id(id).unwrap().unwrap();
+        assert_eq!(user.email, "new@test.com");
+        assert_eq!(user.name, "New Name");
+        assert_eq!(user.role, "admin");
+    }
+
+    #[test]
+    fn test_delete_user() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let id = tracker
+            .create_user("del@test.com", "hash", "Delete Me", "viewer")
+            .unwrap();
+        assert!(tracker.delete_user(id).unwrap());
+        assert!(tracker.get_user_by_id(id).unwrap().is_none());
+        assert!(!tracker.delete_user(id).unwrap());
+    }
+
+    #[test]
+    fn test_duplicate_email_fails() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .create_user("dup@test.com", "hash", "First", "admin")
+            .unwrap();
+        let result = tracker.create_user("dup@test.com", "hash", "Second", "viewer");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_and_validate_session() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user_id = tracker
+            .create_user("sess@test.com", "hash", "Session User", "admin")
+            .unwrap();
+        let token = tracker
+            .create_session(user_id, "2099-12-31T23:59:59")
+            .unwrap();
+        assert_eq!(token.len(), 64);
+        let user = tracker.get_session_user(&token).unwrap().unwrap();
+        assert_eq!(user.id, user_id);
+        assert_eq!(user.email, "sess@test.com");
+    }
+
+    #[test]
+    fn test_expired_session_returns_none() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user_id = tracker
+            .create_user("exp@test.com", "hash", "Expired", "viewer")
+            .unwrap();
+        let token = tracker
+            .create_session(user_id, "2000-01-01T00:00:00")
+            .unwrap();
+        let user = tracker.get_session_user(&token).unwrap();
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn test_delete_session() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user_id = tracker
+            .create_user("delsess@test.com", "hash", "Del Sess", "admin")
+            .unwrap();
+        let token = tracker
+            .create_session(user_id, "2099-12-31T23:59:59")
+            .unwrap();
+        assert!(tracker.get_session_user(&token).unwrap().is_some());
+        tracker.delete_session(&token).unwrap();
+        assert!(tracker.get_session_user(&token).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cleanup_expired_sessions() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user_id = tracker
+            .create_user("clean@test.com", "hash", "Clean", "admin")
+            .unwrap();
+        tracker
+            .create_session(user_id, "2000-01-01T00:00:00")
+            .unwrap();
+        tracker
+            .create_session(user_id, "2000-01-02T00:00:00")
+            .unwrap();
+        tracker
+            .create_session(user_id, "2099-12-31T23:59:59")
+            .unwrap();
+        let deleted = tracker.cleanup_expired_sessions().unwrap();
+        assert_eq!(deleted, 2);
+    }
+
+    #[test]
+    fn test_count_users() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        assert_eq!(tracker.count_users().unwrap(), 0);
+        tracker
+            .create_user("c1@test.com", "hash", "C1", "admin")
+            .unwrap();
+        tracker
+            .create_user("c2@test.com", "hash", "C2", "viewer")
+            .unwrap();
+        assert_eq!(tracker.count_users().unwrap(), 2);
     }
 }

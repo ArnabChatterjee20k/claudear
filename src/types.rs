@@ -1002,10 +1002,6 @@ pub struct AnalyticsSummary {
     pub success_rate_by_source: HashMap<String, f64>,
 }
 
-// ============================================================
-// Regression Tracking Types
-// ============================================================
-
 /// Status of a regression watch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1759,10 +1755,6 @@ mod tests {
         assert!(debug_str.contains("Issue"));
     }
 
-    // ============================================================
-    // Phase 1: Bug Fix Verification System - RegressionWatchStatus Tests
-    // ============================================================
-
     #[test]
     fn test_regression_watch_status_display() {
         assert_eq!(
@@ -1845,10 +1837,6 @@ mod tests {
         }
     }
 
-    // ============================================================
-    // Phase 1: Bug Fix Verification System - IssueType Tests
-    // ============================================================
-
     #[test]
     fn test_issue_type_display() {
         assert_eq!(IssueType::SentryIssue.to_string(), "sentry_issue");
@@ -1905,10 +1893,6 @@ mod tests {
         }
     }
 
-    // ============================================================
-    // Phase 1: Bug Fix Verification System - RegressionWatch Tests
-    // ============================================================
-
     #[test]
     fn test_regression_watch_new() {
         let watch = RegressionWatch::new(IssueType::SentryIssue, "sentry-123", 1);
@@ -1953,10 +1937,6 @@ mod tests {
         assert!(debug_str.contains("RegressionWatch"));
     }
 
-    // ============================================================
-    // Phase 1: Bug Fix Verification System - ReleaseTracking Tests
-    // ============================================================
-
     #[test]
     fn test_release_tracking_new() {
         let tracking = ReleaseTracking::new(1, "v1.2.3", "abc123def");
@@ -1994,10 +1974,6 @@ mod tests {
         let debug_str = format!("{:?}", tracking);
         assert!(debug_str.contains("ReleaseTracking"));
     }
-
-    // ============================================================
-    // Phase 1: Bug Fix Verification System - RegressionCheck Tests
-    // ============================================================
 
     #[test]
     fn test_regression_check_new() {
@@ -2049,10 +2025,6 @@ mod tests {
         let debug_str = format!("{:?}", check);
         assert!(debug_str.contains("RegressionCheck"));
     }
-
-    // ============================================================
-    // Phase 1: Status Transition Tests
-    // ============================================================
 
     #[test]
     fn test_regression_watch_status_transitions() {

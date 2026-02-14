@@ -112,9 +112,12 @@ impl WebhookHandler for SentryWebhookHandler {
 
         let id = issue_data
             .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .unwrap_or_default();
 
         let short_id = issue_data
             .get("shortId")
@@ -145,12 +148,18 @@ impl WebhookHandler for SentryWebhookHandler {
 
         let count = issue_data
             .get("count")
-            .and_then(|v| v.as_i64())
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(1);
 
         let user_count = issue_data
             .get("userCount")
-            .and_then(|v| v.as_i64())
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(0);
 
         let culprit = issue_data

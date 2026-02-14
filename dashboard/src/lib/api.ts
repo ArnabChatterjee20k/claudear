@@ -83,6 +83,28 @@ export interface SourcesResponse {
   sources: SourceInfo[];
 }
 
+// ─── Auth types ──────────────────────────────────
+
+export interface AuthUser {
+  id: number
+  email: string
+  name: string
+  role: string
+}
+
+export interface LoginResponse {
+  user: AuthUser
+}
+
+export interface UserRecord {
+  id: number
+  email: string
+  name: string
+  role: string
+  created_at: string
+  updated_at: string
+}
+
 // ─── New types ──────────────────────────────────
 
 export interface ActivityLogEntry {
@@ -334,10 +356,58 @@ export interface InferenceHistoryEntry {
 
 // ─── Fetchers ──────────────────────────────────
 
+let onUnauthorized: (() => void) | null = null
+
+export function setOnUnauthorized(cb: () => void) {
+  onUnauthorized = cb
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
-  return res.json();
+  const res = await fetch(url)
+  if (res.status === 401) {
+    onUnauthorized?.()
+    throw new Error('Unauthorized')
+  }
+  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`)
+  return res.json()
+}
+
+async function postJson<T>(url: string, body?: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (res.status === 401) {
+    onUnauthorized?.()
+    throw new Error('Unauthorized')
+  }
+  if (!res.ok) throw new Error(`Failed to post ${url}: ${res.status}`)
+  if (res.status === 204) return undefined as T
+  return res.json()
+}
+
+async function putJson<T>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (res.status === 401) {
+    onUnauthorized?.()
+    throw new Error('Unauthorized')
+  }
+  if (!res.ok) throw new Error(`Failed to put ${url}: ${res.status}`)
+  return res.json()
+}
+
+async function deleteRequest(url: string): Promise<void> {
+  const res = await fetch(url, { method: 'DELETE' })
+  if (res.status === 401) {
+    onUnauthorized?.()
+    throw new Error('Unauthorized')
+  }
+  if (!res.ok) throw new Error(`Failed to delete ${url}: ${res.status}`)
 }
 
 // Existing
@@ -467,4 +537,44 @@ export async function fetchInferenceStats(): Promise<InferenceStats> {
 
 export async function fetchInferenceHistory(limit = 50): Promise<InferenceHistoryEntry[]> {
   return fetchJson(`${API_BASE}/inference/history?limit=${limit}`);
+}
+
+// ─── Auth API ────────────────────────────────────
+
+export async function login(email: string, password: string): Promise<LoginResponse> {
+  return postJson(`${API_BASE}/auth/login`, { email, password })
+}
+
+export async function logout(): Promise<void> {
+  await postJson(`${API_BASE}/auth/logout`)
+}
+
+export async function getMe(): Promise<AuthUser> {
+  return fetchJson(`${API_BASE}/auth/me`)
+}
+
+// ─── User Management API ─────────────────────────
+
+export async function fetchUsers(): Promise<UserRecord[]> {
+  return fetchJson(`${API_BASE}/users`)
+}
+
+export async function getUser(id: number): Promise<UserRecord> {
+  return fetchJson(`${API_BASE}/users/${id}`)
+}
+
+export async function createUser(data: {
+  email: string; password: string; name: string; role: string
+}): Promise<UserRecord> {
+  return postJson(`${API_BASE}/users`, data)
+}
+
+export async function updateUser(id: number, data: {
+  email?: string; password?: string; name?: string; role?: string
+}): Promise<UserRecord> {
+  return putJson(`${API_BASE}/users/${id}`, data)
+}
+
+export async function deleteUser(id: number): Promise<void> {
+  return deleteRequest(`${API_BASE}/users/${id}`)
 }
