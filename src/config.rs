@@ -20,6 +20,10 @@ pub struct ClaudeConfig {
     pub model: Option<String>,
     /// Custom instructions appended to Claude's system prompt.
     pub instructions: Option<String>,
+    /// Path to a file containing custom instructions.
+    /// Resolved relative to the config file directory. If both this and
+    /// `instructions` are set, file content comes first, then inline appended.
+    pub instructions_file: Option<String>,
     /// Tool permissions granted without prompting (--allowedTools).
     #[serde(default)]
     pub permissions: Vec<String>,
@@ -32,6 +36,7 @@ impl Default for ClaudeConfig {
         Self {
             model: None,
             instructions: None,
+            instructions_file: None,
             permissions: Vec::new(),
             skip_permissions: true,
         }
