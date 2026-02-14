@@ -98,6 +98,10 @@ claude:
   # Custom instructions appended to Claude's system prompt
   # instructions: "Always write tests. Follow existing code style."
 
+  # Path to a file containing custom instructions (relative to this config file)
+  # If both instructions and instructions_file are set, file content comes first
+  # instructions_file: "./claude-instructions.md"
+
   # Tool permissions granted without prompting (--allowedTools)
   # See: https://docs.anthropic.com/en/docs/claude-code/settings
   # permissions:
