@@ -46,6 +46,7 @@ pub mod source;
 pub mod storage;
 pub mod templates;
 pub mod types;
+pub mod users;
 pub mod watcher;
 pub mod webhook;
 
@@ -85,3 +86,4 @@ pub use storage::{
     StoredDependency, StoredRepository, TimePeriod, TrendAnalysis, TrendDirection,
 };
 pub use types::*;
+pub use users::{ResolvedUser, UserRegistry};
