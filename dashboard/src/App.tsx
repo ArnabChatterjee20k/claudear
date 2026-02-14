@@ -1,5 +1,7 @@
 import { Router } from './router'
 import { AppShell } from './components/layout/app-shell'
+import { AuthProvider, useAuth } from './lib/auth'
+import LoginPage from './pages/login'
 import OverviewPage from './pages/overview'
 import AttemptsPage from './pages/attempts'
 import PrsPage from './pages/prs'
@@ -11,6 +13,7 @@ import ExperimentsPage from './pages/experiments'
 import ReposPage from './pages/repos'
 import InferencePage from './pages/inference'
 import ActivityPage from './pages/activity'
+import UsersPage from './pages/users'
 
 const routes: Record<string, () => JSX.Element> = {
   '/': OverviewPage,
@@ -24,13 +27,36 @@ const routes: Record<string, () => JSX.Element> = {
   '/repos': ReposPage,
   '/inference': InferencePage,
   '/activity': ActivityPage,
+  '/users': UsersPage,
 }
 
-function App() {
+function AuthenticatedApp() {
+  const { user, loading } = useAuth()
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-muted-foreground text-sm">Loading...</div>
+      </div>
+    )
+  }
+
+  if (!user) {
+    return <LoginPage />
+  }
+
   return (
     <AppShell>
       <Router routes={routes} />
     </AppShell>
+  )
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <AuthenticatedApp />
+    </AuthProvider>
   )
 }
 
