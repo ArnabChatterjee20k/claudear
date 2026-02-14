@@ -2,10 +2,12 @@
 
 use super::Notifier;
 use crate::config::DiscordConfig;
+use crate::discord::DiscordClient;
 use crate::error::{Error, Result};
-use crate::types::Issue;
+use crate::types::{AskDelivery, AskReply, AskRequest, Issue};
 use crate::users::UserRegistry;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 /// HTTP response for Discord webhook client.
@@ -181,6 +183,42 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         }
         // Fall back to global config
         self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
+    }
+
+    fn get_target_discord_id_for_issue(&self, issue: &Issue) -> Option<String> {
+        if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
+            if let Some(user) = self.user_registry.get_by_slug(&slug) {
+                if let Some(ref discord_id) = user.discord_id {
+                    return Some(discord_id.clone());
+                }
+            }
+        }
+        self.config.user_id.clone()
+    }
+
+    fn expected_reply_user_id(&self, request: &AskRequest) -> Option<String> {
+        request
+            .target_discord_id
+            .clone()
+            .or_else(|| self.config.user_id.clone())
+    }
+
+    fn extract_reply_text(content: &str) -> Option<String> {
+        let answer = content.trim();
+        if answer.is_empty() {
+            None
+        } else {
+            Some(answer.to_string())
+        }
+    }
+
+    fn extract_reply_text_with_token(content: &str, correlation_id: &str) -> Option<String> {
+        let token = format!("[CLAUDEAR-Q:{}]", correlation_id);
+        if !content.contains(&token) {
+            return None;
+        }
+        let cleaned = content.replace(&token, "");
+        Self::extract_reply_text(&cleaned)
     }
 
     fn get_source_emoji(source: &str) -> &'static str {
@@ -429,6 +467,136 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         })
         .await
     }
+
+    async fn ask_question(
+        &self,
+        issue: &Issue,
+        request: &AskRequest,
+    ) -> Result<Option<AskDelivery>> {
+        let mention = self.get_user_mention_for_issue(issue);
+        let token = format!("[CLAUDEAR-Q:{}]", request.correlation_id);
+        let mut content = String::new();
+        if let Some(m) = mention {
+            content.push_str(&m);
+            content.push(' ');
+        }
+        content.push_str(&format!(
+            "{} Human input needed for {}:\n{}",
+            token, issue.short_id, request.question.question
+        ));
+        if let Some(ref why) = request.question.why {
+            content.push_str(&format!("\nWhy: {}", why));
+        }
+        if let Some(ref ctx) = request.question.context {
+            content.push_str(&format!("\nContext: {}", truncate_string(ctx, 400)));
+        }
+        if !request.question.options.is_empty() {
+            content.push_str(&format!(
+                "\nOptions: {}",
+                request.question.options.join(" | ")
+            ));
+        }
+        content.push_str("\nReply to this message in Discord with your answer.");
+
+        self.send(DiscordMessage {
+            content: Some(content),
+            embeds: None,
+        })
+        .await?;
+
+        Ok(Some(AskDelivery {
+            channel: "discord".to_string(),
+            target: self.get_target_discord_id_for_issue(issue),
+            message_id: None,
+        }))
+    }
+
+    async fn poll_question_replies(
+        &self,
+        request: &AskRequest,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<AskReply>> {
+        let bot_token = match self.config.bot_token.as_ref() {
+            Some(v) if !v.is_empty() => v,
+            _ => return Ok(Vec::new()),
+        };
+        let channel_id = match self.config.channel_id.as_ref() {
+            Some(v) if !v.is_empty() => v,
+            _ => return Ok(Vec::new()),
+        };
+
+        let client = DiscordClient::new(bot_token.clone())?;
+        let messages = client.list_channel_messages(channel_id, 50).await?;
+        let expected_user = self.expected_reply_user_id(request);
+        let token = format!("[CLAUDEAR-Q:{}]", request.correlation_id);
+
+        let ask_message_ids: std::collections::HashSet<String> = messages
+            .iter()
+            .filter(|m| m.content.contains(&token))
+            .map(|m| m.id.clone())
+            .collect();
+
+        let mut replies: Vec<AskReply> = messages
+            .into_iter()
+            .filter_map(|message| {
+                let author = message.author?;
+                if author.bot {
+                    return None;
+                }
+
+                if let Some(ref expected) = expected_user {
+                    if &author.id != expected {
+                        return None;
+                    }
+                }
+
+                let parsed = DateTime::parse_from_rfc3339(&message.timestamp)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))?;
+                if parsed < since {
+                    return None;
+                }
+
+                let is_reply_to_ask = message
+                    .message_reference
+                    .as_ref()
+                    .and_then(|r| r.message_id.as_ref())
+                    .map(|message_id| ask_message_ids.contains(message_id))
+                    .unwrap_or(false);
+
+                let answer = if is_reply_to_ask {
+                    Self::extract_reply_text(&message.content)
+                } else {
+                    // Backward-compatible fallback for manual token replies.
+                    Self::extract_reply_text_with_token(&message.content, &request.correlation_id)
+                }?;
+                Some(AskReply {
+                    correlation_id: request.correlation_id.clone(),
+                    channel: "discord".to_string(),
+                    responder: Some(author.id),
+                    answer,
+                    replied_at: parsed,
+                })
+            })
+            .collect();
+
+        replies.sort_by_key(|r| r.replied_at);
+        Ok(replies)
+    }
+
+    fn supports_replies(&self) -> bool {
+        self.config
+            .bot_token
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+            && self
+                .config
+                .channel_id
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +621,7 @@ mod tests {
         let config_with_id = DiscordConfig {
             webhook_url: Some("https://example.com".to_string()),
             user_id: Some("123456".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config_with_id, empty_registry());
         assert_eq!(notifier.get_user_mention(), Some("<@123456>".to_string()));
@@ -460,6 +629,7 @@ mod tests {
         let config_without_id = DiscordConfig {
             webhook_url: Some("https://example.com".to_string()),
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config_without_id, empty_registry());
         assert_eq!(notifier.get_user_mention(), None);
@@ -470,6 +640,7 @@ mod tests {
         let enabled_config = DiscordConfig {
             webhook_url: Some("https://example.com".to_string()),
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(enabled_config, empty_registry());
         assert!(notifier.is_enabled());
@@ -477,6 +648,7 @@ mod tests {
         let disabled_config = DiscordConfig {
             webhook_url: None,
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(disabled_config, empty_registry());
         assert!(!notifier.is_enabled());
@@ -585,6 +757,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: None, // Disabled
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
 
@@ -598,6 +771,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: None,
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
 
@@ -617,6 +791,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: None,
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
 
@@ -638,6 +813,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: None,
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
 
@@ -657,6 +833,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: None,
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
 
@@ -676,6 +853,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: Some("https://example.com".to_string()),
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
 
@@ -744,6 +922,7 @@ mod tests {
         DiscordConfig {
             webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
             user_id: None,
+            ..Default::default()
         }
     }
 
@@ -751,6 +930,7 @@ mod tests {
         DiscordConfig {
             webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
             user_id: Some("987654321".to_string()),
+            ..Default::default()
         }
     }
 
@@ -1159,6 +1339,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
             user_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::with_http_client_and_registry(config, mock, registry);
         let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
@@ -1184,6 +1365,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
             user_id: Some("999999999".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::with_http_client_and_registry(config, mock, registry);
         let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
@@ -1202,6 +1384,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
             user_id: Some("999999999".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::with_http_client_and_registry(config, mock, registry);
         let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
@@ -1209,5 +1392,103 @@ mod tests {
         let (_, body) = notifier.http.get_last_call().unwrap();
         let content = body["content"].as_str().unwrap();
         assert!(content.contains("<@999999999>"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_question_uses_resolved_user_target() {
+        let mock = MockDiscordWebhookClient::success();
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                discord_id: Some("111222333".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let config = DiscordConfig {
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            user_id: Some("999999999".to_string()),
+            ..Default::default()
+        };
+        let notifier = DiscordNotifier::with_http_client_and_registry(config, mock, registry);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-1".to_string(),
+            source: "linear".to_string(),
+            repo: Some("org/repo".to_string()),
+            issue_id: issue.id.clone(),
+            short_id: issue.short_id.clone(),
+            question: crate::types::BlockingQuestion {
+                question: "Choose target branch?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.target.as_deref(), Some("111222333"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_question_falls_back_to_global_target() {
+        let mock = MockDiscordWebhookClient::success();
+        let registry = crate::users::UserRegistry::new(std::collections::HashMap::new());
+        let config = DiscordConfig {
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            user_id: Some("999999999".to_string()),
+            ..Default::default()
+        };
+        let notifier = DiscordNotifier::with_http_client_and_registry(config, mock, registry);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-2".to_string(),
+            source: "linear".to_string(),
+            repo: Some("org/repo".to_string()),
+            issue_id: issue.id.clone(),
+            short_id: issue.short_id.clone(),
+            question: crate::types::BlockingQuestion {
+                question: "Pick env?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.target.as_deref(), Some("999999999"));
+    }
+
+    #[test]
+    fn test_extract_reply_text() {
+        let content = "Use main branch";
+        let parsed =
+            DiscordNotifier::<ReqwestDiscordWebhookClient>::extract_reply_text(content).unwrap();
+        assert_eq!(parsed, "Use main branch");
+    }
+
+    #[test]
+    fn test_extract_reply_text_with_token() {
+        let content = "[CLAUDEAR-Q:abc123] Use main branch";
+        let parsed = DiscordNotifier::<ReqwestDiscordWebhookClient>::extract_reply_text_with_token(
+            content, "abc123",
+        )
+        .unwrap();
+        assert_eq!(parsed, "Use main branch");
     }
 }

@@ -83,8 +83,22 @@ pub struct DiscordMessage {
     pub content: String,
     /// Timestamp.
     pub timestamp: String,
+    /// Reference to another message when this is a reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_reference: Option<DiscordMessageReference>,
     /// Thread associated with this message (if started).
     pub thread: Option<DiscordThread>,
+}
+
+/// A Discord message reference (used for replies).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordMessageReference {
+    /// Referenced message ID.
+    pub message_id: Option<String>,
+    /// Referenced channel ID.
+    pub channel_id: Option<String>,
+    /// Referenced guild ID.
+    pub guild_id: Option<String>,
 }
 
 /// Parameters for creating a thread.
@@ -566,6 +580,7 @@ mod tests {
             }),
             content: "Hello world".to_string(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            message_reference: None,
             thread: None,
         };
         let json = serde_json::to_string(&message).unwrap();

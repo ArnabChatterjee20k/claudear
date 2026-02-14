@@ -96,6 +96,9 @@ impl RetryManager {
                             self.config.max_retries, error
                         ),
                     )?;
+                    let _ = self
+                        .tracker
+                        .update_qa_outcome_stats_for_attempt(attempt.id, false);
                     tracing::warn!(
                         component = "retry",
                         short_id = %attempt.short_id,

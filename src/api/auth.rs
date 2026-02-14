@@ -453,8 +453,8 @@ mod tests {
     use super::*;
     use crate::api::routes::create_api_router;
     use crate::config::{
-        CascadeConfig, ClaudeConfig, Config, DiscordConfig, EmailConfig, GitHubAppConfig,
-        GitHubConfig, PushConfig, RegressionConfig, RetryConfig, SmsConfig,
+        AskConfig, CascadeConfig, ClaudeConfig, Config, DiscordConfig, EmailConfig,
+        GitHubAppConfig, GitHubConfig, PushConfig, RegressionConfig, RetryConfig, SmsConfig,
     };
     use crate::storage::SqliteTracker;
     use axum::body::Body;
@@ -482,6 +482,7 @@ mod tests {
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
             push: PushConfig::default(),
+            ask: AskConfig::default(),
             github: GitHubConfig::default(),
             github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),

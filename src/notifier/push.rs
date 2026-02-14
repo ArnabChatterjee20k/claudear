@@ -3,7 +3,7 @@
 use super::Notifier;
 use crate::config::PushConfig;
 use crate::error::{Error, Result};
-use crate::types::Issue;
+use crate::types::{AskDelivery, AskRequest, Issue};
 use crate::users::UserRegistry;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -225,6 +225,32 @@ impl Notifier for PushNotifier {
         // High priority for urgent issues
         self.send_push(&title, &message, None, None, Some(1), None)
             .await
+    }
+
+    async fn ask_question(
+        &self,
+        issue: &Issue,
+        request: &AskRequest,
+    ) -> Result<Option<AskDelivery>> {
+        let title = format!("Human input needed: {}", issue.short_id);
+        let message = format!(
+            "[CLAUDEAR-Q:{}]\n{}\n\nReply in Discord or Email.",
+            request.correlation_id, request.question.question
+        );
+        self.send_push(
+            &title,
+            &message,
+            Some(&issue.url),
+            Some("View Issue"),
+            Some(1),
+            Some(issue),
+        )
+        .await?;
+        Ok(Some(AskDelivery {
+            channel: "push".to_string(),
+            target: None,
+            message_id: None,
+        }))
     }
 }
 

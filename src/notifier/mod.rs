@@ -44,12 +44,14 @@
 //! }
 //! ```
 
+pub mod ask_orchestrator;
 mod console;
 mod discord;
 mod email;
 mod push;
 mod sms;
 
+pub use ask_orchestrator::send_to_all_and_wait_first_reply;
 pub use console::ConsoleNotifier;
 pub use discord::DiscordNotifier;
 pub use email::EmailNotifier;
@@ -58,8 +60,9 @@ pub use sms::SmsNotifier;
 
 use crate::error::Result;
 use crate::reports::Report;
-use crate::types::Issue;
+use crate::types::{AskDelivery, AskReply, AskRequest, Issue};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
 /// Trait for notification services.
@@ -103,6 +106,29 @@ pub trait Notifier: Send + Sync {
     async fn notify_report(&self, report: &Report) -> Result<()> {
         // Default implementation formats as text and uses notify_status
         self.notify_status(&report.format_text()).await
+    }
+
+    /// Send a blocking question through this channel.
+    async fn ask_question(
+        &self,
+        _issue: &Issue,
+        _request: &AskRequest,
+    ) -> Result<Option<AskDelivery>> {
+        Ok(None)
+    }
+
+    /// Poll replies for a previously sent question.
+    async fn poll_question_replies(
+        &self,
+        _request: &AskRequest,
+        _since: DateTime<Utc>,
+    ) -> Result<Vec<AskReply>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether this notifier can receive replies.
+    fn supports_replies(&self) -> bool {
+        false
     }
 }
 
@@ -251,6 +277,69 @@ impl Notifier for CompositeNotifier {
         })
         .await;
         Ok(())
+    }
+
+    async fn ask_question(
+        &self,
+        issue: &Issue,
+        request: &AskRequest,
+    ) -> Result<Option<AskDelivery>> {
+        let issue = issue.clone();
+        let request = request.clone();
+        let futures: Vec<_> = self
+            .notifiers
+            .iter()
+            .map(|n| {
+                let notifier = Arc::clone(n);
+                let issue = issue.clone();
+                let request = request.clone();
+                async move { notifier.ask_question(&issue, &request).await }
+            })
+            .collect();
+
+        let mut first_delivery: Option<AskDelivery> = None;
+        for result in futures::future::join_all(futures).await {
+            match result {
+                Ok(delivery) => {
+                    if first_delivery.is_none() {
+                        first_delivery = delivery;
+                    }
+                }
+                Err(e) => tracing::error!("Notification error: {}", e),
+            }
+        }
+        Ok(first_delivery)
+    }
+
+    async fn poll_question_replies(
+        &self,
+        request: &AskRequest,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<AskReply>> {
+        let request = request.clone();
+        let futures: Vec<_> = self
+            .notifiers
+            .iter()
+            .filter(|n| n.supports_replies())
+            .map(|n| {
+                let notifier = Arc::clone(n);
+                let request = request.clone();
+                async move { notifier.poll_question_replies(&request, since).await }
+            })
+            .collect();
+
+        let mut replies = Vec::new();
+        for result in futures::future::join_all(futures).await {
+            match result {
+                Ok(mut channel_replies) => replies.append(&mut channel_replies),
+                Err(e) => tracing::error!("Notification error: {}", e),
+            }
+        }
+        Ok(replies)
+    }
+
+    fn supports_replies(&self) -> bool {
+        self.notifiers.iter().any(|n| n.supports_replies())
     }
 }
 

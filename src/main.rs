@@ -25,8 +25,8 @@ use claudear::{
     users::UserRegistry,
     watcher::{Watcher, WatcherOptions},
     webhook::{
-        print_setup_result, LinearWebhookHandler, SentryWebhookHandler, WebhookConfigurator,
-        WebhookHandlerRegistry, WebhookServer,
+        print_setup_result, GitHubWebhookHandler, LinearWebhookHandler, SentryWebhookHandler,
+        WebhookConfigurator, WebhookHandlerRegistry, WebhookServer,
     },
 };
 use serde_json::json;
@@ -556,6 +556,19 @@ fn create_webhook_handlers(config: &Config) -> WebhookHandlerRegistry {
     registry
 }
 
+fn create_github_webhook_handler(
+    config: &Config,
+    review_watcher: Option<Arc<ReviewWatcher>>,
+) -> Option<GitHubWebhookHandler> {
+    let handler = GitHubWebhookHandler::new(config.github.clone(), review_watcher);
+    if handler.is_enabled() {
+        tracing::info!("GitHub webhook handler registered");
+        Some(handler)
+    } else {
+        None
+    }
+}
+
 fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Notifier> {
     let mut composite = CompositeNotifier::new();
 
@@ -615,6 +628,8 @@ fn start_regression_monitoring(
     config: &Config,
     sqlite_tracker: Arc<SqliteTracker>,
     tracker: Arc<dyn FixAttemptTracker>,
+    sources: Vec<Arc<dyn IssueSource>>,
+    notifier: Arc<dyn Notifier>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.regression.enabled {
         tracing::info!("Regression monitoring disabled in configuration");
@@ -711,7 +726,7 @@ fn start_regression_monitoring(
     let check_interval_hours = scheduler_config.check_interval_hours;
 
     // Create retry manager for triggering retries on regression
-    let retry_manager = RetryManager::new(config.retry.clone(), tracker);
+    let retry_manager = RetryManager::new(config.retry.clone(), tracker.clone());
 
     // Start background task
     let handle = tokio::spawn(async move {
@@ -788,6 +803,48 @@ fn start_regression_monitoring(
                                         watch_id = result.watch_id,
                                         "Final check complete, no regression - issue resolved"
                                     );
+                                    let source_name = result.issue_type.source_name();
+                                    if let Some(source) =
+                                        sources.iter().find(|s| s.name() == source_name)
+                                    {
+                                        match source.resolve_issue(&result.issue_id).await {
+                                            Ok(()) => {
+                                                if let Err(e) =
+                                                    tracker.mark_resolved(source_name, &result.issue_id)
+                                                {
+                                                    tracing::warn!(
+                                                        component = "regression_monitor",
+                                                        source = source_name,
+                                                        issue_id = %result.issue_id,
+                                                        error = %e,
+                                                        "Failed to mark attempt as resolved after final regression check"
+                                                    );
+                                                }
+                                                let _ = notifier
+                                                    .notify_status(&format!(
+                                                        "Regression monitoring complete: {}:{} resolved after final check",
+                                                        source_name, result.issue_id
+                                                    ))
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    component = "regression_monitor",
+                                                    source = source_name,
+                                                    issue_id = %result.issue_id,
+                                                    error = %e,
+                                                    "Failed to resolve source issue after final regression check"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            component = "regression_monitor",
+                                            source = source_name,
+                                            issue_id = %result.issue_id,
+                                            "No source handler found to resolve issue after final regression check"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1747,6 +1804,7 @@ async fn main() -> anyhow::Result<()> {
         // Create ReviewWatcher for PR review tracking
         let review_watcher =
             create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+        let github_webhook_handler = create_github_webhook_handler(&config, review_watcher.clone());
 
         // Build dependency graph for cascade support
         let relationships = if config.cascade.enabled {
@@ -1763,8 +1821,8 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-        // Create GitHub client for cascade PR merge checking
-        let github_client_for_watcher = if config.cascade.enabled && config.is_github_enabled() {
+        // Create GitHub client for PR merge checking.
+        let github_client_for_watcher = if config.is_github_enabled() {
             Some(GitHubClient::new(config.github.clone()))
         } else {
             None
@@ -1780,7 +1838,7 @@ async fn main() -> anyhow::Result<()> {
                 sqlite_tracker: Some(sqlite_tracker.clone()),
                 inferrer: inferrer.clone(),
                 embedding_client: None,
-                review_watcher,
+                review_watcher: review_watcher.clone(),
                 issue_embedding_service: None,
                 relationships,
                 github_client: github_client_for_watcher,
@@ -1835,8 +1893,13 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Start regression monitoring background task
-        let regression_handle =
-            start_regression_monitoring(&config, sqlite_tracker.clone(), tracker.clone());
+        let regression_handle = start_regression_monitoring(
+            &config,
+            sqlite_tracker.clone(),
+            tracker.clone(),
+            sources.clone(),
+            notifier.clone(),
+        );
         if regression_handle.is_some() {
             tracing::info!("  Regression monitoring: enabled");
         }
@@ -1885,21 +1948,26 @@ async fn main() -> anyhow::Result<()> {
         // Dashboard + Webhooks can share the same axum server
         // For now, we'll run them on the same port with webhooks taking precedence
         let inferrer_clone = inferrer.clone();
+        let github_webhook_handler_for_http = github_webhook_handler;
         let http_future = async move {
             if enable_webhooks {
                 let handlers = create_webhook_handlers(&config);
-                if handlers.get_all().is_empty() && !enable_dashboard {
+                if handlers.get_all().is_empty()
+                    && github_webhook_handler_for_http.is_none()
+                    && !enable_dashboard
+                {
                     return Err(anyhow::anyhow!("No webhook handlers configured"));
                 }
 
                 // Webhook server also serves health endpoint which dashboard uses
-                let server = WebhookServer::new(
+                let server = WebhookServer::new_with_github(
                     config.clone(),
                     handlers,
                     notifier.clone(),
                     tracker.clone(),
                     Some(sqlite_tracker.clone()),
                     inferrer_clone,
+                    github_webhook_handler_for_http,
                 );
                 server.start().await?;
             } else if enable_dashboard {
@@ -1954,11 +2022,20 @@ async fn main() -> anyhow::Result<()> {
 
         let github_client = GitHubClient::new(config.github.clone());
         let sources = create_sources(&config);
-        let pr_monitor = PrMonitor::new(
-            github_client,
-            tracker.clone(),
-            config.github.auto_resolve_on_merge,
-        );
+        let pr_monitor = if config.regression.enabled {
+            PrMonitor::with_regression_tracking(
+                github_client,
+                tracker.clone(),
+                config.github.auto_resolve_on_merge,
+                sqlite_tracker.clone(),
+            )
+        } else {
+            PrMonitor::new(
+                github_client,
+                tracker.clone(),
+                config.github.auto_resolve_on_merge,
+            )
+        };
 
         if continuous {
             tracing::info!("Starting PR monitor (continuous mode)...");
@@ -2400,8 +2477,12 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let handlers = create_webhook_handlers(&config);
+            let review_watcher =
+                create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+            let github_webhook_handler =
+                create_github_webhook_handler(&config, review_watcher.clone());
 
-            if handlers.get_all().is_empty() {
+            if handlers.get_all().is_empty() && github_webhook_handler.is_none() {
                 anyhow::bail!("No webhook handlers were registered");
             }
 
@@ -2411,13 +2492,14 @@ async fn main() -> anyhow::Result<()> {
             // Build inferrer for repo inference
             let inferrer = WebhookServer::build_inferrer(&config, Some(&github_client)).await?;
 
-            let server = WebhookServer::new(
+            let server = WebhookServer::new_with_github(
                 config,
                 handlers,
                 notifier,
                 tracker,
                 Some(sqlite_tracker),
                 inferrer,
+                github_webhook_handler,
             );
 
             // Handle shutdown signals
@@ -2444,6 +2526,8 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let dry_run = matches!(cli.command, Commands::DryRun);
+            let sources_for_regression = sources.clone();
+            let notifier_for_regression = notifier.clone();
 
             // Create GitHub client for API-based repo discovery
             let github_client = GitHubClient::new(config.github.clone());
@@ -2468,7 +2552,11 @@ async fn main() -> anyhow::Result<()> {
                 review_watcher,
                 issue_embedding_service: None,
                 relationships: None,
-                github_client: None,
+                github_client: if config.is_github_enabled() {
+                    Some(GitHubClient::new(config.github.clone()))
+                } else {
+                    None
+                },
                 user_registry: user_registry.clone(),
                 dry_run,
             });
@@ -2501,6 +2589,16 @@ async fn main() -> anyhow::Result<()> {
                     port,
                     no_dashboard,
                 } => {
+                    // Keep regression monitoring active in foreground poll mode so merged bug
+                    // fixes complete the regression-final-check -> resolve flow.
+                    let _regression_handle = start_regression_monitoring(
+                        &config,
+                        sqlite_tracker.clone(),
+                        tracker_for_api.clone(),
+                        sources_for_regression.clone(),
+                        notifier_for_regression.clone(),
+                    );
+
                     let shutdown = async {
                         tokio::signal::ctrl_c()
                             .await

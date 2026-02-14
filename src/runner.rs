@@ -3,15 +3,31 @@
 use crate::error::{Error, Result};
 use crate::storage::FixAttemptTracker;
 use crate::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
-use crate::types::{ActivityLogEntry, ClaudeExecution, ClaudeResult, Issue};
+use crate::types::{ActivityLogEntry, BlockingQuestion, ClaudeExecution, ClaudeResult, Issue};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+
+const DEFAULT_LOG_DIR: &str = "./logs";
+const CLAUDE_LOG_SUBDIR: &str = "claude";
+const EXECUTION_LOG_PREVIEW_LIMIT: usize = 2000;
+const QUESTION_PROTOCOL_PREFIX: &str = "CLAUDEAR_QUESTION:";
+const QUESTION_PROTOCOL_INSTRUCTIONS: &str = r#"
+If you are blocked because you need human input, emit exactly one line in this format and then stop:
+CLAUDEAR_QUESTION: {"question":"...","context":"...","options":["..."],"why":"..."}
+Use valid JSON and keep question concise.
+"#;
+
+#[derive(Debug, Clone)]
+struct ExecutionLogFiles {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
 
 /// Configuration for the Claude runner.
 #[derive(Debug, Clone)]
@@ -111,11 +127,13 @@ impl ClaudeRunner {
             let agent_md = template_loader.load_agent_md();
             let template_context =
                 TemplateContext::new(issue.clone(), context.to_string()).with_agent_md(agent_md);
-            return self.template_renderer.render(&template, &template_context);
+            return Self::append_question_protocol(
+                &self.template_renderer.render(&template, &template_context),
+            );
         }
 
         // Fallback to simple format
-        format!(
+        let prompt = format!(
             r#"You are fixing an issue from {}. Here is the issue context:
 
 {}
@@ -132,7 +150,9 @@ The PR title should include the issue ID: {}
 After creating the PR, output the PR URL on a line by itself starting with "PR_URL: ".
 "#,
             issue.source, context, issue.short_id
-        )
+        );
+
+        Self::append_question_protocol(&prompt)
     }
 
     /// Check if a project has an AGENT.md file.
@@ -157,6 +177,156 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         project_dir: &Path,
     ) -> String {
         self.build_prompt(issue, context, project_dir)
+    }
+
+    /// Best-effort detection for Claude/API rate limit failures.
+    pub fn is_rate_limit_error(message: &str) -> bool {
+        let lower = message.to_lowercase();
+        [
+            "rate limit",
+            "ratelimit",
+            "too many requests",
+            "429",
+            "quota exceeded",
+            "resource exhausted",
+            "retry-after",
+            "try again later",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    }
+
+    /// Detect "hard" runtime failures that should be escalated immediately.
+    pub fn is_hard_error(message: &str) -> bool {
+        let lower = message.to_lowercase();
+        Self::is_rate_limit_error(message)
+            || [
+                "failed to spawn claude",
+                "failed to wait for claude",
+                "failed to capture stdout",
+                "failed to capture stderr",
+                "process timed out",
+                "timed out after",
+                "connection reset",
+                "service unavailable",
+                "internal server error",
+                "network error",
+                "broken pipe",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    }
+
+    fn sanitize_label(label: &str) -> String {
+        let mut out = String::with_capacity(label.len().min(64));
+        for ch in label.chars().take(64) {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                out.push(ch);
+            } else {
+                out.push('_');
+            }
+        }
+        if out.is_empty() {
+            "custom".to_string()
+        } else {
+            out
+        }
+    }
+
+    fn resolve_log_root() -> PathBuf {
+        std::env::var("CLAUDEAR_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_DIR))
+    }
+
+    fn create_execution_log_files(label: &str) -> Option<ExecutionLogFiles> {
+        let root = Self::resolve_log_root();
+        if root.as_os_str().is_empty() {
+            return None;
+        }
+
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+        let dir = root.join(CLAUDE_LOG_SUBDIR).join(day);
+
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                component = "claude",
+                path = %dir.display(),
+                error = %e,
+                "Failed to create execution log directory"
+            );
+            return None;
+        }
+
+        let safe_label = Self::sanitize_label(label);
+        let pid = std::process::id();
+        let stem = format!("{}_{}_{}", timestamp, pid, safe_label);
+
+        Some(ExecutionLogFiles {
+            stdout: dir.join(format!("{}.stdout.log", stem)),
+            stderr: dir.join(format!("{}.stderr.log", stem)),
+        })
+    }
+
+    fn compose_failure_message(exit_code: i32, stdout_output: &str, stderr_output: &str) -> String {
+        let stderr_trimmed = stderr_output.trim();
+        let stdout_trimmed = stdout_output.trim();
+        let combined = if stderr_trimmed.is_empty() {
+            stdout_trimmed.to_string()
+        } else if stdout_trimmed.is_empty() {
+            stderr_trimmed.to_string()
+        } else {
+            format!("{}\n{}", stderr_trimmed, stdout_trimmed)
+        };
+
+        if Self::is_rate_limit_error(&combined) {
+            return format!(
+                "Claude rate limit hit: {}",
+                Self::truncate(
+                    if combined.is_empty() {
+                        "Too many requests".to_string()
+                    } else {
+                        combined
+                    }
+                    .as_str(),
+                    EXECUTION_LOG_PREVIEW_LIMIT
+                )
+            );
+        }
+
+        if !stderr_trimmed.is_empty() {
+            return Self::truncate(stderr_trimmed, EXECUTION_LOG_PREVIEW_LIMIT);
+        }
+
+        if !stdout_trimmed.is_empty() {
+            return format!(
+                "Process exited with code {}. Output: {}",
+                exit_code,
+                Self::truncate(stdout_trimmed, EXECUTION_LOG_PREVIEW_LIMIT)
+            );
+        }
+
+        format!("Process exited with code {}", exit_code)
+    }
+
+    fn append_question_protocol(prompt: &str) -> String {
+        if prompt.contains(QUESTION_PROTOCOL_PREFIX) {
+            prompt.to_string()
+        } else {
+            format!("{prompt}\n\n{}", QUESTION_PROTOCOL_INSTRUCTIONS.trim())
+        }
+    }
+
+    fn extract_blocking_question(output: &str) -> Option<BlockingQuestion> {
+        output.lines().find_map(|line| {
+            let trimmed = line.trim();
+            let payload = trimmed.strip_prefix(QUESTION_PROTOCOL_PREFIX)?.trim();
+            if payload.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<BlockingQuestion>(payload).ok()
+        })
     }
 
     async fn execute(
@@ -230,8 +400,9 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         if let Some(id) = attempt_id {
             execution = execution.with_attempt_id(id);
         }
-        execution.prompt_used = Some(prompt.to_string());
-        execution.prompt_hash = Some(Self::hash_prompt(prompt));
+        let prompt_with_protocol = Self::append_question_protocol(prompt);
+        execution.prompt_used = Some(prompt_with_protocol.clone());
+        execution.prompt_hash = Some(Self::hash_prompt(&prompt_with_protocol));
         execution.model_version = Some(
             self.config
                 .model
@@ -276,7 +447,20 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
             args.push("--allowedTools".to_string());
             args.push(perm.clone());
         }
-        args.push(prompt.to_string());
+        args.push(prompt_with_protocol);
+
+        let log_files = Self::create_execution_log_files(label);
+        if let Some(ref files) = log_files {
+            execution.stdout_log_path = Some(files.stdout.display().to_string());
+            execution.stderr_log_path = Some(files.stderr.display().to_string());
+            tracing::info!(
+                component = "claude",
+                label = label,
+                stdout_log = %files.stdout.display(),
+                stderr_log = %files.stderr.display(),
+                "Capturing Claude output to execution log files"
+            );
+        }
 
         let mut child = Command::new("claude")
             .args(&args)
@@ -298,12 +482,52 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
 
         let label_stdout = label.to_string();
         let label_stderr = label.to_string();
+        let stdout_log_path = log_files.as_ref().map(|f| f.stdout.clone());
+        let stderr_log_path = log_files.as_ref().map(|f| f.stderr.clone());
 
         // Stream stdout
         let stdout_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut output = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut writer = match stdout_log_path {
+                Some(path) => match tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .await
+                {
+                    Ok(file) => Some(file),
+                    Err(e) => {
+                        tracing::warn!(
+                            component = "claude",
+                            label = label_stdout.as_str(),
+                            path = %path.display(),
+                            error = %e,
+                            "Failed to open stdout execution log file"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let mut write_failed = false;
+
+            loop {
+                let next_line = lines.next_line().await;
+                let line = match next_line {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            component = "claude",
+                            label = label_stdout.as_str(),
+                            error = %e,
+                            "Failed reading Claude stdout stream"
+                        );
+                        break;
+                    }
+                };
+
                 if !line.trim().is_empty() {
                     tracing::info!(
                         component = "claude",
@@ -312,6 +536,21 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                         line
                     );
                 }
+
+                if let Some(file) = writer.as_mut() {
+                    if !write_failed
+                        && (file.write_all(line.as_bytes()).await.is_err()
+                            || file.write_all(b"\n").await.is_err())
+                        {
+                            write_failed = true;
+                            tracing::warn!(
+                                component = "claude",
+                                label = label_stdout.as_str(),
+                                "Failed writing Claude stdout to execution log file"
+                            );
+                        }
+                }
+
                 output.push_str(&line);
                 output.push('\n');
             }
@@ -322,7 +561,45 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         let stderr_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             let mut output = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut writer = match stderr_log_path {
+                Some(path) => match tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .await
+                {
+                    Ok(file) => Some(file),
+                    Err(e) => {
+                        tracing::warn!(
+                            component = "claude",
+                            label = label_stderr.as_str(),
+                            path = %path.display(),
+                            error = %e,
+                            "Failed to open stderr execution log file"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let mut write_failed = false;
+
+            loop {
+                let next_line = lines.next_line().await;
+                let line = match next_line {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            component = "claude",
+                            label = label_stderr.as_str(),
+                            error = %e,
+                            "Failed reading Claude stderr stream"
+                        );
+                        break;
+                    }
+                };
+
                 if !line.trim().is_empty() {
                     tracing::error!(
                         component = "claude",
@@ -331,6 +608,21 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                         line
                     );
                 }
+
+                if let Some(file) = writer.as_mut() {
+                    if !write_failed
+                        && (file.write_all(line.as_bytes()).await.is_err()
+                            || file.write_all(b"\n").await.is_err())
+                        {
+                            write_failed = true;
+                            tracing::warn!(
+                                component = "claude",
+                                label = label_stderr.as_str(),
+                                "Failed writing Claude stderr to execution log file"
+                            );
+                        }
+                }
+
                 output.push_str(&line);
                 output.push('\n');
             }
@@ -389,6 +681,8 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                         "Process timed out after {} seconds",
                         self.config.timeout_secs
                     )),
+                    blocking_question: None,
+                    used_qa_ids: Vec::new(),
                 });
             }
         };
@@ -416,13 +710,32 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
             );
         }
 
-        // Complete and record the execution
-        execution.complete(status.code(), timed_out);
-        execution.stdout_preview = Some(Self::truncate(&stdout_output, 2000));
-        execution.stderr_preview = if stderr_output.is_empty() {
+        let failure_msg = if status.success() {
             None
         } else {
-            Some(Self::truncate(&stderr_output, 2000))
+            Some(Self::compose_failure_message(
+                exit_code,
+                &stdout_output,
+                &stderr_output,
+            ))
+        };
+        let is_rate_limited = failure_msg
+            .as_ref()
+            .map(|msg| Self::is_rate_limit_error(msg))
+            .unwrap_or(false)
+            || Self::is_rate_limit_error(&stdout_output)
+            || Self::is_rate_limit_error(&stderr_output);
+
+        // Complete and record the execution
+        execution.complete(status.code(), timed_out);
+        execution.stdout_preview =
+            Some(Self::truncate(&stdout_output, EXECUTION_LOG_PREVIEW_LIMIT));
+        execution.stderr_preview = if stderr_output.is_empty() {
+            failure_msg
+                .as_ref()
+                .map(|msg| Self::truncate(msg, EXECUTION_LOG_PREVIEW_LIMIT))
+        } else {
+            Some(Self::truncate(&stderr_output, EXECUTION_LOG_PREVIEW_LIMIT))
         };
 
         // Record the execution to the database (don't fail the main operation if this fails)
@@ -445,11 +758,9 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
             }));
             self.tracker.record_activity(&activity).ok();
         } else {
-            let error_msg = if stderr_output.is_empty() {
-                format!("Process exited with code {}", exit_code)
-            } else {
-                stderr_output.clone()
-            };
+            let error_msg = failure_msg
+                .clone()
+                .unwrap_or_else(|| format!("Process exited with code {}", exit_code));
             let activity = ActivityLogEntry::new(
                 "claude_failed",
                 format!(
@@ -466,21 +777,32 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                 "label": label
             }));
             self.tracker.record_activity(&activity).ok();
+
+            if is_rate_limited {
+                let rate_limit_activity = ActivityLogEntry::new(
+                    "rate_limit_hit",
+                    format!("Claude rate limit hit for {}", label),
+                )
+                .with_source("claude".to_string())
+                .with_metadata(json!({
+                    "label": label,
+                    "exit_code": exit_code,
+                    "error": Self::truncate(&error_msg, 500),
+                }));
+                self.tracker.record_activity(&rate_limit_activity).ok();
+            }
         }
+
+        let blocking_question = Self::extract_blocking_question(&stdout_output)
+            .or_else(|| Self::extract_blocking_question(&stderr_output));
 
         Ok(ClaudeResult {
             success: status.success(),
             output: stdout_output,
             pr_url,
-            error: if status.success() {
-                None
-            } else {
-                Some(if stderr_output.is_empty() {
-                    format!("Process exited with code {}", exit_code)
-                } else {
-                    stderr_output
-                })
-            },
+            error: failure_msg,
+            blocking_question,
+            used_qa_ids: Vec::new(),
         })
     }
 
@@ -693,6 +1015,8 @@ mod tests {
             output: "Success output".to_string(),
             pr_url: Some("https://github.com/org/repo/pull/123".to_string()),
             error: None,
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
         };
 
         assert!(result.success);
@@ -707,6 +1031,8 @@ mod tests {
             output: "Error occurred".to_string(),
             pr_url: None,
             error: Some("Error message".to_string()),
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
         };
 
         assert!(!result.success);
@@ -733,6 +1059,8 @@ mod tests {
             output: String::new(),
             pr_url: None,
             error: None,
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
         };
 
         assert!(!result.success);
@@ -841,6 +1169,8 @@ mod tests {
             output,
             pr_url: None,
             error: None,
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
         };
 
         assert!(result.success);
@@ -854,6 +1184,8 @@ mod tests {
             output: "Output".to_string(),
             pr_url: None,
             error: Some(String::new()),
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
         };
 
         // Even empty error is Some("")
@@ -1049,5 +1381,45 @@ mod tests {
         assert_eq!(issue.title, "Title");
         assert_eq!(issue.url, "https://url.com");
         assert_eq!(issue.source, "linear");
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_detection() {
+        assert!(ClaudeRunner::is_rate_limit_error(
+            "Claude API returned 429 Too Many Requests"
+        ));
+        assert!(ClaudeRunner::is_rate_limit_error("rate limit exceeded"));
+        assert!(!ClaudeRunner::is_rate_limit_error("cargo test failed"));
+    }
+
+    #[test]
+    fn test_is_hard_error_detection() {
+        assert!(ClaudeRunner::is_hard_error(
+            "Failed to spawn claude: No such file or directory"
+        ));
+        assert!(ClaudeRunner::is_hard_error(
+            "Process timed out after 3600 seconds"
+        ));
+        assert!(ClaudeRunner::is_hard_error("429 too many requests"));
+        assert!(!ClaudeRunner::is_hard_error("tests failed"));
+    }
+
+    #[test]
+    fn test_extract_blocking_question_valid_payload() {
+        let output = r#"some logs
+CLAUDEAR_QUESTION: {"question":"Which branch should I target?","context":"Branch policy is unclear","options":["main","develop"],"why":"Need destination branch"}
+done"#;
+
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "Which branch should I target?");
+        assert_eq!(parsed.context.as_deref(), Some("Branch policy is unclear"));
+        assert_eq!(parsed.options, vec!["main", "develop"]);
+        assert_eq!(parsed.why.as_deref(), Some("Need destination branch"));
+    }
+
+    #[test]
+    fn test_extract_blocking_question_ignores_malformed_payload() {
+        let output = "CLAUDEAR_QUESTION: {not valid json}";
+        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
     }
 }

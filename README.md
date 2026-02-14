@@ -16,6 +16,7 @@ A high-performance unified watcher service written in Rust that monitors issue t
 - **Scheduled Reports**: Automated daily/weekly/monthly status reports via notifications
 - **Multi-Repository Cascading**: Dependency tracking with automatic cascading fix propagation
 - **AI Feedback Loop**: Embedding-based similarity matching to learn from past outcomes
+- **Human Q&A Loop**: Claude can ask blocking questions over notifications and resume on first reply
 - **Regression Monitoring**: Post-fix verification to detect regressions on Linear and Sentry
 - **Release Tracking**: Dependency-aware release detection and path analysis
 - **Multiple Notification Channels**: Discord, Email (SMTP), SMS (Twilio), Push (Pushover)
@@ -174,7 +175,8 @@ See `claudear.example.yaml` for a complete configuration file with all options d
 | `github` | GitHub PR monitoring (token, auto-resolve on merge) |
 | `retry` | Retry configuration (max retries, backoff delays) |
 | `discord` | Discord notification webhook |
-| `email` | SMTP email notifications |
+| `email` | SMTP + optional IMAP reply polling |
+| `ask` | Human Q&A loop settings (timeouts, semantic thresholds, rounds) |
 | `sms` | Twilio SMS notifications |
 | `push` | Pushover push notifications |
 
@@ -367,6 +369,25 @@ Reports include:
 - Current pending and retryable issues
 
 Reports are sent via all configured notification channels (Discord, Email, SMS, Push).
+
+### Human Q&A Notifications
+
+When Claude is blocked on missing human context, it emits a machine-readable line and Claudear runs a question loop:
+
+```text
+CLAUDEAR_QUESTION: {"question":"...","context":"...","options":["..."],"why":"..."}
+```
+
+Behavior:
+- Ask delivery fan-outs to all enabled notifiers.
+- v1 reply-capable channels are Discord and Email.
+- Claudear waits for the first valid reply and ignores later replies for that round.
+- If timeout is reached and `ask.best_effort_on_timeout=true`, Claudear continues with explicit uncertainty instead of hard-failing.
+- Q&A pairs are stored and reused with embedding-based semantic matching (scoped by source+repo first, then global fallback).
+
+Reply ingestion requirements:
+- Discord replies require `discord.bot_token` and `discord.channel_id` (webhook-only still sends asks).
+- Email replies require IMAP fields under `email` (`imap_host`, `imap_port`, `imap_username`, `imap_password`, optional folder/TLS settings).
 
 ### Multi-Repository Support
 

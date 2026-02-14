@@ -281,6 +281,7 @@ mod tests {
             email: crate::config::EmailConfig::default(),
             sms: crate::config::SmsConfig::default(),
             push: crate::config::PushConfig::default(),
+            ask: crate::config::AskConfig::default(),
             github: crate::config::GitHubConfig::default(),
             github_app: crate::config::GitHubAppConfig::default(),
             retry: crate::config::RetryConfig::default(),

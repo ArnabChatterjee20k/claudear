@@ -3,7 +3,7 @@ import { useAuth } from '../../lib/auth'
 import {
   Activity, BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
-  Users, LogOut,
+  Users, LogOut, Gauge,
 } from 'lucide-react'
 
 const navItems = [
@@ -18,6 +18,7 @@ const navItems = [
   { path: '/repos', label: 'Repos', icon: FolderGit2 },
   { path: '/inference', label: 'Inference', icon: Brain },
   { path: '/activity', label: 'Activity', icon: ScrollText },
+  { path: '/telemetry', label: 'Telemetry', icon: Gauge },
 ] as const
 
 export function Sidebar() {

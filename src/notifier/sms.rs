@@ -3,7 +3,7 @@
 use super::Notifier;
 use crate::config::SmsConfig;
 use crate::error::{Error, Result};
-use crate::types::Issue;
+use crate::types::{AskDelivery, AskRequest, Issue};
 use crate::users::UserRegistry;
 use async_trait::async_trait;
 
@@ -240,6 +240,23 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
                 .join(", ")
         );
         self.send_sms(&body, None).await
+    }
+
+    async fn ask_question(
+        &self,
+        issue: &Issue,
+        request: &AskRequest,
+    ) -> Result<Option<AskDelivery>> {
+        let body = format!(
+            "[Claude Watchers][CLAUDEAR-Q:{}] {} needs input: {}",
+            request.correlation_id, issue.short_id, request.question.question
+        );
+        self.send_sms(&body, Some(issue)).await?;
+        Ok(Some(AskDelivery {
+            channel: "sms".to_string(),
+            target: None,
+            message_id: None,
+        }))
     }
 }
 

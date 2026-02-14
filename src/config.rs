@@ -86,6 +86,8 @@ pub struct Config {
     pub sms: SmsConfig,
     /// Push notification configuration.
     pub push: PushConfig,
+    /// Human Q&A ask-loop configuration.
+    pub ask: AskConfig,
     /// GitHub configuration for PR monitoring.
     pub github: GitHubConfig,
     /// GitHub App configuration for App-based authentication.
@@ -128,6 +130,7 @@ impl Default for Config {
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
             push: PushConfig::default(),
+            ask: AskConfig::default(),
             github: GitHubConfig::default(),
             github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),
@@ -136,6 +139,43 @@ impl Default for Config {
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Human Q&A ask-loop configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AskConfig {
+    /// Enable/disable human question flow.
+    pub enabled: bool,
+    /// Maximum time to wait for a human answer in seconds.
+    pub wait_timeout_secs: u64,
+    /// Poll interval for reply-capable channels in seconds.
+    pub poll_interval_secs: u64,
+    /// Max ask rounds per attempt to prevent infinite loops.
+    pub max_rounds_per_attempt: u8,
+    /// Semantic threshold for scoped (source+repo) reuse.
+    pub semantic_threshold_scoped: f64,
+    /// Semantic threshold for global fallback reuse.
+    pub semantic_threshold_global: f64,
+    /// Max semantic candidates to include in context/reuse.
+    pub max_reuse_candidates: usize,
+    /// Continue with best effort when no reply is received.
+    pub best_effort_on_timeout: bool,
+}
+
+impl Default for AskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            wait_timeout_secs: 900,
+            poll_interval_secs: 15,
+            max_rounds_per_attempt: 2,
+            semantic_threshold_scoped: 0.82,
+            semantic_threshold_global: 0.88,
+            max_reuse_candidates: 3,
+            best_effort_on_timeout: true,
         }
     }
 }
@@ -180,6 +220,10 @@ pub struct DiscordConfig {
     pub webhook_url: Option<String>,
     /// Discord user ID to mention in notifications.
     pub user_id: Option<String>,
+    /// Discord bot token used for inbound reply polling.
+    pub bot_token: Option<String>,
+    /// Discord channel ID used for inbound reply polling.
+    pub channel_id: Option<String>,
 }
 
 /// Email (SMTP) notification configuration.
@@ -200,6 +244,18 @@ pub struct EmailConfig {
     pub to_addresses: Vec<String>,
     /// Use TLS (default: true).
     pub use_tls: bool,
+    /// IMAP host used for inbound reply polling.
+    pub imap_host: Option<String>,
+    /// IMAP server port (default: 993).
+    pub imap_port: u16,
+    /// IMAP username.
+    pub imap_username: Option<String>,
+    /// IMAP password.
+    pub imap_password: Option<String>,
+    /// Use TLS for IMAP.
+    pub imap_use_tls: bool,
+    /// IMAP folder to poll.
+    pub imap_folder: String,
 }
 
 impl Default for EmailConfig {
@@ -212,6 +268,12 @@ impl Default for EmailConfig {
             from_address: None,
             to_addresses: Vec::new(),
             use_tls: true,
+            imap_host: None,
+            imap_port: 993,
+            imap_username: None,
+            imap_password: None,
+            imap_use_tls: true,
+            imap_folder: "INBOX".to_string(),
         }
     }
 }
@@ -817,6 +879,12 @@ impl Config {
         if let Ok(v) = env::var("DISCORD_USER_ID") {
             self.discord.user_id = Some(v).filter(|s| !s.is_empty());
         }
+        if let Ok(v) = env::var("DISCORD_BOT_TOKEN") {
+            self.discord.bot_token = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("DISCORD_CHANNEL_ID") {
+            self.discord.channel_id = Some(v).filter(|s| !s.is_empty());
+        }
 
         // Email
         if let Ok(v) = env::var("SMTP_HOST") {
@@ -841,6 +909,67 @@ impl Config {
         }
         if let Ok(v) = env::var("SMTP_TLS") {
             self.email.use_tls = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = env::var("IMAP_HOST") {
+            self.email.imap_host = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Some(v) = env::var("IMAP_PORT").ok().and_then(|v| v.parse().ok()) {
+            self.email.imap_port = v;
+        }
+        if let Ok(v) = env::var("IMAP_USERNAME") {
+            self.email.imap_username = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("IMAP_PASSWORD") {
+            self.email.imap_password = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("IMAP_TLS") {
+            self.email.imap_use_tls = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = env::var("IMAP_FOLDER") {
+            if !v.is_empty() {
+                self.email.imap_folder = v;
+            }
+        }
+
+        // Ask loop
+        if let Ok(v) = env::var("ASK_ENABLED") {
+            self.ask.enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Some(v) = env::var("ASK_WAIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.ask.wait_timeout_secs = v;
+        }
+        if let Some(v) = env::var("ASK_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.ask.poll_interval_secs = v;
+        }
+        if let Some(v) = env::var("ASK_MAX_ROUNDS").ok().and_then(|v| v.parse().ok()) {
+            self.ask.max_rounds_per_attempt = v;
+        }
+        if let Some(v) = env::var("ASK_SEMANTIC_THRESHOLD_SCOPED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.ask.semantic_threshold_scoped = v;
+        }
+        if let Some(v) = env::var("ASK_SEMANTIC_THRESHOLD_GLOBAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.ask.semantic_threshold_global = v;
+        }
+        if let Some(v) = env::var("ASK_MAX_REUSE_CANDIDATES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.ask.max_reuse_candidates = v;
+        }
+        if let Ok(v) = env::var("ASK_BEST_EFFORT_ON_TIMEOUT") {
+            self.ask.best_effort_on_timeout = v.to_lowercase() == "true" || v == "1";
         }
 
         // SMS
@@ -1205,6 +1334,8 @@ mod tests {
         "SENTRY_MAX_CONCURRENT",
         "DISCORD_WEBHOOK_URL",
         "DISCORD_USER_ID",
+        "DISCORD_BOT_TOKEN",
+        "DISCORD_CHANNEL_ID",
         "SMTP_HOST",
         "SMTP_PORT",
         "SMTP_USERNAME",
@@ -1212,6 +1343,20 @@ mod tests {
         "EMAIL_FROM",
         "EMAIL_TO",
         "SMTP_TLS",
+        "IMAP_HOST",
+        "IMAP_PORT",
+        "IMAP_USERNAME",
+        "IMAP_PASSWORD",
+        "IMAP_TLS",
+        "IMAP_FOLDER",
+        "ASK_ENABLED",
+        "ASK_WAIT_TIMEOUT_SECS",
+        "ASK_POLL_INTERVAL_SECS",
+        "ASK_MAX_ROUNDS",
+        "ASK_SEMANTIC_THRESHOLD_SCOPED",
+        "ASK_SEMANTIC_THRESHOLD_GLOBAL",
+        "ASK_MAX_REUSE_CANDIDATES",
+        "ASK_BEST_EFFORT_ON_TIMEOUT",
         "TWILIO_ACCOUNT_SID",
         "TWILIO_AUTH_TOKEN",
         "TWILIO_FROM_NUMBER",

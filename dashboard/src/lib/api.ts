@@ -128,6 +128,8 @@ export interface ClaudeExecution {
   timed_out: boolean;
   stdout_preview: string | null;
   stderr_preview: string | null;
+  stdout_log_path: string | null;
+  stderr_log_path: string | null;
   prompt_used: string | null;
   prompt_hash: string | null;
   model_version: string | null;
@@ -177,6 +179,15 @@ export interface AttemptDetailResponse {
   executions: ClaudeExecution[];
   reviews: PrReviewRecord[];
   feedback: FixOutcome | null;
+}
+
+export interface AttemptExecutionLogResponse {
+  attempt_id: number;
+  execution_id: number;
+  stream: 'stdout' | 'stderr';
+  path: string | null;
+  content: string | null;
+  truncated: boolean;
 }
 
 export interface AnalyticsSummary {
@@ -354,6 +365,167 @@ export interface InferenceHistoryEntry {
   created_at: string;
 }
 
+export interface TelemetryWindowMetric {
+  window: string;
+  processed: number;
+  successful: number;
+  failed: number;
+  merged: number;
+  success_rate: number;
+  error_rate: number;
+  throughput_per_hour: number;
+}
+
+export interface TelemetryQueueMetrics {
+  pending_attempts: number;
+  retryable_attempts: number;
+  ready_retries: number;
+  open_prs: number;
+  watches_awaiting_release: number;
+  watches_monitoring: number;
+  watches_resolved: number;
+  watches_regressed: number;
+}
+
+export interface ProcessingTimeSummary {
+  samples: number;
+  avg_secs: number | null;
+  p50_secs: number | null;
+  p95_secs: number | null;
+  p99_secs: number | null;
+  max_secs: number | null;
+}
+
+export interface TelemetryProcessingTime {
+  all_time: ProcessingTimeSummary;
+  last_24h: ProcessingTimeSummary;
+}
+
+export interface SourceTelemetry {
+  source: string;
+  total: number;
+  pending: number;
+  success: number;
+  failed: number;
+  merged: number;
+  closed: number;
+  cannot_fix: number;
+  retryable: number;
+  success_rate: number;
+}
+
+export interface TelemetryTimeseriesPoint {
+  bucket_start: string;
+  total: number;
+  pending: number;
+  success: number;
+  failed: number;
+  merged: number;
+  closed: number;
+  cannot_fix: number;
+}
+
+export interface TelemetryOverview {
+  generated_at: string;
+  uptime_secs: number;
+  windows: TelemetryWindowMetric[];
+  queue: TelemetryQueueMetrics;
+  processing_time: TelemetryProcessingTime;
+  source_breakdown: SourceTelemetry[];
+  top_errors: ErrorPattern[];
+  activity_last_hour: Record<string, number>;
+  metric_counts_last_24h: Record<string, number>;
+  diagnostics?: Record<string, unknown> | null;
+  pr_analytics: PrAnalytics;
+}
+
+export interface TelemetryTimeseries {
+  period: string;
+  bucket_minutes: number;
+  generated_at: string;
+  points: TelemetryTimeseriesPoint[];
+}
+
+export interface TelemetryPipelineTotals {
+  fetched: number;
+  matched: number;
+  queued: number;
+  processed: number;
+  pr_created: number;
+  retries_found: number;
+  retries_executed: number;
+  retries_failed: number;
+  pr_status_checks: number;
+  pr_status_merged: number;
+  pr_status_closed: number;
+  pr_status_errors: number;
+  regression_watches_created: number;
+  auto_resolved_on_merge: number;
+  cascade_triggered: number;
+  cascade_failed: number;
+}
+
+export interface TelemetryPipelineConversion {
+  match_rate: number | null;
+  queue_rate: number | null;
+  processing_rate: number | null;
+  pr_yield_rate: number | null;
+}
+
+export interface TelemetryPollLoad {
+  poll_cycles: number;
+  avg_cycle_secs: number | null;
+  p95_cycle_secs: number | null;
+  active_avg: number | null;
+  active_max: number | null;
+  pending_avg: number | null;
+  pending_max: number | null;
+  total_latest: number | null;
+}
+
+export interface TelemetryPipelineSource {
+  source: string;
+  fetched: number;
+  matched: number;
+  queued: number;
+  processed: number;
+  pr_created: number;
+  retries_executed: number;
+  retries_failed: number;
+  match_rate: number | null;
+  queue_rate: number | null;
+  processing_rate: number | null;
+  pr_yield_rate: number | null;
+}
+
+export interface TelemetryPipeline {
+  generated_at: string;
+  period: string;
+  totals: TelemetryPipelineTotals;
+  conversion: TelemetryPipelineConversion;
+  poll_load: TelemetryPollLoad;
+  per_source: TelemetryPipelineSource[];
+}
+
+export interface TelemetryLatencyByStatus {
+  status: string;
+  summary: ProcessingTimeSummary;
+}
+
+export interface TelemetryLatencyHistogramBucket {
+  label: string;
+  upper_bound_secs: number | null;
+  count: number;
+}
+
+export interface TelemetryLatency {
+  generated_at: string;
+  period: string;
+  overall: ProcessingTimeSummary;
+  by_status: TelemetryLatencyByStatus[];
+  histogram: TelemetryLatencyHistogramBucket[];
+}
+
 // ─── Fetchers ──────────────────────────────────
 
 let onUnauthorized: (() => void) | null = null
@@ -461,6 +633,16 @@ export async function fetchAttemptDetail(attemptId: number): Promise<AttemptDeta
   return fetchJson(`${API_BASE}/attempts/${attemptId}/detail`);
 }
 
+export async function fetchAttemptExecutionLog(
+  attemptId: number,
+  executionId: number,
+  stream: 'stdout' | 'stderr',
+): Promise<AttemptExecutionLogResponse> {
+  return fetchJson(
+    `${API_BASE}/attempts/${attemptId}/logs/${executionId}/${stream}`,
+  );
+}
+
 export async function fetchAnalyticsSummary(): Promise<AnalyticsSummary> {
   return fetchJson(`${API_BASE}/analytics/summary`);
 }
@@ -537,6 +719,38 @@ export async function fetchInferenceStats(): Promise<InferenceStats> {
 
 export async function fetchInferenceHistory(limit = 50): Promise<InferenceHistoryEntry[]> {
   return fetchJson(`${API_BASE}/inference/history?limit=${limit}`);
+}
+
+export async function fetchTelemetryOverview(): Promise<TelemetryOverview> {
+  return fetchJson(`${API_BASE}/telemetry/overview`);
+}
+
+export async function fetchTelemetryTimeseries(params?: {
+  period?: string;
+  bucket_minutes?: number;
+}): Promise<TelemetryTimeseries> {
+  const searchParams = new URLSearchParams();
+  if (params?.period) searchParams.set('period', params.period);
+  if (params?.bucket_minutes) {
+    searchParams.set('bucket_minutes', params.bucket_minutes.toString());
+  }
+  return fetchJson(`${API_BASE}/telemetry/timeseries?${searchParams}`);
+}
+
+export async function fetchTelemetryPipeline(params?: {
+  period?: string;
+}): Promise<TelemetryPipeline> {
+  const searchParams = new URLSearchParams();
+  if (params?.period) searchParams.set('period', params.period);
+  return fetchJson(`${API_BASE}/telemetry/pipeline?${searchParams}`);
+}
+
+export async function fetchTelemetryLatency(params?: {
+  period?: string;
+}): Promise<TelemetryLatency> {
+  const searchParams = new URLSearchParams();
+  if (params?.period) searchParams.set('period', params.period);
+  return fetchJson(`${API_BASE}/telemetry/latency?${searchParams}`);
 }
 
 // ─── Auth API ────────────────────────────────────

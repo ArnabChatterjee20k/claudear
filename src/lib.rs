@@ -36,6 +36,7 @@ pub mod github_app;
 pub mod inference;
 pub mod ipc;
 pub mod notifier;
+pub mod qa;
 pub mod regression;
 pub mod release;
 pub mod repo;

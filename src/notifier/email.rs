@@ -3,14 +3,17 @@
 use super::Notifier;
 use crate::config::EmailConfig;
 use crate::error::{Error, Result};
-use crate::types::Issue;
+use crate::types::{AskDelivery, AskReply, AskRequest, Issue};
 use crate::users::UserRegistry;
 use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
 use lettre::{
     message::{header::ContentType, Mailbox},
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
+use mailparse::MailHeaderMap;
+use std::collections::HashSet;
 
 /// Email notifier that sends notifications via SMTP.
 pub struct EmailNotifier {
@@ -61,6 +64,21 @@ impl EmailNotifier {
         self.config.to_addresses.clone()
     }
 
+    fn target_email_for_issue(&self, issue: &Issue) -> Option<String> {
+        self.resolve_recipients(Some(issue)).into_iter().next()
+    }
+
+    fn expected_reply_emails(&self, request: &AskRequest) -> HashSet<String> {
+        if let Some(ref target) = request.target_email {
+            return std::iter::once(target.to_lowercase()).collect();
+        }
+        self.config
+            .to_addresses
+            .iter()
+            .map(|v| v.to_lowercase())
+            .collect()
+    }
+
     async fn send_email(&self, subject: &str, body: &str, issue: Option<&Issue>) -> Result<()> {
         let transport = match &self.transport {
             Some(t) => t,
@@ -103,6 +121,65 @@ impl EmailNotifier {
             "Issue: {} - {}\nSource: {}\nPriority: {}\nStatus: {}\nURL: {}",
             issue.short_id, issue.title, issue.source, issue.priority, issue.status, issue.url
         )
+    }
+
+    fn extract_email_address(from_header: &str) -> Option<String> {
+        let start = from_header.find('<');
+        let end = from_header.find('>');
+        if let (Some(s), Some(e)) = (start, end) {
+            let addr = from_header[s + 1..e].trim();
+            if !addr.is_empty() {
+                return Some(addr.to_lowercase());
+            }
+        }
+        let trimmed = from_header.trim();
+        if trimmed.contains('@') {
+            Some(trimmed.to_lowercase())
+        } else {
+            None
+        }
+    }
+
+    fn extract_plain_body(parsed: &mailparse::ParsedMail<'_>) -> String {
+        if parsed.subparts.is_empty() {
+            return parsed.get_body().unwrap_or_default();
+        }
+
+        for part in &parsed.subparts {
+            let ctype = part.ctype.mimetype.to_lowercase();
+            if ctype == "text/plain" {
+                return part.get_body().unwrap_or_default();
+            }
+        }
+
+        parsed.get_body().unwrap_or_default()
+    }
+
+    fn sanitize_reply_text(body: &str, correlation_id: &str) -> Option<String> {
+        let token = format!("CLAUDEAR-Q:{}", correlation_id);
+        let mut lines: Vec<String> = Vec::new();
+        for raw_line in body.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('>') {
+                continue;
+            }
+            if line.contains(&token) {
+                continue;
+            }
+            lines.push(line.to_string());
+            if lines.len() >= 30 {
+                break;
+            }
+        }
+        let mut out = lines.join("\n").trim().to_string();
+        if out.len() > 4000 {
+            out.truncate(4000);
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 }
 
@@ -182,6 +259,185 @@ impl Notifier for EmailNotifier {
 
         self.send_email(&subject, &body, None).await
     }
+
+    async fn ask_question(
+        &self,
+        issue: &Issue,
+        request: &AskRequest,
+    ) -> Result<Option<AskDelivery>> {
+        let subject = format!("[CLAUDEAR-Q:{}] {}", request.correlation_id, issue.short_id);
+        let mut body = format!(
+            "Claude needs human input.\n\n{}\n\nQuestion:\n{}\n",
+            Self::format_issue_info(issue),
+            request.question.question
+        );
+        if let Some(ref why) = request.question.why {
+            body.push_str(&format!("\nWhy:\n{}\n", why));
+        }
+        if let Some(ref context) = request.question.context {
+            body.push_str(&format!("\nContext:\n{}\n", context));
+        }
+        if !request.question.options.is_empty() {
+            body.push_str(&format!(
+                "\nOptions:\n- {}\n",
+                request.question.options.join("\n- ")
+            ));
+        }
+        body.push_str("\nReply to this email and keep the token in subject or body.\n");
+
+        self.send_email(&subject, &body, Some(issue)).await?;
+        Ok(Some(AskDelivery {
+            channel: "email".to_string(),
+            target: self.target_email_for_issue(issue),
+            message_id: None,
+        }))
+    }
+
+    async fn poll_question_replies(
+        &self,
+        request: &AskRequest,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<AskReply>> {
+        let imap_host = match self.config.imap_host.clone() {
+            Some(v) if !v.is_empty() => v,
+            _ => return Ok(Vec::new()),
+        };
+        let imap_username = match self.config.imap_username.clone() {
+            Some(v) if !v.is_empty() => v,
+            _ => return Ok(Vec::new()),
+        };
+        let imap_password = match self.config.imap_password.clone() {
+            Some(v) if !v.is_empty() => v,
+            _ => return Ok(Vec::new()),
+        };
+
+        let imap_port = self.config.imap_port;
+        let imap_folder = self.config.imap_folder.clone();
+        let correlation_id = request.correlation_id.clone();
+        let expected_senders = self.expected_reply_emails(request);
+        let imap_use_tls = self.config.imap_use_tls;
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<AskReply>> {
+            let tls = native_tls::TlsConnector::builder().build().map_err(|e| {
+                Error::notifier("email", format!("Failed to build TLS connector: {}", e))
+            })?;
+
+            if !imap_use_tls {
+                return Ok(Vec::new());
+            }
+
+            let client = imap::connect((imap_host.as_str(), imap_port), &imap_host, &tls)
+                .map_err(|e| Error::notifier("email", format!("IMAP connect failed: {}", e)))?;
+            let mut session = client
+                .login(imap_username, imap_password)
+                .map_err(|(e, _)| Error::notifier("email", format!("IMAP login failed: {}", e)))?;
+
+            session
+                .select(&imap_folder)
+                .map_err(|e| Error::notifier("email", format!("IMAP select failed: {}", e)))?;
+
+            let token = format!("CLAUDEAR-Q:{}", correlation_id);
+            let search_query = format!("TEXT \"{}\"", token);
+            let ids = session
+                .search(search_query)
+                .map_err(|e| Error::notifier("email", format!("IMAP search failed: {}", e)))?;
+
+            if ids.is_empty() {
+                let _ = session.logout();
+                return Ok(Vec::new());
+            }
+
+            let sequence = ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let fetches = session
+                .fetch(sequence, "RFC822")
+                .map_err(|e| Error::notifier("email", format!("IMAP fetch failed: {}", e)))?;
+
+            let mut replies = Vec::new();
+            for fetch in fetches.iter() {
+                let raw = match fetch.body() {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let parsed = match mailparse::parse_mail(raw) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let from_header = parsed.headers.get_first_value("From").unwrap_or_default();
+                let responder = Self::extract_email_address(&from_header);
+                if !expected_senders.is_empty() {
+                    match responder.as_ref() {
+                        Some(email) if expected_senders.contains(email) => {}
+                        _ => continue,
+                    }
+                }
+
+                let subject = parsed
+                    .headers
+                    .get_first_value("Subject")
+                    .unwrap_or_default();
+                let body_text = Self::extract_plain_body(&parsed);
+                if !subject.contains(&token) && !body_text.contains(&token) {
+                    continue;
+                }
+
+                let answer = match Self::sanitize_reply_text(&body_text, &correlation_id) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let replied_at = parsed
+                    .headers
+                    .get_first_value("Date")
+                    .and_then(|date| mailparse::dateparse(&date).ok())
+                    .and_then(|secs| Utc.timestamp_opt(secs, 0).single())
+                    .unwrap_or_else(Utc::now);
+
+                if replied_at < since {
+                    continue;
+                }
+
+                replies.push(AskReply {
+                    correlation_id: correlation_id.clone(),
+                    channel: "email".to_string(),
+                    responder,
+                    answer,
+                    replied_at,
+                });
+            }
+
+            replies.sort_by_key(|r| r.replied_at);
+            let _ = session.logout();
+            Ok(replies)
+        })
+        .await
+        .map_err(|e| Error::notifier("email", format!("IMAP task failed: {}", e)))?
+    }
+
+    fn supports_replies(&self) -> bool {
+        self.config
+            .imap_host
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+            && self
+                .config
+                .imap_username
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            && self
+                .config
+                .imap_password
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +458,7 @@ mod tests {
             from_address: None,
             to_addresses: vec![],
             use_tls: true,
+            ..Default::default()
         }
     }
 
@@ -214,6 +471,7 @@ mod tests {
             from_address: None, // Missing from address
             to_addresses: vec!["test@example.com".to_string()],
             use_tls: true,
+            ..Default::default()
         }
     }
 
@@ -226,6 +484,7 @@ mod tests {
             from_address: Some("from@example.com".to_string()),
             to_addresses: vec![], // No recipients
             use_tls: true,
+            ..Default::default()
         }
     }
 
@@ -416,10 +675,74 @@ mod tests {
             from_address: Some("test@localhost".to_string()),
             to_addresses: vec!["recipient@localhost".to_string()],
             use_tls: false,
+            ..Default::default()
         };
 
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
         // Should create successfully with dangerous builder
         assert_eq!(notifier.name(), "email");
+    }
+
+    #[test]
+    fn test_extract_email_address_variants() {
+        assert_eq!(
+            EmailNotifier::extract_email_address("Jane <jane@example.com>").as_deref(),
+            Some("jane@example.com")
+        );
+        assert_eq!(
+            EmailNotifier::extract_email_address("ops@example.com").as_deref(),
+            Some("ops@example.com")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_removes_token_and_quotes() {
+        let body = "Thanks\n\n> quoted\nCLAUDEAR-Q:abc123\nUse main";
+        let parsed = EmailNotifier::sanitize_reply_text(body, "abc123").unwrap();
+        assert_eq!(parsed, "Thanks\nUse main");
+    }
+
+    #[tokio::test]
+    async fn test_ask_question_routes_to_resolved_user_email() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                email: Some("jake@example.com".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = UserRegistry::new(users);
+        let config = EmailConfig {
+            smtp_host: None,
+            from_address: Some("bot@example.com".to_string()),
+            to_addresses: vec!["global@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, registry).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+        let request = AskRequest {
+            correlation_id: "tok-email-1".to_string(),
+            source: "linear".to_string(),
+            repo: Some("org/repo".to_string()),
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which env?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.target.as_deref(), Some("jake@example.com"));
     }
 }

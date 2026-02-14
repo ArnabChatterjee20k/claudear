@@ -1,12 +1,12 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
-use super::FixAttemptTracker;
+use super::{is_vectorlite_available, try_load_vectorlite, FixAttemptTracker};
 use crate::error::Result;
 use crate::feedback::{FixOutcome, Outcome};
 use crate::types::{
     ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
     FixAttemptStatus, IssueEmbedding, PrReviewRecord, ProcessingMetric, PromptExperiment,
-    SimilarIssue, SourceStats,
+    QaKnowledgeEntry, QaMatch, SimilarIssue, SourceStats,
 };
 use chrono::{DateTime, Utc};
 use rand::RngExt;
@@ -25,6 +25,9 @@ static PR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
 
 /// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
 const MAX_PR_URL_LENGTH: usize = 2048;
+const QA_VECTOR_TABLE: &str = "qa_question_embeddings";
+const QA_VECTOR_EF_SEARCH: usize = 200;
+const QA_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
 /// A user row from the database.
 #[derive(Debug, Clone, Serialize)]
@@ -270,6 +273,8 @@ impl SqliteTracker {
                 timed_out INTEGER DEFAULT 0,
                 stdout_preview TEXT,
                 stderr_preview TEXT,
+                stdout_log_path TEXT,
+                stderr_log_path TEXT,
                 prompt_used TEXT,
                 prompt_hash TEXT,
                 model_version TEXT,
@@ -383,6 +388,52 @@ impl SqliteTracker {
             );
             CREATE INDEX IF NOT EXISTS idx_similar_source ON similar_issues(source_issue_id);
             CREATE INDEX IF NOT EXISTS idx_similar_score ON similar_issues(similarity_score DESC);
+
+            -- Human Q&A knowledge for semantic reuse
+            CREATE TABLE IF NOT EXISTS qa_knowledge (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                repo TEXT,
+                issue_id TEXT NOT NULL,
+                short_id TEXT NOT NULL,
+                question_text TEXT NOT NULL,
+                question_norm TEXT NOT NULL,
+                question_embedding BLOB,
+                answer_text TEXT NOT NULL,
+                answer_norm TEXT NOT NULL,
+                answer_embedding BLOB,
+                channel TEXT NOT NULL,
+                responder TEXT,
+                correlation_id TEXT NOT NULL,
+                asked_at TEXT NOT NULL,
+                answered_at TEXT NOT NULL,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                metadata TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_qa_scoped_time ON qa_knowledge(source, repo, answered_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_qa_question_norm ON qa_knowledge(question_norm);
+
+            CREATE TABLE IF NOT EXISTS qa_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER NOT NULL REFERENCES fix_attempts(id),
+                qa_id INTEGER NOT NULL REFERENCES qa_knowledge(id),
+                usage_type TEXT NOT NULL,
+                similarity_score REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(attempt_id, qa_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_qa_usage_attempt ON qa_usage(attempt_id);
+
+            CREATE TABLE IF NOT EXISTS question_channel_cursor (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel TEXT NOT NULL,
+                cursor_key TEXT NOT NULL,
+                cursor_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(channel, cursor_key)
+            );
 
             -- ============================================================
             -- Repository File Index
@@ -615,6 +666,14 @@ impl SqliteTracker {
                 "fix_attempts.cascade_repo",
                 "ALTER TABLE fix_attempts ADD COLUMN cascade_repo TEXT",
             ),
+            (
+                "claude_executions.stdout_log_path",
+                "ALTER TABLE claude_executions ADD COLUMN stdout_log_path TEXT",
+            ),
+            (
+                "claude_executions.stderr_log_path",
+                "ALTER TABLE claude_executions ADD COLUMN stderr_log_path TEXT",
+            ),
         ];
 
         for (column_name, sql) in migrations {
@@ -674,6 +733,422 @@ impl SqliteTracker {
         let repo = caps.get(1)?.as_str().to_string();
         let pr_number: i64 = caps.get(2)?.as_str().parse().ok()?;
         Some((repo, pr_number))
+    }
+
+    fn embedding_to_blob(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
+        embedding.map(|values| values.iter().flat_map(|f| f.to_le_bytes()).collect())
+    }
+
+    fn blob_to_embedding(blob: Option<Vec<u8>>) -> Option<Vec<f32>> {
+        let blob = blob?;
+        if !blob.len().is_multiple_of(4) {
+            return None;
+        }
+        Some(
+            blob.chunks_exact(4)
+                .map(|chunk| {
+                    let arr: [u8; 4] = chunk.try_into().expect("chunks_exact guarantees 4 bytes");
+                    f32::from_le_bytes(arr)
+                })
+                .collect(),
+        )
+    }
+
+    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1 LIMIT 1",
+                params![table_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
+    fn ensure_qa_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
+        if dimension == 0 {
+            return Ok(false);
+        }
+
+        if Self::table_exists(conn, QA_VECTOR_TABLE)? {
+            return Ok(true);
+        }
+
+        if !is_vectorlite_available(conn) {
+            match try_load_vectorlite(conn) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Unable to load vectorlite extension for Q&A search");
+                    return Ok(false);
+                }
+            }
+        }
+
+        let sql = format!(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
+                embedding float32[{dimension}] cosine,
+                hnsw(max_elements=10000, ef_construction=200, M=16)
+            )
+            "#,
+            table = QA_VECTOR_TABLE,
+            dimension = dimension
+        );
+
+        match conn.execute_batch(&sql) {
+            Ok(()) => {
+                let backfill_sql = format!(
+                    r#"
+                    INSERT INTO {table}(rowid, embedding)
+                    SELECT id, question_embedding
+                    FROM qa_knowledge
+                    WHERE question_embedding IS NOT NULL
+                      AND length(question_embedding) = ?1
+                    "#,
+                    table = QA_VECTOR_TABLE
+                );
+                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
+                    tracing::debug!(error = %e, "Failed to backfill Q&A vector embeddings");
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to create Q&A vector table");
+                Ok(false)
+            }
+        }
+    }
+
+    fn upsert_qa_vector_embedding(conn: &Connection, qa_id: i64, embedding: &[f32]) -> Result<()> {
+        if embedding.is_empty() {
+            return Ok(());
+        }
+
+        if !Self::ensure_qa_vector_table(conn, embedding.len())? {
+            return Ok(());
+        }
+
+        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", QA_VECTOR_TABLE);
+        let insert_sql = format!(
+            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
+            QA_VECTOR_TABLE
+        );
+
+        conn.execute(&delete_sql, params![qa_id])?;
+        conn.execute(&insert_sql, params![qa_id, vector_blob])?;
+        Ok(())
+    }
+
+    fn query_qa_matches_vector_scoped(
+        conn: &Connection,
+        source: &str,
+        repo: Option<&str>,
+        question_embedding: &[f32],
+        threshold: f64,
+        limit: usize,
+        candidate_limit: usize,
+    ) -> Result<Option<Vec<QaMatch>>> {
+        if question_embedding.is_empty() || limit == 0 || candidate_limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        if !Self::ensure_qa_vector_table(conn, question_embedding.len())? {
+            return Ok(None);
+        }
+
+        let query_blob: Vec<u8> = question_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let sql = format!(
+            r#"
+            WITH candidates AS (
+                SELECT rowid AS qa_id,
+                       MAX(0.0, MIN(1.0, 1.0 - distance)) AS semantic_similarity
+                FROM {table}
+                WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
+            ),
+            scored AS (
+                SELECT k.id, k.source, k.repo, k.issue_id, k.short_id, k.question_text, k.question_norm,
+                       k.question_embedding, k.answer_text, k.answer_norm, k.answer_embedding, k.channel,
+                       k.responder, k.correlation_id, k.asked_at, k.answered_at, k.success_count,
+                       k.failure_count, k.last_used_at, k.metadata,
+                       c.semantic_similarity AS semantic_similarity,
+                       CASE
+                           WHEN (k.success_count + k.failure_count) > 0 THEN
+                               CAST(k.success_count AS REAL) / CAST((k.success_count + k.failure_count) AS REAL)
+                           ELSE 0.5
+                       END AS historical_success_rate
+                FROM candidates c
+                JOIN qa_knowledge k ON k.id = c.qa_id
+                WHERE k.source = ?4
+                  AND (?5 IS NULL OR k.repo = ?5)
+            ),
+            ranked AS (
+                SELECT id, source, repo, issue_id, short_id, question_text, question_norm,
+                       question_embedding, answer_text, answer_norm, answer_embedding, channel,
+                       responder, correlation_id, asked_at, answered_at, success_count,
+                       failure_count, last_used_at, metadata, semantic_similarity,
+                       historical_success_rate,
+                       (semantic_similarity * 0.75 + historical_success_rate * 0.25) AS final_score
+                FROM scored
+            )
+            SELECT id, source, repo, issue_id, short_id, question_text, question_norm,
+                   question_embedding, answer_text, answer_norm, answer_embedding, channel,
+                   responder, correlation_id, asked_at, answered_at, success_count,
+                   failure_count, last_used_at, metadata, semantic_similarity,
+                   historical_success_rate, final_score
+            FROM ranked
+            WHERE semantic_similarity >= ?6 OR final_score >= ?6
+            ORDER BY final_score DESC, answered_at DESC
+            LIMIT ?7
+            "#,
+            table = QA_VECTOR_TABLE
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to prepare scoped Q&A vector ranking query");
+                return Ok(None);
+            }
+        };
+
+        let rows = match stmt.query_map(
+            params![
+                query_blob,
+                candidate_limit as i64,
+                QA_VECTOR_EF_SEARCH as i64,
+                source,
+                repo,
+                threshold,
+                limit as i64
+            ],
+            Self::row_to_qa_match,
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(error = %e, "Scoped Q&A vector ranking query failed");
+                return Ok(None);
+            }
+        };
+
+        let mut matches = Vec::new();
+        for row in rows {
+            match row {
+                Ok(m) => matches.push(m),
+                Err(e) => tracing::debug!(error = %e, "Failed to read scoped Q&A vector row"),
+            }
+        }
+
+        Ok(Some(matches))
+    }
+
+    fn query_qa_matches_vector_global(
+        conn: &Connection,
+        question_embedding: &[f32],
+        threshold: f64,
+        limit: usize,
+        candidate_limit: usize,
+    ) -> Result<Option<Vec<QaMatch>>> {
+        if question_embedding.is_empty() || limit == 0 || candidate_limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        if !Self::ensure_qa_vector_table(conn, question_embedding.len())? {
+            return Ok(None);
+        }
+
+        let query_blob: Vec<u8> = question_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let sql = format!(
+            r#"
+            WITH candidates AS (
+                SELECT rowid AS qa_id,
+                       MAX(0.0, MIN(1.0, 1.0 - distance)) AS semantic_similarity
+                FROM {table}
+                WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
+            ),
+            scored AS (
+                SELECT k.id, k.source, k.repo, k.issue_id, k.short_id, k.question_text, k.question_norm,
+                       k.question_embedding, k.answer_text, k.answer_norm, k.answer_embedding, k.channel,
+                       k.responder, k.correlation_id, k.asked_at, k.answered_at, k.success_count,
+                       k.failure_count, k.last_used_at, k.metadata,
+                       c.semantic_similarity AS semantic_similarity,
+                       CASE
+                           WHEN (k.success_count + k.failure_count) > 0 THEN
+                               CAST(k.success_count AS REAL) / CAST((k.success_count + k.failure_count) AS REAL)
+                           ELSE 0.5
+                       END AS historical_success_rate
+                FROM candidates c
+                JOIN qa_knowledge k ON k.id = c.qa_id
+            ),
+            ranked AS (
+                SELECT id, source, repo, issue_id, short_id, question_text, question_norm,
+                       question_embedding, answer_text, answer_norm, answer_embedding, channel,
+                       responder, correlation_id, asked_at, answered_at, success_count,
+                       failure_count, last_used_at, metadata, semantic_similarity,
+                       historical_success_rate,
+                       (semantic_similarity * 0.75 + historical_success_rate * 0.25) AS final_score
+                FROM scored
+            )
+            SELECT id, source, repo, issue_id, short_id, question_text, question_norm,
+                   question_embedding, answer_text, answer_norm, answer_embedding, channel,
+                   responder, correlation_id, asked_at, answered_at, success_count,
+                   failure_count, last_used_at, metadata, semantic_similarity,
+                   historical_success_rate, final_score
+            FROM ranked
+            WHERE semantic_similarity >= ?4 OR final_score >= ?4
+            ORDER BY final_score DESC, answered_at DESC
+            LIMIT ?5
+            "#,
+            table = QA_VECTOR_TABLE
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to prepare global Q&A vector ranking query");
+                return Ok(None);
+            }
+        };
+
+        let rows = match stmt.query_map(
+            params![
+                query_blob,
+                candidate_limit as i64,
+                QA_VECTOR_EF_SEARCH as i64,
+                threshold,
+                limit as i64
+            ],
+            Self::row_to_qa_match,
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(error = %e, "Global Q&A vector ranking query failed");
+                return Ok(None);
+            }
+        };
+
+        let mut matches = Vec::new();
+        for row in rows {
+            match row {
+                Ok(m) => matches.push(m),
+                Err(e) => tracing::debug!(error = %e, "Failed to read global Q&A vector row"),
+            }
+        }
+
+        Ok(Some(matches))
+    }
+
+    fn query_qa_matches_exact_scoped(
+        conn: &Connection,
+        source: &str,
+        repo: Option<&str>,
+        question_norm: &str,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        let mut stmt = conn.prepare(
+            r#"
+            WITH scoped AS (
+                SELECT k.id, k.source, k.repo, k.issue_id, k.short_id, k.question_text, k.question_norm,
+                       k.question_embedding, k.answer_text, k.answer_norm, k.answer_embedding, k.channel,
+                       k.responder, k.correlation_id, k.asked_at, k.answered_at, k.success_count,
+                       k.failure_count, k.last_used_at, k.metadata,
+                       1.0 AS semantic_similarity,
+                       CASE
+                           WHEN (k.success_count + k.failure_count) > 0 THEN
+                               CAST(k.success_count AS REAL) / CAST((k.success_count + k.failure_count) AS REAL)
+                           ELSE 0.5
+                       END AS historical_success_rate
+                FROM qa_knowledge k
+                WHERE k.source = ?1
+                  AND (?2 IS NULL OR k.repo = ?2)
+                  AND k.question_norm = ?3
+            ),
+            ranked AS (
+                SELECT id, source, repo, issue_id, short_id, question_text, question_norm,
+                       question_embedding, answer_text, answer_norm, answer_embedding, channel,
+                       responder, correlation_id, asked_at, answered_at, success_count,
+                       failure_count, last_used_at, metadata, semantic_similarity,
+                       historical_success_rate,
+                       (semantic_similarity * 0.75 + historical_success_rate * 0.25) AS final_score
+                FROM scoped
+            )
+            SELECT id, source, repo, issue_id, short_id, question_text, question_norm,
+                   question_embedding, answer_text, answer_norm, answer_embedding, channel,
+                   responder, correlation_id, asked_at, answered_at, success_count,
+                   failure_count, last_used_at, metadata, semantic_similarity,
+                   historical_success_rate, final_score
+            FROM ranked
+            WHERE semantic_similarity >= ?4 OR final_score >= ?4
+            ORDER BY final_score DESC, answered_at DESC
+            LIMIT ?5
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![source, repo, question_norm, threshold, limit as i64],
+            Self::row_to_qa_match,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn query_qa_matches_exact_global(
+        conn: &Connection,
+        question_norm: &str,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        let mut stmt = conn.prepare(
+            r#"
+            WITH scoped AS (
+                SELECT k.id, k.source, k.repo, k.issue_id, k.short_id, k.question_text, k.question_norm,
+                       k.question_embedding, k.answer_text, k.answer_norm, k.answer_embedding, k.channel,
+                       k.responder, k.correlation_id, k.asked_at, k.answered_at, k.success_count,
+                       k.failure_count, k.last_used_at, k.metadata,
+                       1.0 AS semantic_similarity,
+                       CASE
+                           WHEN (k.success_count + k.failure_count) > 0 THEN
+                               CAST(k.success_count AS REAL) / CAST((k.success_count + k.failure_count) AS REAL)
+                           ELSE 0.5
+                       END AS historical_success_rate
+                FROM qa_knowledge k
+                WHERE k.question_norm = ?1
+            ),
+            ranked AS (
+                SELECT id, source, repo, issue_id, short_id, question_text, question_norm,
+                       question_embedding, answer_text, answer_norm, answer_embedding, channel,
+                       responder, correlation_id, asked_at, answered_at, success_count,
+                       failure_count, last_used_at, metadata, semantic_similarity,
+                       historical_success_rate,
+                       (semantic_similarity * 0.75 + historical_success_rate * 0.25) AS final_score
+                FROM scoped
+            )
+            SELECT id, source, repo, issue_id, short_id, question_text, question_norm,
+                   question_embedding, answer_text, answer_norm, answer_embedding, channel,
+                   responder, correlation_id, asked_at, answered_at, success_count,
+                   failure_count, last_used_at, metadata, semantic_similarity,
+                   historical_success_rate, final_score
+            FROM ranked
+            WHERE semantic_similarity >= ?2 OR final_score >= ?2
+            ORDER BY final_score DESC, answered_at DESC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![question_norm, threshold, limit as i64],
+            Self::row_to_qa_match,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 }
 
@@ -1222,6 +1697,77 @@ impl FixAttemptTracker for SqliteTracker {
         SqliteTracker::get_feedback_outcome_by_attempt(self, attempt_id)
     }
 
+    fn store_qa_knowledge(&self, entry: &QaKnowledgeEntry) -> Result<i64> {
+        SqliteTracker::store_qa_knowledge(self, entry)
+    }
+
+    fn find_similar_qa_scoped(
+        &self,
+        source: &str,
+        repo: Option<&str>,
+        question_norm: &str,
+        question_embedding: Option<&[f32]>,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        SqliteTracker::find_similar_qa_scoped(
+            self,
+            source,
+            repo,
+            question_norm,
+            question_embedding,
+            threshold,
+            limit,
+        )
+    }
+
+    fn find_similar_qa_global(
+        &self,
+        question_norm: &str,
+        question_embedding: Option<&[f32]>,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        SqliteTracker::find_similar_qa_global(
+            self,
+            question_norm,
+            question_embedding,
+            threshold,
+            limit,
+        )
+    }
+
+    fn record_qa_usage(
+        &self,
+        attempt_id: i64,
+        qa_id: i64,
+        usage_type: &str,
+        similarity_score: f64,
+    ) -> Result<i64> {
+        SqliteTracker::record_qa_usage(self, attempt_id, qa_id, usage_type, similarity_score)
+    }
+
+    fn update_qa_outcome_stats(&self, qa_id: i64, success: bool) -> Result<()> {
+        SqliteTracker::update_qa_outcome_stats(self, qa_id, success)
+    }
+
+    fn update_qa_outcome_stats_for_attempt(&self, attempt_id: i64, success: bool) -> Result<()> {
+        SqliteTracker::update_qa_outcome_stats_for_attempt(self, attempt_id, success)
+    }
+
+    fn get_channel_cursor(&self, channel: &str, cursor_key: &str) -> Result<Option<String>> {
+        SqliteTracker::get_channel_cursor(self, channel, cursor_key)
+    }
+
+    fn set_channel_cursor(
+        &self,
+        channel: &str,
+        cursor_key: &str,
+        cursor_value: &str,
+    ) -> Result<()> {
+        SqliteTracker::set_channel_cursor(self, channel, cursor_key, cursor_value)
+    }
+
     fn get_recent_activities_filtered(
         &self,
         limit: usize,
@@ -1527,10 +2073,10 @@ impl SqliteTracker {
             r#"
             INSERT INTO claude_executions (
                 attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
-                stdout_preview, stderr_preview, prompt_used, prompt_hash, model_version,
-                working_directory, git_branch, git_commit_before, git_commit_after,
-                files_changed, lines_added, lines_removed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stdout_preview, stderr_preview, stdout_log_path, stderr_log_path,
+                prompt_used, prompt_hash, model_version, working_directory, git_branch,
+                git_commit_before, git_commit_after, files_changed, lines_added, lines_removed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 execution.attempt_id,
@@ -1543,6 +2089,8 @@ impl SqliteTracker {
                 execution.timed_out as i32,
                 execution.stdout_preview,
                 execution.stderr_preview,
+                execution.stdout_log_path,
+                execution.stderr_log_path,
                 execution.prompt_used,
                 execution.prompt_hash,
                 execution.model_version,
@@ -1564,9 +2112,9 @@ impl SqliteTracker {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
-                   stdout_preview, stderr_preview, prompt_used, prompt_hash, model_version,
-                   working_directory, git_branch, git_commit_before, git_commit_after,
-                   files_changed, lines_added, lines_removed
+                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path,
+                   prompt_used, prompt_hash, model_version, working_directory, git_branch,
+                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed
             FROM claude_executions
             WHERE attempt_id = ?
             ORDER BY started_at DESC
@@ -1585,16 +2133,18 @@ impl SqliteTracker {
                 timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
                 stdout_preview: row.get(7)?,
                 stderr_preview: row.get(8)?,
-                prompt_used: row.get(9)?,
-                prompt_hash: row.get(10)?,
-                model_version: row.get(11)?,
-                working_directory: row.get(12)?,
-                git_branch: row.get(13)?,
-                git_commit_before: row.get(14)?,
-                git_commit_after: row.get(15)?,
-                files_changed: row.get(16)?,
-                lines_added: row.get(17)?,
-                lines_removed: row.get(18)?,
+                stdout_log_path: row.get(9)?,
+                stderr_log_path: row.get(10)?,
+                prompt_used: row.get(11)?,
+                prompt_hash: row.get(12)?,
+                model_version: row.get(13)?,
+                working_directory: row.get(14)?,
+                git_branch: row.get(15)?,
+                git_commit_before: row.get(16)?,
+                git_commit_after: row.get(17)?,
+                files_changed: row.get(18)?,
+                lines_added: row.get(19)?,
+                lines_removed: row.get(20)?,
             })
         })?;
 
@@ -2178,6 +2728,259 @@ impl SqliteTracker {
 
         let mut rows = stmt.query_map(params![attempt_id], Self::row_to_fix_outcome)?;
         Ok(rows.next().and_then(|r| r.ok()))
+    }
+
+    /// Store a Q&A knowledge entry.
+    pub fn store_qa_knowledge(&self, entry: &QaKnowledgeEntry) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO qa_knowledge (
+                source, repo, issue_id, short_id, question_text, question_norm, question_embedding,
+                answer_text, answer_norm, answer_embedding, channel, responder, correlation_id,
+                asked_at, answered_at, success_count, failure_count, last_used_at, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                entry.source,
+                entry.repo,
+                entry.issue_id,
+                entry.short_id,
+                entry.question_text,
+                entry.question_norm,
+                Self::embedding_to_blob(entry.question_embedding.as_deref()),
+                entry.answer_text,
+                entry.answer_norm,
+                Self::embedding_to_blob(entry.answer_embedding.as_deref()),
+                entry.channel,
+                entry.responder,
+                entry.correlation_id,
+                entry.asked_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                entry.answered_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                entry.success_count,
+                entry.failure_count,
+                entry
+                    .last_used_at
+                    .map(|v| v.format("%Y-%m-%d %H:%M:%S").to_string()),
+                entry.metadata.as_ref().map(|m| m.to_string()),
+            ],
+        )?;
+
+        let qa_id = conn.last_insert_rowid();
+
+        if let Some(question_embedding) = entry.question_embedding.as_deref() {
+            if let Err(e) = Self::upsert_qa_vector_embedding(&conn, qa_id, question_embedding) {
+                tracing::debug!(
+                    qa_id = qa_id,
+                    error = %e,
+                    "Failed to sync Q&A vector embedding; falling back to SQL ranking"
+                );
+            }
+        }
+
+        Ok(qa_id)
+    }
+
+    /// Find semantically similar Q&A entries within source/repo scope.
+    pub fn find_similar_qa_scoped(
+        &self,
+        source: &str,
+        repo: Option<&str>,
+        question_norm: &str,
+        question_embedding: Option<&[f32]>,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        let conn = self.acquire_lock()?;
+
+        if let Some(query_embedding) = question_embedding {
+            let candidate_limit = limit
+                .saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER)
+                .max(limit);
+            if let Some(vector_matches) = Self::query_qa_matches_vector_scoped(
+                &conn,
+                source,
+                repo,
+                query_embedding,
+                threshold,
+                limit,
+                candidate_limit,
+            )? {
+                if !vector_matches.is_empty() {
+                    return Ok(vector_matches);
+                }
+            }
+        }
+
+        Self::query_qa_matches_exact_scoped(&conn, source, repo, question_norm, threshold, limit)
+    }
+
+    /// Find semantically similar Q&A entries globally.
+    pub fn find_similar_qa_global(
+        &self,
+        question_norm: &str,
+        question_embedding: Option<&[f32]>,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        let conn = self.acquire_lock()?;
+
+        if let Some(query_embedding) = question_embedding {
+            let candidate_limit = limit
+                .saturating_mul(QA_VECTOR_CANDIDATE_MULTIPLIER)
+                .max(limit);
+            if let Some(vector_matches) = Self::query_qa_matches_vector_global(
+                &conn,
+                query_embedding,
+                threshold,
+                limit,
+                candidate_limit,
+            )? {
+                if !vector_matches.is_empty() {
+                    return Ok(vector_matches);
+                }
+            }
+        }
+
+        Self::query_qa_matches_exact_global(&conn, question_norm, threshold, limit)
+    }
+
+    /// Record usage of a Q&A entry for an attempt.
+    pub fn record_qa_usage(
+        &self,
+        attempt_id: i64,
+        qa_id: i64,
+        usage_type: &str,
+        similarity_score: f64,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO qa_usage (attempt_id, qa_id, usage_type, similarity_score, created_at)
+            VALUES (?1, ?2, ?3, ?4, datetime('now'))
+            ON CONFLICT(attempt_id, qa_id) DO UPDATE SET
+                usage_type = excluded.usage_type,
+                similarity_score = excluded.similarity_score,
+                created_at = excluded.created_at
+            "#,
+            params![attempt_id, qa_id, usage_type, similarity_score],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Update success/failure counters for a Q&A entry.
+    pub fn update_qa_outcome_stats(&self, qa_id: i64, success: bool) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        let (field, sql) = if success {
+            (
+                "success_count",
+                "UPDATE qa_knowledge SET success_count = success_count + 1, last_used_at = datetime('now') WHERE id = ?",
+            )
+        } else {
+            (
+                "failure_count",
+                "UPDATE qa_knowledge SET failure_count = failure_count + 1, last_used_at = datetime('now') WHERE id = ?",
+            )
+        };
+        conn.execute(sql, params![qa_id])?;
+        tracing::debug!(qa_id = qa_id, field = field, "Updated Q&A outcome stats");
+        Ok(())
+    }
+
+    /// Update success/failure counters for all Q&A entries used by an attempt.
+    pub fn update_qa_outcome_stats_for_attempt(
+        &self,
+        attempt_id: i64,
+        success: bool,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        let sql = if success {
+            r#"
+            UPDATE qa_knowledge
+            SET success_count = success_count + 1,
+                last_used_at = datetime('now')
+            WHERE id IN (SELECT qa_id FROM qa_usage WHERE attempt_id = ?1)
+            "#
+        } else {
+            r#"
+            UPDATE qa_knowledge
+            SET failure_count = failure_count + 1,
+                last_used_at = datetime('now')
+            WHERE id IN (SELECT qa_id FROM qa_usage WHERE attempt_id = ?1)
+            "#
+        };
+        conn.execute(sql, params![attempt_id])?;
+        Ok(())
+    }
+
+    /// Get channel cursor value for polling channels.
+    pub fn get_channel_cursor(&self, channel: &str, cursor_key: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT cursor_value FROM question_channel_cursor WHERE channel = ?1 AND cursor_key = ?2",
+        )?;
+        let value = stmt
+            .query_row(params![channel, cursor_key], |row| row.get::<_, String>(0))
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Set channel cursor value for polling channels.
+    pub fn set_channel_cursor(
+        &self,
+        channel: &str,
+        cursor_key: &str,
+        cursor_value: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO question_channel_cursor (channel, cursor_key, cursor_value, updated_at)
+            VALUES (?1, ?2, ?3, datetime('now'))
+            ON CONFLICT(channel, cursor_key) DO UPDATE SET
+                cursor_value = excluded.cursor_value,
+                updated_at = excluded.updated_at
+            "#,
+            params![channel, cursor_key, cursor_value],
+        )?;
+        Ok(())
+    }
+
+    fn row_to_qa_knowledge(row: &rusqlite::Row<'_>) -> rusqlite::Result<QaKnowledgeEntry> {
+        let metadata: Option<String> = row.get(19)?;
+        Ok(QaKnowledgeEntry {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            repo: row.get(2)?,
+            issue_id: row.get(3)?,
+            short_id: row.get(4)?,
+            question_text: row.get(5)?,
+            question_norm: row.get(6)?,
+            question_embedding: Self::blob_to_embedding(row.get(7)?),
+            answer_text: row.get(8)?,
+            answer_norm: row.get(9)?,
+            answer_embedding: Self::blob_to_embedding(row.get(10)?),
+            channel: row.get(11)?,
+            responder: row.get(12)?,
+            correlation_id: row.get(13)?,
+            asked_at: Self::parse_datetime(&row.get::<_, String>(14)?),
+            answered_at: Self::parse_datetime(&row.get::<_, String>(15)?),
+            success_count: row.get(16)?,
+            failure_count: row.get(17)?,
+            last_used_at: Self::parse_optional_datetime(row.get::<_, Option<String>>(18)?),
+            metadata: metadata.and_then(|s| serde_json::from_str(&s).ok()),
+        })
+    }
+
+    fn row_to_qa_match(row: &rusqlite::Row<'_>) -> rusqlite::Result<QaMatch> {
+        let entry = Self::row_to_qa_knowledge(row)?;
+        Ok(QaMatch {
+            entry,
+            semantic_similarity: row.get(20)?,
+            historical_success_rate: row.get(21)?,
+            final_score: row.get(22)?,
+        })
     }
 
     /// Map a database row to a FixOutcome.
@@ -4318,7 +5121,7 @@ pub struct DiagnosticCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, Timelike};
+    use chrono::{Datelike, Timelike, Utc};
 
     #[test]
     fn test_record_and_retrieve_attempt() {
@@ -6048,5 +6851,226 @@ mod tests {
             .create_user("c2@test.com", "hash", "C2", "viewer")
             .unwrap();
         assert_eq!(tracker.count_users().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_qa_tables_exist_after_migration() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let conn = tracker.acquire_lock().unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('qa_knowledge','qa_usage','question_channel_cursor')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_find_similar_qa_scoped_filters_by_repo() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let now = Utc::now();
+        let question = "Which branch should we use?";
+        let question_norm = crate::qa::normalize_text(question);
+
+        let entry_a = QaKnowledgeEntry {
+            id: 0,
+            source: "linear".to_string(),
+            repo: Some("org/repo-a".to_string()),
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question_text: question.to_string(),
+            question_norm: question_norm.clone(),
+            question_embedding: None,
+            answer_text: "Use main".to_string(),
+            answer_norm: "use main".to_string(),
+            answer_embedding: None,
+            channel: "email".to_string(),
+            responder: Some("a@example.com".to_string()),
+            correlation_id: "c1".to_string(),
+            asked_at: now,
+            answered_at: now,
+            success_count: 1,
+            failure_count: 0,
+            last_used_at: None,
+            metadata: None,
+        };
+
+        let entry_b = QaKnowledgeEntry {
+            repo: Some("org/repo-b".to_string()),
+            issue_id: "2".to_string(),
+            short_id: "LIN-2".to_string(),
+            correlation_id: "c2".to_string(),
+            ..entry_a.clone()
+        };
+
+        tracker.store_qa_knowledge(&entry_a).unwrap();
+        tracker.store_qa_knowledge(&entry_b).unwrap();
+
+        let matches = tracker
+            .find_similar_qa_scoped("linear", Some("org/repo-a"), &question_norm, None, 0.8, 5)
+            .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].entry.repo.as_deref(), Some("org/repo-a"));
+    }
+
+    #[test]
+    fn test_find_similar_qa_scoped_exact_ranks_by_success_rate() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let now = Utc::now();
+        let question = "Which branch should we use?";
+        let question_norm = crate::qa::normalize_text(question);
+
+        let base_entry = QaKnowledgeEntry {
+            id: 0,
+            source: "linear".to_string(),
+            repo: Some("org/repo-a".to_string()),
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question_text: question.to_string(),
+            question_norm: question_norm.clone(),
+            question_embedding: None,
+            answer_text: "Use main".to_string(),
+            answer_norm: "use main".to_string(),
+            answer_embedding: None,
+            channel: "email".to_string(),
+            responder: Some("a@example.com".to_string()),
+            correlation_id: "c1".to_string(),
+            asked_at: now,
+            answered_at: now,
+            success_count: 0,
+            failure_count: 0,
+            last_used_at: None,
+            metadata: None,
+        };
+
+        let low_confidence = base_entry.clone();
+        let high_confidence = QaKnowledgeEntry {
+            issue_id: "2".to_string(),
+            short_id: "LIN-2".to_string(),
+            answer_text: "Use release branch".to_string(),
+            answer_norm: "use release branch".to_string(),
+            correlation_id: "c2".to_string(),
+            success_count: 9,
+            failure_count: 1,
+            ..base_entry
+        };
+
+        tracker.store_qa_knowledge(&low_confidence).unwrap();
+        tracker.store_qa_knowledge(&high_confidence).unwrap();
+
+        let matches = tracker
+            .find_similar_qa_scoped("linear", Some("org/repo-a"), &question_norm, None, 0.8, 5)
+            .unwrap();
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].entry.answer_text, "Use release branch");
+        assert!(matches[0].historical_success_rate > matches[1].historical_success_rate);
+        assert!(matches[0].final_score > matches[1].final_score);
+    }
+
+    #[test]
+    fn test_find_similar_qa_global_exact_only_returns_normalized_match() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let now = Utc::now();
+        let question_norm = crate::qa::normalize_text("Pick deployment region");
+
+        let matching_entry = QaKnowledgeEntry {
+            id: 0,
+            source: "linear".to_string(),
+            repo: Some("org/repo-a".to_string()),
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question_text: "Pick deployment region".to_string(),
+            question_norm: question_norm.clone(),
+            question_embedding: None,
+            answer_text: "us-east-1".to_string(),
+            answer_norm: "us-east-1".to_string(),
+            answer_embedding: None,
+            channel: "email".to_string(),
+            responder: Some("a@example.com".to_string()),
+            correlation_id: "c1".to_string(),
+            asked_at: now,
+            answered_at: now,
+            success_count: 1,
+            failure_count: 0,
+            last_used_at: None,
+            metadata: None,
+        };
+        let non_matching_entry = QaKnowledgeEntry {
+            issue_id: "2".to_string(),
+            short_id: "LIN-2".to_string(),
+            question_text: "Pick staging region".to_string(),
+            question_norm: crate::qa::normalize_text("Pick staging region"),
+            answer_text: "eu-west-1".to_string(),
+            answer_norm: "eu-west-1".to_string(),
+            correlation_id: "c2".to_string(),
+            ..matching_entry.clone()
+        };
+
+        tracker.store_qa_knowledge(&matching_entry).unwrap();
+        tracker.store_qa_knowledge(&non_matching_entry).unwrap();
+
+        let matches = tracker
+            .find_similar_qa_global(&question_norm, None, 0.8, 5)
+            .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].entry.answer_text, "us-east-1");
+    }
+
+    #[test]
+    fn test_qa_usage_updates_outcome_stats_for_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-1").unwrap().unwrap();
+
+        let now = Utc::now();
+        let qa_id = tracker
+            .store_qa_knowledge(&QaKnowledgeEntry {
+                id: 0,
+                source: "linear".to_string(),
+                repo: Some("org/repo".to_string()),
+                issue_id: "issue-1".to_string(),
+                short_id: "LIN-1".to_string(),
+                question_text: "Question?".to_string(),
+                question_norm: "question?".to_string(),
+                question_embedding: None,
+                answer_text: "Answer".to_string(),
+                answer_norm: "answer".to_string(),
+                answer_embedding: None,
+                channel: "discord".to_string(),
+                responder: Some("user-1".to_string()),
+                correlation_id: "corr-1".to_string(),
+                asked_at: now,
+                answered_at: now,
+                success_count: 0,
+                failure_count: 0,
+                last_used_at: None,
+                metadata: None,
+            })
+            .unwrap();
+
+        tracker
+            .record_qa_usage(attempt.id, qa_id, "asked", 1.0)
+            .unwrap();
+        tracker
+            .update_qa_outcome_stats_for_attempt(attempt.id, true)
+            .unwrap();
+
+        let conn = tracker.acquire_lock().unwrap();
+        let success_count: i64 = conn
+            .query_row(
+                "SELECT success_count FROM qa_knowledge WHERE id = ?1",
+                params![qa_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(success_count, 1);
     }
 }

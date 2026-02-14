@@ -2,6 +2,7 @@ import { describe, expect, test, mock, afterEach } from "bun:test";
 import {
   fetchActivity,
   fetchAttemptDetail,
+  fetchAttemptExecutionLog,
   fetchAnalyticsSummary,
   fetchMetrics,
   fetchErrors,
@@ -18,6 +19,10 @@ import {
   fetchInferenceHistory,
   getRetries,
   getSources,
+  fetchTelemetryOverview,
+  fetchTelemetryTimeseries,
+  fetchTelemetryPipeline,
+  fetchTelemetryLatency,
 } from "../src/lib/api";
 
 function mockFetch(data: unknown, ok = true) {
@@ -52,6 +57,19 @@ describe("new api endpoints", () => {
     mockFetch({ attempt: {}, executions: [], reviews: [], feedback: null });
     await fetchAttemptDetail(42);
     expect(fetch).toHaveBeenCalledWith("/api/attempts/42/detail");
+  });
+
+  test("fetchAttemptExecutionLog calls correct URL", async () => {
+    mockFetch({
+      attempt_id: 42,
+      execution_id: 7,
+      stream: "stdout",
+      path: "/tmp/stdout.log",
+      content: "hello",
+      truncated: false,
+    });
+    await fetchAttemptExecutionLog(42, 7, "stdout");
+    expect(fetch).toHaveBeenCalledWith("/api/attempts/42/logs/7/stdout");
   });
 
   test("fetchAnalyticsSummary calls correct URL", async () => {
@@ -170,6 +188,30 @@ describe("new api endpoints", () => {
     expect(fetch).toHaveBeenCalledWith("/api/sources");
   });
 
+  test("fetchTelemetryOverview calls correct URL", async () => {
+    mockFetch({});
+    await fetchTelemetryOverview();
+    expect(fetch).toHaveBeenCalledWith("/api/telemetry/overview");
+  });
+
+  test("fetchTelemetryTimeseries calls correct URL", async () => {
+    mockFetch({ points: [] });
+    await fetchTelemetryTimeseries({ period: "day", bucket_minutes: 30 });
+    expect(fetch).toHaveBeenCalledWith("/api/telemetry/timeseries?period=day&bucket_minutes=30");
+  });
+
+  test("fetchTelemetryPipeline calls correct URL", async () => {
+    mockFetch({});
+    await fetchTelemetryPipeline({ period: "week" });
+    expect(fetch).toHaveBeenCalledWith("/api/telemetry/pipeline?period=week");
+  });
+
+  test("fetchTelemetryLatency calls correct URL", async () => {
+    mockFetch({});
+    await fetchTelemetryLatency({ period: "day" });
+    expect(fetch).toHaveBeenCalledWith("/api/telemetry/latency?period=day");
+  });
+
   // Error handling tests
   test("all fetchers throw on error response", async () => {
     mockFetch(null, false);
@@ -186,5 +228,9 @@ describe("new api endpoints", () => {
     expect(fetchDependencies()).rejects.toThrow();
     expect(fetchInferenceStats()).rejects.toThrow();
     expect(fetchInferenceHistory()).rejects.toThrow();
+    expect(fetchTelemetryOverview()).rejects.toThrow();
+    expect(fetchTelemetryTimeseries()).rejects.toThrow();
+    expect(fetchTelemetryPipeline()).rejects.toThrow();
+    expect(fetchTelemetryLatency()).rejects.toThrow();
   });
 });

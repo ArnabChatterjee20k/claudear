@@ -14,6 +14,7 @@ import ReposPage from './pages/repos'
 import InferencePage from './pages/inference'
 import ActivityPage from './pages/activity'
 import UsersPage from './pages/users'
+import TelemetryPage from './pages/telemetry'
 
 const routes: Record<string, () => JSX.Element> = {
   '/': OverviewPage,
@@ -27,6 +28,7 @@ const routes: Record<string, () => JSX.Element> = {
   '/repos': ReposPage,
   '/inference': InferencePage,
   '/activity': ActivityPage,
+  '/telemetry': TelemetryPage,
   '/users': UsersPage,
 }
 

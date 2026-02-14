@@ -18,7 +18,7 @@ use crate::feedback::FixOutcome;
 use crate::types::{
     ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
     FixAttemptStatus, PrAnalytics, PrReviewRecord, ProcessingMetric, PromptExperiment,
-    RegressionCheck, RegressionWatch, RegressionWatchStatus,
+    QaKnowledgeEntry, QaMatch, RegressionCheck, RegressionWatch, RegressionWatchStatus,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
@@ -143,6 +143,71 @@ pub trait FixAttemptTracker: Send + Sync {
     /// Get a feedback outcome by attempt ID.
     fn get_feedback_outcome_by_attempt(&self, _attempt_id: i64) -> Result<Option<FixOutcome>> {
         Ok(None)
+    }
+
+    /// Store a Q&A knowledge entry.
+    fn store_qa_knowledge(&self, _entry: &QaKnowledgeEntry) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Find semantically similar Q&A entries within a scoped source/repo.
+    fn find_similar_qa_scoped(
+        &self,
+        _source: &str,
+        _repo: Option<&str>,
+        _question_norm: &str,
+        _question_embedding: Option<&[f32]>,
+        _threshold: f64,
+        _limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        Ok(Vec::new())
+    }
+
+    /// Find semantically similar Q&A entries across all sources.
+    fn find_similar_qa_global(
+        &self,
+        _question_norm: &str,
+        _question_embedding: Option<&[f32]>,
+        _threshold: f64,
+        _limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        Ok(Vec::new())
+    }
+
+    /// Record usage of a Q&A entry for an attempt.
+    fn record_qa_usage(
+        &self,
+        _attempt_id: i64,
+        _qa_id: i64,
+        _usage_type: &str,
+        _similarity_score: f64,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Update success/failure counters for a Q&A entry.
+    fn update_qa_outcome_stats(&self, _qa_id: i64, _success: bool) -> Result<()> {
+        Ok(())
+    }
+
+    /// Update Q&A outcome counters for all Q&A usage linked to an attempt.
+    fn update_qa_outcome_stats_for_attempt(&self, _attempt_id: i64, _success: bool) -> Result<()> {
+        Ok(())
+    }
+
+    /// Retrieve a channel cursor value.
+    fn get_channel_cursor(&self, _channel: &str, _cursor_key: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Save a channel cursor value.
+    fn set_channel_cursor(
+        &self,
+        _channel: &str,
+        _cursor_key: &str,
+        _cursor_value: &str,
+    ) -> Result<()> {
+        Ok(())
     }
 
     // ─── Dashboard extension methods (default no-ops) ───

@@ -1,14 +1,21 @@
 //! HTTP server for webhooks.
 
-use super::{WebhookHandler, WebhookHandlerRegistry};
+use super::{GitHubWebhookHandler, WebhookHandler, WebhookHandlerRegistry};
 use crate::config::Config;
+use crate::error::Error;
 use crate::error::Result;
+use crate::feedback::{FixOutcome, Outcome};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
-use crate::notifier::Notifier;
+use crate::notifier::{send_to_all_and_wait_first_reply, Notifier};
+use crate::qa::{
+    build_correlation_id, embed_text, find_reusable_qa, format_answer_context,
+    format_reuse_context, format_timeout_context, normalize_text,
+};
 use crate::repo::{GitOps, RepoIndex};
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::storage::{FixAttemptTracker, SqliteTracker};
-use crate::types::{validate_issue_id, ActivityLogEntry, Issue};
+use crate::types::{validate_issue_id, ActivityLogEntry, AskRequest, Issue, QaKnowledgeEntry};
+use crate::users::UserRegistry;
 use axum::{
     body::Bytes,
     extract::{Path, State},
@@ -39,7 +46,10 @@ struct AppState {
     tracker: Arc<dyn FixAttemptTracker>,
     sqlite_tracker: Option<Arc<SqliteTracker>>,
     inferrer: Option<RepoInferrer>,
+    embedding_client: Option<crate::feedback::EmbeddingClient>,
+    user_registry: UserRegistry,
     claude: ClaudeRunner,
+    github_handler: Option<GitHubWebhookHandler>,
     /// Tracks currently processing webhooks with timestamps for TTL-based cleanup.
     /// Key: processing key (source:issue_id), Value: timestamp when processing started.
     processing: RwLock<HashMap<String, Instant>>,
@@ -53,6 +63,7 @@ pub struct WebhookServer {
     tracker: Arc<dyn FixAttemptTracker>,
     sqlite_tracker: Option<Arc<SqliteTracker>>,
     inferrer: Option<RepoInferrer>,
+    github_handler: Option<GitHubWebhookHandler>,
     port: u16,
 }
 
@@ -66,6 +77,27 @@ impl WebhookServer {
         sqlite_tracker: Option<Arc<SqliteTracker>>,
         inferrer: Option<RepoInferrer>,
     ) -> Self {
+        Self::new_with_github(
+            config,
+            handlers,
+            notifier,
+            tracker,
+            sqlite_tracker,
+            inferrer,
+            None,
+        )
+    }
+
+    /// Create a new webhook server with optional GitHub review webhook handling.
+    pub fn new_with_github(
+        config: Config,
+        handlers: WebhookHandlerRegistry,
+        notifier: Arc<dyn Notifier>,
+        tracker: Arc<dyn FixAttemptTracker>,
+        sqlite_tracker: Option<Arc<SqliteTracker>>,
+        inferrer: Option<RepoInferrer>,
+        github_handler: Option<GitHubWebhookHandler>,
+    ) -> Self {
         let port = config.webhook_port;
         Self {
             config,
@@ -74,6 +106,7 @@ impl WebhookServer {
             tracker,
             sqlite_tracker,
             inferrer,
+            github_handler,
             port,
         }
     }
@@ -128,6 +161,8 @@ impl WebhookServer {
 
     /// Start the server.
     pub async fn start(self) -> Result<()> {
+        let embedding_client = crate::feedback::EmbeddingClient::from_env().ok();
+        let user_registry = UserRegistry::new(self.config.users.clone());
         let state = Arc::new(AppState {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
@@ -145,6 +180,9 @@ impl WebhookServer {
             tracker: self.tracker,
             sqlite_tracker: self.sqlite_tracker,
             inferrer: self.inferrer,
+            embedding_client,
+            user_registry,
+            github_handler: self.github_handler,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -205,11 +243,13 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
         .iter()
         .map(|h| h.source_name())
         .collect();
+    let github_enabled = state.github_handler.is_some();
 
     Json(json!({
         "status": "ok",
         "processing_count": processing_count,
-        "handlers": handlers
+        "handlers": handlers,
+        "github_webhook_enabled": github_enabled
     }))
 }
 
@@ -219,16 +259,6 @@ async fn webhook_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let handler = match state.handlers.get(&source_name) {
-        Some(h) => h,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": format!("Unknown source: {}", source_name) })),
-            );
-        }
-    };
-
     // Convert headers to HashMap
     let header_map: HashMap<String, String> = headers
         .iter()
@@ -239,10 +269,26 @@ async fn webhook_handler(
         })
         .collect();
 
+    // GitHub review webhooks are handled outside the generic issue handler registry.
+    if source_name == "github" {
+        return handle_github_webhook(state, &header_map, &body).await;
+    }
+
+    let handler = match state.handlers.get(&source_name) {
+        Some(h) => h,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Unknown source: {}", source_name) })),
+            );
+        }
+    };
+
     // Log webhook received
     let has_signature = header_map.contains_key("x-signature")
         || header_map.contains_key("sentry-hook-signature")
-        || header_map.contains_key("linear-signature");
+        || header_map.contains_key("linear-signature")
+        || header_map.contains_key("x-hub-signature-256");
     let activity = ActivityLogEntry::new(
         "webhook_received",
         format!("Webhook received from {}", source_name),
@@ -421,13 +467,81 @@ async fn webhook_handler(
     )
 }
 
+async fn handle_github_webhook(
+    state: Arc<AppState>,
+    header_map: &HashMap<String, String>,
+    body: &Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let source_name = "github";
+
+    let github_handler = match &state.github_handler {
+        Some(handler) => handler,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "GitHub webhook handler is not configured" })),
+            );
+        }
+    };
+
+    let has_signature = header_map.contains_key("x-hub-signature-256");
+    let received_activity =
+        ActivityLogEntry::new("webhook_received", "Webhook received from github")
+            .with_source(source_name.to_string())
+            .with_metadata(json!({
+                "content_length": body.len(),
+                "has_signature": has_signature
+            }));
+    state.tracker.record_activity(&received_activity).ok();
+
+    let payload: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Invalid JSON" })),
+            );
+        }
+    };
+
+    match github_handler
+        .process_webhook(body.as_ref(), &payload, header_map)
+        .await
+    {
+        Ok(true) => (StatusCode::OK, Json(json!({ "status": "processed" }))),
+        Ok(false) => (
+            StatusCode::OK,
+            Json(json!({ "status": "ignored", "reason": "Event not applicable" })),
+        ),
+        Err(Error::Webhook(_)) | Err(Error::InvalidSignature) => {
+            let rejected_activity = ActivityLogEntry::new(
+                "webhook_rejected",
+                "Webhook rejected: invalid signature from github",
+            )
+            .with_source(source_name.to_string());
+            state.tracker.record_activity(&rejected_activity).ok();
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid signature" })),
+            )
+        }
+        Err(e) => {
+            tracing::error!(source = source_name, error = %e, "Error processing GitHub webhook");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to process GitHub webhook" })),
+            )
+        }
+    }
+}
+
 // Repository resolution is now handled by the inference engine (RepoInferrer).
 // See src/inference/mod.rs for the new implementation.
 
 async fn process_issue(
     state: Arc<AppState>,
     handler: Arc<dyn WebhookHandler>,
-    issue: Issue,
+    mut issue: Issue,
     match_result: crate::types::MatchResult,
     processing_key: String,
 ) -> Result<()> {
@@ -454,6 +568,7 @@ async fn process_issue(
             state
                 .tracker
                 .mark_failed(source_name, &issue.id, &format!("Skipped: {}", reason))?;
+            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
             return Ok(());
         }
     };
@@ -487,6 +602,7 @@ async fn process_issue(
                 &issue.id,
                 &format!("Git pull failed: {}", e),
             )?;
+            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
             return Ok(());
         }
 
@@ -518,14 +634,268 @@ async fn process_issue(
     }
 
     // Note: processing flag and attempt already recorded by handle_webhook before spawning
+    if let Some(assignee) = issue.get_metadata::<String>("assignee") {
+        if let Some(resolved) = state.user_registry.resolve(&issue.source, &assignee) {
+            issue.set_metadata("resolved_user", &resolved.slug);
+        }
+    }
+    let attempt_id = state
+        .tracker
+        .get_attempt(source_name, &issue.id)
+        .ok()
+        .flatten()
+        .map(|a| a.id);
 
     let result = async {
         // Notify start
         state.notifier.notify_start(&issue).await?;
 
-        // Build context and run Claude
-        let context = handler.build_issue_context(&issue).await?;
-        let claude_result = state.claude.run_fix(&issue, &context, &project_dir).await?;
+        // Build context and run Claude (with semantic Q&A reuse + ask loop).
+        let mut context = handler.build_issue_context(&issue).await?;
+        let repo_scope = resolution.repo_name().map(|v| v.to_string());
+        let mut used_qa_ids: Vec<i64> = Vec::new();
+
+        if state.config.ask.enabled {
+            let preload_query = format!("{} {}", issue.title, context);
+            let preload_norm = normalize_text(&preload_query);
+            let preload_embedding =
+                embed_text(state.embedding_client.as_ref(), &preload_query).await;
+            match find_reusable_qa(
+                state.tracker.as_ref(),
+                &state.config.ask,
+                source_name,
+                repo_scope.as_deref(),
+                &preload_norm,
+                preload_embedding.as_deref(),
+            ) {
+                Ok(matches) if !matches.is_empty() => {
+                    context = format!("{}\n\n{}", context, format_reuse_context(&matches));
+                    if let Some(id) = attempt_id {
+                        for m in &matches {
+                            let _ = state.tracker.record_qa_usage(
+                                id,
+                                m.entry.id,
+                                "reused",
+                                m.final_score,
+                            );
+                        }
+                    }
+                    used_qa_ids.extend(matches.into_iter().map(|m| m.entry.id));
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "Failed to preload reusable Q&A context"),
+            }
+        }
+
+        let mut rounds: u8 = 0;
+        let claude_result = loop {
+            let prompt = state
+                .claude
+                .build_prompt_for_issue(&issue, &context, &project_dir);
+            let mut run_result = state
+                .claude
+                .execute_with_attempt(&prompt, Some(&issue), attempt_id, &project_dir)
+                .await?;
+            run_result.used_qa_ids = used_qa_ids.clone();
+
+            let blocking_question = match (
+                state.config.ask.enabled,
+                run_result.blocking_question.clone(),
+            ) {
+                (true, Some(q)) => q,
+                _ => break run_result,
+            };
+
+            if rounds >= state.config.ask.max_rounds_per_attempt {
+                run_result.success = false;
+                run_result.error = Some(format!(
+                    "Maximum blocking-question rounds ({}) reached",
+                    state.config.ask.max_rounds_per_attempt
+                ));
+                break run_result;
+            }
+            rounds = rounds.saturating_add(1);
+
+            let question_norm = normalize_text(&blocking_question.question);
+            let question_embedding =
+                embed_text(state.embedding_client.as_ref(), &blocking_question.question).await;
+            let reusable = match find_reusable_qa(
+                state.tracker.as_ref(),
+                &state.config.ask,
+                source_name,
+                repo_scope.as_deref(),
+                &question_norm,
+                question_embedding.as_deref(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to query reusable Q&A");
+                    Vec::new()
+                }
+            };
+
+            if let Some(best) = reusable.first() {
+                if let Some(id) = attempt_id {
+                    let _ = state.tracker.record_qa_usage(
+                        id,
+                        best.entry.id,
+                        "reused",
+                        best.final_score,
+                    );
+                }
+                if !used_qa_ids.contains(&best.entry.id) {
+                    used_qa_ids.push(best.entry.id);
+                }
+                let activity = ActivityLogEntry::new(
+                    "question_reused",
+                    format!("Reused stored Q&A for {}", issue.short_id),
+                )
+                .with_source(source_name.to_string())
+                .with_issue(issue.id.clone(), issue.short_id.clone())
+                .with_metadata(json!({
+                    "qa_id": best.entry.id,
+                    "score": best.final_score,
+                }));
+                state.tracker.record_activity(&activity).ok();
+
+                context = format!(
+                    "{}\n\n{}",
+                    context,
+                    format_answer_context(
+                        &blocking_question,
+                        &best.entry.answer_text,
+                        &best.entry.channel,
+                        true
+                    )
+                );
+                continue;
+            }
+
+            let resolved_user = issue.get_metadata::<String>("resolved_user");
+            let target_discord_id = resolved_user
+                .as_deref()
+                .and_then(|slug| state.user_registry.get_by_slug(slug))
+                .and_then(|u| u.discord_id.clone());
+            let target_email = resolved_user
+                .as_deref()
+                .and_then(|slug| state.user_registry.get_by_slug(slug))
+                .and_then(|u| u.email.clone());
+            let ask_request = AskRequest {
+                correlation_id: build_correlation_id(&issue.short_id),
+                source: issue.source.clone(),
+                repo: repo_scope.clone(),
+                issue_id: issue.id.clone(),
+                short_id: issue.short_id.clone(),
+                question: blocking_question.clone(),
+                asked_at: chrono::Utc::now(),
+                target_discord_id,
+                target_email,
+            };
+
+            let asked_activity = ActivityLogEntry::new(
+                "question_asked",
+                format!("Asked human question for {}", issue.short_id),
+            )
+            .with_source(source_name.to_string())
+            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .with_metadata(json!({
+                "correlation_id": ask_request.correlation_id,
+                "question": blocking_question.question,
+            }));
+            state.tracker.record_activity(&asked_activity).ok();
+
+            let reply = send_to_all_and_wait_first_reply(
+                Arc::clone(&state.notifier),
+                &issue,
+                &ask_request,
+                tokio::time::Duration::from_secs(state.config.ask.wait_timeout_secs),
+                tokio::time::Duration::from_secs(state.config.ask.poll_interval_secs),
+            )
+            .await?;
+
+            if let Some(reply) = reply {
+                let answered_activity = ActivityLogEntry::new(
+                    "question_answered",
+                    format!("Human answered question for {}", issue.short_id),
+                )
+                .with_source(source_name.to_string())
+                .with_issue(issue.id.clone(), issue.short_id.clone())
+                .with_metadata(json!({
+                    "channel": reply.channel,
+                    "responder": reply.responder,
+                    "correlation_id": reply.correlation_id,
+                }));
+                state.tracker.record_activity(&answered_activity).ok();
+
+                let qa_entry = QaKnowledgeEntry {
+                    id: 0,
+                    source: issue.source.clone(),
+                    repo: repo_scope.clone(),
+                    issue_id: issue.id.clone(),
+                    short_id: issue.short_id.clone(),
+                    question_text: blocking_question.question.clone(),
+                    question_norm,
+                    question_embedding: question_embedding.clone(),
+                    answer_text: reply.answer.clone(),
+                    answer_norm: normalize_text(&reply.answer),
+                    answer_embedding: embed_text(state.embedding_client.as_ref(), &reply.answer)
+                        .await,
+                    channel: reply.channel.clone(),
+                    responder: reply.responder.clone(),
+                    correlation_id: ask_request.correlation_id.clone(),
+                    asked_at: ask_request.asked_at,
+                    answered_at: reply.replied_at,
+                    success_count: 0,
+                    failure_count: 0,
+                    last_used_at: None,
+                    metadata: Some(json!({
+                        "context": blocking_question.context,
+                        "options": blocking_question.options,
+                        "why": blocking_question.why,
+                    })),
+                };
+                if let Ok(qa_id) = state.tracker.store_qa_knowledge(&qa_entry) {
+                    if let Some(id) = attempt_id {
+                        let _ = state.tracker.record_qa_usage(id, qa_id, "asked", 1.0);
+                    }
+                    if !used_qa_ids.contains(&qa_id) {
+                        used_qa_ids.push(qa_id);
+                    }
+                }
+
+                context = format!(
+                    "{}\n\n{}",
+                    context,
+                    format_answer_context(&blocking_question, &reply.answer, &reply.channel, false)
+                );
+                continue;
+            }
+
+            let timeout_activity = ActivityLogEntry::new(
+                "question_timeout_best_effort",
+                format!("No human reply received for {}", issue.short_id),
+            )
+            .with_source(source_name.to_string())
+            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .with_metadata(json!({
+                "best_effort": state.config.ask.best_effort_on_timeout,
+                "question": blocking_question.question,
+            }));
+            state.tracker.record_activity(&timeout_activity).ok();
+
+            if state.config.ask.best_effort_on_timeout {
+                context = format!(
+                    "{}\n\n{}",
+                    context,
+                    format_timeout_context(&blocking_question)
+                );
+                continue;
+            }
+
+            run_result.success = false;
+            run_result.error = Some("Timed out waiting for human reply".to_string());
+            break run_result;
+        };
 
         if claude_result.success {
             if let Some(pr_url) = claude_result.pr_url {
@@ -533,6 +903,9 @@ async fn process_issue(
                 state
                     .tracker
                     .mark_success(source_name, &issue.id, &pr_url)?;
+                if let Some(id) = attempt_id {
+                    let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, true);
+                }
                 state.notifier.notify_success(&issue, &pr_url).await?;
 
                 // Log webhook processed successfully with PR
@@ -552,7 +925,11 @@ async fn process_issue(
                 state
                     .tracker
                     .mark_failed(source_name, &issue.id, "No PR URL found")?;
+                if let Some(id) = attempt_id {
+                    let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
+                }
                 state.notifier.notify_completed(&issue).await?;
+                record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
 
                 // Log webhook processed without PR
                 let activity = ActivityLogEntry::new(
@@ -571,7 +948,11 @@ async fn process_issue(
             let error = claude_result.error.as_deref().unwrap_or("Unknown error");
             tracing::error!(short_id = %issue.short_id, error = %error, "Failed");
             state.tracker.mark_failed(source_name, &issue.id, error)?;
-            state.notifier.notify_failed(&issue, error).await?;
+            if let Some(id) = attempt_id {
+                let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
+            }
+            notify_failed_with_escalation(&state, &issue, error).await?;
+            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
 
             // Log webhook processing failed
             let activity = ActivityLogEntry::new(
@@ -591,6 +972,16 @@ async fn process_issue(
     }
     .await;
 
+    if let Err(ref e) = result {
+        let error = e.to_string();
+        let _ = state.tracker.mark_failed(source_name, &issue.id, &error);
+        if let Some(id) = attempt_id {
+            let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
+        }
+        let _ = notify_failed_with_escalation(&state, &issue, &error).await;
+        record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
+    }
+
     // Remove from processing
     {
         let mut processing = state.processing.write().await;
@@ -600,12 +991,79 @@ async fn process_issue(
     result
 }
 
+fn record_feedback_outcome_from_attempt(
+    state: &AppState,
+    source_name: &str,
+    issue: &Issue,
+    outcome: Outcome,
+) {
+    let attempt = match state.tracker.get_attempt(source_name, &issue.id) {
+        Ok(Some(attempt)) => attempt,
+        _ => return,
+    };
+
+    let prompt = state
+        .sqlite_tracker
+        .as_ref()
+        .and_then(|t| t.get_executions_for_attempt(attempt.id).ok())
+        .and_then(|execs| execs.into_iter().next())
+        .and_then(|exec| exec.prompt_used)
+        .unwrap_or_default();
+
+    let fix_outcome = FixOutcome::from_attempt(&attempt, issue, &prompt, outcome);
+    if let Err(e) = state.tracker.store_feedback_outcome(&fix_outcome) {
+        tracing::warn!(error = %e, "Failed to store webhook feedback outcome");
+    }
+}
+
+async fn notify_failed_with_escalation(state: &AppState, issue: &Issue, error: &str) -> Result<()> {
+    if ClaudeRunner::is_hard_error(error) {
+        let mut global_issue = issue.clone();
+        global_issue.metadata.remove("resolved_user");
+        global_issue
+            .metadata
+            .insert("hard_error".to_string(), serde_json::Value::Bool(true));
+
+        let activity = ActivityLogEntry::new(
+            "error",
+            format!("Hard Claude error escalated for {}", issue.short_id),
+        )
+        .with_source(issue.source.clone())
+        .with_issue(issue.id.clone(), issue.short_id.clone())
+        .with_metadata(json!({
+            "hard_error": true,
+            "rate_limited": ClaudeRunner::is_rate_limit_error(error),
+            "error": truncate_error_for_activity(error),
+        }));
+        state.tracker.record_activity(&activity).ok();
+
+        return state.notifier.notify_failed(&global_issue, error).await;
+    }
+
+    state.notifier.notify_failed(issue, error).await
+}
+
+fn truncate_error_for_activity(error: &str) -> String {
+    let max_len = 500;
+    if error.len() <= max_len {
+        error.to_string()
+    } else {
+        let safe_end = error
+            .char_indices()
+            .take_while(|(i, _)| *i <= max_len.saturating_sub(3))
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        format!("{}...", &error[..safe_end])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        CascadeConfig, ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig, GitHubConfig,
-        PushConfig, RegressionConfig, RetryConfig, SmsConfig,
+        AskConfig, CascadeConfig, ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig,
+        GitHubConfig, PushConfig, RegressionConfig, RetryConfig, SmsConfig,
     };
     use crate::notifier::Notifier;
     use crate::reports::Report;
@@ -729,6 +1187,7 @@ mod tests {
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
             push: PushConfig::default(),
+            ask: AskConfig::default(),
             github: GitHubConfig::default(),
             github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),
@@ -989,6 +1448,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -1025,6 +1487,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(processing_set),
         });
 
@@ -1059,6 +1524,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -1127,6 +1595,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -1170,6 +1641,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -1235,6 +1709,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -1310,6 +1787,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -1357,6 +1837,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -1405,6 +1888,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(processing),
         });
 
@@ -1449,6 +1935,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -1515,6 +2004,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -1628,6 +2120,9 @@ mod tests {
             tracker,
             sqlite_tracker: None,
             inferrer: None,
+            embedding_client: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
             processing: RwLock::new(HashMap::new()),
         });
 

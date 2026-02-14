@@ -21,7 +21,7 @@ describe("Sidebar", () => {
     expect(screen.getByText("Claudear")).toBeDefined();
   });
 
-  test("renders all 11 nav item labels", () => {
+  test("renders all nav item labels", () => {
     renderSidebar();
     const labels = [
       "Overview",
@@ -35,6 +35,7 @@ describe("Sidebar", () => {
       "Repos",
       "Inference",
       "Activity",
+      "Telemetry",
     ];
     for (const label of labels) {
       expect(screen.getByText(label)).toBeDefined();

@@ -231,6 +231,83 @@ pub struct ClaudeResult {
     /// Error message if failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Structured blocking question emitted by Claude when it requires human input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocking_question: Option<BlockingQuestion>,
+    /// Q&A knowledge IDs used while preparing this run.
+    #[serde(default)]
+    pub used_qa_ids: Vec<i64>,
+}
+
+/// Structured blocking question emitted by Claude.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockingQuestion {
+    /// The actual question needing a human answer.
+    pub question: String,
+    /// Optional context Claude includes to help the responder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Optional options Claude proposes.
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Optional explanation of why the question is required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+/// Ask request used by notification channels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskRequest {
+    /// Correlation ID for cross-channel dedupe and reply matching.
+    pub correlation_id: String,
+    /// Source service name (e.g. linear, sentry).
+    pub source: String,
+    /// Optional target repository for scoped reuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Source issue ID.
+    pub issue_id: String,
+    /// Human-readable issue key.
+    pub short_id: String,
+    /// Question payload.
+    pub question: BlockingQuestion,
+    /// Ask timestamp.
+    pub asked_at: DateTime<Utc>,
+    /// Optional desired Discord responder ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_discord_id: Option<String>,
+    /// Optional desired email responder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_email: Option<String>,
+}
+
+/// Delivery metadata for an ask message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskDelivery {
+    /// Channel name (discord/email/sms/push).
+    pub channel: String,
+    /// Channel-specific target identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Channel-specific message/thread ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
+/// Reply captured from a notification channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskReply {
+    /// Correlation ID to link with ask.
+    pub correlation_id: String,
+    /// Channel where the reply was received.
+    pub channel: String,
+    /// Responder identity (channel user ID or email).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responder: Option<String>,
+    /// Raw reply text.
+    pub answer: String,
+    /// Reply timestamp.
+    pub replied_at: DateTime<Utc>,
 }
 
 /// Status of a fix attempt.
@@ -475,6 +552,12 @@ pub struct ClaudeExecution {
     /// Preview of stderr.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_preview: Option<String>,
+    /// Absolute path to the captured stdout log file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_log_path: Option<String>,
+    /// Absolute path to the captured stderr log file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_log_path: Option<String>,
     /// The prompt sent to Claude.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_used: Option<String>,
@@ -520,6 +603,8 @@ impl ClaudeExecution {
             timed_out: false,
             stdout_preview: None,
             stderr_preview: None,
+            stdout_log_path: None,
+            stderr_log_path: None,
             prompt_used: None,
             prompt_hash: None,
             model_version: None,
@@ -964,6 +1049,46 @@ pub struct SimilarIssue {
     pub computed_at: DateTime<Utc>,
 }
 
+/// Stored Q&A knowledge entry used for semantic reuse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QaKnowledgeEntry {
+    pub id: i64,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    pub issue_id: String,
+    pub short_id: String,
+    pub question_text: String,
+    pub question_norm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_embedding: Option<Vec<f32>>,
+    pub answer_text: String,
+    pub answer_norm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer_embedding: Option<Vec<f32>>,
+    pub channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responder: Option<String>,
+    pub correlation_id: String,
+    pub asked_at: DateTime<Utc>,
+    pub answered_at: DateTime<Utc>,
+    pub success_count: i64,
+    pub failure_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Similar Q&A match used during retrieval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QaMatch {
+    pub entry: QaKnowledgeEntry,
+    pub semantic_similarity: f64,
+    pub historical_success_rate: f64,
+    pub final_score: f64,
+}
+
 impl SimilarIssue {
     /// Create a new similar issue record.
     pub fn new(
@@ -1403,6 +1528,8 @@ mod tests {
             output: "PR created".to_string(),
             pr_url: Some("https://github.com/test/pr/1".to_string()),
             error: None,
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
         };
         assert!(result.success);
         assert!(result.pr_url.is_some());
@@ -1416,6 +1543,8 @@ mod tests {
             output: "".to_string(),
             pr_url: None,
             error: Some("Build failed".to_string()),
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
         };
         assert!(!result.success);
         assert!(result.pr_url.is_none());
@@ -1725,6 +1854,8 @@ mod tests {
             output: "".to_string(),
             pr_url: None,
             error: Some("No output".to_string()),
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
         };
 
         assert!(result.output.is_empty());

@@ -3,8 +3,10 @@ import useSWR from 'swr'
 import {
   fetchAttempts,
   fetchAttemptDetail,
+  fetchAttemptExecutionLog,
   type AttemptsResponse,
   type AttemptDetailResponse,
+  type AttemptExecutionLogResponse,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
 import { Select } from '../components/ui/select'
@@ -42,11 +44,19 @@ interface AttemptRow {
   retry_count: number
 }
 
+type LogStream = 'stdout' | 'stderr'
+
+interface SelectedExecutionLog {
+  executionId: number
+  stream: LogStream
+}
+
 export default function AttemptsPage() {
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
   const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [selectedLog, setSelectedLog] = useState<SelectedExecutionLog | null>(null)
 
   const { data, error, isLoading } = useSWR<AttemptsResponse>(
     ['attempts', page, statusFilter, sourceFilter],
@@ -65,6 +75,22 @@ export default function AttemptsPage() {
     () => fetchAttemptDetail(selectedId!),
   )
 
+  const {
+    data: executionLog,
+    error: executionLogError,
+    isLoading: executionLogLoading,
+  } = useSWR<AttemptExecutionLogResponse>(
+    selectedId && selectedLog
+      ? ['attempt-exec-log', selectedId, selectedLog.executionId, selectedLog.stream]
+      : null,
+    () =>
+      fetchAttemptExecutionLog(
+        selectedId!,
+        selectedLog!.executionId,
+        selectedLog!.stream,
+      ),
+  )
+
   const columns: Column<AttemptRow>[] = [
     {
       key: 'status',
@@ -76,7 +102,10 @@ export default function AttemptsPage() {
       header: 'ID',
       render: row => (
         <button
-          onClick={() => setSelectedId(row.id === selectedId ? null : row.id)}
+          onClick={() => {
+            setSelectedId(row.id === selectedId ? null : row.id)
+            setSelectedLog(null)
+          }}
           className="font-mono text-sm text-primary hover:underline"
         >
           {row.short_id}
@@ -287,6 +316,7 @@ export default function AttemptsPage() {
                             <th className="text-left py-2 font-medium">Exit Code</th>
                             <th className="text-left py-2 font-medium">Files Changed</th>
                             <th className="text-left py-2 font-medium">Lines +/-</th>
+                            <th className="text-left py-2 font-medium">Logs</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -317,11 +347,72 @@ export default function AttemptsPage() {
                                   ? `+${exec.lines_added ?? 0} / -${exec.lines_removed ?? 0}`
                                   : '--'}
                               </td>
+                              <td className="py-2">
+                                <div className="flex gap-2">
+                                  <button
+                                    onClick={() =>
+                                      setSelectedLog({
+                                        executionId: exec.id,
+                                        stream: 'stdout',
+                                      })
+                                    }
+                                    disabled={!exec.stdout_log_path && !exec.stdout_preview}
+                                    className="text-xs px-2 py-1 border rounded hover:bg-muted disabled:opacity-40"
+                                  >
+                                    stdout
+                                  </button>
+                                  <button
+                                    onClick={() =>
+                                      setSelectedLog({
+                                        executionId: exec.id,
+                                        stream: 'stderr',
+                                      })
+                                    }
+                                    disabled={!exec.stderr_log_path && !exec.stderr_preview}
+                                    className="text-xs px-2 py-1 border rounded hover:bg-muted disabled:opacity-40"
+                                  >
+                                    stderr
+                                  </button>
+                                </div>
+                              </td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
                     </div>
+                  </CardContent>
+                </Card>
+              )}
+
+              {selectedLog && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle>
+                      Execution Log ({selectedLog.stream}) - #{selectedLog.executionId}
+                    </CardTitle>
+                    {executionLog?.path && (
+                      <CardDescription>{executionLog.path}</CardDescription>
+                    )}
+                  </CardHeader>
+                  <CardContent>
+                    {executionLogLoading && <Skeleton className="h-48 w-full" />}
+                    {executionLogError && (
+                      <p className="text-sm text-destructive">
+                        Failed to load execution log.
+                      </p>
+                    )}
+                    {executionLog && (
+                      <div className="space-y-2">
+                        {executionLog.truncated && (
+                          <p className="text-xs text-muted-foreground">
+                            Showing the most recent log content (truncated).
+                          </p>
+                        )}
+                        <pre className="text-xs bg-muted rounded-md p-3 overflow-x-auto whitespace-pre-wrap break-words max-h-[480px] overflow-y-auto">
+                          {executionLog.content || 'No log output captured.'}
+                        </pre>
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               )}

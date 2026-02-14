@@ -219,6 +219,7 @@ describe("Page Components", () => {
             id: 1, attempt_id: 1, started_at: "2024-01-01T00:00:00Z",
             completed_at: "2024-01-01T00:01:00Z", duration_secs: 60.5,
             exit_code: 0, timed_out: false, stdout_preview: null, stderr_preview: null,
+            stdout_log_path: null, stderr_log_path: null,
             prompt_used: null, prompt_hash: null, model_version: null,
             working_directory: null, git_branch: null, git_commit_before: null,
             git_commit_after: null, files_changed: 3, lines_added: 45, lines_removed: 12,
@@ -321,6 +322,203 @@ describe("Page Components", () => {
       renderPage(<AnalyticsPage />);
       // Page header still renders
       expect(screen.getByText("Analytics")).toBeDefined();
+    });
+  });
+
+  describe("TelemetryPage", () => {
+    const mockOverview = {
+      generated_at: "2024-01-01T00:00:00Z",
+      uptime_secs: 7200,
+      windows: [
+        {
+          window: "1h",
+          processed: 12,
+          successful: 10,
+          failed: 2,
+          merged: 6,
+          success_rate: 83.3,
+          error_rate: 16.7,
+          throughput_per_hour: 12,
+        },
+      ],
+      queue: {
+        pending_attempts: 3,
+        retryable_attempts: 2,
+        ready_retries: 1,
+        open_prs: 4,
+        watches_awaiting_release: 1,
+        watches_monitoring: 2,
+        watches_resolved: 5,
+        watches_regressed: 1,
+      },
+      processing_time: {
+        all_time: { samples: 10, avg_secs: 30, p50_secs: 20, p95_secs: 60, p99_secs: 80, max_secs: 90 },
+        last_24h: { samples: 5, avg_secs: 25, p50_secs: 20, p95_secs: 45, p99_secs: 50, max_secs: 60 },
+      },
+      source_breakdown: [
+        {
+          source: "linear",
+          total: 10,
+          pending: 1,
+          success: 5,
+          failed: 2,
+          merged: 2,
+          closed: 0,
+          cannot_fix: 0,
+          retryable: 1,
+          success_rate: 70,
+        },
+      ],
+      top_errors: [],
+      activity_last_hour: { processing_completed: 4 },
+      metric_counts_last_24h: { processing_time: 5 },
+      diagnostics: { fix_attempts: 10 },
+      pr_analytics: {
+        total: 8,
+        open: 4,
+        merged: 3,
+        closed: 1,
+        avg_time_to_first_review_mins: 30,
+        avg_time_to_merge_mins: 90,
+        avg_review_cycles: 1.2,
+        merge_rate: 0.75,
+        by_repo: {},
+      },
+    };
+
+    const mockSeries = {
+      period: "day",
+      bucket_minutes: 30,
+      generated_at: "2024-01-01T00:00:00Z",
+      points: [
+        {
+          bucket_start: "2024-01-01T00:00:00Z",
+          total: 3,
+          pending: 1,
+          success: 1,
+          failed: 0,
+          merged: 1,
+          closed: 0,
+          cannot_fix: 0,
+        },
+      ],
+    };
+
+    const mockPipeline = {
+      generated_at: "2024-01-01T00:00:00Z",
+      period: "day",
+      totals: {
+        fetched: 20,
+        matched: 10,
+        queued: 8,
+        processed: 6,
+        pr_created: 3,
+        retries_found: 2,
+        retries_executed: 1,
+        retries_failed: 0,
+        pr_status_checks: 5,
+        pr_status_merged: 2,
+        pr_status_closed: 1,
+        pr_status_errors: 0,
+        regression_watches_created: 1,
+        auto_resolved_on_merge: 1,
+        cascade_triggered: 1,
+        cascade_failed: 0,
+      },
+      conversion: {
+        match_rate: 0.5,
+        queue_rate: 0.8,
+        processing_rate: 0.75,
+        pr_yield_rate: 0.5,
+      },
+      poll_load: {
+        poll_cycles: 4,
+        avg_cycle_secs: 4.2,
+        p95_cycle_secs: 6.8,
+        active_avg: 0.5,
+        active_max: 2,
+        pending_avg: 3,
+        pending_max: 5,
+        total_latest: 10,
+      },
+      per_source: [
+        {
+          source: "linear",
+          fetched: 10,
+          matched: 6,
+          queued: 5,
+          processed: 4,
+          pr_created: 2,
+          retries_executed: 1,
+          retries_failed: 0,
+          match_rate: 0.6,
+          queue_rate: 0.83,
+          processing_rate: 0.8,
+          pr_yield_rate: 0.5,
+        },
+      ],
+    };
+
+    const mockLatency = {
+      generated_at: "2024-01-01T00:00:00Z",
+      period: "day",
+      overall: {
+        samples: 12,
+        avg_secs: 32,
+        p50_secs: 25,
+        p95_secs: 60,
+        p99_secs: 75,
+        max_secs: 80,
+      },
+      by_status: [
+        {
+          status: "merged",
+          summary: {
+            samples: 6,
+            avg_secs: 28,
+            p50_secs: 24,
+            p95_secs: 55,
+            p99_secs: 70,
+            max_secs: 72,
+          },
+        },
+      ],
+      histogram: [
+        { label: "<=15s", upper_bound_secs: 15, count: 2 },
+        { label: "<=30s", upper_bound_secs: 30, count: 5 },
+        { label: "<=60s", upper_bound_secs: 60, count: 4 },
+        { label: ">5m", upper_bound_secs: null, count: 0 },
+      ],
+    };
+
+    test("renders without crashing", async () => {
+      mockFetchByUrl({
+        "/api/telemetry/overview": mockOverview,
+        "/api/telemetry/timeseries": mockSeries,
+        "/api/telemetry/pipeline": mockPipeline,
+        "/api/telemetry/latency": mockLatency,
+      });
+      const TelemetryPage = (await import("../src/pages/telemetry")).default;
+      renderPage(<TelemetryPage />);
+      expect(screen.getByText("Telemetry")).toBeDefined();
+    });
+
+    test("shows telemetry data", async () => {
+      mockFetchByUrl({
+        "/api/telemetry/overview": mockOverview,
+        "/api/telemetry/timeseries": mockSeries,
+        "/api/telemetry/pipeline": mockPipeline,
+        "/api/telemetry/latency": mockLatency,
+      });
+      const TelemetryPage = (await import("../src/pages/telemetry")).default;
+      renderPage(<TelemetryPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Pending Attempts")).toBeDefined();
+      });
+      expect(screen.getByText("Window Performance")).toBeDefined();
+      expect(screen.getByText("Poll Pipeline")).toBeDefined();
+      expect(screen.getByText("Processing Latency")).toBeDefined();
     });
   });
 

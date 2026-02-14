@@ -232,6 +232,32 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         response.json()
     }
 
+    /// List recent messages from a channel.
+    pub async fn list_channel_messages(
+        &self,
+        channel_id: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscordMessage>> {
+        let clamped_limit = limit.clamp(1, 100);
+        let url = format!(
+            "{}/channels/{}/messages?limit={}",
+            DISCORD_API_BASE, channel_id, clamped_limit
+        );
+        let response = self.http.get(&url).await?;
+
+        if !response.is_success() {
+            return Err(Error::notifier(
+                "discord",
+                format!(
+                    "Failed to list channel messages ({}): {}",
+                    response.status, response.body
+                ),
+            ));
+        }
+
+        response.json()
+    }
+
     /// Archive a thread.
     pub async fn archive_thread(&self, thread_id: &str) -> Result<DiscordThread> {
         let url = format!("{}/channels/{}", DISCORD_API_BASE, thread_id);
@@ -636,6 +662,21 @@ mod tests {
         let params = CreateMessageParams::text("Hello");
         let result = client.send_message("123", params).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_channel_messages_success() {
+        let mock = MockDiscordClient::new();
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/messages?limit=10",
+            200,
+            &format!("[{}]", mock_message_json()),
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let messages = client.list_channel_messages("123", 10).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "999");
     }
 
     #[tokio::test]

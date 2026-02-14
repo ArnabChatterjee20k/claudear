@@ -7,17 +7,23 @@ use crate::feedback::{
 };
 use crate::github::{GitHubClient, PrReviewState, PrStatus, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
+use crate::notifier::send_to_all_and_wait_first_reply;
 use crate::notifier::Notifier;
+use crate::qa::{
+    build_correlation_id, embed_text, find_reusable_qa, format_answer_context,
+    format_reuse_context, format_timeout_context, normalize_text,
+};
 use crate::repo::{GitOps, RepoIndex, RepoRelationships};
 use crate::retry::RetryManager;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::source::IssueSource;
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
 use crate::types::{
-    ActivityLogEntry, ErrorPattern, FixAttemptStats, Issue, MatchPriority, MatchResult,
-    ProcessingMetric,
+    ActivityLogEntry, AskRequest, ErrorPattern, FixAttemptStats, Issue, IssueType, MatchPriority,
+    MatchResult, ProcessingMetric, QaKnowledgeEntry, RegressionWatch,
 };
 use crate::users::UserRegistry;
+use chrono::Utc;
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -591,18 +597,21 @@ impl Watcher {
             ));
         }
 
-        // Process the issue (this will create a new commit on the existing branch)
-        // Note: The issue will be re-fetched by trigger_issue, which will get the
-        // latest description. Review feedback context is passed via the tracker's
-        // attempt record for reference.
+        // Process the issue with the review feedback appended to context.
         if let Some(pr_url) = &attempt.pr_url {
             tracing::info!(
                 pr_url = %pr_url,
                 "Re-processing issue to address review feedback"
             );
 
-            // Use trigger_issue to re-process
-            if let Err(e) = self.trigger_issue(&attempt.source, &attempt.issue_id).await {
+            if let Err(e) = self
+                .trigger_issue_with_feedback(
+                    &attempt.source,
+                    &attempt.issue_id,
+                    Some(feedback.to_string()),
+                )
+                .await
+            {
                 tracing::error!(
                     error = %e,
                     "Failed to trigger re-processing for review feedback"
@@ -940,6 +949,7 @@ Create a PR with your changes."#,
 
     /// Run a single poll cycle.
     async fn poll(&self) -> Result<()> {
+        let poll_started_at = std::time::Instant::now();
         tracing::info!("");
         tracing::info!(
             "[{}] Polling...",
@@ -966,6 +976,47 @@ Create a PR with your changes."#,
             }
         }
 
+        // Record lightweight operational telemetry for dashboard analytics.
+        if !self.dry_run {
+            let poll_duration_metric = ProcessingMetric::new(
+                "poll_cycle_duration_secs",
+                poll_started_at.elapsed().as_secs_f64(),
+            );
+            if let Err(e) = self.tracker.record_metric(&poll_duration_metric) {
+                tracing::debug!(error = %e, "Failed to record poll_cycle_duration_secs metric");
+            }
+
+            let source_count_metric =
+                ProcessingMetric::new("poll_sources", self.sources.len() as f64);
+            if let Err(e) = self.tracker.record_metric(&source_count_metric) {
+                tracing::debug!(error = %e, "Failed to record poll_sources metric");
+            }
+
+            let active = self.active_processing.load(Ordering::SeqCst) as f64;
+            let active_metric = ProcessingMetric::new("active_processing", active);
+            if let Err(e) = self.tracker.record_metric(&active_metric) {
+                tracing::debug!(error = %e, "Failed to record active_processing metric");
+            }
+
+            match self.tracker.get_stats() {
+                Ok(stats) => {
+                    let pending_metric =
+                        ProcessingMetric::new("pending_attempts", stats.pending as f64);
+                    if let Err(e) = self.tracker.record_metric(&pending_metric) {
+                        tracing::debug!(error = %e, "Failed to record pending_attempts metric");
+                    }
+
+                    let total_metric = ProcessingMetric::new("total_attempts", stats.total as f64);
+                    if let Err(e) = self.tracker.record_metric(&total_metric) {
+                        tracing::debug!(error = %e, "Failed to record total_attempts metric");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "Failed to load stats for poll metrics");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -973,8 +1024,24 @@ Create a PR with your changes."#,
     async fn process_ready_retries(&self) -> Result<()> {
         let retry_manager = RetryManager::new(self.config.retry.clone(), self.tracker.clone());
         let ready = retry_manager.get_ready_retries()?;
+        let ready_count = ready.len();
+
+        let ready_found_metric = ProcessingMetric::new("ready_retries_found", ready_count as f64);
+        if let Err(e) = self.tracker.record_metric(&ready_found_metric) {
+            tracing::debug!(error = %e, "Failed to record ready_retries_found metric");
+        }
 
         if ready.is_empty() {
+            let retries_executed_metric =
+                ProcessingMetric::new("ready_retries_executed_total", 0.0);
+            if let Err(e) = self.tracker.record_metric(&retries_executed_metric) {
+                tracing::debug!(error = %e, "Failed to record ready_retries_executed_total metric");
+            }
+
+            let retries_failed_metric = ProcessingMetric::new("ready_retries_failed_total", 0.0);
+            if let Err(e) = self.tracker.record_metric(&retries_failed_metric) {
+                tracing::debug!(error = %e, "Failed to record ready_retries_failed_total metric");
+            }
             return Ok(());
         }
 
@@ -983,6 +1050,9 @@ Create a PR with your changes."#,
             count = ready.len(),
             "Processing ready retries"
         );
+
+        let mut retries_executed = 0usize;
+        let mut retries_failed = 0usize;
 
         for attempt in ready {
             // Check if we're still running
@@ -1024,13 +1094,32 @@ Create a PR with your changes."#,
             retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
 
             // Trigger the issue processing
-            if let Err(e) = self.trigger_issue(&attempt.source, &attempt.issue_id).await {
-                tracing::error!(
-                    component = "watcher",
-                    short_id = %attempt.short_id,
-                    error = %e,
-                    "Failed to trigger retry"
-                );
+            match self.trigger_issue(&attempt.source, &attempt.issue_id).await {
+                Ok(()) => {
+                    retries_executed += 1;
+                    let metric = ProcessingMetric::new("ready_retry_executed", 1.0)
+                        .with_source(attempt.source.clone());
+                    if let Err(e) = self.tracker.record_metric(&metric) {
+                        tracing::debug!(error = %e, "Failed to record ready_retry_executed metric");
+                    }
+                }
+                Err(e) => {
+                    retries_failed += 1;
+                    let metric = ProcessingMetric::new("ready_retry_failed", 1.0)
+                        .with_source(attempt.source.clone());
+                    if let Err(record_err) = self.tracker.record_metric(&metric) {
+                        tracing::debug!(
+                            error = %record_err,
+                            "Failed to record ready_retry_failed metric"
+                        );
+                    }
+                    tracing::error!(
+                        component = "watcher",
+                        short_id = %attempt.short_id,
+                        error = %e,
+                        "Failed to trigger retry"
+                    );
+                }
             }
 
             // Add delay between retries
@@ -1039,22 +1128,39 @@ Create a PR with your changes."#,
             }
         }
 
+        let retries_executed_metric =
+            ProcessingMetric::new("ready_retries_executed_total", retries_executed as f64);
+        if let Err(e) = self.tracker.record_metric(&retries_executed_metric) {
+            tracing::debug!(error = %e, "Failed to record ready_retries_executed_total metric");
+        }
+
+        let retries_failed_metric =
+            ProcessingMetric::new("ready_retries_failed_total", retries_failed as f64);
+        if let Err(e) = self.tracker.record_metric(&retries_failed_metric) {
+            tracing::debug!(error = %e, "Failed to record ready_retries_failed_total metric");
+        }
+
         Ok(())
     }
 
     /// Check for merged PRs and trigger cascade processing.
     async fn check_pr_merges_and_cascade(&self) -> Result<()> {
-        let github_client = match &self.github_client {
-            Some(c) => c,
-            None => return Ok(()),
+        let github_client = self.github_client.as_ref();
+        // Get all successful attempts with PRs that haven't been merged yet.
+        // If GitHub client is unavailable, we still emit zero-value lifecycle metrics.
+        let pending_prs = if github_client.is_some() {
+            self.tracker.get_pending_prs()?
+        } else {
+            Vec::new()
         };
-
-        if !self.config.cascade.enabled {
-            return Ok(());
-        }
-
-        // Get all successful attempts with PRs that haven't been merged yet
-        let pending_prs = self.tracker.get_pending_prs()?;
+        let mut pr_status_checks = 0usize;
+        let mut pr_status_merged = 0usize;
+        let mut pr_status_closed = 0usize;
+        let mut pr_status_errors = 0usize;
+        let mut regression_watches_created = 0usize;
+        let mut auto_resolved_on_merge = 0usize;
+        let mut cascade_triggered = 0usize;
+        let mut cascade_failed = 0usize;
 
         for attempt in &pending_prs {
             let repo = match &attempt.github_repo {
@@ -1065,40 +1171,173 @@ Create a PR with your changes."#,
                 Some(n) => n,
                 None => continue,
             };
+            let Some(github_client) = github_client else {
+                break;
+            };
 
+            pr_status_checks += 1;
             match github_client.get_pr_status(repo, pr_number).await {
                 Ok(PrStatus::Merged) => {
+                    pr_status_merged += 1;
                     self.tracker
                         .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    let _ = self
+                        .tracker
+                        .update_qa_outcome_stats_for_attempt(attempt.id, true);
+
+                    // For bug-type issues, create a regression watch instead of immediate auto-resolve.
+                    let regression_watch_id = if attempt.is_bug() {
+                        if let Some(ref sqlite_tracker) = self.sqlite_tracker {
+                            let issue_type = match attempt.source.as_str() {
+                                "sentry" => IssueType::SentryIssue,
+                                "linear" => IssueType::LinearBug,
+                                _ => IssueType::SentryIssue,
+                            };
+                            let mut watch =
+                                RegressionWatch::new(issue_type, &attempt.issue_id, attempt.id);
+                            watch.pr_merged_at = Some(chrono::Utc::now());
+
+                            match sqlite_tracker.create_regression_watch(&watch) {
+                                Ok(watch_id) => {
+                                    regression_watches_created += 1;
+                                    tracing::info!(
+                                        component = "watcher",
+                                        source = %attempt.source,
+                                        issue_id = %attempt.issue_id,
+                                        short_id = %attempt.short_id,
+                                        watch_id = watch_id,
+                                        "Created regression watch for merged bug fix"
+                                    );
+                                    Some(watch_id)
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        component = "watcher",
+                                        source = %attempt.source,
+                                        issue_id = %attempt.issue_id,
+                                        short_id = %attempt.short_id,
+                                        error = %e,
+                                        "Failed to create regression watch"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Auto-resolve only when enabled and no regression watch is active.
+                    let should_resolve =
+                        regression_watch_id.is_none() && self.config.github.auto_resolve_on_merge;
+                    if should_resolve {
+                        if let Some(source) =
+                            self.sources.iter().find(|s| s.name() == attempt.source)
+                        {
+                            match source.resolve_issue(&attempt.issue_id).await {
+                                Ok(()) => {
+                                    auto_resolved_on_merge += 1;
+                                    self.tracker
+                                        .mark_resolved(&attempt.source, &attempt.issue_id)?;
+                                    if let Some(pr_url) = &attempt.pr_url {
+                                        let issue = Issue::new(
+                                            &attempt.issue_id,
+                                            &attempt.short_id,
+                                            "Issue resolved",
+                                            pr_url,
+                                            &attempt.source,
+                                        );
+                                        let _ = self.notifier.notify_merged(&issue, pr_url).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        component = "watcher",
+                                        source = %attempt.source,
+                                        issue_id = %attempt.issue_id,
+                                        error = %e,
+                                        "Failed to resolve issue after PR merge"
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     // Record feedback outcome
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
                         .await;
 
+                    // Stop review polling for merged PRs.
+                    if let (Some(review_watcher), Some(pr_url)) =
+                        (self.review_watcher.as_ref(), attempt.pr_url.as_ref())
+                    {
+                        review_watcher.unwatch_pr(pr_url);
+                    }
+
                     let pr_url = attempt.pr_url.as_deref().unwrap_or("");
-                    if let Err(e) = self.trigger_cascade(attempt, pr_url).await {
-                        tracing::error!(
-                            component = "cascade",
-                            short_id = %attempt.short_id,
-                            error = %e,
-                            "Failed to trigger cascade after merge"
-                        );
+                    if self.config.cascade.enabled {
+                        match self.trigger_cascade(attempt, pr_url).await {
+                            Ok(()) => {
+                                cascade_triggered += 1;
+                            }
+                            Err(e) => {
+                                cascade_failed += 1;
+                                tracing::error!(
+                                    component = "cascade",
+                                    short_id = %attempt.short_id,
+                                    error = %e,
+                                    "Failed to trigger cascade after merge"
+                                );
+                            }
+                        }
                     }
                 }
                 Ok(PrStatus::Closed) => {
+                    pr_status_closed += 1;
                     self.tracker
                         .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    let _ = self
+                        .tracker
+                        .update_qa_outcome_stats_for_attempt(attempt.id, false);
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Closed)
                         .await;
+                    if let (Some(review_watcher), Some(pr_url)) =
+                        (self.review_watcher.as_ref(), attempt.pr_url.as_ref())
+                    {
+                        review_watcher.unwatch_pr(pr_url);
+                    }
                 }
                 Ok(_) => {} // Still open
                 Err(e) => {
+                    pr_status_errors += 1;
                     tracing::debug!(
                         short_id = %attempt.short_id,
                         error = %e,
                         "Failed to check PR status"
                     );
                 }
+            }
+        }
+
+        let cycle_metrics = [
+            ("pr_status_checks", pr_status_checks as f64),
+            ("pr_status_merged", pr_status_merged as f64),
+            ("pr_status_closed", pr_status_closed as f64),
+            ("pr_status_errors", pr_status_errors as f64),
+            (
+                "regression_watches_created",
+                regression_watches_created as f64,
+            ),
+            ("auto_resolved_on_merge", auto_resolved_on_merge as f64),
+            ("cascade_triggered", cascade_triggered as f64),
+            ("cascade_failed", cascade_failed as f64),
+        ];
+        for (name, value) in cycle_metrics {
+            let metric = ProcessingMetric::new(name, value);
+            if let Err(e) = self.tracker.record_metric(&metric) {
+                tracing::debug!(error = %e, metric = name, "Failed to record PR lifecycle metric");
             }
         }
 
@@ -1111,6 +1350,11 @@ Create a PR with your changes."#,
 
         let issues = source.fetch_issues().await?;
         tracing::info!(source = source.name(), count = issues.len(), "Found issues");
+        let fetched_metric = ProcessingMetric::new("issues_fetched", issues.len() as f64)
+            .with_source(source.name().to_string());
+        if let Err(e) = self.tracker.record_metric(&fetched_metric) {
+            tracing::debug!(error = %e, "Failed to record issues_fetched metric");
+        }
 
         // Get already attempted issue IDs
         let attempted_ids = self.tracker.get_attempted_issue_ids(source.name());
@@ -1143,20 +1387,31 @@ Create a PR with your changes."#,
         }
         drop(processing);
 
-        if candidates.is_empty() {
+        let candidates_count = candidates.len();
+        let matched_metric = ProcessingMetric::new("issues_matched", candidates_count as f64)
+            .with_source(source.name().to_string());
+        if let Err(e) = self.tracker.record_metric(&matched_metric) {
+            tracing::debug!(error = %e, "Failed to record issues_matched metric");
+        }
+
+        // Apply per-source max issues per cycle limit (falls back to global)
+        let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
+
+        // Sort by priority before selecting the subset that will be processed.
+        self.sort_by_priority(&mut candidates);
+        let to_process: Vec<_> = candidates.into_iter().take(source_max_issues).collect();
+
+        let to_process_count = to_process.len();
+        let queued_metric = ProcessingMetric::new("issues_queued", to_process_count as f64)
+            .with_source(source.name().to_string());
+        if let Err(e) = self.tracker.record_metric(&queued_metric) {
+            tracing::debug!(error = %e, "Failed to record issues_queued metric");
+        }
+        if to_process.is_empty() {
             tracing::info!(source = source.name(), "No new issues to process");
             return Ok(());
         }
 
-        // Sort by priority
-        self.sort_by_priority(&mut candidates);
-
-        // Apply per-source max issues per cycle limit (falls back to global)
-        let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
-        let candidates_count = candidates.len();
-        let to_process: Vec<_> = candidates.into_iter().take(source_max_issues).collect();
-
-        let to_process_count = to_process.len();
         let skipped = candidates_count.saturating_sub(source_max_issues);
         if skipped > 0 {
             tracing::info!(
@@ -1254,7 +1509,8 @@ Create a PR with your changes."#,
             // Process the issue
             let source_clone = Arc::clone(source);
             let this = self;
-            this.process_issue(source_clone, issue, match_result).await;
+            this.process_issue(source_clone, issue, match_result, None)
+                .await;
 
             // Add delay between starting new issues
             if i < source_max_issues - 1 && self.config.processing_delay_ms > 0 {
@@ -1286,7 +1542,9 @@ Create a PR with your changes."#,
         source: Arc<dyn IssueSource>,
         mut issue: Issue,
         match_result: MatchResult,
+        review_feedback: Option<String>,
     ) {
+        let processing_started_at = std::time::Instant::now();
         let processing_key = format!("{}:{}", source.name(), issue.id);
 
         // Atomic check-and-insert to prevent race conditions.
@@ -1448,15 +1706,250 @@ Create a PR with your changes."#,
                 context = format!("{}\n{}", context, similar_issues_context);
             }
 
-            let prompt = self.claude.build_prompt_for_issue(&issue, &context, &project_dir);
+            // Append PR review feedback context for review-driven reruns.
+            if let Some(ref feedback) = review_feedback {
+                context = format!(
+                    "{}\n\n## PR Review Feedback\n{}\n\nAddress all review feedback in this update.",
+                    context, feedback
+                );
+            }
 
-            // Enhance prompt with learnings from past outcomes
-            let prompt = {
-                let analyzer = self.feedback_analyzer.lock().await;
-                analyzer.enhance_prompt(&prompt, &issue)
+            let repo_scope = resolution.repo_name().map(|v| v.to_string());
+            let mut used_qa_ids: Vec<i64> = Vec::new();
+
+            // Preload reusable Q&A context before the first Claude run.
+            if self.config.ask.enabled {
+                let preload_query = format!("{} {}", issue.title, context);
+                let preload_norm = normalize_text(&preload_query);
+                let preload_embedding = embed_text(self.embedding_client.as_ref(), &preload_query).await;
+                match find_reusable_qa(
+                    self.tracker.as_ref(),
+                    &self.config.ask,
+                    source.name(),
+                    repo_scope.as_deref(),
+                    &preload_norm,
+                    preload_embedding.as_deref(),
+                ) {
+                    Ok(matches) if !matches.is_empty() => {
+                        context = format!("{}\n\n{}", context, format_reuse_context(&matches));
+                        if let Some(id) = attempt_id {
+                            for m in &matches {
+                                let _ = self
+                                    .tracker
+                                    .record_qa_usage(id, m.entry.id, "reused", m.final_score);
+                            }
+                        }
+                        used_qa_ids.extend(matches.into_iter().map(|m| m.entry.id));
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "Failed to preload reusable Q&A context"),
+                }
+            }
+
+            let mut rounds: u8 = 0;
+            let (claude_result, last_prompt) = loop {
+                let prompt = self.claude.build_prompt_for_issue(&issue, &context, &project_dir);
+
+                // Enhance prompt with learnings from past outcomes.
+                let prompt = {
+                    let analyzer = self.feedback_analyzer.lock().await;
+                    analyzer.enhance_prompt(&prompt, &issue)
+                };
+                let mut run_result = self
+                    .claude
+                    .execute_with_attempt(&prompt, Some(&issue), attempt_id, &project_dir)
+                    .await?;
+                run_result.used_qa_ids = used_qa_ids.clone();
+
+                let blocking_question = match (self.config.ask.enabled, run_result.blocking_question.clone()) {
+                    (true, Some(q)) => q,
+                    _ => break (run_result, prompt),
+                };
+
+                if rounds >= self.config.ask.max_rounds_per_attempt {
+                    run_result.success = false;
+                    run_result.error = Some(format!(
+                        "Maximum blocking-question rounds ({}) reached",
+                        self.config.ask.max_rounds_per_attempt
+                    ));
+                    break (run_result, prompt);
+                }
+                rounds = rounds.saturating_add(1);
+
+                let question_norm = normalize_text(&blocking_question.question);
+                let question_embedding =
+                    embed_text(self.embedding_client.as_ref(), &blocking_question.question).await;
+
+                let reusable = match find_reusable_qa(
+                    self.tracker.as_ref(),
+                    &self.config.ask,
+                    source.name(),
+                    repo_scope.as_deref(),
+                    &question_norm,
+                    question_embedding.as_deref(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to query reusable Q&A for blocking question");
+                        Vec::new()
+                    }
+                };
+
+                if let Some(best) = reusable.first() {
+                    if let Some(id) = attempt_id {
+                        let _ = self
+                            .tracker
+                            .record_qa_usage(id, best.entry.id, "reused", best.final_score);
+                    }
+                    if !used_qa_ids.contains(&best.entry.id) {
+                        used_qa_ids.push(best.entry.id);
+                    }
+                    let activity = ActivityLogEntry::new(
+                        "question_reused",
+                        format!("Reused stored Q&A for {}", issue.short_id),
+                    )
+                    .with_source(issue.source.clone())
+                    .with_issue(issue.id.clone(), issue.short_id.clone())
+                    .with_metadata(json!({
+                        "qa_id": best.entry.id,
+                        "score": best.final_score,
+                    }));
+                    self.tracker.record_activity(&activity).ok();
+
+                    context = format!(
+                        "{}\n\n{}",
+                        context,
+                        format_answer_context(
+                            &blocking_question,
+                            &best.entry.answer_text,
+                            &best.entry.channel,
+                            true,
+                        )
+                    );
+                    continue;
+                }
+
+                let resolved_user = issue.get_metadata::<String>("resolved_user");
+                let target_discord_id = resolved_user
+                    .as_deref()
+                    .and_then(|slug| self.user_registry.get_by_slug(slug))
+                    .and_then(|u| u.discord_id.clone());
+                let target_email = resolved_user
+                    .as_deref()
+                    .and_then(|slug| self.user_registry.get_by_slug(slug))
+                    .and_then(|u| u.email.clone());
+                let ask_request = AskRequest {
+                    correlation_id: build_correlation_id(&issue.short_id),
+                    source: issue.source.clone(),
+                    repo: repo_scope.clone(),
+                    issue_id: issue.id.clone(),
+                    short_id: issue.short_id.clone(),
+                    question: blocking_question.clone(),
+                    asked_at: Utc::now(),
+                    target_discord_id,
+                    target_email,
+                };
+
+                let asked_activity = ActivityLogEntry::new(
+                    "question_asked",
+                    format!("Asked human question for {}", issue.short_id),
+                )
+                .with_source(issue.source.clone())
+                .with_issue(issue.id.clone(), issue.short_id.clone())
+                .with_metadata(json!({
+                    "correlation_id": ask_request.correlation_id,
+                    "question": blocking_question.question,
+                }));
+                self.tracker.record_activity(&asked_activity).ok();
+
+                let reply = send_to_all_and_wait_first_reply(
+                    Arc::clone(&self.notifier),
+                    &issue,
+                    &ask_request,
+                    Duration::from_secs(self.config.ask.wait_timeout_secs),
+                    Duration::from_secs(self.config.ask.poll_interval_secs),
+                )
+                .await?;
+
+                if let Some(reply) = reply {
+                    let answered_activity = ActivityLogEntry::new(
+                        "question_answered",
+                        format!("Human answered question for {}", issue.short_id),
+                    )
+                    .with_source(issue.source.clone())
+                    .with_issue(issue.id.clone(), issue.short_id.clone())
+                    .with_metadata(json!({
+                        "channel": reply.channel,
+                        "responder": reply.responder,
+                        "correlation_id": reply.correlation_id,
+                    }));
+                    self.tracker.record_activity(&answered_activity).ok();
+
+                    let qa_entry = QaKnowledgeEntry {
+                        id: 0,
+                        source: issue.source.clone(),
+                        repo: repo_scope.clone(),
+                        issue_id: issue.id.clone(),
+                        short_id: issue.short_id.clone(),
+                        question_text: blocking_question.question.clone(),
+                        question_norm,
+                        question_embedding: question_embedding.clone(),
+                        answer_text: reply.answer.clone(),
+                        answer_norm: normalize_text(&reply.answer),
+                        answer_embedding: embed_text(self.embedding_client.as_ref(), &reply.answer).await,
+                        channel: reply.channel.clone(),
+                        responder: reply.responder.clone(),
+                        correlation_id: ask_request.correlation_id.clone(),
+                        asked_at: ask_request.asked_at,
+                        answered_at: reply.replied_at,
+                        success_count: 0,
+                        failure_count: 0,
+                        last_used_at: None,
+                        metadata: Some(json!({
+                            "context": blocking_question.context,
+                            "options": blocking_question.options,
+                            "why": blocking_question.why,
+                        })),
+                    };
+
+                    if let Ok(qa_id) = self.tracker.store_qa_knowledge(&qa_entry) {
+                        if let Some(id) = attempt_id {
+                            let _ = self.tracker.record_qa_usage(id, qa_id, "asked", 1.0);
+                        }
+                        if !used_qa_ids.contains(&qa_id) {
+                            used_qa_ids.push(qa_id);
+                        }
+                    }
+
+                    context = format!(
+                        "{}\n\n{}",
+                        context,
+                        format_answer_context(&blocking_question, &reply.answer, &reply.channel, false)
+                    );
+                    continue;
+                }
+
+                let timeout_activity = ActivityLogEntry::new(
+                    "question_timeout_best_effort",
+                    format!("No human reply received for {}", issue.short_id),
+                )
+                .with_source(issue.source.clone())
+                .with_issue(issue.id.clone(), issue.short_id.clone())
+                .with_metadata(json!({
+                    "best_effort": self.config.ask.best_effort_on_timeout,
+                    "question": blocking_question.question,
+                }));
+                self.tracker.record_activity(&timeout_activity).ok();
+
+                if self.config.ask.best_effort_on_timeout {
+                    context = format!("{}\n\n{}", context, format_timeout_context(&blocking_question));
+                    continue;
+                }
+
+                run_result.success = false;
+                run_result.error = Some("Timed out waiting for human reply".to_string());
+                break (run_result, prompt);
             };
-
-            let claude_result = self.claude.execute_with_attempt(&prompt, Some(&issue), attempt_id, &project_dir).await?;
 
             if claude_result.success {
                 if let Some(ref pr_url) = claude_result.pr_url {
@@ -1464,6 +1957,9 @@ Create a PR with your changes."#,
                     self.tracker
                         .mark_success(source.name(), &issue.id, pr_url)?;
                     self.notifier.notify_success(&issue, pr_url).await?;
+                    if let Some(id) = attempt_id {
+                        let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, true);
+                    }
 
                     // Record metric for PR creation
                     let metric = ProcessingMetric::new("pr_created", 1.0)
@@ -1521,10 +2017,13 @@ Create a PR with your changes."#,
                         "No PR URL found in output",
                     )?;
                     self.notifier.notify_completed(&issue).await?;
+                    if let Some(id) = attempt_id {
+                        let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, false);
+                    }
 
                     // Record feedback outcome
                     if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
-                        self.record_feedback_outcome(&attempt, &issue, &prompt, Outcome::Failed).await;
+                        self.record_feedback_outcome(&attempt, &issue, &last_prompt, Outcome::Failed).await;
                     }
 
                     // Log processing_completed activity without PR
@@ -1544,11 +2043,14 @@ Create a PR with your changes."#,
                 let error = claude_result.error.as_deref().unwrap_or("Unknown error");
                 tracing::error!(short_id = %issue.short_id, error = %error, "Failed");
                 self.tracker.mark_failed(source.name(), &issue.id, error)?;
-                self.notifier.notify_failed(&issue, error).await?;
+                self.notify_failed_with_escalation(&issue, error).await?;
+                if let Some(id) = attempt_id {
+                    let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, false);
+                }
 
                 // Record feedback outcome
                 if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
-                    self.record_feedback_outcome(&attempt, &issue, &prompt, Outcome::Failed).await;
+                    self.record_feedback_outcome(&attempt, &issue, &last_prompt, Outcome::Failed).await;
                 }
 
                 // Record error pattern for analytics
@@ -1565,7 +2067,10 @@ Create a PR with your changes."#,
             let _ = self
                 .tracker
                 .mark_failed(source.name(), &issue.id, &error_str);
-            let _ = self.notifier.notify_failed(&issue, &error_str).await;
+            if let Some(id) = attempt_id {
+                let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, false);
+            }
+            let _ = self.notify_failed_with_escalation(&issue, &error_str).await;
 
             // Record feedback outcome
             if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
@@ -1575,6 +2080,24 @@ Create a PR with your changes."#,
 
             // Record error pattern for analytics
             self.record_error_pattern(source.name(), &issue.id, &error_str);
+        }
+
+        // Record processing duration as a first-class metric for telemetry dashboards.
+        let final_status = self
+            .tracker
+            .get_attempt(source.name(), &issue.id)
+            .ok()
+            .flatten()
+            .map(|a| a.status.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let processing_time_metric = ProcessingMetric::new(
+            "processing_time",
+            processing_started_at.elapsed().as_secs_f64(),
+        )
+        .with_source(source.name().to_string())
+        .with_tags(json!({ "status": final_status }));
+        if let Err(e) = self.tracker.record_metric(&processing_time_metric) {
+            tracing::debug!(error = %e, "Failed to record processing_time metric");
         }
 
         // Cleanup
@@ -1598,6 +2121,49 @@ Create a PR with your changes."#,
 
         if let Err(e) = self.tracker.record_error_pattern(&pattern) {
             tracing::warn!(error = %e, "Failed to record error pattern");
+        }
+    }
+
+    /// Route hard failures to the global notifier user (override per-issue assignee routing).
+    async fn notify_failed_with_escalation(&self, issue: &Issue, error: &str) -> Result<()> {
+        if ClaudeRunner::is_hard_error(error) {
+            let mut global_issue = issue.clone();
+            global_issue.metadata.remove("resolved_user");
+            global_issue
+                .metadata
+                .insert("hard_error".to_string(), serde_json::Value::Bool(true));
+
+            let activity = ActivityLogEntry::new(
+                "error",
+                format!("Hard Claude error escalated for {}", issue.short_id),
+            )
+            .with_source(issue.source.clone())
+            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .with_metadata(json!({
+                "hard_error": true,
+                "rate_limited": ClaudeRunner::is_rate_limit_error(error),
+                "error": Self::truncate_error_for_activity(error),
+            }));
+            self.tracker.record_activity(&activity).ok();
+
+            return self.notifier.notify_failed(&global_issue, error).await;
+        }
+
+        self.notifier.notify_failed(issue, error).await
+    }
+
+    fn truncate_error_for_activity(error: &str) -> String {
+        let max_len = 500;
+        if error.len() <= max_len {
+            error.to_string()
+        } else {
+            let safe_end = error
+                .char_indices()
+                .take_while(|(i, _)| *i <= max_len.saturating_sub(3))
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            format!("{}...", &error[..safe_end])
         }
     }
 
@@ -1653,6 +2219,17 @@ Create a PR with your changes."#,
 
     /// Manually trigger processing for a specific issue.
     pub async fn trigger_issue(&self, source_name: &str, issue_id: &str) -> Result<()> {
+        self.trigger_issue_with_feedback(source_name, issue_id, None)
+            .await
+    }
+
+    /// Manually trigger processing for a specific issue with optional review feedback context.
+    pub async fn trigger_issue_with_feedback(
+        &self,
+        source_name: &str,
+        issue_id: &str,
+        review_feedback: Option<String>,
+    ) -> Result<()> {
         let source = self
             .sources
             .iter()
@@ -1669,7 +2246,7 @@ Create a PR with your changes."#,
         let issue = source.get_issue(issue_id).await?;
         let match_result = MatchResult::matched("Manual trigger", MatchPriority::Urgent);
 
-        self.process_issue(Arc::clone(source), issue, match_result)
+        self.process_issue(Arc::clone(source), issue, match_result, review_feedback)
             .await;
 
         Ok(())
@@ -1739,6 +2316,9 @@ Create a PR with your changes."#,
                                 "Failed to mark attempt as closed"
                             );
                         }
+                        let _ = self
+                            .tracker
+                            .update_qa_outcome_stats_for_attempt(attempt.id, false);
 
                         // Notify about the auto-close
                         let issue = Issue::new(
@@ -1759,6 +2339,13 @@ Create a PR with your changes."#,
                         // Record feedback outcome
                         self.record_feedback_outcome_from_attempt(&attempt, Outcome::Closed)
                             .await;
+
+                        // Stop review polling for auto-closed PRs.
+                        if let (Some(review_watcher), Some(pr_url)) =
+                            (self.review_watcher.as_ref(), attempt.pr_url.as_ref())
+                        {
+                            review_watcher.unwatch_pr(pr_url);
+                        }
 
                         if let Some(ref url) = attempt.pr_url {
                             auto_closed.push(url.clone());
@@ -1989,6 +2576,7 @@ mod tests {
             email: crate::config::EmailConfig::default(),
             sms: crate::config::SmsConfig::default(),
             push: crate::config::PushConfig::default(),
+            ask: crate::config::AskConfig::default(),
             github: crate::config::GitHubConfig::default(),
             github_app: crate::config::GitHubAppConfig::default(),
             retry: crate::config::RetryConfig::default(),
@@ -2574,6 +3162,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_watcher_poll_records_cycle_metrics() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), sources, false);
+        watcher.poll().await.unwrap();
+
+        let poll_cycle = tracker
+            .get_metrics("poll_cycle_duration_secs", None, 10)
+            .unwrap();
+        assert_eq!(poll_cycle.len(), 1);
+        assert!(poll_cycle[0].metric_value >= 0.0);
+
+        let poll_sources = tracker.get_metrics("poll_sources", None, 10).unwrap();
+        assert_eq!(poll_sources.len(), 1);
+        assert_eq!(poll_sources[0].metric_value, 0.0);
+
+        assert_eq!(
+            tracker
+                .get_metrics("ready_retries_found", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .get_metrics("ready_retries_executed_total", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .get_metrics("ready_retries_failed_total", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .get_metrics("pr_status_checks", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn test_watcher_poll_dry_run() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -2684,6 +3321,28 @@ mod tests {
         // poll_source returns Result<()>, not Vec
         let result = watcher.poll_source(&source).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_watcher_poll_source_records_zero_stage_metrics() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("empty")) as Arc<dyn IssueSource>;
+        let sources = vec![source.clone()];
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), sources, false);
+        watcher.poll_source(&source).await.unwrap();
+
+        let fetched = tracker.get_metrics("issues_fetched", None, 10).unwrap();
+        let matched = tracker.get_metrics("issues_matched", None, 10).unwrap();
+        let queued = tracker.get_metrics("issues_queued", None, 10).unwrap();
+
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(fetched[0].metric_value, 0.0);
+        assert_eq!(matched[0].metric_value, 0.0);
+        assert_eq!(queued[0].metric_value, 0.0);
     }
 
     #[tokio::test]
