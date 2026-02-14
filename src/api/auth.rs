@@ -181,6 +181,7 @@ pub async fn login_handler(
     let mut cookie = Cookie::new(SESSION_COOKIE, token);
     cookie.set_path("/");
     cookie.set_http_only(true);
+    cookie.set_secure(true);
     cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
     cookie.set_max_age(tower_cookies::cookie::time::Duration::days(
         SESSION_MAX_AGE_DAYS,
@@ -300,11 +301,35 @@ pub async fn create_user_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Validate email
+    if body.email.trim().is_empty() || !body.email.contains('@') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Validate password (minimum 8 characters)
+    if body.password.len() < 8 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Validate name
+    if body.name.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let db = state
         .tracker
         .as_any()
         .downcast_ref::<SqliteTracker>()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Check for duplicate email
+    if db
+        .get_user_by_email(&body.email)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_some()
+    {
+        return Err(StatusCode::CONFLICT);
+    }
 
     // Hash password
     let password_hash = bcrypt::hash(&body.password, bcrypt::DEFAULT_COST)
@@ -650,7 +675,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"new@test.com","password":"newpass","name":"New User","role":"viewer"}"#,
+                        r#"{"email":"new@test.com","password":"newpass1!","name":"New User","role":"viewer"}"#,
                     ))
                     .unwrap(),
             )
@@ -679,7 +704,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::from(
-                        r#"{"email":"new@test.com","password":"newpass","name":"New User","role":"viewer"}"#,
+                        r#"{"email":"new@test.com","password":"newpass1!","name":"New User","role":"viewer"}"#,
                     ))
                     .unwrap(),
             )
