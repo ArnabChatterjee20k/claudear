@@ -680,6 +680,10 @@ impl SqliteTracker {
 }
 
 impl FixAttemptTracker for SqliteTracker {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn has_attempted(&self, source: &str, issue_id: &str) -> bool {
         let conn = match self.conn.lock() {
             Ok(c) => c,

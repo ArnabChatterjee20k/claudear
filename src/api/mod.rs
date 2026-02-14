@@ -2,6 +2,7 @@
 //!
 //! Provides REST API for the analytics dashboard.
 
+pub mod auth;
 mod routes;
 
 pub use routes::{create_api_router, create_api_router_with_dashboard};
@@ -11,6 +12,7 @@ use crate::error::Result;
 use crate::storage::FixAttemptTracker;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tower_cookies::CookieManagerLayer;
 use tower_http::cors::{Any, CorsLayer};
 
 /// API server configuration.
@@ -70,7 +72,8 @@ impl ApiServer {
             self.tracker.clone(),
             self.dashboard_dir.clone(),
         )
-        .layer(cors);
+        .layer(cors)
+        .layer(CookieManagerLayer::new());
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
 

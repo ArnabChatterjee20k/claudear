@@ -25,6 +25,9 @@ use std::collections::HashSet;
 
 /// Trait for tracking fix attempts.
 pub trait FixAttemptTracker: Send + Sync {
+    /// Downcast to concrete type for auth operations.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Check if an issue has already been attempted.
     fn has_attempted(&self, source: &str, issue_id: &str) -> bool;
 
