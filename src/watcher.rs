@@ -17,6 +17,7 @@ use crate::types::{
     ActivityLogEntry, ErrorPattern, FixAttemptStats, Issue, MatchPriority, MatchResult,
     ProcessingMetric,
 };
+use crate::users::UserRegistry;
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -37,6 +38,7 @@ pub struct WatcherOptions {
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub relationships: Option<RepoRelationships>,
     pub github_client: Option<GitHubClient>,
+    pub user_registry: UserRegistry,
     pub dry_run: bool,
 }
 
@@ -53,6 +55,7 @@ pub struct Watcher {
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     relationships: Option<RepoRelationships>,
     github_client: Option<GitHubClient>,
+    user_registry: UserRegistry,
     claude: ClaudeRunner,
     dry_run: bool,
     is_running: AtomicBool,
@@ -87,6 +90,7 @@ impl Watcher {
             issue_embedding_service: options.issue_embedding_service,
             relationships: options.relationships,
             github_client: options.github_client,
+            user_registry: options.user_registry,
             dry_run: options.dry_run,
             is_running: AtomicBool::new(false),
             processing: RwLock::new(HashSet::new()),
@@ -1281,7 +1285,7 @@ Create a PR with your changes."#,
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
-        issue: Issue,
+        mut issue: Issue,
         match_result: MatchResult,
     ) {
         let processing_key = format!("{}:{}", source.name(), issue.id);
@@ -1399,6 +1403,18 @@ Create a PR with your changes."#,
             .ok()
             .flatten()
             .map(|a| a.id);
+
+        // Resolve issue assignee to a configured user
+        if let Some(assignee) = issue.get_metadata::<String>("assignee") {
+            if let Some(resolved) = self.user_registry.resolve(&issue.source, &assignee) {
+                tracing::info!(
+                    short_id = %issue.short_id,
+                    user = %resolved.slug,
+                    "Resolved issue assignee to user"
+                );
+                issue.set_metadata("resolved_user", &resolved.slug);
+            }
+        }
 
         let result = async {
             // Notify start
@@ -2003,6 +2019,7 @@ mod tests {
             issue_embedding_service: None,
             relationships: None,
             github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
             dry_run,
         })
     }
@@ -2278,6 +2295,7 @@ mod tests {
             issue_embedding_service: None,
             relationships: None,
             github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
             dry_run: true,
         };
 
@@ -2810,6 +2828,7 @@ mod tests {
             issue_embedding_service: None,
             relationships: None,
             github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
             dry_run: false,
         });
 
@@ -2889,6 +2908,7 @@ mod tests {
             issue_embedding_service: None,
             relationships: None,
             github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
             dry_run: true,
         });
 

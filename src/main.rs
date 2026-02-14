@@ -22,6 +22,7 @@ use claudear::{
     source::{IssueSource, LinearSource, SentrySource},
     storage::{FixAttemptTracker, SqliteTracker},
     types::{ActivityLogEntry, FixAttemptStatus},
+    users::UserRegistry,
     watcher::{Watcher, WatcherOptions},
     webhook::{
         print_setup_result, LinearWebhookHandler, SentryWebhookHandler, WebhookConfigurator,
@@ -1718,6 +1719,7 @@ async fn main() -> anyhow::Result<()> {
                 issue_embedding_service: None,
                 relationships,
                 github_client: github_client_for_watcher,
+                user_registry: UserRegistry::new(config.users.clone()),
                 dry_run: false,
             })))
         } else {
@@ -2149,6 +2151,7 @@ async fn main() -> anyhow::Result<()> {
             issue_embedding_service: None,
             relationships: None,
             github_client: None,
+            user_registry: UserRegistry::new(config.users.clone()),
             dry_run: false,
         });
 
@@ -2401,6 +2404,7 @@ async fn main() -> anyhow::Result<()> {
                 issue_embedding_service: None,
                 relationships: None,
                 github_client: None,
+                user_registry: UserRegistry::new(config.users.clone()),
                 dry_run,
             });
 
