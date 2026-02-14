@@ -2424,18 +2424,21 @@ work_dir: /tmp/repos
         let config_path = dir.path().join("claudear.yaml");
         fs::write(&config_path, "work_dir: /tmp/repos\n").unwrap();
 
-        with_env(&[("CLAUDE_INSTRUCTIONS_FILE", "my-instructions.md")], || {
-            let config = Config::load(&config_path).unwrap();
-            assert_eq!(
-                config.claude.instructions_file,
-                Some("my-instructions.md".to_string())
-            );
-            // After load, instructions should contain resolved file content
-            assert_eq!(
-                config.claude.instructions,
-                Some("File content.".to_string())
-            );
-        });
+        with_env(
+            &[("CLAUDE_INSTRUCTIONS_FILE", "my-instructions.md")],
+            || {
+                let config = Config::load(&config_path).unwrap();
+                assert_eq!(
+                    config.claude.instructions_file,
+                    Some("my-instructions.md".to_string())
+                );
+                // After load, instructions should contain resolved file content
+                assert_eq!(
+                    config.claude.instructions,
+                    Some("File content.".to_string())
+                );
+            },
+        );
     }
 
     #[test]
