@@ -4,6 +4,7 @@ use super::Notifier;
 use crate::config::PushConfig;
 use crate::error::{Error, Result};
 use crate::types::Issue;
+use crate::users::UserRegistry;
 use async_trait::async_trait;
 use serde::Serialize;
 
@@ -11,6 +12,7 @@ use serde::Serialize;
 pub struct PushNotifier {
     config: PushConfig,
     client: reqwest::Client,
+    user_registry: UserRegistry,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,11 +36,25 @@ struct PushoverMessage {
 
 impl PushNotifier {
     /// Create a new push notifier.
-    pub fn new(config: PushConfig) -> Self {
+    pub fn new(config: PushConfig, user_registry: UserRegistry) -> Self {
         Self {
             config,
             client: reqwest::Client::new(),
+            user_registry,
         }
+    }
+
+    fn resolve_user_key(&self, issue: Option<&Issue>) -> Option<String> {
+        if let Some(issue) = issue {
+            if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
+                if let Some(user) = self.user_registry.get_by_slug(&slug) {
+                    if user.push_user_key.is_some() {
+                        return user.push_user_key.clone();
+                    }
+                }
+            }
+        }
+        self.config.user_key.clone()
     }
 
     async fn send_push(
@@ -48,10 +64,16 @@ impl PushNotifier {
         url: Option<&str>,
         url_title: Option<&str>,
         priority: Option<i8>,
+        issue: Option<&Issue>,
     ) -> Result<()> {
-        let (api_token, user_key) = match (&self.config.api_token, &self.config.user_key) {
-            (Some(token), Some(key)) => (token, key),
-            _ => return Ok(()),
+        let api_token = match &self.config.api_token {
+            Some(token) => token,
+            None => return Ok(()),
+        };
+
+        let user_key = match self.resolve_user_key(issue) {
+            Some(key) => key,
+            None => return Ok(()),
         };
 
         // Truncate message if too long (Pushover limit is 1024 chars for message)
@@ -63,7 +85,7 @@ impl PushNotifier {
 
         let push_message = PushoverMessage {
             token: api_token.clone(),
-            user: user_key.clone(),
+            user: user_key,
             message: truncated_message,
             title: Some(title.to_string()),
             url: url.map(|s| s.to_string()),
@@ -123,6 +145,7 @@ impl Notifier for PushNotifier {
             Some(&issue.url),
             Some("View Issue"),
             Some(-1),
+            Some(issue),
         )
         .await
     }
@@ -131,8 +154,15 @@ impl Notifier for PushNotifier {
         let title = format!("\u{2705} PR Created: {}", issue.short_id);
         let message = format!("{}\n\nPR URL: {}", issue.title, pr_url);
 
-        self.send_push(&title, &message, Some(pr_url), Some("View PR"), Some(0))
-            .await
+        self.send_push(
+            &title,
+            &message,
+            Some(pr_url),
+            Some("View PR"),
+            Some(0),
+            Some(issue),
+        )
+        .await
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
@@ -145,6 +175,7 @@ impl Notifier for PushNotifier {
             Some(&issue.url),
             Some("View Issue"),
             Some(-1),
+            Some(issue),
         )
         .await
     }
@@ -160,12 +191,13 @@ impl Notifier for PushNotifier {
             Some(&issue.url),
             Some("View Issue"),
             Some(1),
+            Some(issue),
         )
         .await
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
-        self.send_push("Claude Watchers", message, None, None, Some(-1))
+        self.send_push("Claude Watchers", message, None, None, Some(-1), None)
             .await
     }
 
@@ -191,13 +223,18 @@ impl Notifier for PushNotifier {
             .join("\n");
 
         // High priority for urgent issues
-        self.send_push(&title, &message, None, None, Some(1)).await
+        self.send_push(&title, &message, None, None, Some(1), None)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_registry() -> UserRegistry {
+        UserRegistry::new(std::collections::HashMap::new())
+    }
 
     fn disabled_config() -> PushConfig {
         PushConfig {
@@ -234,7 +271,7 @@ mod tests {
             device: None,
             priority: None,
         };
-        let notifier = PushNotifier::new(enabled_config);
+        let notifier = PushNotifier::new(enabled_config, empty_registry());
         assert!(notifier.is_enabled());
 
         let disabled_config = PushConfig {
@@ -243,7 +280,7 @@ mod tests {
             device: None,
             priority: None,
         };
-        let notifier = PushNotifier::new(disabled_config);
+        let notifier = PushNotifier::new(disabled_config, empty_registry());
         assert!(!notifier.is_enabled());
     }
 
@@ -255,14 +292,14 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
         assert_eq!(notifier.name(), "push");
     }
 
     #[test]
     fn test_is_enabled_partial_configs() {
-        assert!(!PushNotifier::new(partial_config_no_token()).is_enabled());
-        assert!(!PushNotifier::new(partial_config_no_user()).is_enabled());
+        assert!(!PushNotifier::new(partial_config_no_token(), empty_registry()).is_enabled());
+        assert!(!PushNotifier::new(partial_config_no_user(), empty_registry()).is_enabled());
     }
 
     #[test]
@@ -284,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_start_disabled() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier.notify_start(&issue).await;
@@ -293,7 +330,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_success_disabled() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier
@@ -304,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_completed_disabled() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier.notify_completed(&issue).await;
@@ -313,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_failed_disabled() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier.notify_failed(&issue, "Error message").await;
@@ -322,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_status_disabled() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
 
         let result = notifier.notify_status("Status update").await;
         assert!(result.is_ok());
@@ -330,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_empty() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
 
         let result = notifier.notify_urgent_issues(&[]).await;
         assert!(result.is_ok());
@@ -338,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_disabled() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
         let issues = vec![
             Issue::new("1", "PROJ-1", "Issue 1", "https://example.com", "linear"),
             Issue::new("2", "PROJ-2", "Issue 2", "https://example.com", "linear"),
@@ -350,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_single() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
         let issues = vec![Issue::new(
             "1",
             "PROJ-1",
@@ -365,7 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_truncated_to_five() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
         let issues: Vec<Issue> = (0..10)
             .map(|i| {
                 Issue::new(
@@ -438,13 +475,13 @@ mod tests {
             priority: Some(1),
         };
 
-        let notifier = PushNotifier::new(config);
+        let notifier = PushNotifier::new(config, empty_registry());
         assert!(notifier.is_enabled());
     }
 
     #[tokio::test]
     async fn test_notify_start_different_sources() {
-        let notifier = PushNotifier::new(disabled_config());
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
 
         for source in ["linear", "sentry", "github", "jira", "unknown"] {
             let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", source);

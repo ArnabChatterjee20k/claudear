@@ -533,7 +533,7 @@ fn create_webhook_handlers(config: &Config) -> WebhookHandlerRegistry {
     registry
 }
 
-fn create_notifier(config: &Config) -> Arc<dyn Notifier> {
+fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Notifier> {
     let mut composite = CompositeNotifier::new();
 
     // Always add console notifier
@@ -541,12 +541,15 @@ fn create_notifier(config: &Config) -> Arc<dyn Notifier> {
 
     // Add Discord if configured
     if config.discord.webhook_url.is_some() {
-        composite.add(Arc::new(DiscordNotifier::new(config.discord.clone())));
+        composite.add(Arc::new(DiscordNotifier::new(
+            config.discord.clone(),
+            user_registry.clone(),
+        )));
         tracing::info!("Discord notifier enabled");
     }
 
     // Add Email if configured
-    if let Ok(email_notifier) = EmailNotifier::new(config.email.clone()) {
+    if let Ok(email_notifier) = EmailNotifier::new(config.email.clone(), user_registry.clone()) {
         if email_notifier.is_enabled() {
             composite.add(Arc::new(email_notifier));
             tracing::info!("Email notifier enabled");
@@ -554,14 +557,14 @@ fn create_notifier(config: &Config) -> Arc<dyn Notifier> {
     }
 
     // Add SMS if configured
-    let sms_notifier = SmsNotifier::new(config.sms.clone());
+    let sms_notifier = SmsNotifier::new(config.sms.clone(), user_registry.clone());
     if sms_notifier.is_enabled() {
         composite.add(Arc::new(sms_notifier));
         tracing::info!("SMS notifier enabled");
     }
 
     // Add Push if configured
-    let push_notifier = PushNotifier::new(config.push.clone());
+    let push_notifier = PushNotifier::new(config.push.clone(), user_registry);
     if push_notifier.is_enabled() {
         composite.add(Arc::new(push_notifier));
         tracing::info!("Push notifier enabled");
@@ -1627,7 +1630,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize components
     tracing::info!("Initializing...");
-    let notifier = create_notifier(&config);
+    let user_registry = UserRegistry::new(config.users.clone());
+    let notifier = create_notifier(&config, user_registry.clone());
     let (tracker, sqlite_tracker) = create_tracker(&config);
 
     // Handle Start command (daemon mode with IPC - runs all services concurrently)
@@ -1719,7 +1723,7 @@ async fn main() -> anyhow::Result<()> {
                 issue_embedding_service: None,
                 relationships,
                 github_client: github_client_for_watcher,
-                user_registry: UserRegistry::new(config.users.clone()),
+                user_registry: user_registry.clone(),
                 dry_run: false,
             })))
         } else {
@@ -2151,7 +2155,7 @@ async fn main() -> anyhow::Result<()> {
             issue_embedding_service: None,
             relationships: None,
             github_client: None,
-            user_registry: UserRegistry::new(config.users.clone()),
+            user_registry: user_registry.clone(),
             dry_run: false,
         });
 
@@ -2404,7 +2408,7 @@ async fn main() -> anyhow::Result<()> {
                 issue_embedding_service: None,
                 relationships: None,
                 github_client: None,
-                user_registry: UserRegistry::new(config.users.clone()),
+                user_registry: user_registry.clone(),
                 dry_run,
             });
 

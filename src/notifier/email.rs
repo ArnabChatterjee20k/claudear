@@ -4,6 +4,7 @@ use super::Notifier;
 use crate::config::EmailConfig;
 use crate::error::{Error, Result};
 use crate::types::Issue;
+use crate::users::UserRegistry;
 use async_trait::async_trait;
 use lettre::{
     message::{header::ContentType, Mailbox},
@@ -15,11 +16,12 @@ use lettre::{
 pub struct EmailNotifier {
     config: EmailConfig,
     transport: Option<AsyncSmtpTransport<Tokio1Executor>>,
+    user_registry: UserRegistry,
 }
 
 impl EmailNotifier {
     /// Create a new email notifier.
-    pub fn new(config: EmailConfig) -> Result<Self> {
+    pub fn new(config: EmailConfig, user_registry: UserRegistry) -> Result<Self> {
         let transport = if let (Some(host), Some(username), Some(password)) = (
             config.smtp_host.as_ref(),
             config.smtp_username.as_ref(),
@@ -39,10 +41,27 @@ impl EmailNotifier {
             None
         };
 
-        Ok(Self { config, transport })
+        Ok(Self {
+            config,
+            transport,
+            user_registry,
+        })
     }
 
-    async fn send_email(&self, subject: &str, body: &str) -> Result<()> {
+    fn resolve_recipients(&self, issue: Option<&Issue>) -> Vec<String> {
+        if let Some(issue) = issue {
+            if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
+                if let Some(user) = self.user_registry.get_by_slug(&slug) {
+                    if let Some(ref email) = user.email {
+                        return vec![email.clone()];
+                    }
+                }
+            }
+        }
+        self.config.to_addresses.clone()
+    }
+
+    async fn send_email(&self, subject: &str, body: &str, issue: Option<&Issue>) -> Result<()> {
         let transport = match &self.transport {
             Some(t) => t,
             None => return Ok(()),
@@ -55,7 +74,9 @@ impl EmailNotifier {
             None => return Ok(()),
         };
 
-        for to_address in &self.config.to_addresses {
+        let recipients = self.resolve_recipients(issue);
+
+        for to_address in &recipients {
             let to_mailbox = to_address
                 .parse::<Mailbox>()
                 .map_err(|e| Error::notifier("email", format!("Invalid to address: {}", e)))?;
@@ -103,7 +124,7 @@ impl Notifier for EmailNotifier {
             "Claude Watchers is now processing an issue.\n\n{}\n\nYou will receive another notification when processing completes.",
             Self::format_issue_info(issue)
         );
-        self.send_email(&subject, &body).await
+        self.send_email(&subject, &body, Some(issue)).await
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
@@ -113,7 +134,7 @@ impl Notifier for EmailNotifier {
             Self::format_issue_info(issue),
             pr_url
         );
-        self.send_email(&subject, &body).await
+        self.send_email(&subject, &body, Some(issue)).await
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
@@ -122,7 +143,7 @@ impl Notifier for EmailNotifier {
             "Claude Watchers completed processing but no PR URL was captured.\n\n{}",
             Self::format_issue_info(issue)
         );
-        self.send_email(&subject, &body).await
+        self.send_email(&subject, &body, Some(issue)).await
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
@@ -132,12 +153,12 @@ impl Notifier for EmailNotifier {
             Self::format_issue_info(issue),
             error
         );
-        self.send_email(&subject, &body).await
+        self.send_email(&subject, &body, Some(issue)).await
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
         let subject = "[Claude Watchers] Status Update".to_string();
-        self.send_email(&subject, message).await
+        self.send_email(&subject, message, None).await
     }
 
     async fn notify_urgent_issues(&self, issues: &[Issue]) -> Result<()> {
@@ -159,7 +180,7 @@ impl Notifier for EmailNotifier {
             ));
         }
 
-        self.send_email(&subject, &body).await
+        self.send_email(&subject, &body, None).await
     }
 }
 
@@ -167,6 +188,10 @@ impl Notifier for EmailNotifier {
 mod tests {
     use super::*;
     use crate::types::{IssuePriority, IssueStatus};
+
+    fn empty_registry() -> UserRegistry {
+        UserRegistry::new(std::collections::HashMap::new())
+    }
 
     fn disabled_config() -> EmailConfig {
         EmailConfig {
@@ -206,33 +231,33 @@ mod tests {
 
     #[test]
     fn test_new_disabled() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
         assert_eq!(notifier.name(), "email");
         assert!(!notifier.is_enabled());
     }
 
     #[test]
     fn test_name() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
         assert_eq!(notifier.name(), "email");
     }
 
     #[test]
     fn test_is_enabled_no_transport() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
         assert!(!notifier.is_enabled());
     }
 
     #[test]
     fn test_is_enabled_no_from() {
-        let notifier = EmailNotifier::new(partial_config()).unwrap();
+        let notifier = EmailNotifier::new(partial_config(), empty_registry()).unwrap();
         // Has transport but no from address
         assert!(!notifier.is_enabled());
     }
 
     #[test]
     fn test_is_enabled_no_to() {
-        let notifier = EmailNotifier::new(no_to_config()).unwrap();
+        let notifier = EmailNotifier::new(no_to_config(), empty_registry()).unwrap();
         // Has transport and from but no recipients
         assert!(!notifier.is_enabled());
     }
@@ -292,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_start_disabled() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         // Should return Ok even when disabled
@@ -302,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_success_disabled() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier
@@ -313,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_completed_disabled() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier.notify_completed(&issue).await;
@@ -322,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_failed_disabled() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier.notify_failed(&issue, "Error message").await;
@@ -331,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_status_disabled() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
 
         let result = notifier.notify_status("Status update").await;
         assert!(result.is_ok());
@@ -339,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_empty() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
 
         let result = notifier.notify_urgent_issues(&[]).await;
         assert!(result.is_ok());
@@ -347,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_disabled() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
         let issues = vec![
             Issue::new("1", "PROJ-1", "Issue 1", "https://example.com", "linear"),
             Issue::new("2", "PROJ-2", "Issue 2", "https://example.com", "linear"),
@@ -359,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_single_vs_plural() {
-        let notifier = EmailNotifier::new(disabled_config()).unwrap();
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
 
         // Single issue
         let single = vec![Issue::new(
@@ -393,7 +418,7 @@ mod tests {
             use_tls: false,
         };
 
-        let notifier = EmailNotifier::new(config).unwrap();
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
         // Should create successfully with dangerous builder
         assert_eq!(notifier.name(), "email");
     }
