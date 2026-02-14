@@ -390,11 +390,15 @@ impl<H: SentryHttpClient + 'static> IssueSource for SentrySource<H> {
         let top_issues = top_result?;
 
         // Track escalating IDs
-        {
-            let mut ids = self.escalating_issue_ids.write().unwrap();
-            ids.clear();
-            for issue in &escalating_issues {
-                ids.insert(issue.id.clone());
+        match self.escalating_issue_ids.write() {
+            Ok(mut ids) => {
+                ids.clear();
+                for issue in &escalating_issues {
+                    ids.insert(issue.id.clone());
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "escalating_issue_ids RwLock poisoned, skipping update");
             }
         }
 

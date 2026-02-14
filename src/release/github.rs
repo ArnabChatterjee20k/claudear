@@ -610,8 +610,15 @@ impl<H: HttpClient> ReleaseClient<H> {
                     semver::Version::parse(min_ver),
                 ) {
                     (Ok(lock_semver), Ok(min_semver)) => Ok(lock_semver >= min_semver),
-                    // Fall back to string comparison
-                    _ => Ok(lock_ver >= min_ver),
+                    // Fall back to string comparison (may be incorrect for multi-digit segments)
+                    _ => {
+                        tracing::warn!(
+                            lock_ver = lock_ver,
+                            min_ver = min_ver,
+                            "Non-semver version comparison, falling back to lexicographic"
+                        );
+                        Ok(lock_ver >= min_ver)
+                    }
                 }
             }
             None => Ok(false),

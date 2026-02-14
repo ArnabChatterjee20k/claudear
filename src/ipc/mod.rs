@@ -108,7 +108,10 @@ fn is_process_running(pid: u32) -> bool {
         // SAFETY: kill with signal 0 doesn't actually send a signal,
         // it just checks if the process exists and we have permission to signal it.
         // Returns 0 if process exists, -1 if not (with errno set to ESRCH).
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        match i32::try_from(pid) {
+            Ok(pid_i32) => unsafe { libc::kill(pid_i32, 0) == 0 },
+            Err(_) => false, // PID exceeds i32::MAX, cannot be valid
+        }
     }
 
     // Fallback for other platforms

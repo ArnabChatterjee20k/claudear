@@ -147,7 +147,6 @@ pub struct ActivityEntry {
 /// Types of activity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ActivityType {
-    // === Issue Events ===
     /// Issue detected.
     IssueDetected,
 
@@ -169,7 +168,6 @@ pub enum ActivityType {
     /// Issue was escalated (e.g., Sentry event count spike).
     IssueEscalated,
 
-    // === Processing Events ===
     /// Processing started.
     ProcessingStarted,
 
@@ -188,7 +186,6 @@ pub enum ActivityType {
     /// A retry is being executed.
     RetryExecuted,
 
-    // === PR Events ===
     /// PR created.
     PrCreated,
 
@@ -216,7 +213,6 @@ pub enum ActivityType {
     /// PR was auto-closed because the source issue was resolved/cancelled.
     PrAutoClosed,
 
-    // === Claude Events ===
     /// Claude execution started.
     ClaudeStarted,
 
@@ -229,7 +225,6 @@ pub enum ActivityType {
     /// Claude execution failed.
     ClaudeFailed,
 
-    // === Webhook Events ===
     /// Webhook received.
     WebhookReceived,
 
@@ -239,7 +234,6 @@ pub enum ActivityType {
     /// Webhook rejected (invalid signature, filtered out, etc.).
     WebhookRejected,
 
-    // === System Events ===
     /// Watcher started.
     WatcherStarted,
 

@@ -13,7 +13,7 @@ use crate::storage::FixAttemptTracker;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_cookies::CookieManagerLayer;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 /// API server configuration.
 pub struct ApiServer {
@@ -62,10 +62,7 @@ impl ApiServer {
 
     /// Start the API server.
     pub async fn start(self) -> Result<()> {
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
+        let cors = CorsLayer::permissive();
 
         let app = create_api_router_with_dashboard(
             self.config.clone(),
