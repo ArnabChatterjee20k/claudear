@@ -541,14 +541,14 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                     if !write_failed
                         && (file.write_all(line.as_bytes()).await.is_err()
                             || file.write_all(b"\n").await.is_err())
-                        {
-                            write_failed = true;
-                            tracing::warn!(
-                                component = "claude",
-                                label = label_stdout.as_str(),
-                                "Failed writing Claude stdout to execution log file"
-                            );
-                        }
+                    {
+                        write_failed = true;
+                        tracing::warn!(
+                            component = "claude",
+                            label = label_stdout.as_str(),
+                            "Failed writing Claude stdout to execution log file"
+                        );
+                    }
                 }
 
                 output.push_str(&line);
@@ -613,14 +613,14 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                     if !write_failed
                         && (file.write_all(line.as_bytes()).await.is_err()
                             || file.write_all(b"\n").await.is_err())
-                        {
-                            write_failed = true;
-                            tracing::warn!(
-                                component = "claude",
-                                label = label_stderr.as_str(),
-                                "Failed writing Claude stderr to execution log file"
-                            );
-                        }
+                    {
+                        write_failed = true;
+                        tracing::warn!(
+                            component = "claude",
+                            label = label_stderr.as_str(),
+                            "Failed writing Claude stderr to execution log file"
+                        );
+                    }
                 }
 
                 output.push_str(&line);
