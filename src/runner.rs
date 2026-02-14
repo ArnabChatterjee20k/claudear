@@ -12,6 +12,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::oneshot;
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const CLAUDE_LOG_SUBDIR: &str = "claude";
@@ -485,10 +486,11 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         let stdout_log_path = log_files.as_ref().map(|f| f.stdout.clone());
         let stderr_log_path = log_files.as_ref().map(|f| f.stderr.clone());
 
-        // Stream stdout
+        let (question_tx, question_rx) = oneshot::channel::<()>();
         let stdout_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut output = String::new();
+            let mut question_tx = Some(question_tx);
             let mut writer = match stdout_log_path {
                 Some(path) => match tokio::fs::OpenOptions::new()
                     .create(true)
@@ -535,6 +537,18 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                         "{}",
                         line
                     );
+                }
+
+                // Detect blocking question in real-time and signal parent.
+                if question_tx.is_some() && line.trim().starts_with(QUESTION_PROTOCOL_PREFIX) {
+                    tracing::info!(
+                        component = "claude",
+                        label = label_stdout.as_str(),
+                        "Blocking question detected in stream, signalling early termination"
+                    );
+                    if let Some(tx) = question_tx.take() {
+                        let _ = tx.send(());
+                    }
                 }
 
                 if let Some(file) = writer.as_mut() {
@@ -629,16 +643,47 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
             output
         });
 
-        // Wait for process with timeout
         let timeout_duration = std::time::Duration::from_secs(self.config.timeout_secs);
-        let wait_result = tokio::time::timeout(timeout_duration, child.wait()).await;
 
-        let (status, timed_out) = match wait_result {
-            Ok(Ok(status)) => (status, false),
-            Ok(Err(e)) => {
+        enum WaitOutcome {
+            Exited(std::result::Result<std::process::ExitStatus, std::io::Error>),
+            QuestionDetected,
+            TimedOut,
+        }
+
+        let outcome = tokio::select! {
+            result = child.wait() => WaitOutcome::Exited(result),
+            _ = question_rx => WaitOutcome::QuestionDetected,
+            _ = tokio::time::sleep(timeout_duration) => WaitOutcome::TimedOut,
+        };
+
+        let (status, timed_out) = match outcome {
+            WaitOutcome::Exited(Ok(status)) => (status, false),
+            WaitOutcome::Exited(Err(e)) => {
                 return Err(Error::runner(format!("Failed to wait for claude: {}", e)));
             }
-            Err(_) => {
+            WaitOutcome::QuestionDetected => {
+                tracing::info!(
+                    component = "claude",
+                    label = label,
+                    "Killing subprocess early — blocking question detected in stream"
+                );
+                if let Err(e) = child.kill().await {
+                    tracing::error!(component = "claude", error = %e, "Failed to kill process after question detected");
+                }
+                // Wait for the process to actually finish so pipes are drained.
+                let exit_status = child.wait().await;
+                let status = match exit_status {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(component = "claude", error = %e, "Failed to reap killed process");
+                        // Fabricate a non-success status; the question is already captured.
+                        std::process::ExitStatus::default()
+                    }
+                };
+                (status, false)
+            }
+            WaitOutcome::TimedOut => {
                 // Timeout occurred - try to kill the process
                 tracing::error!(
                     component = "claude",
