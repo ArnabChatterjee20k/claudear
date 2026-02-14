@@ -2659,7 +2659,7 @@ claude:
 
         let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"my-instructions.md\"\n  instructions: \"And inline.\"";
         let config_path = dir.path().join("claudear.yaml");
-        fs::write(&config_path, &yaml).unwrap();
+        fs::write(&config_path, yaml).unwrap();
 
         with_env(&[], || {
             let config = Config::load(&config_path).unwrap();

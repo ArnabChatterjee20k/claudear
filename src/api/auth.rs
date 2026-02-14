@@ -698,7 +698,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri(&format!("/api/users/{}", admin_id))
+                    .uri(format!("/api/users/{}", admin_id))
                     .header("cookie", format!("claudear_session={}", token))
                     .body(Body::empty())
                     .unwrap(),
