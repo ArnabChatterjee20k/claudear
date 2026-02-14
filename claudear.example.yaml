@@ -113,6 +113,31 @@ claude:
   skip_permissions: true
 
 # ============================================
+# User Registry (Optional)
+# ============================================
+# Map team members to their identifiers across services.
+# When an issue is assigned to a user, notifications are routed to them specifically.
+# Global config fields (e.g. discord.user_id) can reference user slugs instead of raw IDs.
+
+# users:
+#   jake:
+#     # Source identifiers (matched against issue assignees)
+#     linear_name: "Jake Barnwell"
+#     github_username: "jakebarnby"
+#     sentry_username: "jake"
+#     # Notification channel IDs
+#     discord_id: "123456789012345678"
+#     email: "jake@example.com"
+#     push_user_key: "pushover_user_key"
+#     sms_number: "+1234567890"
+#
+#   alice:
+#     linear_name: "Alice Smith"
+#     github_username: "alicesmith"
+#     discord_id: "987654321098765432"
+#     email: "alice@example.com"
+
+# ============================================
 # Discord Notifications (Optional)
 # ============================================
 
