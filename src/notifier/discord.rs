@@ -4,6 +4,7 @@ use super::Notifier;
 use crate::config::DiscordConfig;
 use crate::error::{Error, Result};
 use crate::types::Issue;
+use crate::users::UserRegistry;
 use async_trait::async_trait;
 use serde::Serialize;
 
@@ -54,6 +55,7 @@ impl DiscordWebhookClient for ReqwestDiscordWebhookClient {
 pub struct DiscordNotifier<H: DiscordWebhookClient = ReqwestDiscordWebhookClient> {
     config: DiscordConfig,
     http: H,
+    user_registry: UserRegistry,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,10 +98,11 @@ struct DiscordFooter {
 }
 
 impl DiscordNotifier<ReqwestDiscordWebhookClient> {
-    pub fn new(config: DiscordConfig) -> Self {
+    pub fn new(config: DiscordConfig, user_registry: UserRegistry) -> Self {
         Self {
             config,
             http: ReqwestDiscordWebhookClient::new(),
+            user_registry,
         }
     }
 }
@@ -124,7 +127,24 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     /// Create a new Discord notifier with a custom HTTP client.
     pub fn with_http_client(config: DiscordConfig, http: H) -> Self {
-        Self { config, http }
+        Self {
+            config,
+            http,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Create a new Discord notifier with a custom HTTP client and user registry.
+    pub fn with_http_client_and_registry(
+        config: DiscordConfig,
+        http: H,
+        user_registry: UserRegistry,
+    ) -> Self {
+        Self {
+            config,
+            http,
+            user_registry,
+        }
     }
 
     async fn send(&self, message: DiscordMessage) -> Result<()> {
@@ -147,6 +167,19 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     }
 
     fn get_user_mention(&self) -> Option<String> {
+        self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
+    }
+
+    fn get_user_mention_for_issue(&self, issue: &Issue) -> Option<String> {
+        // Check for resolved user first
+        if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
+            if let Some(user) = self.user_registry.get_by_slug(&slug) {
+                if let Some(ref discord_id) = user.discord_id {
+                    return Some(format!("<@{}>", discord_id));
+                }
+            }
+        }
+        // Fall back to global config
         self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
     }
 
@@ -176,7 +209,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     }
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
-        let mention = self.get_user_mention();
+        let mention = self.get_user_mention_for_issue(issue);
         let emoji = Self::get_source_emoji(&issue.source);
         let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
         let title = truncate_string(&issue.title, MAX_DESCRIPTION_LENGTH);
@@ -217,7 +250,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
-        let mention = self.get_user_mention();
+        let mention = self.get_user_mention_for_issue(issue);
         let emoji = Self::get_source_emoji(&issue.source);
         let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
         let title = truncate_string(&issue.title, MAX_DESCRIPTION_LENGTH);
@@ -259,7 +292,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
-        let mention = self.get_user_mention();
+        let mention = self.get_user_mention_for_issue(issue);
         let emoji = Self::get_source_emoji(&issue.source);
         let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
         let title = truncate_string(&issue.title, MAX_DESCRIPTION_LENGTH);
@@ -295,7 +328,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
-        let mention = self.get_user_mention();
+        let mention = self.get_user_mention_for_issue(issue);
         let emoji = Self::get_source_emoji(&issue.source);
         let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
         let title = truncate_string(&issue.title, MAX_DESCRIPTION_LENGTH);
@@ -402,6 +435,10 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
 mod tests {
     use super::*;
 
+    fn empty_registry() -> crate::users::UserRegistry {
+        crate::users::UserRegistry::new(std::collections::HashMap::new())
+    }
+
     #[test]
     fn test_source_emoji() {
         type TestNotifier = DiscordNotifier<ReqwestDiscordWebhookClient>;
@@ -417,14 +454,14 @@ mod tests {
             webhook_url: Some("https://example.com".to_string()),
             user_id: Some("123456".to_string()),
         };
-        let notifier = DiscordNotifier::new(config_with_id);
+        let notifier = DiscordNotifier::new(config_with_id, empty_registry());
         assert_eq!(notifier.get_user_mention(), Some("<@123456>".to_string()));
 
         let config_without_id = DiscordConfig {
             webhook_url: Some("https://example.com".to_string()),
             user_id: None,
         };
-        let notifier = DiscordNotifier::new(config_without_id);
+        let notifier = DiscordNotifier::new(config_without_id, empty_registry());
         assert_eq!(notifier.get_user_mention(), None);
     }
 
@@ -434,21 +471,21 @@ mod tests {
             webhook_url: Some("https://example.com".to_string()),
             user_id: None,
         };
-        let notifier = DiscordNotifier::new(enabled_config);
+        let notifier = DiscordNotifier::new(enabled_config, empty_registry());
         assert!(notifier.is_enabled());
 
         let disabled_config = DiscordConfig {
             webhook_url: None,
             user_id: None,
         };
-        let notifier = DiscordNotifier::new(disabled_config);
+        let notifier = DiscordNotifier::new(disabled_config, empty_registry());
         assert!(!notifier.is_enabled());
     }
 
     #[test]
     fn test_notifier_name() {
         let config = DiscordConfig::default();
-        let notifier = DiscordNotifier::new(config);
+        let notifier = DiscordNotifier::new(config, empty_registry());
         assert_eq!(notifier.name(), "discord");
     }
 
@@ -549,7 +586,7 @@ mod tests {
             webhook_url: None, // Disabled
             user_id: None,
         };
-        let notifier = DiscordNotifier::new(config);
+        let notifier = DiscordNotifier::new(config, empty_registry());
 
         // Should return Ok without actually sending
         let result = notifier.notify_status("Test status").await;
@@ -562,7 +599,7 @@ mod tests {
             webhook_url: None,
             user_id: None,
         };
-        let notifier = DiscordNotifier::new(config);
+        let notifier = DiscordNotifier::new(config, empty_registry());
 
         let issue = Issue::new(
             "123",
@@ -581,7 +618,7 @@ mod tests {
             webhook_url: None,
             user_id: None,
         };
-        let notifier = DiscordNotifier::new(config);
+        let notifier = DiscordNotifier::new(config, empty_registry());
 
         let issue = Issue::new(
             "123",
@@ -602,7 +639,7 @@ mod tests {
             webhook_url: None,
             user_id: None,
         };
-        let notifier = DiscordNotifier::new(config);
+        let notifier = DiscordNotifier::new(config, empty_registry());
 
         let issue = Issue::new(
             "123",
@@ -621,7 +658,7 @@ mod tests {
             webhook_url: None,
             user_id: None,
         };
-        let notifier = DiscordNotifier::new(config);
+        let notifier = DiscordNotifier::new(config, empty_registry());
 
         let issue = Issue::new(
             "123",
@@ -640,7 +677,7 @@ mod tests {
             webhook_url: Some("https://example.com".to_string()),
             user_id: None,
         };
-        let notifier = DiscordNotifier::new(config);
+        let notifier = DiscordNotifier::new(config, empty_registry());
 
         // Empty list should return Ok without sending
         let result = notifier.notify_urgent_issues(&[]).await;
@@ -1105,5 +1142,72 @@ mod tests {
         let (_, body) = notifier.http.get_last_call().unwrap();
         let footer = body["embeds"][0]["footer"]["text"].as_str().unwrap();
         assert_eq!(footer, "Claude Watchers");
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_with_resolved_user_mention() {
+        let mock = MockDiscordWebhookClient::success();
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                discord_id: Some("111222333".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let config = DiscordConfig {
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            user_id: None,
+        };
+        let notifier = DiscordNotifier::with_http_client_and_registry(config, mock, registry);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+        notifier.notify_start(&issue).await.unwrap();
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("<@111222333>"));
+    }
+
+    #[tokio::test]
+    async fn test_resolved_user_overrides_global_user_id() {
+        let mock = MockDiscordWebhookClient::success();
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                discord_id: Some("111222333".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let config = DiscordConfig {
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            user_id: Some("999999999".to_string()),
+        };
+        let notifier = DiscordNotifier::with_http_client_and_registry(config, mock, registry);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+        notifier.notify_start(&issue).await.unwrap();
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("<@111222333>"));
+        assert!(!content.contains("<@999999999>"));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_to_global_when_no_resolved_user() {
+        let mock = MockDiscordWebhookClient::success();
+        let registry = crate::users::UserRegistry::new(std::collections::HashMap::new());
+        let config = DiscordConfig {
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            user_id: Some("999999999".to_string()),
+        };
+        let notifier = DiscordNotifier::with_http_client_and_registry(config, mock, registry);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        notifier.notify_start(&issue).await.unwrap();
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("<@999999999>"));
     }
 }

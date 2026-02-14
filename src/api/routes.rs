@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::storage::FixAttemptTracker;
-use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
+use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, RegressionWatchStatus};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -47,8 +47,30 @@ pub fn create_api_router_with_dashboard(
         .route("/api/stats/overview", get(overview_handler))
         .route("/api/attempts", get(attempts_handler))
         .route("/api/attempts/{id}", get(attempt_detail_handler))
+        .route(
+            "/api/attempts/{id}/detail",
+            get(attempt_full_detail_handler),
+        )
         .route("/api/sources", get(sources_handler))
         .route("/api/retries", get(retries_handler))
+        .route("/api/activity", get(activity_handler))
+        .route("/api/analytics/summary", get(analytics_summary_handler))
+        .route("/api/metrics", get(metrics_handler))
+        .route("/api/errors", get(errors_handler))
+        .route("/api/prs", get(prs_handler))
+        .route("/api/prs/analytics", get(pr_analytics_handler))
+        .route("/api/feedback", get(feedback_handler))
+        .route("/api/regressions", get(regressions_handler))
+        .route(
+            "/api/regressions/{id}/checks",
+            get(regression_checks_handler),
+        )
+        .route("/api/experiments", get(experiments_handler))
+        .route("/api/repos", get(repos_handler))
+        .route("/api/repos/stats", get(repo_stats_handler))
+        .route("/api/repos/dependencies", get(dependencies_handler))
+        .route("/api/inference/stats", get(inference_stats_handler))
+        .route("/api/inference/history", get(inference_history_handler))
         .with_state(state);
 
     // If dashboard directory is provided, serve static files
@@ -401,6 +423,287 @@ fn get_attempts(tracker: &Arc<dyn FixAttemptTracker>, limit: Option<usize>) -> V
     }
 }
 
+// ─── New query types ──────────────────────────────────
+
+#[derive(Deserialize)]
+struct ActivityQuery {
+    limit: Option<usize>,
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MetricsQuery {
+    name: Option<String>,
+    period: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ErrorsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct PrsQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct FeedbackQuery {
+    source: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RegressionsQuery {
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InferenceHistoryQuery {
+    limit: Option<usize>,
+}
+
+// ─── New response types ──────────────────────────────────
+
+#[derive(Serialize)]
+struct AttemptDetailResponse {
+    attempt: FixAttempt,
+    executions: Vec<crate::types::ClaudeExecution>,
+    reviews: Vec<crate::types::PrReviewRecord>,
+    feedback: Option<crate::feedback::FixOutcome>,
+}
+
+// ─── New handlers ──────────────────────────────────
+
+async fn attempt_full_detail_handler(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<AttemptDetailResponse>, StatusCode> {
+    let attempt = state
+        .tracker
+        .get_attempt_by_id(id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let executions = state
+        .tracker
+        .get_executions_for_attempt(id)
+        .unwrap_or_default();
+
+    let reviews = state
+        .tracker
+        .get_reviews_for_attempt(id)
+        .unwrap_or_default();
+
+    let feedback = state
+        .tracker
+        .get_feedback_outcome_by_attempt(id)
+        .unwrap_or(None);
+
+    Ok(Json(AttemptDetailResponse {
+        attempt,
+        executions,
+        reviews,
+        feedback,
+    }))
+}
+
+async fn activity_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<ActivityQuery>,
+) -> Result<Json<Vec<crate::types::ActivityLogEntry>>, StatusCode> {
+    let limit = query.limit.unwrap_or(50).min(500);
+    let source_filter = query.source.as_deref();
+
+    state
+        .tracker
+        .get_recent_activities_filtered(limit, source_filter)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn analytics_summary_handler(
+    State(state): State<ApiState>,
+) -> Result<Json<crate::types::AnalyticsSummary>, StatusCode> {
+    state
+        .tracker
+        .get_analytics_summary()
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn metrics_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<MetricsQuery>,
+) -> Result<Json<Vec<crate::types::ProcessingMetric>>, StatusCode> {
+    let metric_name = query.name.as_deref().unwrap_or("processing_time");
+    let limit = query.limit.unwrap_or(100).min(1000);
+
+    let since = query.period.as_deref().and_then(|p| {
+        let duration = match p {
+            "hour" => chrono::Duration::hours(1),
+            "day" => chrono::Duration::days(1),
+            "week" => chrono::Duration::days(7),
+            "month" => chrono::Duration::days(30),
+            _ => return None,
+        };
+        Some(chrono::Utc::now() - duration)
+    });
+
+    state
+        .tracker
+        .get_metrics(metric_name, since, limit)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn errors_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<ErrorsQuery>,
+) -> Result<Json<Vec<crate::types::ErrorPattern>>, StatusCode> {
+    let limit = query.limit.unwrap_or(50).min(200);
+
+    state
+        .tracker
+        .get_error_patterns(limit)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn prs_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<PrsQuery>,
+) -> Result<Json<Vec<crate::types::PrRecord>>, StatusCode> {
+    let limit = query.limit.unwrap_or(100).min(500);
+
+    state
+        .tracker
+        .list_prs(query.status.as_deref(), limit)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn pr_analytics_handler(
+    State(state): State<ApiState>,
+) -> Result<Json<crate::types::PrAnalytics>, StatusCode> {
+    state
+        .tracker
+        .get_pr_analytics()
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn feedback_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<FeedbackQuery>,
+) -> Result<Json<Vec<crate::feedback::FixOutcome>>, StatusCode> {
+    let limit = query.limit.unwrap_or(50).min(200);
+
+    state
+        .tracker
+        .get_feedback_outcomes(query.source.as_deref(), limit)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn regressions_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<RegressionsQuery>,
+) -> Result<Json<Vec<crate::types::RegressionWatch>>, StatusCode> {
+    match query.status.as_deref() {
+        Some(status_str) => {
+            let status: RegressionWatchStatus =
+                status_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+            state
+                .tracker
+                .get_regression_watches_by_status(status)
+                .map(Json)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        None => state
+            .tracker
+            .get_all_regression_watches()
+            .map(Json)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn regression_checks_handler(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::types::RegressionCheck>>, StatusCode> {
+    state
+        .tracker
+        .get_regression_checks(id)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn experiments_handler(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<crate::types::PromptExperiment>>, StatusCode> {
+    state
+        .tracker
+        .get_active_experiments()
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn repos_handler(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<crate::storage::StoredIndexedRepo>>, StatusCode> {
+    state
+        .tracker
+        .list_indexed_repos()
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn repo_stats_handler(
+    State(state): State<ApiState>,
+) -> Result<Json<crate::storage::IndexStats>, StatusCode> {
+    state
+        .tracker
+        .get_index_stats()
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn dependencies_handler(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<crate::storage::StoredDependency>>, StatusCode> {
+    state
+        .tracker
+        .list_all_dependencies()
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn inference_stats_handler(
+    State(state): State<ApiState>,
+) -> Result<Json<crate::storage::InferenceStats>, StatusCode> {
+    state
+        .tracker
+        .get_inference_stats()
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn inference_history_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<InferenceHistoryQuery>,
+) -> Result<Json<Vec<crate::storage::InferenceHistoryEntry>>, StatusCode> {
+    let limit = query.limit.unwrap_or(50).min(500);
+
+    state
+        .tracker
+        .get_inference_history(limit)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +743,7 @@ mod tests {
             sentry: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
+            users: std::collections::HashMap::new(),
         }
     }
 

@@ -4,6 +4,7 @@ use super::Notifier;
 use crate::config::SmsConfig;
 use crate::error::{Error, Result};
 use crate::types::Issue;
+use crate::users::UserRegistry;
 use async_trait::async_trait;
 
 /// HTTP response for SMS client.
@@ -71,14 +72,16 @@ impl SmsHttpClient for ReqwestSmsClient {
 pub struct SmsNotifier<H: SmsHttpClient = ReqwestSmsClient> {
     config: SmsConfig,
     http: H,
+    user_registry: UserRegistry,
 }
 
 impl SmsNotifier<ReqwestSmsClient> {
     /// Create a new SMS notifier.
-    pub fn new(config: SmsConfig) -> Self {
+    pub fn new(config: SmsConfig, user_registry: UserRegistry) -> Self {
         Self {
             config,
             http: ReqwestSmsClient::new(),
+            user_registry,
         }
     }
 }
@@ -86,10 +89,40 @@ impl SmsNotifier<ReqwestSmsClient> {
 impl<H: SmsHttpClient> SmsNotifier<H> {
     /// Create a new SMS notifier with custom HTTP client.
     pub fn with_http_client(config: SmsConfig, http: H) -> Self {
-        Self { config, http }
+        Self {
+            config,
+            http,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+        }
     }
 
-    async fn send_sms(&self, body: &str) -> Result<()> {
+    /// Create a new SMS notifier with custom HTTP client and user registry.
+    pub fn with_http_client_and_registry(
+        config: SmsConfig,
+        http: H,
+        user_registry: UserRegistry,
+    ) -> Self {
+        Self {
+            config,
+            http,
+            user_registry,
+        }
+    }
+
+    fn resolve_recipients(&self, issue: Option<&Issue>) -> Vec<String> {
+        if let Some(issue) = issue {
+            if let Some(slug) = issue.get_metadata::<String>("resolved_user") {
+                if let Some(user) = self.user_registry.get_by_slug(&slug) {
+                    if let Some(ref number) = user.sms_number {
+                        return vec![number.clone()];
+                    }
+                }
+            }
+        }
+        self.config.to_numbers.clone()
+    }
+
+    async fn send_sms(&self, body: &str, issue: Option<&Issue>) -> Result<()> {
         let (account_sid, auth_token, from_number) = match (
             &self.config.account_sid,
             &self.config.auth_token,
@@ -111,7 +144,9 @@ impl<H: SmsHttpClient> SmsNotifier<H> {
             body.to_string()
         };
 
-        for to_number in &self.config.to_numbers {
+        let recipients = self.resolve_recipients(issue);
+
+        for to_number in &recipients {
             let params = [
                 ("From", from_number.as_str()),
                 ("To", to_number.as_str()),
@@ -153,7 +188,7 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
             "[Claude Watchers] Processing {} from {} - {}",
             issue.short_id, issue.source, issue.title
         );
-        self.send_sms(&body).await
+        self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
@@ -161,12 +196,12 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
             "[Claude Watchers] PR Created for {}: {}",
             issue.short_id, pr_url
         );
-        self.send_sms(&body).await
+        self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
         let body = format!("[Claude Watchers] Completed {} (no PR URL)", issue.short_id);
-        self.send_sms(&body).await
+        self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
@@ -181,12 +216,12 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
             "[Claude Watchers] FAILED {}: {}",
             issue.short_id, short_error
         );
-        self.send_sms(&body).await
+        self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
         let body = format!("[Claude Watchers] {}", message);
-        self.send_sms(&body).await
+        self.send_sms(&body, None).await
     }
 
     async fn notify_urgent_issues(&self, issues: &[Issue]) -> Result<()> {
@@ -204,7 +239,7 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        self.send_sms(&body).await
+        self.send_sms(&body, None).await
     }
 }
 
@@ -213,6 +248,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    fn empty_registry() -> UserRegistry {
+        UserRegistry::new(std::collections::HashMap::new())
+    }
 
     /// Mock SMS HTTP client for testing.
     #[allow(clippy::type_complexity)]
@@ -354,7 +393,7 @@ mod tests {
             from_number: Some("+1234567890".to_string()),
             to_numbers: vec!["+0987654321".to_string()],
         };
-        let notifier = SmsNotifier::new(enabled_config);
+        let notifier = SmsNotifier::new(enabled_config, empty_registry());
         assert!(notifier.is_enabled());
 
         let disabled_config = SmsConfig {
@@ -363,27 +402,27 @@ mod tests {
             from_number: None,
             to_numbers: vec![],
         };
-        let notifier = SmsNotifier::new(disabled_config);
+        let notifier = SmsNotifier::new(disabled_config, empty_registry());
         assert!(!notifier.is_enabled());
     }
 
     #[test]
     fn test_name() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
         assert_eq!(notifier.name(), "sms");
     }
 
     #[test]
     fn test_is_enabled_partial_configs() {
-        assert!(!SmsNotifier::new(partial_config_no_sid()).is_enabled());
-        assert!(!SmsNotifier::new(partial_config_no_token()).is_enabled());
-        assert!(!SmsNotifier::new(partial_config_no_from()).is_enabled());
-        assert!(!SmsNotifier::new(partial_config_no_to()).is_enabled());
+        assert!(!SmsNotifier::new(partial_config_no_sid(), empty_registry()).is_enabled());
+        assert!(!SmsNotifier::new(partial_config_no_token(), empty_registry()).is_enabled());
+        assert!(!SmsNotifier::new(partial_config_no_from(), empty_registry()).is_enabled());
+        assert!(!SmsNotifier::new(partial_config_no_to(), empty_registry()).is_enabled());
     }
 
     #[tokio::test]
     async fn test_notify_start_disabled() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier.notify_start(&issue).await;
@@ -392,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_success_disabled() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier
@@ -403,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_completed_disabled() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier.notify_completed(&issue).await;
@@ -412,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_failed_disabled() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         let result = notifier.notify_failed(&issue, "Error message").await;
@@ -421,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_failed_long_error() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("123", "PROJ-123", "Test", "https://example.com", "linear");
 
         // Error longer than 100 characters
@@ -432,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_status_disabled() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
 
         let result = notifier.notify_status("Status update").await;
         assert!(result.is_ok());
@@ -440,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_empty() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
 
         let result = notifier.notify_urgent_issues(&[]).await;
         assert!(result.is_ok());
@@ -448,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_disabled() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
         let issues = vec![
             Issue::new("1", "PROJ-1", "Issue 1", "https://example.com", "linear"),
             Issue::new("2", "PROJ-2", "Issue 2", "https://example.com", "linear"),
@@ -460,7 +499,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_urgent_issues_truncated_to_three() {
-        let notifier = SmsNotifier::new(disabled_config());
+        let notifier = SmsNotifier::new(disabled_config(), empty_registry());
         let issues: Vec<Issue> = (0..10)
             .map(|i| {
                 Issue::new(
@@ -490,7 +529,7 @@ mod tests {
             ],
         };
 
-        let notifier = SmsNotifier::new(config);
+        let notifier = SmsNotifier::new(config, empty_registry());
         assert!(notifier.is_enabled());
     }
 

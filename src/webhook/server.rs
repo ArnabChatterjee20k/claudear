@@ -736,6 +736,7 @@ mod tests {
             sentry: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
+            users: std::collections::HashMap::new(),
         }
     }
 

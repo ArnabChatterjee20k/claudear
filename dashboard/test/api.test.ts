@@ -1,20 +1,27 @@
-import { describe, expect, test, mock, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, mock, afterEach } from "bun:test";
 import {
   fetchOverview,
-  fetchStats,
+  getStats,
   fetchAttempts,
-  fetchHealth,
+  getHealth,
   type Overview,
   type Stats,
   type AttemptsResponse,
+  type Health,
 } from "../src/lib/api";
+
+function mockFetch(data: unknown, ok = true) {
+  globalThis.fetch = mock(() =>
+    Promise.resolve({
+      ok,
+      status: ok ? 200 : 500,
+      json: () => Promise.resolve(data),
+    })
+  ) as unknown as typeof fetch;
+}
 
 describe("api", () => {
   const originalFetch = globalThis.fetch;
-
-  beforeEach(() => {
-    // Reset fetch mock before each test
-  });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
@@ -39,12 +46,7 @@ describe("api", () => {
         sources: [],
       };
 
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve(mockOverview),
-        } as Response)
-      );
+      mockFetch(mockOverview);
 
       const result = await fetchOverview();
       expect(result).toEqual(mockOverview);
@@ -52,17 +54,12 @@ describe("api", () => {
     });
 
     test("throws on non-ok response", async () => {
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: false,
-        } as Response)
-      );
-
-      expect(fetchOverview()).rejects.toThrow("Failed to fetch overview");
+      mockFetch(null, false);
+      expect(fetchOverview()).rejects.toThrow();
     });
   });
 
-  describe("fetchStats", () => {
+  describe("getStats", () => {
     test("fetches stats successfully", async () => {
       const mockStats: Stats = {
         total: 100,
@@ -75,26 +72,16 @@ describe("api", () => {
         by_source: {},
       };
 
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve(mockStats),
-        } as Response)
-      );
+      mockFetch(mockStats);
 
-      const result = await fetchStats();
+      const result = await getStats();
       expect(result).toEqual(mockStats);
       expect(fetch).toHaveBeenCalledWith("/api/stats");
     });
 
     test("throws on error", async () => {
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: false,
-        } as Response)
-      );
-
-      expect(fetchStats()).rejects.toThrow("Failed to fetch stats");
+      mockFetch(null, false);
+      expect(getStats()).rejects.toThrow();
     });
   });
 
@@ -107,12 +94,7 @@ describe("api", () => {
         per_page: 20,
       };
 
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        } as Response)
-      );
+      mockFetch(mockResponse);
 
       const result = await fetchAttempts();
       expect(result).toEqual(mockResponse);
@@ -120,77 +102,25 @@ describe("api", () => {
     });
 
     test("fetches attempts with status filter", async () => {
-      const mockResponse: AttemptsResponse = {
-        attempts: [],
-        total: 0,
-        page: 1,
-        per_page: 20,
-      };
-
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        } as Response)
-      );
-
+      mockFetch({ attempts: [], total: 0, page: 1, per_page: 20 });
       await fetchAttempts({ status: "pending" });
       expect(fetch).toHaveBeenCalledWith("/api/attempts?status=pending");
     });
 
     test("fetches attempts with source filter", async () => {
-      const mockResponse: AttemptsResponse = {
-        attempts: [],
-        total: 0,
-        page: 1,
-        per_page: 20,
-      };
-
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        } as Response)
-      );
-
+      mockFetch({ attempts: [], total: 0, page: 1, per_page: 20 });
       await fetchAttempts({ source: "linear" });
       expect(fetch).toHaveBeenCalledWith("/api/attempts?source=linear");
     });
 
     test("fetches attempts with pagination", async () => {
-      const mockResponse: AttemptsResponse = {
-        attempts: [],
-        total: 100,
-        page: 2,
-        per_page: 10,
-      };
-
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        } as Response)
-      );
-
+      mockFetch({ attempts: [], total: 100, page: 2, per_page: 10 });
       await fetchAttempts({ page: 2, per_page: 10 });
       expect(fetch).toHaveBeenCalledWith("/api/attempts?page=2&per_page=10");
     });
 
     test("fetches attempts with all params", async () => {
-      const mockResponse: AttemptsResponse = {
-        attempts: [],
-        total: 50,
-        page: 1,
-        per_page: 25,
-      };
-
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        } as Response)
-      );
-
+      mockFetch({ attempts: [], total: 50, page: 1, per_page: 25 });
       await fetchAttempts({
         status: "success",
         source: "sentry",
@@ -203,40 +133,30 @@ describe("api", () => {
     });
 
     test("throws on error", async () => {
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: false,
-        } as Response)
-      );
-
-      expect(fetchAttempts()).rejects.toThrow("Failed to fetch attempts");
+      mockFetch(null, false);
+      expect(fetchAttempts()).rejects.toThrow();
     });
   });
 
-  describe("fetchHealth", () => {
+  describe("getHealth", () => {
     test("fetches health status", async () => {
-      const mockHealth = { status: "ok", version: "1.0.0" };
+      const mockHealth: Health = {
+        status: "ok",
+        version: "1.0.0",
+        uptime_secs: 3600,
+        database: { status: "ok" },
+      };
 
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve(mockHealth),
-        } as Response)
-      );
+      mockFetch(mockHealth);
 
-      const result = await fetchHealth();
+      const result = await getHealth();
       expect(result).toEqual(mockHealth);
       expect(fetch).toHaveBeenCalledWith("/api/health");
     });
 
     test("throws on error", async () => {
-      globalThis.fetch = mock(() =>
-        Promise.resolve({
-          ok: false,
-        } as Response)
-      );
-
-      expect(fetchHealth()).rejects.toThrow("Failed to fetch health");
+      mockFetch(null, false);
+      expect(getHealth()).rejects.toThrow();
     });
   });
 });
