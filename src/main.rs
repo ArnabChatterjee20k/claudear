@@ -191,6 +191,10 @@ enum Commands {
     /// Diagnostic commands for debugging
     #[command(subcommand)]
     Diag(DiagCommands),
+
+    /// User management commands
+    #[command(subcommand)]
+    Users(UsersCommands),
 }
 
 /// Repository management subcommands
@@ -390,6 +394,25 @@ enum DiagCommands {
         source: String,
         /// Target repository (where release happens)
         target: String,
+    },
+}
+
+/// User management subcommands
+#[derive(Subcommand)]
+enum UsersCommands {
+    /// Seed an admin user (creates or updates password if email exists)
+    Seed {
+        /// User email
+        #[arg(long)]
+        email: String,
+
+        /// User password
+        #[arg(long)]
+        password: String,
+
+        /// User display name
+        #[arg(long, default_value = "Admin")]
+        name: String,
     },
 }
 
@@ -1626,6 +1649,44 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Handle Users commands early (don't need sources or full validation)
+    if let Commands::Users(ref users_cmd) = cli.command {
+        let db_tracker = SqliteTracker::new(&config.db_path)?;
+
+        match users_cmd {
+            UsersCommands::Seed {
+                email,
+                password,
+                name,
+            } => {
+                let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
+                    .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))?;
+
+                match db_tracker.get_user_by_email(email)? {
+                    Some(existing) => {
+                        db_tracker.update_user(
+                            existing.id,
+                            None,
+                            Some(&hash),
+                            Some(name.as_str()),
+                            Some("admin"),
+                        )?;
+                        println!(
+                            "Updated existing user '{}' (id={}) with new password and admin role",
+                            email, existing.id
+                        );
+                    }
+                    None => {
+                        let id = db_tracker.create_user(email, &hash, name, "admin")?;
+                        println!("Created admin user '{}' (id={})", email, id);
+                    }
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
     config.validate()?;
 
     // Initialize components
@@ -2521,7 +2582,8 @@ async fn main() -> anyhow::Result<()> {
                 | Commands::Report(_)
                 | Commands::Repos(_)
                 | Commands::Inference(_)
-                | Commands::Diag(_) => unreachable!(),
+                | Commands::Diag(_)
+                | Commands::Users(_) => unreachable!(),
             }
         }
     }
