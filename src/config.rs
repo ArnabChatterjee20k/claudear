@@ -656,6 +656,11 @@ impl Config {
                 self.claude.instructions = Some(v);
             }
         }
+        if let Ok(v) = env::var("CLAUDE_INSTRUCTIONS_FILE") {
+            if !v.is_empty() {
+                self.claude.instructions_file = Some(v);
+            }
+        }
         if let Ok(v) = env::var("CLAUDE_PERMISSIONS") {
             if !v.is_empty() {
                 self.claude.permissions = v.split(',').map(|s| s.trim().to_string()).collect();
@@ -1091,6 +1096,7 @@ mod tests {
         "RETRY_MAX_DELAY_MS",
         "CLAUDE_MODEL",
         "CLAUDE_INSTRUCTIONS",
+        "CLAUDE_INSTRUCTIONS_FILE",
         "CLAUDE_PERMISSIONS",
         "CLAUDE_SKIP_PERMISSIONS",
     ];
@@ -2361,6 +2367,22 @@ work_dir: /tmp/repos
         with_env(&[("CLAUDE_INSTRUCTIONS", "Be concise.")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(config.claude.instructions, Some("Be concise.".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_env_override_claude_instructions_file() {
+        let yaml = r#"
+work_dir: /tmp/repos
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(&[("CLAUDE_INSTRUCTIONS_FILE", "./my-instructions.md")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert_eq!(
+                config.claude.instructions_file,
+                Some("./my-instructions.md".to_string())
+            );
         });
     }
 
