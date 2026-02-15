@@ -1542,6 +1542,8 @@ impl FixAttemptTracker for SqliteTracker {
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE pr_url = ?
+            ORDER BY attempted_at DESC, id DESC
+            LIMIT 1
             "#,
         )?;
 
@@ -5347,6 +5349,40 @@ mod tests {
             .unwrap();
         assert_eq!(attempt.issue_id, "123");
         assert_eq!(attempt.source, "linear");
+    }
+
+    #[test]
+    fn test_get_attempt_by_pr_url_returns_latest_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/org/repo/pull/99";
+
+        tracker
+            .record_attempt("linear", "older", "PROJ-OLDER")
+            .unwrap();
+        tracker.mark_success("linear", "older", pr_url).unwrap();
+
+        tracker
+            .record_attempt("linear", "newer", "PROJ-NEWER")
+            .unwrap();
+        tracker.mark_success("linear", "newer", pr_url).unwrap();
+
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            conn.execute(
+                "UPDATE fix_attempts SET attempted_at = ? WHERE source = ? AND issue_id = ?",
+                params!["2030-01-01 00:00:00", "linear", "older"],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE fix_attempts SET attempted_at = ? WHERE source = ? AND issue_id = ?",
+                params!["2020-01-01 00:00:00", "linear", "newer"],
+            )
+            .unwrap();
+        }
+
+        let attempt = tracker.get_attempt_by_pr_url(pr_url).unwrap().unwrap();
+        assert_eq!(attempt.issue_id, "older");
+        assert_eq!(attempt.short_id, "PROJ-OLDER");
     }
 
     #[test]

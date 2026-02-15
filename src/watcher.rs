@@ -19,8 +19,8 @@ use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::source::IssueSource;
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
 use crate::types::{
-    ActivityLogEntry, AskRequest, ErrorPattern, FixAttemptStats, Issue, IssueType, MatchPriority,
-    MatchResult, ProcessingMetric, QaKnowledgeEntry, RegressionWatch,
+    ActivityLogEntry, AskRequest, ErrorPattern, FixAttemptStats, FixAttemptStatus, Issue,
+    IssueType, MatchPriority, MatchResult, ProcessingMetric, QaKnowledgeEntry, RegressionWatch,
 };
 use crate::users::UserRegistry;
 use chrono::Utc;
@@ -521,6 +521,17 @@ impl Watcher {
 
             // Find the original issue for this PR
             if let Some(attempt) = self.tracker.get_attempt_by_pr_url(&pr_url)? {
+                if Self::is_terminal_attempt_status(attempt.status) {
+                    tracing::info!(
+                        pr_url = %pr_url,
+                        source = %attempt.source,
+                        issue_id = %attempt.issue_id,
+                        status = %attempt.status,
+                        "Skipping review feedback for terminal attempt status"
+                    );
+                    review_watcher.unwatch_pr(&pr_url);
+                    continue;
+                }
                 if let Err(e) = self
                     .process_review_action(&attempt, &feedback_summary)
                     .await
@@ -540,6 +551,13 @@ impl Watcher {
         }
 
         Ok(())
+    }
+
+    fn is_terminal_attempt_status(status: FixAttemptStatus) -> bool {
+        matches!(
+            status,
+            FixAttemptStatus::Merged | FixAttemptStatus::Closed | FixAttemptStatus::CannotFix
+        )
     }
 
     fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<(String, String, usize)> {
@@ -3277,6 +3295,28 @@ mod tests {
         let result = SeedResult::default();
         assert_eq!(result.total, 0);
         assert!(result.by_source.is_empty());
+    }
+
+    #[test]
+    fn test_is_terminal_attempt_status() {
+        assert!(!Watcher::is_terminal_attempt_status(
+            FixAttemptStatus::Pending
+        ));
+        assert!(!Watcher::is_terminal_attempt_status(
+            FixAttemptStatus::Success
+        ));
+        assert!(!Watcher::is_terminal_attempt_status(
+            FixAttemptStatus::Failed
+        ));
+        assert!(Watcher::is_terminal_attempt_status(
+            FixAttemptStatus::Merged
+        ));
+        assert!(Watcher::is_terminal_attempt_status(
+            FixAttemptStatus::Closed
+        ));
+        assert!(Watcher::is_terminal_attempt_status(
+            FixAttemptStatus::CannotFix
+        ));
     }
 
     #[test]
