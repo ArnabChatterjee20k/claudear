@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import useSWR from 'swr'
 import { fetchOverview, getRetries, type Overview, type AttemptSummary, type RetriesResponse } from '../lib/api'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
@@ -18,12 +19,24 @@ import {
 
 export default function OverviewPage() {
   const { data: overview, error: overviewError, isLoading: overviewLoading } = useSWR<Overview>('overview', fetchOverview, {
-    refreshInterval: 10000,
+    refreshInterval: 15000,
   })
 
   const { data: retries } = useSWR<RetriesResponse>('retries', getRetries, {
-    refreshInterval: 10000,
+    refreshInterval: 15000,
   })
+
+  const readyRetryIds = useMemo(() => {
+    return new Set((retries?.ready || []).map(attempt => attempt.id))
+  }, [retries?.ready])
+
+  const waitingRetries = useMemo(() => {
+    return (retries?.retryable || []).filter(attempt => !readyRetryIds.has(attempt.id))
+  }, [retries?.retryable, readyRetryIds])
+
+  const displayedRecentAttempts = useMemo(() => {
+    return (overview?.recent_attempts || []).slice(0, 8)
+  }, [overview?.recent_attempts])
 
   if (overviewError) {
     return (
@@ -95,15 +108,13 @@ export default function OverviewPage() {
                 </div>
               </div>
             )}
-            {retries.retryable.length > 0 && retries.ready.length < retries.retryable.length && (
+            {waitingRetries.length > 0 && (
               <div>
                 <h4 className="text-sm font-medium mb-2 text-muted-foreground">Waiting for Backoff</h4>
                 <div className="space-y-2">
-                  {retries.retryable
-                    .filter(a => !retries.ready.some(r => r.id === a.id))
-                    .map(attempt => (
-                      <AttemptRow key={attempt.id} attempt={attempt} />
-                    ))}
+                  {waitingRetries.map(attempt => (
+                    <AttemptRow key={attempt.id} attempt={attempt} />
+                  ))}
                 </div>
               </div>
             )}
@@ -151,7 +162,7 @@ export default function OverviewPage() {
               <p className="text-muted-foreground">No attempts yet</p>
             ) : (
               <div className="space-y-3">
-                {recent_attempts.slice(0, 8).map(attempt => (
+                {displayedRecentAttempts.map(attempt => (
                   <AttemptRow key={attempt.id} attempt={attempt} />
                 ))}
               </div>

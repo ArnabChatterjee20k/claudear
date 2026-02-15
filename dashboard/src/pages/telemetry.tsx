@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import useSWR from 'swr'
 import {
   fetchTelemetryOverview,
@@ -83,44 +83,58 @@ export default function TelemetryPage() {
   const { data: overview, error: overviewError, isLoading: overviewLoading } = useSWR<TelemetryOverview>(
     'telemetry-overview',
     fetchTelemetryOverview,
-    { refreshInterval: 10000 },
+    { refreshInterval: 15000 },
   )
 
   const { data: series, isLoading: seriesLoading } = useSWR<TelemetryTimeseries>(
     ['telemetry-timeseries', period],
     () => fetchTelemetryTimeseries({ period, bucket_minutes: bucketMinutes }),
-    { refreshInterval: 15000 },
+    { refreshInterval: 20000 },
   )
 
   const { data: pipeline, isLoading: pipelineLoading } = useSWR<TelemetryPipeline>(
     ['telemetry-pipeline', period],
     () => fetchTelemetryPipeline({ period }),
-    { refreshInterval: 15000 },
+    { refreshInterval: 20000 },
   )
 
   const { data: latency, isLoading: latencyLoading } = useSWR<TelemetryLatency>(
     ['telemetry-latency', period],
     () => fetchTelemetryLatency({ period }),
-    { refreshInterval: 15000 },
+    { refreshInterval: 20000 },
   )
 
-  const chartData = (series?.points || []).map(p => ({
-    time: new Date(p.bucket_start).toLocaleString(undefined, {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    }),
-    total: p.total,
-    success: p.success + p.merged,
-    failed: p.failed + p.closed + p.cannot_fix,
-    pending: p.pending,
-  }))
+  const chartData = useMemo(() => {
+    return (series?.points || []).map(p => ({
+      time: new Date(p.bucket_start).toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+      total: p.total,
+      success: p.success + p.merged,
+      failed: p.failed + p.closed + p.cannot_fix,
+      pending: p.pending,
+    }))
+  }, [series?.points])
 
-  const latencyHistogramData = (latency?.histogram || []).map(bucket => ({
-    bucket: bucket.label,
-    count: bucket.count,
-  }))
+  const latencyHistogramData = useMemo(() => {
+    return (latency?.histogram || []).map(bucket => ({
+      bucket: bucket.label,
+      count: bucket.count,
+    }))
+  }, [latency?.histogram])
+
+  const sortedActivityLastHour = useMemo(() => {
+    if (!overview) return []
+    return Object.entries(overview.activity_last_hour).sort(([, a], [, b]) => b - a)
+  }, [overview?.activity_last_hour])
+
+  const sortedMetricCounts = useMemo(() => {
+    if (!overview) return []
+    return Object.entries(overview.metric_counts_last_24h).sort(([, a], [, b]) => b - a)
+  }, [overview?.metric_counts_last_24h])
 
   return (
     <div className="space-y-6">
@@ -525,14 +539,12 @@ export default function TelemetryPage() {
                   {Object.keys(overview.activity_last_hour).length === 0 && (
                     <p className="text-muted-foreground">No activity recorded.</p>
                   )}
-                  {Object.entries(overview.activity_last_hour)
-                    .sort(([, a], [, b]) => b - a)
-                    .map(([name, count]) => (
-                      <div key={name} className="flex items-center justify-between border-b pb-1 last:border-0">
-                        <span>{name}</span>
-                        <span className="font-medium">{count}</span>
-                      </div>
-                    ))}
+                  {sortedActivityLastHour.map(([name, count]) => (
+                    <div key={name} className="flex items-center justify-between border-b pb-1 last:border-0">
+                      <span>{name}</span>
+                      <span className="font-medium">{count}</span>
+                    </div>
+                  ))}
                 </div>
               </CardContent>
             </Card>
@@ -543,14 +555,12 @@ export default function TelemetryPage() {
               </CardHeader>
               <CardContent>
                 <div className="space-y-2 text-sm">
-                  {Object.entries(overview.metric_counts_last_24h)
-                    .sort(([, a], [, b]) => b - a)
-                    .map(([name, count]) => (
-                      <div key={name} className="flex items-center justify-between border-b pb-1 last:border-0">
-                        <span>{name}</span>
-                        <span className="font-medium">{count}</span>
-                      </div>
-                    ))}
+                  {sortedMetricCounts.map(([name, count]) => (
+                    <div key={name} className="flex items-center justify-between border-b pb-1 last:border-0">
+                      <span>{name}</span>
+                      <span className="font-medium">{count}</span>
+                    </div>
+                  ))}
                 </div>
               </CardContent>
             </Card>

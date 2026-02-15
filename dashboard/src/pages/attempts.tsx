@@ -67,7 +67,7 @@ export default function AttemptsPage() {
         status: statusFilter || undefined,
         source: sourceFilter || undefined,
       }),
-    { refreshInterval: 10000 },
+    { refreshInterval: 15000 },
   )
 
   const { data: detail, isLoading: detailLoading } = useSWR<AttemptDetailResponse>(

@@ -3,7 +3,7 @@
 use super::auth::*;
 use crate::config::Config;
 use crate::retry::RetryManager;
-use crate::storage::FixAttemptTracker;
+use crate::storage::{FixAttemptTracker, SqliteTracker};
 use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, RegressionWatchStatus};
 use axum::{
     extract::{Path, Query, State},
@@ -261,8 +261,19 @@ async fn overview_handler(
         0.0
     };
 
-    // Get recent attempts (last 10)
-    let recent = get_attempts(&state.tracker, Some(10));
+    // Get recent attempts (last 10) from SQL directly when available.
+    let recent = if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
+        db.list_recent_attempts(10)
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(|attempt| attempt_to_summary(&attempt))
+                    .collect()
+            })
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        get_attempts(&state.tracker, Some(10))
+    };
 
     // Build source summaries
     let sources: Vec<SourceSummary> = stats
@@ -301,30 +312,41 @@ async fn attempts_handler(
 ) -> Result<Json<AttemptsResponse>, StatusCode> {
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
+    let status_filter = query.status.as_ref().map(|s| s.to_lowercase());
+    let source_filter = query.source.as_ref().map(|s| s.to_lowercase());
+    let status_filter = status_filter.as_deref();
+    let source_filter = source_filter.as_deref();
 
-    // Get all attempts and filter
-    let all_attempts = get_attempts(&state.tracker, None);
-
-    let filtered: Vec<AttemptSummary> = all_attempts
-        .into_iter()
-        .filter(|a| {
-            let status_match = query
-                .status
-                .as_ref()
-                .map(|s| a.status.to_lowercase() == s.to_lowercase())
-                .unwrap_or(true);
-            let source_match = query
-                .source
-                .as_ref()
-                .map(|s| a.source.to_lowercase() == s.to_lowercase())
-                .unwrap_or(true);
-            status_match && source_match
-        })
-        .collect();
-
-    let total = filtered.len();
-    let start = (page - 1) * per_page;
-    let attempts: Vec<AttemptSummary> = filtered.into_iter().skip(start).take(per_page).collect();
+    let (attempts, total) = if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>()
+    {
+        let offset = (page - 1) * per_page;
+        let rows = db
+            .list_attempts(status_filter, source_filter, per_page, offset)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let total = db
+            .count_attempts(status_filter, source_filter)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let attempts = rows
+            .into_iter()
+            .map(|attempt| attempt_to_summary(&attempt))
+            .collect();
+        (attempts, total)
+    } else {
+        // Fallback for non-SQLite tracker implementations.
+        let all_attempts = get_attempts(&state.tracker, None);
+        let filtered: Vec<AttemptSummary> = all_attempts
+            .into_iter()
+            .filter(|a| {
+                let status_match = status_filter.map(|s| a.status == s).unwrap_or(true);
+                let source_match = source_filter.map(|s| a.source == s).unwrap_or(true);
+                status_match && source_match
+            })
+            .collect();
+        let total = filtered.len();
+        let start = (page - 1) * per_page;
+        let attempts = filtered.into_iter().skip(start).take(per_page).collect();
+        (attempts, total)
+    };
 
     Ok(Json(AttemptsResponse {
         attempts,
@@ -426,6 +448,15 @@ fn attempt_to_summary(attempt: &FixAttempt) -> AttemptSummary {
 
 /// Get attempts from tracker, optionally limited.
 fn get_attempts(tracker: &Arc<dyn FixAttemptTracker>, limit: Option<usize>) -> Vec<AttemptSummary> {
+    if let (Some(db), Some(max)) = (tracker.as_any().downcast_ref::<SqliteTracker>(), limit) {
+        if let Ok(attempts) = db.list_recent_attempts(max) {
+            return attempts
+                .into_iter()
+                .map(|a| attempt_to_summary(&a))
+                .collect();
+        }
+    }
+
     let mut all: Vec<FixAttempt> = Vec::new();
 
     for status in [
@@ -470,6 +501,23 @@ fn get_attempt_records(tracker: &Arc<dyn FixAttemptTracker>) -> Vec<FixAttempt> 
     }
 
     all
+}
+
+/// Get raw attempt records since a timestamp for telemetry aggregation.
+fn get_attempt_records_since(
+    tracker: &Arc<dyn FixAttemptTracker>,
+    since: DateTime<Utc>,
+) -> Vec<FixAttempt> {
+    if let Some(db) = tracker.as_any().downcast_ref::<SqliteTracker>() {
+        if let Ok(attempts) = db.list_attempts_since(since) {
+            return attempts;
+        }
+    }
+
+    get_attempt_records(tracker)
+        .into_iter()
+        .filter(|a| a.attempted_at >= since)
+        .collect()
 }
 
 fn compute_processing_time_summary(
@@ -937,13 +985,19 @@ async fn attempt_execution_log_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let execution = state
-        .tracker
-        .get_executions_for_attempt(attempt_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .into_iter()
-        .find(|e| e.id == execution_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let execution = if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
+        db.get_execution_for_attempt(attempt_id, execution_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?
+    } else {
+        state
+            .tracker
+            .get_executions_for_attempt(attempt_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .find(|e| e.id == execution_id)
+            .ok_or(StatusCode::NOT_FOUND)?
+    };
 
     let log_path = match stream.as_str() {
         "stdout" => execution.stdout_log_path.clone(),
@@ -1221,12 +1275,16 @@ async fn telemetry_overview_handler(
     State(state): State<ApiState>,
 ) -> Result<Json<TelemetryOverviewResponse>, StatusCode> {
     let now = Utc::now();
-    let attempts = get_attempt_records(&state.tracker);
+    let stats = state
+        .tracker
+        .get_stats()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let recent_attempts = get_attempt_records_since(&state.tracker, now - Duration::days(7));
 
     let windows = vec![
-        summarize_window(&attempts, "1h", now - Duration::hours(1)),
-        summarize_window(&attempts, "24h", now - Duration::hours(24)),
-        summarize_window(&attempts, "7d", now - Duration::days(7)),
+        summarize_window(&recent_attempts, "1h", now - Duration::hours(1)),
+        summarize_window(&recent_attempts, "24h", now - Duration::hours(24)),
+        summarize_window(&recent_attempts, "7d", now - Duration::days(7)),
     ];
 
     let retryable = state
@@ -1239,10 +1297,6 @@ async fn telemetry_overview_handler(
         .filter(|a| retry_manager.is_ready_for_retry(a))
         .count() as i64;
 
-    let open_prs = state
-        .tracker
-        .get_open_prs()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let pr_analytics = state
         .tracker
         .get_pr_analytics()
@@ -1253,14 +1307,10 @@ async fn telemetry_overview_handler(
         .get_all_regression_watches()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut queue = TelemetryQueueMetrics {
-        pending_attempts: state
-            .tracker
-            .get_stats()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .pending as i64,
+        pending_attempts: stats.pending as i64,
         retryable_attempts: retryable.len() as i64,
         ready_retries,
-        open_prs: open_prs.len() as i64,
+        open_prs: pr_analytics.open,
         ..TelemetryQueueMetrics::default()
     };
     for watch in &watches {
@@ -1287,19 +1337,25 @@ async fn telemetry_overview_handler(
 
     let top_errors = state.tracker.get_error_patterns(10).unwrap_or_default();
 
-    let mut activity_last_hour: HashMap<String, i64> = HashMap::new();
-    for entry in state
-        .tracker
-        .get_recent_activities_filtered(5_000, None)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| a.timestamp >= now - Duration::hours(1))
-    {
-        *activity_last_hour.entry(entry.activity_type).or_insert(0) += 1;
-    }
+    let activity_last_hour =
+        if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
+            db.get_activity_type_counts_since(now - Duration::hours(1))
+                .unwrap_or_default()
+        } else {
+            let mut counts = HashMap::new();
+            for entry in state
+                .tracker
+                .get_recent_activities_filtered(5_000, None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| a.timestamp >= now - Duration::hours(1))
+            {
+                *counts.entry(entry.activity_type).or_insert(0) += 1;
+            }
+            counts
+        };
 
-    let mut metric_counts_last_24h: HashMap<String, i64> = HashMap::new();
-    for metric_name in [
+    let metric_names = [
         "processing_time",
         "batch_processed",
         "pr_created",
@@ -1324,32 +1380,52 @@ async fn telemetry_overview_handler(
         "auto_resolved_on_merge",
         "cascade_triggered",
         "cascade_failed",
-    ] {
-        let count = state
-            .tracker
-            .get_metrics(metric_name, Some(now - Duration::hours(24)), 20_000)
-            .map(|m| m.len() as i64)
-            .unwrap_or(0);
-        metric_counts_last_24h.insert(metric_name.to_string(), count);
+    ];
+    let mut metric_counts_last_24h: HashMap<String, i64> = HashMap::new();
+    if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
+        let counts = db
+            .get_metric_counts_since(&metric_names, now - Duration::hours(24))
+            .unwrap_or_default();
+        for metric_name in metric_names {
+            metric_counts_last_24h.insert(
+                metric_name.to_string(),
+                counts.get(metric_name).copied().unwrap_or(0),
+            );
+        }
+    } else {
+        for metric_name in metric_names {
+            let count = state
+                .tracker
+                .get_metrics(metric_name, Some(now - Duration::hours(24)), 20_000)
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
+            metric_counts_last_24h.insert(metric_name.to_string(), count);
+        }
     }
 
     let mut by_source: HashMap<String, SourceTelemetry> = HashMap::new();
-    for attempt in &attempts {
-        let entry = by_source
-            .entry(attempt.source.clone())
-            .or_insert_with(|| SourceTelemetry {
-                source: attempt.source.clone(),
-                ..SourceTelemetry::default()
-            });
-        entry.total += 1;
-        match attempt.status {
-            FixAttemptStatus::Pending => entry.pending += 1,
-            FixAttemptStatus::Success => entry.success += 1,
-            FixAttemptStatus::Failed => entry.failed += 1,
-            FixAttemptStatus::Merged => entry.merged += 1,
-            FixAttemptStatus::Closed => entry.closed += 1,
-            FixAttemptStatus::CannotFix => entry.cannot_fix += 1,
-        }
+    for (source, source_stats) in &stats.by_source {
+        let processed = source_stats.success
+            + source_stats.failed
+            + source_stats.merged
+            + source_stats.closed
+            + source_stats.cannot_fix;
+        let pending = source_stats.total.saturating_sub(processed);
+        by_source.insert(
+            source.clone(),
+            SourceTelemetry {
+                source: source.clone(),
+                total: source_stats.total as i64,
+                pending: pending as i64,
+                success: source_stats.success as i64,
+                failed: source_stats.failed as i64,
+                merged: source_stats.merged as i64,
+                closed: source_stats.closed as i64,
+                cannot_fix: source_stats.cannot_fix as i64,
+                retryable: 0,
+                success_rate: 0.0,
+            },
+        );
     }
     for attempt in &retryable {
         let entry = by_source
@@ -1377,7 +1453,7 @@ async fn telemetry_overview_handler(
     let diagnostics = state
         .tracker
         .as_any()
-        .downcast_ref::<crate::storage::SqliteTracker>()
+        .downcast_ref::<SqliteTracker>()
         .and_then(|db| db.get_diagnostic_counts().ok());
 
     let response = TelemetryOverviewResponse {
@@ -1433,10 +1509,7 @@ async fn telemetry_timeseries_handler(
         cursor += Duration::seconds(bucket_seconds);
     }
 
-    for attempt in get_attempt_records(&state.tracker)
-        .into_iter()
-        .filter(|a| a.attempted_at >= start)
-    {
+    for attempt in get_attempt_records_since(&state.tracker, start) {
         let bucket = floor_to_bucket(attempt.attempted_at, bucket_minutes).timestamp();
         if let Some(point) = buckets.get_mut(&bucket) {
             point.total += 1;
@@ -1467,71 +1540,269 @@ async fn telemetry_pipeline_handler(
     let now = Utc::now();
     let (period_label, period_duration) = parse_telemetry_period(query.period.as_deref(), "week");
     let since = now - period_duration;
+    let total_metric_names = [
+        "issues_fetched",
+        "issues_matched",
+        "issues_queued",
+        "batch_processed",
+        "pr_created",
+        "ready_retries_found",
+        "ready_retries_executed_total",
+        "ready_retries_failed_total",
+        "pr_status_checks",
+        "pr_status_merged",
+        "pr_status_closed",
+        "pr_status_errors",
+        "regression_watches_created",
+        "auto_resolved_on_merge",
+        "cascade_triggered",
+        "cascade_failed",
+    ];
+    let per_source_metric_names = [
+        "issues_fetched",
+        "issues_matched",
+        "issues_queued",
+        "batch_processed",
+        "pr_created",
+        "ready_retry_executed",
+        "ready_retry_failed",
+    ];
 
-    let issues_fetched = state
-        .tracker
-        .get_metrics("issues_fetched", Some(since), 50_000)
-        .unwrap_or_default();
-    let issues_matched = state
-        .tracker
-        .get_metrics("issues_matched", Some(since), 50_000)
-        .unwrap_or_default();
-    let issues_queued = state
-        .tracker
-        .get_metrics("issues_queued", Some(since), 50_000)
-        .unwrap_or_default();
-    let batch_processed = state
-        .tracker
-        .get_metrics("batch_processed", Some(since), 50_000)
-        .unwrap_or_default();
-    let pr_created = state
-        .tracker
-        .get_metrics("pr_created", Some(since), 50_000)
-        .unwrap_or_default();
-    let retries_found = state
-        .tracker
-        .get_metrics("ready_retries_found", Some(since), 50_000)
-        .unwrap_or_default();
-    let retries_executed = state
-        .tracker
-        .get_metrics("ready_retries_executed_total", Some(since), 50_000)
-        .unwrap_or_default();
-    let retries_failed = state
-        .tracker
-        .get_metrics("ready_retries_failed_total", Some(since), 50_000)
-        .unwrap_or_default();
-    let pr_status_checks = state
-        .tracker
-        .get_metrics("pr_status_checks", Some(since), 50_000)
-        .unwrap_or_default();
-    let pr_status_merged = state
-        .tracker
-        .get_metrics("pr_status_merged", Some(since), 50_000)
-        .unwrap_or_default();
-    let pr_status_closed = state
-        .tracker
-        .get_metrics("pr_status_closed", Some(since), 50_000)
-        .unwrap_or_default();
-    let pr_status_errors = state
-        .tracker
-        .get_metrics("pr_status_errors", Some(since), 50_000)
-        .unwrap_or_default();
-    let regression_watches_created = state
-        .tracker
-        .get_metrics("regression_watches_created", Some(since), 50_000)
-        .unwrap_or_default();
-    let auto_resolved_on_merge = state
-        .tracker
-        .get_metrics("auto_resolved_on_merge", Some(since), 50_000)
-        .unwrap_or_default();
-    let cascade_triggered = state
-        .tracker
-        .get_metrics("cascade_triggered", Some(since), 50_000)
-        .unwrap_or_default();
-    let cascade_failed = state
-        .tracker
-        .get_metrics("cascade_failed", Some(since), 50_000)
-        .unwrap_or_default();
+    let mut totals = TelemetryPipelineTotals::default();
+    let mut per_source: HashMap<String, TelemetryPipelineSource> = HashMap::new();
+
+    if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
+        let sums = db
+            .get_metric_sums_since(&total_metric_names, since)
+            .unwrap_or_default();
+
+        totals.fetched = sums.get("issues_fetched").copied().unwrap_or(0.0);
+        totals.matched = sums.get("issues_matched").copied().unwrap_or(0.0);
+        totals.queued = sums.get("issues_queued").copied().unwrap_or(0.0);
+        totals.processed = sums.get("batch_processed").copied().unwrap_or(0.0);
+        totals.pr_created = sums.get("pr_created").copied().unwrap_or(0.0);
+        totals.retries_found = sums.get("ready_retries_found").copied().unwrap_or(0.0);
+        totals.retries_executed = sums
+            .get("ready_retries_executed_total")
+            .copied()
+            .unwrap_or(0.0);
+        totals.retries_failed = sums
+            .get("ready_retries_failed_total")
+            .copied()
+            .unwrap_or(0.0);
+        totals.pr_status_checks = sums.get("pr_status_checks").copied().unwrap_or(0.0);
+        totals.pr_status_merged = sums.get("pr_status_merged").copied().unwrap_or(0.0);
+        totals.pr_status_closed = sums.get("pr_status_closed").copied().unwrap_or(0.0);
+        totals.pr_status_errors = sums.get("pr_status_errors").copied().unwrap_or(0.0);
+        totals.regression_watches_created = sums
+            .get("regression_watches_created")
+            .copied()
+            .unwrap_or(0.0);
+        totals.auto_resolved_on_merge = sums.get("auto_resolved_on_merge").copied().unwrap_or(0.0);
+        totals.cascade_triggered = sums.get("cascade_triggered").copied().unwrap_or(0.0);
+        totals.cascade_failed = sums.get("cascade_failed").copied().unwrap_or(0.0);
+
+        let per_source_sums = db
+            .get_metric_sums_by_source_since(&per_source_metric_names, since)
+            .unwrap_or_default();
+        for ((metric_name, source), value) in per_source_sums {
+            let entry =
+                per_source
+                    .entry(source.clone())
+                    .or_insert_with(|| TelemetryPipelineSource {
+                        source,
+                        ..TelemetryPipelineSource::default()
+                    });
+            match metric_name.as_str() {
+                "issues_fetched" => entry.fetched += value,
+                "issues_matched" => entry.matched += value,
+                "issues_queued" => entry.queued += value,
+                "batch_processed" => entry.processed += value,
+                "pr_created" => entry.pr_created += value,
+                "ready_retry_executed" => entry.retries_executed += value,
+                "ready_retry_failed" => entry.retries_failed += value,
+                _ => {}
+            }
+        }
+    } else {
+        let issues_fetched = state
+            .tracker
+            .get_metrics("issues_fetched", Some(since), 50_000)
+            .unwrap_or_default();
+        let issues_matched = state
+            .tracker
+            .get_metrics("issues_matched", Some(since), 50_000)
+            .unwrap_or_default();
+        let issues_queued = state
+            .tracker
+            .get_metrics("issues_queued", Some(since), 50_000)
+            .unwrap_or_default();
+        let batch_processed = state
+            .tracker
+            .get_metrics("batch_processed", Some(since), 50_000)
+            .unwrap_or_default();
+        let pr_created = state
+            .tracker
+            .get_metrics("pr_created", Some(since), 50_000)
+            .unwrap_or_default();
+        let retries_found = state
+            .tracker
+            .get_metrics("ready_retries_found", Some(since), 50_000)
+            .unwrap_or_default();
+        let retries_executed = state
+            .tracker
+            .get_metrics("ready_retries_executed_total", Some(since), 50_000)
+            .unwrap_or_default();
+        let retries_failed = state
+            .tracker
+            .get_metrics("ready_retries_failed_total", Some(since), 50_000)
+            .unwrap_or_default();
+        let pr_status_checks = state
+            .tracker
+            .get_metrics("pr_status_checks", Some(since), 50_000)
+            .unwrap_or_default();
+        let pr_status_merged = state
+            .tracker
+            .get_metrics("pr_status_merged", Some(since), 50_000)
+            .unwrap_or_default();
+        let pr_status_closed = state
+            .tracker
+            .get_metrics("pr_status_closed", Some(since), 50_000)
+            .unwrap_or_default();
+        let pr_status_errors = state
+            .tracker
+            .get_metrics("pr_status_errors", Some(since), 50_000)
+            .unwrap_or_default();
+        let regression_watches_created = state
+            .tracker
+            .get_metrics("regression_watches_created", Some(since), 50_000)
+            .unwrap_or_default();
+        let auto_resolved_on_merge = state
+            .tracker
+            .get_metrics("auto_resolved_on_merge", Some(since), 50_000)
+            .unwrap_or_default();
+        let cascade_triggered = state
+            .tracker
+            .get_metrics("cascade_triggered", Some(since), 50_000)
+            .unwrap_or_default();
+        let cascade_failed = state
+            .tracker
+            .get_metrics("cascade_failed", Some(since), 50_000)
+            .unwrap_or_default();
+
+        totals = TelemetryPipelineTotals {
+            fetched: sum_metric_values(&issues_fetched),
+            matched: sum_metric_values(&issues_matched),
+            queued: sum_metric_values(&issues_queued),
+            processed: sum_metric_values(&batch_processed),
+            pr_created: sum_metric_values(&pr_created),
+            retries_found: sum_metric_values(&retries_found),
+            retries_executed: sum_metric_values(&retries_executed),
+            retries_failed: sum_metric_values(&retries_failed),
+            pr_status_checks: sum_metric_values(&pr_status_checks),
+            pr_status_merged: sum_metric_values(&pr_status_merged),
+            pr_status_closed: sum_metric_values(&pr_status_closed),
+            pr_status_errors: sum_metric_values(&pr_status_errors),
+            regression_watches_created: sum_metric_values(&regression_watches_created),
+            auto_resolved_on_merge: sum_metric_values(&auto_resolved_on_merge),
+            cascade_triggered: sum_metric_values(&cascade_triggered),
+            cascade_failed: sum_metric_values(&cascade_failed),
+        };
+
+        let per_source_retry_executed = state
+            .tracker
+            .get_metrics("ready_retry_executed", Some(since), 50_000)
+            .unwrap_or_default();
+        let per_source_retry_failed = state
+            .tracker
+            .get_metrics("ready_retry_failed", Some(since), 50_000)
+            .unwrap_or_default();
+
+        for metric in &issues_fetched {
+            if let Some(source) = &metric.source {
+                let entry =
+                    per_source
+                        .entry(source.clone())
+                        .or_insert_with(|| TelemetryPipelineSource {
+                            source: source.clone(),
+                            ..TelemetryPipelineSource::default()
+                        });
+                entry.fetched += metric.metric_value;
+            }
+        }
+        for metric in &issues_matched {
+            if let Some(source) = &metric.source {
+                let entry =
+                    per_source
+                        .entry(source.clone())
+                        .or_insert_with(|| TelemetryPipelineSource {
+                            source: source.clone(),
+                            ..TelemetryPipelineSource::default()
+                        });
+                entry.matched += metric.metric_value;
+            }
+        }
+        for metric in &issues_queued {
+            if let Some(source) = &metric.source {
+                let entry =
+                    per_source
+                        .entry(source.clone())
+                        .or_insert_with(|| TelemetryPipelineSource {
+                            source: source.clone(),
+                            ..TelemetryPipelineSource::default()
+                        });
+                entry.queued += metric.metric_value;
+            }
+        }
+        for metric in &batch_processed {
+            if let Some(source) = &metric.source {
+                let entry =
+                    per_source
+                        .entry(source.clone())
+                        .or_insert_with(|| TelemetryPipelineSource {
+                            source: source.clone(),
+                            ..TelemetryPipelineSource::default()
+                        });
+                entry.processed += metric.metric_value;
+            }
+        }
+        for metric in &pr_created {
+            if let Some(source) = &metric.source {
+                let entry =
+                    per_source
+                        .entry(source.clone())
+                        .or_insert_with(|| TelemetryPipelineSource {
+                            source: source.clone(),
+                            ..TelemetryPipelineSource::default()
+                        });
+                entry.pr_created += metric.metric_value;
+            }
+        }
+        for metric in &per_source_retry_executed {
+            if let Some(source) = &metric.source {
+                let entry =
+                    per_source
+                        .entry(source.clone())
+                        .or_insert_with(|| TelemetryPipelineSource {
+                            source: source.clone(),
+                            ..TelemetryPipelineSource::default()
+                        });
+                entry.retries_executed += metric.metric_value;
+            }
+        }
+        for metric in &per_source_retry_failed {
+            if let Some(source) = &metric.source {
+                let entry =
+                    per_source
+                        .entry(source.clone())
+                        .or_insert_with(|| TelemetryPipelineSource {
+                            source: source.clone(),
+                            ..TelemetryPipelineSource::default()
+                        });
+                entry.retries_failed += metric.metric_value;
+            }
+        }
+    }
 
     let poll_cycle_duration = state
         .tracker
@@ -1549,25 +1820,6 @@ async fn telemetry_pipeline_handler(
         .tracker
         .get_metrics("total_attempts", Some(since), 50_000)
         .unwrap_or_default();
-
-    let totals = TelemetryPipelineTotals {
-        fetched: sum_metric_values(&issues_fetched),
-        matched: sum_metric_values(&issues_matched),
-        queued: sum_metric_values(&issues_queued),
-        processed: sum_metric_values(&batch_processed),
-        pr_created: sum_metric_values(&pr_created),
-        retries_found: sum_metric_values(&retries_found),
-        retries_executed: sum_metric_values(&retries_executed),
-        retries_failed: sum_metric_values(&retries_failed),
-        pr_status_checks: sum_metric_values(&pr_status_checks),
-        pr_status_merged: sum_metric_values(&pr_status_merged),
-        pr_status_closed: sum_metric_values(&pr_status_closed),
-        pr_status_errors: sum_metric_values(&pr_status_errors),
-        regression_watches_created: sum_metric_values(&regression_watches_created),
-        auto_resolved_on_merge: sum_metric_values(&auto_resolved_on_merge),
-        cascade_triggered: sum_metric_values(&cascade_triggered),
-        cascade_failed: sum_metric_values(&cascade_failed),
-    };
 
     let conversion = TelemetryPipelineConversion {
         match_rate: ratio(totals.matched, totals.fetched),
@@ -1587,101 +1839,6 @@ async fn telemetry_pipeline_handler(
         pending_max: max_metric_value(&pending_attempts),
         total_latest: latest_metric_value(&total_attempts),
     };
-
-    let per_source_retry_executed = state
-        .tracker
-        .get_metrics("ready_retry_executed", Some(since), 50_000)
-        .unwrap_or_default();
-    let per_source_retry_failed = state
-        .tracker
-        .get_metrics("ready_retry_failed", Some(since), 50_000)
-        .unwrap_or_default();
-
-    let mut per_source: HashMap<String, TelemetryPipelineSource> = HashMap::new();
-    for metric in &issues_fetched {
-        if let Some(source) = &metric.source {
-            let entry =
-                per_source
-                    .entry(source.clone())
-                    .or_insert_with(|| TelemetryPipelineSource {
-                        source: source.clone(),
-                        ..TelemetryPipelineSource::default()
-                    });
-            entry.fetched += metric.metric_value;
-        }
-    }
-    for metric in &issues_matched {
-        if let Some(source) = &metric.source {
-            let entry =
-                per_source
-                    .entry(source.clone())
-                    .or_insert_with(|| TelemetryPipelineSource {
-                        source: source.clone(),
-                        ..TelemetryPipelineSource::default()
-                    });
-            entry.matched += metric.metric_value;
-        }
-    }
-    for metric in &issues_queued {
-        if let Some(source) = &metric.source {
-            let entry =
-                per_source
-                    .entry(source.clone())
-                    .or_insert_with(|| TelemetryPipelineSource {
-                        source: source.clone(),
-                        ..TelemetryPipelineSource::default()
-                    });
-            entry.queued += metric.metric_value;
-        }
-    }
-    for metric in &batch_processed {
-        if let Some(source) = &metric.source {
-            let entry =
-                per_source
-                    .entry(source.clone())
-                    .or_insert_with(|| TelemetryPipelineSource {
-                        source: source.clone(),
-                        ..TelemetryPipelineSource::default()
-                    });
-            entry.processed += metric.metric_value;
-        }
-    }
-    for metric in &pr_created {
-        if let Some(source) = &metric.source {
-            let entry =
-                per_source
-                    .entry(source.clone())
-                    .or_insert_with(|| TelemetryPipelineSource {
-                        source: source.clone(),
-                        ..TelemetryPipelineSource::default()
-                    });
-            entry.pr_created += metric.metric_value;
-        }
-    }
-    for metric in &per_source_retry_executed {
-        if let Some(source) = &metric.source {
-            let entry =
-                per_source
-                    .entry(source.clone())
-                    .or_insert_with(|| TelemetryPipelineSource {
-                        source: source.clone(),
-                        ..TelemetryPipelineSource::default()
-                    });
-            entry.retries_executed += metric.metric_value;
-        }
-    }
-    for metric in &per_source_retry_failed {
-        if let Some(source) = &metric.source {
-            let entry =
-                per_source
-                    .entry(source.clone())
-                    .or_insert_with(|| TelemetryPipelineSource {
-                        source: source.clone(),
-                        ..TelemetryPipelineSource::default()
-                    });
-            entry.retries_failed += metric.metric_value;
-        }
-    }
 
     let mut per_source: Vec<TelemetryPipelineSource> = per_source
         .into_values()

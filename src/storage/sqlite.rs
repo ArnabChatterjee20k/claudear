@@ -165,6 +165,9 @@ impl SqliteTracker {
             CREATE INDEX IF NOT EXISTS idx_fix_attempts_source_issue ON fix_attempts(source, issue_id);
             CREATE INDEX IF NOT EXISTS idx_fix_attempts_pr_url ON fix_attempts(pr_url);
             CREATE INDEX IF NOT EXISTS idx_fix_attempts_retryable ON fix_attempts(status, retry_count, attempted_at);
+            -- Hot path for attempts list endpoints: filter by status/source, sort by attempted_at.
+            CREATE INDEX IF NOT EXISTS idx_fix_attempts_status_attempted ON fix_attempts(status, attempted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fix_attempts_source_status_attempted ON fix_attempts(source, status, attempted_at DESC);
 
             -- Feedback outcomes table for learning from past fixes
             CREATE TABLE IF NOT EXISTS feedback_outcomes (
@@ -263,6 +266,7 @@ impl SqliteTracker {
             CREATE INDEX IF NOT EXISTS idx_activity_issue ON activity_log(issue_id);
             -- Composite index covers queries on source alone and source+issue_id
             CREATE INDEX IF NOT EXISTS idx_activity_source_issue ON activity_log(source, issue_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_activity_source_timestamp ON activity_log(source, timestamp DESC);
 
             -- Claude executions - detailed execution metrics
             CREATE TABLE IF NOT EXISTS claude_executions (
@@ -2056,6 +2060,33 @@ impl SqliteTracker {
         Ok(rows.flatten().collect())
     }
 
+    /// Count activity events grouped by type since a timestamp.
+    pub fn get_activity_type_counts_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<String, i64>> {
+        let conn = self.acquire_lock()?;
+        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT activity_type, COUNT(*)
+            FROM activity_log
+            WHERE timestamp >= ?1
+            GROUP BY activity_type
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![since_str], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut counts = HashMap::new();
+        for row in rows.flatten() {
+            counts.insert(row.0, row.1);
+        }
+        Ok(counts)
+    }
+
     /// Get activities for a specific issue.
     pub fn get_activities_for_issue(
         &self,
@@ -2265,6 +2296,57 @@ impl SqliteTracker {
         }
 
         Ok(executions)
+    }
+
+    /// Get a specific execution for an attempt.
+    pub fn get_execution_for_attempt(
+        &self,
+        attempt_id: i64,
+        execution_id: i64,
+    ) -> Result<Option<ClaudeExecution>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
+                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
+                   prompt_used, prompt_hash, model_version, working_directory, git_branch,
+                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed
+            FROM claude_executions
+            WHERE attempt_id = ?1 AND id = ?2
+            LIMIT 1
+            "#,
+        )?;
+
+        let execution = stmt
+            .query_row(params![attempt_id, execution_id], |row| {
+                Ok(ClaudeExecution {
+                    id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
+                    completed_at: Self::parse_optional_datetime(row.get(3)?),
+                    duration_secs: row.get(4)?,
+                    exit_code: row.get(5)?,
+                    timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
+                    stdout_preview: row.get(7)?,
+                    stderr_preview: row.get(8)?,
+                    stdout_log_path: row.get(9)?,
+                    stderr_log_path: row.get(10)?,
+                    event_log_path: row.get(11)?,
+                    prompt_used: row.get(12)?,
+                    prompt_hash: row.get(13)?,
+                    model_version: row.get(14)?,
+                    working_directory: row.get(15)?,
+                    git_branch: row.get(16)?,
+                    git_commit_before: row.get(17)?,
+                    git_commit_after: row.get(18)?,
+                    files_changed: row.get(19)?,
+                    lines_added: row.get(20)?,
+                    lines_removed: row.get(21)?,
+                })
+            })
+            .optional()?;
+
+        Ok(execution)
     }
 
     /// Record a PR review.
@@ -3249,6 +3331,156 @@ impl SqliteTracker {
         let rows = stmt.query_map(params_refs.as_slice(), Self::row_to_metric)?;
 
         Ok(rows.flatten().collect())
+    }
+
+    /// Get metric row counts grouped by name since a timestamp.
+    pub fn get_metric_counts_since(
+        &self,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<String, i64>> {
+        if metric_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.acquire_lock()?;
+
+        let placeholders = (0..metric_names.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT metric_name, COUNT(*)
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND metric_name IN ({})
+            GROUP BY metric_name
+            "#,
+            placeholders
+        );
+
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(metric_names.len() + 1);
+        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
+        for metric_name in metric_names {
+            bind_params.push(Box::new((*metric_name).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut counts = HashMap::new();
+        for row in rows.flatten() {
+            counts.insert(row.0, row.1);
+        }
+        Ok(counts)
+    }
+
+    /// Get metric sums grouped by name since a timestamp.
+    pub fn get_metric_sums_since(
+        &self,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<String, f64>> {
+        if metric_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.acquire_lock()?;
+
+        let placeholders = (0..metric_names.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT metric_name, SUM(metric_value)
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND metric_name IN ({})
+            GROUP BY metric_name
+            "#,
+            placeholders
+        );
+
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(metric_names.len() + 1);
+        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
+        for metric_name in metric_names {
+            bind_params.push(Box::new((*metric_name).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+            ))
+        })?;
+
+        let mut sums = HashMap::new();
+        for row in rows.flatten() {
+            sums.insert(row.0, row.1);
+        }
+        Ok(sums)
+    }
+
+    /// Get metric sums grouped by (metric_name, source) since a timestamp.
+    pub fn get_metric_sums_by_source_since(
+        &self,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<(String, String), f64>> {
+        if metric_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.acquire_lock()?;
+
+        let placeholders = (0..metric_names.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT metric_name, source, SUM(metric_value)
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND metric_name IN ({})
+            GROUP BY metric_name, source
+            "#,
+            placeholders
+        );
+
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(metric_names.len() + 1);
+        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
+        for metric_name in metric_names {
+            bind_params.push(Box::new((*metric_name).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+            ))
+        })?;
+
+        let mut sums = HashMap::new();
+        for row in rows.flatten() {
+            if let Some(source) = row.1 {
+                sums.insert((row.0, source), row.2);
+            }
+        }
+        Ok(sums)
     }
 
     fn row_to_metric(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessingMetric> {
@@ -4642,6 +4874,140 @@ impl SqliteTracker {
 
         let result = stmt.query_row(params![id], Self::row_to_fix_attempt).ok();
         Ok(result)
+    }
+
+    /// List fix attempts with optional status/source filters and pagination.
+    pub fn list_attempts(
+        &self,
+        status: Option<&str>,
+        source: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut attempts = Vec::new();
+
+        let query_all = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            ORDER BY attempted_at DESC
+            LIMIT ?1 OFFSET ?2
+        "#;
+        let query_status = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE status = ?1
+            ORDER BY attempted_at DESC
+            LIMIT ?2 OFFSET ?3
+        "#;
+        let query_source = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE source = ?1
+            ORDER BY attempted_at DESC
+            LIMIT ?2 OFFSET ?3
+        "#;
+        let query_status_source = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE status = ?1 AND source = ?2
+            ORDER BY attempted_at DESC
+            LIMIT ?3 OFFSET ?4
+        "#;
+
+        match (status, source) {
+            (Some(status), Some(source)) => {
+                let mut stmt = conn.prepare_cached(query_status_source)?;
+                let rows = stmt.query_map(
+                    params![status, source, limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+            (Some(status), None) => {
+                let mut stmt = conn.prepare_cached(query_status)?;
+                let rows = stmt.query_map(
+                    params![status, limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+            (None, Some(source)) => {
+                let mut stmt = conn.prepare_cached(query_source)?;
+                let rows = stmt.query_map(
+                    params![source, limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare_cached(query_all)?;
+                let rows = stmt.query_map(
+                    params![limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+        }
+
+        Ok(attempts)
+    }
+
+    /// Count fix attempts with optional status/source filters.
+    pub fn count_attempts(&self, status: Option<&str>, source: Option<&str>) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = match (status, source) {
+            (Some(status), Some(source)) => conn.query_row(
+                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1 AND source = ?2",
+                params![status, source],
+                |row| row.get(0),
+            )?,
+            (Some(status), None) => conn.query_row(
+                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1",
+                params![status],
+                |row| row.get(0),
+            )?,
+            (None, Some(source)) => conn.query_row(
+                "SELECT COUNT(*) FROM fix_attempts WHERE source = ?1",
+                params![source],
+                |row| row.get(0),
+            )?,
+            (None, None) => {
+                conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?
+            }
+        };
+        Ok(count as usize)
+    }
+
+    /// List recent attempts ordered by attempted time descending.
+    pub fn list_recent_attempts(&self, limit: usize) -> Result<Vec<FixAttempt>> {
+        self.list_attempts(None, None, limit, 0)
+    }
+
+    /// List attempts since a timestamp, ordered by attempted time descending.
+    pub fn list_attempts_since(&self, since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE attempted_at >= ?1
+            ORDER BY attempted_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![since_str], Self::row_to_fix_attempt)?;
+        Ok(rows.flatten().collect())
     }
 
     /// Record a cascade fix attempt linked to a parent attempt.
