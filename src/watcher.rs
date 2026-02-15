@@ -1105,6 +1105,18 @@ Create a PR with your changes."#,
                 }
                 Err(e) => {
                     retries_failed += 1;
+                    let retry_error = format!("Retry trigger failed: {}", e);
+                    if let Err(mark_err) =
+                        self.tracker
+                            .mark_failed(&attempt.source, &attempt.issue_id, &retry_error)
+                    {
+                        tracing::warn!(
+                            component = "watcher",
+                            short_id = %attempt.short_id,
+                            error = %mark_err,
+                            "Failed to restore retry attempt state after trigger error"
+                        );
+                    }
                     let metric = ProcessingMetric::new("ready_retry_failed", 1.0)
                         .with_source(attempt.source.clone());
                     if let Err(record_err) = self.tracker.record_metric(&metric) {
@@ -1567,6 +1579,17 @@ Create a PR with your changes."#,
         tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
         tracing::info!(short_id = %issue.short_id, priority = ?match_result.priority, "Match priority");
 
+        // Record/update attempt state early so preflight failures are not retried forever.
+        let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
+        if let Err(e) = self.tracker.record_attempt_with_labels(
+            source.name(),
+            &issue.id,
+            &issue.short_id,
+            &labels,
+        ) {
+            tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
+        }
+
         // Infer the target repository using the shared resolution function
         let resolution =
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, self.sqlite_tracker.as_ref());
@@ -1575,6 +1598,17 @@ Create a PR with your changes."#,
             RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
             RepoResolution::Skip { reason } => {
                 tracing::debug!(short_id = %issue.short_id, reason = %reason, "Skipping issue");
+                let resolution_error = format!("Repository resolution failed: {}", reason);
+                if let Err(e) =
+                    self.tracker
+                        .mark_failed(source.name(), &issue.id, &resolution_error)
+                {
+                    tracing::warn!(
+                        short_id = %issue.short_id,
+                        error = %e,
+                        "Failed to mark issue as failed after repository resolution skip"
+                    );
+                }
                 // Clean up processing state before returning
                 {
                     let mut processing = self.processing.write().await;
@@ -1600,6 +1634,17 @@ Create a PR with your changes."#,
             if let Err(e) =
                 GitOps::ensure_repo_at_path(&project_dir, github_url, default_branch).await
             {
+                let pull_error = format!("Failed to pull repository: {}", e);
+                if let Err(mark_err) =
+                    self.tracker
+                        .mark_failed(source.name(), &issue.id, &pull_error)
+                {
+                    tracing::warn!(
+                        short_id = %issue.short_id,
+                        error = %mark_err,
+                        "Failed to mark issue as failed after repository pull failure"
+                    );
+                }
                 tracing::error!(
                     short_id = %issue.short_id,
                     repo = %repo_name,
@@ -1640,17 +1685,6 @@ Create a PR with your changes."#,
                     }
                 }
             }
-        }
-
-        // Extract labels from issue metadata for bug detection
-        let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
-        if let Err(e) = self.tracker.record_attempt_with_labels(
-            source.name(),
-            &issue.id,
-            &issue.short_id,
-            &labels,
-        ) {
-            tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
 
         // Get the attempt ID for analytics tracking
@@ -3573,6 +3607,84 @@ mod tests {
         // Poll should complete successfully
         let result = watcher.poll().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_ready_retries_marks_failed_when_trigger_fails() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("mock", "missing-1", "MOCK-1")
+            .unwrap();
+        tracker
+            .mark_failed("mock", "missing-1", "initial failure")
+            .unwrap();
+
+        let source = Arc::new(MockSource::new("mock")) as Arc<dyn IssueSource>;
+
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        config.processing_delay_ms = 0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source],
+            notifier,
+            tracker: tracker.clone(),
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        watcher.process_ready_retries().await.unwrap();
+
+        let attempt = tracker.get_attempt("mock", "missing-1").unwrap().unwrap();
+        assert_eq!(attempt.status, crate::types::FixAttemptStatus::Failed);
+        assert_eq!(attempt.retry_count, 1);
+        assert!(attempt
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Retry trigger failed"));
+    }
+
+    #[tokio::test]
+    async fn test_poll_source_marks_failed_when_repo_resolution_skips() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let source = Arc::new(MockSource::with_issues(
+            "mock",
+            vec![Issue::new(
+                "issue-1",
+                "MOCK-1",
+                "Issue without resolvable repo",
+                "https://example.com/issue-1",
+                "mock",
+            )],
+        )) as Arc<dyn IssueSource>;
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), vec![source.clone()], false);
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        watcher.poll_source(&source).await.unwrap();
+
+        let attempt = tracker.get_attempt("mock", "issue-1").unwrap().unwrap();
+        assert_eq!(attempt.status, crate::types::FixAttemptStatus::Failed);
+        assert!(attempt
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Repository resolution failed"));
     }
 
     #[test]

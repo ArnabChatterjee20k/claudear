@@ -1543,7 +1543,7 @@ impl FixAttemptTracker for SqliteTracker {
                    github_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
-            WHERE (status = 'failed' OR status = 'closed')
+            WHERE (status = 'failed' OR status = 'closed' OR status = 'pending')
               AND COALESCE(retry_count, 0) < ?
             ORDER BY attempted_at ASC
             "#,
@@ -5446,6 +5446,20 @@ mod tests {
         assert!(attempt.github_repo.is_none());
         assert!(attempt.github_pr_number.is_none());
         assert!(attempt.error_message.is_none());
+    }
+
+    #[test]
+    fn test_get_retryable_issues_includes_pending() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker
+            .record_attempt("linear", "pending-1", "PROJ-PENDING-1")
+            .unwrap();
+
+        let retryable = tracker.get_retryable_issues(3).unwrap();
+        assert_eq!(retryable.len(), 1);
+        assert_eq!(retryable[0].issue_id, "pending-1");
+        assert_eq!(retryable[0].status, FixAttemptStatus::Pending);
     }
 
     #[test]

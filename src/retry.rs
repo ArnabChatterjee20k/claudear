@@ -23,8 +23,10 @@ impl RetryManager {
 
     /// Check if an attempt should be retried.
     pub fn should_retry(&self, attempt: &FixAttempt) -> bool {
-        // Only retry failed or closed attempts
-        if attempt.status != FixAttemptStatus::Failed && attempt.status != FixAttemptStatus::Closed
+        // Retry failed/closed attempts and recover stale pending attempts
+        if attempt.status != FixAttemptStatus::Failed
+            && attempt.status != FixAttemptStatus::Closed
+            && attempt.status != FixAttemptStatus::Pending
         {
             return false;
         }
@@ -280,6 +282,12 @@ mod tests {
             ..failed.clone()
         };
         assert!(manager.should_retry(&closed));
+
+        let pending = FixAttempt {
+            status: FixAttemptStatus::Pending,
+            ..failed.clone()
+        };
+        assert!(manager.should_retry(&pending));
 
         let success = FixAttempt {
             status: FixAttemptStatus::Success,
