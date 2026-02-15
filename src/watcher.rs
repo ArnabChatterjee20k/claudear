@@ -418,14 +418,16 @@ impl Watcher {
                     }
                 }
 
-                // Check for PRs to auto-close due to issue state changes
-                if let Err(e) = self.check_and_auto_close_prs().await {
-                    tracing::debug!(error = %e, "Error checking for auto-close PRs");
-                }
+                if !self.dry_run {
+                    // Check for PRs to auto-close due to issue state changes
+                    if let Err(e) = self.check_and_auto_close_prs().await {
+                        tracing::debug!(error = %e, "Error checking for auto-close PRs");
+                    }
 
-                // Check for PR reviews
-                if let Err(e) = self.check_reviews().await {
-                    tracing::debug!(error = %e, "Error checking for PR reviews");
+                    // Check for PR reviews
+                    if let Err(e) = self.check_reviews().await {
+                        tracing::debug!(error = %e, "Error checking for PR reviews");
+                    }
                 }
 
                 // Poll for new issues
@@ -1073,9 +1075,16 @@ Create a PR with your changes."#,
                 }
             }
 
-            // Wait for concurrency slot (per-source limit)
-            let retry_max_concurrent = self.config.max_concurrent_for(&attempt.source);
-            while self.active_processing.load(Ordering::SeqCst) >= retry_max_concurrent {
+            // Wait for concurrency slot (per-source limit, clamped to 1 to avoid deadlock).
+            let configured_retry_max_concurrent = self.config.max_concurrent_for(&attempt.source);
+            let retry_max_concurrent = configured_retry_max_concurrent.max(1);
+            if configured_retry_max_concurrent == 0 {
+                tracing::warn!(
+                    source = %attempt.source,
+                    "max_concurrent_for source evaluated to 0, clamping to 1"
+                );
+            }
+            while self.active_processing_for_source(&attempt.source).await >= retry_max_concurrent {
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -1519,15 +1528,22 @@ Create a PR with your changes."#,
             }
         }
 
-        // Process issues with rate limiting (per-source concurrency limit)
-        let source_max_concurrent = self.config.max_concurrent_for(source.name());
+        // Process issues with rate limiting (per-source limit, clamped to 1 to avoid deadlock).
+        let configured_source_max_concurrent = self.config.max_concurrent_for(source.name());
+        let source_max_concurrent = configured_source_max_concurrent.max(1);
+        if configured_source_max_concurrent == 0 {
+            tracing::warn!(
+                source = source.name(),
+                "max_concurrent_for source evaluated to 0, clamping to 1"
+            );
+        }
         for (i, (issue, match_result)) in to_process.into_iter().enumerate() {
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
 
             // Wait for concurrency slot (per-source limit)
-            while self.active_processing.load(Ordering::SeqCst) >= source_max_concurrent {
+            while self.active_processing_for_source(source.name()).await >= source_max_concurrent {
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -1546,11 +1562,6 @@ Create a PR with your changes."#,
             }
         }
 
-        // Wait for all processing to complete
-        while self.active_processing.load(Ordering::SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-
         // Record processing metrics (don't fail main operation if this fails)
         let metric = ProcessingMetric::new("batch_processed", to_process_count as f64)
             .with_source(source.name().to_string());
@@ -1559,6 +1570,16 @@ Create a PR with your changes."#,
         }
 
         Ok(())
+    }
+
+    /// Number of active processing items for a specific source.
+    async fn active_processing_for_source(&self, source_name: &str) -> usize {
+        let prefix = format!("{}:", source_name);
+        let processing = self.processing.read().await;
+        processing
+            .iter()
+            .filter(|key| key.starts_with(&prefix))
+            .count()
     }
 
     /// Process a single issue.
@@ -2558,6 +2579,7 @@ mod tests {
         name: String,
         issues: Vec<Issue>,
         match_priority: MatchPriority,
+        issue_status_calls: AtomicUsize,
     }
 
     impl MockSource {
@@ -2566,6 +2588,7 @@ mod tests {
                 name: name.to_string(),
                 issues: vec![],
                 match_priority: MatchPriority::Normal,
+                issue_status_calls: AtomicUsize::new(0),
             }
         }
 
@@ -2574,6 +2597,7 @@ mod tests {
                 name: name.to_string(),
                 issues,
                 match_priority: MatchPriority::Normal,
+                issue_status_calls: AtomicUsize::new(0),
             }
         }
 
@@ -2582,7 +2606,12 @@ mod tests {
                 name: name.to_string(),
                 issues,
                 match_priority,
+                issue_status_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn issue_status_call_count(&self) -> usize {
+            self.issue_status_calls.load(AtomicOrdering::SeqCst)
         }
     }
 
@@ -2609,6 +2638,11 @@ mod tests {
                 .find(|i| i.id == id)
                 .cloned()
                 .ok_or_else(|| crate::error::Error::source(&self.name, "Issue not found"))
+        }
+        async fn get_issue_status(&self, issue_id: &str) -> Result<String> {
+            self.issue_status_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let issue = self.get_issue(issue_id).await?;
+            Ok(format!("{:?}", issue.status))
         }
     }
 
@@ -3545,6 +3579,222 @@ mod tests {
             elapsed < std::time::Duration::from_millis(450),
             "poll_source took too long: {:?}",
             elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_watcher_poll_source_not_blocked_by_other_source_activity() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let source = Arc::new(MockSource::with_issues(
+            "target",
+            vec![Issue::new(
+                "1",
+                "TARGET-1",
+                "Target issue",
+                "http://example.com/target/1",
+                "target",
+            )],
+        )) as Arc<dyn IssueSource>;
+
+        let mut config = test_config();
+        config.max_concurrent = 1;
+        config.processing_delay_ms = 0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source.clone()],
+            notifier,
+            tracker: tracker.clone(),
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // Simulate unrelated in-flight work from another source.
+        watcher.active_processing.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.insert("other:inflight".to_string());
+        }
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            watcher.poll_source(&source),
+        )
+        .await;
+        assert!(result.is_ok(), "poll_source timed out unexpectedly");
+        assert!(result.unwrap().is_ok());
+
+        let attempt = tracker.get_attempt("target", "1").unwrap().unwrap();
+        assert_eq!(attempt.status, crate::types::FixAttemptStatus::Failed);
+
+        // Clean up simulated work so test state remains consistent.
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.remove("other:inflight");
+        }
+        watcher.active_processing.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn test_watcher_poll_source_zero_max_concurrent_does_not_deadlock() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let source = Arc::new(MockSource::with_issues(
+            "zero-concurrency",
+            vec![Issue::new(
+                "1",
+                "ZERO-1",
+                "Zero concurrency issue",
+                "http://example.com/zero/1",
+                "zero-concurrency",
+            )],
+        )) as Arc<dyn IssueSource>;
+
+        let mut config = test_config();
+        config.max_concurrent = 0;
+        config.processing_delay_ms = 0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source.clone()],
+            notifier,
+            tracker: tracker.clone(),
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            watcher.poll_source(&source),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "poll_source timed out with max_concurrent=0"
+        );
+        assert!(result.unwrap().is_ok());
+
+        let attempt = tracker
+            .get_attempt("zero-concurrency", "1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, crate::types::FixAttemptStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_process_ready_retries_zero_max_concurrent_does_not_deadlock() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("mock", "missing-retry", "MOCK-RETRY")
+            .unwrap();
+        tracker
+            .mark_failed("mock", "missing-retry", "initial failure")
+            .unwrap();
+
+        let source = Arc::new(MockSource::new("mock")) as Arc<dyn IssueSource>;
+
+        let mut config = test_config();
+        config.max_concurrent = 0;
+        config.processing_delay_ms = 0;
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source],
+            notifier,
+            tracker: tracker.clone(),
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            watcher.process_ready_retries(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "process_ready_retries timed out with max_concurrent=0"
+        );
+        assert!(result.unwrap().is_ok());
+
+        let attempt = tracker
+            .get_attempt("mock", "missing-retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, crate::types::FixAttemptStatus::Failed);
+        assert_eq!(attempt.retry_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_watcher_start_dry_run_skips_auto_close_checks() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker
+            .mark_success("mock", "1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let mock_source = Arc::new(MockSource::with_issues(
+            "mock",
+            vec![Issue::new(
+                "1",
+                "MOCK-1",
+                "Mock issue",
+                "http://example.com/mock/1",
+                "mock",
+            )],
+        ));
+        let source = Arc::clone(&mock_source) as Arc<dyn IssueSource>;
+
+        let watcher = Arc::new(create_test_watcher(notifier, tracker, vec![source], true));
+
+        let runner = {
+            let watcher = Arc::clone(&watcher);
+            tokio::spawn(async move { watcher.start(Some(50)).await })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        watcher.stop();
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), runner).await;
+        assert!(joined.is_ok(), "watcher start loop did not stop in time");
+        assert!(joined.unwrap().expect("task join failed").is_ok());
+        assert_eq!(
+            mock_source.issue_status_call_count(),
+            0,
+            "dry_run should not call get_issue_status via auto-close checks"
         );
     }
 
