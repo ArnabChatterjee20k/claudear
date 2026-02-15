@@ -65,6 +65,17 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
+/// Return the emoji for a given issue source.
+pub(crate) fn get_source_emoji(source: &str) -> &'static str {
+    match source.to_lowercase().as_str() {
+        "linear" => "\u{1F4CB}", // clipboard
+        "sentry" => "\u{1F534}", // red circle
+        "github" => "\u{1F419}", // octopus
+        "jira" => "\u{1F3AB}",   // ticket
+        _ => "\u{1F4CC}",        // pushpin
+    }
+}
+
 /// Trait for notification services.
 #[async_trait]
 pub trait Notifier: Send + Sync {

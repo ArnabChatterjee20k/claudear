@@ -11,12 +11,16 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     /// PR was merged successfully
+    #[serde(rename = "merged")]
     Merged,
     /// PR was closed without merging
+    #[serde(rename = "closed")]
     Closed,
     /// Fix attempt failed before creating PR
+    #[serde(rename = "failed")]
     Failed,
     /// Issue could not be fixed after retries
+    #[serde(rename = "cannot_fix")]
     CannotFix,
 }
 
@@ -1063,10 +1067,20 @@ mod tests {
     fn test_outcome_serde() {
         let outcome = Outcome::Merged;
         let json = serde_json::to_string(&outcome).unwrap();
-        assert_eq!(json, "\"Merged\"");
+        assert_eq!(json, "\"merged\"");
 
         let parsed: Outcome = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, Outcome::Merged);
+    }
+
+    #[test]
+    fn test_outcome_serde_cannot_fix() {
+        let outcome = Outcome::CannotFix;
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(json, "\"cannot_fix\"");
+
+        let parsed: Outcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, Outcome::CannotFix);
     }
 
     #[test]

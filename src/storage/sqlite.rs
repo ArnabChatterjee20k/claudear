@@ -11,7 +11,7 @@ use crate::types::{
 use chrono::{DateTime, Utc};
 use rand::RngExt;
 use rusqlite::OptionalExtension;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1157,24 +1157,11 @@ impl FixAttemptTracker for SqliteTracker {
         self
     }
 
-    fn has_attempted(&self, source: &str, issue_id: &str) -> bool {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to acquire database lock in has_attempted");
-                return false;
-            }
-        };
-        let mut stmt = match conn
-            .prepare_cached("SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ?")
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to prepare statement in has_attempted");
-                return false;
-            }
-        };
-        stmt.exists(params![source, issue_id]).unwrap_or(false)
+    fn has_attempted(&self, source: &str, issue_id: &str) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let mut stmt =
+            conn.prepare_cached("SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ?")?;
+        Ok(stmt.exists(params![source, issue_id])?)
     }
 
     fn get_attempted_issue_ids(&self, source: &str) -> HashSet<String> {
@@ -1252,7 +1239,6 @@ impl FixAttemptTracker for SqliteTracker {
             VALUES (?, ?, ?, 'pending', datetime('now'), ?)
             ON CONFLICT(source, issue_id) DO UPDATE SET
                 short_id = excluded.short_id,
-                attempted_at = datetime('now'),
                 issue_labels = COALESCE(excluded.issue_labels, fix_attempts.issue_labels)
             "#,
             params![source, issue_id, short_id, labels_json],
@@ -1543,7 +1529,7 @@ impl FixAttemptTracker for SqliteTracker {
                    github_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
-            WHERE (status = 'failed' OR status = 'closed' OR status = 'pending')
+            WHERE (status = 'failed' OR status = 'closed')
               AND COALESCE(retry_count, 0) < ?
             ORDER BY attempted_at ASC
             "#,
@@ -1887,11 +1873,11 @@ impl SqliteTracker {
             return Ok(0);
         }
 
-        let conn = self.acquire_lock()?;
-        conn.execute("BEGIN IMMEDIATE", [])?;
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let result = (|| {
-            let mut stmt = conn.prepare_cached(
+        {
+            let mut stmt = tx.prepare_cached(
                 r#"
                 INSERT INTO activity_log (timestamp, activity_type, source, issue_id, short_id, message, metadata)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1910,26 +1896,10 @@ impl SqliteTracker {
                     metadata_json,
                 ])?;
             }
-            Ok(entries.len())
-        })();
-
-        match result {
-            Ok(count) => {
-                conn.execute("COMMIT", [])?;
-                Ok(count)
-            }
-            Err(e) => {
-                if let Err(rollback_err) = conn.execute("ROLLBACK", []) {
-                    tracing::error!(
-                        component = "sqlite",
-                        original_error = %e,
-                        rollback_error = %rollback_err,
-                        "Failed to rollback transaction after batch activity insert error"
-                    );
-                }
-                Err(e)
-            }
         }
+
+        tx.commit()?;
+        Ok(entries.len())
     }
 
     /// Get recent activities, optionally filtered by source.
@@ -3039,11 +3009,11 @@ impl SqliteTracker {
             return Ok(0);
         }
 
-        let conn = self.acquire_lock()?;
-        conn.execute("BEGIN IMMEDIATE", [])?;
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let result = (|| {
-            let mut stmt = conn.prepare_cached(
+        {
+            let mut stmt = tx.prepare_cached(
                 r#"
                 INSERT INTO processing_metrics (timestamp, metric_name, metric_value, source, tags)
                 VALUES (?, ?, ?, ?, ?)
@@ -3060,26 +3030,10 @@ impl SqliteTracker {
                     tags_json,
                 ])?;
             }
-            Ok(metrics.len())
-        })();
-
-        match result {
-            Ok(count) => {
-                conn.execute("COMMIT", [])?;
-                Ok(count)
-            }
-            Err(e) => {
-                if let Err(rollback_err) = conn.execute("ROLLBACK", []) {
-                    tracing::error!(
-                        component = "sqlite",
-                        original_error = %e,
-                        rollback_error = %rollback_err,
-                        "Failed to rollback transaction after batch metrics insert error"
-                    );
-                }
-                Err(e)
-            }
         }
+
+        tx.commit()?;
+        Ok(metrics.len())
     }
 
     /// Get metrics by name within a time range.
@@ -5129,9 +5083,9 @@ mod tests {
 
         tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
 
-        assert!(tracker.has_attempted("linear", "123"));
-        assert!(!tracker.has_attempted("linear", "456"));
-        assert!(!tracker.has_attempted("sentry", "123"));
+        assert!(tracker.has_attempted("linear", "123").unwrap());
+        assert!(!tracker.has_attempted("linear", "456").unwrap());
+        assert!(!tracker.has_attempted("sentry", "123").unwrap());
 
         let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
         assert_eq!(attempt.issue_id, "123");
@@ -5264,10 +5218,10 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
-        assert!(tracker.has_attempted("linear", "123"));
+        assert!(tracker.has_attempted("linear", "123").unwrap());
 
         tracker.reset_attempt("linear", "123").unwrap();
-        assert!(!tracker.has_attempted("linear", "123"));
+        assert!(!tracker.has_attempted("linear", "123").unwrap());
     }
 
     #[test]
@@ -5449,17 +5403,26 @@ mod tests {
     }
 
     #[test]
-    fn test_get_retryable_issues_includes_pending() {
+    fn test_get_retryable_issues_excludes_pending() {
         let tracker = SqliteTracker::in_memory().unwrap();
 
+        // Pending issues should NOT be retryable -- they are still in their initial processing.
+        // Only failed/closed issues should be eligible for retry.
         tracker
             .record_attempt("linear", "pending-1", "PROJ-PENDING-1")
             .unwrap();
 
         let retryable = tracker.get_retryable_issues(3).unwrap();
+        assert_eq!(retryable.len(), 0);
+
+        // After marking as failed, it should become retryable
+        tracker
+            .mark_failed("linear", "pending-1", "some error")
+            .unwrap();
+        let retryable = tracker.get_retryable_issues(3).unwrap();
         assert_eq!(retryable.len(), 1);
         assert_eq!(retryable[0].issue_id, "pending-1");
-        assert_eq!(retryable[0].status, FixAttemptStatus::Pending);
+        assert_eq!(retryable[0].status, FixAttemptStatus::Failed);
     }
 
     #[test]
@@ -5614,8 +5577,8 @@ mod tests {
             .record_attempt("sentry", "123", "SENTRY-123")
             .unwrap();
 
-        assert!(tracker.has_attempted("linear", "123"));
-        assert!(tracker.has_attempted("sentry", "123"));
+        assert!(tracker.has_attempted("linear", "123").unwrap());
+        assert!(tracker.has_attempted("sentry", "123").unwrap());
 
         tracker
             .mark_success("linear", "123", "https://github.com/org/repo/pull/1")

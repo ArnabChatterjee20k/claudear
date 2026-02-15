@@ -39,8 +39,17 @@ impl GitOps {
             })?;
         }
 
+        // Validate the URL to prevent command injection via malicious repository URLs.
+        // Reject URLs containing shell metacharacters or those starting with '-' (option injection).
+        if url.starts_with('-') || url.contains(';') || url.contains('|') || url.contains('$') {
+            return Err(Error::git(format!(
+                "Invalid repository URL (contains disallowed characters): {}",
+                url
+            )));
+        }
+
         let output = Command::new("git")
-            .args(["clone", "--depth", "1", url])
+            .args(["clone", "--depth", "1", "--", url])
             .arg(target)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -61,7 +70,20 @@ impl GitOps {
     async fn pull(repo_path: &Path, branch: &str) -> Result<()> {
         tracing::debug!(repo = ?repo_path, branch = %branch, "Pulling latest changes");
 
-        // First, fetch
+        // Validate branch name to prevent injection via crafted branch names
+        if branch.starts_with('-')
+            || branch.contains(';')
+            || branch.contains('|')
+            || branch.contains('$')
+            || branch.contains("..")
+        {
+            return Err(Error::git(format!(
+                "Invalid branch name (contains disallowed characters): {}",
+                branch
+            )));
+        }
+
+        // First, fetch (branch name is validated above)
         let output = Command::new("git")
             .args(["fetch", "origin", branch])
             .current_dir(repo_path)
@@ -76,7 +98,7 @@ impl GitOps {
             return Err(Error::git(format!("git fetch failed: {}", stderr)));
         }
 
-        // Checkout the branch
+        // Checkout the branch (branch name is validated above)
         let output = Command::new("git")
             .args(["checkout", branch])
             .current_dir(repo_path)

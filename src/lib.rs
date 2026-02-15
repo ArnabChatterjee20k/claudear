@@ -33,6 +33,7 @@ pub mod error;
 pub mod feedback;
 pub mod github;
 pub mod github_app;
+pub mod http;
 pub mod inference;
 pub mod ipc;
 pub mod notifier;

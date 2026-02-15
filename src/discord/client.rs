@@ -4,28 +4,14 @@ use super::types::{
     CreateMessageParams, CreateThreadParams, DiscordChannel, DiscordMessage, DiscordThread,
 };
 use crate::error::{Error, Result};
+use crate::http::HttpResponse;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
-/// HTTP response abstraction for testability.
-#[derive(Debug)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: String,
-}
-
-impl HttpResponse {
-    pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
-    }
-
-    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.body)
-            .map_err(|e| Error::notifier("discord", format!("Failed to parse response: {}", e)))
-    }
-}
+/// Default HTTP request timeout for Discord API calls (30 seconds).
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 
 /// Trait for HTTP client operations to enable testing.
 #[async_trait]
@@ -52,6 +38,7 @@ impl ReqwestDiscordClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
             .build()
             .map_err(|e| Error::network(format!("Failed to create HTTP client: {}", e)))?;
 

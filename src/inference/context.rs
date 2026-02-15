@@ -222,7 +222,7 @@ impl IssueContext {
 
 /// Check if a string looks like a file path.
 fn looks_like_path(s: &str) -> bool {
-    s.contains('/') || s.contains('\\') || s.contains('.') && !s.starts_with('.')
+    s.contains('/') || s.contains('\\') || (s.contains('.') && !s.starts_with('.'))
 }
 
 /// Normalize a Sentry project name to a potential repository name.

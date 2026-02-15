@@ -312,16 +312,21 @@ pub struct AskReply {
 
 /// Status of a fix attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum FixAttemptStatus {
+    #[serde(rename = "pending")]
     Pending,
+    #[serde(rename = "success")]
     Success,
+    #[serde(rename = "failed")]
     Failed,
     /// PR was merged and issue was resolved.
+    #[serde(rename = "merged")]
     Merged,
     /// PR was closed without merging.
+    #[serde(rename = "closed")]
     Closed,
     /// Max retries reached, issue cannot be automatically fixed.
+    #[serde(rename = "cannot_fix")]
     CannotFix,
 }
 
@@ -1597,10 +1602,33 @@ mod tests {
     fn test_fix_attempt_status_serde() {
         let status = FixAttemptStatus::CannotFix;
         let json = serde_json::to_string(&status).unwrap();
-        // Note: rename_all = "lowercase" makes this "cannotfix"
-        assert_eq!(json, "\"cannotfix\"");
+        // Serde now matches Display/FromStr: "cannot_fix"
+        assert_eq!(json, "\"cannot_fix\"");
         let parsed: FixAttemptStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, FixAttemptStatus::CannotFix);
+    }
+
+    #[test]
+    fn test_fix_attempt_status_serde_roundtrip_all_variants() {
+        for status in [
+            FixAttemptStatus::Pending,
+            FixAttemptStatus::Success,
+            FixAttemptStatus::Failed,
+            FixAttemptStatus::Merged,
+            FixAttemptStatus::Closed,
+            FixAttemptStatus::CannotFix,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            // Verify serde serialization matches Display
+            assert_eq!(json, format!("\"{}\"", status));
+            // Verify round-trip through serde
+            let parsed: FixAttemptStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, status);
+            // Verify round-trip through FromStr
+            let display_str = status.to_string();
+            let from_str: FixAttemptStatus = display_str.parse().unwrap();
+            assert_eq!(from_str, status);
+        }
     }
 
     #[test]

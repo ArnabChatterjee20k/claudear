@@ -910,7 +910,7 @@ Create a PR with your changes."#,
                 Ok(issues) => {
                     let mut seeded = 0;
                     for issue in issues {
-                        if !self.tracker.has_attempted(source.name(), &issue.id) {
+                        if !self.tracker.has_attempted(source.name(), &issue.id)? {
                             // Extract labels from issue metadata for bug detection
                             let labels: Vec<String> =
                                 issue.get_metadata("labels").unwrap_or_default();
@@ -2784,9 +2784,9 @@ mod tests {
 
         let watcher = create_test_watcher(notifier, tracker.clone(), sources, false);
 
-        assert!(tracker.has_attempted("test", "123"));
+        assert!(tracker.has_attempted("test", "123").unwrap());
         watcher.reset_attempt("test", "123").unwrap();
-        assert!(!tracker.has_attempted("test", "123"));
+        assert!(!tracker.has_attempted("test", "123").unwrap());
     }
 
     #[test]
@@ -2918,8 +2918,8 @@ mod tests {
         assert_eq!(*result.by_source.get("mock").unwrap(), 2);
 
         // Verify issues are marked as seen
-        assert!(tracker.has_attempted("mock", "1"));
-        assert!(tracker.has_attempted("mock", "2"));
+        assert!(tracker.has_attempted("mock", "1").unwrap());
+        assert!(tracker.has_attempted("mock", "2").unwrap());
     }
 
     #[tokio::test]
@@ -3343,7 +3343,7 @@ mod tests {
         assert!(result.is_ok());
 
         // In dry run mode, issues are NOT marked as attempted (just logged)
-        assert!(!tracker.has_attempted("mock", "1"));
+        assert!(!tracker.has_attempted("mock", "1").unwrap());
     }
 
     #[tokio::test]
@@ -3474,8 +3474,8 @@ mod tests {
         let result = watcher.poll_source(&source).await;
         assert!(result.is_ok());
         // In dry run mode, issues are NOT recorded (just logged)
-        assert!(!tracker.has_attempted("test", "1"));
-        assert!(!tracker.has_attempted("test", "2"));
+        assert!(!tracker.has_attempted("test", "1").unwrap());
+        assert!(!tracker.has_attempted("test", "2").unwrap());
     }
 
     #[tokio::test]
@@ -3825,8 +3825,8 @@ mod tests {
         let result = watcher.poll_source(&source).await;
         assert!(result.is_ok());
         // Only the pre-existing one should be in tracker (dry run doesn't add new ones)
-        assert!(tracker.has_attempted("test", "1"));
-        assert!(!tracker.has_attempted("test", "2")); // Not recorded in dry run
+        assert!(tracker.has_attempted("test", "1").unwrap());
+        assert!(!tracker.has_attempted("test", "2").unwrap()); // Not recorded in dry run
     }
 
     #[tokio::test]
@@ -4146,14 +4146,14 @@ mod tests {
 
         // Record an attempt
         tracker.record_attempt("test", "123", "T-123").unwrap();
-        assert!(tracker.has_attempted("test", "123"));
+        assert!(tracker.has_attempted("test", "123").unwrap());
 
         let watcher = create_test_watcher(notifier, tracker.clone(), sources, false);
 
         // Reset should succeed
         let result = watcher.reset_attempt("test", "123");
         assert!(result.is_ok());
-        assert!(!tracker.has_attempted("test", "123"));
+        assert!(!tracker.has_attempted("test", "123").unwrap());
     }
 
     #[test]

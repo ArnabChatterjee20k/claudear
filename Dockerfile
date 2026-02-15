@@ -26,13 +26,14 @@ COPY --from=builder /app/target/release/claudear /usr/local/bin/claudear
 
 RUN useradd -m -u 1000 appuser
 
-RUN mkdir -p /app/data /root/.cache/fastembed && \
-    chown -R appuser:appuser /app /root/.cache
+RUN mkdir -p /app/data /home/appuser/.cache/fastembed && \
+    chown -R appuser:appuser /app /home/appuser/.cache
 
 USER appuser
 
 ENV PROJECT_DIR=/app/project
 ENV DATA_DIR=/app/data
+ENV EMBEDDING_CACHE_DIR=/home/appuser/.cache/fastembed
 
 EXPOSE 3100
 

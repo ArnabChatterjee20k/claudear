@@ -625,7 +625,8 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::{HttpClient, HttpResponse};
+    use crate::github::HttpClient;
+    use crate::http::HttpResponse;
     use crate::storage::FixAttemptTracker;
     use crate::types::IssueType;
     use async_trait::async_trait;

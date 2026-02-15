@@ -83,9 +83,10 @@ impl FeedbackAnalyzer {
         self.tracker.record(fix_outcome)
     }
 
-    /// Find similar past issues.
+    /// Find the most similar past issues, sorted by similarity descending.
     pub fn find_similar(&self, issue: &Issue) -> Vec<SimilarIssue> {
-        self.tracker
+        let mut candidates: Vec<SimilarIssue> = self
+            .tracker
             .all()
             .iter()
             .map(|o| {
@@ -96,8 +97,14 @@ impl FeedbackAnalyzer {
                 }
             })
             .filter(|s| s.similarity >= self.min_similarity)
-            .take(self.max_similar_results)
-            .collect()
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(self.max_similar_results);
+        candidates
     }
 
     /// Generate suggestions for improving the prompt based on past outcomes.

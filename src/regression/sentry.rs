@@ -150,7 +150,7 @@ impl<H: SentryHttpClient> RegressionChecker for SentryRegressionChecker<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::sentry::HttpResponse;
+    use crate::http::HttpResponse;
     use crate::types::IssueType;
     use chrono::{Duration, Utc};
 

@@ -381,11 +381,21 @@ async fn webhook_handler(
     }
 
     // Check if already attempted
-    if state.tracker.has_attempted(&source_name, &issue.id) {
-        return (
-            StatusCode::OK,
-            Json(json!({ "status": "ignored", "reason": "Already attempted" })),
-        );
+    match state.tracker.has_attempted(&source_name, &issue.id) {
+        Ok(true) => {
+            return (
+                StatusCode::OK,
+                Json(json!({ "status": "ignored", "reason": "Already attempted" })),
+            );
+        }
+        Err(e) => {
+            tracing::error!(source = source_name.as_str(), error = %e, "Failed to check if issue was already attempted");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "status": "error", "reason": "Database error" })),
+            );
+        }
+        Ok(false) => {}
     }
 
     // Check if currently processing AND atomically mark as processing if not

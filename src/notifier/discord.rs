@@ -4,17 +4,12 @@ use super::Notifier;
 use crate::config::DiscordConfig;
 use crate::discord::DiscordClient;
 use crate::error::{Error, Result};
+use crate::http::HttpResponse;
 use crate::types::{AskDelivery, AskReply, AskRequest, Issue};
 use crate::users::UserRegistry;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-
-/// HTTP response for Discord webhook client.
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: String,
-}
 
 /// Trait for HTTP client used by Discord notifier.
 #[async_trait]
@@ -30,7 +25,11 @@ pub struct ReqwestDiscordWebhookClient {
 impl ReqwestDiscordWebhookClient {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 }
@@ -222,16 +221,8 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     }
 }
 
-/// Return the emoji for a given issue source.
-pub(crate) fn get_source_emoji(source: &str) -> &'static str {
-    match source.to_lowercase().as_str() {
-        "linear" => "\u{1F4CB}", // clipboard
-        "sentry" => "\u{1F534}", // red circle
-        "github" => "\u{1F419}", // octopus
-        "jira" => "\u{1F3AB}",   // ticket
-        _ => "\u{1F4CC}",        // pushpin
-    }
-}
+// Re-export the shared emoji function for backward compatibility within this module.
+pub(crate) use super::get_source_emoji;
 
 /// Return the current UTC timestamp in RFC 3339 format.
 pub(crate) fn timestamp() -> String {

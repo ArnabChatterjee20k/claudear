@@ -3,15 +3,10 @@
 use super::Notifier;
 use crate::config::SmsConfig;
 use crate::error::{Error, Result};
+use crate::http::HttpResponse;
 use crate::types::{AskDelivery, AskRequest, Issue};
 use crate::users::UserRegistry;
 use async_trait::async_trait;
-
-/// HTTP response for SMS client.
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: String,
-}
 
 /// Trait for HTTP client used by SMS notifier.
 #[async_trait]
@@ -33,7 +28,11 @@ pub struct ReqwestSmsClient {
 impl ReqwestSmsClient {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 }

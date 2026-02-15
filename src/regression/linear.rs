@@ -596,7 +596,7 @@ impl<H: HttpClient> RegressionChecker for LinearRegressionChecker<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::HttpResponse;
+    use crate::http::HttpResponse;
     use crate::types::IssueType;
     use chrono::{Duration, Utc};
     use std::sync::atomic::{AtomicUsize, Ordering};

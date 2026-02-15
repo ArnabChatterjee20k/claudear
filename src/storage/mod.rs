@@ -29,7 +29,7 @@ pub trait FixAttemptTracker: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Check if an issue has already been attempted.
-    fn has_attempted(&self, source: &str, issue_id: &str) -> bool;
+    fn has_attempted(&self, source: &str, issue_id: &str) -> Result<bool>;
 
     /// Get all attempted issue IDs for a source.
     fn get_attempted_issue_ids(&self, source: &str) -> HashSet<String>;

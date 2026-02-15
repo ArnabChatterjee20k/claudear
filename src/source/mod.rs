@@ -53,7 +53,7 @@ pub trait IssueSource: Send + Sync {
     async fn get_issue_status(&self, issue_id: &str) -> Result<String> {
         // Default implementation fetches the full issue and returns its status
         let issue = self.get_issue(issue_id).await?;
-        Ok(format!("{:?}", issue.status))
+        Ok(issue.status.to_string())
     }
 
     /// Check if a status string represents a terminal state for this source.

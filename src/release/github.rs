@@ -769,7 +769,7 @@ pub struct PrDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::HttpResponse;
+    use crate::http::HttpResponse;
     use async_trait::async_trait;
 
     struct MockHttpClient {

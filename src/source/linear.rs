@@ -3,29 +3,10 @@
 use super::IssueSource;
 use crate::config::LinearConfig;
 use crate::error::{Error, Result};
+use crate::http::HttpResponse;
 use crate::types::{Issue, IssuePriority, IssueStatus, MatchPriority, MatchResult};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-
-/// HTTP response abstraction for testability.
-#[derive(Debug)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: String,
-}
-
-impl HttpResponse {
-    /// Check if the status is successful (2xx).
-    pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
-    }
-
-    /// Parse the body as JSON.
-    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.body)
-            .map_err(|e| Error::Other(format!("JSON parse error: {}", e)))
-    }
-}
 
 /// Trait for GraphQL client operations to enable testing.
 #[async_trait]
@@ -40,11 +21,17 @@ pub struct ReqwestLinearClient {
     client: reqwest::Client,
 }
 
+/// Default HTTP request timeout for Linear API calls (30 seconds).
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+
 impl ReqwestLinearClient {
-    /// Create a new reqwest-based HTTP client.
+    /// Create a new reqwest-based HTTP client with a default timeout.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+                .build()
+                .expect("Failed to build HTTP client"),
         }
     }
 }

@@ -2,36 +2,12 @@
 
 use crate::config::GitHubConfig;
 use crate::error::{Error, Result};
+use crate::http::HttpResponse;
 use crate::storage::{FixAttemptTracker, SqliteTracker};
 use crate::types::{FixAttempt, IssueType, PrReviewRecord, RegressionWatch};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-/// HTTP response abstraction for testability.
-#[derive(Debug)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: String,
-}
-
-impl HttpResponse {
-    /// Check if the status is successful (2xx).
-    pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
-    }
-
-    /// Check if the status is 404 Not Found.
-    pub fn is_not_found(&self) -> bool {
-        self.status == 404
-    }
-
-    /// Parse the body as JSON.
-    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.body)
-            .map_err(|e| Error::Other(format!("JSON parse error: {}", e)))
-    }
-}
 
 /// Trait for HTTP client operations to enable testing.
 #[async_trait]
@@ -49,7 +25,11 @@ impl ReqwestHttpClient {
     /// Create a new reqwest-based HTTP client.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 }

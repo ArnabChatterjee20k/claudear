@@ -50,7 +50,7 @@ services:
       - ${PROJECT_DIR:-.}:/app/project:ro
       - ./claudear.yaml:/app/claudear.yaml:ro
       # Cache embedding models between container restarts
-      - embedding_cache:/root/.cache/fastembed
+      - embedding_cache:/home/appuser/.cache/fastembed
     ports:
       - "${APP_PORT:-3100}:3100"
     networks:

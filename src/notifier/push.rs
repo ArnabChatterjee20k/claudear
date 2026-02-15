@@ -39,7 +39,11 @@ impl PushNotifier {
     pub fn new(config: PushConfig, user_registry: UserRegistry) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             user_registry,
         }
     }
@@ -109,16 +113,6 @@ impl PushNotifier {
 
         Ok(())
     }
-
-    fn get_source_emoji(source: &str) -> &'static str {
-        match source.to_lowercase().as_str() {
-            "linear" => "\u{1F4CB}",
-            "sentry" => "\u{1F534}",
-            "github" => "\u{1F419}",
-            "jira" => "\u{1F3AB}",
-            _ => "\u{1F4CC}",
-        }
-    }
 }
 
 #[async_trait]
@@ -132,7 +126,7 @@ impl Notifier for PushNotifier {
     }
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
-        let emoji = Self::get_source_emoji(&issue.source);
+        let emoji = crate::notifier::get_source_emoji(&issue.source);
         let title = format!("{} Processing: {}", emoji, issue.short_id);
         let message = format!(
             "{}\n\nSource: {}\nPriority: {}\nStatus: {}",
@@ -216,7 +210,7 @@ impl Notifier for PushNotifier {
             .iter()
             .take(5)
             .map(|i| {
-                let emoji = Self::get_source_emoji(&i.source);
+                let emoji = crate::notifier::get_source_emoji(&i.source);
                 format!("{} {} - {}", emoji, i.short_id, i.title)
             })
             .collect::<Vec<_>>()
@@ -312,8 +306,8 @@ mod tests {
 
     #[test]
     fn test_source_emoji() {
-        assert_eq!(PushNotifier::get_source_emoji("linear"), "\u{1F4CB}");
-        assert_eq!(PushNotifier::get_source_emoji("sentry"), "\u{1F534}");
+        assert_eq!(crate::notifier::get_source_emoji("linear"), "\u{1F4CB}");
+        assert_eq!(crate::notifier::get_source_emoji("sentry"), "\u{1F534}");
     }
 
     #[test]
@@ -330,19 +324,19 @@ mod tests {
 
     #[test]
     fn test_source_emoji_all_sources() {
-        assert_eq!(PushNotifier::get_source_emoji("linear"), "\u{1F4CB}");
-        assert_eq!(PushNotifier::get_source_emoji("sentry"), "\u{1F534}");
-        assert_eq!(PushNotifier::get_source_emoji("github"), "\u{1F419}");
-        assert_eq!(PushNotifier::get_source_emoji("jira"), "\u{1F3AB}");
-        assert_eq!(PushNotifier::get_source_emoji("unknown"), "\u{1F4CC}");
+        assert_eq!(crate::notifier::get_source_emoji("linear"), "\u{1F4CB}");
+        assert_eq!(crate::notifier::get_source_emoji("sentry"), "\u{1F534}");
+        assert_eq!(crate::notifier::get_source_emoji("github"), "\u{1F419}");
+        assert_eq!(crate::notifier::get_source_emoji("jira"), "\u{1F3AB}");
+        assert_eq!(crate::notifier::get_source_emoji("unknown"), "\u{1F4CC}");
     }
 
     #[test]
     fn test_source_emoji_case_insensitive() {
-        assert_eq!(PushNotifier::get_source_emoji("LINEAR"), "\u{1F4CB}");
-        assert_eq!(PushNotifier::get_source_emoji("Sentry"), "\u{1F534}");
-        assert_eq!(PushNotifier::get_source_emoji("GitHub"), "\u{1F419}");
-        assert_eq!(PushNotifier::get_source_emoji("JIRA"), "\u{1F3AB}");
+        assert_eq!(crate::notifier::get_source_emoji("LINEAR"), "\u{1F4CB}");
+        assert_eq!(crate::notifier::get_source_emoji("Sentry"), "\u{1F534}");
+        assert_eq!(crate::notifier::get_source_emoji("GitHub"), "\u{1F419}");
+        assert_eq!(crate::notifier::get_source_emoji("JIRA"), "\u{1F3AB}");
     }
 
     #[tokio::test]
@@ -518,18 +512,18 @@ mod tests {
 
     #[test]
     fn test_source_emoji_empty_string() {
-        assert_eq!(PushNotifier::get_source_emoji(""), "\u{1F4CC}");
+        assert_eq!(crate::notifier::get_source_emoji(""), "\u{1F4CC}");
     }
 
     #[test]
     fn test_source_emoji_mixed_case_github() {
-        assert_eq!(PushNotifier::get_source_emoji("GiThUb"), "\u{1F419}");
+        assert_eq!(crate::notifier::get_source_emoji("GiThUb"), "\u{1F419}");
     }
 
     #[test]
     fn test_source_emoji_with_whitespace_is_default() {
         // Whitespace-padded source should not match
-        assert_eq!(PushNotifier::get_source_emoji(" linear "), "\u{1F4CC}");
+        assert_eq!(crate::notifier::get_source_emoji(" linear "), "\u{1F4CC}");
     }
 
     #[test]

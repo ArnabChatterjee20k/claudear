@@ -249,11 +249,11 @@ pub fn print_setup_result(result: &WebhookSetupResult) {
 
 fn mask_secret(secret: &str) -> String {
     let chars: Vec<char> = secret.chars().collect();
-    if chars.len() <= 8 {
+    if chars.len() <= 12 {
         "*".repeat(chars.len())
     } else {
-        let prefix: String = chars[..4].iter().collect();
-        let suffix: String = chars[chars.len() - 4..].iter().collect();
+        let prefix: String = chars[..3].iter().collect();
+        let suffix: String = chars[chars.len() - 3..].iter().collect();
         format!("{}...{}", prefix, suffix)
     }
 }
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_mask_secret_long() {
-        assert_eq!(mask_secret("1234567890abcdef"), "1234...cdef");
+        assert_eq!(mask_secret("1234567890abcdef"), "123...def");
     }
 
     #[test]
@@ -304,8 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn test_mask_secret_exactly_8() {
-        assert_eq!(mask_secret("12345678"), "********");
+    fn test_mask_secret_exactly_12() {
+        assert_eq!(mask_secret("123456789012"), "************");
+    }
+
+    #[test]
+    fn test_mask_secret_13_chars() {
+        assert_eq!(mask_secret("1234567890abc"), "123...abc");
     }
 
     #[test]

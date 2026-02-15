@@ -57,6 +57,24 @@ struct ProjectResponse {
     slug: String,
 }
 
+/// Validate that a slug contains only safe characters for URL path components.
+/// Allows alphanumeric, hyphens, underscores, and dots.
+fn validate_slug(slug: &str, label: &str) -> Result<()> {
+    if slug.is_empty() {
+        return Err(Error::config(format!("{} slug cannot be empty", label)));
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(Error::config(format!(
+            "{} slug contains invalid characters: {}",
+            label, slug
+        )));
+    }
+    Ok(())
+}
+
 impl SentryApiClient {
     const BASE_URL: &'static str = "https://sentry.io/api/0";
 
@@ -65,7 +83,11 @@ impl SentryApiClient {
         Self {
             auth_token,
             org_slug,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -81,6 +103,7 @@ impl SentryApiClient {
 
     /// List all projects in the organization.
     pub async fn list_projects(&self) -> Result<Vec<String>> {
+        validate_slug(&self.org_slug, "organization")?;
         let url = format!(
             "{}/organizations/{}/projects/",
             Self::BASE_URL,
@@ -130,6 +153,8 @@ impl SentryApiClient {
         url: &str,
         events: &[&str],
     ) -> Result<SentryWebhookRegistration> {
+        validate_slug(&self.org_slug, "organization")?;
+        validate_slug(project_slug, "project")?;
         let api_url = format!(
             "{}/projects/{}/{}/hooks/",
             Self::BASE_URL,

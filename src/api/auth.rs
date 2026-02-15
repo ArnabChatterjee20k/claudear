@@ -7,12 +7,54 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
 use tower_cookies::{Cookie, Cookies};
 
 use super::routes::ApiState;
 
 const SESSION_COOKIE: &str = "claudear_session";
 const SESSION_MAX_AGE_DAYS: i64 = 7;
+
+/// Maximum number of login attempts per email within the rate limit window.
+const LOGIN_RATE_LIMIT_MAX_ATTEMPTS: usize = 10;
+
+/// Duration of the rate limit window in seconds.
+const LOGIN_RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
+
+/// In-memory rate limiter for login attempts, keyed by email address.
+/// This protects against brute force attacks on specific accounts and
+/// mitigates CPU exhaustion from repeated bcrypt verification.
+static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Check if a login attempt is allowed for the given key (email).
+/// Returns true if the attempt is within rate limits, false if it should be rejected.
+fn check_login_rate_limit(key: &str) -> bool {
+    let mut limiter = match LOGIN_RATE_LIMITER.lock() {
+        Ok(l) => l,
+        Err(poisoned) => {
+            tracing::warn!("Login rate limiter mutex was poisoned, recovering");
+            poisoned.into_inner()
+        }
+    };
+
+    let now = Instant::now();
+    let window = std::time::Duration::from_secs(LOGIN_RATE_LIMIT_WINDOW_SECS);
+
+    let attempts = limiter.entry(key.to_string()).or_default();
+
+    // Remove attempts outside the window
+    attempts.retain(|t| now.duration_since(*t) < window);
+
+    if attempts.len() >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
+        return false;
+    }
+
+    attempts.push(now);
+    true
+}
 
 // ─── Extractors ──────────────────────────────────
 
@@ -150,6 +192,12 @@ pub async fn login_handler(
     cookies: Cookies,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
+    // Rate limit login attempts by email to prevent brute force and bcrypt CPU exhaustion
+    if !check_login_rate_limit(&body.email) {
+        tracing::warn!(email = %body.email, "Login rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     let db = state
         .tracker
         .as_any()

@@ -3,30 +3,11 @@
 use super::IssueSource;
 use crate::config::SentryConfig;
 use crate::error::{Error, Result};
+use crate::http::HttpResponse;
 use crate::types::{Issue, IssuePriority, IssueStatus, MatchPriority, MatchResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashSet;
-
-/// HTTP response abstraction for testability.
-#[derive(Debug)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: String,
-}
-
-impl HttpResponse {
-    /// Check if the status is successful (2xx).
-    pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
-    }
-
-    /// Parse the body as JSON.
-    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.body)
-            .map_err(|e| Error::Other(format!("JSON parse error: {}", e)))
-    }
-}
 
 /// Trait for HTTP client operations to enable testing.
 #[async_trait]
@@ -48,11 +29,17 @@ pub struct ReqwestSentryClient {
     client: reqwest::Client,
 }
 
+/// Default HTTP request timeout for Sentry API calls (30 seconds).
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+
 impl ReqwestSentryClient {
-    /// Create a new reqwest-based HTTP client.
+    /// Create a new reqwest-based HTTP client with a default timeout.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+                .build()
+                .expect("Failed to build HTTP client"),
         }
     }
 }
@@ -656,7 +643,7 @@ impl<H: SentryHttpClient + 'static> IssueSource for SentrySource<H> {
     async fn get_issue_status(&self, issue_id: &str) -> Result<String> {
         let issue = self.get_issue(issue_id).await?;
         // Return the raw status string (e.g., "resolved", "ignored", "unresolved")
-        Ok(format!("{:?}", issue.status).to_lowercase())
+        Ok(issue.status.to_string())
     }
 
     fn is_terminal_status(&self, status: &str) -> bool {

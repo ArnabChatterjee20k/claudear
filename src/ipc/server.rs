@@ -20,10 +20,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 /// Default maximum number of activity entries to keep (can be overridden via config).
 const DEFAULT_MAX_ACTIVITY_ENTRIES: usize = 10_000;
+
+/// Maximum number of concurrent IPC connections.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 /// IPC server that listens on a Unix socket.
 pub struct IpcServer {
@@ -260,12 +263,22 @@ impl IpcServer {
         }
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let conn_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, _)) => {
+                            let permit = match conn_semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    tracing::warn!("IPC connection limit reached ({MAX_CONCURRENT_CONNECTIONS}), rejecting connection");
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
+
                             let tracker = self.tracker.clone();
                             let sources = self.sources.clone();
                             let notifier = self.notifier.clone();
@@ -274,6 +287,7 @@ impl IpcServer {
                             let shutdown_tx = self.shutdown_tx.clone();
 
                             tokio::spawn(async move {
+                                let _permit = permit; // held until handler completes
                                 if let Err(e) = handle_connection(
                                     stream, tracker, sources, notifier, watcher, state, shutdown_tx
                                 ).await {
