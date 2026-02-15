@@ -1054,7 +1054,7 @@ Create a PR with your changes."#,
         let mut retries_executed = 0usize;
         let mut retries_failed = 0usize;
 
-        for attempt in ready {
+        for (i, attempt) in ready.into_iter().enumerate() {
             // Check if we're still running
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
@@ -1134,8 +1134,8 @@ Create a PR with your changes."#,
                 }
             }
 
-            // Add delay between retries
-            if self.config.processing_delay_ms > 0 {
+            // Add delay between retries (skip trailing delay after the last item)
+            if i + 1 < ready_count && self.config.processing_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
             }
         }
@@ -1540,8 +1540,8 @@ Create a PR with your changes."#,
             this.process_issue(source_clone, issue, match_result, None)
                 .await;
 
-            // Add delay between starting new issues
-            if i < source_max_issues - 1 && self.config.processing_delay_ms > 0 {
+            // Add delay between starting new issues (skip trailing delay after the last item)
+            if i + 1 < to_process_count && self.config.processing_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
             }
         }
@@ -3501,6 +3501,51 @@ mod tests {
 
         let attempt = tracker.get_attempt("urgent", "1").unwrap().unwrap();
         assert_eq!(attempt.status, crate::types::FixAttemptStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_watcher_poll_source_skips_trailing_processing_delay() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let source = Arc::new(MockSource::with_issues(
+            "timing",
+            vec![
+                Issue::new("1", "TIME-1", "Issue 1", "http://example.com/1", "timing"),
+                Issue::new("2", "TIME-2", "Issue 2", "http://example.com/2", "timing"),
+            ],
+        )) as Arc<dyn IssueSource>;
+
+        let mut config = test_config();
+        config.max_issues_per_cycle = 5;
+        config.processing_delay_ms = 250;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source.clone()],
+            notifier,
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        let started = std::time::Instant::now();
+        watcher.poll_source(&source).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(450),
+            "poll_source took too long: {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
