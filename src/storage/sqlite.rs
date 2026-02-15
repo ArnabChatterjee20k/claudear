@@ -14,7 +14,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 /// Compiled regex for parsing GitHub PR URLs (compiled once, reused).
@@ -25,6 +25,8 @@ static PR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
 
 /// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
 const MAX_PR_URL_LENGTH: usize = 2048;
+const DEFAULT_LOG_DIR: &str = "./logs";
+const AUDIT_LOG_SUBDIR: &str = "audit";
 const QA_VECTOR_TABLE: &str = "qa_question_embeddings";
 const QA_VECTOR_EF_SEARCH: usize = 200;
 const QA_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
@@ -275,6 +277,7 @@ impl SqliteTracker {
                 stderr_preview TEXT,
                 stdout_log_path TEXT,
                 stderr_log_path TEXT,
+                event_log_path TEXT,
                 prompt_used TEXT,
                 prompt_hash TEXT,
                 model_version TEXT,
@@ -674,6 +677,10 @@ impl SqliteTracker {
                 "claude_executions.stderr_log_path",
                 "ALTER TABLE claude_executions ADD COLUMN stderr_log_path TEXT",
             ),
+            (
+                "claude_executions.event_log_path",
+                "ALTER TABLE claude_executions ADD COLUMN event_log_path TEXT",
+            ),
         ];
 
         for (column_name, sql) in migrations {
@@ -720,6 +727,77 @@ impl SqliteTracker {
 
     fn parse_optional_datetime(s: Option<String>) -> Option<DateTime<Utc>> {
         s.map(|s| Self::parse_datetime(&s))
+    }
+
+    fn resolve_log_root() -> PathBuf {
+        std::env::var("CLAUDEAR_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_DIR))
+    }
+
+    /// Best-effort mirror of structured audit records to JSONL on disk.
+    fn append_audit_json_line(category: &str, payload: &serde_json::Value) {
+        use std::io::Write as _;
+
+        let root = Self::resolve_log_root();
+        if root.as_os_str().is_empty() {
+            return;
+        }
+
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let dir = root.join(AUDIT_LOG_SUBDIR).join(category);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                component = "sqlite",
+                category = category,
+                path = %dir.display(),
+                error = %e,
+                "Failed to create audit log directory"
+            );
+            return;
+        }
+
+        let file_path = dir.join(format!("{}.jsonl", day));
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::warn!(
+                    component = "sqlite",
+                    category = category,
+                    path = %file_path.display(),
+                    error = %e,
+                    "Failed to open audit log file"
+                );
+                return;
+            }
+        };
+
+        let serialized = match serde_json::to_string(payload) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    component = "sqlite",
+                    category = category,
+                    error = %e,
+                    "Failed to serialize audit log payload"
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = writeln!(file, "{}", serialized) {
+            tracing::warn!(
+                component = "sqlite",
+                category = category,
+                path = %file_path.display(),
+                error = %e,
+                "Failed to append audit log payload"
+            );
+        }
     }
 
     /// Parse a GitHub PR URL to extract repo and PR number.
@@ -1239,6 +1317,7 @@ impl FixAttemptTracker for SqliteTracker {
             VALUES (?, ?, ?, 'pending', datetime('now'), ?)
             ON CONFLICT(source, issue_id) DO UPDATE SET
                 short_id = excluded.short_id,
+                attempted_at = datetime('now'),
                 issue_labels = COALESCE(excluded.issue_labels, fix_attempts.issue_labels)
             "#,
             params![source, issue_id, short_id, labels_json],
@@ -1860,7 +1939,22 @@ impl SqliteTracker {
                 metadata_json,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        Self::append_audit_json_line(
+            "activity",
+            &serde_json::json!({
+                "id": id,
+                "timestamp": entry.timestamp.to_rfc3339(),
+                "activity_type": entry.activity_type,
+                "source": entry.source,
+                "issue_id": entry.issue_id,
+                "short_id": entry.short_id,
+                "message": entry.message,
+                "metadata": entry.metadata,
+            }),
+        );
+        Ok(id)
     }
 
     /// Record multiple activities in a single transaction for better performance.
@@ -1899,6 +1993,22 @@ impl SqliteTracker {
         }
 
         tx.commit()?;
+        drop(conn);
+        for entry in entries {
+            Self::append_audit_json_line(
+                "activity",
+                &serde_json::json!({
+                    "id": serde_json::Value::Null,
+                    "timestamp": entry.timestamp.to_rfc3339(),
+                    "activity_type": entry.activity_type,
+                    "source": entry.source,
+                    "issue_id": entry.issue_id,
+                    "short_id": entry.short_id,
+                    "message": entry.message,
+                    "metadata": entry.metadata,
+                }),
+            );
+        }
         Ok(entries.len())
     }
 
@@ -2043,10 +2153,10 @@ impl SqliteTracker {
             r#"
             INSERT INTO claude_executions (
                 attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
-                stdout_preview, stderr_preview, stdout_log_path, stderr_log_path,
+                stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
                 prompt_used, prompt_hash, model_version, working_directory, git_branch,
                 git_commit_before, git_commit_after, files_changed, lines_added, lines_removed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 execution.attempt_id,
@@ -2061,6 +2171,7 @@ impl SqliteTracker {
                 execution.stderr_preview,
                 execution.stdout_log_path,
                 execution.stderr_log_path,
+                execution.event_log_path,
                 execution.prompt_used,
                 execution.prompt_hash,
                 execution.model_version,
@@ -2073,7 +2184,35 @@ impl SqliteTracker {
                 execution.lines_removed,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        Self::append_audit_json_line(
+            "execution",
+            &serde_json::json!({
+                "id": id,
+                "attempt_id": execution.attempt_id,
+                "started_at": execution.started_at.to_rfc3339(),
+                "completed_at": execution.completed_at.map(|v| v.to_rfc3339()),
+                "duration_secs": execution.duration_secs,
+                "exit_code": execution.exit_code,
+                "timed_out": execution.timed_out,
+                "stdout_preview": execution.stdout_preview,
+                "stderr_preview": execution.stderr_preview,
+                "stdout_log_path": execution.stdout_log_path,
+                "stderr_log_path": execution.stderr_log_path,
+                "event_log_path": execution.event_log_path,
+                "prompt_hash": execution.prompt_hash,
+                "model_version": execution.model_version,
+                "working_directory": execution.working_directory,
+                "git_branch": execution.git_branch,
+                "git_commit_before": execution.git_commit_before,
+                "git_commit_after": execution.git_commit_after,
+                "files_changed": execution.files_changed,
+                "lines_added": execution.lines_added,
+                "lines_removed": execution.lines_removed,
+            }),
+        );
+        Ok(id)
     }
 
     /// Get executions for a specific attempt.
@@ -2082,7 +2221,7 @@ impl SqliteTracker {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
-                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path,
+                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
                    prompt_used, prompt_hash, model_version, working_directory, git_branch,
                    git_commit_before, git_commit_after, files_changed, lines_added, lines_removed
             FROM claude_executions
@@ -2105,16 +2244,17 @@ impl SqliteTracker {
                 stderr_preview: row.get(8)?,
                 stdout_log_path: row.get(9)?,
                 stderr_log_path: row.get(10)?,
-                prompt_used: row.get(11)?,
-                prompt_hash: row.get(12)?,
-                model_version: row.get(13)?,
-                working_directory: row.get(14)?,
-                git_branch: row.get(15)?,
-                git_commit_before: row.get(16)?,
-                git_commit_after: row.get(17)?,
-                files_changed: row.get(18)?,
-                lines_added: row.get(19)?,
-                lines_removed: row.get(20)?,
+                event_log_path: row.get(11)?,
+                prompt_used: row.get(12)?,
+                prompt_hash: row.get(13)?,
+                model_version: row.get(14)?,
+                working_directory: row.get(15)?,
+                git_branch: row.get(16)?,
+                git_commit_before: row.get(17)?,
+                git_commit_after: row.get(18)?,
+                files_changed: row.get(19)?,
+                lines_added: row.get(20)?,
+                lines_removed: row.get(21)?,
             })
         })?;
 
@@ -2996,7 +3136,20 @@ impl SqliteTracker {
                 tags_json,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        Self::append_audit_json_line(
+            "metric",
+            &serde_json::json!({
+                "id": id,
+                "timestamp": metric.timestamp.to_rfc3339(),
+                "metric_name": metric.metric_name,
+                "metric_value": metric.metric_value,
+                "source": metric.source,
+                "tags": metric.tags,
+            }),
+        );
+        Ok(id)
     }
 
     /// Record multiple metrics in a single transaction for better performance.
@@ -3033,6 +3186,20 @@ impl SqliteTracker {
         }
 
         tx.commit()?;
+        drop(conn);
+        for metric in metrics {
+            Self::append_audit_json_line(
+                "metric",
+                &serde_json::json!({
+                    "id": serde_json::Value::Null,
+                    "timestamp": metric.timestamp.to_rfc3339(),
+                    "metric_name": metric.metric_name,
+                    "metric_value": metric.metric_value,
+                    "source": metric.source,
+                    "tags": metric.tags,
+                }),
+            );
+        }
         Ok(metrics.len())
     }
 
@@ -5548,8 +5715,29 @@ mod tests {
             .mark_success("linear", "123", "https://github.com/org/repo/pull/1")
             .unwrap();
 
+        // Backdate attempted_at so we can verify the upsert refreshes it.
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            conn.execute(
+                "UPDATE fix_attempts SET attempted_at = ? WHERE source = ? AND issue_id = ?",
+                params!["2000-01-01 00:00:00", "linear", "123"],
+            )
+            .unwrap();
+        }
+        let before = tracker
+            .get_attempt("linear", "123")
+            .unwrap()
+            .unwrap()
+            .attempted_at;
+        assert_eq!(
+            before,
+            chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+
         // Record again - using ON CONFLICT DO UPDATE, this should only update
-        // short_id and attempted_at, preserving status and pr_url
+        // short_id and attempted_at, preserving status and pr_url.
         tracker
             .record_attempt("linear", "123", "PROJ-123-v2")
             .unwrap();
@@ -5563,6 +5751,7 @@ mod tests {
             attempt.pr_url,
             Some("https://github.com/org/repo/pull/1".to_string())
         );
+        assert!(attempt.attempted_at > before);
     }
 
     #[test]
@@ -8036,6 +8225,7 @@ mod tests {
         execution.files_changed = Some(3);
         execution.lines_added = Some(50);
         execution.lines_removed = Some(10);
+        execution.event_log_path = Some("/tmp/claudear.events.jsonl".to_string());
 
         let id = tracker.record_execution(&execution).unwrap();
         assert!(id > 0);
@@ -8052,6 +8242,10 @@ mod tests {
         assert_eq!(executions[0].files_changed, Some(3));
         assert_eq!(executions[0].lines_added, Some(50));
         assert_eq!(executions[0].lines_removed, Some(10));
+        assert_eq!(
+            executions[0].event_log_path,
+            Some("/tmp/claudear.events.jsonl".to_string())
+        );
     }
 
     #[test]

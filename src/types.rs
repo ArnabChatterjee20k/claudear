@@ -563,6 +563,9 @@ pub struct ClaudeExecution {
     /// Absolute path to the captured stderr log file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_log_path: Option<String>,
+    /// Absolute path to the captured execution event log file (JSONL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_log_path: Option<String>,
     /// The prompt sent to Claude.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_used: Option<String>,
@@ -610,6 +613,7 @@ impl ClaudeExecution {
             stderr_preview: None,
             stdout_log_path: None,
             stderr_log_path: None,
+            event_log_path: None,
             prompt_used: None,
             prompt_hash: None,
             model_version: None,

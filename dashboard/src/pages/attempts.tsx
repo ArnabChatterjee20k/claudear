@@ -44,7 +44,7 @@ interface AttemptRow {
   retry_count: number
 }
 
-type LogStream = 'stdout' | 'stderr'
+type LogStream = 'stdout' | 'stderr' | 'events'
 
 interface SelectedExecutionLog {
   executionId: number
@@ -372,6 +372,18 @@ export default function AttemptsPage() {
                                     className="text-xs px-2 py-1 border rounded hover:bg-muted disabled:opacity-40"
                                   >
                                     stderr
+                                  </button>
+                                  <button
+                                    onClick={() =>
+                                      setSelectedLog({
+                                        executionId: exec.id,
+                                        stream: 'events',
+                                      })
+                                    }
+                                    disabled={!exec.event_log_path}
+                                    className="text-xs px-2 py-1 border rounded hover:bg-muted disabled:opacity-40"
+                                  >
+                                    events
                                   </button>
                                 </div>
                               </td>

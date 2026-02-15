@@ -130,6 +130,7 @@ export interface ClaudeExecution {
   stderr_preview: string | null;
   stdout_log_path: string | null;
   stderr_log_path: string | null;
+  event_log_path?: string | null;
   prompt_used: string | null;
   prompt_hash: string | null;
   model_version: string | null;
@@ -184,7 +185,7 @@ export interface AttemptDetailResponse {
 export interface AttemptExecutionLogResponse {
   attempt_id: number;
   execution_id: number;
-  stream: 'stdout' | 'stderr';
+  stream: 'stdout' | 'stderr' | 'events';
   path: string | null;
   content: string | null;
   truncated: boolean;
@@ -636,7 +637,7 @@ export async function fetchAttemptDetail(attemptId: number): Promise<AttemptDeta
 export async function fetchAttemptExecutionLog(
   attemptId: number,
   executionId: number,
-  stream: 'stdout' | 'stderr',
+  stream: 'stdout' | 'stderr' | 'events',
 ): Promise<AttemptExecutionLogResponse> {
   return fetchJson(
     `${API_BASE}/attempts/${attemptId}/logs/${executionId}/${stream}`,

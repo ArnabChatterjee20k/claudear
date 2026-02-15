@@ -72,6 +72,19 @@ describe("new api endpoints", () => {
     expect(fetch).toHaveBeenCalledWith("/api/attempts/42/logs/7/stdout");
   });
 
+  test("fetchAttemptExecutionLog supports events stream", async () => {
+    mockFetch({
+      attempt_id: 42,
+      execution_id: 7,
+      stream: "events",
+      path: "/tmp/events.jsonl",
+      content: "{\"event\":\"execution_initialized\"}",
+      truncated: false,
+    });
+    await fetchAttemptExecutionLog(42, 7, "events");
+    expect(fetch).toHaveBeenCalledWith("/api/attempts/42/logs/7/events");
+  });
+
   test("fetchAnalyticsSummary calls correct URL", async () => {
     mockFetch({});
     await fetchAnalyticsSummary();

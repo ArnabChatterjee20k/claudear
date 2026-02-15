@@ -637,18 +637,76 @@ impl Watcher {
                 "Re-processing issue to address review feedback"
             );
 
-            if let Err(e) = self
-                .trigger_issue_with_feedback(
-                    &attempt.source,
-                    &attempt.issue_id,
-                    Some(feedback.to_string()),
-                )
-                .await
-            {
-                tracing::error!(
-                    error = %e,
-                    "Failed to trigger re-processing for review feedback"
-                );
+            // If the same issue is currently being processed, wait for that run
+            // to finish so review feedback isn't silently dropped.
+            let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
+            let wait_started = std::time::Instant::now();
+            let max_wait = std::time::Duration::from_secs(300);
+            loop {
+                while {
+                    let processing = self.processing.read().await;
+                    processing.contains(&processing_key)
+                } {
+                    if !self.is_running.load(Ordering::SeqCst) {
+                        return Err(crate::error::Error::source(
+                            &attempt.source,
+                            format!(
+                                "Watcher stopping while waiting for in-flight processing of {}",
+                                attempt.short_id
+                            ),
+                        ));
+                    }
+                    if wait_started.elapsed() >= max_wait {
+                        return Err(crate::error::Error::source(
+                            &attempt.source,
+                            format!(
+                                "Timed out waiting for in-flight processing of {}",
+                                attempt.short_id
+                            ),
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+
+                match self
+                    .trigger_issue_with_feedback(
+                        &attempt.source,
+                        &attempt.issue_id,
+                        Some(feedback.to_string()),
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(e) => {
+                        let still_processing = {
+                            let processing = self.processing.read().await;
+                            processing.contains(&processing_key)
+                        };
+                        if still_processing {
+                            if !self.is_running.load(Ordering::SeqCst) {
+                                return Err(crate::error::Error::source(
+                                    &attempt.source,
+                                    format!(
+                                        "Watcher stopping while waiting for in-flight processing of {}",
+                                        attempt.short_id
+                                    ),
+                                ));
+                            }
+                            if wait_started.elapsed() >= max_wait {
+                                return Err(crate::error::Error::source(
+                                    &attempt.source,
+                                    format!(
+                                        "Timed out waiting for in-flight processing of {}",
+                                        attempt.short_id
+                                    ),
+                                ));
+                            }
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
             }
         }
 
@@ -1058,6 +1116,14 @@ Create a PR with your changes."#,
         let retry_manager = RetryManager::new(self.config.retry.clone(), self.tracker.clone());
         let ready = retry_manager.get_ready_retries()?;
         let ready_count = ready.len();
+        self.record_source_decision(
+            "watcher",
+            "ready_retry_scan",
+            "Scanned for ready retries",
+            json!({
+                "ready_count": ready_count,
+            }),
+        );
 
         let ready_found_metric = ProcessingMetric::new("ready_retries_found", ready_count as f64);
         if let Err(e) = self.tracker.record_metric(&ready_found_metric) {
@@ -1098,6 +1164,18 @@ Create a PR with your changes."#,
             {
                 let processing = self.processing.read().await;
                 if processing.contains(&processing_key) {
+                    self.record_source_decision(
+                        &attempt.source,
+                        "ready_retry_skipped_inflight",
+                        format!(
+                            "Retry skipped because {} is already in-flight",
+                            attempt.short_id
+                        ),
+                        json!({
+                            "issue_id": attempt.issue_id.clone(),
+                            "short_id": attempt.short_id.clone(),
+                        }),
+                    );
                     tracing::debug!(
                         short_id = %attempt.short_id,
                         "Issue already being processed, skipping retry"
@@ -1136,6 +1214,16 @@ Create a PR with your changes."#,
             // Trigger the issue processing
             match self.trigger_issue(&attempt.source, &attempt.issue_id).await {
                 Ok(()) => {
+                    self.record_source_decision(
+                        &attempt.source,
+                        "ready_retry_triggered",
+                        format!("Retry triggered for {}", attempt.short_id),
+                        json!({
+                            "issue_id": attempt.issue_id.clone(),
+                            "short_id": attempt.short_id.clone(),
+                            "retry_count": attempt.retry_count,
+                        }),
+                    );
                     retries_executed += 1;
                     let metric = ProcessingMetric::new("ready_retry_executed", 1.0)
                         .with_source(attempt.source.clone());
@@ -1144,6 +1232,17 @@ Create a PR with your changes."#,
                     }
                 }
                 Err(e) => {
+                    self.record_source_decision(
+                        &attempt.source,
+                        "ready_retry_trigger_failed",
+                        format!("Retry trigger failed for {}", attempt.short_id),
+                        json!({
+                            "issue_id": attempt.issue_id.clone(),
+                            "short_id": attempt.short_id.clone(),
+                            "retry_count": attempt.retry_count,
+                            "error": e.to_string(),
+                        }),
+                    );
                     retries_failed += 1;
                     let retry_error = format!("Retry trigger failed: {}", e);
                     if let Err(mark_err) =
@@ -1419,10 +1518,15 @@ Create a PR with your changes."#,
         // Filter and match criteria
         let mut candidates: Vec<(Issue, MatchResult)> = Vec::new();
         let mut seen_issue_ids = HashSet::new();
+        let mut duplicate_skipped = 0usize;
+        let mut attempted_skipped = 0usize;
+        let mut inflight_skipped = 0usize;
+        let mut unmatched_skipped = 0usize;
 
         let processing = self.processing.read().await;
         for issue in issues {
             if !seen_issue_ids.insert(issue.id.clone()) {
+                duplicate_skipped = duplicate_skipped.saturating_add(1);
                 tracing::debug!(
                     source = source.name(),
                     issue_id = %issue.id,
@@ -1433,18 +1537,22 @@ Create a PR with your changes."#,
 
             // Skip if already attempted
             if attempted_ids.contains(&issue.id) {
+                attempted_skipped = attempted_skipped.saturating_add(1);
                 continue;
             }
 
             // Skip if currently processing
             let processing_key = format!("{}:{}", source.name(), issue.id);
             if processing.contains(&processing_key) {
+                inflight_skipped = inflight_skipped.saturating_add(1);
                 continue;
             }
 
             let match_result = source.matches_criteria(&issue);
             if match_result.matches {
                 candidates.push((issue, match_result));
+            } else {
+                unmatched_skipped = unmatched_skipped.saturating_add(1);
             }
         }
         drop(processing);
@@ -1464,11 +1572,34 @@ Create a PR with your changes."#,
         let to_process: Vec<_> = candidates.into_iter().take(source_max_issues).collect();
 
         let to_process_count = to_process.len();
+        let queued_short_ids: Vec<String> = to_process
+            .iter()
+            .map(|(issue, _)| issue.short_id.clone())
+            .collect();
         let queued_metric = ProcessingMetric::new("issues_queued", to_process_count as f64)
             .with_source(source.name().to_string());
         if let Err(e) = self.tracker.record_metric(&queued_metric) {
             tracing::debug!(error = %e, "Failed to record issues_queued metric");
         }
+        self.record_source_decision(
+            source.name(),
+            "poll_filtering_summary",
+            format!("Poll decisions summarized for {}", source.name()),
+            json!({
+                "fetched": candidates_count + duplicate_skipped + attempted_skipped + inflight_skipped + unmatched_skipped,
+                "matched": candidates_count,
+                "queued": to_process_count,
+                "deferred": candidates_count.saturating_sub(source_max_issues),
+                "skipped": {
+                    "duplicate": duplicate_skipped,
+                    "already_attempted": attempted_skipped,
+                    "inflight": inflight_skipped,
+                    "unmatched": unmatched_skipped,
+                },
+                "queued_short_ids": queued_short_ids,
+                "source_max_issues": source_max_issues,
+            }),
+        );
         if to_process.is_empty() {
             tracing::info!(source = source.name(), "No new issues to process");
             return Ok(());
@@ -1584,7 +1715,8 @@ Create a PR with your changes."#,
             // Process the issue
             let source_clone = Arc::clone(source);
             let this = self;
-            this.process_issue(source_clone, issue, match_result, None)
+            let _ = this
+                .process_issue(source_clone, issue, match_result, None)
                 .await;
 
             // Add delay between starting new issues (skip trailing delay after the last item)
@@ -1613,6 +1745,39 @@ Create a PR with your changes."#,
             .count()
     }
 
+    fn record_source_decision(
+        &self,
+        source: &str,
+        decision: &str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) {
+        let activity = ActivityLogEntry::new("decision", message.into())
+            .with_source(source.to_string())
+            .with_metadata(json!({
+                "decision": decision,
+                "details": details,
+            }));
+        self.tracker.record_activity(&activity).ok();
+    }
+
+    fn record_issue_decision(
+        &self,
+        issue: &Issue,
+        decision: &str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) {
+        let activity = ActivityLogEntry::new("decision", message.into())
+            .with_source(issue.source.clone())
+            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .with_metadata(json!({
+                "decision": decision,
+                "details": details,
+            }));
+        self.tracker.record_activity(&activity).ok();
+    }
+
     /// Process a single issue.
     ///
     /// Uses the RepoInferrer engine to determine which repository to use
@@ -1623,7 +1788,7 @@ Create a PR with your changes."#,
         mut issue: Issue,
         match_result: MatchResult,
         review_feedback: Option<String>,
-    ) {
+    ) -> bool {
         let processing_started_at = std::time::Instant::now();
         let processing_key = format!("{}:{}", source.name(), issue.id);
 
@@ -1636,7 +1801,7 @@ Create a PR with your changes."#,
                     short_id = %issue.short_id,
                     "Issue already being processed, skipping"
                 );
-                return;
+                return false;
             }
             processing.insert(processing_key.clone());
         }
@@ -1646,6 +1811,16 @@ Create a PR with your changes."#,
         tracing::info!(short_id = %issue.short_id, title = %issue.title, "Processing issue");
         tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
         tracing::info!(short_id = %issue.short_id, priority = ?match_result.priority, "Match priority");
+        self.record_issue_decision(
+            &issue,
+            "issue_selected_for_processing",
+            format!("Selected {} for processing", issue.short_id),
+            json!({
+                "match_reason": match_result.reason.clone(),
+                "priority": format!("{:?}", match_result.priority),
+                "review_feedback_attached": review_feedback.is_some(),
+            }),
+        );
 
         // Record/update attempt state early so preflight failures are not retried forever.
         let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
@@ -1663,8 +1838,29 @@ Create a PR with your changes."#,
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, self.sqlite_tracker.as_ref());
 
         let project_dir = match &resolution {
-            RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
+            RepoResolution::Resolved { project_dir, .. } => {
+                self.record_issue_decision(
+                    &issue,
+                    "repo_resolution_selected",
+                    format!("Resolved repository for {}", issue.short_id),
+                    json!({
+                        "repo_name": resolution.repo_name(),
+                        "github_url": resolution.github_url(),
+                        "default_branch": resolution.default_branch(),
+                        "project_dir": project_dir.display().to_string(),
+                    }),
+                );
+                project_dir.clone()
+            }
             RepoResolution::Skip { reason } => {
+                self.record_issue_decision(
+                    &issue,
+                    "repo_resolution_skipped",
+                    format!("Skipped {} due to repository resolution", issue.short_id),
+                    json!({
+                        "reason": reason,
+                    }),
+                );
                 tracing::debug!(short_id = %issue.short_id, reason = %reason, "Skipping issue");
                 let resolution_error = format!("Repository resolution failed: {}", reason);
                 if let Err(e) =
@@ -1683,7 +1879,7 @@ Create a PR with your changes."#,
                     processing.remove(&processing_key);
                 }
                 self.active_processing.fetch_sub(1, Ordering::SeqCst);
-                return;
+                return true;
             }
         };
 
@@ -1693,6 +1889,17 @@ Create a PR with your changes."#,
             resolution.default_branch(),
             resolution.repo_name(),
         ) {
+            self.record_issue_decision(
+                &issue,
+                "repo_sync_started",
+                format!("Syncing repository {} for {}", repo_name, issue.short_id),
+                json!({
+                    "repo_name": repo_name,
+                    "github_url": github_url,
+                    "default_branch": default_branch,
+                    "project_dir": project_dir.display().to_string(),
+                }),
+            );
             tracing::info!(
                 short_id = %issue.short_id,
                 repo = %repo_name,
@@ -1703,6 +1910,15 @@ Create a PR with your changes."#,
                 GitOps::ensure_repo_at_path(&project_dir, github_url, default_branch).await
             {
                 let pull_error = format!("Failed to pull repository: {}", e);
+                self.record_issue_decision(
+                    &issue,
+                    "repo_sync_failed",
+                    format!("Repository sync failed for {}", issue.short_id),
+                    json!({
+                        "repo_name": repo_name,
+                        "error": pull_error.clone(),
+                    }),
+                );
                 if let Err(mark_err) =
                     self.tracker
                         .mark_failed(source.name(), &issue.id, &pull_error)
@@ -1725,8 +1941,18 @@ Create a PR with your changes."#,
                     processing.remove(&processing_key);
                 }
                 self.active_processing.fetch_sub(1, Ordering::SeqCst);
-                return;
+                return true;
             }
+
+            self.record_issue_decision(
+                &issue,
+                "repo_sync_completed",
+                format!("Repository synced for {}", issue.short_id),
+                json!({
+                    "repo_name": repo_name,
+                    "project_dir": project_dir.display().to_string(),
+                }),
+            );
 
             // Re-index files and sync to database
             if let Some(inferrer) = &self.inferrer {
@@ -2055,6 +2281,16 @@ Create a PR with your changes."#,
 
             if claude_result.success {
                 if let Some(ref pr_url) = claude_result.pr_url {
+                    self.record_issue_decision(
+                        &issue,
+                        "claude_run_succeeded_with_pr",
+                        format!("Claude produced PR for {}", issue.short_id),
+                        json!({
+                            "pr_url": pr_url,
+                            "attempt_id": attempt_id,
+                            "used_qa_ids": claude_result.used_qa_ids,
+                        }),
+                    );
                     tracing::info!(short_id = %issue.short_id, pr_url = %pr_url, "Success! PR created");
                     self.tracker
                         .mark_success(source.name(), &issue.id, pr_url)?;
@@ -2112,6 +2348,15 @@ Create a PR with your changes."#,
                     }));
                     self.tracker.record_activity(&activity).ok();
                 } else {
+                    self.record_issue_decision(
+                        &issue,
+                        "claude_run_succeeded_without_pr",
+                        format!("Claude returned success without PR for {}", issue.short_id),
+                        json!({
+                            "attempt_id": attempt_id,
+                            "used_qa_ids": claude_result.used_qa_ids,
+                        }),
+                    );
                     tracing::info!(short_id = %issue.short_id, "Completed but no PR URL found");
                     self.tracker.mark_failed(
                         source.name(),
@@ -2143,6 +2388,16 @@ Create a PR with your changes."#,
                 }
             } else {
                 let error = claude_result.error.as_deref().unwrap_or("Unknown error");
+                self.record_issue_decision(
+                    &issue,
+                    "claude_run_failed",
+                    format!("Claude failed for {}", issue.short_id),
+                    json!({
+                        "error": error,
+                        "attempt_id": attempt_id,
+                        "used_qa_ids": claude_result.used_qa_ids,
+                    }),
+                );
                 tracing::error!(short_id = %issue.short_id, error = %error, "Failed");
                 self.tracker.mark_failed(source.name(), &issue.id, error)?;
                 self.notify_failed_with_escalation(&issue, error).await?;
@@ -2166,6 +2421,15 @@ Create a PR with your changes."#,
         if let Err(ref e) = result {
             tracing::error!(short_id = %issue.short_id, error = %e, "Error processing issue");
             let error_str = e.to_string();
+            self.record_issue_decision(
+                &issue,
+                "processing_pipeline_error",
+                format!("Processing pipeline error for {}", issue.short_id),
+                json!({
+                    "error": error_str.clone(),
+                    "attempt_id": attempt_id,
+                }),
+            );
             let _ = self
                 .tracker
                 .mark_failed(source.name(), &issue.id, &error_str);
@@ -2208,6 +2472,7 @@ Create a PR with your changes."#,
             processing.remove(&processing_key);
         }
         self.active_processing.fetch_sub(1, Ordering::SeqCst);
+        true
     }
 
     /// Record an error pattern to the analytics database.
@@ -2229,6 +2494,15 @@ Create a PR with your changes."#,
     /// Route hard failures to the global notifier user (override per-issue assignee routing).
     async fn notify_failed_with_escalation(&self, issue: &Issue, error: &str) -> Result<()> {
         if ClaudeRunner::is_hard_error(error) {
+            self.record_issue_decision(
+                issue,
+                "hard_error_escalated",
+                format!("Escalating hard error for {}", issue.short_id),
+                json!({
+                    "error": Self::truncate_error_for_activity(error),
+                    "rate_limited": ClaudeRunner::is_rate_limit_error(error),
+                }),
+            );
             let mut global_issue = issue.clone();
             global_issue.metadata.remove("resolved_user");
             global_issue
@@ -2348,8 +2622,18 @@ Create a PR with your changes."#,
         let issue = source.get_issue(issue_id).await?;
         let match_result = MatchResult::matched("Manual trigger", MatchPriority::Urgent);
 
-        self.process_issue(Arc::clone(source), issue, match_result, review_feedback)
+        let started = self
+            .process_issue(Arc::clone(source), issue, match_result, review_feedback)
             .await;
+        if !started {
+            return Err(crate::error::Error::source(
+                source_name,
+                format!(
+                    "Issue {} is already being processed; trigger deferred",
+                    issue_id
+                ),
+            ));
+        }
 
         Ok(())
     }
@@ -3915,6 +4199,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_review_action_waits_for_inflight_issue_processing() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker
+            .mark_success("mock", "1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let source = Arc::new(MockSource::with_issues(
+            "mock",
+            vec![Issue::new(
+                "1",
+                "MOCK-1",
+                "Mock issue",
+                "http://example.com/mock/1",
+                "mock",
+            )],
+        )) as Arc<dyn IssueSource>;
+
+        let watcher = Arc::new(create_test_watcher(
+            notifier,
+            tracker.clone(),
+            vec![source],
+            false,
+        ));
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.insert("mock:1".to_string());
+        }
+
+        let release = Arc::clone(&watcher);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut processing = release.processing.write().await;
+            processing.remove("mock:1");
+        });
+
+        let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            watcher.process_review_action(&attempt, "Please address review feedback"),
+        )
+        .await;
+        assert!(result.is_ok(), "process_review_action timed out");
+        assert!(
+            result.unwrap().is_ok(),
+            "process_review_action returned error"
+        );
+
+        let updated_attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        assert_eq!(
+            updated_attempt.status,
+            crate::types::FixAttemptStatus::Failed,
+            "review rerun should execute after lock release (repo resolution fails in test setup, marking failed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_review_action_exits_when_watcher_stopping() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker
+            .mark_success("mock", "1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let source = Arc::new(MockSource::with_issues(
+            "mock",
+            vec![Issue::new(
+                "1",
+                "MOCK-1",
+                "Mock issue",
+                "http://example.com/mock/1",
+                "mock",
+            )],
+        )) as Arc<dyn IssueSource>;
+
+        let watcher = Arc::new(create_test_watcher(
+            notifier,
+            tracker.clone(),
+            vec![source],
+            false,
+        ));
+
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.insert("mock:1".to_string());
+        }
+        watcher.is_running.store(false, Ordering::SeqCst);
+
+        let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        let result = watcher
+            .process_review_action(&attempt, "Please address review feedback")
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Watcher stopping while waiting"),
+            "expected watcher-stopping wait error"
+        );
+    }
+
+    #[tokio::test]
     async fn test_watcher_poll_source_skips_attempted() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3965,6 +4358,35 @@ mod tests {
         let result = watcher.trigger_issue("mock", "123").await;
         // Should succeed in dry run (doesn't actually process)
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_watcher_trigger_issue_inflight_returns_error() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issues = vec![Issue::new(
+            "123",
+            "T-123",
+            "Test Issue",
+            "http://example.com/123",
+            "mock",
+        )];
+        let source = Arc::new(MockSource::with_issues("mock", issues)) as Arc<dyn IssueSource>;
+        let sources = vec![source];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, true);
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.insert("mock:123".to_string());
+        }
+
+        let result = watcher.trigger_issue("mock", "123").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("already being processed"));
     }
 
     #[test]

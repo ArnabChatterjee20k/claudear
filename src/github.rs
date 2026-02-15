@@ -1339,7 +1339,11 @@ impl<H: HttpClient> ReviewWatcher<H> {
             .iter()
             .filter(|c| !attached_comment_ids.contains(&c.id))
             .filter(|c| {
-                if trigger.is_empty() {
+                if c.pull_request_review_id.is_some() {
+                    // Inline comments are review feedback and should remain actionable
+                    // even when they arrive in a later poll cycle.
+                    true
+                } else if trigger.is_empty() {
                     true
                 } else {
                     c.body.to_lowercase().contains(&trigger.to_lowercase())
@@ -2645,6 +2649,65 @@ mod tests {
             updated_state.last_comment_time.as_deref(),
             Some("2024-01-01T00:01:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn test_review_watcher_processes_delayed_inline_comment_without_trigger() {
+        let mock = MockHttpClient::new();
+        let reviews_url = "https://api.github.com/repos/owner/repo/pulls/1/reviews";
+        let comments_url = "https://api.github.com/repos/owner/repo/pulls/1/comments";
+
+        mock.mock_response(
+            reviews_url,
+            200,
+            r#"[
+                {"id": 10, "state": "CHANGES_REQUESTED", "body": "needs fixes", "user": {"id": 123, "login": "reviewer", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
+            ]"#,
+        );
+        mock.mock_response(comments_url, 200, "[]");
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let watcher = ReviewWatcher::with_http_client(client);
+
+        watcher.watch_pr(PrReviewState::new(
+            "url",
+            "owner/repo",
+            1,
+            "issue",
+            "linear",
+        ));
+
+        let first = watcher.check_for_reviews().await.unwrap();
+        assert_eq!(first.len(), 1);
+
+        // Next poll: review feed is empty, but an inline comment for the prior review arrives.
+        watcher.github.http.mock_response(reviews_url, 200, "[]");
+        watcher.github.http.mock_response(
+            comments_url,
+            200,
+            r#"[
+                {"id": 1, "path": "file.rs", "body": "inline feedback", "user": {"id": 123, "login": "reviewer", "type": "User"}, "created_at": "2024-01-01T00:01:00Z", "updated_at": "2024-01-01T00:01:00Z", "html_url": "url", "pull_request_review_id": 10}
+            ]"#,
+        );
+
+        let second = watcher.check_for_reviews().await.unwrap();
+        assert_eq!(second.len(), 1);
+        match &second[0] {
+            ReviewEvent::CommentsAdded { comments, .. } => {
+                assert_eq!(comments.len(), 1);
+                assert_eq!(comments[0].body, "inline feedback");
+                assert_eq!(comments[0].pull_request_review_id, Some(10));
+            }
+            _ => panic!("Expected CommentsAdded event"),
+        }
     }
 
     #[tokio::test]

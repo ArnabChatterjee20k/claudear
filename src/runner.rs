@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const CLAUDE_LOG_SUBDIR: &str = "claude";
@@ -28,6 +28,7 @@ Use valid JSON and keep question concise.
 struct ExecutionLogFiles {
     stdout: PathBuf,
     stderr: PathBuf,
+    events: PathBuf,
 }
 
 /// Configuration for the Claude runner.
@@ -267,6 +268,7 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         Some(ExecutionLogFiles {
             stdout: dir.join(format!("{}.stdout.log", stem)),
             stderr: dir.join(format!("{}.stderr.log", stem)),
+            events: dir.join(format!("{}.events.jsonl", stem)),
         })
     }
 
@@ -328,6 +330,58 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
             }
             serde_json::from_str::<BlockingQuestion>(payload).ok()
         })
+    }
+
+    async fn append_execution_event(
+        writer: &Option<Arc<Mutex<tokio::fs::File>>>,
+        label: &str,
+        event: &str,
+        data: serde_json::Value,
+    ) {
+        let Some(writer) = writer else {
+            return;
+        };
+
+        let payload = json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "label": label,
+            "event": event,
+            "data": data,
+        });
+
+        let serialized = match serde_json::to_string(&payload) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    component = "claude",
+                    label = label,
+                    error = %e,
+                    "Failed to serialize execution event payload"
+                );
+                return;
+            }
+        };
+
+        let mut guard = writer.lock().await;
+        if let Err(e) = guard.write_all(serialized.as_bytes()).await {
+            tracing::warn!(
+                component = "claude",
+                label = label,
+                event = event,
+                error = %e,
+                "Failed to write execution event payload"
+            );
+            return;
+        }
+        if let Err(e) = guard.write_all(b"\n").await {
+            tracing::warn!(
+                component = "claude",
+                label = label,
+                event = event,
+                error = %e,
+                "Failed to terminate execution event payload line"
+            );
+        }
     }
 
     async fn execute(
@@ -454,43 +508,139 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         if let Some(ref files) = log_files {
             execution.stdout_log_path = Some(files.stdout.display().to_string());
             execution.stderr_log_path = Some(files.stderr.display().to_string());
+            execution.event_log_path = Some(files.events.display().to_string());
             tracing::info!(
                 component = "claude",
                 label = label,
                 stdout_log = %files.stdout.display(),
                 stderr_log = %files.stderr.display(),
+                events_log = %files.events.display(),
                 "Capturing Claude output to execution log files"
             );
         }
 
-        let mut child = Command::new("claude")
+        let event_writer: Option<Arc<Mutex<tokio::fs::File>>> =
+            match log_files.as_ref().map(|files| files.events.clone()) {
+                Some(path) => match tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .await
+                {
+                    Ok(file) => Some(Arc::new(Mutex::new(file))),
+                    Err(e) => {
+                        tracing::warn!(
+                            component = "claude",
+                            label = label,
+                            path = %path.display(),
+                            error = %e,
+                            "Failed to open execution events log file"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
+        let cli_args_without_prompt: Vec<String> = args
+            .iter()
+            .take(args.len().saturating_sub(1))
+            .cloned()
+            .collect();
+        Self::append_execution_event(
+            &event_writer,
+            label,
+            "execution_initialized",
+            json!({
+                "attempt_id": attempt_id,
+                "timeout_secs": self.config.timeout_secs,
+                "working_dir": project_dir.display().to_string(),
+                "model": self.config.model.clone(),
+                "skip_permissions": self.config.skip_permissions,
+                "permissions": self.config.permissions.clone(),
+                "cli_args_without_prompt": cli_args_without_prompt,
+                "prompt_hash": execution.prompt_hash.clone(),
+            }),
+        )
+        .await;
+
+        let mut child = match Command::new("claude")
             .args(&args)
             .current_dir(project_dir)
             .envs(env)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| Error::runner(format!("Failed to spawn claude: {}", e)))?;
+        {
+            Ok(child) => child,
+            Err(e) => {
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "spawn_failed",
+                    json!({
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
+                return Err(Error::runner(format!("Failed to spawn claude: {}", e)));
+            }
+        };
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::runner("Failed to capture stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::runner("Failed to capture stderr"))?;
+        Self::append_execution_event(
+            &event_writer,
+            label,
+            "subprocess_spawned",
+            json!({
+                "pid": child.id(),
+            }),
+        )
+        .await;
+
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "stdout_capture_failed",
+                    json!({
+                        "error": "Failed to capture stdout",
+                    }),
+                )
+                .await;
+                return Err(Error::runner("Failed to capture stdout"));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "stderr_capture_failed",
+                    json!({
+                        "error": "Failed to capture stderr",
+                    }),
+                )
+                .await;
+                return Err(Error::runner("Failed to capture stderr"));
+            }
+        };
 
         let label_stdout = label.to_string();
         let label_stderr = label.to_string();
         let stdout_log_path = log_files.as_ref().map(|f| f.stdout.clone());
         let stderr_log_path = log_files.as_ref().map(|f| f.stderr.clone());
+        let stdout_event_writer = event_writer.clone();
+        let stderr_event_writer = event_writer.clone();
 
         let (question_tx, question_rx) = oneshot::channel::<()>();
         let stdout_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut output = String::new();
             let mut question_tx = Some(question_tx);
+            let mut line_number: u64 = 0;
             let mut writer = match stdout_log_path {
                 Some(path) => match tokio::fs::OpenOptions::new()
                     .create(true)
@@ -520,6 +670,15 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                     Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(e) => {
+                        ClaudeRunner::append_execution_event(
+                            &stdout_event_writer,
+                            label_stdout.as_str(),
+                            "stdout_read_error",
+                            json!({
+                                "error": e.to_string(),
+                            }),
+                        )
+                        .await;
                         tracing::warn!(
                             component = "claude",
                             label = label_stdout.as_str(),
@@ -529,6 +688,18 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                         break;
                     }
                 };
+
+                line_number = line_number.saturating_add(1);
+                ClaudeRunner::append_execution_event(
+                    &stdout_event_writer,
+                    label_stdout.as_str(),
+                    "stdout_line",
+                    json!({
+                        "line_number": line_number,
+                        "line": line.as_str(),
+                    }),
+                )
+                .await;
 
                 if !line.trim().is_empty() {
                     tracing::info!(
@@ -541,6 +712,15 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
 
                 // Detect blocking question in real-time and signal parent.
                 if question_tx.is_some() && line.trim().starts_with(QUESTION_PROTOCOL_PREFIX) {
+                    ClaudeRunner::append_execution_event(
+                        &stdout_event_writer,
+                        label_stdout.as_str(),
+                        "blocking_question_detected",
+                        json!({
+                            "line_number": line_number,
+                        }),
+                    )
+                    .await;
                     tracing::info!(
                         component = "claude",
                         label = label_stdout.as_str(),
@@ -557,6 +737,13 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                             || file.write_all(b"\n").await.is_err())
                     {
                         write_failed = true;
+                        ClaudeRunner::append_execution_event(
+                            &stdout_event_writer,
+                            label_stdout.as_str(),
+                            "stdout_log_write_failed",
+                            json!({}),
+                        )
+                        .await;
                         tracing::warn!(
                             component = "claude",
                             label = label_stdout.as_str(),
@@ -568,6 +755,15 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                 output.push_str(&line);
                 output.push('\n');
             }
+            ClaudeRunner::append_execution_event(
+                &stdout_event_writer,
+                label_stdout.as_str(),
+                "stdout_stream_closed",
+                json!({
+                    "line_count": line_number,
+                }),
+            )
+            .await;
             output
         });
 
@@ -575,6 +771,7 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         let stderr_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             let mut output = String::new();
+            let mut line_number: u64 = 0;
             let mut writer = match stderr_log_path {
                 Some(path) => match tokio::fs::OpenOptions::new()
                     .create(true)
@@ -604,6 +801,15 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                     Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(e) => {
+                        ClaudeRunner::append_execution_event(
+                            &stderr_event_writer,
+                            label_stderr.as_str(),
+                            "stderr_read_error",
+                            json!({
+                                "error": e.to_string(),
+                            }),
+                        )
+                        .await;
                         tracing::warn!(
                             component = "claude",
                             label = label_stderr.as_str(),
@@ -613,6 +819,18 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                         break;
                     }
                 };
+
+                line_number = line_number.saturating_add(1);
+                ClaudeRunner::append_execution_event(
+                    &stderr_event_writer,
+                    label_stderr.as_str(),
+                    "stderr_line",
+                    json!({
+                        "line_number": line_number,
+                        "line": line.as_str(),
+                    }),
+                )
+                .await;
 
                 if !line.trim().is_empty() {
                     tracing::error!(
@@ -629,6 +847,13 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                             || file.write_all(b"\n").await.is_err())
                     {
                         write_failed = true;
+                        ClaudeRunner::append_execution_event(
+                            &stderr_event_writer,
+                            label_stderr.as_str(),
+                            "stderr_log_write_failed",
+                            json!({}),
+                        )
+                        .await;
                         tracing::warn!(
                             component = "claude",
                             label = label_stderr.as_str(),
@@ -640,6 +865,15 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                 output.push_str(&line);
                 output.push('\n');
             }
+            ClaudeRunner::append_execution_event(
+                &stderr_event_writer,
+                label_stderr.as_str(),
+                "stderr_stream_closed",
+                json!({
+                    "line_count": line_number,
+                }),
+            )
+            .await;
             output
         });
 
@@ -658,17 +892,60 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         };
 
         let (status, timed_out) = match outcome {
-            WaitOutcome::Exited(Ok(status)) => (status, false),
+            WaitOutcome::Exited(Ok(status)) => {
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "subprocess_exited",
+                    json!({
+                        "exit_code": status.code(),
+                    }),
+                )
+                .await;
+                (status, false)
+            }
             WaitOutcome::Exited(Err(e)) => {
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "wait_failed",
+                    json!({
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
                 return Err(Error::runner(format!("Failed to wait for claude: {}", e)));
             }
             WaitOutcome::QuestionDetected => {
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "question_detected_wait_outcome",
+                    json!({}),
+                )
+                .await;
                 tracing::info!(
                     component = "claude",
                     label = label,
                     "Killing subprocess early — blocking question detected in stream"
                 );
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "kill_requested_after_question",
+                    json!({}),
+                )
+                .await;
                 if let Err(e) = child.kill().await {
+                    Self::append_execution_event(
+                        &event_writer,
+                        label,
+                        "kill_failed_after_question",
+                        json!({
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .await;
                     tracing::error!(component = "claude", error = %e, "Failed to kill process after question detected");
                 }
                 // Wait for the process to actually finish so pipes are drained.
@@ -676,6 +953,15 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                 let status = match exit_status {
                     Ok(s) => s,
                     Err(e) => {
+                        Self::append_execution_event(
+                            &event_writer,
+                            label,
+                            "wait_failed_after_question_kill",
+                            json!({
+                                "error": e.to_string(),
+                            }),
+                        )
+                        .await;
                         tracing::warn!(component = "claude", error = %e, "Failed to reap killed process");
                         // Fabricate a non-success status; the question is already captured.
                         std::process::ExitStatus::default()
@@ -684,6 +970,15 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                 (status, false)
             }
             WaitOutcome::TimedOut => {
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "subprocess_timed_out",
+                    json!({
+                        "timeout_secs": self.config.timeout_secs,
+                    }),
+                )
+                .await;
                 // Timeout occurred - try to kill the process
                 tracing::error!(
                     component = "claude",
@@ -691,7 +986,23 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                     timeout_secs = self.config.timeout_secs,
                     "Process timed out, attempting to kill"
                 );
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "kill_requested_after_timeout",
+                    json!({}),
+                )
+                .await;
                 if let Err(e) = child.kill().await {
+                    Self::append_execution_event(
+                        &event_writer,
+                        label,
+                        "kill_failed_after_timeout",
+                        json!({
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .await;
                     tracing::error!(component = "claude", error = %e, "Failed to kill timed-out process");
                 }
 
@@ -714,7 +1025,26 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                     self.config.timeout_secs
                 ));
                 if let Err(e) = self.tracker.record_execution(&execution) {
+                    Self::append_execution_event(
+                        &event_writer,
+                        label,
+                        "execution_record_failed",
+                        json!({
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .await;
                     tracing::warn!(error = %e, "Failed to record timed-out execution to database");
+                } else {
+                    Self::append_execution_event(
+                        &event_writer,
+                        label,
+                        "execution_recorded",
+                        json!({
+                            "timed_out": true,
+                        }),
+                    )
+                    .await;
                 }
 
                 // Return a result indicating timeout
@@ -743,6 +1073,18 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
             timed_out = timed_out,
             "Process completed"
         );
+        Self::append_execution_event(
+            &event_writer,
+            label,
+            "process_completed",
+            json!({
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "stdout_bytes": stdout_output.len(),
+                "stderr_bytes": stderr_output.len(),
+            }),
+        )
+        .await;
 
         let pr_url = Self::extract_pr_url(&stdout_output);
 
@@ -753,6 +1095,15 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
                 pr_url = url,
                 "PR URL extracted"
             );
+            Self::append_execution_event(
+                &event_writer,
+                label,
+                "pr_url_extracted",
+                json!({
+                    "pr_url": url,
+                }),
+            )
+            .await;
         }
 
         let failure_msg = if status.success() {
@@ -785,7 +1136,27 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
 
         // Record the execution to the database (don't fail the main operation if this fails)
         if let Err(e) = self.tracker.record_execution(&execution) {
+            Self::append_execution_event(
+                &event_writer,
+                label,
+                "execution_record_failed",
+                json!({
+                    "error": e.to_string(),
+                }),
+            )
+            .await;
             tracing::warn!(error = %e, "Failed to record execution to database");
+        } else {
+            Self::append_execution_event(
+                &event_writer,
+                label,
+                "execution_recorded",
+                json!({
+                    "timed_out": false,
+                    "exit_code": execution.exit_code,
+                }),
+            )
+            .await;
         }
 
         // Log completion activity
@@ -840,6 +1211,20 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
 
         let blocking_question = Self::extract_blocking_question(&stdout_output)
             .or_else(|| Self::extract_blocking_question(&stderr_output));
+        if let Some(question) = blocking_question.as_ref() {
+            Self::append_execution_event(
+                &event_writer,
+                label,
+                "blocking_question_parsed",
+                json!({
+                    "question": question.question.as_str(),
+                    "has_context": question.context.is_some(),
+                    "options": question.options.clone(),
+                    "has_why": question.why.is_some(),
+                }),
+            )
+            .await;
+        }
 
         Ok(ClaudeResult {
             success: status.success(),
@@ -2003,6 +2388,7 @@ CLAUDEAR_QUESTION: {"question":"second question","options":[]}"#;
         assert!(exec.stderr_preview.is_none());
         assert!(exec.stdout_log_path.is_none());
         assert!(exec.stderr_log_path.is_none());
+        assert!(exec.event_log_path.is_none());
         assert!(exec.prompt_used.is_none());
         assert!(exec.prompt_hash.is_none());
         assert!(exec.model_version.is_none());

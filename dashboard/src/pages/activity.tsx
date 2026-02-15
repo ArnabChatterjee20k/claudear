@@ -15,6 +15,11 @@ const activityTypeColors: Record<string, string> = {
   attempt_started: 'bg-yellow-100 text-yellow-800',
   attempt_completed: 'bg-green-100 text-green-800',
   attempt_failed: 'bg-red-100 text-red-800',
+  decision: 'bg-slate-100 text-slate-800',
+  claude_started: 'bg-indigo-100 text-indigo-800',
+  claude_completed: 'bg-emerald-100 text-emerald-800',
+  claude_failed: 'bg-rose-100 text-rose-800',
+  claude_timed_out: 'bg-orange-100 text-orange-800',
   pr_created: 'bg-purple-100 text-purple-800',
   pr_merged: 'bg-purple-200 text-purple-900',
   pr_closed: 'bg-orange-100 text-orange-800',
@@ -27,6 +32,8 @@ const sourceOptions = [
   { value: 'linear', label: 'Linear' },
   { value: 'jira', label: 'Jira' },
   { value: 'github', label: 'GitHub' },
+  { value: 'claude', label: 'Claude' },
+  { value: 'watcher', label: 'Watcher' },
 ]
 
 export default function ActivityPage() {

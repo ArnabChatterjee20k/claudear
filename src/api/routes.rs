@@ -924,7 +924,7 @@ async fn attempt_execution_log_handler(
     State(state): State<ApiState>,
     Path((attempt_id, execution_id, stream)): Path<(i64, i64, String)>,
 ) -> Result<Json<AttemptExecutionLogResponse>, StatusCode> {
-    if stream != "stdout" && stream != "stderr" {
+    if stream != "stdout" && stream != "stderr" && stream != "events" {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -945,16 +945,18 @@ async fn attempt_execution_log_handler(
         .find(|e| e.id == execution_id)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let log_path = if stream == "stdout" {
-        execution.stdout_log_path.clone()
-    } else {
-        execution.stderr_log_path.clone()
+    let log_path = match stream.as_str() {
+        "stdout" => execution.stdout_log_path.clone(),
+        "stderr" => execution.stderr_log_path.clone(),
+        "events" => execution.event_log_path.clone(),
+        _ => None,
     };
 
-    let fallback_preview = if stream == "stdout" {
-        execution.stdout_preview.clone()
-    } else {
-        execution.stderr_preview.clone()
+    let fallback_preview = match stream.as_str() {
+        "stdout" => execution.stdout_preview.clone(),
+        "stderr" => execution.stderr_preview.clone(),
+        "events" => None,
+        _ => None,
     };
 
     let mut truncated = false;
