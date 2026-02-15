@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::feedback::{
     format_similar_issues_context, FeedbackAnalyzer, FixOutcome, IssueEmbeddingService, Outcome,
 };
-use crate::github::{GitHubClient, PrReviewState, PrStatus, ReviewWatcher};
+use crate::github::{GitHubClient, PrReviewState, PrStatus, ReviewEvent, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::send_to_all_and_wait_first_reply;
 use crate::notifier::Notifier;
@@ -511,23 +511,16 @@ impl Watcher {
 
         // Check for new reviews
         let events = review_watcher.check_for_reviews().await?;
-
-        for event in events {
-            if !event.requires_action() {
-                continue;
-            }
-
-            // Get the PR URL from the event
-            let pr_url = event.pr_url();
-            let feedback_summary = event.get_feedback_summary();
-
+        for (pr_url, feedback_summary, feedback_count) in Self::group_review_feedback_by_pr(events)
+        {
             tracing::info!(
                 pr_url = %pr_url,
+                feedback_count,
                 "Review feedback received, processing..."
             );
 
             // Find the original issue for this PR
-            if let Some(attempt) = self.tracker.get_attempt_by_pr_url(pr_url)? {
+            if let Some(attempt) = self.tracker.get_attempt_by_pr_url(&pr_url)? {
                 if let Err(e) = self
                     .process_review_action(&attempt, &feedback_summary)
                     .await
@@ -547,6 +540,37 @@ impl Watcher {
         }
 
         Ok(())
+    }
+
+    fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<(String, String, usize)> {
+        let mut feedback_by_pr: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut pr_order: Vec<String> = Vec::new();
+
+        for event in events {
+            if !event.requires_action() {
+                continue;
+            }
+
+            let pr_url = event.pr_url().to_string();
+            if !feedback_by_pr.contains_key(&pr_url) {
+                pr_order.push(pr_url.clone());
+            }
+            feedback_by_pr
+                .entry(pr_url)
+                .or_default()
+                .push(event.get_feedback_summary());
+        }
+
+        pr_order
+            .into_iter()
+            .filter_map(|pr_url| {
+                feedback_by_pr.remove(&pr_url).map(|feedbacks| {
+                    let count = feedbacks.len();
+                    (pr_url, feedbacks.join("\n\n---\n\n"), count)
+                })
+            })
+            .collect()
     }
 
     /// Process review feedback by triggering Claude to address the feedback.
@@ -3829,6 +3853,65 @@ mod tests {
             joined.unwrap().expect("task join failed").is_ok(),
             "watcher returned an error with zero interval"
         );
+    }
+
+    #[test]
+    fn test_group_review_feedback_by_pr_batches_same_pr() {
+        let review1 = crate::github::PrReview {
+            id: 1,
+            state: "CHANGES_REQUESTED".to_string(),
+            body: Some("first".to_string()),
+            user: crate::github::GitHubUser {
+                id: 1,
+                login: "r1".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            submitted_at: Some("2024-01-01T00:00:00Z".to_string()),
+            html_url: None,
+        };
+        let review2 = crate::github::PrReview {
+            id: 2,
+            state: "COMMENTED".to_string(),
+            body: Some("second".to_string()),
+            user: crate::github::GitHubUser {
+                id: 2,
+                login: "r2".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            submitted_at: Some("2024-01-01T00:01:00Z".to_string()),
+            html_url: None,
+        };
+
+        let events = vec![
+            crate::github::ReviewEvent::ReviewSubmitted {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                review: review1,
+                inline_comments: vec![],
+            },
+            crate::github::ReviewEvent::ReviewSubmitted {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                review: review2,
+                inline_comments: vec![],
+            },
+            crate::github::ReviewEvent::CommentsAdded {
+                pr_url: "https://github.com/org/repo/pull/2".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 2,
+                comments: vec![], // requires_action = false, should be ignored
+            },
+        ];
+
+        let grouped = Watcher::group_review_feedback_by_pr(events);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0, "https://github.com/org/repo/pull/1");
+        assert_eq!(grouped[0].2, 2);
+        assert!(grouped[0].1.contains("first"));
+        assert!(grouped[0].1.contains("second"));
+        assert!(grouped[0].1.contains("---"));
     }
 
     #[tokio::test]
