@@ -1265,14 +1265,28 @@ impl<H: HttpClient> ReviewWatcher<H> {
         }
 
         // Check for new comments
-        let comments = self
+        let comments = match self
             .github
             .get_new_review_comments(
                 &state.repo,
                 state.pr_number,
                 state.last_comment_time.as_deref(),
             )
-            .await?;
+            .await
+        {
+            Ok(comments) => comments,
+            Err(e) => {
+                // Don't drop already-collected review events for this poll cycle
+                // when comment retrieval fails transiently.
+                tracing::warn!(
+                    component = "review_watcher",
+                    pr_url = %state.pr_url,
+                    error = %e,
+                    "Failed to fetch review comments; continuing with review events only"
+                );
+                return Ok(events);
+            }
+        };
 
         // Get the review trigger (e.g., "/claudear")
         let trigger = self.github.review_trigger();
@@ -2150,6 +2164,54 @@ mod tests {
             }
             _ => panic!("Expected ReviewSubmitted event"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_review_watcher_keeps_review_events_when_comment_fetch_fails() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"[
+                {"id": 1, "state": "CHANGES_REQUESTED", "body": "Fix this", "user": {"id": 123, "login": "reviewer", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
+            ]"#,
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments",
+            500,
+            "Internal Server Error",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let watcher = ReviewWatcher::with_http_client(client);
+
+        watcher.watch_pr(PrReviewState::new(
+            "url",
+            "owner/repo",
+            1,
+            "issue",
+            "linear",
+        ));
+
+        let events = watcher.check_for_reviews().await.unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ReviewEvent::ReviewSubmitted { review, .. } => {
+                assert_eq!(review.state, "CHANGES_REQUESTED");
+            }
+            _ => panic!("Expected ReviewSubmitted event"),
+        }
+
+        let updated_state = watcher.get_state("url").unwrap();
+        assert_eq!(updated_state.last_review_id, Some(1));
     }
 
     #[tokio::test]
