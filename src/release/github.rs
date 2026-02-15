@@ -354,11 +354,23 @@ impl<H: HttpClient> ReleaseClient<H> {
             })
             .collect();
 
-        // Sort by published_at ascending to get the first release after
+        // Sort by actual timestamp (not string order) to get the first release after.
         candidates.sort_by(|a, b| {
-            let a_time = a.published_at.as_ref().unwrap();
-            let b_time = b.published_at.as_ref().unwrap();
-            a_time.cmp(b_time)
+            let a_time = a
+                .published_at
+                .as_deref()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+            let b_time = b
+                .published_at
+                .as_deref()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+
+            match (a_time, b_time) {
+                (Some(a_dt), Some(b_dt)) => a_dt.cmp(&b_dt),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
         });
 
         Ok(candidates.into_iter().next())
@@ -862,6 +874,50 @@ mod tests {
         assert_eq!(releases.len(), 2);
         assert_eq!(releases[0].tag_name, "v1.1.0");
         assert_eq!(releases[1].tag_name, "v1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_get_first_release_after_sorts_by_actual_timestamp() {
+        let mock = MockHttpClient::new(
+            200,
+            r#"[
+                {
+                    "id": 1,
+                    "tag_name": "v2.0.0",
+                    "name": "Version 2.0.0",
+                    "draft": false,
+                    "prerelease": false,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "published_at": "2024-01-01T00:10:00Z",
+                    "target_commitish": "main",
+                    "body": "",
+                    "html_url": "https://github.com/org/repo/releases/tag/v2.0.0"
+                },
+                {
+                    "id": 2,
+                    "tag_name": "v1.9.0",
+                    "name": "Version 1.9.0",
+                    "draft": false,
+                    "prerelease": false,
+                    "created_at": "2023-12-31T23:00:00Z",
+                    "published_at": "2024-01-01T00:30:00+01:00",
+                    "target_commitish": "main",
+                    "body": "",
+                    "html_url": "https://github.com/org/repo/releases/tag/v1.9.0"
+                }
+            ]"#,
+        );
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release = client
+            .get_first_release_after("org/repo", "2023-12-31T22:00:00Z")
+            .await
+            .unwrap()
+            .expect("Expected a release after timestamp");
+
+        // 2024-01-01T00:30:00+01:00 == 2023-12-31T23:30:00Z, which is earlier
+        // than 2024-01-01T00:10:00Z and should be selected first.
+        assert_eq!(release.tag_name, "v1.9.0");
     }
 
     #[tokio::test]
