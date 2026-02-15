@@ -14,7 +14,7 @@ else
 	INSTALL_CMD := install -Dm755
 endif
 
-.PHONY: all build build-release install uninstall clean test test-all lint fmt check \
+.PHONY: all build build-release install uninstall clean test test-all test-prod-e2e lint fmt check \
         dashboard dashboard-build dashboard-dev dashboard-test \
         docker docker-build docker-up docker-down docker-logs docker-clean \
         dev run help
@@ -55,6 +55,10 @@ test:
 
 ## test-all: Run all tests (Rust + Dashboard)
 test-all: test dashboard-test
+
+## test-prod-e2e: Run real production smoke test (requires live service credentials)
+test-prod-e2e:
+	./scripts/prod-e2e-smoke.sh
 
 ## lint: Run clippy linter
 lint:

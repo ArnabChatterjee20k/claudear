@@ -191,7 +191,7 @@ impl Notifier for PushNotifier {
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
-        self.send_push("Claude Watchers", message, None, None, Some(-1), None)
+        self.send_push("Claudear", message, None, None, Some(-1), None)
             .await
     }
 

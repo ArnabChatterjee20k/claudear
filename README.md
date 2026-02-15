@@ -677,6 +677,32 @@ cargo test test_exponential_backoff_delay
 make check
 ```
 
+### Production E2E Smoke Test
+
+For a real production-path verification (live Linear + GitHub + Claude), use:
+
+```bash
+make test-prod-e2e
+```
+
+Required environment variables:
+
+- `CLAUDEAR_E2E_LINEAR_API_KEY`
+- `CLAUDEAR_E2E_LINEAR_TEAM_ID`
+- `CLAUDEAR_E2E_GITHUB_REPO` (format: `owner/repo`)
+- `CLAUDEAR_E2E_GITHUB_TOKEN`
+- `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`
+
+What this smoke test does:
+
+1. Creates a real Linear issue.
+2. Clones the real target GitHub repository into a temporary workspace.
+3. Runs the real `claudear trigger` flow against that issue.
+4. Verifies success + PR URL in the SQLite tracker and verifies the PR via GitHub API.
+5. Cleans up by closing the PR and resolving the Linear issue.
+
+Script location: `scripts/prod-e2e-smoke.sh`
+
 ### Linting
 
 ```bash
@@ -716,6 +742,7 @@ Run `make help` for a full list. Key targets:
 | `make install` | Install to /usr/local/bin |
 | `make test` | Run Rust tests |
 | `make test-all` | Run Rust + dashboard tests |
+| `make test-prod-e2e` | Run real production smoke test |
 | `make lint` | Run clippy linter |
 | `make fmt` | Format code |
 | `make check` | Format + lint + test |
@@ -790,6 +817,11 @@ The project includes GitHub Actions workflows for:
   - Publishes Docker image to GHCR
   - Publishes to Homebrew tap
   - Builds and publishes Debian packages to APT repository
+
+- **Production E2E Smoke** (`e2e-prod-smoke.yml`): Manual/nightly live-flow verification
+  - Disabled by default; enable with repository variable `CLAUDEAR_PROD_E2E_ENABLED=true`
+  - Requires repository secrets listed in the Production E2E section above
+  - Executes `scripts/prod-e2e-smoke.sh` against real services and performs cleanup
 
 ### Creating a Release
 

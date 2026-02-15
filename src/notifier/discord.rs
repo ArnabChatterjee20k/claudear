@@ -238,7 +238,7 @@ pub(crate) fn build_start_message(issue: &Issue, mention: Option<String>) -> Dis
     let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
 
     DiscordMessage {
-        content: mention.map(|m| format!("{} Processing issue...", m)),
+        content: mention.map(|m| m.to_string()),
         embeds: Some(vec![DiscordEmbed {
             title: Some(format!("{} Processing: {}", emoji, short_id)),
             description: Some(title),
@@ -262,7 +262,7 @@ pub(crate) fn build_start_message(issue: &Issue, mention: Option<String>) -> Dis
                 },
             ]),
             footer: Some(DiscordFooter {
-                text: "Claude Watchers".to_string(),
+                text: "Claudear".to_string(),
             }),
             timestamp: Some(timestamp()),
         }]),
@@ -283,7 +283,7 @@ pub(crate) fn build_success_message(
     let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
 
     DiscordMessage {
-        content: mention.map(|m| format!("{} PR created!", m)),
+        content: mention.map(|m| m.to_string()),
         embeds: Some(vec![DiscordEmbed {
             title: Some(format!("\u{2705} PR Created: {}", short_id)),
             description: Some(title),
@@ -307,7 +307,7 @@ pub(crate) fn build_success_message(
                 },
             ]),
             footer: Some(DiscordFooter {
-                text: "Claude Watchers".to_string(),
+                text: "Claudear".to_string(),
             }),
             timestamp: Some(timestamp()),
         }]),
@@ -323,7 +323,7 @@ pub(crate) fn build_completed_message(issue: &Issue, mention: Option<String>) ->
     let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
 
     DiscordMessage {
-        content: mention.map(|m| format!("{} Issue processed (no PR URL found)", m)),
+        content: mention.map(|m| m.to_string()),
         embeds: Some(vec![DiscordEmbed {
             title: Some(format!("\u{2714}\u{FE0F} Completed: {}", short_id)),
             description: Some(title),
@@ -342,7 +342,7 @@ pub(crate) fn build_completed_message(issue: &Issue, mention: Option<String>) ->
                 },
             ]),
             footer: Some(DiscordFooter {
-                text: "Claude Watchers".to_string(),
+                text: "Claudear".to_string(),
             }),
             timestamp: Some(timestamp()),
         }]),
@@ -363,7 +363,7 @@ pub(crate) fn build_failed_message(
     let error_display = truncate_string(error, 1000);
 
     DiscordMessage {
-        content: mention.map(|m| format!("{} Fix attempt failed", m)),
+        content: mention.map(|m| m.to_string()),
         embeds: Some(vec![DiscordEmbed {
             title: Some(format!("\u{274C} Failed: {}", short_id)),
             description: Some(title),
@@ -382,7 +382,7 @@ pub(crate) fn build_failed_message(
                 },
             ]),
             footer: Some(DiscordFooter {
-                text: "Claude Watchers".to_string(),
+                text: "Claudear".to_string(),
             }),
             timestamp: Some(timestamp()),
         }]),
@@ -402,7 +402,7 @@ pub(crate) fn build_status_message(message: &str) -> DiscordMessage {
             color: Some(0x9b59b6), // Purple
             fields: None,
             footer: Some(DiscordFooter {
-                text: "Claude Watchers".to_string(),
+                text: "Claudear".to_string(),
             }),
             timestamp: Some(timestamp()),
         }]),
@@ -437,7 +437,7 @@ pub(crate) fn build_urgent_issues_message(
         .collect();
 
     Some(DiscordMessage {
-        content: mention.map(|m| format!("{} Urgent issues detected!", m)),
+        content: mention.map(|m| m.to_string()),
         embeds: Some(vec![DiscordEmbed {
             title: Some(format!(
                 "\u{1F6A8} {} Urgent Issue{} Detected",
@@ -449,7 +449,7 @@ pub(crate) fn build_urgent_issues_message(
             color: Some(0xf39c12), // Orange
             fields: Some(fields),
             footer: Some(DiscordFooter {
-                text: "Claude Watchers".to_string(),
+                text: "Claudear".to_string(),
             }),
             timestamp: Some(timestamp()),
         }]),
@@ -1357,7 +1357,7 @@ mod tests {
 
         let (_, body) = notifier.http.get_last_call().unwrap();
         let footer = body["embeds"][0]["footer"]["text"].as_str().unwrap();
-        assert_eq!(footer, "Claude Watchers");
+        assert_eq!(footer, "Claudear");
     }
 
     #[tokio::test]
@@ -3044,7 +3044,7 @@ mod tests {
         assert_eq!(fields[0].value, "linear");
         assert_eq!(fields[1].name, "Priority");
         assert_eq!(fields[2].name, "Status");
-        assert_eq!(embed.footer.as_ref().unwrap().text, "Claude Watchers");
+        assert_eq!(embed.footer.as_ref().unwrap().text, "Claudear");
         assert!(embed.timestamp.is_some());
     }
 
@@ -3165,7 +3165,7 @@ mod tests {
         assert!(embed.url.is_none());
         assert_eq!(embed.color, Some(0x9b59b6));
         assert!(embed.fields.is_none());
-        assert_eq!(embed.footer.as_ref().unwrap().text, "Claude Watchers");
+        assert_eq!(embed.footer.as_ref().unwrap().text, "Claudear");
     }
 
     #[test]

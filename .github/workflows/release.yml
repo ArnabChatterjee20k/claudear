@@ -258,7 +258,7 @@ jobs:
           Codename: stable
           Architectures: amd64 arm64
           Components: main
-          Description: Claude Watchers APT Repository
+          Description: Claudear APT Repository
           EOF
 
           # Add checksums

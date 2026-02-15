@@ -184,22 +184,19 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
         let body = format!(
-            "[Claude Watchers] Processing {} from {} - {}",
+            "[Claudear] Processing {} from {} - {}",
             issue.short_id, issue.source, issue.title
         );
         self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
-        let body = format!(
-            "[Claude Watchers] PR Created for {}: {}",
-            issue.short_id, pr_url
-        );
+        let body = format!("[Claudear] PR Created for {}: {}", issue.short_id, pr_url);
         self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
-        let body = format!("[Claude Watchers] Completed {} (no PR URL)", issue.short_id);
+        let body = format!("[Claudear] Completed {} (no PR URL)", issue.short_id);
         self.send_sms(&body, Some(issue)).await
     }
 
@@ -211,15 +208,12 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
             error.to_string()
         };
 
-        let body = format!(
-            "[Claude Watchers] FAILED {}: {}",
-            issue.short_id, short_error
-        );
+        let body = format!("[Claudear] FAILED {}: {}", issue.short_id, short_error);
         self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
-        let body = format!("[Claude Watchers] {}", message);
+        let body = format!("[Claudear] {}", message);
         self.send_sms(&body, None).await
     }
 
@@ -229,7 +223,7 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
         }
 
         let body = format!(
-            "[Claude Watchers] {} urgent issue(s): {}",
+            "[Claudear] {} urgent issue(s): {}",
             issues.len(),
             issues
                 .iter()
@@ -247,7 +241,7 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
         request: &AskRequest,
     ) -> Result<Option<AskDelivery>> {
         let body = format!(
-            "[Claude Watchers][CLAUDEAR-Q:{}] {} needs input: {}",
+            "[Claudear][CLAUDEAR-Q:{}] {} needs input: {}",
             request.correlation_id, issue.short_id, request.question.question
         );
         self.send_sms(&body, Some(issue)).await?;
@@ -701,7 +695,7 @@ mod tests {
         let calls = notifier.http.get_last_calls();
         let body_param = calls[0].3.iter().find(|(k, _)| k == "Body").unwrap();
         // Body should be truncated to 1500 chars + "..."
-        assert!(body_param.1.len() <= 1600); // "[Claude Watchers] " + truncated body
+        assert!(body_param.1.len() <= 1600); // "[Claudear] " + truncated body
         assert!(body_param.1.ends_with("..."));
     }
 
@@ -724,7 +718,7 @@ mod tests {
 
         let calls = notifier.http.get_last_calls();
         let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
-        assert!(body.contains("[Claude Watchers]"));
+        assert!(body.contains("[Claudear]"));
         assert!(body.contains("PR Created"));
         assert!(body.contains("PROJ-123"));
         assert!(body.contains("https://github.com/org/repo/pull/42"));
@@ -804,7 +798,7 @@ mod tests {
 
         let calls = notifier.http.get_last_calls();
         let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
-        assert_eq!(body, "[Claude Watchers] System is healthy");
+        assert_eq!(body, "[Claudear] System is healthy");
     }
 
     #[tokio::test]

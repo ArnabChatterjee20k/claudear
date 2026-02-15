@@ -196,18 +196,18 @@ impl Notifier for EmailNotifier {
     }
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
-        let subject = format!("[Claude Watchers] Processing: {}", issue.short_id);
+        let subject = format!("[Claudear] Processing: {}", issue.short_id);
         let body = format!(
-            "Claude Watchers is now processing an issue.\n\n{}\n\nYou will receive another notification when processing completes.",
+            "Claudear is now processing an issue.\n\n{}\n\nYou will receive another notification when processing completes.",
             Self::format_issue_info(issue)
         );
         self.send_email(&subject, &body, Some(issue)).await
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
-        let subject = format!("[Claude Watchers] PR Created: {}", issue.short_id);
+        let subject = format!("[Claudear] PR Created: {}", issue.short_id);
         let body = format!(
-            "Claude Watchers successfully created a PR!\n\n{}\n\nPR URL: {}",
+            "Claudear successfully created a PR!\n\n{}\n\nPR URL: {}",
             Self::format_issue_info(issue),
             pr_url
         );
@@ -215,18 +215,18 @@ impl Notifier for EmailNotifier {
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
-        let subject = format!("[Claude Watchers] Completed: {}", issue.short_id);
+        let subject = format!("[Claudear] Completed: {}", issue.short_id);
         let body = format!(
-            "Claude Watchers completed processing but no PR URL was captured.\n\n{}",
+            "Claudear completed processing but no PR URL was captured.\n\n{}",
             Self::format_issue_info(issue)
         );
         self.send_email(&subject, &body, Some(issue)).await
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
-        let subject = format!("[Claude Watchers] Failed: {}", issue.short_id);
+        let subject = format!("[Claudear] Failed: {}", issue.short_id);
         let body = format!(
-            "Claude Watchers failed to process an issue.\n\n{}\n\nError: {}",
+            "Claudear failed to process an issue.\n\n{}\n\nError: {}",
             Self::format_issue_info(issue),
             error
         );
@@ -234,7 +234,7 @@ impl Notifier for EmailNotifier {
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
-        let subject = "[Claude Watchers] Status Update".to_string();
+        let subject = "[Claudear] Status Update".to_string();
         self.send_email(&subject, message, None).await
     }
 
@@ -244,7 +244,7 @@ impl Notifier for EmailNotifier {
         }
 
         let subject = format!(
-            "[Claude Watchers] {} Urgent Issue{} Detected",
+            "[Claudear] {} Urgent Issue{} Detected",
             issues.len(),
             if issues.len() > 1 { "s" } else { "" }
         );

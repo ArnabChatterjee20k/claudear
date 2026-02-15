@@ -108,7 +108,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
             )
             .field("Source", &issue.source, true)
             .field("Priority", issue.priority.to_string(), true)
-            .footer("Claude Watchers")
+            .footer("Claudear")
             .timestamp(chrono::Utc::now().to_rfc3339());
 
         let message = self
@@ -174,7 +174,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
             .color(color)
             .field("Reviewer", reviewer, true)
             .field("State", review_state, true)
-            .footer("Claude Watchers")
+            .footer("Claudear")
             .timestamp(chrono::Utc::now().to_rfc3339());
 
         if let Some(review_body) = body {
@@ -227,7 +227,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
             .description(&truncated_comment)
             .color(colors::INFO)
             .field("By", commenter, true)
-            .footer("Claude Watchers")
+            .footer("Claudear")
             .timestamp(chrono::Utc::now().to_rfc3339());
 
         if let Some(path) = file_path {
@@ -265,7 +265,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
             .title("Agent Working")
             .description(task_description)
             .color(colors::INFO)
-            .footer("Claude Watchers")
+            .footer("Claudear")
             .timestamp(chrono::Utc::now().to_rfc3339());
 
         self.client
@@ -301,7 +301,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
             .title("Agent Completed")
             .description("Review feedback has been addressed")
             .color(colors::SUCCESS)
-            .footer("Claude Watchers")
+            .footer("Claudear")
             .timestamp(chrono::Utc::now().to_rfc3339());
 
         if let Some(url) = commit_url {
@@ -343,7 +343,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
             .title("Agent Failed")
             .description(&truncated_error)
             .color(colors::ERROR)
-            .footer("Claude Watchers")
+            .footer("Claudear")
             .timestamp(chrono::Utc::now().to_rfc3339());
 
         self.client
@@ -375,7 +375,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
             .title("PR Merged")
             .description("The pull request has been merged. Issue resolved.")
             .color(colors::SUCCESS)
-            .footer("Claude Watchers")
+            .footer("Claudear")
             .timestamp(chrono::Utc::now().to_rfc3339());
 
         self.client
@@ -418,7 +418,7 @@ impl<H: DiscordHttpClient> ThreadManager<H> {
             .title("PR Closed")
             .description("The pull request was closed without merging.")
             .color(colors::WARNING)
-            .footer("Claude Watchers")
+            .footer("Claudear")
             .timestamp(chrono::Utc::now().to_rfc3339());
 
         self.client
