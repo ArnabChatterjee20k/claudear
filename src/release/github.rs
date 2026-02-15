@@ -3,6 +3,7 @@
 use crate::error::{Error, Result};
 use crate::github::{HttpClient, ReqwestHttpClient};
 use serde::Deserialize;
+use std::cmp::Ordering;
 
 /// A GitHub release.
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +47,104 @@ impl ReleaseClient<ReqwestHttpClient> {
 }
 
 impl<H: HttpClient> ReleaseClient<H> {
+    /// Returns true if a package-lock.json `packages` path maps to a package name.
+    ///
+    /// Matches both direct and nested `node_modules` entries, including scoped packages.
+    fn npm_package_path_matches(path: &str, package_name: &str) -> bool {
+        let target = format!("node_modules/{}", package_name);
+        path == target || path.ends_with(&format!("/{}", target))
+    }
+
+    /// Returns true when a yarn.lock stanza header contains the target package.
+    ///
+    /// Handles both single-descriptor and multi-descriptor headers:
+    /// - `"lodash@^4.17.0":`
+    /// - `"lodash@^4.17.0", "lodash@~4.17.21":`
+    fn yarn_header_matches_package(line: &str, package_name: &str) -> bool {
+        let trimmed = line.trim();
+        if !trimmed.ends_with(':') {
+            return false;
+        }
+
+        let header = trimmed.trim_end_matches(':').trim();
+        header.split(',').any(|descriptor| {
+            let descriptor = descriptor.trim().trim_matches('"').trim_matches('\'');
+            descriptor == package_name || descriptor.starts_with(&format!("{}@", package_name))
+        })
+    }
+
+    /// Split a version string into numeric/text parts for natural fallback comparison.
+    fn split_version_parts(version: &str) -> Vec<VersionPart> {
+        let mut parts = Vec::new();
+        let mut chars = version.chars().peekable();
+
+        while let Some(ch) = chars.peek().copied() {
+            if ch.is_ascii_digit() {
+                let mut token = String::new();
+                while let Some(c) = chars.peek().copied() {
+                    if c.is_ascii_digit() {
+                        token.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                parts.push(VersionPart::Number(token));
+            } else if ch.is_ascii_alphabetic() {
+                let mut token = String::new();
+                while let Some(c) = chars.peek().copied() {
+                    if c.is_ascii_alphabetic() {
+                        token.push(c.to_ascii_lowercase());
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                parts.push(VersionPart::Text(token));
+            } else {
+                chars.next();
+            }
+        }
+
+        parts
+    }
+
+    /// Compare numeric strings without integer overflow.
+    fn compare_numeric_strings(a: &str, b: &str) -> Ordering {
+        let a_trimmed = a.trim_start_matches('0');
+        let b_trimmed = b.trim_start_matches('0');
+        let a_norm = if a_trimmed.is_empty() { "0" } else { a_trimmed };
+        let b_norm = if b_trimmed.is_empty() { "0" } else { b_trimmed };
+
+        match a_norm.len().cmp(&b_norm.len()) {
+            Ordering::Equal => a_norm.cmp(b_norm),
+            ord => ord,
+        }
+    }
+
+    /// Numeric-aware fallback version comparison for non-semver strings.
+    fn compare_relaxed_versions(lock_ver: &str, min_ver: &str) -> Ordering {
+        let lock_parts = Self::split_version_parts(lock_ver);
+        let min_parts = Self::split_version_parts(min_ver);
+
+        for (lock_part, min_part) in lock_parts.iter().zip(min_parts.iter()) {
+            let ord = match (lock_part, min_part) {
+                (VersionPart::Number(a), VersionPart::Number(b)) => {
+                    Self::compare_numeric_strings(a, b)
+                }
+                (VersionPart::Text(a), VersionPart::Text(b)) => a.cmp(b),
+                (VersionPart::Number(_), VersionPart::Text(_)) => Ordering::Greater,
+                (VersionPart::Text(_), VersionPart::Number(_)) => Ordering::Less,
+            };
+
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+
+        lock_parts.len().cmp(&min_parts.len())
+    }
+
     /// Create a new release client with a custom HTTP client.
     pub fn with_http_client(token: impl Into<String>, http: H) -> Self {
         Self {
@@ -407,11 +506,14 @@ impl<H: HttpClient> ReleaseClient<H> {
         let lock: NpmLock = serde_json::from_str(lock_content)
             .map_err(|e| Error::Other(format!("Failed to parse package-lock.json: {}", e)))?;
 
-        // npm v3+ uses "packages" with node_modules/ prefix
+        // npm v3+ uses "packages" with node_modules/ paths (can be nested)
         if let Some(packages) = &lock.packages {
-            let key = format!("node_modules/{}", package_name);
-            if let Some(pkg) = packages.get(&key) {
-                return Self::compare_versions(pkg.version.as_deref(), min_version);
+            for (path, pkg) in packages {
+                if Self::npm_package_path_matches(path, package_name)
+                    && Self::compare_versions(pkg.version.as_deref(), min_version)?
+                {
+                    return Ok(true);
+                }
             }
         }
 
@@ -430,19 +532,16 @@ impl<H: HttpClient> ReleaseClient<H> {
     fn check_yarn_lock(lock_content: &str, package_name: &str, min_version: &str) -> Result<bool> {
         // Yarn lock format:
         // "package-name@^1.0.0":
+        // "package-name@^1.0.0", "package-name@~1.2.0":
         //   version "1.2.3"
         //   ...
-
-        let pattern = format!(r#"^"?{}@[^"]*"?:\s*$"#, regex_lite::escape(package_name));
-        let re = regex_lite::Regex::new(&pattern)
-            .map_err(|e| Error::Other(format!("Invalid regex: {}", e)))?;
 
         let version_re = regex_lite::Regex::new(r#"^\s+version\s+"([^"]+)""#)
             .map_err(|e| Error::Other(format!("Invalid regex: {}", e)))?;
 
         let mut in_package = false;
         for line in lock_content.lines() {
-            if re.is_match(line) {
+            if Self::yarn_header_matches_package(line, package_name) {
                 in_package = true;
                 continue;
             }
@@ -610,14 +709,14 @@ impl<H: HttpClient> ReleaseClient<H> {
                     semver::Version::parse(min_ver),
                 ) {
                     (Ok(lock_semver), Ok(min_semver)) => Ok(lock_semver >= min_semver),
-                    // Fall back to string comparison (may be incorrect for multi-digit segments)
+                    // Fall back to numeric-aware token comparison for non-semver strings.
                     _ => {
                         tracing::warn!(
                             lock_ver = lock_ver,
                             min_ver = min_ver,
-                            "Non-semver version comparison, falling back to lexicographic"
+                            "Non-semver version comparison, using relaxed numeric comparison"
                         );
-                        Ok(lock_ver >= min_ver)
+                        Ok(Self::compare_relaxed_versions(lock_ver, min_ver) != Ordering::Less)
                     }
                 }
             }
@@ -634,6 +733,12 @@ impl<H: HttpClient> ReleaseClient<H> {
     ) -> Result<bool> {
         Self::check_composer_lock(lock_content, package_name, min_version)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VersionPart {
+    Number(String),
+    Text(String),
 }
 
 /// PR details from GitHub API.
@@ -955,6 +1060,25 @@ mod tests {
     }
 
     #[test]
+    fn test_check_npm_lock_nested_package_path() {
+        let lock = r#"{
+            "packages": {
+                "": {"version": "1.0.0"},
+                "node_modules/parent": {"version": "2.0.0"},
+                "node_modules/parent/node_modules/lodash": {"version": "4.17.21"}
+            }
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "package-lock.json",
+            "lodash",
+            "4.17.20"
+        )
+        .unwrap());
+    }
+
+    #[test]
     fn test_check_yarn_lock() {
         let lock = r#"
 "lodash@^4.17.0":
@@ -995,6 +1119,48 @@ mod tests {
             "yarn.lock",
             "nonexistent",
             "1.0.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_check_yarn_lock_multi_descriptor_header() {
+        let lock = r#"
+"lodash@^4.17.0", "lodash@~4.17.10":
+  version "4.17.21"
+  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"
+"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "yarn.lock",
+            "lodash",
+            "4.17.20"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_compare_versions_non_semver_numeric_segments() {
+        let lock = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "1.10"}
+            ]
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "1.2"
+        )
+        .unwrap());
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "1.11"
         )
         .unwrap());
     }
