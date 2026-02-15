@@ -691,7 +691,7 @@ Required environment variables:
 - `CLAUDEAR_E2E_LINEAR_TEAM_ID`
 - `CLAUDEAR_E2E_GITHUB_REPO` (format: `owner/repo`)
 - `CLAUDEAR_E2E_GITHUB_TOKEN`
-- `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`
+- `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (optional if `claude auth status` shows `"loggedIn": true` on the runner/machine)
 
 What this smoke test does:
 
