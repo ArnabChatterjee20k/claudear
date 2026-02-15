@@ -212,11 +212,11 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
 
     /// Find the dependency type from fix repo to target repo.
     /// Returns the type of the first hop in the dependency chain.
-    fn find_dependency_type(&self, fix_repo: &str, _target_repo: &str) -> DependencyType {
-        // Get dependency type from the first hop
+    fn find_dependency_type(&self, fix_repo: &str, target_repo: &str) -> DependencyType {
+        // Get dependency type from the first hop specifically on the path to target_repo.
         self.relationships
             .get_graph()
-            .get_first_hop_dependency_type(fix_repo)
+            .get_first_hop_dependency_type_to_target(fix_repo, target_repo)
             .unwrap_or(DependencyType::Manual)
     }
 
@@ -2953,6 +2953,41 @@ mod tests {
 
         let dep_type = release_tracker.find_dependency_type("submod", "parent");
         assert_eq!(dep_type, DependencyType::GitSubmodule);
+    }
+
+    #[test]
+    fn test_find_dependency_type_uses_target_path_not_first_inserted_edge() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mock = MockHttpClient::new(vec![]);
+        let client = ReleaseClient::with_http_client("test-token", mock);
+
+        let mut relationships = RepoRelationships::new();
+        // Intentionally insert Composer edge first to ensure lookup is target-specific.
+        relationships
+            .add_dependency("fix-lib", "php-app", DependencyType::Composer, None)
+            .unwrap();
+        relationships
+            .add_dependency("fix-lib", "js-app", DependencyType::Npm, None)
+            .unwrap();
+        relationships
+            .add_dependency("php-app", "cloud-php", DependencyType::Manual, None)
+            .unwrap();
+        relationships
+            .add_dependency("js-app", "cloud-js", DependencyType::Manual, None)
+            .unwrap();
+
+        let release_tracker = ReleaseTracker::with_http_client_and_relationships(
+            client,
+            tracker,
+            ReleaseTrackerConfig::default(),
+            relationships,
+        );
+
+        let dep_type_php = release_tracker.find_dependency_type("fix-lib", "cloud-php");
+        assert_eq!(dep_type_php, DependencyType::Composer);
+
+        let dep_type_js = release_tracker.find_dependency_type("fix-lib", "cloud-js");
+        assert_eq!(dep_type_js, DependencyType::Npm);
     }
 
     // Covers: check_watch_release direct release path (fix repo is target)

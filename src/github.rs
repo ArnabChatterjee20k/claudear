@@ -181,6 +181,20 @@ impl GitHubClient<ReqwestHttpClient> {
 }
 
 impl<H: HttpClient> GitHubClient<H> {
+    /// Returns true when `candidate` is at or after `since`.
+    ///
+    /// GitHub timestamps are RFC3339. We parse for timezone-safe ordering and
+    /// fall back to string comparison if parsing fails.
+    fn timestamp_at_or_after(candidate: &str, since: &str) -> bool {
+        match (
+            chrono::DateTime::parse_from_rfc3339(candidate),
+            chrono::DateTime::parse_from_rfc3339(since),
+        ) {
+            (Ok(candidate_dt), Ok(since_dt)) => candidate_dt >= since_dt,
+            _ => candidate >= since,
+        }
+    }
+
     /// Create a new GitHub client with a custom HTTP client.
     pub fn with_http_client(config: GitHubConfig, http: H) -> Self {
         Self { config, http }
@@ -312,7 +326,7 @@ impl<H: HttpClient> GitHubClient<H> {
                 .filter(|r| {
                     r.submitted_at
                         .as_ref()
-                        .map(|t| t.as_str() > since_time)
+                        .map(|t| Self::timestamp_at_or_after(t, since_time))
                         .unwrap_or(false)
                 })
                 .collect())
@@ -333,7 +347,7 @@ impl<H: HttpClient> GitHubClient<H> {
         if let Some(since_time) = since {
             Ok(comments
                 .into_iter()
-                .filter(|c| c.updated_at.as_str() > since_time)
+                .filter(|c| Self::timestamp_at_or_after(&c.updated_at, since_time))
                 .collect())
         } else {
             Ok(comments)
@@ -1016,6 +1030,29 @@ impl<H: HttpClient> ReviewWatcher<H> {
         Ok(events)
     }
 
+    /// Check reviews for a single watched PR.
+    ///
+    /// This is used by webhook handlers to trigger immediate processing for the
+    /// PR that emitted an event, instead of waiting for the next poll cycle.
+    pub async fn check_for_pr(&self, pr_url: &str) -> Result<Vec<ReviewEvent>> {
+        if !self.github.is_enabled() {
+            return Ok(vec![]);
+        }
+
+        let state = {
+            let states = self.states.read().unwrap_or_else(|poisoned| {
+                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+                poisoned.into_inner()
+            });
+            states.get(pr_url).filter(|s| s.is_active).cloned()
+        };
+
+        match state {
+            Some(state) => self.check_pr_reviews(&state).await,
+            None => Ok(vec![]),
+        }
+    }
+
     /// Record a review to the database for analytics.
     fn record_review_to_db(&self, state: &PrReviewState, review: &PrReview) {
         if let Some(ref tracker) = self.tracker {
@@ -1682,6 +1719,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_new_reviews_includes_equal_timestamp_boundary() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"[
+                {"id": 1, "state": "APPROVED", "body": null, "user": {"id": 123, "login": "old"}, "submitted_at": "2024-01-01T11:59:59Z"},
+                {"id": 2, "state": "CHANGES_REQUESTED", "body": null, "user": {"id": 124, "login": "equal"}, "submitted_at": "2024-01-01T12:00:00Z"}
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let reviews = client
+            .get_new_reviews("owner/repo", 1, Some("2024-01-01T12:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].user.login, "equal");
+    }
+
+    #[tokio::test]
+    async fn test_get_new_reviews_filters_timezone_correctly() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"[
+                {"id": 1, "state": "APPROVED", "body": null, "user": {"id": 123, "login": "offset_before"}, "submitted_at": "2024-01-01T10:00:00+02:00"},
+                {"id": 2, "state": "CHANGES_REQUESTED", "body": null, "user": {"id": 124, "login": "after"}, "submitted_at": "2024-01-01T08:45:00Z"}
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let reviews = client
+            .get_new_reviews("owner/repo", 1, Some("2024-01-01T08:30:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].user.login, "after");
+    }
+
+    #[tokio::test]
     async fn test_get_new_reviews_no_filter() {
         let mock = MockHttpClient::new();
         mock.mock_response(
@@ -1735,6 +1832,66 @@ mod tests {
             .unwrap();
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].path, "b.rs");
+    }
+
+    #[tokio::test]
+    async fn test_get_new_review_comments_include_equal_timestamp_boundary() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments",
+            200,
+            r#"[
+                {"id": 1, "path": "a.rs", "body": "old", "user": {"id": 1, "login": "u"}, "created_at": "2024-01-01T11:59:59Z", "updated_at": "2024-01-01T11:59:59Z", "html_url": "url"},
+                {"id": 2, "path": "b.rs", "body": "equal", "user": {"id": 1, "login": "u"}, "created_at": "2024-01-01T12:00:00Z", "updated_at": "2024-01-01T12:00:00Z", "html_url": "url"}
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let comments = client
+            .get_new_review_comments("owner/repo", 1, Some("2024-01-01T12:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].path, "b.rs");
+    }
+
+    #[tokio::test]
+    async fn test_get_new_review_comments_filter_timezone_correctly() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments",
+            200,
+            r#"[
+                {"id": 1, "path": "offset_before.rs", "body": "old", "user": {"id": 1, "login": "u"}, "created_at": "2024-01-01T10:00:00+02:00", "updated_at": "2024-01-01T10:00:00+02:00", "html_url": "url"},
+                {"id": 2, "path": "after.rs", "body": "new", "user": {"id": 1, "login": "u"}, "created_at": "2024-01-01T08:45:00Z", "updated_at": "2024-01-01T08:45:00Z", "html_url": "url"}
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let comments = client
+            .get_new_review_comments("owner/repo", 1, Some("2024-01-01T08:30:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].path, "after.rs");
     }
 
     #[tokio::test]
@@ -1806,6 +1963,90 @@ mod tests {
             }
             _ => panic!("Expected ReviewSubmitted event"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_review_watcher_check_for_single_pr() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"[
+                {"id": 1, "state": "CHANGES_REQUESTED", "body": "Fix this", "user": {"id": 123, "login": "reviewer", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
+            ]"#,
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments",
+            200,
+            "[]",
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/other/pulls/2/reviews",
+            200,
+            r#"[
+                {"id": 2, "state": "APPROVED", "body": null, "user": {"id": 124, "login": "other", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
+            ]"#,
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/other/pulls/2/comments",
+            200,
+            "[]",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let watcher = ReviewWatcher::with_http_client(client);
+
+        watcher.watch_pr(PrReviewState::new(
+            "url-1",
+            "owner/repo",
+            1,
+            "issue-1",
+            "linear",
+        ));
+        watcher.watch_pr(PrReviewState::new(
+            "url-2",
+            "owner/other",
+            2,
+            "issue-2",
+            "linear",
+        ));
+
+        let events = watcher.check_for_pr("url-1").await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].pr_url(), "url-1");
+
+        let requests = watcher.github.http.get_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|(url, _)| url.contains("/repos/owner/repo/pulls/1/")));
+    }
+
+    #[tokio::test]
+    async fn test_review_watcher_check_for_single_pr_unknown_returns_empty() {
+        let mock = MockHttpClient::new();
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let watcher = ReviewWatcher::with_http_client(client);
+
+        let events = watcher.check_for_pr("missing-url").await.unwrap();
+        assert!(events.is_empty());
+        assert!(watcher.github.http.get_requests().is_empty());
     }
 
     #[tokio::test]

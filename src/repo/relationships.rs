@@ -272,6 +272,42 @@ impl DependencyGraph {
             .map(|dep| dep.dep_type)
     }
 
+    /// Get the dependency type of the first hop on a path from `repo` to `target`.
+    ///
+    /// Uses BFS and returns the first-hop dependency type for the first path found.
+    pub fn get_first_hop_dependency_type_to_target(
+        &self,
+        repo: &str,
+        target: &str,
+    ) -> Option<DependencyType> {
+        if repo == target {
+            return None;
+        }
+
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: std::collections::VecDeque<(String, Option<DependencyType>)> =
+            std::collections::VecDeque::new();
+        queue.push_back((repo.to_string(), None));
+
+        while let Some((current, first_hop)) = queue.pop_front() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+
+            if let Some(deps) = self.downstream_deps.get(&current) {
+                for dep in deps {
+                    let next_first_hop = first_hop.or(Some(dep.dep_type));
+                    if dep.downstream == target {
+                        return next_first_hop;
+                    }
+                    queue.push_back((dep.downstream.clone(), next_first_hop));
+                }
+            }
+        }
+
+        None
+    }
+
     /// Get the dependency graph as a printable string.
     pub fn to_string_tree(&self, root: Option<&str>) -> String {
         let mut output = String::new();
@@ -974,6 +1010,37 @@ mod tests {
     fn test_get_first_hop_dependency_type_none() {
         let graph = DependencyGraph::new();
         assert!(graph.get_first_hop_dependency_type("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_get_first_hop_dependency_type_to_target() {
+        let mut manager = RepoRelationships::new();
+        manager
+            .add_dependency("fix", "mid-a", DependencyType::Composer, None)
+            .unwrap();
+        manager
+            .add_dependency("fix", "mid-b", DependencyType::Npm, None)
+            .unwrap();
+        manager
+            .add_dependency("mid-a", "target-a", DependencyType::Manual, None)
+            .unwrap();
+        manager
+            .add_dependency("mid-b", "target-b", DependencyType::Manual, None)
+            .unwrap();
+
+        let graph = manager.get_graph();
+        assert_eq!(
+            graph.get_first_hop_dependency_type_to_target("fix", "target-a"),
+            Some(DependencyType::Composer)
+        );
+        assert_eq!(
+            graph.get_first_hop_dependency_type_to_target("fix", "target-b"),
+            Some(DependencyType::Npm)
+        );
+        assert_eq!(
+            graph.get_first_hop_dependency_type_to_target("fix", "missing"),
+            None
+        );
     }
 
     #[test]

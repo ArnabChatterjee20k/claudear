@@ -241,9 +241,13 @@ impl GitHubWebhookHandler {
             "Received PR review via webhook"
         );
 
-        // TODO: Trigger review processing through ReviewWatcher
-        // For now we just log it - the full integration would call review_watcher methods
-        // to process the review and potentially re-trigger Claude
+        let processed_events = review_watcher.check_for_pr(pr_url).await?;
+        tracing::info!(
+            source = "github",
+            pr_url = %pr_url,
+            events = processed_events.len(),
+            "Processed review webhook through ReviewWatcher"
+        );
 
         Ok(true)
     }
@@ -330,9 +334,13 @@ impl GitHubWebhookHandler {
             "Received PR review comment via webhook"
         );
 
-        // TODO: Trigger comment processing through ReviewWatcher
-        // For now we just log it - the full integration would process comments
-        // and potentially re-trigger Claude with the feedback
+        let processed_events = review_watcher.check_for_pr(pr_url).await?;
+        tracing::info!(
+            source = "github",
+            pr_url = %pr_url,
+            events = processed_events.len(),
+            "Processed review comment webhook through ReviewWatcher"
+        );
 
         Ok(true)
     }
