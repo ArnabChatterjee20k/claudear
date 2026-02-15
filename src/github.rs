@@ -977,6 +977,32 @@ impl<H: HttpClient> ReviewWatcher<H> {
         states.values().cloned().collect()
     }
 
+    fn compare_timestamps(candidate: &str, baseline: &str) -> std::cmp::Ordering {
+        match (
+            chrono::DateTime::parse_from_rfc3339(candidate),
+            chrono::DateTime::parse_from_rfc3339(baseline),
+        ) {
+            (Ok(candidate_dt), Ok(baseline_dt)) => candidate_dt.cmp(&baseline_dt),
+            _ => candidate.cmp(baseline),
+        }
+    }
+
+    fn comment_is_after_cursor(
+        comment: &PrReviewComment,
+        last_comment_time: Option<&str>,
+        last_comment_id: Option<i64>,
+    ) -> bool {
+        let Some(last_time) = last_comment_time else {
+            return true;
+        };
+
+        match Self::compare_timestamps(&comment.updated_at, last_time) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => last_comment_id.map(|id| comment.id > id).unwrap_or(true),
+        }
+    }
+
     /// Check all watched PRs for new reviews.
     pub async fn check_for_reviews(&self) -> Result<Vec<ReviewEvent>> {
         if !self.github.is_enabled() {
@@ -1084,7 +1110,7 @@ impl<H: HttpClient> ReviewWatcher<H> {
         let mut events = Vec::new();
 
         // Check for new reviews
-        let reviews = self
+        let mut reviews = self
             .github
             .get_new_reviews(
                 &state.repo,
@@ -1092,10 +1118,13 @@ impl<H: HttpClient> ReviewWatcher<H> {
                 state.last_review_time.as_deref(),
             )
             .await?;
+        reviews.sort_by_key(|r| r.id);
 
         // Collect review IDs we're processing this cycle so we can
         // attach their inline comments directly to the review event.
         let mut processed_review_ids: Vec<i64> = Vec::new();
+        let mut latest_review_id = state.last_review_id;
+        let mut latest_review_time = state.last_review_time.clone();
 
         for review in reviews {
             // Skip reviews we've already processed
@@ -1128,14 +1157,29 @@ impl<H: HttpClient> ReviewWatcher<H> {
                 inline_comments: Vec::new(), // populated below
             });
 
-            // Update state
+            latest_review_id = Some(latest_review_id.map_or(review.id, |id| id.max(review.id)));
+            if let Some(submitted_at) = review.submitted_at.clone() {
+                let should_update_time = latest_review_time
+                    .as_deref()
+                    .map(|existing| {
+                        GitHubClient::<H>::timestamp_at_or_after(&submitted_at, existing)
+                    })
+                    .unwrap_or(true);
+                if should_update_time {
+                    latest_review_time = Some(submitted_at);
+                }
+            }
+        }
+
+        if latest_review_id != state.last_review_id || latest_review_time != state.last_review_time
+        {
             let mut states = self.states.write().unwrap_or_else(|poisoned| {
                 tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
                 poisoned.into_inner()
             });
             if let Some(s) = states.get_mut(&state.pr_url) {
-                s.last_review_id = Some(review.id);
-                s.last_review_time = review.submitted_at.clone();
+                s.last_review_id = latest_review_id;
+                s.last_review_time = latest_review_time.clone();
 
                 // Persist state update to database
                 if let Some(ref sqlite) = self.sqlite_tracker {
@@ -1164,17 +1208,17 @@ impl<H: HttpClient> ReviewWatcher<H> {
         // Get the review trigger (e.g., "/claudear")
         let trigger = self.github.review_trigger();
 
-        // Filter out comments we've already processed
-        let new_comments: Vec<_> = comments
+        // Cursor comments are all non-bot comments after the current cursor.
+        let cursor_comments: Vec<_> = comments
             .into_iter()
-            .filter(|c| {
-                if let Some(last_id) = state.last_comment_id {
-                    c.id > last_id
-                } else {
-                    true
-                }
-            })
             .filter(|c| c.user.user_type.as_deref() != Some("Bot"))
+            .filter(|c| {
+                Self::comment_is_after_cursor(
+                    c,
+                    state.last_comment_time.as_deref(),
+                    state.last_comment_id,
+                )
+            })
             .collect();
 
         // Attach inline comments to their parent review events (these bypass
@@ -1184,7 +1228,7 @@ impl<H: HttpClient> ReviewWatcher<H> {
         let mut attached_comment_ids: std::collections::HashSet<i64> =
             std::collections::HashSet::new();
 
-        for comment in &new_comments {
+        for comment in &cursor_comments {
             if let Some(review_id) = comment.pull_request_review_id {
                 if processed_review_ids.contains(&review_id) {
                     // Find the matching review event and attach this comment
@@ -1208,8 +1252,8 @@ impl<H: HttpClient> ReviewWatcher<H> {
 
         // Standalone comments: not attached to a review we just processed,
         // must match the trigger filter
-        let standalone_comments: Vec<_> = new_comments
-            .into_iter()
+        let standalone_comments: Vec<_> = cursor_comments
+            .iter()
             .filter(|c| !attached_comment_ids.contains(&c.id))
             .filter(|c| {
                 if trigger.is_empty() {
@@ -1218,16 +1262,10 @@ impl<H: HttpClient> ReviewWatcher<H> {
                     c.body.to_lowercase().contains(&trigger.to_lowercase())
                 }
             })
+            .cloned()
             .collect();
 
-        // Combine all new comments (attached + standalone) for state tracking
-        let all_new_comment_ids: Vec<i64> = attached_comment_ids
-            .iter()
-            .copied()
-            .chain(standalone_comments.iter().map(|c| c.id))
-            .collect();
-
-        if !all_new_comment_ids.is_empty() {
+        if !attached_comment_ids.is_empty() || !standalone_comments.is_empty() {
             // Record all new comments to database
             if let Some(ref sqlite) = self.sqlite_tracker {
                 // Re-collect for recording: attached comments are already in events,
@@ -1263,40 +1301,37 @@ impl<H: HttpClient> ReviewWatcher<H> {
                     }
                 }
             }
+        }
 
-            // Update state with latest comment
-            let max_id = all_new_comment_ids.iter().copied().max().unwrap();
-            let latest_time = {
-                let mut latest: Option<String> = None;
-                for event in &events {
-                    if let ReviewEvent::ReviewSubmitted {
-                        inline_comments, ..
-                    } = event
-                    {
-                        for c in inline_comments {
-                            if c.id == max_id {
-                                latest = Some(c.updated_at.clone());
-                            }
-                        }
-                    }
+        if !cursor_comments.is_empty() {
+            // Update state cursor using all processed comments (including non-trigger comments)
+            // to prevent repeatedly scanning unchanged comments every poll cycle.
+            let mut latest_comment_id = state.last_comment_id;
+            let mut latest_comment_time = state.last_comment_time.clone();
+            for comment in &cursor_comments {
+                let replace = latest_comment_time
+                    .as_deref()
+                    .map(|existing_time| {
+                        let cmp = Self::compare_timestamps(&comment.updated_at, existing_time);
+                        cmp == std::cmp::Ordering::Greater
+                            || (cmp == std::cmp::Ordering::Equal
+                                && comment.id > latest_comment_id.unwrap_or(i64::MIN))
+                    })
+                    .unwrap_or(true);
+
+                if replace {
+                    latest_comment_id = Some(comment.id);
+                    latest_comment_time = Some(comment.updated_at.clone());
                 }
-                if latest.is_none() {
-                    for c in &standalone_comments {
-                        if c.id == max_id {
-                            latest = Some(c.updated_at.clone());
-                        }
-                    }
-                }
-                latest
-            };
+            }
 
             let mut states = self.states.write().unwrap_or_else(|poisoned| {
                 tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
                 poisoned.into_inner()
             });
             if let Some(s) = states.get_mut(&state.pr_url) {
-                s.last_comment_id = Some(max_id);
-                if let Some(t) = latest_time {
+                s.last_comment_id = latest_comment_id;
+                if let Some(t) = latest_comment_time {
                     s.last_comment_time = Some(t);
                 }
 
@@ -2135,6 +2170,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_review_watcher_tracks_max_review_cursor_with_descending_reviews() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"[
+                {"id": 9, "state": "CHANGES_REQUESTED", "body": "latest", "user": {"id": 123, "login": "user-a", "type": "User"}, "submitted_at": "2024-01-02T00:00:00Z"},
+                {"id": 5, "state": "COMMENTED", "body": "older", "user": {"id": 124, "login": "user-b", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
+            ]"#,
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments",
+            200,
+            "[]",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let watcher = ReviewWatcher::with_http_client(client);
+
+        watcher.watch_pr(PrReviewState::new(
+            "url",
+            "owner/repo",
+            1,
+            "issue",
+            "linear",
+        ));
+
+        let events = watcher.check_for_reviews().await.unwrap();
+        assert_eq!(events.len(), 2);
+
+        let updated_state = watcher.get_state("url").unwrap();
+        assert_eq!(updated_state.last_review_id, Some(9));
+        assert_eq!(
+            updated_state.last_review_time.as_deref(),
+            Some("2024-01-02T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_watcher_no_duplicate_events_on_descending_reviews() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"[
+                {"id": 9, "state": "CHANGES_REQUESTED", "body": "latest", "user": {"id": 123, "login": "user-a", "type": "User"}, "submitted_at": "2024-01-02T00:00:00Z"},
+                {"id": 5, "state": "COMMENTED", "body": "older", "user": {"id": 124, "login": "user-b", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
+            ]"#,
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments",
+            200,
+            "[]",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let watcher = ReviewWatcher::with_http_client(client);
+
+        watcher.watch_pr(PrReviewState::new(
+            "url",
+            "owner/repo",
+            1,
+            "issue",
+            "linear",
+        ));
+
+        let first = watcher.check_for_reviews().await.unwrap();
+        assert_eq!(first.len(), 2);
+
+        let second = watcher.check_for_reviews().await.unwrap();
+        assert!(
+            second.is_empty(),
+            "second poll should not emit duplicate review events"
+        );
+    }
+
+    #[tokio::test]
     async fn test_review_watcher_comments_added_event() {
         let mock = MockHttpClient::new();
         mock.mock_response(
@@ -2173,6 +2301,116 @@ mod tests {
             }
             _ => panic!("Expected CommentsAdded event"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_review_watcher_advances_comment_cursor_without_trigger() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            "[]",
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments",
+            200,
+            r#"[
+                {"id": 1, "path": "file.rs", "body": "plain comment", "user": {"id": 123, "login": "user", "type": "User"}, "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z", "html_url": "url"}
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let watcher = ReviewWatcher::with_http_client(client);
+
+        watcher.watch_pr(PrReviewState::new(
+            "url",
+            "owner/repo",
+            1,
+            "issue",
+            "linear",
+        ));
+
+        let events = watcher.check_for_reviews().await.unwrap();
+        assert!(events.is_empty());
+
+        let updated_state = watcher.get_state("url").unwrap();
+        assert_eq!(updated_state.last_comment_id, Some(1));
+        assert_eq!(
+            updated_state.last_comment_time.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_watcher_processes_comment_edit_after_cursor_advance() {
+        let mock = MockHttpClient::new();
+        let reviews_url = "https://api.github.com/repos/owner/repo/pulls/1/reviews";
+        let comments_url = "https://api.github.com/repos/owner/repo/pulls/1/comments";
+
+        mock.mock_response(reviews_url, 200, "[]");
+        mock.mock_response(
+            comments_url,
+            200,
+            r#"[
+                {"id": 1, "path": "file.rs", "body": "plain comment", "user": {"id": 123, "login": "user", "type": "User"}, "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z", "html_url": "url"}
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let watcher = ReviewWatcher::with_http_client(client);
+
+        watcher.watch_pr(PrReviewState::new(
+            "url",
+            "owner/repo",
+            1,
+            "issue",
+            "linear",
+        ));
+
+        let first = watcher.check_for_reviews().await.unwrap();
+        assert!(first.is_empty());
+
+        // Same comment ID, newer timestamp, now containing trigger.
+        watcher.github.http.mock_response(
+            comments_url,
+            200,
+            r#"[
+                {"id": 1, "path": "file.rs", "body": "/claudear please re-run", "user": {"id": 123, "login": "user", "type": "User"}, "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:01:00Z", "html_url": "url"}
+            ]"#,
+        );
+
+        let second = watcher.check_for_reviews().await.unwrap();
+        assert_eq!(second.len(), 1);
+        match &second[0] {
+            ReviewEvent::CommentsAdded { comments, .. } => {
+                assert_eq!(comments.len(), 1);
+                assert_eq!(comments[0].body, "/claudear please re-run");
+            }
+            _ => panic!("Expected CommentsAdded event"),
+        }
+
+        let updated_state = watcher.get_state("url").unwrap();
+        assert_eq!(updated_state.last_comment_id, Some(1));
+        assert_eq!(
+            updated_state.last_comment_time.as_deref(),
+            Some("2024-01-01T00:01:00Z")
+        );
     }
 
     #[tokio::test]
