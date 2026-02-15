@@ -274,7 +274,14 @@ impl Watcher {
 
     /// Start the watcher with polling.
     pub async fn start(&self, interval_ms: Option<u64>) -> Result<()> {
-        let poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
+        let configured_poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
+        let poll_interval = configured_poll_interval.max(1);
+        if configured_poll_interval == 0 {
+            tracing::warn!(
+                component = "watcher",
+                "Poll interval evaluated to 0ms, clamping to 1ms to avoid timer panic"
+            );
+        }
 
         tracing::info!("");
         tracing::info!(
@@ -3795,6 +3802,32 @@ mod tests {
             mock_source.issue_status_call_count(),
             0,
             "dry_run should not call get_issue_status via auto-close checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_watcher_start_zero_interval_clamped_without_panic() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("mock")) as Arc<dyn IssueSource>;
+        let watcher = Arc::new(create_test_watcher(notifier, tracker, vec![source], true));
+
+        let runner = {
+            let watcher = Arc::clone(&watcher);
+            tokio::spawn(async move { watcher.start(Some(0)).await })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        watcher.stop();
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), runner).await;
+        assert!(
+            joined.is_ok(),
+            "watcher start loop timed out with zero interval"
+        );
+        assert!(
+            joined.unwrap().expect("task join failed").is_ok(),
+            "watcher returned an error with zero interval"
         );
     }
 

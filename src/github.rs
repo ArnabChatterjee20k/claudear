@@ -243,22 +243,48 @@ impl<H: HttpClient> GitHubClient<H> {
             .as_ref()
             .ok_or_else(|| Error::config("GitHub token not configured"))?;
 
-        let url = format!(
+        let base_url = format!(
             "https://api.github.com/repos/{}/pulls/{}/reviews",
             repo, pr_number
         );
         let headers = self.build_headers(token);
 
-        let response = self.http.get(&url, headers).await?;
+        let mut all_reviews = Vec::new();
+        let mut page = 1usize;
+        const DEFAULT_PAGE_SIZE: usize = 30;
+        const MAX_PAGES: usize = 100;
 
-        if !response.is_success() {
-            return Err(Error::Other(format!(
-                "GitHub API error ({}): {}",
-                response.status, response.body
-            )));
+        loop {
+            let url = if page == 1 {
+                base_url.clone()
+            } else {
+                format!("{}?page={}", base_url, page)
+            };
+            let response = self.http.get(&url, headers.clone()).await?;
+
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "GitHub API error ({}): {}",
+                    response.status, response.body
+                )));
+            }
+
+            let reviews: Vec<PrReview> = response.json()?;
+            let count = reviews.len();
+            all_reviews.extend(reviews);
+
+            if count < DEFAULT_PAGE_SIZE {
+                break;
+            }
+
+            page += 1;
+            if page > MAX_PAGES {
+                tracing::warn!(repo = %repo, pr_number, "Hit pagination limit for PR reviews");
+                break;
+            }
         }
 
-        response.json()
+        Ok(all_reviews)
     }
 
     /// Get review comments for a PR.
@@ -273,22 +299,48 @@ impl<H: HttpClient> GitHubClient<H> {
             .as_ref()
             .ok_or_else(|| Error::config("GitHub token not configured"))?;
 
-        let url = format!(
+        let base_url = format!(
             "https://api.github.com/repos/{}/pulls/{}/comments",
             repo, pr_number
         );
         let headers = self.build_headers(token);
 
-        let response = self.http.get(&url, headers).await?;
+        let mut all_comments = Vec::new();
+        let mut page = 1usize;
+        const DEFAULT_PAGE_SIZE: usize = 30;
+        const MAX_PAGES: usize = 100;
 
-        if !response.is_success() {
-            return Err(Error::Other(format!(
-                "GitHub API error ({}): {}",
-                response.status, response.body
-            )));
+        loop {
+            let url = if page == 1 {
+                base_url.clone()
+            } else {
+                format!("{}?page={}", base_url, page)
+            };
+            let response = self.http.get(&url, headers.clone()).await?;
+
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "GitHub API error ({}): {}",
+                    response.status, response.body
+                )));
+            }
+
+            let comments: Vec<PrReviewComment> = response.json()?;
+            let count = comments.len();
+            all_comments.extend(comments);
+
+            if count < DEFAULT_PAGE_SIZE {
+                break;
+            }
+
+            page += 1;
+            if page > MAX_PAGES {
+                tracing::warn!(repo = %repo, pr_number, "Hit pagination limit for PR review comments");
+                break;
+            }
         }
 
-        response.json()
+        Ok(all_comments)
     }
 
     /// Get reviews for a PR that haven't been processed yet.
@@ -895,23 +947,40 @@ impl<H: HttpClient> ReviewWatcher<H> {
 
     /// Start watching a PR for reviews.
     pub fn watch_pr(&self, state: PrReviewState) {
-        // Persist to database first if sqlite_tracker is available
+        let mut merged_state = state;
+        let mut states = self.states.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        // Preserve existing review/comment cursors when a PR is re-registered.
+        // This prevents replaying the full review history on subsequent poll cycles.
+        if let Some(existing) = states.get(&merged_state.pr_url) {
+            merged_state.last_review_id = merged_state.last_review_id.or(existing.last_review_id);
+            if merged_state.last_review_time.is_none() {
+                merged_state.last_review_time = existing.last_review_time.clone();
+            }
+            merged_state.last_comment_id =
+                merged_state.last_comment_id.or(existing.last_comment_id);
+            if merged_state.last_comment_time.is_none() {
+                merged_state.last_comment_time = existing.last_comment_time.clone();
+            }
+        }
+        merged_state.is_active = true;
+        states.insert(merged_state.pr_url.clone(), merged_state.clone());
+        drop(states);
+
+        // Persist merged state if sqlite_tracker is available
         if let Some(ref sqlite) = self.sqlite_tracker {
-            if let Err(e) = sqlite.save_pr_review_state(&state) {
+            if let Err(e) = sqlite.save_pr_review_state(&merged_state) {
                 tracing::warn!(
                     component = "review_watcher",
-                    pr_url = %state.pr_url,
+                    pr_url = %merged_state.pr_url,
                     error = %e,
                     "Failed to persist PR review state to database"
                 );
             }
         }
-
-        let mut states = self.states.write().unwrap_or_else(|poisoned| {
-            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-            poisoned.into_inner()
-        });
-        states.insert(state.pr_url.clone(), state);
     }
 
     /// Stop watching a PR.
@@ -1643,6 +1712,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_new_reviews_reads_additional_pages() {
+        let mock = MockHttpClient::new();
+
+        let first_page_reviews = (1..=30)
+            .map(|id| {
+                format!(
+                    r#"{{"id": {id}, "state": "APPROVED", "body": null, "user": {{"id": {id}, "login": "user-{id}", "type": "User"}}, "submitted_at": "2024-01-01T00:{:02}:00Z"}}"#,
+                    id - 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            format!("[{}]", first_page_reviews),
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews?page=2",
+            200,
+            r#"[
+                {"id": 31, "state": "CHANGES_REQUESTED", "body": "latest", "user": {"id": 131, "login": "latest-user", "type": "User"}, "submitted_at": "2024-01-01T01:00:00Z"}
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let reviews = client
+            .get_new_reviews("owner/repo", 1, Some("2024-01-01T00:30:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].id, 31);
+
+        let requests = client.http.get_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].0,
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews?page=2"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_pr_reviews_api_error() {
         let mock = MockHttpClient::new();
         mock.mock_response(
@@ -1700,6 +1820,58 @@ mod tests {
             .unwrap();
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].path, "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn test_get_new_review_comments_reads_additional_pages() {
+        let mock = MockHttpClient::new();
+
+        let first_page_comments = (1..=30)
+            .map(|id| {
+                format!(
+                    r#"{{"id": {id}, "path": "file-{id}.rs", "body": "older", "user": {{"id": {id}, "login": "user-{id}", "type": "User"}}, "created_at": "2024-01-01T00:{:02}:00Z", "updated_at": "2024-01-01T00:{:02}:00Z", "html_url": "url-{id}"}}"#,
+                    id - 1,
+                    id - 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments",
+            200,
+            format!("[{}]", first_page_comments),
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments?page=2",
+            200,
+            r#"[
+                {"id": 31, "path": "new.rs", "body": "new comment", "user": {"id": 231, "login": "latest-user", "type": "User"}, "created_at": "2024-01-01T01:00:00Z", "updated_at": "2024-01-01T01:00:00Z", "html_url": "url-31"}
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let comments = client
+            .get_new_review_comments("owner/repo", 1, Some("2024-01-01T00:30:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, 31);
+
+        let requests = client.http.get_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].0,
+            "https://api.github.com/repos/owner/repo/pulls/1/comments?page=2"
+        );
     }
 
     #[tokio::test]
@@ -2652,6 +2824,96 @@ mod tests {
         let after_unwatch = watcher.get_state("url");
         assert!(after_unwatch.is_some());
         assert!(!after_unwatch.unwrap().is_active);
+    }
+
+    #[test]
+    fn test_review_watcher_watch_pr_preserves_existing_cursors() {
+        let config = GitHubConfig {
+            token: Some("test".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::new(config);
+        let watcher = ReviewWatcher::new(client);
+
+        let mut existing = PrReviewState::new("url", "repo", 1, "issue", "linear");
+        existing.last_review_id = Some(42);
+        existing.last_review_time = Some("2024-01-01T00:00:00Z".to_string());
+        existing.last_comment_id = Some(64);
+        existing.last_comment_time = Some("2024-01-01T01:00:00Z".to_string());
+        watcher.watch_pr(existing);
+
+        // Re-registering the same PR should not reset cursor state.
+        watcher.watch_pr(PrReviewState::new("url", "repo", 1, "issue", "linear"));
+
+        let state = watcher.get_state("url").unwrap();
+        assert_eq!(state.last_review_id, Some(42));
+        assert_eq!(
+            state.last_review_time.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+        assert_eq!(state.last_comment_id, Some(64));
+        assert_eq!(
+            state.last_comment_time.as_deref(),
+            Some("2024-01-01T01:00:00Z")
+        );
+        assert!(state.is_active);
+    }
+
+    #[tokio::test]
+    async fn test_review_watcher_rewatch_does_not_replay_processed_reviews() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"[
+                {"id": 1, "state": "CHANGES_REQUESTED", "body": "Fix this", "user": {"id": 123, "login": "reviewer", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
+            ]"#,
+        );
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/comments",
+            200,
+            "[]",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let watcher = ReviewWatcher::with_http_client(client);
+
+        watcher.watch_pr(PrReviewState::new(
+            "url",
+            "owner/repo",
+            1,
+            "issue",
+            "linear",
+        ));
+
+        let first = watcher.check_for_reviews().await.unwrap();
+        assert_eq!(first.len(), 1);
+
+        // Simulate re-registration from a later successful rerun on the same PR URL.
+        watcher.watch_pr(PrReviewState::new(
+            "url",
+            "owner/repo",
+            1,
+            "issue",
+            "linear",
+        ));
+        let second = watcher.check_for_reviews().await.unwrap();
+        assert!(
+            second.is_empty(),
+            "re-watching should preserve cursor state and avoid replay"
+        );
     }
 
     #[test]

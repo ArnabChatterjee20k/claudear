@@ -723,7 +723,14 @@ fn start_regression_monitoring(
         scheduler_config.clone(),
     );
 
-    let check_interval_hours = scheduler_config.check_interval_hours;
+    let configured_check_interval_hours = scheduler_config.check_interval_hours;
+    let check_interval_hours = configured_check_interval_hours.max(1);
+    if configured_check_interval_hours == 0 {
+        tracing::warn!(
+            component = "regression_monitor",
+            "check_interval_hours evaluated to 0, clamping to 1 hour to avoid timer panic"
+        );
+    }
 
     // Create retry manager for triggering retries on regression
     let retry_manager = RetryManager::new(config.retry.clone(), tracker.clone());
@@ -2039,13 +2046,21 @@ async fn main() -> anyhow::Result<()> {
 
         if continuous {
             tracing::info!("Starting PR monitor (continuous mode)...");
-            tracing::info!("  Poll interval: {}ms", config.github.poll_interval_ms);
+            let configured_poll_interval_ms = config.github.poll_interval_ms;
+            let poll_interval_ms = configured_poll_interval_ms.max(1);
+            if configured_poll_interval_ms == 0 {
+                tracing::warn!(
+                    component = "pr_monitor",
+                    "poll_interval_ms evaluated to 0, clamping to 1ms to avoid timer panic"
+                );
+            }
+            tracing::info!("  Poll interval: {}ms", poll_interval_ms);
             tracing::info!(
                 "  Auto-resolve on merge: {}",
                 config.github.auto_resolve_on_merge
             );
 
-            let mut poll_timer = interval(Duration::from_millis(config.github.poll_interval_ms));
+            let mut poll_timer = interval(Duration::from_millis(poll_interval_ms));
 
             let shutdown = async {
                 tokio::signal::ctrl_c()
