@@ -1378,9 +1378,19 @@ Create a PR with your changes."#,
 
         // Filter and match criteria
         let mut candidates: Vec<(Issue, MatchResult)> = Vec::new();
+        let mut seen_issue_ids = HashSet::new();
 
         let processing = self.processing.read().await;
         for issue in issues {
+            if !seen_issue_ids.insert(issue.id.clone()) {
+                tracing::debug!(
+                    source = source.name(),
+                    issue_id = %issue.id,
+                    "Skipping duplicate issue in poll payload"
+                );
+                continue;
+            }
+
             // Skip if already attempted
             if attempted_ids.contains(&issue.id) {
                 continue;
@@ -1500,7 +1510,13 @@ Create a PR with your changes."#,
             .collect();
 
         if !urgent_issues.is_empty() {
-            self.notifier.notify_urgent_issues(&urgent_issues).await?;
+            if let Err(e) = self.notifier.notify_urgent_issues(&urgent_issues).await {
+                tracing::warn!(
+                    source = source.name(),
+                    error = %e,
+                    "Failed to send urgent issue notification"
+                );
+            }
         }
 
         // Process issues with rate limiting (per-source concurrency limit)
@@ -2464,6 +2480,7 @@ mod tests {
     struct MockNotifier {
         enabled: bool,
         call_count: AtomicUsize,
+        fail_urgent_notify: bool,
     }
 
     impl MockNotifier {
@@ -2471,6 +2488,15 @@ mod tests {
             Self {
                 enabled,
                 call_count: AtomicUsize::new(0),
+                fail_urgent_notify: false,
+            }
+        }
+
+        fn with_urgent_failure(enabled: bool) -> Self {
+            Self {
+                enabled,
+                call_count: AtomicUsize::new(0),
+                fail_urgent_notify: true,
             }
         }
 
@@ -2508,6 +2534,12 @@ mod tests {
             Ok(())
         }
         async fn notify_urgent_issues(&self, _issues: &[Issue]) -> Result<()> {
+            if self.fail_urgent_notify {
+                return Err(crate::error::Error::notifier(
+                    "mock",
+                    "urgent notify failed",
+                ));
+            }
             self.call_count.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(())
         }
@@ -2525,6 +2557,7 @@ mod tests {
     struct MockSource {
         name: String,
         issues: Vec<Issue>,
+        match_priority: MatchPriority,
     }
 
     impl MockSource {
@@ -2532,6 +2565,7 @@ mod tests {
             Self {
                 name: name.to_string(),
                 issues: vec![],
+                match_priority: MatchPriority::Normal,
             }
         }
 
@@ -2539,6 +2573,15 @@ mod tests {
             Self {
                 name: name.to_string(),
                 issues,
+                match_priority: MatchPriority::Normal,
+            }
+        }
+
+        fn with_priority(name: &str, issues: Vec<Issue>, match_priority: MatchPriority) -> Self {
+            Self {
+                name: name.to_string(),
+                issues,
+                match_priority,
             }
         }
     }
@@ -2555,7 +2598,7 @@ mod tests {
             Ok(self.issues.clone())
         }
         fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
-            MatchResult::matched("Mock match", MatchPriority::Normal)
+            MatchResult::matched("Mock match", self.match_priority)
         }
         async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
             Ok(format!("Context for {}", issue.short_id))
@@ -3399,6 +3442,65 @@ mod tests {
         // In dry run mode, issues are NOT recorded (just logged)
         assert!(!tracker.has_attempted("test", "1"));
         assert!(!tracker.has_attempted("test", "2"));
+    }
+
+    #[tokio::test]
+    async fn test_watcher_poll_source_deduplicates_duplicate_issue_ids() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issues = vec![
+            Issue::new("1", "T-1", "Issue 1", "http://example.com/1", "test"),
+            Issue::new(
+                "1",
+                "T-1",
+                "Issue 1 duplicate",
+                "http://example.com/1",
+                "test",
+            ),
+        ];
+        let source = Arc::new(MockSource::with_issues("test", issues)) as Arc<dyn IssueSource>;
+        let sources = vec![source.clone()];
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), sources, true); // dry run
+
+        watcher.poll_source(&source).await.unwrap();
+
+        let matched = tracker.get_metrics("issues_matched", None, 10).unwrap();
+        let queued = tracker.get_metrics("issues_queued", None, 10).unwrap();
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(matched[0].metric_value, 1.0);
+        assert_eq!(queued[0].metric_value, 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_watcher_poll_source_continues_when_urgent_notification_fails() {
+        let notifier = Arc::new(MockNotifier::with_urgent_failure(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let source = Arc::new(MockSource::with_priority(
+            "urgent",
+            vec![Issue::new(
+                "1",
+                "URGENT-1",
+                "Urgent issue",
+                "http://example.com/urgent/1",
+                "urgent",
+            )],
+            MatchPriority::Urgent,
+        )) as Arc<dyn IssueSource>;
+        let sources = vec![source.clone()];
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), sources, false);
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        let result = watcher.poll_source(&source).await;
+        assert!(result.is_ok());
+
+        let attempt = tracker.get_attempt("urgent", "1").unwrap().unwrap();
+        assert_eq!(attempt.status, crate::types::FixAttemptStatus::Failed);
     }
 
     #[tokio::test]
