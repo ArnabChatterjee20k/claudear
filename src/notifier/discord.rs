@@ -2,7 +2,7 @@
 
 use super::Notifier;
 use crate::config::DiscordConfig;
-use crate::discord::DiscordClient;
+use crate::discord::{CreateMessageParams, DiscordClient, MessageEmbed};
 use crate::error::{Error, Result};
 use crate::http::HttpResponse;
 use crate::types::{AskDelivery, AskReply, AskRequest, Issue};
@@ -149,22 +149,89 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     }
 
     async fn send(&self, message: DiscordMessage) -> Result<()> {
-        let webhook_url = match &self.config.webhook_url {
-            Some(url) => url,
-            None => return Ok(()),
-        };
+        if let Some(ref webhook_url) = self.config.webhook_url {
+            let body = serde_json::to_value(&message)?;
+            let response = self.http.post_json(webhook_url, &body).await?;
 
-        let body = serde_json::to_value(&message)?;
-        let response = self.http.post_json(webhook_url, &body).await?;
+            if response.status < 200 || response.status >= 300 {
+                return Err(Error::notifier(
+                    "discord",
+                    format!("Webhook error: {}", response.body),
+                ));
+            }
 
-        if response.status < 200 || response.status >= 300 {
-            return Err(Error::notifier(
-                "discord",
-                format!("Webhook error: {}", response.body),
-            ));
+            return Ok(());
+        }
+
+        if self.has_bot_channel() {
+            let bot_token = self.config.bot_token.as_ref().unwrap();
+            let channel_id = self.config.channel_id.as_ref().unwrap();
+            let params = Self::to_create_message_params(&message);
+            let client = DiscordClient::new(bot_token.clone())?;
+            client.send_message(channel_id, params).await?;
         }
 
         Ok(())
+    }
+
+    fn has_bot_channel(&self) -> bool {
+        self.config
+            .bot_token
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+            && self
+                .config
+                .channel_id
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+    }
+
+    fn to_create_message_params(msg: &DiscordMessage) -> CreateMessageParams {
+        let content = msg.content.clone().unwrap_or_default();
+        let embeds = msg.embeds.as_ref().map(|embeds| {
+            embeds
+                .iter()
+                .map(|e| {
+                    let mut embed = MessageEmbed::new();
+                    if let Some(ref title) = e.title {
+                        embed = embed.title(title.clone());
+                    }
+                    if let Some(ref description) = e.description {
+                        embed = embed.description(description.clone());
+                    }
+                    if let Some(ref url) = e.url {
+                        embed = embed.url(url.clone());
+                    }
+                    if let Some(color) = e.color {
+                        embed = embed.color(color);
+                    }
+                    if let Some(ref fields) = e.fields {
+                        for f in fields {
+                            embed = embed.field(&f.name, &f.value, f.inline.unwrap_or(false));
+                        }
+                    }
+                    if let Some(ref footer) = e.footer {
+                        embed = embed.footer(&footer.text);
+                    }
+                    if let Some(ref ts) = e.timestamp {
+                        embed = embed.timestamp(ts.clone());
+                    }
+                    embed
+                })
+                .collect()
+        });
+
+        CreateMessageParams {
+            content: if content.len() > 2000 {
+                format!("{}...", &content[..content.floor_char_boundary(1997)])
+            } else {
+                content
+            },
+            tts: None,
+            embeds,
+        }
     }
 
     fn get_user_mention(&self) -> Option<String> {
@@ -499,7 +566,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     }
 
     fn is_enabled(&self) -> bool {
-        self.config.webhook_url.is_some()
+        self.config.webhook_url.is_some() || self.has_bot_channel()
     }
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
@@ -625,17 +692,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     }
 
     fn supports_replies(&self) -> bool {
-        self.config
-            .bot_token
-            .as_ref()
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-            && self
-                .config
-                .channel_id
-                .as_ref()
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
+        self.has_bot_channel()
     }
 }
 
@@ -690,6 +747,54 @@ mod tests {
             ..Default::default()
         };
         let notifier = DiscordNotifier::new(disabled_config, empty_registry());
+        assert!(!notifier.is_enabled());
+    }
+
+    #[test]
+    fn test_is_enabled_with_bot_channel_only() {
+        let config = DiscordConfig {
+            webhook_url: None,
+            user_id: None,
+            bot_token: Some("bot-token".to_string()),
+            channel_id: Some("channel-123".to_string()),
+        };
+        let notifier = DiscordNotifier::new(config, empty_registry());
+        assert!(notifier.is_enabled());
+    }
+
+    #[test]
+    fn test_is_enabled_false_with_only_bot_token() {
+        let config = DiscordConfig {
+            webhook_url: None,
+            user_id: None,
+            bot_token: Some("bot-token".to_string()),
+            channel_id: None,
+        };
+        let notifier = DiscordNotifier::new(config, empty_registry());
+        assert!(!notifier.is_enabled());
+    }
+
+    #[test]
+    fn test_is_enabled_false_with_only_channel_id() {
+        let config = DiscordConfig {
+            webhook_url: None,
+            user_id: None,
+            bot_token: None,
+            channel_id: Some("channel-123".to_string()),
+        };
+        let notifier = DiscordNotifier::new(config, empty_registry());
+        assert!(!notifier.is_enabled());
+    }
+
+    #[test]
+    fn test_is_enabled_false_with_empty_bot_token() {
+        let config = DiscordConfig {
+            webhook_url: None,
+            user_id: None,
+            bot_token: Some("".to_string()),
+            channel_id: Some("channel-123".to_string()),
+        };
+        let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(!notifier.is_enabled());
     }
 
@@ -3294,5 +3399,85 @@ mod tests {
         let content = msg.content.as_ref().unwrap();
         assert!(content.contains("Context:"));
         assert!(content.contains("..."));
+    }
+
+    #[test]
+    fn test_to_create_message_params_preserves_content() {
+        let msg = DiscordMessage {
+            content: Some("Hello world".to_string()),
+            embeds: None,
+        };
+        let params = DiscordNotifier::<MockDiscordWebhookClient>::to_create_message_params(&msg);
+        assert_eq!(params.content, "Hello world");
+        assert!(params.embeds.is_none());
+    }
+
+    #[test]
+    fn test_to_create_message_params_defaults_empty_content() {
+        let msg = DiscordMessage {
+            content: None,
+            embeds: None,
+        };
+        let params = DiscordNotifier::<MockDiscordWebhookClient>::to_create_message_params(&msg);
+        assert_eq!(params.content, "");
+    }
+
+    #[test]
+    fn test_to_create_message_params_preserves_embeds() {
+        let msg = DiscordMessage {
+            content: Some("text".to_string()),
+            embeds: Some(vec![DiscordEmbed {
+                title: Some("My Title".to_string()),
+                description: Some("My Desc".to_string()),
+                url: Some("https://example.com".to_string()),
+                color: Some(0xFF0000),
+                fields: Some(vec![DiscordField {
+                    name: "Field1".to_string(),
+                    value: "Value1".to_string(),
+                    inline: Some(true),
+                }]),
+                footer: Some(DiscordFooter {
+                    text: "Footer".to_string(),
+                }),
+                timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            }]),
+        };
+        let params = DiscordNotifier::<MockDiscordWebhookClient>::to_create_message_params(&msg);
+        assert_eq!(params.content, "text");
+
+        let embeds = params.embeds.unwrap();
+        assert_eq!(embeds.len(), 1);
+        let embed = &embeds[0];
+        assert_eq!(embed.title.as_deref(), Some("My Title"));
+        assert_eq!(embed.description.as_deref(), Some("My Desc"));
+        assert_eq!(embed.url.as_deref(), Some("https://example.com"));
+        assert_eq!(embed.color, Some(0xFF0000));
+        let fields = embed.fields.as_ref().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "Field1");
+        assert_eq!(fields[0].value, "Value1");
+        assert_eq!(fields[0].inline, Some(true));
+        assert_eq!(embed.footer.as_ref().unwrap().text, "Footer");
+        assert_eq!(embed.timestamp.as_deref(), Some("2024-01-01T00:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn test_send_prefers_webhook_when_both_configured() {
+        let mock = MockDiscordWebhookClient::success();
+        let config = DiscordConfig {
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            user_id: None,
+            bot_token: Some("bot-token".to_string()),
+            channel_id: Some("channel-123".to_string()),
+        };
+        let notifier = DiscordNotifier::with_http_client(config, mock);
+        let issue = Issue::new("1", "P-1", "Test", "https://example.com", "linear");
+
+        notifier.notify_start(&issue).await.unwrap();
+
+        // Should have used the webhook (mock was called), not the bot API
+        assert_eq!(notifier.http.get_call_count(), 1);
+        let (url, _) = notifier.http.get_last_call().unwrap();
+        assert_eq!(url, "https://discord.com/api/webhooks/123/abc");
     }
 }

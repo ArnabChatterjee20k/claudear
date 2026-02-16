@@ -576,11 +576,9 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
     composite.add(Arc::new(ConsoleNotifier::new()));
 
     // Add Discord if configured
-    if config.discord.webhook_url.is_some() {
-        composite.add(Arc::new(DiscordNotifier::new(
-            config.discord.clone(),
-            user_registry.clone(),
-        )));
+    let discord_notifier = DiscordNotifier::new(config.discord.clone(), user_registry.clone());
+    if discord_notifier.is_enabled() {
+        composite.add(Arc::new(discord_notifier));
         tracing::info!("Discord notifier enabled");
     }
 
