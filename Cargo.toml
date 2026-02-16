@@ -87,7 +87,7 @@ base64 = "0.22"
 semver = "1"
 
 # Authentication
-bcrypt = "0.17"
+bcrypt = "0.18"
 tower-cookies = "0.11"
 
 # Email (SMTP)
