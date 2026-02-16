@@ -199,7 +199,21 @@ impl WebhookServer {
             )
             .with_state(state.clone());
 
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
+        let addr = format!("0.0.0.0:{}", self.port);
+        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied && self.port < 1024 {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Cannot bind to port {} (privileged ports < 1024 require root). \
+                         Use a port >= 1024 or run with elevated privileges.",
+                        self.port
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
 
         tracing::info!(port = self.port, "Webhook server listening");
         tracing::info!(

@@ -103,13 +103,16 @@ pub fn create_api_router_with_dashboard(
         )
         .with_state(state);
 
-    // If dashboard directory is provided, serve static files
+    // If dashboard directory is provided, serve from filesystem (development override)
     if let Some(dashboard_path) = dashboard_dir {
         let index_file = dashboard_path.join("index.html");
         let serve_dir =
             ServeDir::new(&dashboard_path).not_found_service(ServeFile::new(&index_file));
 
         api_routes.fallback_service(serve_dir)
+    } else if super::embedded::has_dashboard() {
+        // Serve the embedded dashboard compiled into the binary
+        api_routes.fallback_service(tower::service_fn(super::embedded::embedded_fallback))
     } else {
         api_routes
     }

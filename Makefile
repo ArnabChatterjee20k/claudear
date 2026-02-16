@@ -30,8 +30,8 @@ all: build
 build:
 	$(CARGO) build
 
-## build-release: Build the CLI in release mode (optimized)
-build-release:
+## build-release: Build the CLI in release mode with embedded dashboard
+build-release: dashboard-build
 	$(CARGO) build --release
 
 ## install: Install the CLI to /usr/local/bin (requires sudo)

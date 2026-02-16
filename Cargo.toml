@@ -86,6 +86,10 @@ base64 = "0.22"
 # Semantic versioning
 semver = "1"
 
+# Embedded dashboard
+rust-embed = "8.5"
+mime_guess = "2.0"
+
 # Authentication
 bcrypt = "0.18"
 tower-cookies = "0.11"

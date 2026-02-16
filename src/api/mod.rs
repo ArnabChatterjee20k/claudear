@@ -3,6 +3,7 @@
 //! Provides REST API for the analytics dashboard.
 
 pub mod auth;
+pub(crate) mod embedded;
 mod routes;
 
 pub use routes::{create_api_router, create_api_router_with_dashboard};
@@ -99,13 +100,37 @@ impl ApiServer {
         .layer(cors)
         .layer(CookieManagerLayer::new());
 
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
+        let addr = format!("0.0.0.0:{}", self.port);
+        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied && self.port < 1024 {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Cannot bind to port {} (privileged ports < 1024 require root). \
+                         Use a port >= 1024 or run with elevated privileges.",
+                        self.port
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
 
         tracing::info!("Dashboard API server listening on port {}", self.port);
         if self.dashboard_dir.is_some() {
-            tracing::info!("Dashboard available at http://localhost:{}", self.port);
+            tracing::info!(
+                "Serving dashboard from filesystem at http://localhost:{}",
+                self.port
+            );
+        } else if embedded::has_dashboard() {
+            tracing::info!(
+                "Serving embedded dashboard at http://localhost:{}",
+                self.port
+            );
         } else {
-            tracing::info!("API only mode - serve dashboard separately or provide --dashboard-dir");
+            tracing::info!(
+                "API only mode - no dashboard embedded. Use --dashboard-dir for development."
+            );
         }
 
         // Spawn background task to periodically clean up expired sessions.

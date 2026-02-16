@@ -2334,6 +2334,7 @@ async fn main() -> anyhow::Result<()> {
         dashboard_dir,
     } = cli.command
     {
+        // --dashboard-dir overrides the embedded dashboard (useful for development)
         let server = if let Some(dir) = dashboard_dir {
             ApiServer::with_dashboard(config, tracker, port, dir)
         } else {

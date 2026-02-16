@@ -40,6 +40,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build dashboard
+        run: cd dashboard && bun install --frozen-lockfile && bun run build
+
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
@@ -191,6 +197,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build dashboard
+        run: cd dashboard && bun install --frozen-lockfile && bun run build
 
       - name: Install cargo-deb
         run: cargo install cargo-deb

@@ -56,19 +56,6 @@ services:
     networks:
       - edge
 
-  dashboard:
-    build:
-      context: ./dashboard
-      dockerfile: Dockerfile
-    container_name: claudear-dashboard
-    restart: unless-stopped
-    depends_on:
-      - app
-    ports:
-      - "${DASHBOARD_PORT:-8080}:80"
-    networks:
-      - edge
-
 networks:
   edge:
     driver: bridge
