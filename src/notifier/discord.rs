@@ -444,7 +444,7 @@ pub(crate) fn build_urgent_issues_message(
                 issues.len(),
                 if issues.len() > 1 { "s" } else { "" }
             )),
-            description: Some("The following issues require immediate attention:".to_string()),
+            description: Some("The following issues require attention:".to_string()),
             url: None,
             color: Some(0xf39c12), // Orange
             fields: Some(fields),
@@ -2058,7 +2058,7 @@ mod tests {
         let (_, body) = notifier.http.get_last_call().unwrap();
         let content = body["content"].as_str().unwrap();
         assert!(content.contains("<@987654321>"));
-        assert!(content.contains("PR created!"));
+        assert_eq!(content, "<@987654321>");
     }
 
     #[tokio::test]
@@ -2120,7 +2120,7 @@ mod tests {
         let (_, body) = notifier.http.get_last_call().unwrap();
         let content = body["content"].as_str().unwrap();
         assert!(content.contains("<@987654321>"));
-        assert!(content.contains("no PR URL found"));
+        assert_eq!(content, "<@987654321>");
     }
 
     #[tokio::test]
@@ -2167,7 +2167,7 @@ mod tests {
         let (_, body) = notifier.http.get_last_call().unwrap();
         let content = body["content"].as_str().unwrap();
         assert!(content.contains("<@987654321>"));
-        assert!(content.contains("Fix attempt failed"));
+        assert_eq!(content, "<@987654321>");
     }
 
     #[tokio::test]
@@ -2274,7 +2274,7 @@ mod tests {
 
         let (_, body) = notifier.http.get_last_call().unwrap();
         let desc = body["embeds"][0]["description"].as_str().unwrap();
-        assert!(desc.contains("require immediate attention"));
+        assert!(desc.contains("require attention"));
     }
 
     #[tokio::test]
@@ -3026,7 +3026,7 @@ mod tests {
         let issue = test_issue();
         let msg = build_start_message(&issue, Some("<@12345>".to_string()));
 
-        assert_eq!(msg.content.as_deref(), Some("<@12345> Processing issue..."));
+        assert_eq!(msg.content.as_deref(), Some("<@12345>"));
         let embeds = msg.embeds.as_ref().unwrap();
         assert_eq!(embeds.len(), 1);
         let embed = &embeds[0];
@@ -3066,7 +3066,7 @@ mod tests {
             Some("<@user>".to_string()),
         );
 
-        assert_eq!(msg.content.as_deref(), Some("<@user> PR created!"));
+        assert_eq!(msg.content.as_deref(), Some("<@user>"));
         let embed = &msg.embeds.as_ref().unwrap()[0];
         assert!(embed
             .title
@@ -3103,7 +3103,7 @@ mod tests {
         let issue = test_issue();
         let msg = build_completed_message(&issue, Some("<@u>".to_string()));
 
-        assert!(msg.content.as_ref().unwrap().contains("no PR URL found"));
+        assert_eq!(msg.content.as_deref(), Some("<@u>"));
         let embed = &msg.embeds.as_ref().unwrap()[0];
         assert!(embed.title.as_ref().unwrap().contains("Completed: PROJ-42"));
         assert_eq!(embed.color, Some(0x9b59b6));
@@ -3131,7 +3131,7 @@ mod tests {
             Some("<@u>".to_string()),
         );
 
-        assert!(msg.content.as_ref().unwrap().contains("Fix attempt failed"));
+        assert_eq!(msg.content.as_deref(), Some("<@u>"));
         let embed = &msg.embeds.as_ref().unwrap()[0];
         assert!(embed.title.as_ref().unwrap().contains("Failed: PROJ-42"));
         assert_eq!(embed.color, Some(0xe74c3c));
@@ -3192,11 +3192,7 @@ mod tests {
         let issues = vec![test_issue()];
         let msg = build_urgent_issues_message(&issues, Some("<@u>".to_string())).unwrap();
 
-        assert!(msg
-            .content
-            .as_ref()
-            .unwrap()
-            .contains("Urgent issues detected!"));
+        assert_eq!(msg.content.as_deref(), Some("<@u>"));
         let embed = &msg.embeds.as_ref().unwrap()[0];
         assert!(embed
             .title
