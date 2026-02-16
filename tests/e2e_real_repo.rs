@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use async_trait::async_trait;
-use claudear::config::Config;
+use claudear::config::{AskConfig, Config, RetryConfig};
 use claudear::notifier::Notifier;
 use claudear::repo::{IndexedRepo, RepoIndex};
 use claudear::source::IssueSource;
@@ -17,7 +17,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct EnvVarGuard {
     key: &'static str,
@@ -268,18 +268,25 @@ fn make_linear_task(id: &str, short_id: &str) -> Issue {
 }
 
 fn build_config(temp_dir: &TempDir) -> Config {
-    let mut config = Config::default();
-    config.work_dir = temp_dir.path().join("work");
-    config.db_path = temp_dir.path().join("e2e-tracker.db");
-    config.known_orgs = vec!["test-org".to_string()];
-    config.ask.enabled = false;
-    config.processing_delay_ms = 0;
-    config.max_concurrent = 1;
-    config.max_issues_per_cycle = 10;
-    config.claude_timeout_secs = 30;
-    config.retry.base_delay_ms = 0;
-    config.retry.max_delay_ms = 0;
-    config
+    Config {
+        work_dir: temp_dir.path().join("work"),
+        db_path: temp_dir.path().join("e2e-tracker.db"),
+        known_orgs: vec!["test-org".to_string()],
+        ask: AskConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        processing_delay_ms: 0,
+        max_concurrent: 1,
+        max_issues_per_cycle: 10,
+        claude_timeout_secs: 30,
+        retry: RetryConfig {
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
@@ -341,7 +348,7 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
 
 #[tokio::test]
 async fn e2e_successful_task_updates_real_repo_and_tracker() {
-    let _env_guard = ENV_LOCK.lock().unwrap();
+    let _env_guard = ENV_LOCK.lock().await;
     let harness = create_harness(vec![make_linear_task("task-success", "TASK-1001")]);
 
     harness
@@ -388,7 +395,7 @@ async fn e2e_successful_task_updates_real_repo_and_tracker() {
 
 #[tokio::test]
 async fn e2e_multiple_mock_tasks_reset_repo_and_clear_task_state() {
-    let _env_guard = ENV_LOCK.lock().unwrap();
+    let _env_guard = ENV_LOCK.lock().await;
     let harness = create_harness(vec![
         make_linear_task("task-success", "TASK-2001"),
         make_linear_task("task-no-pr", "TASK-2002"),
