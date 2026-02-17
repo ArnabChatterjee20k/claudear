@@ -17,3 +17,4 @@ claudear.yaml
 .fastembed_cache
 logs
 .worktrees/
+cobertura.xml

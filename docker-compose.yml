@@ -33,6 +33,9 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_AUTO_RESOLVE_ON_MERGE: ${GITHUB_AUTO_RESOLVE_ON_MERGE:-true}
 
+      # Claude Code authentication (if unset, container will prompt OAuth login on first start)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
       # Notifications
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
       DISCORD_USER_ID: ${DISCORD_USER_ID:-}
@@ -51,6 +54,8 @@ services:
       - ./claudear.yaml:/app/claudear.yaml:ro
       # Cache embedding models between container restarts
       - embedding_cache:/home/appuser/.cache/fastembed
+      # Persist Claude Code auth across container restarts
+      - claude_config:/home/appuser/.claude
     ports:
       - "${APP_PORT:-3100}:3100"
     networks:
@@ -62,3 +67,4 @@ networks:
 
 volumes:
   embedding_cache:
+  claude_config:

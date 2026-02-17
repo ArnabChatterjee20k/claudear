@@ -1,0 +1,11 @@
+target/
+data/
+logs/
+.git/
+node_modules/
+dashboard/node_modules/
+*.swp
+*.swo
+.env
+.env.*
+cobertura.xml
