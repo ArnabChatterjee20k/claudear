@@ -280,6 +280,14 @@ pub struct DiscordConfig {
     pub bot_token: Option<String>,
     /// Discord channel ID used for inbound reply polling.
     pub channel_id: Option<String>,
+    /// Enable Discord as an issue source (messages become issues).
+    pub source_enabled: bool,
+    /// Channel to listen for issue messages (falls back to channel_id).
+    pub listen_channel_id: Option<String>,
+    /// Guild (server) ID for constructing message URLs.
+    pub guild_id: Option<String>,
+    /// Polling interval in milliseconds for Discord source (overrides global).
+    pub poll_interval_ms: Option<u64>,
 }
 
 /// Email (SMTP) notification configuration.
@@ -503,6 +511,8 @@ pub struct LinearConfig {
     pub max_issues_per_cycle: Option<usize>,
     /// Maximum concurrent issue processing for this source (overrides global).
     pub max_concurrent: Option<usize>,
+    /// Polling interval in milliseconds for Linear source (overrides global).
+    pub poll_interval_ms: Option<u64>,
 }
 
 impl Default for LinearConfig {
@@ -517,6 +527,7 @@ impl Default for LinearConfig {
             webhook_secret: None,
             max_issues_per_cycle: None,
             max_concurrent: None,
+            poll_interval_ms: None,
         }
     }
 }
@@ -609,6 +620,8 @@ pub struct SentryConfig {
     pub max_issues_per_cycle: Option<usize>,
     /// Maximum concurrent issue processing for this source (overrides global).
     pub max_concurrent: Option<usize>,
+    /// Polling interval in milliseconds for Sentry source (overrides global).
+    pub poll_interval_ms: Option<u64>,
 }
 
 impl Default for SentryConfig {
@@ -625,6 +638,7 @@ impl Default for SentryConfig {
             client_secret: None,
             max_issues_per_cycle: None,
             max_concurrent: None,
+            poll_interval_ms: None,
         }
     }
 }
@@ -737,8 +751,9 @@ impl Config {
 
     /// Load configuration from YAML string (useful for testing).
     pub fn from_yaml(yaml: &str) -> Result<Self> {
-        let config: Config = serde_yaml::from_str(yaml)
+        let mut config: Config = serde_yaml::from_str(yaml)
             .map_err(|e| Error::config(format!("Failed to parse YAML: {}", e)))?;
+        config.apply_env_overrides();
         Ok(config)
     }
 
@@ -940,6 +955,21 @@ impl Config {
         }
         if let Ok(v) = env::var("DISCORD_CHANNEL_ID") {
             self.discord.channel_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("DISCORD_SOURCE_ENABLED") {
+            self.discord.source_enabled = v == "true" || v == "1";
+        }
+        if let Ok(v) = env::var("DISCORD_LISTEN_CHANNEL_ID") {
+            self.discord.listen_channel_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("DISCORD_GUILD_ID") {
+            self.discord.guild_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Some(v) = env::var("DISCORD_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.discord.poll_interval_ms = Some(v);
         }
 
         // Email
@@ -1180,6 +1210,12 @@ impl Config {
             {
                 linear.max_concurrent = Some(v);
             }
+            if let Some(v) = env::var("LINEAR_POLL_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                linear.poll_interval_ms = Some(v);
+            }
         }
     }
 
@@ -1246,6 +1282,12 @@ impl Config {
                 .and_then(|v| v.parse().ok())
             {
                 sentry.max_concurrent = Some(v);
+            }
+            if let Some(v) = env::var("SENTRY_POLL_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                sentry.poll_interval_ms = Some(v);
             }
         }
     }
@@ -1345,6 +1387,28 @@ impl Config {
             _ => self.max_concurrent,
         }
     }
+
+    /// Get the poll interval in milliseconds for a specific source.
+    /// Uses the source-specific value if set, otherwise falls back to the global value.
+    pub fn poll_interval_ms_for(&self, source_name: &str) -> u64 {
+        match source_name {
+            "discord" => self
+                .discord
+                .poll_interval_ms
+                .unwrap_or(self.poll_interval_ms),
+            "linear" => self
+                .linear
+                .as_ref()
+                .and_then(|c| c.poll_interval_ms)
+                .unwrap_or(self.poll_interval_ms),
+            "sentry" => self
+                .sentry
+                .as_ref()
+                .and_then(|c| c.poll_interval_ms)
+                .unwrap_or(self.poll_interval_ms),
+            _ => self.poll_interval_ms,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1378,6 +1442,7 @@ mod tests {
         "LINEAR_WEBHOOK_SECRET",
         "LINEAR_MAX_ISSUES_PER_CYCLE",
         "LINEAR_MAX_CONCURRENT",
+        "LINEAR_POLL_INTERVAL_MS",
         "SENTRY_AUTH_TOKEN",
         "SENTRY_ORG_SLUG",
         "SENTRY_ENABLED",
@@ -1388,10 +1453,15 @@ mod tests {
         "SENTRY_CLIENT_SECRET",
         "SENTRY_MAX_ISSUES_PER_CYCLE",
         "SENTRY_MAX_CONCURRENT",
+        "SENTRY_POLL_INTERVAL_MS",
         "DISCORD_WEBHOOK_URL",
         "DISCORD_USER_ID",
         "DISCORD_BOT_TOKEN",
         "DISCORD_CHANNEL_ID",
+        "DISCORD_SOURCE_ENABLED",
+        "DISCORD_LISTEN_CHANNEL_ID",
+        "DISCORD_GUILD_ID",
+        "DISCORD_POLL_INTERVAL_MS",
         "SMTP_HOST",
         "SMTP_PORT",
         "SMTP_USERNAME",
@@ -2170,6 +2240,86 @@ sentry:
         // Sentry overrides concurrent but not issues
         assert_eq!(config.max_issues_per_cycle_for("sentry"), 5);
         assert_eq!(config.max_concurrent_for("sentry"), 6);
+    }
+
+    #[test]
+    fn test_poll_interval_ms_for_falls_back_to_global() {
+        let config = Config {
+            poll_interval_ms: 300_000,
+            linear: Some(LinearConfig {
+                api_key: "key".into(),
+                ..Default::default()
+            }),
+            sentry: Some(SentryConfig {
+                auth_token: "tok".into(),
+                org_slug: "org".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.poll_interval_ms_for("discord"), 300_000);
+        assert_eq!(config.poll_interval_ms_for("linear"), 300_000);
+        assert_eq!(config.poll_interval_ms_for("sentry"), 300_000);
+        assert_eq!(config.poll_interval_ms_for("unknown"), 300_000);
+    }
+
+    #[test]
+    fn test_poll_interval_ms_for_overrides_global() {
+        let config = Config {
+            poll_interval_ms: 300_000,
+            discord: DiscordConfig {
+                poll_interval_ms: Some(30_000),
+                ..Default::default()
+            },
+            linear: Some(LinearConfig {
+                api_key: "key".into(),
+                poll_interval_ms: Some(600_000),
+                ..Default::default()
+            }),
+            sentry: Some(SentryConfig {
+                auth_token: "tok".into(),
+                org_slug: "org".into(),
+                poll_interval_ms: Some(120_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.poll_interval_ms_for("discord"), 30_000);
+        assert_eq!(config.poll_interval_ms_for("linear"), 600_000);
+        assert_eq!(config.poll_interval_ms_for("sentry"), 120_000);
+        assert_eq!(config.poll_interval_ms_for("unknown"), 300_000);
+    }
+
+    #[test]
+    fn test_poll_interval_ms_for_from_yaml() {
+        let yaml = r#"
+work_dir: /tmp/repos
+poll_interval_ms: 300000
+discord:
+  poll_interval_ms: 30000
+linear:
+  api_key: lin_key
+  poll_interval_ms: 600000
+sentry:
+  auth_token: sentry_tok
+  org_slug: org
+  poll_interval_ms: 120000
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert_eq!(config.poll_interval_ms_for("discord"), 30_000);
+        assert_eq!(config.poll_interval_ms_for("linear"), 600_000);
+        assert_eq!(config.poll_interval_ms_for("sentry"), 120_000);
+        assert_eq!(config.poll_interval_ms_for("unknown"), 300_000);
+    }
+
+    #[test]
+    fn test_poll_interval_ms_for_env_override() {
+        with_env(&[("DISCORD_POLL_INTERVAL_MS", "15000")], || {
+            let config = Config::from_yaml("work_dir: /tmp").unwrap();
+            assert_eq!(config.poll_interval_ms_for("discord"), 15_000);
+            // Global unchanged
+            assert_eq!(config.poll_interval_ms_for("unknown"), 300_000);
+        });
     }
 
     #[test]

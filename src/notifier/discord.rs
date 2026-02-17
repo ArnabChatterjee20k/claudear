@@ -57,6 +57,8 @@ pub struct DiscordNotifier<H: DiscordWebhookClient = ReqwestDiscordWebhookClient
     config: DiscordConfig,
     http: H,
     user_registry: UserRegistry,
+    /// Reusable Discord bot API client, created once during construction.
+    bot_client: Option<DiscordClient>,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,10 +102,16 @@ pub(crate) struct DiscordFooter {
 
 impl DiscordNotifier<ReqwestDiscordWebhookClient> {
     pub fn new(config: DiscordConfig, user_registry: UserRegistry) -> Self {
+        let bot_client = config
+            .bot_token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .and_then(|token| DiscordClient::new(token).ok());
         Self {
             config,
             http: ReqwestDiscordWebhookClient::new(),
             user_registry,
+            bot_client,
         }
     }
 }
@@ -128,10 +136,16 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     /// Create a new Discord notifier with a custom HTTP client.
     pub fn with_http_client(config: DiscordConfig, http: H) -> Self {
+        let bot_client = config
+            .bot_token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .and_then(|token| DiscordClient::new(token).ok());
         Self {
             config,
             http,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            bot_client,
         }
     }
 
@@ -141,10 +155,16 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         http: H,
         user_registry: UserRegistry,
     ) -> Self {
+        let bot_client = config
+            .bot_token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .and_then(|token| DiscordClient::new(token).ok());
         Self {
             config,
             http,
             user_registry,
+            bot_client,
         }
     }
 
@@ -163,12 +183,13 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
             return Ok(());
         }
 
-        if self.has_bot_channel() {
-            let bot_token = self.config.bot_token.as_ref().unwrap();
-            let channel_id = self.config.channel_id.as_ref().unwrap();
-            let params = Self::to_create_message_params(&message);
-            let client = DiscordClient::new(bot_token.clone())?;
-            client.send_message(channel_id, params).await?;
+        if let Some(ref client) = self.bot_client {
+            if let Some(ref channel_id) = self.config.channel_id {
+                if !channel_id.is_empty() {
+                    let params = Self::to_create_message_params(&message);
+                    client.send_message(channel_id, params).await?;
+                }
+            }
         }
 
         Ok(())
@@ -623,16 +644,15 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         request: &AskRequest,
         since: DateTime<Utc>,
     ) -> Result<Vec<AskReply>> {
-        let bot_token = match self.config.bot_token.as_ref() {
-            Some(v) if !v.is_empty() => v,
-            _ => return Ok(Vec::new()),
+        let client = match self.bot_client.as_ref() {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
         };
         let channel_id = match self.config.channel_id.as_ref() {
             Some(v) if !v.is_empty() => v,
             _ => return Ok(Vec::new()),
         };
 
-        let client = DiscordClient::new(bot_token.clone())?;
         let messages = client.list_channel_messages(channel_id, 50).await?;
         let expected_user = self.expected_reply_user_id(request);
         let token = format!("[CLAUDEAR-Q:{}]", request.correlation_id);
@@ -757,6 +777,7 @@ mod tests {
             user_id: None,
             bot_token: Some("bot-token".to_string()),
             channel_id: Some("channel-123".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(notifier.is_enabled());
@@ -769,6 +790,7 @@ mod tests {
             user_id: None,
             bot_token: Some("bot-token".to_string()),
             channel_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(!notifier.is_enabled());
@@ -781,6 +803,7 @@ mod tests {
             user_id: None,
             bot_token: None,
             channel_id: Some("channel-123".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(!notifier.is_enabled());
@@ -793,6 +816,7 @@ mod tests {
             user_id: None,
             bot_token: Some("".to_string()),
             channel_id: Some("channel-123".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(!notifier.is_enabled());
@@ -1772,6 +1796,7 @@ mod tests {
             user_id: None,
             bot_token: Some("bot-token".to_string()),
             channel_id: Some("channel-123".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(notifier.supports_replies());
@@ -1784,6 +1809,7 @@ mod tests {
             user_id: None,
             bot_token: None,
             channel_id: Some("channel-123".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(!notifier.supports_replies());
@@ -1796,6 +1822,7 @@ mod tests {
             user_id: None,
             bot_token: Some("bot-token".to_string()),
             channel_id: None,
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(!notifier.supports_replies());
@@ -1808,6 +1835,7 @@ mod tests {
             user_id: None,
             bot_token: Some("".to_string()),
             channel_id: Some("channel-123".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(!notifier.supports_replies());
@@ -1820,6 +1848,7 @@ mod tests {
             user_id: None,
             bot_token: Some("bot-token".to_string()),
             channel_id: Some("".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(!notifier.supports_replies());
@@ -2586,6 +2615,7 @@ mod tests {
             user_id: None,
             bot_token: None,
             channel_id: Some("channel-123".to_string()),
+            ..Default::default()
         };
         let mock = MockDiscordWebhookClient::success();
         let notifier = DiscordNotifier::with_http_client(config, mock);
@@ -2605,6 +2635,7 @@ mod tests {
             user_id: None,
             bot_token: Some("".to_string()),
             channel_id: Some("channel-123".to_string()),
+            ..Default::default()
         };
         let mock = MockDiscordWebhookClient::success();
         let notifier = DiscordNotifier::with_http_client(config, mock);
@@ -2624,6 +2655,7 @@ mod tests {
             user_id: None,
             bot_token: Some("valid-token".to_string()),
             channel_id: None,
+            ..Default::default()
         };
         let mock = MockDiscordWebhookClient::success();
         let notifier = DiscordNotifier::with_http_client(config, mock);
@@ -2643,6 +2675,7 @@ mod tests {
             user_id: None,
             bot_token: Some("valid-token".to_string()),
             channel_id: Some("".to_string()),
+            ..Default::default()
         };
         let mock = MockDiscordWebhookClient::success();
         let notifier = DiscordNotifier::with_http_client(config, mock);
@@ -3469,6 +3502,7 @@ mod tests {
             user_id: None,
             bot_token: Some("bot-token".to_string()),
             channel_id: Some("channel-123".to_string()),
+            ..Default::default()
         };
         let notifier = DiscordNotifier::with_http_client(config, mock);
         let issue = Issue::new("1", "P-1", "Test", "https://example.com", "linear");

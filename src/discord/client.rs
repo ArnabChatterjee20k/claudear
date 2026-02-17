@@ -245,6 +245,37 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         response.json()
     }
 
+    /// List messages from a channel after a given message ID (for incremental polling).
+    /// Messages are returned in ascending order (oldest first).
+    pub async fn list_channel_messages_after(
+        &self,
+        channel_id: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscordMessage>> {
+        let clamped_limit = limit.clamp(1, 100);
+        let url = format!(
+            "{}/channels/{}/messages?after={}&limit={}",
+            DISCORD_API_BASE, channel_id, after, clamped_limit
+        );
+        let response = self.http.get(&url).await?;
+
+        if !response.is_success() {
+            return Err(Error::notifier(
+                "discord",
+                format!(
+                    "Failed to list channel messages ({}): {}",
+                    response.status, response.body
+                ),
+            ));
+        }
+
+        // Discord returns messages newest-first; reverse to get chronological order
+        let mut messages: Vec<DiscordMessage> = response.json()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// Archive a thread.
     pub async fn archive_thread(&self, thread_id: &str) -> Result<DiscordThread> {
         let url = format!("{}/channels/{}", DISCORD_API_BASE, thread_id);
@@ -664,6 +695,43 @@ mod tests {
         let messages = client.list_channel_messages("123", 10).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, "999");
+    }
+
+    #[tokio::test]
+    async fn test_list_channel_messages_after_success() {
+        let mock = MockDiscordClient::new();
+        let msg1 = r#"{"id": "1001", "channel_id": "123", "content": "First", "timestamp": "2024-01-01T00:01:00Z", "author": {"id": "222", "username": "user1"}}"#;
+        let msg2 = r#"{"id": "1002", "channel_id": "123", "content": "Second", "timestamp": "2024-01-01T00:02:00Z", "author": {"id": "222", "username": "user1"}}"#;
+        // Discord API returns newest first
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/messages?after=1000&limit=50",
+            200,
+            format!("[{}, {}]", msg2, msg1),
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let messages = client
+            .list_channel_messages_after("123", "1000", 50)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        // Should be reversed to chronological order
+        assert_eq!(messages[0].id, "1001");
+        assert_eq!(messages[1].id, "1002");
+    }
+
+    #[tokio::test]
+    async fn test_list_channel_messages_after_error() {
+        let mock = MockDiscordClient::new();
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/messages?after=1000&limit=50",
+            403,
+            "Forbidden",
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let result = client.list_channel_messages_after("123", "1000", 50).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

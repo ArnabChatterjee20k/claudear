@@ -1,8 +1,10 @@
 //! Issue source implementations.
 
+mod discord;
 mod linear;
 pub mod sentry;
 
+pub use discord::DiscordSource;
 pub use linear::LinearSource;
 pub use sentry::SentrySource;
 
