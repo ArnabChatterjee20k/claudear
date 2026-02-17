@@ -157,57 +157,14 @@ impl FixOutcome {
 
     /// Calculate semantic similarity score with another outcome (0.0 to 1.0).
     ///
-    /// Uses cosine similarity on embeddings when available, falls back to
-    /// Jaccard similarity on keywords otherwise.
+    /// Uses cosine similarity on embeddings. Returns 0.0 if either outcome
+    /// lacks an embedding.
     pub fn similarity(&self, other: &FixOutcome) -> f64 {
-        // Use embedding-based cosine similarity if both have embeddings
         if let (Some(ref self_emb), Some(ref other_emb)) = (&self.embedding, &other.embedding) {
             return cosine_similarity(self_emb, other_emb) as f64;
         }
 
-        // Fallback to keyword-based Jaccard similarity
-        self.keyword_similarity(&other.keywords)
-    }
-
-    /// Calculate semantic similarity with an issue (for finding similar past issues).
-    ///
-    /// Uses cosine similarity on embeddings when available (requires issue_embedding),
-    /// falls back to Jaccard similarity on keywords otherwise.
-    pub fn similarity_to_issue(&self, issue: &Issue) -> f64 {
-        let description = issue.description.as_deref().unwrap_or("");
-        let issue_keywords = Self::extract_keywords(&issue.title, description);
-        self.keyword_similarity(&issue_keywords)
-    }
-
-    /// Calculate similarity with an issue using a pre-computed embedding.
-    ///
-    /// This is the preferred method when embeddings are available.
-    pub fn similarity_to_embedding(&self, issue_embedding: &[f32]) -> f64 {
-        if let Some(ref self_emb) = self.embedding {
-            cosine_similarity(self_emb, issue_embedding) as f64
-        } else {
-            0.0 // No embedding available, can't compute similarity
-        }
-    }
-
-    /// Keyword-based Jaccard similarity (fallback when no embeddings).
-    fn keyword_similarity(&self, other_keywords: &[String]) -> f64 {
-        let self_keywords: std::collections::HashSet<_> = self.keywords.iter().collect();
-        let other_keywords_set: std::collections::HashSet<&String> =
-            other_keywords.iter().collect();
-
-        if self_keywords.is_empty() || other_keywords_set.is_empty() {
-            return 0.0;
-        }
-
-        let intersection = self_keywords.intersection(&other_keywords_set).count() as f64;
-        let union = self_keywords.union(&other_keywords_set).count() as f64;
-
-        if union == 0.0 {
-            0.0
-        } else {
-            intersection / union // Jaccard similarity
-        }
+        0.0
     }
 }
 
@@ -361,51 +318,6 @@ impl OutcomeTracker {
             outcome.set_embedding(embedding);
         }
         Ok(())
-    }
-
-    /// Find similar past outcomes for an issue using keyword similarity (fallback).
-    pub fn find_similar(
-        &self,
-        issue: &Issue,
-        limit: usize,
-        min_similarity: f64,
-    ) -> Vec<&FixOutcome> {
-        let mut scored: Vec<_> = self
-            .outcomes
-            .iter()
-            .map(|o| (o, o.similarity_to_issue(issue)))
-            .filter(|(_, score)| *score >= min_similarity)
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        scored.into_iter().take(limit).map(|(o, _)| o).collect()
-    }
-
-    /// Find similar past outcomes using semantic embedding similarity.
-    ///
-    /// This is the preferred method when embeddings are available.
-    /// Returns outcomes sorted by similarity (highest first).
-    pub fn find_similar_by_embedding(
-        &self,
-        issue_embedding: &[f32],
-        limit: usize,
-        min_similarity: f64,
-    ) -> Vec<(&FixOutcome, f64)> {
-        let mut scored: Vec<_> = self
-            .outcomes
-            .iter()
-            .filter(|o| o.embedding.is_some()) // Only compare with outcomes that have embeddings
-            .map(|o| {
-                let similarity = o.similarity_to_embedding(issue_embedding);
-                (o, similarity)
-            })
-            .filter(|(_, score)| *score >= min_similarity)
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        scored.into_iter().take(limit).collect()
     }
 
     /// Get outcomes by result.
@@ -562,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn test_similarity() {
+    fn test_similarity_with_embeddings() {
         let issue1 = create_test_issue(
             "Database timeout error",
             "Connection to PostgreSQL times out",
@@ -570,12 +482,28 @@ mod tests {
         let issue2 = create_test_issue("Database connection issue", "PostgreSQL connection fails");
         let attempt = create_test_attempt();
 
-        let outcome1 = FixOutcome::from_attempt(&attempt, &issue1, "test prompt", Outcome::Merged);
-        let outcome2 = FixOutcome::from_attempt(&attempt, &issue2, "test prompt", Outcome::Closed);
+        let mut outcome1 =
+            FixOutcome::from_attempt(&attempt, &issue1, "test prompt", Outcome::Merged);
+        let mut outcome2 =
+            FixOutcome::from_attempt(&attempt, &issue2, "test prompt", Outcome::Closed);
+
+        outcome1.set_embedding(vec![0.9, 0.1, 0.0]);
+        outcome2.set_embedding(vec![0.8, 0.2, 0.0]);
 
         let similarity = outcome1.similarity(&outcome2);
-        assert!(similarity > 0.0); // Should have some overlap
+        assert!(similarity > 0.0);
         assert!(similarity <= 1.0);
+    }
+
+    #[test]
+    fn test_similarity_without_embeddings_returns_zero() {
+        let issue1 = create_test_issue("Database timeout error", "Connection times out");
+        let attempt = create_test_attempt();
+
+        let outcome1 = FixOutcome::from_attempt(&attempt, &issue1, "test prompt", Outcome::Merged);
+        let outcome2 = FixOutcome::from_attempt(&attempt, &issue1, "test prompt", Outcome::Closed);
+
+        assert_eq!(outcome1.similarity(&outcome2), 0.0);
     }
 
     #[test]
@@ -589,28 +517,6 @@ mod tests {
 
         assert_eq!(id, 1);
         assert_eq!(tracker.all().len(), 1);
-    }
-
-    #[test]
-    fn test_find_similar() {
-        let mut tracker = OutcomeTracker::new();
-        let attempt = create_test_attempt();
-
-        // Add some outcomes
-        let issue1 =
-            create_test_issue("API endpoint returns 500", "Server error in users endpoint");
-        let outcome1 = FixOutcome::from_attempt(&attempt, &issue1, "prompt", Outcome::Merged);
-        tracker.record(outcome1).unwrap();
-
-        let issue2 = create_test_issue("CSS styling broken", "Buttons not aligned properly");
-        let outcome2 = FixOutcome::from_attempt(&attempt, &issue2, "prompt", Outcome::Closed);
-        tracker.record(outcome2).unwrap();
-
-        // Search for similar
-        let search_issue = create_test_issue("API returns error 500", "Error in the API endpoint");
-        let similar = tracker.find_similar(&search_issue, 5, 0.0);
-
-        assert!(!similar.is_empty());
     }
 
     #[test]
@@ -731,14 +637,17 @@ mod tests {
     }
 
     #[test]
-    fn test_similarity_identical() {
+    fn test_similarity_identical_embeddings() {
         let issue = create_test_issue("Same title", "Same description");
         let attempt = create_test_attempt();
-        let outcome1 = FixOutcome::from_attempt(&attempt, &issue, "prompt", Outcome::Merged);
-        let outcome2 = FixOutcome::from_attempt(&attempt, &issue, "prompt", Outcome::Merged);
+        let mut outcome1 = FixOutcome::from_attempt(&attempt, &issue, "prompt", Outcome::Merged);
+        let mut outcome2 = FixOutcome::from_attempt(&attempt, &issue, "prompt", Outcome::Merged);
+
+        outcome1.set_embedding(vec![1.0, 0.0, 0.0]);
+        outcome2.set_embedding(vec![1.0, 0.0, 0.0]);
 
         let similarity = outcome1.similarity(&outcome2);
-        assert_eq!(similarity, 1.0); // Identical should be 1.0
+        assert!((similarity - 1.0).abs() < 0.0001); // Identical embeddings should be ~1.0
     }
 
     #[test]
@@ -752,30 +661,6 @@ mod tests {
 
         let similarity = outcome1.similarity(&outcome2);
         assert!(similarity < 0.3); // Very different topics
-    }
-
-    #[test]
-    fn test_similarity_empty_keywords() {
-        let attempt = create_test_attempt();
-        let issue1 = Issue {
-            id: "1".to_string(),
-            short_id: "1".to_string(),
-            title: "a b c".to_string(), // Only short words
-            description: None,
-            url: "url".to_string(),
-            source: "test".to_string(),
-            priority: IssuePriority::Medium,
-            status: IssueStatus::Open,
-            metadata: Default::default(),
-            created_at: None,
-            updated_at: None,
-        };
-
-        let outcome = FixOutcome::from_attempt(&attempt, &issue1, "prompt", Outcome::Merged);
-
-        // Empty keywords should result in 0 similarity
-        let issue2 = create_test_issue("Database error", "Connection fails");
-        assert_eq!(outcome.similarity_to_issue(&issue2), 0.0);
     }
 
     #[test]
@@ -1006,46 +891,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_similar_with_min_similarity() {
-        let mut tracker = OutcomeTracker::new();
-        let attempt = create_test_attempt();
-
-        let issue1 = create_test_issue(
-            "PostgreSQL database timeout",
-            "Connection to PostgreSQL times out",
-        );
-        tracker
-            .record(FixOutcome::from_attempt(
-                &attempt,
-                &issue1,
-                "p",
-                Outcome::Merged,
-            ))
-            .unwrap();
-
-        let issue2 = create_test_issue("JavaScript button styling", "React component CSS issue");
-        tracker
-            .record(FixOutcome::from_attempt(
-                &attempt,
-                &issue2,
-                "p",
-                Outcome::Closed,
-            ))
-            .unwrap();
-
-        // Search for PostgreSQL issue - should find issue1 with high similarity
-        let search = create_test_issue("PostgreSQL connection error", "Database connection fails");
-
-        let _high_min = tracker.find_similar(&search, 10, 0.3);
-        // Should only find the PostgreSQL one (if similarity is above 0.3)
-        // Results depend on keyword extraction
-
-        let low_min = tracker.find_similar(&search, 10, 0.0);
-        // With 0 min, should find both
-        assert!(!low_min.is_empty());
-    }
-
-    #[test]
     fn test_fix_outcome_from_attempt_sets_fields() {
         let issue = create_test_issue("Test Title", "Test Description");
         let mut attempt = create_test_attempt();
@@ -1118,75 +963,18 @@ mod tests {
     }
 
     #[test]
-    fn test_embedding_similarity_fallback_to_keywords() {
+    fn test_similarity_returns_zero_without_both_embeddings() {
         let issue = create_test_issue("Database error", "PostgreSQL connection fails");
         let attempt = create_test_attempt();
 
         let mut outcome1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
         let outcome2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
 
-        // Only outcome1 has embedding, so should fall back to keywords
+        // Only outcome1 has embedding — should return 0.0 without fallback
         outcome1.set_embedding(vec![1.0, 0.0, 0.0]);
 
         let similarity = outcome1.similarity(&outcome2);
-        // Should use keyword-based similarity since outcome2 has no embedding
-        assert!(similarity > 0.0); // Same keywords
-    }
-
-    #[test]
-    fn test_similarity_to_embedding() {
-        let issue = create_test_issue("Test", "Test");
-        let attempt = create_test_attempt();
-
-        let mut outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
-        outcome.set_embedding(vec![1.0, 0.0, 0.0]);
-
-        let query_embedding = vec![0.9, 0.1, 0.0];
-        let similarity = outcome.similarity_to_embedding(&query_embedding);
-
-        assert!(similarity > 0.9);
-        assert!(similarity <= 1.0);
-    }
-
-    #[test]
-    fn test_similarity_to_embedding_no_embedding() {
-        let issue = create_test_issue("Test", "Test");
-        let attempt = create_test_attempt();
-
-        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
-        // No embedding set
-
-        let query_embedding = vec![1.0, 0.0, 0.0];
-        let similarity = outcome.similarity_to_embedding(&query_embedding);
-
-        assert_eq!(similarity, 0.0); // No embedding, returns 0
-    }
-
-    #[test]
-    fn test_find_similar_by_embedding() {
-        let mut tracker = OutcomeTracker::new();
-        let attempt = create_test_attempt();
-
-        // Create outcomes with embeddings
-        let issue1 = create_test_issue("Database error", "PostgreSQL");
-        let mut outcome1 = FixOutcome::from_attempt(&attempt, &issue1, "p", Outcome::Merged);
-        outcome1.set_embedding(vec![1.0, 0.0, 0.0]); // Similar to query
-        let id1 = tracker.record(outcome1).unwrap();
-        tracker.set_embedding(id1, vec![1.0, 0.0, 0.0]).unwrap();
-
-        let issue2 = create_test_issue("CSS issue", "Styling");
-        let mut outcome2 = FixOutcome::from_attempt(&attempt, &issue2, "p", Outcome::Closed);
-        outcome2.set_embedding(vec![0.0, 1.0, 0.0]); // Orthogonal to query
-        let id2 = tracker.record(outcome2).unwrap();
-        tracker.set_embedding(id2, vec![0.0, 1.0, 0.0]).unwrap();
-
-        // Query embedding similar to outcome1
-        let query = vec![0.95, 0.05, 0.0];
-        let similar = tracker.find_similar_by_embedding(&query, 10, 0.5);
-
-        // Should find outcome1 but not outcome2
-        assert_eq!(similar.len(), 1);
-        assert!(similar[0].1 > 0.9); // High similarity
+        assert_eq!(similarity, 0.0);
     }
 
     #[test]
@@ -1393,9 +1181,11 @@ mod tests {
     fn test_similarity_self_is_one() {
         let attempt = create_test_attempt();
         let issue = create_test_issue("Database timeout", "PostgreSQL connection timed out");
-        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let mut outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        outcome.set_embedding(vec![1.0, 0.0, 0.0]);
+
         let sim = outcome.similarity(&outcome);
-        assert_eq!(sim, 1.0, "self-similarity should be exactly 1.0");
+        assert!((sim - 1.0).abs() < 0.0001, "self-similarity should be ~1.0");
     }
 
     #[test]
@@ -1478,60 +1268,6 @@ mod tests {
             "opposite vectors should have negative cosine similarity, got {}",
             sim
         );
-    }
-
-    #[test]
-    fn test_similarity_to_embedding_zero_vector() {
-        let attempt = create_test_attempt();
-        let issue = create_test_issue("Test", "Test");
-        let mut o = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
-        o.set_embedding(vec![0.0, 0.0, 0.0]);
-        // Zero vector triggers the norm==0 guard in cosine_similarity, returning 0.0
-        let sim = o.similarity_to_embedding(&[1.0, 0.0, 0.0]);
-        assert_eq!(sim, 0.0, "zero vector sim should be 0.0, got {}", sim);
-    }
-
-    #[test]
-    fn test_find_similar_by_embedding_empty_tracker() {
-        let tracker = OutcomeTracker::new();
-        let results = tracker.find_similar_by_embedding(&[1.0, 0.0], 10, 0.0);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_find_similar_by_embedding_high_threshold_filters_all() {
-        let mut tracker = OutcomeTracker::new();
-        let attempt = create_test_attempt();
-        let issue = create_test_issue("Test", "Test");
-        let mut o = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
-        o.set_embedding(vec![1.0, 0.0, 0.0]);
-        let id = tracker.record(o).unwrap();
-        tracker.set_embedding(id, vec![1.0, 0.0, 0.0]).unwrap();
-
-        // Orthogonal query with high threshold
-        let results = tracker.find_similar_by_embedding(&[0.0, 1.0, 0.0], 10, 0.99);
-        assert!(
-            results.is_empty(),
-            "orthogonal query with high threshold should return nothing"
-        );
-    }
-
-    #[test]
-    fn test_find_similar_limit_zero() {
-        let mut tracker = OutcomeTracker::new();
-        let attempt = create_test_attempt();
-        let issue = create_test_issue("Database timeout", "PostgreSQL connection fails");
-        tracker
-            .record(FixOutcome::from_attempt(
-                &attempt,
-                &issue,
-                "p",
-                Outcome::Merged,
-            ))
-            .unwrap();
-
-        let results = tracker.find_similar(&issue, 0, 0.0);
-        assert!(results.is_empty(), "limit=0 should return empty");
     }
 
     #[test]
@@ -1730,64 +1466,5 @@ mod tests {
         assert!(!is_common_word("The"));
         assert!(!is_common_word("IS"));
         assert!(!is_common_word("Error"));
-    }
-
-    #[test]
-    fn test_find_similar_sorted_by_similarity_desc() {
-        let mut tracker = OutcomeTracker::new();
-        let attempt = create_test_attempt();
-
-        // Add outcomes with varying similarity to the search query
-        let issue_exact =
-            create_test_issue("PostgreSQL database timeout", "Connection pool exhausted");
-        let issue_partial =
-            create_test_issue("PostgreSQL connection issue", "Memory leak detected");
-        let issue_different =
-            create_test_issue("JavaScript CSS styling", "React component rendering");
-
-        tracker
-            .record(FixOutcome::from_attempt(
-                &attempt,
-                &issue_different,
-                "p",
-                Outcome::Merged,
-            ))
-            .unwrap();
-        tracker
-            .record(FixOutcome::from_attempt(
-                &attempt,
-                &issue_exact,
-                "p",
-                Outcome::Merged,
-            ))
-            .unwrap();
-        tracker
-            .record(FixOutcome::from_attempt(
-                &attempt,
-                &issue_partial,
-                "p",
-                Outcome::Merged,
-            ))
-            .unwrap();
-
-        let search = create_test_issue(
-            "PostgreSQL database timeout error",
-            "Connection to database pool exhausted",
-        );
-        let results = tracker.find_similar(&search, 10, 0.0);
-
-        // Results should be sorted by similarity descending
-        if results.len() >= 2 {
-            for i in 0..results.len() - 1 {
-                let sim_i = results[i].similarity_to_issue(&search);
-                let sim_next = results[i + 1].similarity_to_issue(&search);
-                assert!(
-                    sim_i >= sim_next,
-                    "results not sorted: {} < {}",
-                    sim_i,
-                    sim_next
-                );
-            }
-        }
     }
 }

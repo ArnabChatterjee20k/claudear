@@ -30,6 +30,12 @@ const AUDIT_LOG_SUBDIR: &str = "audit";
 const QA_VECTOR_TABLE: &str = "qa_question_embeddings";
 const QA_VECTOR_EF_SEARCH: usize = 200;
 const QA_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
+const ISSUE_VECTOR_TABLE: &str = "issue_embedding_vectors";
+const ISSUE_VECTOR_EF_SEARCH: usize = 200;
+const ISSUE_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
+const OUTCOME_VECTOR_TABLE: &str = "outcome_embedding_vectors";
+const OUTCOME_VECTOR_EF_SEARCH: usize = 200;
+const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
 /// A user row from the database.
 #[derive(Debug, Clone, Serialize)]
@@ -615,6 +621,18 @@ impl SqliteTracker {
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
             CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+            -- Webhook delivery idempotency: prevents redelivered webhooks from
+            -- being processed twice after server restart.
+            CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                delivery_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                received_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(delivery_id, source)
+            );
+            CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_cleanup
+                ON webhook_deliveries(received_at);
             "#,
         )?;
 
@@ -684,6 +702,11 @@ impl SqliteTracker {
             (
                 "claude_executions.event_log_path",
                 "ALTER TABLE claude_executions ADD COLUMN event_log_path TEXT",
+            ),
+            // Soft-reset support: tracks when an attempt was reset for re-processing
+            (
+                "fix_attempts.reset_at",
+                "ALTER TABLE fix_attempts ADD COLUMN reset_at TEXT",
             ),
         ];
 
@@ -823,6 +846,10 @@ impl SqliteTracker {
                 "feedback_outcomes.strategy_fingerprint_id",
                 "ALTER TABLE feedback_outcomes ADD COLUMN strategy_fingerprint_id INTEGER",
             ),
+            (
+                "feedback_outcomes.embedding",
+                "ALTER TABLE feedback_outcomes ADD COLUMN embedding BLOB",
+            ),
         ];
         for (column_name, sql) in learning_migrations {
             if let Err(e) = conn.execute(sql, []) {
@@ -949,7 +976,13 @@ impl SqliteTracker {
     }
 
     fn embedding_to_blob(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
-        embedding.map(|values| values.iter().flat_map(|f| f.to_le_bytes()).collect())
+        embedding.map(|values| {
+            let mut blob = Vec::with_capacity(values.len() * 4);
+            for f in values {
+                blob.extend_from_slice(&f.to_le_bytes());
+            }
+            blob
+        })
     }
 
     fn blob_to_embedding(blob: Option<Vec<u8>>) -> Option<Vec<f32>> {
@@ -1051,6 +1084,171 @@ impl SqliteTracker {
 
         conn.execute(&delete_sql, params![qa_id])?;
         conn.execute(&insert_sql, params![qa_id, vector_blob])?;
+        Ok(())
+    }
+
+    /// Ensure the HNSW vector table for issue embeddings exists.
+    /// Returns `true` if the table is available, `false` if vectorlite is not installed.
+    fn ensure_issue_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
+        if dimension == 0 {
+            return Ok(false);
+        }
+
+        if Self::table_exists(conn, ISSUE_VECTOR_TABLE)? {
+            return Ok(true);
+        }
+
+        if !is_vectorlite_available(conn) {
+            match try_load_vectorlite(conn) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Unable to load vectorlite extension for issue embeddings");
+                    return Ok(false);
+                }
+            }
+        }
+
+        let sql = format!(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
+                embedding float32[{dimension}] cosine,
+                hnsw(max_elements=10000, ef_construction=200, M=16)
+            )
+            "#,
+            table = ISSUE_VECTOR_TABLE,
+            dimension = dimension
+        );
+
+        match conn.execute_batch(&sql) {
+            Ok(()) => {
+                let backfill_sql = format!(
+                    r#"
+                    INSERT INTO {table}(rowid, embedding)
+                    SELECT id, embedding
+                    FROM issue_embeddings
+                    WHERE embedding IS NOT NULL
+                      AND length(embedding) = ?1
+                    "#,
+                    table = ISSUE_VECTOR_TABLE
+                );
+                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
+                    tracing::debug!(error = %e, "Failed to backfill issue vector embeddings");
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to create issue vector table");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Upsert an issue embedding into the HNSW vector table.
+    fn upsert_issue_vector_embedding(
+        conn: &Connection,
+        issue_emb_id: i64,
+        embedding: &[f32],
+    ) -> Result<()> {
+        if embedding.is_empty() {
+            return Ok(());
+        }
+
+        if !Self::ensure_issue_vector_table(conn, embedding.len())? {
+            return Ok(());
+        }
+
+        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", ISSUE_VECTOR_TABLE);
+        let insert_sql = format!(
+            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
+            ISSUE_VECTOR_TABLE
+        );
+
+        conn.execute(&delete_sql, params![issue_emb_id])?;
+        conn.execute(&insert_sql, params![issue_emb_id, vector_blob])?;
+        Ok(())
+    }
+
+    /// Ensure the HNSW vector table for outcome embeddings exists.
+    fn ensure_outcome_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
+        if dimension == 0 {
+            return Ok(false);
+        }
+
+        if Self::table_exists(conn, OUTCOME_VECTOR_TABLE)? {
+            return Ok(true);
+        }
+
+        if !is_vectorlite_available(conn) {
+            match try_load_vectorlite(conn) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Unable to load vectorlite extension for outcome embeddings");
+                    return Ok(false);
+                }
+            }
+        }
+
+        let sql = format!(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
+                embedding float32[{dimension}] cosine,
+                hnsw(max_elements=10000, ef_construction=200, M=16)
+            )
+            "#,
+            table = OUTCOME_VECTOR_TABLE,
+            dimension = dimension
+        );
+
+        match conn.execute_batch(&sql) {
+            Ok(()) => {
+                let backfill_sql = format!(
+                    r#"
+                    INSERT INTO {table}(rowid, embedding)
+                    SELECT id, embedding
+                    FROM feedback_outcomes
+                    WHERE embedding IS NOT NULL
+                      AND length(embedding) = ?1
+                    "#,
+                    table = OUTCOME_VECTOR_TABLE
+                );
+                if let Err(e) = conn.execute(&backfill_sql, params![(dimension * 4) as i64]) {
+                    tracing::debug!(error = %e, "Failed to backfill outcome vector embeddings");
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to create outcome vector table");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Upsert an outcome embedding into the HNSW vector table.
+    fn upsert_outcome_vector_embedding(
+        conn: &Connection,
+        outcome_id: i64,
+        embedding: &[f32],
+    ) -> Result<()> {
+        if embedding.is_empty() {
+            return Ok(());
+        }
+
+        if !Self::ensure_outcome_vector_table(conn, embedding.len())? {
+            return Ok(());
+        }
+
+        let vector_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let delete_sql = format!("DELETE FROM {} WHERE rowid = ?1", OUTCOME_VECTOR_TABLE);
+        let insert_sql = format!(
+            "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
+            OUTCOME_VECTOR_TABLE
+        );
+
+        conn.execute(&delete_sql, params![outcome_id])?;
+        conn.execute(&insert_sql, params![outcome_id, vector_blob])?;
         Ok(())
     }
 
@@ -1372,8 +1570,11 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn has_attempted(&self, source: &str, issue_id: &str) -> Result<bool> {
         let conn = self.acquire_lock()?;
-        let mut stmt =
-            conn.prepare_cached("SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ?")?;
+        // Exclude soft-reset entries (reset_at IS NOT NULL) so they are treated as
+        // "not yet attempted" and will be picked up for re-processing.
+        let mut stmt = conn.prepare_cached(
+            "SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ? AND reset_at IS NULL",
+        )?;
         Ok(stmt.exists(params![source, issue_id])?)
     }
 
@@ -1385,9 +1586,9 @@ impl FixAttemptTracker for SqliteTracker {
                 return HashSet::new();
             }
         };
-        let mut stmt = match conn
-            .prepare_cached("SELECT issue_id FROM fix_attempts WHERE source = ?")
-        {
+        let mut stmt = match conn.prepare_cached(
+            "SELECT issue_id FROM fix_attempts WHERE source = ? AND reset_at IS NULL",
+        ) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to prepare statement in get_attempted_issue_ids");
@@ -1446,6 +1647,9 @@ impl FixAttemptTracker for SqliteTracker {
             Some(serde_json::to_string(labels).unwrap_or_default())
         };
 
+        // Conditional upsert: only update existing rows that have been soft-reset
+        // (reset_at IS NOT NULL). This prevents silently overwriting state for
+        // actively-processing or already-completed attempts.
         let rows_affected = conn.execute(
             r#"
             INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, issue_labels)
@@ -1453,16 +1657,26 @@ impl FixAttemptTracker for SqliteTracker {
             ON CONFLICT(source, issue_id) DO UPDATE SET
                 short_id = excluded.short_id,
                 attempted_at = datetime('now'),
-                issue_labels = COALESCE(excluded.issue_labels, fix_attempts.issue_labels)
+                issue_labels = COALESCE(excluded.issue_labels, fix_attempts.issue_labels),
+                reset_at = NULL
+            WHERE fix_attempts.reset_at IS NOT NULL
             "#,
             params![source, issue_id, short_id, labels_json],
         )?;
-        tracing::info!(
-            source = source,
-            issue_id = issue_id,
-            rows_affected = rows_affected,
-            "Fix attempt recorded"
-        );
+        if rows_affected == 0 {
+            tracing::warn!(
+                source = source,
+                issue_id = issue_id,
+                "Attempt already exists and is not in reset state, skipping"
+            );
+        } else {
+            tracing::info!(
+                source = source,
+                issue_id = issue_id,
+                rows_affected = rows_affected,
+                "Fix attempt recorded"
+            );
+        }
         Ok(())
     }
 
@@ -1691,8 +1905,24 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn reset_attempt(&self, source: &str, issue_id: &str) -> Result<()> {
         let conn = self.acquire_lock()?;
+        // Soft reset: preserve the row (and FK references) but mark it for re-processing.
+        // The reset_at timestamp signals has_attempted/get_attempted_issue_ids to treat
+        // this issue as "not yet attempted" so it will be picked up again.
         conn.execute(
-            "DELETE FROM fix_attempts WHERE source = ? AND issue_id = ?",
+            r#"
+            UPDATE fix_attempts
+            SET status = 'pending',
+                retry_count = 0,
+                reset_at = datetime('now'),
+                pr_url = NULL,
+                github_repo = NULL,
+                github_pr_number = NULL,
+                error_message = NULL,
+                merged_at = NULL,
+                resolved_at = NULL,
+                attempted_at = datetime('now')
+            WHERE source = ? AND issue_id = ?
+            "#,
             params![source, issue_id],
         )?;
         Ok(())
@@ -1762,19 +1992,35 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn prepare_for_retry(&self, source: &str, issue_id: &str) -> Result<()> {
         let conn = self.acquire_lock()?;
-        conn.execute(
+        // Atomically increment retry count and reset status in one statement.
+        // Guard with status check to prevent overwriting active/succeeded attempts.
+        let rows_affected = conn.execute(
             r#"
             UPDATE fix_attempts
             SET status = 'pending',
+                retry_count = COALESCE(retry_count, 0) + 1,
+                last_retry_at = datetime('now'),
                 pr_url = NULL,
                 github_repo = NULL,
                 github_pr_number = NULL,
                 error_message = NULL,
                 attempted_at = datetime('now')
             WHERE source = ? AND issue_id = ?
+              AND status IN ('failed', 'closed')
             "#,
             params![source, issue_id],
         )?;
+        if rows_affected == 0 {
+            tracing::warn!(
+                source = source,
+                issue_id = issue_id,
+                "prepare_for_retry: no rows updated (attempt not in retryable state)"
+            );
+            return Err(crate::error::Error::Storage(format!(
+                "Attempt {}/{} not in retryable state (failed/closed)",
+                source, issue_id
+            )));
+        }
         Ok(())
     }
 
@@ -2169,6 +2415,32 @@ impl FixAttemptTracker for SqliteTracker {
         window_minutes: i64,
     ) -> Result<Vec<(String, DateTime<Utc>)>> {
         SqliteTracker::get_recent_issue_arrivals(self, source, window_minutes)
+    }
+}
+
+impl SqliteTracker {
+    /// Check if a webhook delivery ID has been seen, and record it if not.
+    /// Returns true if this is a new delivery, false if it's a duplicate.
+    pub fn check_and_record_delivery(&self, delivery_id: &str, source: &str) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let rows_affected = conn.execute(
+            "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, source) VALUES (?, ?)",
+            params![delivery_id, source],
+        )?;
+        Ok(rows_affected > 0)
+    }
+
+    /// Remove webhook delivery records older than the specified number of hours.
+    pub fn cleanup_old_deliveries(&self, max_age_hours: u64) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let rows = conn.execute(
+            "DELETE FROM webhook_deliveries WHERE received_at < datetime('now', ?)",
+            params![format!("-{} hours", max_age_hours)],
+        )?;
+        if rows > 0 {
+            tracing::debug!(rows = rows, "Cleaned up old webhook deliveries");
+        }
+        Ok(rows)
     }
 }
 
@@ -2850,12 +3122,11 @@ impl SqliteTracker {
     pub fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
-        // Serialize the embedding vector to bytes
-        let embedding_bytes: Vec<u8> = embedding
-            .embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        // Serialize the embedding vector to bytes (pre-allocated)
+        let mut embedding_bytes = Vec::with_capacity(embedding.embedding.len() * 4);
+        for f in &embedding.embedding {
+            embedding_bytes.extend_from_slice(&f.to_le_bytes());
+        }
 
         conn.execute(
             r#"
@@ -2876,7 +3147,75 @@ impl SqliteTracker {
                 embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+
+        // Dual-write: upsert into HNSW vector table (get row ID reliably via SELECT)
+        let row_id: i64 = conn.query_row(
+            "SELECT id FROM issue_embeddings WHERE source = ?1 AND issue_id = ?2",
+            params![embedding.source, embedding.issue_id],
+            |row| row.get(0),
+        )?;
+        if let Err(e) = Self::upsert_issue_vector_embedding(&conn, row_id, &embedding.embedding) {
+            tracing::debug!(error = %e, "Failed to upsert issue vector embedding");
+        }
+
+        Ok(row_id)
+    }
+
+    /// Store multiple embeddings in a single transaction.
+    ///
+    /// Much more efficient than calling `store_embedding` in a loop because
+    /// the mutex is acquired once and all inserts share one transaction.
+    pub fn store_embeddings_batch(&self, embeddings: &[IssueEmbedding]) -> Result<()> {
+        if embeddings.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        {
+            let mut stmt = tx.prepare_cached(
+                r#"
+                INSERT INTO issue_embeddings (source, issue_id, short_id, title, embedding, embedding_model, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, issue_id) DO UPDATE SET
+                    embedding = excluded.embedding,
+                    embedding_model = excluded.embedding_model,
+                    created_at = excluded.created_at
+                "#,
+            )?;
+
+            for embedding in embeddings {
+                let mut embedding_bytes = Vec::with_capacity(embedding.embedding.len() * 4);
+                for f in &embedding.embedding {
+                    embedding_bytes.extend_from_slice(&f.to_le_bytes());
+                }
+
+                stmt.execute(params![
+                    embedding.source,
+                    embedding.issue_id,
+                    embedding.short_id,
+                    embedding.title,
+                    embedding_bytes,
+                    embedding.embedding_model,
+                    embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                ])?;
+
+                // Dual-write: upsert into HNSW vector table
+                let row_id: i64 = tx.query_row(
+                    "SELECT id FROM issue_embeddings WHERE source = ?1 AND issue_id = ?2",
+                    params![embedding.source, embedding.issue_id],
+                    |row| row.get(0),
+                )?;
+                if let Err(e) =
+                    Self::upsert_issue_vector_embedding(&tx, row_id, &embedding.embedding)
+                {
+                    tracing::debug!(error = %e, "Failed to upsert issue vector embedding in batch");
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
     }
 
     /// Get an embedding by source and issue ID.
@@ -3012,6 +3351,238 @@ impl SqliteTracker {
             .map_err(|e| crate::error::Error::Storage(format!("Failed to read embeddings: {}", e)))
     }
 
+    /// Find similar issue embeddings using the HNSW vector index.
+    ///
+    /// Returns `None` if vectorlite is unavailable.
+    /// Returns `Some(vec)` with matching embeddings and similarity scores.
+    pub fn find_similar_issues_vector(
+        &self,
+        query_embedding: &[f32],
+        source: &str,
+        exclude_issue_id: Option<&str>,
+        min_similarity: f64,
+        limit: usize,
+    ) -> Result<Option<Vec<(IssueEmbedding, f64)>>> {
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let conn = self.acquire_lock()?;
+
+        if !Self::ensure_issue_vector_table(&conn, query_embedding.len())? {
+            return Ok(None);
+        }
+
+        let query_blob: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let candidate_limit = limit * ISSUE_VECTOR_CANDIDATE_MULTIPLIER;
+
+        let sql = format!(
+            r#"
+            WITH candidates AS (
+                SELECT rowid AS emb_id,
+                       MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
+                FROM {table}
+                WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
+            )
+            SELECT e.id, e.source, e.issue_id, e.short_id, e.title, e.embedding,
+                   e.embedding_model, e.created_at, c.similarity
+            FROM candidates c
+            JOIN issue_embeddings e ON e.id = c.emb_id
+            WHERE e.source = ?4
+              AND (?5 IS NULL OR e.issue_id != ?5)
+              AND c.similarity >= ?6
+            ORDER BY c.similarity DESC
+            LIMIT ?7
+            "#,
+            table = ISSUE_VECTOR_TABLE
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to prepare issue vector search query");
+                return Ok(None);
+            }
+        };
+
+        let rows = match stmt.query_map(
+            params![
+                query_blob,
+                candidate_limit as i64,
+                ISSUE_VECTOR_EF_SEARCH as i64,
+                source,
+                exclude_issue_id,
+                min_similarity,
+                limit as i64
+            ],
+            |row| {
+                let embedding_bytes: Vec<u8> = row.get(5)?;
+                let embedding: Vec<f32> = embedding_bytes
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        let arr: [u8; 4] =
+                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
+                        f32::from_le_bytes(arr)
+                    })
+                    .collect();
+
+                let ie = IssueEmbedding {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    issue_id: row.get(2)?,
+                    short_id: row.get(3)?,
+                    title: row.get(4)?,
+                    embedding,
+                    embedding_model: row.get(6)?,
+                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
+                };
+                let similarity: f64 = row.get(8)?;
+                Ok((ie, similarity))
+            },
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(error = %e, "Issue vector search query failed");
+                return Ok(None);
+            }
+        };
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(r) => results.push(r),
+                Err(e) => tracing::debug!(error = %e, "Failed to read issue vector row"),
+            }
+        }
+
+        Ok(Some(results))
+    }
+
+    /// Find similar outcome embeddings using the HNSW vector index.
+    ///
+    /// Returns `None` if vectorlite is unavailable (caller should fall back).
+    /// Returns `Some(vec)` with matching outcomes and similarity scores.
+    pub fn find_similar_outcomes_vector(
+        &self,
+        query_embedding: &[f32],
+        min_similarity: f64,
+        limit: usize,
+    ) -> Result<Option<Vec<(FixOutcome, f64)>>> {
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let conn = self.acquire_lock()?;
+
+        if !Self::ensure_outcome_vector_table(&conn, query_embedding.len())? {
+            return Ok(None);
+        }
+
+        let query_blob: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let candidate_limit = limit * OUTCOME_VECTOR_CANDIDATE_MULTIPLIER;
+
+        let sql = format!(
+            r#"
+            WITH candidates AS (
+                SELECT rowid AS outcome_id,
+                       MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
+                FROM {table}
+                WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
+            )
+            SELECT f.id, f.attempt_id, f.source, f.issue_id, f.issue_text, f.prompt_used,
+                   f.outcome, f.error_type, f.learnings, f.keywords, f.created_at,
+                   f.embedding, c.similarity
+            FROM candidates c
+            JOIN feedback_outcomes f ON f.id = c.outcome_id
+            WHERE c.similarity >= ?4
+            ORDER BY c.similarity DESC
+            LIMIT ?5
+            "#,
+            table = OUTCOME_VECTOR_TABLE
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to prepare outcome vector search query");
+                return Ok(None);
+            }
+        };
+
+        let rows = match stmt.query_map(
+            params![
+                query_blob,
+                candidate_limit as i64,
+                OUTCOME_VECTOR_EF_SEARCH as i64,
+                min_similarity,
+                limit as i64
+            ],
+            |row| {
+                let outcome_str: String = row.get(6)?;
+                let keywords_str: Option<String> = row.get(9)?;
+                let created_at_str: String = row.get(10)?;
+
+                // Deserialize embedding BLOB if present
+                let embedding_blob: Option<Vec<u8>> = row.get(11)?;
+                let embedding = embedding_blob.and_then(|blob| {
+                    if blob.len() % 4 != 0 {
+                        return None;
+                    }
+                    Some(
+                        blob.chunks_exact(4)
+                            .map(|chunk| {
+                                let arr: [u8; 4] =
+                                    chunk.try_into().expect("chunks_exact guarantees 4 bytes");
+                                f32::from_le_bytes(arr)
+                            })
+                            .collect(),
+                    )
+                });
+
+                let fo = FixOutcome {
+                    id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    source: row.get(2)?,
+                    issue_id: row.get(3)?,
+                    issue_text: row.get(4)?,
+                    prompt_used: row.get(5)?,
+                    outcome: Outcome::parse(&outcome_str).unwrap_or(Outcome::Failed),
+                    error_type: row.get(7)?,
+                    learnings: row.get(8)?,
+                    keywords: keywords_str
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    embedding,
+                    created_at: Self::parse_datetime(&created_at_str),
+                };
+                let similarity: f64 = row.get(12)?;
+                Ok((fo, similarity))
+            },
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(error = %e, "Outcome vector search query failed");
+                return Ok(None);
+            }
+        };
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(r) => results.push(r),
+                Err(e) => tracing::debug!(error = %e, "Failed to read outcome vector row"),
+            }
+        }
+
+        Ok(Some(results))
+    }
+
     /// Record or update an error pattern.
     pub fn record_error_pattern(&self, pattern: &ErrorPattern) -> Result<i64> {
         let conn = self.acquire_lock()?;
@@ -3093,10 +3664,16 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let keywords_json = serde_json::to_string(&outcome.keywords).unwrap_or_default();
 
+        // Serialize embedding to BLOB if present
+        let embedding_blob: Option<Vec<u8>> = outcome
+            .embedding
+            .as_ref()
+            .map(|emb| emb.iter().flat_map(|f| f.to_le_bytes()).collect());
+
         conn.execute(
             r#"
-            INSERT INTO feedback_outcomes (attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO feedback_outcomes (attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at, embedding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 outcome.attempt_id,
@@ -3109,9 +3686,19 @@ impl SqliteTracker {
                 outcome.learnings,
                 keywords_json,
                 outcome.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                embedding_blob,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let row_id = conn.last_insert_rowid();
+
+        // Dual-write: upsert into HNSW vector table if embedding is present
+        if let Some(ref emb) = outcome.embedding {
+            if let Err(e) = Self::upsert_outcome_vector_embedding(&conn, row_id, emb) {
+                tracing::debug!(error = %e, "Failed to upsert outcome vector embedding");
+            }
+        }
+
+        Ok(row_id)
     }
 
     /// Retrieve feedback outcomes with optional source filter.
@@ -3125,7 +3712,7 @@ impl SqliteTracker {
         let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match source {
             Some(s) => (
                 r#"
-                SELECT id, attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at
+                SELECT id, attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at, embedding
                 FROM feedback_outcomes
                 WHERE source = ?
                 ORDER BY created_at DESC
@@ -3135,7 +3722,7 @@ impl SqliteTracker {
             ),
             None => (
                 r#"
-                SELECT id, attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at
+                SELECT id, attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at, embedding
                 FROM feedback_outcomes
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -3161,7 +3748,7 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at
+            SELECT id, attempt_id, source, issue_id, issue_text, prompt_used, outcome, error_type, learnings, keywords, created_at, embedding
             FROM feedback_outcomes
             WHERE attempt_id = ?
             LIMIT 1
@@ -3426,10 +4013,29 @@ impl SqliteTracker {
     }
 
     /// Map a database row to a FixOutcome.
+    /// Expected column order: id, attempt_id, source, issue_id, issue_text,
+    /// prompt_used, outcome, error_type, learnings, keywords, created_at, embedding
     fn row_to_fix_outcome(row: &rusqlite::Row) -> rusqlite::Result<FixOutcome> {
         let outcome_str: String = row.get(6)?;
         let keywords_str: Option<String> = row.get(9)?;
         let created_at_str: String = row.get(10)?;
+
+        // Deserialize embedding BLOB if present (column 11)
+        let embedding_blob: Option<Vec<u8>> = row.get(11).unwrap_or(None);
+        let embedding = embedding_blob.and_then(|blob| {
+            if blob.len() % 4 != 0 {
+                return None;
+            }
+            Some(
+                blob.chunks_exact(4)
+                    .map(|chunk| {
+                        let arr: [u8; 4] =
+                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
+                        f32::from_le_bytes(arr)
+                    })
+                    .collect(),
+            )
+        });
 
         Ok(FixOutcome {
             id: row.get(0)?,
@@ -3444,7 +4050,7 @@ impl SqliteTracker {
             keywords: keywords_str
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default(),
-            embedding: None,
+            embedding,
             created_at: Self::parse_datetime(&created_at_str),
         })
     }
@@ -3875,6 +4481,62 @@ impl SqliteTracker {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Store multiple similar issue relationships in a single transaction.
+    pub fn store_similar_issues_batch(&self, similar_issues: &[SimilarIssue]) -> Result<()> {
+        if similar_issues.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare_cached(
+                r#"
+                INSERT INTO similar_issues (source_issue_id, similar_issue_id, similarity_score, computed_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_issue_id, similar_issue_id) DO UPDATE SET
+                    similarity_score = excluded.similarity_score,
+                    computed_at = excluded.computed_at
+                "#,
+            )?;
+            for similar in similar_issues {
+                stmt.execute(params![
+                    similar.source_issue_id,
+                    similar.similar_issue_id,
+                    similar.similarity_score,
+                    similar.computed_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get fix attempts for multiple (source, issue_id) pairs in a single query.
+    pub fn get_attempts_batch(&self, keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.acquire_lock()?;
+        let mut results = Vec::with_capacity(keys.len());
+        // Use a prepared statement to amortize compilation cost across the batch.
+        let mut stmt = conn.prepare_cached(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                   github_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE source = ? AND issue_id = ?
+            "#,
+        )?;
+        for (source, issue_id) in keys {
+            let attempt = stmt
+                .query_row(params![source, issue_id], Self::row_to_fix_attempt)
+                .ok();
+            results.push(attempt);
+        }
+        Ok(results)
     }
 
     /// Find similar issues for a given issue.
@@ -6558,10 +7220,27 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/1")
+            .unwrap();
         assert!(tracker.has_attempted("linear", "123").unwrap());
 
+        // Soft reset: has_attempted returns false, but the row is preserved
         tracker.reset_attempt("linear", "123").unwrap();
         assert!(!tracker.has_attempted("linear", "123").unwrap());
+
+        // Row still exists with pending status and reset fields cleared
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Pending);
+        assert_eq!(attempt.retry_count, 0);
+        assert!(attempt.pr_url.is_none());
+        assert!(attempt.error_message.is_none());
+        assert!(attempt.merged_at.is_none());
+        assert!(attempt.resolved_at.is_none());
+
+        // get_attempted_issue_ids also excludes reset entries
+        let ids = tracker.get_attempted_issue_ids("linear");
+        assert!(!ids.contains("123"));
     }
 
     #[test]
@@ -6731,7 +7410,7 @@ mod tests {
             .unwrap();
         tracker.mark_closed("linear", "123").unwrap();
 
-        // Prepare for retry should reset to pending
+        // Prepare for retry should reset to pending and increment retry_count
         tracker.prepare_for_retry("linear", "123").unwrap();
 
         let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
@@ -6740,6 +7419,31 @@ mod tests {
         assert!(attempt.github_repo.is_none());
         assert!(attempt.github_pr_number.is_none());
         assert!(attempt.error_message.is_none());
+        assert_eq!(attempt.retry_count, 1);
+        assert!(attempt.last_retry_at.is_some());
+    }
+
+    #[test]
+    fn test_prepare_for_retry_rejects_non_retryable_status() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Pending attempt should not be retryable
+        tracker.record_attempt("linear", "1", "PROJ-1").unwrap();
+        assert!(tracker.prepare_for_retry("linear", "1").is_err());
+
+        // Success attempt should not be retryable
+        tracker.record_attempt("linear", "2", "PROJ-2").unwrap();
+        tracker
+            .mark_success("linear", "2", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        assert!(tracker.prepare_for_retry("linear", "2").is_err());
+
+        // Cannot_fix attempt should not be retryable
+        tracker.record_attempt("linear", "3", "PROJ-3").unwrap();
+        tracker
+            .mark_cannot_fix("linear", "3", "Max retries")
+            .unwrap();
+        assert!(tracker.prepare_for_retry("linear", "3").is_err());
     }
 
     #[test]
@@ -6888,43 +7592,47 @@ mod tests {
             .mark_success("linear", "123", "https://github.com/org/repo/pull/1")
             .unwrap();
 
-        // Backdate attempted_at so we can verify the upsert refreshes it.
-        {
-            let conn = tracker.acquire_lock().unwrap();
-            conn.execute(
-                "UPDATE fix_attempts SET attempted_at = ? WHERE source = ? AND issue_id = ?",
-                params!["2000-01-01 00:00:00", "linear", "123"],
-            )
-            .unwrap();
-        }
-        let before = tracker
-            .get_attempt("linear", "123")
-            .unwrap()
-            .unwrap()
-            .attempted_at;
-        assert_eq!(
-            before,
-            chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc)
-        );
-
-        // Record again - using ON CONFLICT DO UPDATE, this should only update
-        // short_id and attempted_at, preserving status and pr_url.
+        // Record again — conditional upsert should NOT overwrite an already-processed
+        // attempt (no reset_at set), so the row should remain unchanged.
         tracker
             .record_attempt("linear", "123", "PROJ-123-v2")
             .unwrap();
 
         let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
-        // short_id should be updated
-        assert_eq!(attempt.short_id, "PROJ-123-v2");
-        // status and pr_url should be preserved (not reset)
+        // short_id should NOT be updated (conditional upsert skipped)
+        assert_eq!(attempt.short_id, "PROJ-123");
+        // status and pr_url should be preserved
         assert_eq!(attempt.status, FixAttemptStatus::Success);
         assert_eq!(
             attempt.pr_url,
             Some("https://github.com/org/repo/pull/1".to_string())
         );
-        assert!(attempt.attempted_at > before);
+    }
+
+    #[test]
+    fn test_record_attempt_upsert_works_after_reset() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Record and process
+        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
+        tracker
+            .mark_success("linear", "123", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        // Soft reset
+        tracker.reset_attempt("linear", "123").unwrap();
+
+        // Record again — conditional upsert SHOULD update because reset_at IS NOT NULL
+        tracker
+            .record_attempt("linear", "123", "PROJ-123-v2")
+            .unwrap();
+
+        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
+        // short_id should be updated (upsert fires for reset entries)
+        assert_eq!(attempt.short_id, "PROJ-123-v2");
+        assert_eq!(attempt.status, FixAttemptStatus::Pending);
+        // pr_url was cleared by reset
+        assert!(attempt.pr_url.is_none());
     }
 
     #[test]
@@ -9573,8 +10281,7 @@ mod tests {
         assert_eq!(attempt.status, FixAttemptStatus::Failed);
         assert_eq!(attempt.error_message, Some("Build error".to_string()));
 
-        // Increment retry count, then prepare for retry
-        tracker.increment_retry("linear", "retry-issue").unwrap();
+        // prepare_for_retry atomically increments retry_count and resets status
         tracker.prepare_for_retry("linear", "retry-issue").unwrap();
         let attempt = tracker
             .get_attempt("linear", "retry-issue")

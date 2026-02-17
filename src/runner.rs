@@ -63,16 +63,21 @@ pub struct ClaudeRunner {
     config: ClaudeRunnerConfig,
     template_renderer: TemplateRenderer,
     tracker: Arc<dyn FixAttemptTracker>,
+    /// Cached base environment variables, captured once at construction time.
+    /// Cloned per-invocation instead of re-reading the entire process environment.
+    base_env: HashMap<String, String>,
 }
 
 impl ClaudeRunner {
     /// Create a new Claude runner.
     pub fn new(config: ClaudeRunnerConfig, tracker: Arc<dyn FixAttemptTracker>) -> Self {
         let template_renderer = TemplateRenderer::new();
+        let base_env: HashMap<String, String> = std::env::vars().collect();
         Self {
             config,
             template_renderer,
             tracker,
+            base_env,
         }
     }
 
@@ -104,7 +109,7 @@ impl ClaudeRunner {
     ) -> Result<ClaudeResult> {
         tracing::info!(component = "claude", issue_id = %issue_identifier, "Running /issue skill");
 
-        let mut env: HashMap<String, String> = std::env::vars().collect();
+        let mut env = self.base_env.clone();
         env.insert("LINEAR_ISSUE_ID".to_string(), issue_identifier.to_string());
         env.insert("LINEAR_ISSUE_URL".to_string(), issue_url.to_string());
 
@@ -131,7 +136,8 @@ impl ClaudeRunner {
                 TemplateContext::new(issue.clone(), context.to_string()).with_agent_md(agent_md);
             return Self::append_question_protocol(
                 &self.template_renderer.render(&template, &template_context),
-            );
+            )
+            .into_owned();
         }
 
         // Fallback to simple format
@@ -154,7 +160,7 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
             issue.source, context, issue.short_id
         );
 
-        Self::append_question_protocol(&prompt)
+        Self::append_question_protocol(&prompt).into_owned()
     }
 
     /// Check if a project has an AGENT.md file.
@@ -184,6 +190,11 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
     /// Best-effort detection for Claude/API rate limit failures.
     pub fn is_rate_limit_error(message: &str) -> bool {
         let lower = message.to_lowercase();
+        Self::is_rate_limit_error_lower(&lower)
+    }
+
+    /// Rate-limit detection on an already-lowercased string (avoids double allocation).
+    fn is_rate_limit_error_lower(lower: &str) -> bool {
         [
             "rate limit",
             "ratelimit",
@@ -201,7 +212,7 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
     /// Detect "hard" runtime failures that should be escalated immediately.
     pub fn is_hard_error(message: &str) -> bool {
         let lower = message.to_lowercase();
-        Self::is_rate_limit_error(message)
+        Self::is_rate_limit_error_lower(&lower)
             || [
                 "failed to spawn claude",
                 "failed to wait for claude",
@@ -273,28 +284,27 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
     }
 
     fn compose_failure_message(exit_code: i32, stdout_output: &str, stderr_output: &str) -> String {
+        use std::borrow::Cow;
+
         let stderr_trimmed = stderr_output.trim();
         let stdout_trimmed = stdout_output.trim();
-        let combined = if stderr_trimmed.is_empty() {
-            stdout_trimmed.to_string()
+        let combined: Cow<'_, str> = if stderr_trimmed.is_empty() {
+            Cow::Borrowed(stdout_trimmed)
         } else if stdout_trimmed.is_empty() {
-            stderr_trimmed.to_string()
+            Cow::Borrowed(stderr_trimmed)
         } else {
-            format!("{}\n{}", stderr_trimmed, stdout_trimmed)
+            Cow::Owned(format!("{}\n{}", stderr_trimmed, stdout_trimmed))
         };
 
         if Self::is_rate_limit_error(&combined) {
+            let msg = if combined.is_empty() {
+                "Too many requests"
+            } else {
+                &combined
+            };
             return format!(
                 "Claude rate limit hit: {}",
-                Self::truncate(
-                    if combined.is_empty() {
-                        "Too many requests".to_string()
-                    } else {
-                        combined
-                    }
-                    .as_str(),
-                    EXECUTION_LOG_PREVIEW_LIMIT
-                )
+                Self::truncate(msg, EXECUTION_LOG_PREVIEW_LIMIT)
             );
         }
 
@@ -313,11 +323,14 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         format!("Process exited with code {}", exit_code)
     }
 
-    fn append_question_protocol(prompt: &str) -> String {
+    fn append_question_protocol(prompt: &str) -> std::borrow::Cow<'_, str> {
         if prompt.contains(QUESTION_PROTOCOL_PREFIX) {
-            prompt.to_string()
+            std::borrow::Cow::Borrowed(prompt)
         } else {
-            format!("{prompt}\n\n{}", QUESTION_PROTOCOL_INSTRUCTIONS.trim())
+            std::borrow::Cow::Owned(format!(
+                "{prompt}\n\n{}",
+                QUESTION_PROTOCOL_INSTRUCTIONS.trim()
+            ))
         }
     }
 
@@ -390,7 +403,7 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         issue: Option<&Issue>,
         project_dir: &Path,
     ) -> Result<ClaudeResult> {
-        let mut env: HashMap<String, String> = std::env::vars().collect();
+        let mut env = self.base_env.clone();
 
         if let Some(issue) = issue {
             let source_upper = issue.source.to_uppercase();
@@ -425,7 +438,7 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         attempt_id: Option<i64>,
         project_dir: &Path,
     ) -> Result<ClaudeResult> {
-        let mut env: HashMap<String, String> = std::env::vars().collect();
+        let mut env = self.base_env.clone();
 
         if let Some(issue) = issue {
             let source_upper = issue.source.to_uppercase();
@@ -455,7 +468,7 @@ After creating the PR, output the PR URL on a line by itself starting with "PR_U
         if let Some(id) = attempt_id {
             execution = execution.with_attempt_id(id);
         }
-        let prompt_with_protocol = Self::append_question_protocol(prompt);
+        let prompt_with_protocol = Self::append_question_protocol(prompt).into_owned();
         execution.prompt_used = Some(prompt_with_protocol.clone());
         execution.prompt_hash = Some(Self::hash_prompt(&prompt_with_protocol));
         execution.model_version = Some(

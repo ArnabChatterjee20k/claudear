@@ -23,10 +23,9 @@ impl RetryManager {
 
     /// Check if an attempt should be retried.
     pub fn should_retry(&self, attempt: &FixAttempt) -> bool {
-        // Retry failed/closed attempts and recover stale pending attempts
-        if attempt.status != FixAttemptStatus::Failed
-            && attempt.status != FixAttemptStatus::Closed
-            && attempt.status != FixAttemptStatus::Pending
+        // Only retry failed/closed attempts. Pending attempts are either actively
+        // processing or freshly recorded — never eligible for retry.
+        if attempt.status != FixAttemptStatus::Failed && attempt.status != FixAttemptStatus::Closed
         {
             return false;
         }
@@ -49,7 +48,11 @@ impl RetryManager {
         let min_retry_time = attempt
             .last_retry_at
             .or(Some(attempt.attempted_at))
-            .map(|t| t + ChronoDuration::milliseconds(delay.as_millis() as i64))
+            .map(|t| {
+                t + ChronoDuration::milliseconds(
+                    i64::try_from(delay.as_millis()).unwrap_or(i64::MAX),
+                )
+            })
             .unwrap_or(Utc::now());
 
         Utc::now() >= min_retry_time
@@ -72,7 +75,12 @@ impl RetryManager {
 
         let delay = self.get_delay(attempt.retry_count);
         let base_time = attempt.last_retry_at.unwrap_or(attempt.attempted_at);
-        Some(base_time + ChronoDuration::milliseconds(delay.as_millis() as i64))
+        Some(
+            base_time
+                + ChronoDuration::milliseconds(
+                    i64::try_from(delay.as_millis()).unwrap_or(i64::MAX),
+                ),
+        )
     }
 
     /// Process a failed attempt - either schedule retry or mark as cannot fix.
@@ -115,8 +123,10 @@ impl RetryManager {
 
                     // Use current retry_count for delay calculation (0 = waiting for first retry, 1 = waiting for second, etc.)
                     let delay = self.get_delay(attempt.retry_count);
-                    let next_retry_time =
-                        Utc::now() + ChronoDuration::milliseconds(delay.as_millis() as i64);
+                    let next_retry_time = Utc::now()
+                        + ChronoDuration::milliseconds(
+                            i64::try_from(delay.as_millis()).unwrap_or(i64::MAX),
+                        );
 
                     tracing::info!(
                         component = "retry",
@@ -180,14 +190,16 @@ impl RetryManager {
     }
 
     /// Prepare an attempt for retry - resets status and clears PR info.
+    /// The retry count increment is done atomically inside prepare_for_retry.
     pub fn prepare_retry(&self, source: &str, issue_id: &str) -> Result<()> {
-        // Get attempt info before incrementing
+        // Get attempt info before preparing
         let attempt = self.tracker.get_attempt(source, issue_id)?;
         let (short_id, retry_count) = attempt
             .map(|a| (a.short_id.clone(), a.retry_count + 1))
             .unwrap_or_else(|| (issue_id.to_string(), 1));
 
-        self.tracker.increment_retry(source, issue_id)?;
+        // Atomically increments retry_count AND resets status to pending.
+        // Guarded: only succeeds if status is 'failed' or 'closed'.
         self.tracker.prepare_for_retry(source, issue_id)?;
 
         // Log retry_executed activity
@@ -287,7 +299,7 @@ mod tests {
             status: FixAttemptStatus::Pending,
             ..failed.clone()
         };
-        assert!(manager.should_retry(&pending));
+        assert!(!manager.should_retry(&pending));
 
         let success = FixAttempt {
             status: FixAttemptStatus::Success,

@@ -59,8 +59,8 @@ pub use error::{Error, Result};
 pub use feedback::{
     cosine_similarity, euclidean_distance, format_similar_issues_context, normalize,
     EmbeddingClient, EmbeddingConfig, EmbeddingResult, FeedbackAnalyzer, FixOutcome,
-    IssueEmbeddingConfig, IssueEmbeddingService, MemoryVectorStore, Outcome, PromptSuggestion,
-    SimilarIssue, SimilarIssueWithDetails,
+    IssueEmbeddingConfig, IssueEmbeddingService, Outcome, PromptSuggestion, SimilarIssue,
+    SimilarIssueWithDetails,
 };
 pub use github::{
     GitHubClient, GitHubUser, PrMonitor, PrReview, PrReviewComment, PrReviewState, PrStatus,

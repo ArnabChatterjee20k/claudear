@@ -4,8 +4,7 @@
 
 use crate::error::{Error, Result};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Configuration for the embedding service.
 #[derive(Debug, Clone)]
@@ -115,28 +114,49 @@ impl EmbeddingClient {
     }
 
     /// Generate embedding for text.
+    ///
+    /// Uses `spawn_blocking` because ONNX inference is CPU-bound and would
+    /// otherwise block a tokio worker thread.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let mut model = self.model.lock().await;
+        let model = self.model.clone();
+        let text = text.to_string();
 
-        let embeddings = model
-            .embed(vec![text], None)
-            .map_err(|e| Error::Other(format!("Failed to generate embedding: {}", e)))?;
+        tokio::task::spawn_blocking(move || {
+            let mut model = model
+                .lock()
+                .map_err(|e| Error::Other(format!("Embedding model lock poisoned: {}", e)))?;
 
-        embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Other("No embedding returned".to_string()))
+            let embeddings = model
+                .embed(vec![&text], None)
+                .map_err(|e| Error::Other(format!("Failed to generate embedding: {}", e)))?;
+
+            embeddings
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Other("No embedding returned".to_string()))
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Embedding task panicked: {}", e)))?
     }
 
     /// Generate embeddings for multiple texts.
+    ///
+    /// Uses `spawn_blocking` because ONNX inference is CPU-bound.
     pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let mut model = self.model.lock().await;
-
+        let model = self.model.clone();
         let texts_owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
 
-        model
-            .embed(texts_owned, None)
-            .map_err(|e| Error::Other(format!("Failed to generate embeddings: {}", e)))
+        tokio::task::spawn_blocking(move || {
+            let mut model = model
+                .lock()
+                .map_err(|e| Error::Other(format!("Embedding model lock poisoned: {}", e)))?;
+
+            model
+                .embed(texts_owned, None)
+                .map_err(|e| Error::Other(format!("Failed to generate embeddings: {}", e)))
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Embedding batch task panicked: {}", e)))?
     }
 
     /// Check if the embedding model is available.
@@ -156,20 +176,20 @@ impl EmbeddingClient {
 }
 
 /// Calculate cosine similarity between two vectors.
+///
+/// Uses an iterator pattern that is more amenable to LLVM auto-vectorization
+/// than an indexed loop, which can yield significant speedups on 768-dim vectors.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
 
-    let mut dot_product = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-
-    for i in 0..a.len() {
-        dot_product += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
+    let (dot_product, norm_a, norm_b) = a
+        .iter()
+        .zip(b.iter())
+        .fold((0.0f32, 0.0f32, 0.0f32), |(dot, na, nb), (&x, &y)| {
+            (dot + x * y, na + x * x, nb + y * y)
+        });
 
     let norm_a = norm_a.sqrt();
     let norm_b = norm_b.sqrt();
@@ -212,77 +232,6 @@ pub struct EmbeddingResult {
     pub similarity: f32,
     /// The original text (optional).
     pub text: Option<String>,
-}
-
-/// In-memory vector store for testing and small-scale use.
-pub struct MemoryVectorStore {
-    embeddings: Vec<(i64, Vec<f32>, Option<String>)>,
-}
-
-impl MemoryVectorStore {
-    /// Create a new empty vector store.
-    pub fn new() -> Self {
-        Self {
-            embeddings: Vec::new(),
-        }
-    }
-
-    /// Add an embedding to the store.
-    pub fn add(&mut self, id: i64, embedding: Vec<f32>, text: Option<String>) {
-        self.embeddings.push((id, embedding, text));
-    }
-
-    /// Remove an embedding by ID.
-    pub fn remove(&mut self, id: i64) {
-        self.embeddings.retain(|(i, _, _)| *i != id);
-    }
-
-    /// Search for similar embeddings.
-    pub fn search(&self, query: &[f32], limit: usize, min_similarity: f32) -> Vec<EmbeddingResult> {
-        let mut results: Vec<_> = self
-            .embeddings
-            .iter()
-            .map(|(id, emb, text)| {
-                let similarity = cosine_similarity(query, emb);
-                EmbeddingResult {
-                    id: *id,
-                    similarity,
-                    text: text.clone(),
-                }
-            })
-            .filter(|r| r.similarity >= min_similarity)
-            .collect();
-
-        results.sort_by(|a, b| {
-            b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        results.truncate(limit);
-        results
-    }
-
-    /// Get the number of embeddings in the store.
-    pub fn len(&self) -> usize {
-        self.embeddings.len()
-    }
-
-    /// Check if the store is empty.
-    pub fn is_empty(&self) -> bool {
-        self.embeddings.is_empty()
-    }
-
-    /// Clear all embeddings.
-    pub fn clear(&mut self) {
-        self.embeddings.clear();
-    }
-}
-
-impl Default for MemoryVectorStore {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[cfg(test)]
@@ -359,53 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_vector_store() {
-        let mut store = MemoryVectorStore::new();
-
-        store.add(1, vec![1.0, 0.0, 0.0], Some("First".to_string()));
-        store.add(2, vec![0.9, 0.1, 0.0], Some("Second".to_string()));
-        store.add(3, vec![0.0, 1.0, 0.0], Some("Third".to_string()));
-
-        assert_eq!(store.len(), 3);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let results = store.search(&query, 2, 0.0);
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, 1);
-        assert_eq!(results[1].id, 2);
-    }
-
-    #[test]
-    fn test_memory_vector_store_min_similarity() {
-        let mut store = MemoryVectorStore::new();
-
-        store.add(1, vec![1.0, 0.0, 0.0], None);
-        store.add(2, vec![0.0, 1.0, 0.0], None);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let results = store.search(&query, 10, 0.9);
-
-        // Only the first item should match with similarity >= 0.9
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, 1);
-    }
-
-    #[test]
-    fn test_memory_vector_store_remove() {
-        let mut store = MemoryVectorStore::new();
-
-        store.add(1, vec![1.0, 0.0], None);
-        store.add(2, vec![0.0, 1.0], None);
-
-        assert_eq!(store.len(), 2);
-
-        store.remove(1);
-
-        assert_eq!(store.len(), 1);
-    }
-
-    #[test]
     fn test_embedding_config_default() {
         let config = EmbeddingConfig::default();
         assert!(matches!(config.model, EmbeddingModel::NomicEmbedTextV15));
@@ -470,41 +372,6 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_vector_store_search_empty() {
-        let store = MemoryVectorStore::new();
-        let query = vec![1.0, 0.0];
-        let results = store.search(&query, 10, 0.0);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_memory_vector_store_search_limit() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0, 0.0, 0.0], None);
-        store.add(2, vec![0.9, 0.1, 0.0], None);
-        store.add(3, vec![0.8, 0.2, 0.0], None);
-        store.add(4, vec![0.7, 0.3, 0.0], None);
-
-        let query = vec![1.0, 0.0, 0.0];
-        let results = store.search(&query, 2, 0.0);
-
-        assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn test_memory_vector_store_with_text() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0, 0.0], Some("First item".to_string()));
-        store.add(2, vec![0.0, 1.0], Some("Second item".to_string()));
-
-        let query = vec![1.0, 0.0];
-        let results = store.search(&query, 1, 0.0);
-
-        assert_eq!(results[0].id, 1);
-        assert_eq!(results[0].text, Some("First item".to_string()));
-    }
-
-    #[test]
     fn test_embedding_result_fields() {
         let result = EmbeddingResult {
             id: 42,
@@ -526,30 +393,6 @@ mod tests {
         };
 
         assert!(result.text.is_none());
-    }
-
-    #[test]
-    fn test_memory_vector_store_empty() {
-        let store = MemoryVectorStore::new();
-        assert!(store.is_empty());
-        assert_eq!(store.len(), 0);
-    }
-
-    #[test]
-    fn test_memory_vector_store_clear() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0, 0.0], None);
-        store.add(2, vec![0.0, 1.0], None);
-
-        assert_eq!(store.len(), 2);
-        store.clear();
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn test_memory_vector_store_default() {
-        let store = MemoryVectorStore::default();
-        assert!(store.is_empty());
     }
 
     // ── Edge case tests ──
@@ -680,89 +523,6 @@ mod tests {
         let v: Vec<f32> = vec![];
         let n = normalize(&v);
         assert!(n.is_empty());
-    }
-
-    #[test]
-    fn test_memory_vector_store_remove_nonexistent() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0], None);
-        store.remove(999); // Should not panic
-        assert_eq!(store.len(), 1);
-    }
-
-    #[test]
-    fn test_memory_vector_store_remove_all() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0], None);
-        store.add(2, vec![0.0], None);
-        store.remove(1);
-        store.remove(2);
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn test_memory_vector_store_duplicate_ids() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0, 0.0], Some("first".to_string()));
-        store.add(1, vec![0.0, 1.0], Some("second".to_string()));
-
-        // Both entries should exist (store doesn't enforce unique IDs)
-        assert_eq!(store.len(), 2);
-
-        // Remove should remove all entries with that ID
-        store.remove(1);
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn test_memory_vector_store_search_limit_zero() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0, 0.0], None);
-
-        let results = store.search(&[1.0, 0.0], 0, 0.0);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_memory_vector_store_search_high_min_filters_all() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0, 0.0], None);
-        store.add(2, vec![0.0, 1.0], None);
-
-        // Orthogonal query, high threshold
-        let results = store.search(&[0.707, 0.707], 10, 0.99);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_memory_vector_store_search_sorted_by_similarity() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0, 0.0, 0.0], None); // Most similar to query
-        store.add(2, vec![0.5, 0.5, 0.5], None); // Medium
-        store.add(3, vec![0.0, 0.0, 1.0], None); // Least similar
-
-        let results = store.search(&[1.0, 0.0, 0.0], 10, -1.0);
-        assert!(results.len() >= 2);
-        // Should be sorted descending by similarity
-        for i in 0..results.len() - 1 {
-            assert!(
-                results[i].similarity >= results[i + 1].similarity,
-                "results not sorted: {} < {}",
-                results[i].similarity,
-                results[i + 1].similarity
-            );
-        }
-    }
-
-    #[test]
-    fn test_memory_vector_store_add_after_clear() {
-        let mut store = MemoryVectorStore::new();
-        store.add(1, vec![1.0], None);
-        store.clear();
-        store.add(2, vec![0.5], None);
-        assert_eq!(store.len(), 1);
-        let results = store.search(&[0.5], 10, 0.0);
-        assert_eq!(results[0].id, 2);
     }
 
     #[test]

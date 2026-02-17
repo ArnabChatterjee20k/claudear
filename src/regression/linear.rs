@@ -171,21 +171,7 @@ impl<H: HttpClient> LinearRegressionChecker<H> {
                 let candidate_emb = client.embed(candidate_text).await?;
                 Ok(cosine_similarity(original_emb, &candidate_emb))
             }
-            _ => {
-                // Fallback to keyword matching if no embedding client
-                let candidate_lower = candidate_text.to_lowercase();
-                let matches = self
-                    .keywords
-                    .iter()
-                    .filter(|k| candidate_lower.contains(&k.to_lowercase()))
-                    .count();
-                // Return a similarity score based on keyword matches
-                if self.keywords.is_empty() {
-                    Ok(0.0)
-                } else {
-                    Ok(matches as f32 / self.keywords.len() as f32)
-                }
-            }
+            _ => Ok(0.0),
         }
     }
 
@@ -671,16 +657,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_regression_when_new_github_issue() {
-        // Create a timestamp in the future to ensure the issue is "new"
+    async fn test_no_regression_without_embedding_client() {
+        // Without an embedding client, similarity always returns 0.0
+        // so no regression can be detected via similarity
         let future_time = (Utc::now() + Duration::hours(1)).to_rfc3339();
 
-        // Use lower similarity threshold for keyword-only fallback matching
         let mut config = create_config();
-        config.similarity_threshold = 0.5; // Lower threshold for keyword matching
+        config.similarity_threshold = 0.5;
 
         let mock = MockHttpClient::new(vec![
-            // GitHub search - found issue with same keyword "bug"
             (
                 200,
                 &format!(
@@ -699,6 +684,8 @@ mod tests {
                     future_time
                 ),
             ),
+            // Threads check
+            (200, "<html><body>No matches</body></html>"),
         ]);
 
         let checker = LinearRegressionChecker::with_http_client(
@@ -712,8 +699,8 @@ mod tests {
         watch.monitoring_started_at = Some(Utc::now());
 
         let result = checker.check_regression(&watch).await.unwrap();
-        assert!(result.regression_detected);
-        assert!(result.details.unwrap().contains("GitHub issues"));
+        // No embedding client → similarity is 0.0 → no regression detected
+        assert!(!result.regression_detected);
     }
 
     #[tokio::test]
@@ -761,15 +748,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_regression_when_threads_mention() {
-        // Use lower similarity threshold for keyword-only fallback matching
+    async fn test_no_regression_without_embedding_client_threads() {
+        // Without an embedding client, check_similarity returns 0.0
+        // so no regression can be detected even if threads mention keywords
         let mut config = create_config();
-        config.similarity_threshold = 0.5; // Lower threshold for keyword matching
+        config.similarity_threshold = 0.5;
 
         let mock = MockHttpClient::new(vec![
             // GitHub search - no results
             (200, r#"{"total_count": 0, "items": []}"#),
-            // Threads check - keyword found in content
+            // Threads check
             (
                 200,
                 "<html><body><h2>Authentication Error Discussion</h2>Discussion about authentication-error issue and how to solve it</body></html>",
@@ -787,8 +775,7 @@ mod tests {
         watch.monitoring_started_at = Some(Utc::now() - Duration::hours(1));
 
         let result = checker.check_regression(&watch).await.unwrap();
-        assert!(result.regression_detected);
-        assert!(result.details.unwrap().contains("appwrite.io/threads"));
+        assert!(!result.regression_detected);
     }
 
     #[tokio::test]

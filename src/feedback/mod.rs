@@ -12,7 +12,7 @@ mod outcomes;
 pub use analyzer::{FeedbackAnalyzer, PromptSuggestion, SimilarIssue};
 pub use embeddings::{
     cosine_similarity, euclidean_distance, normalize, EmbeddingClient, EmbeddingConfig,
-    EmbeddingResult, MemoryVectorStore,
+    EmbeddingResult,
 };
 pub use issue_embeddings::{
     format_similar_issues_context, IssueEmbeddingConfig, IssueEmbeddingService,

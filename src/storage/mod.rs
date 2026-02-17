@@ -11,7 +11,7 @@ pub use sqlite::{
     ConfidenceBreakdown, DiagnosticCounts, IndexStats, InferenceHistoryEntry, InferenceStats,
     SqliteTracker, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
 };
-pub use vectorlite::{is_vectorlite_available, try_load_vectorlite, VectorStoreConfig};
+pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 
 use crate::error::Result;
 use crate::feedback::FixOutcome;

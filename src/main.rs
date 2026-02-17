@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use claudear::{
     api::ApiServer,
     config::Config,
+    feedback::{EmbeddingClient, EmbeddingConfig, IssueEmbeddingService},
     github::{GitHubClient, PrMonitor, PrStatus, ReviewWatcher},
     ipc::{default_socket_path, is_daemon_running, print_response, IpcClient, IpcServer},
     notifier::{
@@ -19,7 +20,7 @@ use claudear::{
     repo::{DependencyType, RepoIndex, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
-    source::{IssueSource, LinearSource, SentrySource},
+    source::{DiscordSource, IssueSource, LinearSource, SentrySource},
     storage::{FixAttemptTracker, SqliteTracker},
     types::{ActivityLogEntry, FixAttemptStatus},
     users::UserRegistry,
@@ -466,6 +467,24 @@ fn init_logging(
     }
 }
 
+/// Build an `IssueEmbeddingService` for semantic dedup and context enrichment.
+///
+/// Returns `None` if the embedding model fails to load, allowing graceful degradation.
+fn build_issue_embedding_service(
+    sqlite_tracker: &Arc<SqliteTracker>,
+) -> Option<Arc<IssueEmbeddingService>> {
+    match EmbeddingClient::new(EmbeddingConfig::default()) {
+        Ok(client) => Some(Arc::new(IssueEmbeddingService::with_defaults(
+            Arc::new(client),
+            sqlite_tracker.clone(),
+        ))),
+        Err(e) => {
+            tracing::warn!(error = %e, "Issue embedding service unavailable");
+            None
+        }
+    }
+}
+
 /// Create a ReviewWatcher if GitHub is configured.
 fn create_review_watcher(
     config: &Config,
@@ -530,6 +549,17 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
         if sentry_config.enabled {
             sources.push(Arc::new(SentrySource::new(sentry_config.clone())));
             tracing::info!("Sentry source initialized");
+        }
+    }
+
+    if config.discord.source_enabled {
+        if config.discord.bot_token.is_some()
+            && (config.discord.listen_channel_id.is_some() || config.discord.channel_id.is_some())
+        {
+            sources.push(Arc::new(DiscordSource::new(config.discord.clone())));
+            tracing::info!("Discord source initialized");
+        } else {
+            tracing::warn!("Discord source_enabled but missing bot_token or channel_id; skipping");
         }
     }
 
@@ -1800,8 +1830,9 @@ async fn main() -> anyhow::Result<()> {
         // Create GitHub client for API-based repo discovery
         let github_client = GitHubClient::new(config.github.clone());
 
-        // Build repository inferrer for issue-to-repo mapping
-        let inferrer = Watcher::build_inferrer(&config, Some(&github_client)).await?;
+        // Build repository inferrer for issue-to-repo mapping (with embeddings for semantic matching)
+        let (inferrer, embedding_client) =
+            Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
         if inferrer.is_some() {
             tracing::info!("Repository inference enabled");
         }
@@ -1833,6 +1864,9 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
+        // Build issue embedding service for semantic dedup
+        let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
+
         // Create watcher if polling is enabled
         let watcher = if enable_polling {
             Some(Arc::new(Watcher::new(WatcherOptions {
@@ -1842,9 +1876,9 @@ async fn main() -> anyhow::Result<()> {
                 tracker: tracker.clone(),
                 sqlite_tracker: Some(sqlite_tracker.clone()),
                 inferrer: inferrer.clone(),
-                embedding_client: None,
+                embedding_client,
                 review_watcher: review_watcher.clone(),
-                issue_embedding_service: None,
+                issue_embedding_service: issue_embedding_service.clone(),
                 relationships,
                 github_client: github_client_for_watcher,
                 user_registry: user_registry.clone(),
@@ -1855,11 +1889,15 @@ async fn main() -> anyhow::Result<()> {
         };
 
         // Create IPC server
-        let ipc_server = Arc::new(if let Some(ref w) = watcher {
-            IpcServer::new(tracker.clone(), sources.clone(), notifier.clone())
-                .with_watcher(w.clone())
-        } else {
-            IpcServer::new(tracker.clone(), sources.clone(), notifier.clone())
+        let ipc_server = Arc::new({
+            let server = IpcServer::builder(tracker.clone(), sources.clone(), notifier.clone())
+                .max_retries(config.retry.max_retries)
+                .build();
+            if let Some(ref w) = watcher {
+                server.with_watcher(w.clone())
+            } else {
+                server
+            }
         });
 
         ipc_server.set_mode(&mode_str).await;
@@ -1965,7 +2003,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Webhook server also serves health endpoint which dashboard uses
-                let server = WebhookServer::new_with_github(
+                let mut server = WebhookServer::new_with_github(
                     config.clone(),
                     handlers,
                     notifier.clone(),
@@ -1974,6 +2012,8 @@ async fn main() -> anyhow::Result<()> {
                     inferrer_clone,
                     github_webhook_handler_for_http,
                 );
+                server.set_issue_embedding_service(issue_embedding_service.clone());
+                server.set_review_watcher(review_watcher.clone());
                 server.start().await?;
             } else if enable_dashboard {
                 // Dashboard only (no webhooks)
@@ -2287,12 +2327,15 @@ async fn main() -> anyhow::Result<()> {
         // Create GitHub client for API-based repo discovery
         let github_client = GitHubClient::new(config.github.clone());
 
-        // Build inferrer for retry processing
-        let inferrer = Watcher::build_inferrer(&config, Some(&github_client)).await?;
+        // Build inferrer for retry processing (with embeddings for semantic matching)
+        let (inferrer, embedding_client) =
+            Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
 
         // Create ReviewWatcher for PR review tracking
         let review_watcher =
             create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+
+        let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
 
         let watcher = Watcher::new(WatcherOptions {
             config: config.clone(),
@@ -2301,9 +2344,9 @@ async fn main() -> anyhow::Result<()> {
             tracker: tracker.clone(),
             sqlite_tracker: Some(sqlite_tracker.clone()),
             inferrer,
-            embedding_client: None,
+            embedding_client,
             review_watcher,
-            issue_embedding_service: None,
+            issue_embedding_service,
             relationships: None,
             github_client: None,
             user_registry: user_registry.clone(),
@@ -2506,7 +2549,9 @@ async fn main() -> anyhow::Result<()> {
             // Build inferrer for repo inference
             let inferrer = WebhookServer::build_inferrer(&config, Some(&github_client)).await?;
 
-            let server = WebhookServer::new_with_github(
+            let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
+
+            let mut server = WebhookServer::new_with_github(
                 config,
                 handlers,
                 notifier,
@@ -2515,6 +2560,8 @@ async fn main() -> anyhow::Result<()> {
                 inferrer,
                 github_webhook_handler,
             );
+            server.set_issue_embedding_service(issue_embedding_service);
+            server.set_review_watcher(review_watcher);
 
             // Handle shutdown signals
             let shutdown = async {
@@ -2554,6 +2601,8 @@ async fn main() -> anyhow::Result<()> {
             let review_watcher =
                 create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
 
+            let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
+
             let tracker_for_api = tracker.clone();
             let watcher = Watcher::new(WatcherOptions {
                 config: config.clone(),
@@ -2564,7 +2613,7 @@ async fn main() -> anyhow::Result<()> {
                 inferrer,
                 embedding_client,
                 review_watcher,
-                issue_embedding_service: None,
+                issue_embedding_service,
                 relationships: None,
                 github_client: if config.is_github_enabled() {
                     Some(GitHubClient::new(config.github.clone()))

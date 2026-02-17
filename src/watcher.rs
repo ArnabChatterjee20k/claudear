@@ -24,6 +24,7 @@ use crate::types::{
 };
 use crate::users::UserRegistry;
 use chrono::Utc;
+use futures::future::join_all;
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -74,6 +75,14 @@ pub struct Watcher {
 impl Watcher {
     /// Create a new watcher.
     pub fn new(options: WatcherOptions) -> Self {
+        let feedback_analyzer = {
+            let analyzer = FeedbackAnalyzer::new();
+            match &options.sqlite_tracker {
+                Some(st) => analyzer.with_sqlite_tracker(st.clone()),
+                None => analyzer,
+            }
+        };
+
         Self {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
@@ -101,7 +110,7 @@ impl Watcher {
             is_running: AtomicBool::new(false),
             processing: RwLock::new(HashSet::new()),
             active_processing: AtomicUsize::new(0),
-            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
         }
     }
 
@@ -275,11 +284,13 @@ impl Watcher {
     /// Start the watcher with polling.
     pub async fn start(&self, interval_ms: Option<u64>) -> Result<()> {
         let configured_poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
-        let poll_interval = configured_poll_interval.max(1);
-        if configured_poll_interval == 0 {
+        let poll_interval = configured_poll_interval.max(1000);
+        if configured_poll_interval < 1000 {
             tracing::warn!(
                 component = "watcher",
-                "Poll interval evaluated to 0ms, clamping to 1ms to avoid timer panic"
+                configured = configured_poll_interval,
+                clamped = poll_interval,
+                "Poll interval below 1000ms, clamping to 1000ms to avoid busy-loop"
             );
         }
 
@@ -290,7 +301,7 @@ impl Watcher {
         );
         tracing::info!("  Work dir: {:?}", self.config.work_dir);
         tracing::info!("  Known orgs: {}", self.config.known_orgs.len());
-        tracing::info!("  Poll interval: {}ms", poll_interval);
+        tracing::info!("  Poll interval: {}ms (global)", poll_interval);
         tracing::info!(
             "  Max issues per cycle: {} (global)",
             self.config.max_issues_per_cycle
@@ -299,12 +310,15 @@ impl Watcher {
         for source in &self.sources {
             let src_max_issues = self.config.max_issues_per_cycle_for(source.name());
             let src_max_concurrent = self.config.max_concurrent_for(source.name());
+            let src_poll_interval = self.config.poll_interval_ms_for(source.name());
             if src_max_issues != self.config.max_issues_per_cycle
                 || src_max_concurrent != self.config.max_concurrent
+                || src_poll_interval != poll_interval
             {
                 tracing::info!(
-                    "    {}: max_issues={}, max_concurrent={}",
+                    "    {}: poll_interval={}ms, max_issues={}, max_concurrent={}",
                     source.name(),
+                    src_poll_interval,
                     src_max_issues,
                     src_max_concurrent
                 );
@@ -400,24 +414,76 @@ impl Watcher {
 
         self.is_running.store(true, Ordering::SeqCst);
 
-        // Initial poll
+        // Initial poll of all sources + housekeeping
         self.poll().await?;
 
-        // Set up interval
-        let mut poll_timer = interval(Duration::from_millis(poll_interval));
-        poll_timer.tick().await; // Skip immediate first tick
+        // Build per-source timer state: (source index, interval_ms, last_poll)
+        let now = std::time::Instant::now();
+        let mut source_timers: Vec<(usize, u64, std::time::Instant)> = self
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(i, source)| {
+                let src_interval = self.config.poll_interval_ms_for(source.name()).max(1);
+                tracing::info!(
+                    source = source.name(),
+                    interval_ms = src_interval,
+                    "Per-source poll interval"
+                );
+                (i, src_interval, now)
+            })
+            .collect();
 
-        // Counter for periodic repo refresh (every 5 polls)
-        let mut poll_count: u32 = 0;
+        // Determine the base tick: minimum source interval or global, whichever is smallest.
+        // Cap at 1s to avoid busy-looping when all intervals are large.
+        let min_source_interval = source_timers
+            .iter()
+            .map(|(_, ms, _)| *ms)
+            .min()
+            .unwrap_or(poll_interval);
+        let base_tick_ms = min_source_interval.min(poll_interval).max(1000);
+        let mut base_timer = interval(Duration::from_millis(base_tick_ms));
+        base_timer.tick().await; // Skip immediate first tick
+
+        // Global housekeeping timer
+        let global_interval = Duration::from_millis(poll_interval);
+        let mut last_global = std::time::Instant::now();
+
+        // Counter for periodic repo refresh (every 5 global cycles)
+        let mut global_cycle_count: u32 = 0;
         const REFRESH_INTERVAL: u32 = 5;
+        const LEARNING_INTERVAL: u32 = 10;
 
         while self.is_running.load(Ordering::SeqCst) {
-            poll_timer.tick().await;
-            if self.is_running.load(Ordering::SeqCst) {
-                poll_count = poll_count.wrapping_add(1);
+            base_timer.tick().await;
+            if !self.is_running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Poll each source whose interval has elapsed
+            for (src_idx, src_interval_ms, last_poll) in &mut source_timers {
+                let src_interval = Duration::from_millis(*src_interval_ms);
+                if last_poll.elapsed() >= src_interval {
+                    let source = &self.sources[*src_idx];
+                    if let Err(e) = self.poll_source(source).await {
+                        tracing::error!(
+                            component = "watcher",
+                            source = source.name(),
+                            error = %e,
+                            "Error polling source"
+                        );
+                    }
+                    *last_poll = std::time::Instant::now();
+                }
+            }
+
+            // Global housekeeping on the global timer
+            if last_global.elapsed() >= global_interval {
+                last_global = std::time::Instant::now();
+                global_cycle_count = global_cycle_count.wrapping_add(1);
 
                 // Periodically refresh repo index to detect new repositories
-                if poll_count.is_multiple_of(REFRESH_INTERVAL) {
+                if global_cycle_count.is_multiple_of(REFRESH_INTERVAL) {
                     match self.refresh_repos().await {
                         Ok(0) => {} // No new repos
                         Ok(n) => tracing::info!("Discovered and embedded {} new repositories", n),
@@ -437,9 +503,14 @@ impl Watcher {
                     }
                 }
 
-                // Poll for new issues
-                if let Err(e) = self.poll().await {
-                    tracing::error!(component = "watcher", error = %e, "Poll error");
+                // Run housekeeping (retries, cascades, metrics)
+                if let Err(e) = self.poll_housekeeping().await {
+                    tracing::error!(component = "watcher", error = %e, "Housekeeping error");
+                }
+
+                // Periodic learning subsystem tasks
+                if !self.dry_run && global_cycle_count.is_multiple_of(LEARNING_INTERVAL) {
+                    self.run_periodic_learning().await;
                 }
             }
         }
@@ -1119,11 +1190,17 @@ Create a PR with your changes."#,
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S")
         );
 
-        for source in &self.sources {
-            if let Err(e) = self.poll_source(source).await {
-                tracing::error!(component = "watcher", source = source.name(), error = %e, "Error polling");
-            }
-        }
+        // Poll all sources concurrently for better throughput.
+        let poll_futures: Vec<_> = self
+            .sources
+            .iter()
+            .map(|source| async move {
+                if let Err(e) = self.poll_source(source).await {
+                    tracing::error!(component = "watcher", source = source.name(), error = %e, "Error polling");
+                }
+            })
+            .collect();
+        join_all(poll_futures).await;
 
         // Process any ready retries
         if !self.dry_run {
@@ -1147,6 +1224,69 @@ Create a PR with your changes."#,
             );
             if let Err(e) = self.tracker.record_metric(&poll_duration_metric) {
                 tracing::debug!(error = %e, "Failed to record poll_cycle_duration_secs metric");
+            }
+
+            let source_count_metric =
+                ProcessingMetric::new("poll_sources", self.sources.len() as f64);
+            if let Err(e) = self.tracker.record_metric(&source_count_metric) {
+                tracing::debug!(error = %e, "Failed to record poll_sources metric");
+            }
+
+            let active = self.active_processing.load(Ordering::SeqCst) as f64;
+            let active_metric = ProcessingMetric::new("active_processing", active);
+            if let Err(e) = self.tracker.record_metric(&active_metric) {
+                tracing::debug!(error = %e, "Failed to record active_processing metric");
+            }
+
+            match self.tracker.get_stats() {
+                Ok(stats) => {
+                    let pending_metric =
+                        ProcessingMetric::new("pending_attempts", stats.pending as f64);
+                    if let Err(e) = self.tracker.record_metric(&pending_metric) {
+                        tracing::debug!(error = %e, "Failed to record pending_attempts metric");
+                    }
+
+                    let total_metric = ProcessingMetric::new("total_attempts", stats.total as f64);
+                    if let Err(e) = self.tracker.record_metric(&total_metric) {
+                        tracing::debug!(error = %e, "Failed to record total_attempts metric");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "Failed to load stats for poll metrics");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run housekeeping tasks: retries, cascades, and metrics.
+    /// Called on the global timer, separate from per-source polling.
+    async fn poll_housekeeping(&self) -> Result<()> {
+        let housekeeping_started_at = std::time::Instant::now();
+
+        // Process any ready retries
+        if !self.dry_run {
+            if let Err(e) = self.process_ready_retries().await {
+                tracing::error!(component = "watcher", error = %e, "Error processing retries");
+            }
+        }
+
+        // Check for PR merges and trigger cascades
+        if !self.dry_run {
+            if let Err(e) = self.check_pr_merges_and_cascade().await {
+                tracing::error!(component = "watcher", error = %e, "Error checking PR merges for cascade");
+            }
+        }
+
+        // Record lightweight operational telemetry for dashboard analytics.
+        if !self.dry_run {
+            let duration_metric = ProcessingMetric::new(
+                "housekeeping_cycle_duration_secs",
+                housekeeping_started_at.elapsed().as_secs_f64(),
+            );
+            if let Err(e) = self.tracker.record_metric(&duration_metric) {
+                tracing::debug!(error = %e, "Failed to record housekeeping_cycle_duration_secs metric");
             }
 
             let source_count_metric =
@@ -1632,6 +1772,37 @@ Create a PR with your changes."#,
         }
         drop(processing);
 
+        // Semantic dedup: filter out candidates that are duplicates of already-handled issues
+        let mut semantic_duplicate_skipped = 0usize;
+        if let Some(ref embedding_service) = self.issue_embedding_service {
+            let mut kept = Vec::with_capacity(candidates.len());
+            for (issue, match_result) in candidates {
+                match embedding_service
+                    .check_duplicate(&issue, source.name())
+                    .await
+                {
+                    Ok(Some(duplicate)) => {
+                        semantic_duplicate_skipped = semantic_duplicate_skipped.saturating_add(1);
+                        let similar_id = duplicate
+                            .embedding
+                            .short_id
+                            .as_deref()
+                            .unwrap_or(&duplicate.embedding.issue_id);
+                        tracing::info!(
+                            short_id = %issue.short_id,
+                            similar_to = %similar_id,
+                            similarity = %format!("{:.0}%", duplicate.similarity * 100.0),
+                            "Skipping semantic duplicate during poll filtering"
+                        );
+                    }
+                    _ => {
+                        kept.push((issue, match_result));
+                    }
+                }
+            }
+            candidates = kept;
+        }
+
         let candidates_count = candidates.len();
         let matched_metric = ProcessingMetric::new("issues_matched", candidates_count as f64)
             .with_source(source.name().to_string());
@@ -1661,7 +1832,7 @@ Create a PR with your changes."#,
             "poll_filtering_summary",
             format!("Poll decisions summarized for {}", source.name()),
             json!({
-                "fetched": candidates_count + duplicate_skipped + attempted_skipped + inflight_skipped + unmatched_skipped,
+                "fetched": candidates_count + duplicate_skipped + attempted_skipped + inflight_skipped + unmatched_skipped + semantic_duplicate_skipped,
                 "matched": candidates_count,
                 "queued": to_process_count,
                 "deferred": candidates_count.saturating_sub(source_max_issues),
@@ -1670,6 +1841,7 @@ Create a PR with your changes."#,
                     "already_attempted": attempted_skipped,
                     "inflight": inflight_skipped,
                     "unmatched": unmatched_skipped,
+                    "semantic_duplicate": semantic_duplicate_skipped,
                 },
                 "queued_short_ids": queued_short_ids,
                 "source_max_issues": source_max_issues,
@@ -2076,6 +2248,64 @@ Create a PR with your changes."#,
             }
         }
 
+        // Dedup gate: skip if this issue is a semantic duplicate of one already handled
+        if let Some(ref embedding_service) = self.issue_embedding_service {
+            if let Ok(Some(duplicate)) = embedding_service
+                .check_duplicate(&issue, source.name())
+                .await
+            {
+                let similar_id = duplicate
+                    .embedding
+                    .short_id
+                    .as_deref()
+                    .unwrap_or(&duplicate.embedding.issue_id);
+                let similarity_pct = duplicate.similarity * 100.0;
+
+                tracing::info!(
+                    short_id = %issue.short_id,
+                    similar_to = %similar_id,
+                    similarity = %format!("{:.0}%", similarity_pct),
+                    "Skipping semantic duplicate"
+                );
+
+                self.record_issue_decision(
+                    &issue,
+                    "semantic_duplicate_skipped",
+                    format!(
+                        "{} skipped as semantic duplicate of {}",
+                        issue.short_id, similar_id
+                    ),
+                    json!({
+                        "similar_issue_id": duplicate.embedding.issue_id,
+                        "similar_short_id": similar_id,
+                        "similarity": duplicate.similarity,
+                        "similar_issue_status": duplicate.outcome.as_deref(),
+                    }),
+                );
+
+                let metric = ProcessingMetric::new("semantic_duplicate_skipped", 1.0)
+                    .with_source(source.name().to_string());
+                self.tracker.record_metric(&metric).ok();
+
+                let _ = self.tracker.mark_failed(
+                    source.name(),
+                    &issue.id,
+                    &format!(
+                        "Semantic duplicate of {} ({:.0}% similar)",
+                        similar_id, similarity_pct
+                    ),
+                );
+
+                // Cleanup
+                {
+                    let mut processing = self.processing.write().await;
+                    processing.remove(&processing_key);
+                }
+                self.active_processing.fetch_sub(1, Ordering::SeqCst);
+                return false;
+            }
+        }
+
         let result = async {
             // Notify start
             self.notifier.notify_start(&issue).await?;
@@ -2089,6 +2319,22 @@ Create a PR with your changes."#,
                             similar_count = similar.len(),
                             "Found similar past issues for context"
                         );
+                        self.record_issue_decision(
+                            &issue,
+                            "similar_issues_context_added",
+                            format!("{} similar issues added to context for {}", similar.len(), issue.short_id),
+                            json!({
+                                "similar_count": similar.len(),
+                                "similarities": similar.iter().map(|s| json!({
+                                    "issue_id": s.embedding.issue_id,
+                                    "short_id": s.embedding.short_id,
+                                    "similarity": s.similarity,
+                                })).collect::<Vec<_>>(),
+                            }),
+                        );
+                        let metric = ProcessingMetric::new("similar_issues_context_added", 1.0)
+                            .with_source(source.name().to_string());
+                        self.tracker.record_metric(&metric).ok();
                         format_similar_issues_context(&similar)
                     }
                     Ok(_) => String::new(),
@@ -2153,10 +2399,17 @@ Create a PR with your changes."#,
             let (claude_result, last_prompt) = loop {
                 let prompt = self.claude.build_prompt_for_issue(&issue, &context, &project_dir);
 
-                // Enhance prompt with learnings from past outcomes.
+                // Enhance prompt with learnings from past outcomes (semantic when possible).
                 let prompt = {
                     let analyzer = self.feedback_analyzer.lock().await;
-                    analyzer.enhance_prompt(&prompt, &issue)
+                    let issue_emb = self
+                        .issue_embedding_service
+                        .as_ref()
+                        .and_then(|svc| svc.get_embedding(source.name(), &issue.id).ok().flatten());
+                    match issue_emb {
+                        Some(emb) => analyzer.enhance_prompt(&prompt, &issue, &emb.embedding),
+                        None => prompt,
+                    }
                 };
 
                 // ── Continuous Learning: layer additional context ──
@@ -2415,8 +2668,21 @@ Create a PR with your changes."#,
 
                     // Store embedding for future similarity lookups
                     if let Some(ref embedding_service) = self.issue_embedding_service {
-                        if let Err(e) = embedding_service.embed_issue(&issue, source.name()).await {
-                            tracing::warn!(error = %e, "Failed to store issue embedding");
+                        match embedding_service.embed_issue(&issue, source.name()).await {
+                            Ok(_) => {
+                                self.record_issue_decision(
+                                    &issue,
+                                    "issue_embedding_stored",
+                                    format!("Stored embedding for {}", issue.short_id),
+                                    json!({}),
+                                );
+                                let metric = ProcessingMetric::new("issue_embedding_stored", 1.0)
+                                    .with_source(source.name().to_string());
+                                self.tracker.record_metric(&metric).ok();
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to store issue embedding");
+                            }
                         }
                     }
 
@@ -2658,9 +2924,24 @@ Create a PR with your changes."#,
         prompt: &str,
         outcome: Outcome,
     ) {
-        let fix_outcome = FixOutcome::from_attempt(attempt, issue, prompt, outcome);
+        let mut fix_outcome = FixOutcome::from_attempt(attempt, issue, prompt, outcome);
 
-        // Store to DB
+        // Compute embedding for the outcome's issue text (reuse existing issue embedding if available)
+        if let Some(ref embedding_client) = self.embedding_client {
+            let embedding = match self
+                .issue_embedding_service
+                .as_ref()
+                .and_then(|svc| svc.get_embedding(&attempt.source, &issue.id).ok().flatten())
+            {
+                Some(existing) => Some(existing.embedding),
+                None => embedding_client.embed(&fix_outcome.issue_text).await.ok(),
+            };
+            if let Some(emb) = embedding {
+                fix_outcome.set_embedding(emb);
+            }
+        }
+
+        // Store to DB (including embedding if computed)
         if let Err(e) = self.tracker.store_feedback_outcome(&fix_outcome) {
             tracing::warn!(error = %e, "Failed to store feedback outcome to DB");
         }
@@ -2698,6 +2979,117 @@ Create a PR with your changes."#,
 
         self.record_feedback_outcome(attempt, &issue, &prompt, outcome)
             .await;
+    }
+
+    /// Run periodic learning subsystem tasks (QA promotion, cluster detection).
+    async fn run_periodic_learning(&self) {
+        let learning = &self.config.learning;
+
+        // System 3: Promote repeated Q&A answers to standing instructions
+        if learning.qa_promotion {
+            match crate::learning::QaPromoter::scan_and_promote(
+                self.tracker.as_ref(),
+                self.embedding_client.as_ref(),
+                learning.qa_promotion_threshold,
+                0.8,
+            ) {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!(
+                        promoted = n,
+                        "Promoted Q&A answers to standing instructions"
+                    );
+                    self.record_source_decision(
+                        "system",
+                        "qa_promotion_completed",
+                        format!("Promoted {} Q&A answers to standing instructions", n),
+                        json!({ "promoted_count": n }),
+                    );
+                }
+                Err(e) => tracing::debug!(error = %e, "Q&A promotion scan failed"),
+            }
+        }
+
+        // System 8: Detect clusters of correlated issues
+        if learning.cluster_detection {
+            for source in &self.sources {
+                match crate::learning::ClusterDetector::detect_clusters(
+                    self.tracker.as_ref(),
+                    source.name(),
+                    learning.cluster_window_minutes as i64,
+                    learning.min_cluster_size,
+                ) {
+                    Ok(clusters) if !clusters.is_empty() => {
+                        for cluster in &clusters {
+                            match self.tracker.store_issue_cluster(cluster) {
+                                Ok(_) => {
+                                    tracing::info!(
+                                        source = source.name(),
+                                        issues = cluster.issue_ids.len(),
+                                        "Detected and stored issue cluster"
+                                    );
+                                }
+                                Err(e) => {
+                                    // UNIQUE constraint violation means cluster already stored
+                                    tracing::debug!(error = %e, "Failed to store cluster (may already exist)");
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(error = %e, source = source.name(), "Cluster detection failed")
+                    }
+                }
+
+                // Check if existing active clusters have been resolved
+                if let Ok(active_clusters) = self.tracker.get_active_clusters(source.name()) {
+                    for cluster in &active_clusters {
+                        match crate::learning::ClusterDetector::check_cluster_resolution(
+                            self.tracker.as_ref(),
+                            cluster,
+                        ) {
+                            Ok(true) => {
+                                // Find the merged issue to record as resolver
+                                let resolver = cluster.issue_ids.iter().find_map(|issue_id| {
+                                    self.tracker
+                                        .get_attempt(&cluster.source, issue_id)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|a| {
+                                            if a.status == FixAttemptStatus::Merged {
+                                                Some((issue_id.clone(), a.id))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                });
+                                let (resolved_issue, resolved_attempt) =
+                                    resolver.unwrap_or_else(|| ("unknown".to_string(), 0));
+                                if let Err(e) = self.tracker.update_cluster_resolution(
+                                    cluster.id,
+                                    &resolved_issue,
+                                    resolved_attempt,
+                                ) {
+                                    tracing::debug!(error = %e, "Failed to mark cluster resolved");
+                                } else {
+                                    tracing::info!(
+                                        source = source.name(),
+                                        cluster_key = %cluster.cluster_key,
+                                        resolved_by = %resolved_issue,
+                                        "Cluster resolved (at least one issue merged)"
+                                    );
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::debug!(error = %e, "Failed to check cluster resolution")
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Run post-merge learning hooks (extract learnings, analyze diff, compute quality score).
@@ -2786,6 +3178,37 @@ Create a PR with your changes."#,
                             .update_pr_fix_quality_score(pr_url, quality.score)
                         {
                             tracing::warn!(error = %e, "Failed to store quality score");
+                        }
+                    }
+                }
+            }
+        }
+
+        // System 9: Auto-generate AGENT.md from accumulated knowledge
+        if learning.auto_agent_md {
+            if let Some(repo) = attempt.github_repo.as_deref() {
+                let knowledge = self.tracker.get_repo_knowledge(repo).unwrap_or_default();
+                let instructions = self
+                    .tracker
+                    .get_promoted_instructions(repo)
+                    .unwrap_or_default();
+                if !knowledge.is_empty() || !instructions.is_empty() {
+                    let agent_md = crate::learning::RepoKnowledgeManager::generate_agent_md(
+                        &knowledge,
+                        &instructions,
+                    );
+                    let agent_md_path = self.config.work_dir.join(repo).join("AGENT.md");
+                    if let Some(parent) = agent_md_path.parent() {
+                        if parent.exists() {
+                            if let Err(e) = std::fs::write(&agent_md_path, &agent_md) {
+                                tracing::debug!(error = %e, path = ?agent_md_path, "Failed to write AGENT.md");
+                            } else {
+                                tracing::info!(
+                                    repo = repo,
+                                    path = ?agent_md_path,
+                                    "Generated AGENT.md from accumulated knowledge"
+                                );
+                            }
                         }
                     }
                 }

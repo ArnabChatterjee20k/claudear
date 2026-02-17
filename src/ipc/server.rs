@@ -37,8 +37,6 @@ pub struct IpcServer {
     watcher: Option<Arc<Watcher>>,
     state: Arc<ServerState>,
     shutdown_tx: broadcast::Sender<()>,
-    /// Maximum number of activity entries to keep.
-    max_activity_entries: usize,
 }
 
 /// Shared state for the IPC server.
@@ -72,6 +70,9 @@ struct ServerState {
 
     /// Maximum activity entries (configurable).
     max_activity_entries: usize,
+
+    /// Maximum retry attempts (from config).
+    max_retries: u32,
 }
 
 impl IpcServer {
@@ -96,12 +97,6 @@ impl IpcServer {
     /// Set the watcher instance.
     pub fn with_watcher(mut self, watcher: Arc<Watcher>) -> Self {
         self.watcher = Some(watcher);
-        self
-    }
-
-    /// Set the maximum activity entries.
-    pub fn with_max_activity_entries(mut self, max: usize) -> Self {
-        self.max_activity_entries = max;
         self
     }
 
@@ -432,13 +427,10 @@ async fn handle_command(
             Err(e) => IpcResponse::error(format!("Failed to list PRs: {}", e)),
         },
 
-        IpcCommand::ListRetries => {
-            // Use a reasonable default max_retries
-            match tracker.get_retryable_issues(3) {
-                Ok(attempts) => IpcResponse::ok_with(IpcData::Attempts(attempts)),
-                Err(e) => IpcResponse::error(format!("Failed to list retries: {}", e)),
-            }
-        }
+        IpcCommand::ListRetries => match tracker.get_retryable_issues(state.max_retries) {
+            Ok(attempts) => IpcResponse::ok_with(IpcData::Attempts(attempts)),
+            Err(e) => IpcResponse::error(format!("Failed to list retries: {}", e)),
+        },
 
         IpcCommand::Trigger { source, issue_id } => {
             if let Some(watcher) = watcher {
@@ -472,7 +464,7 @@ async fn handle_command(
                 }
             } else {
                 // Try direct tracker reset
-                match tracker.prepare_for_retry(&source, &issue_id) {
+                match tracker.reset_attempt(&source, &issue_id) {
                     Ok(()) => IpcResponse::ok_with(IpcData::Reset { source, issue_id }),
                     Err(e) => IpcResponse::error(format!("Failed to reset: {}", e)),
                 }
@@ -481,7 +473,7 @@ async fn handle_command(
 
         IpcCommand::ProcessRetries => {
             if let Some(watcher) = watcher {
-                match tracker.get_retryable_issues(3) {
+                match tracker.get_retryable_issues(state.max_retries) {
                     Ok(attempts) => {
                         let mut count = 0;
                         for attempt in attempts {
@@ -548,6 +540,7 @@ pub struct IpcServerBuilder {
     sources: Vec<Arc<dyn IssueSource>>,
     notifier: Arc<dyn Notifier>,
     max_activity_entries: usize,
+    max_retries: u32,
 }
 
 impl IpcServerBuilder {
@@ -562,12 +555,19 @@ impl IpcServerBuilder {
             sources,
             notifier,
             max_activity_entries: DEFAULT_MAX_ACTIVITY_ENTRIES,
+            max_retries: 2,
         }
     }
 
     /// Set the maximum number of activity entries to keep.
     pub fn max_activity_entries(mut self, max: usize) -> Self {
         self.max_activity_entries = max;
+        self
+    }
+
+    /// Set the maximum number of retries.
+    pub fn max_retries(mut self, max: u32) -> Self {
+        self.max_retries = max;
         self
     }
 
@@ -593,9 +593,9 @@ impl IpcServerBuilder {
                 poll_interval_ms: AtomicU64::new(0),
                 source_names,
                 max_activity_entries: self.max_activity_entries,
+                max_retries: self.max_retries,
             }),
             shutdown_tx,
-            max_activity_entries: self.max_activity_entries,
         }
     }
 }
@@ -617,6 +617,7 @@ mod tests {
             poll_interval_ms: AtomicU64::new(0),
             source_names: vec!["linear".to_string()],
             max_activity_entries: DEFAULT_MAX_ACTIVITY_ENTRIES,
+            max_retries: 2,
         };
 
         assert!(!state.paused.load(Ordering::SeqCst));

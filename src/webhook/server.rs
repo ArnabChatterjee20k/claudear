@@ -4,17 +4,23 @@ use super::{GitHubWebhookHandler, WebhookHandler, WebhookHandlerRegistry};
 use crate::config::Config;
 use crate::error::Error;
 use crate::error::Result;
-use crate::feedback::{FixOutcome, Outcome};
+use crate::feedback::{
+    format_similar_issues_context, FeedbackAnalyzer, FixOutcome, IssueEmbeddingService, Outcome,
+};
+use crate::github::{PrReviewState, ReviewWatcher};
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::{send_to_all_and_wait_first_reply, Notifier};
 use crate::qa::{
     build_correlation_id, embed_text, find_reusable_qa, format_answer_context,
     format_reuse_context, format_timeout_context, normalize_text,
 };
-use crate::repo::{GitOps, RepoIndex};
+use crate::repo::GitOps;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
-use crate::storage::{FixAttemptTracker, SqliteTracker};
-use crate::types::{validate_issue_id, ActivityLogEntry, AskRequest, Issue, QaKnowledgeEntry};
+use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
+use crate::types::{
+    validate_issue_id, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
+    QaKnowledgeEntry,
+};
 use crate::users::UserRegistry;
 use axum::{
     body::Bytes,
@@ -47,6 +53,9 @@ struct AppState {
     sqlite_tracker: Option<Arc<SqliteTracker>>,
     inferrer: Option<RepoInferrer>,
     embedding_client: Option<crate::feedback::EmbeddingClient>,
+    issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
+    review_watcher: Option<Arc<ReviewWatcher>>,
     user_registry: UserRegistry,
     claude: ClaudeRunner,
     github_handler: Option<GitHubWebhookHandler>,
@@ -63,6 +72,8 @@ pub struct WebhookServer {
     tracker: Arc<dyn FixAttemptTracker>,
     sqlite_tracker: Option<Arc<SqliteTracker>>,
     inferrer: Option<RepoInferrer>,
+    issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    review_watcher: Option<Arc<ReviewWatcher>>,
     github_handler: Option<GitHubWebhookHandler>,
     port: u16,
 }
@@ -106,63 +117,56 @@ impl WebhookServer {
             tracker,
             sqlite_tracker,
             inferrer,
+            issue_embedding_service: None,
+            review_watcher: None,
             github_handler,
             port,
         }
     }
 
+    /// Set the issue embedding service for semantic dedup and context enrichment.
+    pub fn set_issue_embedding_service(&mut self, service: Option<Arc<IssueEmbeddingService>>) {
+        self.issue_embedding_service = service;
+    }
+
+    /// Set the review watcher for PR review tracking.
+    pub fn set_review_watcher(&mut self, watcher: Option<Arc<ReviewWatcher>>) {
+        self.review_watcher = watcher;
+    }
+
     /// Build a repository inferrer from config.
     ///
-    /// This uses the fallback mechanism: if `auto_discover_paths` is configured,
-    /// it scans the local filesystem. Otherwise, if a GitHub token is configured,
-    /// it fetches repos via the GitHub API.
+    /// Delegates to `Watcher::build_inferrer` to avoid code duplication.
     pub async fn build_inferrer(
         config: &Config,
         github_client: Option<&crate::github::GitHubClient>,
     ) -> Result<Option<RepoInferrer>> {
-        if config.known_orgs.is_empty() {
-            tracing::info!("No known_orgs configured, inference disabled");
-            return Ok(None);
-        }
-
-        // Check if we have any discovery method available
-        let has_local_paths = !config.auto_discover_paths.is_empty();
-        let has_github_client = github_client.map(|c| c.is_enabled()).unwrap_or(false);
-
-        if !has_local_paths && !has_github_client {
-            tracing::info!(
-                "No auto_discover_paths configured and no GitHub token available, inference disabled"
-            );
-            return Ok(None);
-        }
-
-        let index = RepoIndex::build_with_fallback(
-            &config.known_orgs,
-            &config.auto_discover_paths,
-            github_client,
-            &config.work_dir,
-            config.github.use_ssh,
-        )
-        .await?;
-
-        if index.is_empty() {
-            tracing::warn!("Repository index is empty, no repos discovered");
-            return Ok(None);
-        }
-
-        tracing::info!(
-            repos = index.len(),
-            files = index.total_files(),
-            "Repository index built for inference"
-        );
-
-        Ok(Some(RepoInferrer::new(index)))
+        crate::watcher::Watcher::build_inferrer(config, github_client).await
     }
 
     /// Start the server.
     pub async fn start(self) -> Result<()> {
         let embedding_client = crate::feedback::EmbeddingClient::from_env().ok();
         let user_registry = UserRegistry::new(self.config.users.clone());
+
+        // Initialize FeedbackAnalyzer and warm-start with DB outcomes
+        let mut feedback_analyzer = FeedbackAnalyzer::new();
+        if let Some(ref sqlite_tracker) = self.sqlite_tracker {
+            feedback_analyzer = feedback_analyzer.with_sqlite_tracker(sqlite_tracker.clone());
+            match sqlite_tracker.get_feedback_outcomes(None, 1000) {
+                Ok(outcomes) if !outcomes.is_empty() => {
+                    let count = outcomes.len();
+                    feedback_analyzer.load_outcomes(outcomes);
+                    tracing::info!(
+                        count = count,
+                        "Loaded feedback outcomes for webhook learning"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "Failed to load feedback outcomes"),
+            }
+        }
+
         let state = Arc::new(AppState {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
@@ -181,6 +185,9 @@ impl WebhookServer {
             sqlite_tracker: self.sqlite_tracker,
             inferrer: self.inferrer,
             embedding_client,
+            issue_embedding_service: self.issue_embedding_service,
+            feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
+            review_watcher: self.review_watcher,
             user_registry,
             github_handler: self.github_handler,
             processing: RwLock::new(HashMap::new()),
@@ -332,6 +339,42 @@ async fn webhook_handler(
         );
     }
 
+    // Webhook delivery ID idempotency: prevent redelivered webhooks from
+    // being processed twice (e.g., after server restart loses in-memory state).
+    let delivery_id = header_map
+        .get("linear-delivery")
+        .or_else(|| header_map.get("x-github-delivery"))
+        .or_else(|| header_map.get("sentry-hook-id"));
+    if let (Some(delivery_id), Some(sqlite_tracker)) = (delivery_id, state.sqlite_tracker.as_ref())
+    {
+        match sqlite_tracker.check_and_record_delivery(delivery_id, &source_name) {
+            Ok(true) => {} // New delivery, proceed
+            Ok(false) => {
+                tracing::info!(
+                    source = source_name.as_str(),
+                    delivery_id = delivery_id.as_str(),
+                    "Duplicate webhook delivery, ignoring"
+                );
+                return (
+                    StatusCode::OK,
+                    Json(json!({ "status": "ignored", "reason": "Duplicate delivery" })),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    source = source_name.as_str(),
+                    error = %e,
+                    "Failed to check delivery idempotency, proceeding anyway"
+                );
+            }
+        }
+        // Probabilistically clean up old delivery records (older than 24h).
+        // Only run ~1-in-50 requests to avoid unnecessary DELETE queries on every webhook.
+        if rand::random_range(0u32..50) == 0 {
+            sqlite_tracker.cleanup_old_deliveries(24).ok();
+        }
+    }
+
     // Parse JSON
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(p) => p,
@@ -412,6 +455,53 @@ async fn webhook_handler(
         Ok(false) => {}
     }
 
+    // Semantic dedup gate: skip if this issue is a duplicate of one already handled
+    if let Some(ref embedding_service) = state.issue_embedding_service {
+        if let Ok(Some(duplicate)) = embedding_service
+            .check_duplicate(&issue, &source_name)
+            .await
+        {
+            let similar_id = duplicate
+                .embedding
+                .short_id
+                .as_deref()
+                .unwrap_or(&duplicate.embedding.issue_id);
+
+            let activity = ActivityLogEntry::new(
+                "decision",
+                format!(
+                    "{} skipped as semantic duplicate of {}",
+                    issue.short_id, similar_id
+                ),
+            )
+            .with_source(source_name.clone())
+            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .with_metadata(json!({
+                "decision": "semantic_duplicate_skipped",
+                "details": {
+                    "similar_issue_id": duplicate.embedding.issue_id,
+                    "similar_short_id": similar_id,
+                    "similarity": duplicate.similarity,
+                    "similar_issue_status": duplicate.outcome.as_deref(),
+                }
+            }));
+            state.tracker.record_activity(&activity).ok();
+
+            let metric = ProcessingMetric::new("semantic_duplicate_skipped", 1.0)
+                .with_source(source_name.clone());
+            state.tracker.record_metric(&metric).ok();
+
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "skipped",
+                    "reason": format!("Semantic duplicate of {} ({:.0}% similar)",
+                        similar_id, duplicate.similarity * 100.0)
+                })),
+            );
+        }
+    }
+
     // Check if currently processing AND atomically mark as processing if not
     // This prevents race conditions where two webhooks pass the check simultaneously
     let processing_key = format!("{}:{}", source_name, issue.id);
@@ -472,16 +562,22 @@ async fn webhook_handler(
     let handler_clone = Arc::clone(handler);
 
     tokio::spawn(async move {
-        if let Err(e) = process_issue(
+        let cleanup_state = Arc::clone(&state_clone);
+        let cleanup_key = processing_key.clone();
+        let result = process_issue(
             state_clone,
             handler_clone,
             issue,
             match_result,
             processing_key,
         )
-        .await
-        {
+        .await;
+        if let Err(e) = &result {
             tracing::error!(source = source_name.as_str(), error = %e, "Error processing webhook");
+            // Ensure processing key is cleaned up on error (process_issue normally
+            // cleans up on success, but may miss cleanup on early error paths)
+            let mut processing = cleanup_state.processing.write().await;
+            processing.remove(&cleanup_key);
         }
     });
 
@@ -592,7 +688,8 @@ async fn process_issue(
             state
                 .tracker
                 .mark_failed(source_name, &issue.id, &format!("Skipped: {}", reason))?;
-            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
+            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed)
+                .await;
             return Ok(());
         }
     };
@@ -626,7 +723,8 @@ async fn process_issue(
                 &issue.id,
                 &format!("Git pull failed: {}", e),
             )?;
-            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
+            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed)
+                .await;
             return Ok(());
         }
 
@@ -670,12 +768,40 @@ async fn process_issue(
         .flatten()
         .map(|a| a.id);
 
+    let processing_started_at = Instant::now();
     let result = async {
         // Notify start
         state.notifier.notify_start(&issue).await?;
 
         // Build context and run Claude (with semantic Q&A reuse + ask loop).
         let mut context = handler.build_issue_context(&issue).await?;
+
+        // Enrich context with similar past issues
+        if let Some(ref embedding_service) = state.issue_embedding_service {
+            match embedding_service.find_similar(&issue, source_name).await {
+                Ok(similar) if !similar.is_empty() => {
+                    let activity = ActivityLogEntry::new(
+                        "decision",
+                        format!("{} similar issues added to context for {}", similar.len(), issue.short_id),
+                    )
+                    .with_source(source_name.to_string())
+                    .with_issue(issue.id.clone(), issue.short_id.clone())
+                    .with_metadata(json!({
+                        "decision": "similar_issues_context_added",
+                        "details": { "similar_count": similar.len() }
+                    }));
+                    state.tracker.record_activity(&activity).ok();
+
+                    let metric = ProcessingMetric::new("similar_issues_context_added", 1.0)
+                        .with_source(source_name.to_string());
+                    state.tracker.record_metric(&metric).ok();
+
+                    context = format!("{}\n{}", context, format_similar_issues_context(&similar));
+                }
+                _ => {}
+            }
+        }
+
         let repo_scope = resolution.repo_name().map(|v| v.to_string());
         let mut used_qa_ids: Vec<i64> = Vec::new();
 
@@ -716,6 +842,29 @@ async fn process_issue(
             let prompt = state
                 .claude
                 .build_prompt_for_issue(&issue, &context, &project_dir);
+
+            // Enhance prompt with feedback learnings from past outcomes (semantic when possible)
+            let prompt = {
+                let analyzer = state.feedback_analyzer.lock().await;
+                // Try to use pre-computed issue embedding for semantic search
+                let issue_emb = state
+                    .issue_embedding_service
+                    .as_ref()
+                    .and_then(|svc| svc.get_embedding(source_name, &issue.id).ok().flatten());
+                match issue_emb {
+                    Some(emb) => analyzer.enhance_prompt(&prompt, &issue, &emb.embedding),
+                    None => prompt,
+                }
+            };
+
+            // Enhance prompt with continuous learning context
+            let prompt = enhance_prompt_with_learning(
+                &state,
+                &prompt,
+                &issue,
+                resolution.repo_name(),
+            );
+
             let mut run_result = state
                 .claude
                 .execute_with_attempt(&prompt, Some(&issue), attempt_id, &project_dir)
@@ -921,6 +1070,31 @@ async fn process_issue(
             break run_result;
         };
 
+        // Strategy fingerprinting (after Claude execution, regardless of outcome)
+        if state.config.learning.strategy_fingerprinting {
+            if let Some(ref sqlite) = state.sqlite_tracker {
+                if let Some(aid) = attempt_id {
+                    if let Ok(execs) = sqlite.get_executions_for_attempt(aid) {
+                        if let Some(exec) = execs.first() {
+                            if let Some(ref log_path) = exec.stdout_log_path {
+                                let path = std::path::Path::new(log_path);
+                                if path.exists() {
+                                    match crate::learning::StrategyParser::parse_from_log(path, aid) {
+                                        Ok(fp) => {
+                                            if let Err(e) = state.tracker.store_strategy_fingerprint(&fp) {
+                                                tracing::warn!(error = %e, "Failed to store strategy fingerprint");
+                                            }
+                                        }
+                                        Err(e) => tracing::debug!(error = %e, "Failed to parse strategy from log"),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if claude_result.success {
             if let Some(pr_url) = claude_result.pr_url {
                 tracing::info!(short_id = %issue.short_id, pr_url = %pr_url, "Success! PR created");
@@ -931,6 +1105,52 @@ async fn process_issue(
                     let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, true);
                 }
                 state.notifier.notify_success(&issue, &pr_url).await?;
+
+                // Record pr_created metric
+                let metric = ProcessingMetric::new("pr_created", 1.0)
+                    .with_source(source_name.to_string());
+                state.tracker.record_metric(&metric).ok();
+
+                // Store embedding for future similarity lookups
+                if let Some(ref embedding_service) = state.issue_embedding_service {
+                    if embedding_service.embed_issue(&issue, source_name).await.is_ok() {
+                        let activity = ActivityLogEntry::new(
+                            "decision",
+                            format!("Stored embedding for {}", issue.short_id),
+                        )
+                        .with_source(source_name.to_string())
+                        .with_issue(issue.id.clone(), issue.short_id.clone())
+                        .with_metadata(json!({
+                            "decision": "issue_embedding_stored",
+                        }));
+                        state.tracker.record_activity(&activity).ok();
+
+                        let metric = ProcessingMetric::new("issue_embedding_stored", 1.0)
+                            .with_source(source_name.to_string());
+                        state.tracker.record_metric(&metric).ok();
+                    }
+                }
+
+                // Register PR for review watching (actual Merged outcome is
+                // recorded later when the review loop detects the merge)
+                if let Some(ref review_watcher) = state.review_watcher {
+                    if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(&pr_url) {
+                        let pr_state = PrReviewState::new(
+                            &pr_url,
+                            &repo,
+                            pr_number,
+                            &issue.id,
+                            source_name,
+                        );
+                        review_watcher.watch_pr(pr_state);
+                        tracing::info!(
+                            pr_url = %pr_url,
+                            repo = %repo,
+                            pr_number = pr_number,
+                            "PR registered for review watching (webhook)"
+                        );
+                    }
+                }
 
                 // Log webhook processed successfully with PR
                 let activity = ActivityLogEntry::new(
@@ -953,7 +1173,7 @@ async fn process_issue(
                     let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
                 }
                 state.notifier.notify_completed(&issue).await?;
-                record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
+                record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed).await;
 
                 // Log webhook processed without PR
                 let activity = ActivityLogEntry::new(
@@ -976,7 +1196,10 @@ async fn process_issue(
                 let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
             }
             notify_failed_with_escalation(&state, &issue, error).await?;
-            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
+            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed).await;
+
+            // Record error pattern for analytics
+            record_error_pattern(&state, source_name, &issue.id, error);
 
             // Log webhook processing failed
             let activity = ActivityLogEntry::new(
@@ -1003,8 +1226,27 @@ async fn process_issue(
             let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
         }
         let _ = notify_failed_with_escalation(&state, &issue, &error).await;
-        record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed);
+        record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed).await;
+
+        // Record error pattern for pipeline errors
+        record_error_pattern(&state, source_name, &issue.id, &error);
     }
+
+    // Record processing duration metric
+    let final_status = state
+        .tracker
+        .get_attempt(source_name, &issue.id)
+        .ok()
+        .flatten()
+        .map(|a| a.status.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let processing_time_metric = ProcessingMetric::new(
+        "processing_time",
+        processing_started_at.elapsed().as_secs_f64(),
+    )
+    .with_source(source_name.to_string())
+    .with_tags(json!({ "status": final_status }));
+    state.tracker.record_metric(&processing_time_metric).ok();
 
     // Remove from processing
     {
@@ -1015,7 +1257,7 @@ async fn process_issue(
     result
 }
 
-fn record_feedback_outcome_from_attempt(
+async fn record_feedback_outcome_from_attempt(
     state: &AppState,
     source_name: &str,
     issue: &Issue,
@@ -1034,9 +1276,31 @@ fn record_feedback_outcome_from_attempt(
         .and_then(|exec| exec.prompt_used)
         .unwrap_or_default();
 
-    let fix_outcome = FixOutcome::from_attempt(&attempt, issue, &prompt, outcome);
+    let mut fix_outcome = FixOutcome::from_attempt(&attempt, issue, &prompt, outcome);
+
+    // Compute embedding for the outcome's issue text (reuse existing issue embedding if available)
+    if let Some(ref embedding_client) = state.embedding_client {
+        let embedding = match state
+            .issue_embedding_service
+            .as_ref()
+            .and_then(|svc| svc.get_embedding(source_name, &issue.id).ok().flatten())
+        {
+            Some(existing) => Some(existing.embedding),
+            None => embedding_client.embed(&fix_outcome.issue_text).await.ok(),
+        };
+        if let Some(emb) = embedding {
+            fix_outcome.set_embedding(emb);
+        }
+    }
+
     if let Err(e) = state.tracker.store_feedback_outcome(&fix_outcome) {
         tracing::warn!(error = %e, "Failed to store webhook feedback outcome");
+    }
+
+    // Update in-memory analyzer for prompt enhancement
+    let mut analyzer = state.feedback_analyzer.lock().await;
+    if let Err(e) = analyzer.record_outcome(&attempt, issue, &prompt, outcome) {
+        tracing::warn!(error = %e, "Failed to record webhook feedback in memory");
     }
 }
 
@@ -1079,6 +1343,89 @@ fn truncate_error_for_activity(error: &str) -> String {
             .map(|(i, _)| i)
             .unwrap_or(0);
         format!("{}...", &error[..safe_end])
+    }
+}
+
+/// Enhance a prompt with continuous learning context (repo knowledge, promoted
+/// instructions, strategy suggestions, cluster context).
+fn enhance_prompt_with_learning(
+    state: &AppState,
+    base_prompt: &str,
+    issue: &Issue,
+    repo: Option<&str>,
+) -> String {
+    let learning = &state.config.learning;
+    let Some(repo_name) = repo else {
+        return base_prompt.to_string();
+    };
+
+    let mut extra_context = String::new();
+
+    // System 4: Per-repo knowledge context
+    if learning.repo_knowledge {
+        if let Ok(knowledge) = state.tracker.get_repo_knowledge(repo_name) {
+            let ctx = crate::learning::RepoKnowledgeManager::format_knowledge_context(&knowledge);
+            if !ctx.is_empty() {
+                extra_context.push_str(&ctx);
+            }
+        }
+    }
+
+    // System 3: Promoted instructions
+    if learning.qa_promotion {
+        if let Ok(instructions) = state.tracker.get_promoted_instructions(repo_name) {
+            let ctx = crate::learning::QaPromoter::format_promoted_context(&instructions);
+            if !ctx.is_empty() {
+                extra_context.push_str(&ctx);
+            }
+        }
+    }
+
+    // System 6: Strategy suggestions
+    if learning.strategy_fingerprinting {
+        if let Ok(strategies) = state.tracker.get_successful_strategies(repo_name, 3) {
+            let ctx = crate::learning::StrategyParser::format_strategy_suggestions(&strategies);
+            if !ctx.is_empty() {
+                extra_context.push_str(&ctx);
+            }
+        }
+    }
+
+    // System 8: Cluster context
+    if learning.cluster_detection {
+        if let Ok(clusters) = state.tracker.get_active_clusters(&issue.source) {
+            for cluster in &clusters {
+                if cluster.issue_ids.contains(&issue.id) {
+                    extra_context.push_str(
+                        &crate::learning::ClusterDetector::format_cluster_context(cluster),
+                    );
+                    extra_context.push('\n');
+                    break;
+                }
+            }
+        }
+    }
+
+    if extra_context.is_empty() {
+        return base_prompt.to_string();
+    }
+
+    format!("{}\n---\n\n{}", extra_context, base_prompt)
+}
+
+/// Record an error pattern to the analytics database.
+fn record_error_pattern(state: &AppState, source: &str, issue_id: &str, error_msg: &str) {
+    let error_type = classify_error(error_msg);
+    let pattern_hash = compute_error_hash(error_msg);
+
+    let mut pattern = ErrorPattern::new(pattern_hash);
+    pattern.error_type = Some(error_type.to_string());
+    pattern.error_message = Some(error_msg.to_string());
+    pattern.sources = Some(vec![source.to_string()]);
+    pattern.example_issue_ids = Some(vec![issue_id.to_string()]);
+
+    if let Err(e) = state.tracker.record_error_pattern(&pattern) {
+        tracing::warn!(error = %e, "Failed to record error pattern");
     }
 }
 
@@ -1474,6 +1821,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
@@ -1513,6 +1863,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(processing_set),
@@ -1550,6 +1903,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
@@ -1621,6 +1977,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
@@ -1667,6 +2026,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
@@ -1735,6 +2097,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
@@ -1813,6 +2178,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
@@ -1863,6 +2231,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
@@ -1914,6 +2285,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(processing),
@@ -1961,6 +2335,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
@@ -2030,6 +2407,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
@@ -2146,6 +2526,9 @@ mod tests {
             sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
