@@ -320,12 +320,7 @@ mod tests {
         }
 
         // Now scan and promote — need min_occurrences=2
-        let count = QaPromoter::scan_and_promote(&tracker, None, 2, 0.8).unwrap();
-
-        // The entries have the same answer_norm, so they should be grouped
-        // Whether they get promoted depends on the global query returning them
-        // At minimum, the code path is exercised without error
-        assert!(count >= 0);
+        QaPromoter::scan_and_promote(&tracker, None, 2, 0.8).unwrap();
     }
 
     #[test]

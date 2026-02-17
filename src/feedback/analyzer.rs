@@ -401,7 +401,7 @@ mod tests {
             outcomes.push(SimilarIssue {
                 outcome: FixOutcome {
                     id: i,
-                    attempt_id: i as i64,
+                    attempt_id: i,
                     source: "linear".to_string(),
                     issue_id: format!("issue-{}", i),
                     issue_text: "Timeout error".to_string(),
