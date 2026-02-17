@@ -1578,7 +1578,9 @@ linear:
 
     #[test]
     fn test_from_yaml_full_config() {
-        let yaml = r#"
+        // Wrap in with_env to prevent env var interference from parallel tests
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /path/to/repos
 known_orgs:
   - appwrite
@@ -1656,43 +1658,44 @@ sentry:
   escalation_threshold_percent: 25
   client_secret: client_secret
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_yaml(yaml).unwrap();
 
-        assert_eq!(config.work_dir, PathBuf::from("/path/to/repos"));
-        assert_eq!(config.known_orgs, vec!["appwrite", "utopia-php"]);
-        assert_eq!(config.auto_discover_paths, vec!["~/Local", "~/Projects"]);
-        assert_eq!(config.poll_interval_ms, 600000);
-        assert_eq!(config.webhook_port, 8080);
-        assert_eq!(config.db_path, PathBuf::from("/custom/db.sqlite"));
-        assert_eq!(config.max_issues_per_cycle, 10);
-        assert_eq!(config.max_concurrent, 3);
-        assert_eq!(config.processing_delay_ms, 10000);
+            assert_eq!(config.work_dir, PathBuf::from("/path/to/repos"));
+            assert_eq!(config.known_orgs, vec!["appwrite", "utopia-php"]);
+            assert_eq!(config.auto_discover_paths, vec!["~/Local", "~/Projects"]);
+            assert_eq!(config.poll_interval_ms, 600000);
+            assert_eq!(config.webhook_port, 8080);
+            assert_eq!(config.db_path, PathBuf::from("/custom/db.sqlite"));
+            assert_eq!(config.max_issues_per_cycle, 10);
+            assert_eq!(config.max_concurrent, 3);
+            assert_eq!(config.processing_delay_ms, 10000);
 
-        // Discord
-        assert_eq!(
-            config.discord.webhook_url,
-            Some("https://discord.com/api/webhooks/123/abc".to_string())
-        );
-        assert_eq!(config.discord.user_id, Some("987654321".to_string()));
+            // Discord
+            assert_eq!(
+                config.discord.webhook_url,
+                Some("https://discord.com/api/webhooks/123/abc".to_string())
+            );
+            assert_eq!(config.discord.user_id, Some("987654321".to_string()));
 
-        // Email
-        assert_eq!(config.email.smtp_host, Some("smtp.example.com".to_string()));
-        assert_eq!(config.email.smtp_port, 465);
-        assert!(config.email.use_tls);
+            // Email
+            assert_eq!(config.email.smtp_host, Some("smtp.example.com".to_string()));
+            assert_eq!(config.email.smtp_port, 465);
+            assert!(config.email.use_tls);
 
-        // Linear
-        let linear = config.linear.unwrap();
-        assert!(linear.enabled);
-        assert_eq!(linear.api_key, "lin_api_key");
-        assert_eq!(linear.trigger_labels, vec!["auto", "implement"]);
-        assert_eq!(linear.team_id, Some("team_123".to_string()));
+            // Linear
+            let linear = config.linear.unwrap();
+            assert!(linear.enabled);
+            assert_eq!(linear.api_key, "lin_api_key");
+            assert_eq!(linear.trigger_labels, vec!["auto", "implement"]);
+            assert_eq!(linear.team_id, Some("team_123".to_string()));
 
-        // Sentry
-        let sentry = config.sentry.unwrap();
-        assert!(sentry.enabled);
-        assert_eq!(sentry.auth_token, "sentry_token");
-        assert_eq!(sentry.org_slug, "my-org");
-        assert_eq!(sentry.top_issues_count, 50);
+            // Sentry
+            let sentry = config.sentry.unwrap();
+            assert!(sentry.enabled);
+            assert_eq!(sentry.auth_token, "sentry_token");
+            assert_eq!(sentry.org_slug, "my-org");
+            assert_eq!(sentry.top_issues_count, 50);
+        });
     }
 
     /// Helper to create a minimal valid config YAML for tests.
