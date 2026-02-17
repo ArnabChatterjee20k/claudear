@@ -262,4 +262,292 @@ mod tests {
         let normalized = name.trim_start_matches('@').to_string();
         assert_eq!(normalized, "appwrite/sdk");
     }
+
+    // ── Edge case tests ──
+
+    #[test]
+    fn test_is_known_org_no_slash() {
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        // Package without slash: split('/').next() returns the whole string,
+        // which matches "utopia-php" in known_orgs
+        assert!(discovery.is_known_org("utopia-php"));
+    }
+
+    #[test]
+    fn test_is_known_org_empty_string() {
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        assert!(!discovery.is_known_org(""));
+    }
+
+    #[test]
+    fn test_is_known_org_empty_orgs() {
+        let discovery = DependencyDiscovery::new(vec![]);
+        assert!(!discovery.is_known_org("utopia-php/database"));
+    }
+
+    #[test]
+    fn test_is_known_org_case_sensitive() {
+        let discovery = DependencyDiscovery::new(vec!["Appwrite".to_string()]);
+        assert!(discovery.is_known_org("Appwrite/sdk"));
+        assert!(!discovery.is_known_org("appwrite/sdk"));
+    }
+
+    #[test]
+    fn test_scan_directory_no_manifests() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        let deps = discovery.scan_directory(temp.path()).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_scan_directory_composer_json() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let composer = serde_json::json!({
+            "name": "appwrite/cloud",
+            "require": {
+                "utopia-php/database": "^1.0",
+                "symfony/console": "^5.0"
+            }
+        });
+        std::fs::write(
+            temp.path().join("composer.json"),
+            serde_json::to_string(&composer).unwrap(),
+        )
+        .unwrap();
+
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        let deps = discovery.scan_directory(temp.path()).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on, "utopia-php/database");
+        assert_eq!(deps[0].repo, "appwrite/cloud");
+        assert_eq!(deps[0].dep_type, "composer");
+    }
+
+    #[test]
+    fn test_scan_directory_composer_require_dev() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let composer = serde_json::json!({
+            "name": "appwrite/cloud",
+            "require-dev": {
+                "utopia-php/testing": "^1.0"
+            }
+        });
+        std::fs::write(
+            temp.path().join("composer.json"),
+            serde_json::to_string(&composer).unwrap(),
+        )
+        .unwrap();
+
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        let deps = discovery.scan_directory(temp.path()).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on, "utopia-php/testing");
+    }
+
+    #[test]
+    fn test_scan_directory_package_json() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let package = serde_json::json!({
+            "name": "@appwrite/console",
+            "dependencies": {
+                "@appwrite/sdk": "^1.0",
+                "react": "^18.0"
+            }
+        });
+        std::fs::write(
+            temp.path().join("package.json"),
+            serde_json::to_string(&package).unwrap(),
+        )
+        .unwrap();
+
+        let discovery = DependencyDiscovery::new(vec!["appwrite".to_string()]);
+        let deps = discovery.scan_directory(temp.path()).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on, "appwrite/sdk");
+        assert_eq!(deps[0].dep_type, "npm");
+    }
+
+    #[test]
+    fn test_scan_directory_package_json_dev_deps() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let package = serde_json::json!({
+            "name": "my-app",
+            "devDependencies": {
+                "@appwrite/testing": "^1.0"
+            }
+        });
+        std::fs::write(
+            temp.path().join("package.json"),
+            serde_json::to_string(&package).unwrap(),
+        )
+        .unwrap();
+
+        let discovery = DependencyDiscovery::new(vec!["appwrite".to_string()]);
+        let deps = discovery.scan_directory(temp.path()).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on, "appwrite/testing");
+    }
+
+    #[test]
+    fn test_scan_directory_malformed_json() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("composer.json"), "{ invalid json }").unwrap();
+
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        // Should not error out - gracefully handles malformed JSON
+        let deps = discovery.scan_directory(temp.path()).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_scan_directory_composer_no_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let composer = serde_json::json!({
+            "require": {
+                "utopia-php/database": "^1.0"
+            }
+        });
+        std::fs::write(
+            temp.path().join("composer.json"),
+            serde_json::to_string(&composer).unwrap(),
+        )
+        .unwrap();
+
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        let deps = discovery.scan_directory(temp.path()).unwrap();
+        // Falls back to directory name for repo name
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on, "utopia-php/database");
+    }
+
+    #[test]
+    fn test_scan_directory_empty_require() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let composer = serde_json::json!({
+            "name": "myapp",
+            "require": {}
+        });
+        std::fs::write(
+            temp.path().join("composer.json"),
+            serde_json::to_string(&composer).unwrap(),
+        )
+        .unwrap();
+
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        let deps = discovery.scan_directory(temp.path()).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_scan_directories_empty_paths() {
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        let deps = discovery.scan_directories(&[]).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_scan_directories_nonexistent_path() {
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        let deps = discovery
+            .scan_directories(&["/nonexistent/path".to_string()])
+            .unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_scan_directories_scans_subdirectories() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        // Create a subdirectory with a composer.json
+        let sub = temp.path().join("my-project");
+        std::fs::create_dir(&sub).unwrap();
+        let composer = serde_json::json!({
+            "name": "my-project",
+            "require": {
+                "utopia-php/database": "^1.0"
+            }
+        });
+        std::fs::write(
+            sub.join("composer.json"),
+            serde_json::to_string(&composer).unwrap(),
+        )
+        .unwrap();
+
+        let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);
+        let deps = discovery
+            .scan_directories(&[temp.path().to_string_lossy().to_string()])
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on, "utopia-php/database");
+    }
+
+    #[test]
+    fn test_get_repo_name_fallback_to_dir_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // No manifests - falls back to directory name
+        let discovery = DependencyDiscovery::new(vec![]);
+        let name = discovery.get_repo_name(temp.path());
+        assert!(name.is_some());
+        // Should be the temp dir's basename
+    }
+
+    #[test]
+    fn test_get_repo_name_prefers_composer_over_package() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("composer.json"),
+            serde_json::json!({"name": "composer-name"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            serde_json::json!({"name": "package-name"}).to_string(),
+        )
+        .unwrap();
+
+        let discovery = DependencyDiscovery::new(vec![]);
+        let name = discovery.get_repo_name(temp.path());
+        assert_eq!(name, Some("composer-name".to_string()));
+    }
+
+    #[test]
+    fn test_get_repo_name_npm_scope_stripped() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            serde_json::json!({"name": "@org/package"}).to_string(),
+        )
+        .unwrap();
+
+        let discovery = DependencyDiscovery::new(vec![]);
+        let name = discovery.get_repo_name(temp.path());
+        assert_eq!(name, Some("org/package".to_string()));
+    }
+
+    #[test]
+    fn test_discovered_dependency_fields() {
+        let dep = DiscoveredDependency {
+            repo: "my-app".to_string(),
+            depends_on: "utopia-php/database".to_string(),
+            dep_type: "composer".to_string(),
+            repo_path: "/path/to/app".to_string(),
+        };
+        assert_eq!(dep.repo, "my-app");
+        assert_eq!(dep.depends_on, "utopia-php/database");
+        assert_eq!(dep.dep_type, "composer");
+        assert_eq!(dep.repo_path, "/path/to/app");
+    }
+
+    #[test]
+    fn test_discovered_dependency_clone() {
+        let dep = DiscoveredDependency {
+            repo: "app".to_string(),
+            depends_on: "lib".to_string(),
+            dep_type: "npm".to_string(),
+            repo_path: "/p".to_string(),
+        };
+        let cloned = dep.clone();
+        assert_eq!(cloned.repo, "app");
+    }
 }

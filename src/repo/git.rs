@@ -179,4 +179,119 @@ mod tests {
     fn test_is_git_repo_nonexistent() {
         assert!(!GitOps::is_git_repo(Path::new("/nonexistent/path")));
     }
+
+    #[test]
+    fn test_is_git_repo_file_not_dir() {
+        // .git exists but as a file, not a directory (like a submodule)
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join(".git"), "gitdir: ../other/.git").unwrap();
+        // is_dir() returns false for files, so this should be false
+        assert!(!GitOps::is_git_repo(temp.path()));
+    }
+
+    #[tokio::test]
+    async fn test_clone_rejects_option_injection() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("repo");
+
+        // URL starting with '-' should be rejected (option injection)
+        let result = GitOps::ensure_repo_at_path(&target, "--upload-pack=evil", "main").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("disallowed characters"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clone_rejects_semicolon_in_url() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("repo");
+
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://example.com;rm -rf /", "main").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("disallowed characters"));
+    }
+
+    #[tokio::test]
+    async fn test_clone_rejects_pipe_in_url() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("repo");
+
+        let result = GitOps::ensure_repo_at_path(&target, "https://example.com|evil", "main").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_clone_rejects_dollar_in_url() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("repo");
+
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://example.com/$HOME", "main").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pull_rejects_option_injection_in_branch() {
+        let temp = TempDir::new().unwrap();
+        // Create a directory to trigger the pull path (repo_path.exists() = true)
+        std::fs::create_dir_all(temp.path().join("repo")).unwrap();
+        let target = temp.path().join("repo");
+
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://example.com/repo.git", "--evil-option")
+                .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("disallowed characters"));
+    }
+
+    #[tokio::test]
+    async fn test_pull_rejects_semicolon_in_branch() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("repo")).unwrap();
+        let target = temp.path().join("repo");
+
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://example.com/repo.git", "main;evil").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pull_rejects_dotdot_in_branch() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("repo")).unwrap();
+        let target = temp.path().join("repo");
+
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://example.com/repo.git", "main..evil")
+                .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("disallowed characters"));
+    }
+
+    #[tokio::test]
+    async fn test_clone_invalid_url_git_error() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("repo");
+
+        // Valid URL format but nonexistent - git clone should fail
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://nonexistent.invalid/repo.git", "main")
+                .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_current_branch_non_git_dir() {
+        let temp = TempDir::new().unwrap();
+        let result = GitOps::current_branch(temp.path()).await;
+        assert!(result.is_err());
+    }
 }

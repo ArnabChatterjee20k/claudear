@@ -622,6 +622,60 @@ impl Watcher {
             }
         }
 
+        // ── Continuous Learning: classify review feedback ──
+        if self.config.learning.review_classification {
+            if let Some(repo) = &attempt.github_repo {
+                // Parse feedback as review comments for classification
+                let mock_comment = crate::github::PrReviewComment {
+                    id: 0,
+                    path: String::new(),
+                    position: None,
+                    original_position: None,
+                    body: feedback.to_string(),
+                    user: crate::github::GitHubUser {
+                        login: "reviewer".to_string(),
+                        id: 0,
+                        user_type: None,
+                    },
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    html_url: String::new(),
+                    pull_request_review_id: None,
+                    start_line: None,
+                    line: None,
+                    side: None,
+                };
+
+                if let Err(e) = crate::learning::ReviewClassifier::process_review_comments(
+                    self.tracker.as_ref(),
+                    repo,
+                    &[mock_comment],
+                    Some(feedback),
+                ) {
+                    tracing::warn!(error = %e, "Failed to classify review feedback");
+                }
+
+                // Check if any patterns should be promoted
+                if let Ok(promotable) = crate::learning::ReviewClassifier::check_promotion_threshold(
+                    self.tracker.as_ref(),
+                    repo,
+                    self.config.learning.review_promotion_threshold,
+                ) {
+                    for pattern in &promotable {
+                        if let Err(e) =
+                            crate::learning::RepoKnowledgeManager::learn_from_review_pattern(
+                                self.tracker.as_ref(),
+                                repo,
+                                pattern,
+                            )
+                        {
+                            tracing::warn!(error = %e, "Failed to learn from promoted review pattern");
+                        }
+                    }
+                }
+            }
+        }
+
         // Find the source for this issue
         let source = match self.sources.iter().find(|s| s.name() == attempt.source) {
             Some(s) => s,
@@ -1438,6 +1492,9 @@ Create a PR with your changes."#,
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
                         .await;
 
+                    // ── Continuous Learning: post-merge hooks ──
+                    self.run_post_merge_learning(attempt).await;
+
                     // Stop review polling for merged PRs.
                     if let (Some(review_watcher), Some(pr_url)) =
                         (self.review_watcher.as_ref(), attempt.pr_url.as_ref())
@@ -2101,6 +2158,13 @@ Create a PR with your changes."#,
                     let analyzer = self.feedback_analyzer.lock().await;
                     analyzer.enhance_prompt(&prompt, &issue)
                 };
+
+                // ── Continuous Learning: layer additional context ──
+                let prompt = self.enhance_prompt_with_learning(
+                    &prompt,
+                    &issue,
+                    resolution.repo_name(),
+                );
                 let mut run_result = self
                     .claude
                     .execute_with_attempt(&prompt, Some(&issue), attempt_id, &project_dir)
@@ -2296,6 +2360,31 @@ Create a PR with your changes."#,
                 run_result.error = Some("Timed out waiting for human reply".to_string());
                 break (run_result, prompt);
             };
+
+            // ── Continuous Learning: Strategy fingerprinting ──
+            if self.config.learning.strategy_fingerprinting {
+                if let Some(sqlite) = &self.sqlite_tracker {
+                    if let Some(aid) = attempt_id {
+                        if let Ok(execs) = sqlite.get_executions_for_attempt(aid) {
+                            if let Some(exec) = execs.first() {
+                                if let Some(ref log_path) = exec.stdout_log_path {
+                                    let path = std::path::Path::new(log_path);
+                                    if path.exists() {
+                                        match crate::learning::StrategyParser::parse_from_log(path, aid) {
+                                            Ok(fp) => {
+                                                if let Err(e) = self.tracker.store_strategy_fingerprint(&fp) {
+                                                    tracing::warn!(error = %e, "Failed to store strategy fingerprint");
+                                                }
+                                            }
+                                            Err(e) => tracing::debug!(error = %e, "Failed to parse strategy from log"),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             if claude_result.success {
                 if let Some(ref pr_url) = claude_result.pr_url {
@@ -2609,6 +2698,166 @@ Create a PR with your changes."#,
 
         self.record_feedback_outcome(attempt, &issue, &prompt, outcome)
             .await;
+    }
+
+    /// Run post-merge learning hooks (extract learnings, analyze diff, compute quality score).
+    async fn run_post_merge_learning(&self, attempt: &crate::types::FixAttempt) {
+        let learning = &self.config.learning;
+
+        // System 1: Auto-extract learnings from execution logs
+        if learning.auto_extract_learnings {
+            if let Some(sqlite) = &self.sqlite_tracker {
+                if let Ok(execs) = sqlite.get_executions_for_attempt(attempt.id) {
+                    if let Some(exec) = execs.first() {
+                        if let Some(ref log_path) = exec.stdout_log_path {
+                            let path = std::path::Path::new(log_path);
+                            if path.exists() {
+                                match crate::learning::LogExtractor::extract_learnings_from_log(
+                                    path,
+                                ) {
+                                    Ok(learnings) => {
+                                        let summary =
+                                            crate::learning::LogExtractor::summarize(&learnings);
+                                        // Store learnings on the feedback outcome
+                                        if let Ok(Some(outcome)) =
+                                            self.tracker.get_feedback_outcome_by_attempt(attempt.id)
+                                        {
+                                            if let Err(e) = self
+                                                .tracker
+                                                .update_feedback_learnings(outcome.id, &summary)
+                                            {
+                                                tracing::warn!(error = %e, "Failed to store extracted learnings");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(error = %e, "Failed to extract learnings from log")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // System 2: Analyze PR diff
+        if learning.diff_analysis {
+            if let (Some(github), Some(repo), Some(pr_number)) = (
+                self.github_client.as_ref(),
+                attempt.github_repo.as_deref(),
+                attempt.github_pr_number,
+            ) {
+                let pr_url = attempt.pr_url.as_deref().unwrap_or("");
+                match github.get_pr_diff(repo, pr_number).await {
+                    Ok(diff) => {
+                        let analysis = crate::learning::DiffAnalyzer::analyze_diff(
+                            &diff, attempt.id, pr_url, repo, pr_number,
+                        );
+
+                        if let Err(e) = self.tracker.store_diff_analysis(&analysis) {
+                            tracing::warn!(error = %e, "Failed to store diff analysis");
+                        }
+
+                        // Feed into repo knowledge
+                        if learning.repo_knowledge {
+                            if let Err(e) = crate::learning::RepoKnowledgeManager::learn_from_diff(
+                                self.tracker.as_ref(),
+                                repo,
+                                &analysis,
+                            ) {
+                                tracing::warn!(error = %e, "Failed to learn from diff");
+                            }
+                        }
+                    }
+                    Err(e) => tracing::debug!(error = %e, "Failed to fetch PR diff for analysis"),
+                }
+            }
+        }
+
+        // System 7: Compute quality score
+        if learning.quality_scoring {
+            if let Some(sqlite) = &self.sqlite_tracker {
+                if let Some(ref pr_url) = attempt.pr_url {
+                    if let Ok(Some(pr_record)) = sqlite.get_pr(pr_url) {
+                        let quality = crate::learning::QualityScorer::compute(&pr_record);
+                        if let Err(e) = self
+                            .tracker
+                            .update_pr_fix_quality_score(pr_url, quality.score)
+                        {
+                            tracing::warn!(error = %e, "Failed to store quality score");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enhance a prompt with continuous learning context.
+    fn enhance_prompt_with_learning(
+        &self,
+        base_prompt: &str,
+        _issue: &Issue,
+        repo: Option<&str>,
+    ) -> String {
+        let learning = &self.config.learning;
+        let Some(repo_name) = repo else {
+            return base_prompt.to_string();
+        };
+
+        let mut extra_context = String::new();
+
+        // System 4: Per-repo knowledge context
+        if learning.repo_knowledge {
+            if let Ok(knowledge) = self.tracker.get_repo_knowledge(repo_name) {
+                let ctx =
+                    crate::learning::RepoKnowledgeManager::format_knowledge_context(&knowledge);
+                if !ctx.is_empty() {
+                    extra_context.push_str(&ctx);
+                }
+            }
+        }
+
+        // System 3: Promoted instructions
+        if learning.qa_promotion {
+            if let Ok(instructions) = self.tracker.get_promoted_instructions(repo_name) {
+                let ctx = crate::learning::QaPromoter::format_promoted_context(&instructions);
+                if !ctx.is_empty() {
+                    extra_context.push_str(&ctx);
+                }
+            }
+        }
+
+        // System 6: Strategy suggestions
+        if learning.strategy_fingerprinting {
+            if let Ok(strategies) = self.tracker.get_successful_strategies(repo_name, 3) {
+                let ctx = crate::learning::StrategyParser::format_strategy_suggestions(&strategies);
+                if !ctx.is_empty() {
+                    extra_context.push_str(&ctx);
+                }
+            }
+        }
+
+        // System 8: Cluster context
+        if learning.cluster_detection {
+            if let Ok(clusters) = self.tracker.get_active_clusters(&_issue.source) {
+                for cluster in &clusters {
+                    if cluster.issue_ids.contains(&_issue.id) {
+                        extra_context.push_str(
+                            &crate::learning::ClusterDetector::format_cluster_context(cluster),
+                        );
+                        extra_context.push('\n');
+                        break;
+                    }
+                }
+            }
+        }
+
+        if extra_context.is_empty() {
+            return base_prompt.to_string();
+        }
+
+        format!("{}\n---\n\n{}", extra_context, base_prompt)
     }
 
     /// Manually trigger processing for a specific issue.
@@ -3029,6 +3278,7 @@ mod tests {
             regression: crate::config::RegressionConfig::default(),
             cascade: crate::config::CascadeConfig::default(),
             users: std::collections::HashMap::new(),
+            learning: crate::config::LearningConfig::default(),
         }
     }
 

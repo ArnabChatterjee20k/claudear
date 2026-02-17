@@ -398,4 +398,108 @@ mod tests {
         assert!(out.contains("Score: 1.000\n"));
         assert!(out.contains("Score: 0.000\n"));
     }
+
+    // ── Edge case tests ──
+
+    #[test]
+    fn test_normalize_text_very_long_string() {
+        let long = "word ".repeat(10_000);
+        let normalized = normalize_text(&long);
+        assert!(!normalized.is_empty());
+        assert!(!normalized.starts_with(' '));
+        assert!(!normalized.ends_with(' '));
+    }
+
+    #[test]
+    fn test_normalize_text_only_special_chars() {
+        assert_eq!(normalize_text("!@#$%^&*()"), "!@#$%^&*()");
+    }
+
+    #[test]
+    fn test_normalize_text_mixed_whitespace_types() {
+        assert_eq!(normalize_text("a\tb\nc\rd"), "a b c d");
+    }
+
+    #[test]
+    fn test_build_correlation_id_empty_short_id() {
+        let id = build_correlation_id("");
+        assert!(id.starts_with('-'));
+    }
+
+    #[test]
+    fn test_build_correlation_id_very_long() {
+        let long_id = "a".repeat(1000);
+        let id = build_correlation_id(&long_id);
+        assert!(id.len() > 1000);
+    }
+
+    #[test]
+    fn test_build_correlation_id_all_special_chars() {
+        let id = build_correlation_id("!@#$%^&*()");
+        assert!(id.starts_with('-'));
+    }
+
+    #[test]
+    fn test_format_reuse_context_score_negative() {
+        let matches = vec![make_qa_match("Q?", "A", -0.5)];
+        let out = format_reuse_context(&matches);
+        assert!(out.contains("Score: -0.500"));
+    }
+
+    #[test]
+    fn test_format_answer_context_multiline_answer() {
+        let q = make_question("Details?");
+        let out = format_answer_context(&q, "Line 1\nLine 2\nLine 3", "slack", false);
+        assert!(out.contains("Line 1\nLine 2\nLine 3"));
+    }
+
+    #[test]
+    fn test_format_timeout_context_empty_question() {
+        let q = make_question("");
+        let out = format_timeout_context(&q);
+        assert!(out.contains("Question: "));
+    }
+
+    #[test]
+    fn test_format_reuse_context_high_precision_scores() {
+        let matches = vec![
+            make_qa_match("Q1?", "A1", 0.999999),
+            make_qa_match("Q2?", "A2", 0.000001),
+        ];
+        let out = format_reuse_context(&matches);
+        assert!(out.contains("Score: 1.000"));
+        assert!(out.contains("Score: 0.000"));
+    }
+
+    #[test]
+    fn test_format_answer_context_very_long_answer() {
+        let q = make_question("What?");
+        let answer = "x".repeat(10_000);
+        let out = format_answer_context(&q, &answer, "ch", false);
+        assert!(out.len() > 10_000);
+    }
+
+    #[test]
+    fn test_find_reusable_qa_with_sqlite_tracker() {
+        let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
+        let ask_config = AskConfig::default();
+        let result = find_reusable_qa(
+            &tracker,
+            &ask_config,
+            "linear",
+            Some("org/repo"),
+            "how",
+            None,
+        )
+        .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_find_reusable_qa_no_repo() {
+        let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
+        let ask_config = AskConfig::default();
+        let result = find_reusable_qa(&tracker, &ask_config, "sentry", None, "what", None).unwrap();
+        assert!(result.is_empty());
+    }
 }

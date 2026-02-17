@@ -82,3 +82,120 @@ impl Default for WebhookHandlerRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Result;
+    use crate::types::{Issue, MatchResult};
+    use async_trait::async_trait;
+
+    struct MockHandler {
+        name: String,
+    }
+
+    impl MockHandler {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WebhookHandler for MockHandler {
+        fn source_name(&self) -> &str {
+            &self.name
+        }
+
+        fn verify_signature(&self, _payload: &[u8], _headers: &HashMap<String, String>) -> bool {
+            true
+        }
+
+        async fn parse_payload(&self, _payload: &serde_json::Value) -> Result<Option<Issue>> {
+            Ok(None)
+        }
+
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("test", crate::types::MatchPriority::Normal)
+        }
+
+        async fn build_issue_context(&self, _issue: &Issue) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn test_registry_new_is_empty() {
+        let registry = WebhookHandlerRegistry::new();
+        assert!(registry.get_all().is_empty());
+        assert!(!registry.has("anything"));
+    }
+
+    #[test]
+    fn test_registry_default_is_empty() {
+        let registry = WebhookHandlerRegistry::default();
+        assert!(registry.get_all().is_empty());
+    }
+
+    #[test]
+    fn test_registry_register_and_get() {
+        let mut registry = WebhookHandlerRegistry::new();
+        registry.register(Arc::new(MockHandler::new("linear")));
+
+        assert!(registry.has("linear"));
+        assert!(registry.get("linear").is_some());
+        assert_eq!(registry.get("linear").unwrap().source_name(), "linear");
+    }
+
+    #[test]
+    fn test_registry_get_nonexistent() {
+        let registry = WebhookHandlerRegistry::new();
+        assert!(registry.get("nonexistent").is_none());
+        assert!(!registry.has("nonexistent"));
+    }
+
+    #[test]
+    fn test_registry_register_multiple() {
+        let mut registry = WebhookHandlerRegistry::new();
+        registry.register(Arc::new(MockHandler::new("linear")));
+        registry.register(Arc::new(MockHandler::new("sentry")));
+        registry.register(Arc::new(MockHandler::new("github")));
+
+        assert_eq!(registry.get_all().len(), 3);
+        assert!(registry.has("linear"));
+        assert!(registry.has("sentry"));
+        assert!(registry.has("github"));
+    }
+
+    #[test]
+    fn test_registry_register_duplicate_overwrites() {
+        let mut registry = WebhookHandlerRegistry::new();
+        registry.register(Arc::new(MockHandler::new("linear")));
+        registry.register(Arc::new(MockHandler::new("linear")));
+
+        // Should still only have one handler
+        assert_eq!(registry.get_all().len(), 1);
+        assert!(registry.has("linear"));
+    }
+
+    #[test]
+    fn test_registry_empty_source_name() {
+        let mut registry = WebhookHandlerRegistry::new();
+        registry.register(Arc::new(MockHandler::new("")));
+
+        assert!(registry.has(""));
+        assert!(registry.get("").is_some());
+        assert_eq!(registry.get_all().len(), 1);
+    }
+
+    #[test]
+    fn test_registry_has_case_sensitive() {
+        let mut registry = WebhookHandlerRegistry::new();
+        registry.register(Arc::new(MockHandler::new("Linear")));
+
+        assert!(registry.has("Linear"));
+        assert!(!registry.has("linear"));
+        assert!(!registry.has("LINEAR"));
+    }
+}

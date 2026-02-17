@@ -391,6 +391,34 @@ impl<H: HttpClient> GitHubClient<H> {
         self.config.token.as_deref()
     }
 
+    /// Fetch the raw unified diff for a PR.
+    pub async fn get_pr_diff(&self, repo: &str, pr_number: i64) -> Result<String> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
+        let headers = vec![
+            ("Authorization", format!("Bearer {}", token)),
+            ("Accept", "application/vnd.github.v3.diff".to_string()),
+            ("User-Agent", "claudear".to_string()),
+            ("X-GitHub-Api-Version", "2022-11-28".to_string()),
+        ];
+
+        let response = self.http.get(&url, headers).await?;
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "GitHub API error fetching diff for {}/pull/{}: {}",
+                repo, pr_number, response.body
+            )));
+        }
+
+        Ok(response.body)
+    }
+
     /// List all repositories for an organization.
     ///
     /// Paginates through all results (100 per page) and returns all repos.

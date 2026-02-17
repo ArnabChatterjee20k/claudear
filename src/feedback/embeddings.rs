@@ -551,4 +551,238 @@ mod tests {
         let store = MemoryVectorStore::default();
         assert!(store.is_empty());
     }
+
+    // ── Edge case tests ──
+
+    #[test]
+    fn test_cosine_similarity_single_element() {
+        assert!((cosine_similarity(&[3.0], &[5.0]) - 1.0).abs() < 0.001);
+        assert!((cosine_similarity(&[-3.0], &[5.0]) + 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cosine_similarity_nan_handling() {
+        let a = vec![f32::NAN, 1.0];
+        let b = vec![1.0, 1.0];
+        let sim = cosine_similarity(&a, &b);
+        // NaN in input should propagate to NaN output
+        assert!(sim.is_nan());
+    }
+
+    #[test]
+    fn test_cosine_similarity_infinity() {
+        let a = vec![f32::INFINITY, 0.0];
+        let b = vec![1.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        // Infinity should still produce a valid result (inf/inf = NaN, or 1.0)
+        assert!(sim.is_nan() || (sim - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cosine_similarity_very_small_values() {
+        let a = vec![1e-30, 1e-30];
+        let b = vec![1e-30, 1e-30];
+        let sim = cosine_similarity(&a, &b);
+        // Should be close to 1.0 for identical vectors, even with tiny values
+        // May be 0.0 if underflow makes norms 0
+        assert!(
+            sim == 0.0 || (sim - 1.0).abs() < 0.01,
+            "expected 0.0 or ~1.0, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_cosine_similarity_very_large_values() {
+        let a = vec![1e30, 1e30];
+        let b = vec![1e30, 1e30];
+        let sim = cosine_similarity(&a, &b);
+        // May overflow, check it doesn't panic
+        assert!(sim.is_finite() || sim.is_nan());
+    }
+
+    #[test]
+    fn test_cosine_similarity_mixed_signs() {
+        let a = vec![1.0, -1.0, 1.0, -1.0];
+        let b = vec![1.0, -1.0, 1.0, -1.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!((sim - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cosine_similarity_one_zero_one_nonzero() {
+        let a = vec![0.0, 0.0];
+        let b = vec![0.0, 0.0];
+        // Both zero vectors
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn test_euclidean_distance_empty() {
+        // Same-length empty vectors should have 0 distance
+        let a: Vec<f32> = vec![];
+        let b: Vec<f32> = vec![];
+        let dist = euclidean_distance(&a, &b);
+        assert!((dist - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_euclidean_distance_single_element() {
+        let a = vec![0.0];
+        let b = vec![5.0];
+        let dist = euclidean_distance(&a, &b);
+        assert!((dist - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_euclidean_distance_negative_values() {
+        let a = vec![-3.0, 0.0];
+        let b = vec![0.0, 4.0];
+        let dist = euclidean_distance(&a, &b);
+        assert!((dist - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_euclidean_distance_symmetric() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        assert!((euclidean_distance(&a, &b) - euclidean_distance(&b, &a)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_normalize_single_element() {
+        let v = vec![5.0];
+        let n = normalize(&v);
+        assert!((n[0] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_normalize_negative_values() {
+        let v = vec![-3.0, -4.0];
+        let n = normalize(&v);
+        let norm: f32 = n.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.001);
+        // Signs should be preserved
+        assert!(n[0] < 0.0);
+        assert!(n[1] < 0.0);
+    }
+
+    #[test]
+    fn test_normalize_already_unit() {
+        let v = vec![0.6, 0.8]; // 0.36 + 0.64 = 1.0
+        let n = normalize(&v);
+        assert!((n[0] - 0.6).abs() < 0.001);
+        assert!((n[1] - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_normalize_empty() {
+        let v: Vec<f32> = vec![];
+        let n = normalize(&v);
+        assert!(n.is_empty());
+    }
+
+    #[test]
+    fn test_memory_vector_store_remove_nonexistent() {
+        let mut store = MemoryVectorStore::new();
+        store.add(1, vec![1.0], None);
+        store.remove(999); // Should not panic
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_memory_vector_store_remove_all() {
+        let mut store = MemoryVectorStore::new();
+        store.add(1, vec![1.0], None);
+        store.add(2, vec![0.0], None);
+        store.remove(1);
+        store.remove(2);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_memory_vector_store_duplicate_ids() {
+        let mut store = MemoryVectorStore::new();
+        store.add(1, vec![1.0, 0.0], Some("first".to_string()));
+        store.add(1, vec![0.0, 1.0], Some("second".to_string()));
+
+        // Both entries should exist (store doesn't enforce unique IDs)
+        assert_eq!(store.len(), 2);
+
+        // Remove should remove all entries with that ID
+        store.remove(1);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_memory_vector_store_search_limit_zero() {
+        let mut store = MemoryVectorStore::new();
+        store.add(1, vec![1.0, 0.0], None);
+
+        let results = store.search(&[1.0, 0.0], 0, 0.0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_memory_vector_store_search_high_min_filters_all() {
+        let mut store = MemoryVectorStore::new();
+        store.add(1, vec![1.0, 0.0], None);
+        store.add(2, vec![0.0, 1.0], None);
+
+        // Orthogonal query, high threshold
+        let results = store.search(&[0.707, 0.707], 10, 0.99);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_memory_vector_store_search_sorted_by_similarity() {
+        let mut store = MemoryVectorStore::new();
+        store.add(1, vec![1.0, 0.0, 0.0], None); // Most similar to query
+        store.add(2, vec![0.5, 0.5, 0.5], None); // Medium
+        store.add(3, vec![0.0, 0.0, 1.0], None); // Least similar
+
+        let results = store.search(&[1.0, 0.0, 0.0], 10, -1.0);
+        assert!(results.len() >= 2);
+        // Should be sorted descending by similarity
+        for i in 0..results.len() - 1 {
+            assert!(
+                results[i].similarity >= results[i + 1].similarity,
+                "results not sorted: {} < {}",
+                results[i].similarity,
+                results[i + 1].similarity
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_vector_store_add_after_clear() {
+        let mut store = MemoryVectorStore::new();
+        store.add(1, vec![1.0], None);
+        store.clear();
+        store.add(2, vec![0.5], None);
+        assert_eq!(store.len(), 1);
+        let results = store.search(&[0.5], 10, 0.0);
+        assert_eq!(results[0].id, 2);
+    }
+
+    #[test]
+    fn test_embedding_config_debug() {
+        let config = EmbeddingConfig::default();
+        // Should implement Debug without panicking
+        let debug_str = format!("{:?}", config);
+        assert!(!debug_str.is_empty());
+    }
+
+    #[test]
+    fn test_embedding_result_clone() {
+        let result = EmbeddingResult {
+            id: 1,
+            similarity: 0.9,
+            text: Some("test".to_string()),
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.id, 1);
+        assert!((cloned.similarity - 0.9).abs() < 0.001);
+        assert_eq!(cloned.text, Some("test".to_string()));
+    }
 }

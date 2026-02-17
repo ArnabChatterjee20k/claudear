@@ -290,6 +290,7 @@ mod tests {
             regression: crate::config::RegressionConfig::default(),
             cascade: crate::config::CascadeConfig::default(),
             users: std::collections::HashMap::new(),
+            learning: crate::config::LearningConfig::default(),
         }
     }
 

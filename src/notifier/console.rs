@@ -247,4 +247,63 @@ mod tests {
             assert!(result.is_ok());
         }
     }
+
+    // ── Edge case tests ──
+
+    #[tokio::test]
+    async fn test_notify_start_empty_fields() {
+        let notifier = ConsoleNotifier::new();
+        let issue = Issue::new("", "", "", "", "");
+        assert!(notifier.notify_start(&issue).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_empty_pr_url() {
+        let notifier = ConsoleNotifier::new();
+        let issue = Issue::new("1", "T-1", "test", "url", "linear");
+        assert!(notifier.notify_success(&issue, "").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_empty_error() {
+        let notifier = ConsoleNotifier::new();
+        let issue = Issue::new("1", "T-1", "test", "url", "linear");
+        assert!(notifier.notify_failed(&issue, "").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_status_empty_message() {
+        let notifier = ConsoleNotifier::new();
+        assert!(notifier.notify_status("").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_unicode_title() {
+        let notifier = ConsoleNotifier::new();
+        let issue = Issue::new("1", "T-1", "Ошибка: 数据库超时 🔥", "url", "sentry");
+        assert!(notifier.notify_start(&issue).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_multiline_error() {
+        let notifier = ConsoleNotifier::new();
+        let issue = Issue::new("1", "T-1", "test", "url", "linear");
+        assert!(notifier
+            .notify_failed(&issue, "line1\nline2\nline3")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_status_very_long_message() {
+        let notifier = ConsoleNotifier::new();
+        let long_msg = "x".repeat(10_000);
+        assert!(notifier.notify_status(&long_msg).await.is_ok());
+    }
+
+    #[test]
+    fn test_supports_replies_false() {
+        let notifier = ConsoleNotifier::new();
+        assert!(!notifier.supports_replies());
+    }
 }

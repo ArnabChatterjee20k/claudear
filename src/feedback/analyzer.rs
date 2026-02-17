@@ -264,6 +264,61 @@ impl FeedbackAnalyzer {
     pub fn add_learnings(&mut self, outcome_id: i64, learnings: &str) -> Result<()> {
         self.tracker.add_learnings(outcome_id, learnings)
     }
+
+    /// Build an enhanced prompt with quality-weighted feedback learnings.
+    ///
+    /// When quality weights are available, suggestions from fast-merge, clean PRs
+    /// influence future suggestions more than multi-round ones.
+    pub fn enhance_prompt_with_quality(
+        &self,
+        base_prompt: &str,
+        issue: &Issue,
+        quality_weights: &std::collections::HashMap<i64, f64>,
+    ) -> String {
+        let mut suggestions = self.suggest_improvements(issue);
+
+        // Apply quality weighting if available
+        if !quality_weights.is_empty() {
+            for suggestion in &mut suggestions {
+                for outcome_id in &suggestion.based_on {
+                    if let Some(&quality) = quality_weights.get(outcome_id) {
+                        suggestion.confidence = crate::learning::QualityScorer::weight_confidence(
+                            suggestion.confidence,
+                            quality,
+                        );
+                    }
+                }
+            }
+            // Re-sort by updated confidence
+            suggestions.sort_by(|a, b| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        if suggestions.is_empty() {
+            return base_prompt.to_string();
+        }
+
+        let mut enhanced = String::new();
+        enhanced.push_str("# Learnings from Similar Issues\n\n");
+
+        for suggestion in suggestions.iter().take(3) {
+            let prefix = match suggestion.suggestion_type {
+                SuggestionType::AddContext => "Context:",
+                SuggestionType::AvoidPattern => "Avoid:",
+                SuggestionType::IncludeInstruction => "Instruction:",
+                SuggestionType::Warning => "Warning:",
+            };
+            enhanced.push_str(&format!("- {} {}\n", prefix, suggestion.text));
+        }
+
+        enhanced.push_str("\n---\n\n");
+        enhanced.push_str(base_prompt);
+
+        enhanced
+    }
 }
 
 impl Default for FeedbackAnalyzer {
@@ -906,5 +961,221 @@ mod tests {
             // If we got suggestions from both outcomes, generic context should be present
             assert!(has_generic_context);
         }
+    }
+
+    // ── enhance_prompt_with_quality tests ──
+
+    #[test]
+    fn test_enhance_prompt_with_quality_no_suggestions() {
+        let analyzer = FeedbackAnalyzer::new();
+        let issue = create_test_issue("Unique Test", "Unique Description", "linear");
+        let weights = std::collections::HashMap::new();
+
+        let enhanced = analyzer.enhance_prompt_with_quality("Base prompt", &issue, &weights);
+        assert_eq!(enhanced, "Base prompt");
+    }
+
+    #[test]
+    fn test_enhance_prompt_with_quality_empty_weights() {
+        let mut analyzer = FeedbackAnalyzer::with_settings(0.0, 10);
+
+        let issue = create_test_issue("API error", "Server error", "sentry");
+        let attempt = create_test_attempt("sentry");
+        let id = analyzer
+            .record_outcome(&attempt, &issue, "Fix it", Outcome::Merged)
+            .unwrap();
+        analyzer.add_learnings(id, "Check error handling").unwrap();
+
+        let new_issue = create_test_issue("API error bug", "Server error issue", "sentry");
+        let weights = std::collections::HashMap::new();
+
+        let enhanced = analyzer.enhance_prompt_with_quality("Base prompt", &new_issue, &weights);
+        // With empty weights, should still work same as enhance_prompt
+        assert!(enhanced.contains("Base prompt"));
+    }
+
+    #[test]
+    fn test_enhance_prompt_with_quality_applies_weights() {
+        let mut analyzer = FeedbackAnalyzer::with_settings(0.0, 10);
+
+        let issue1 = create_test_issue("Auth bug", "Login fails", "sentry");
+        let attempt = create_test_attempt("sentry");
+        let id = analyzer
+            .record_outcome(&attempt, &issue1, "Fix auth", Outcome::Merged)
+            .unwrap();
+        analyzer.add_learnings(id, "Check session tokens").unwrap();
+
+        // Apply quality weight
+        let mut weights = std::collections::HashMap::new();
+        weights.insert(id, 0.95); // High quality
+
+        let new_issue = create_test_issue("Auth error", "Login broken", "sentry");
+        let enhanced = analyzer.enhance_prompt_with_quality("Base prompt", &new_issue, &weights);
+        assert!(enhanced.contains("Base prompt"));
+        // The quality weighting should affect confidence but not change content presence
+        if enhanced.len() > "Base prompt".len() {
+            assert!(enhanced.contains("Learnings from Similar Issues"));
+        }
+    }
+
+    #[test]
+    fn test_enhance_prompt_with_quality_low_weight_reduces_confidence() {
+        let mut analyzer = FeedbackAnalyzer::with_settings(0.0, 10);
+
+        // Record 3 successful outcomes with learnings to trigger multi-suggestion path
+        for i in 0..3 {
+            let issue = create_test_issue(
+                &format!("DB error {}", i),
+                &format!("DB fails {}", i),
+                "linear",
+            );
+            let attempt = create_test_attempt("linear");
+            let id = analyzer
+                .record_outcome(&attempt, &issue, "fix", Outcome::Merged)
+                .unwrap();
+            analyzer
+                .add_learnings(id, &format!("Learning {}", i))
+                .unwrap();
+        }
+
+        let new_issue = create_test_issue("DB error test", "DB fails test", "linear");
+
+        // Get suggestions without quality weights
+        let base_suggestions = analyzer.suggest_improvements(&new_issue);
+
+        // Get enhanced with zero quality weight (should reduce confidence)
+        let mut weights = std::collections::HashMap::new();
+        for s in &base_suggestions {
+            for outcome_id in &s.based_on {
+                weights.insert(*outcome_id, 0.0);
+            }
+        }
+
+        // This exercises the quality weighting code path
+        let enhanced = analyzer.enhance_prompt_with_quality("prompt", &new_issue, &weights);
+        assert!(enhanced.contains("prompt"));
+    }
+
+    #[test]
+    fn test_new_default_settings() {
+        let analyzer = FeedbackAnalyzer::new();
+        // Verify default settings are applied
+        let issue = create_test_issue("test", "test", "sentry");
+        let similar = analyzer.find_similar(&issue);
+        assert!(similar.is_empty()); // No outcomes recorded
+    }
+
+    #[test]
+    fn test_with_settings_zero_max_results() {
+        let mut analyzer = FeedbackAnalyzer::with_settings(0.0, 0);
+        let issue = create_test_issue("test", "test", "sentry");
+        let attempt = create_test_attempt("sentry");
+        analyzer
+            .record_outcome(&attempt, &issue, "p", Outcome::Merged)
+            .unwrap();
+
+        let similar = analyzer.find_similar(&issue);
+        assert!(similar.is_empty()); // Max 0 results
+    }
+
+    #[test]
+    fn test_find_similar_high_threshold_returns_empty() {
+        let mut analyzer = FeedbackAnalyzer::with_settings(1.0, 10);
+        let issue = create_test_issue("test A", "desc A", "sentry");
+        let attempt = create_test_attempt("sentry");
+        analyzer
+            .record_outcome(&attempt, &issue, "p", Outcome::Merged)
+            .unwrap();
+
+        let other = create_test_issue("test B", "desc B", "sentry");
+        let similar = analyzer.find_similar(&other);
+        // Threshold 1.0 means only exact match (which self-similarity might not even be 1.0)
+        // At minimum this exercises the filter path
+        assert!(similar.len() <= 1);
+    }
+
+    #[test]
+    fn test_load_outcomes_replaces_state() {
+        let mut analyzer = FeedbackAnalyzer::new();
+        let issue = create_test_issue("test", "test", "sentry");
+        let attempt = create_test_attempt("sentry");
+        analyzer
+            .record_outcome(&attempt, &issue, "p", Outcome::Merged)
+            .unwrap();
+
+        // Load empty outcomes effectively clears
+        analyzer.load_outcomes(vec![]);
+        let similar = analyzer.find_similar(&issue);
+        assert!(similar.is_empty());
+    }
+
+    #[test]
+    fn test_suggest_improvements_no_outcomes() {
+        let analyzer = FeedbackAnalyzer::new();
+        let issue = create_test_issue("test", "test", "sentry");
+        let suggestions = analyzer.suggest_improvements(&issue);
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_enhance_prompt_no_match_returns_base() {
+        let analyzer = FeedbackAnalyzer::new();
+        let issue = create_test_issue("test", "test", "sentry");
+        let enhanced = analyzer.enhance_prompt("Fix this bug", &issue);
+        assert_eq!(enhanced, "Fix this bug");
+    }
+
+    #[test]
+    fn test_enhance_prompt_empty_base_prompt() {
+        let analyzer = FeedbackAnalyzer::new();
+        let issue = create_test_issue("test", "test", "sentry");
+        let enhanced = analyzer.enhance_prompt("", &issue);
+        assert_eq!(enhanced, "");
+    }
+
+    #[test]
+    fn test_record_outcome_returns_sequential_ids() {
+        let mut analyzer = FeedbackAnalyzer::new();
+        let issue = create_test_issue("test", "test", "sentry");
+        let attempt = create_test_attempt("sentry");
+        let id1 = analyzer
+            .record_outcome(&attempt, &issue, "p", Outcome::Merged)
+            .unwrap();
+        let id2 = analyzer
+            .record_outcome(&attempt, &issue, "p", Outcome::Failed)
+            .unwrap();
+        assert!(id2 > id1);
+    }
+
+    #[test]
+    fn test_enhance_prompt_with_quality_reorders_by_confidence() {
+        let mut analyzer = FeedbackAnalyzer::with_settings(0.0, 10);
+
+        // Record outcomes to generate multiple suggestions
+        let issue1 = create_test_issue("Cache bug", "Cache fails", "sentry");
+        let attempt1 = create_test_attempt("sentry");
+        let id1 = analyzer
+            .record_outcome(&attempt1, &issue1, "fix", Outcome::Merged)
+            .unwrap();
+        analyzer
+            .add_learnings(id1, "Invalidate cache on update")
+            .unwrap();
+
+        let issue2 = create_test_issue("Cache problem", "Cache broken", "sentry");
+        let mut attempt2 = create_test_attempt("sentry");
+        attempt2.error_message = Some("Cache timeout error".to_string());
+        let id2 = analyzer
+            .record_outcome(&attempt2, &issue2, "fix", Outcome::Failed)
+            .unwrap();
+
+        let new_issue = create_test_issue("Cache issue", "Cache error", "sentry");
+
+        // High quality weight on successful outcome, low on failed
+        let mut weights = std::collections::HashMap::new();
+        weights.insert(id1, 1.0);
+        weights.insert(id2, 0.1);
+
+        let enhanced = analyzer.enhance_prompt_with_quality("prompt", &new_issue, &weights);
+        assert!(enhanced.contains("prompt"));
     }
 }

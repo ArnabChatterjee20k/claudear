@@ -1266,4 +1266,528 @@ mod tests {
         let parsed: FixOutcome = serde_json::from_str(&json).unwrap();
         assert!(parsed.embedding.is_none());
     }
+
+    // ── Edge case tests ──
+
+    #[test]
+    fn test_outcome_parse_empty_string() {
+        assert_eq!(Outcome::parse(""), None);
+    }
+
+    #[test]
+    fn test_outcome_parse_whitespace() {
+        // Leading/trailing whitespace should not match
+        assert_eq!(Outcome::parse(" merged "), None);
+        assert_eq!(Outcome::parse("merged "), None);
+    }
+
+    #[test]
+    fn test_outcome_parse_cannotfix_variant() {
+        // Both underscore and no-underscore should work
+        assert_eq!(Outcome::parse("cannot_fix"), Some(Outcome::CannotFix));
+        assert_eq!(Outcome::parse("cannotfix"), Some(Outcome::CannotFix));
+        assert_eq!(Outcome::parse("CANNOTFIX"), Some(Outcome::CannotFix));
+        assert_eq!(Outcome::parse("CANNOT_FIX"), Some(Outcome::CannotFix));
+    }
+
+    #[test]
+    fn test_outcome_is_success_only_merged() {
+        // Only Merged is considered success
+        assert!(Outcome::Merged.is_success());
+        assert!(!Outcome::CannotFix.is_success());
+    }
+
+    #[test]
+    fn test_outcome_roundtrip_all_variants() {
+        for outcome in [
+            Outcome::Merged,
+            Outcome::Closed,
+            Outcome::Failed,
+            Outcome::CannotFix,
+        ] {
+            let s = outcome.as_str();
+            let parsed = Outcome::parse(s).unwrap();
+            assert_eq!(parsed, outcome, "roundtrip failed for {:?}", outcome);
+        }
+    }
+
+    #[test]
+    fn test_extract_keywords_empty_inputs() {
+        let keywords = FixOutcome::extract_keywords("", "");
+        assert!(keywords.is_empty());
+    }
+
+    #[test]
+    fn test_extract_keywords_only_common_words() {
+        // All words are either short (<= 3 chars) or common words
+        let keywords = FixOutcome::extract_keywords("the bug is a fix", "error in the issue");
+        // "bug" and "is" are 3 chars or less, "the" is common, "fix" is common, "error" is common, "issue" is common
+        // Only words > 3 chars that are not common should appear
+        for kw in &keywords {
+            assert!(kw.len() > 3, "short word leaked: {}", kw);
+            assert!(!is_common_word(kw), "common word leaked: {}", kw);
+        }
+    }
+
+    #[test]
+    fn test_extract_keywords_special_characters() {
+        let keywords =
+            FixOutcome::extract_keywords("null_pointer_exception", "at com.example.MyClass:42");
+        // Should split on non-alphanumeric (except underscore)
+        assert!(
+            keywords.contains(&"null_pointer_exception".to_string())
+                || keywords.contains(&"null_pointer".to_string())
+                || keywords.iter().any(|k| k.contains("null"))
+        );
+    }
+
+    #[test]
+    fn test_extract_keywords_unicode() {
+        let keywords = FixOutcome::extract_keywords("Ошибка базы данных", "подключение не удалось");
+        // Should handle Unicode gracefully - either extract unicode words or produce empty
+        // The important thing is it doesn't panic
+        for kw in &keywords {
+            assert!(kw.len() > 3);
+        }
+    }
+
+    #[test]
+    fn test_categorize_error_case_insensitive() {
+        assert_eq!(FixOutcome::categorize_error("TIMEOUT"), "timeout");
+        assert_eq!(
+            FixOutcome::categorize_error("Permission DENIED"),
+            "permission"
+        );
+        assert_eq!(FixOutcome::categorize_error("SYNTAX error"), "syntax");
+    }
+
+    #[test]
+    fn test_categorize_error_empty_string() {
+        assert_eq!(FixOutcome::categorize_error(""), "unknown");
+    }
+
+    #[test]
+    fn test_categorize_error_multiple_matching_keywords() {
+        // "timeout" checked first, so it should win over other matches
+        assert_eq!(
+            FixOutcome::categorize_error("Build failed due to timeout"),
+            "timeout"
+        );
+        // "permission" checked before "syntax"
+        assert_eq!(
+            FixOutcome::categorize_error("Permission denied: parse error"),
+            "permission"
+        );
+    }
+
+    #[test]
+    fn test_categorize_error_priority_order() {
+        // Verify the priority ordering: timeout > permission > syntax > test_failure > build_failure > not_found > conflict > unknown
+        // "test fail" should match test_failure not other patterns
+        assert_eq!(FixOutcome::categorize_error("test failed"), "test_failure");
+        // But "test" alone isn't enough — needs both "test" and "fail"
+        assert_eq!(FixOutcome::categorize_error("test passed"), "unknown");
+    }
+
+    #[test]
+    fn test_similarity_self_is_one() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Database timeout", "PostgreSQL connection timed out");
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let sim = outcome.similarity(&outcome);
+        assert_eq!(sim, 1.0, "self-similarity should be exactly 1.0");
+    }
+
+    #[test]
+    fn test_similarity_symmetric() {
+        let attempt = create_test_attempt();
+        let issue1 = create_test_issue("Database timeout error", "PostgreSQL connection");
+        let issue2 = create_test_issue("API server crash", "PostgreSQL pool exhausted");
+        let o1 = FixOutcome::from_attempt(&attempt, &issue1, "p", Outcome::Merged);
+        let o2 = FixOutcome::from_attempt(&attempt, &issue2, "p", Outcome::Merged);
+        let sim_12 = o1.similarity(&o2);
+        let sim_21 = o2.similarity(&o1);
+        assert!(
+            (sim_12 - sim_21).abs() < 1e-10,
+            "similarity should be symmetric"
+        );
+    }
+
+    #[test]
+    fn test_similarity_both_empty_keywords() {
+        let attempt = create_test_attempt();
+        // Very short words only -> no keywords extracted
+        let issue1 = Issue {
+            id: "1".to_string(),
+            short_id: "1".to_string(),
+            title: "a b c".to_string(),
+            description: None,
+            url: "u".to_string(),
+            source: "t".to_string(),
+            priority: IssuePriority::Medium,
+            status: IssueStatus::Open,
+            metadata: Default::default(),
+            created_at: None,
+            updated_at: None,
+        };
+        let issue2 = Issue {
+            id: "2".to_string(),
+            short_id: "2".to_string(),
+            title: "x y z".to_string(),
+            description: None,
+            url: "u".to_string(),
+            source: "t".to_string(),
+            priority: IssuePriority::Medium,
+            status: IssueStatus::Open,
+            metadata: Default::default(),
+            created_at: None,
+            updated_at: None,
+        };
+        let o1 = FixOutcome::from_attempt(&attempt, &issue1, "p", Outcome::Merged);
+        let o2 = FixOutcome::from_attempt(&attempt, &issue2, "p", Outcome::Merged);
+        assert_eq!(o1.similarity(&o2), 0.0, "both empty keywords should be 0.0");
+    }
+
+    #[test]
+    fn test_embedding_similarity_identical_vectors() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let mut o1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let mut o2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        o1.set_embedding(vec![1.0, 2.0, 3.0]);
+        o2.set_embedding(vec![1.0, 2.0, 3.0]);
+        let sim = o1.similarity(&o2);
+        assert!(
+            (sim - 1.0).abs() < 0.01,
+            "identical embeddings should have similarity ~1.0, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_embedding_similarity_opposite_vectors() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let mut o1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let mut o2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        o1.set_embedding(vec![1.0, 0.0, 0.0]);
+        o2.set_embedding(vec![-1.0, 0.0, 0.0]);
+        let sim = o1.similarity(&o2);
+        assert!(
+            sim < 0.0,
+            "opposite vectors should have negative cosine similarity, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_similarity_to_embedding_zero_vector() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let mut o = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        o.set_embedding(vec![0.0, 0.0, 0.0]);
+        // Zero vector triggers the norm==0 guard in cosine_similarity, returning 0.0
+        let sim = o.similarity_to_embedding(&[1.0, 0.0, 0.0]);
+        assert_eq!(sim, 0.0, "zero vector sim should be 0.0, got {}", sim);
+    }
+
+    #[test]
+    fn test_find_similar_by_embedding_empty_tracker() {
+        let tracker = OutcomeTracker::new();
+        let results = tracker.find_similar_by_embedding(&[1.0, 0.0], 10, 0.0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_find_similar_by_embedding_high_threshold_filters_all() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let mut o = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        o.set_embedding(vec![1.0, 0.0, 0.0]);
+        let id = tracker.record(o).unwrap();
+        tracker.set_embedding(id, vec![1.0, 0.0, 0.0]).unwrap();
+
+        // Orthogonal query with high threshold
+        let results = tracker.find_similar_by_embedding(&[0.0, 1.0, 0.0], 10, 0.99);
+        assert!(
+            results.is_empty(),
+            "orthogonal query with high threshold should return nothing"
+        );
+    }
+
+    #[test]
+    fn test_find_similar_limit_zero() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Database timeout", "PostgreSQL connection fails");
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+
+        let results = tracker.find_similar(&issue, 0, 0.0);
+        assert!(results.is_empty(), "limit=0 should return empty");
+    }
+
+    #[test]
+    fn test_common_errors_limit_zero() {
+        let mut tracker = OutcomeTracker::new();
+        let issue = create_test_issue("Test", "Test");
+        let mut attempt = create_test_attempt();
+        attempt.error_message = Some("Connection timed out".to_string());
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Failed,
+            ))
+            .unwrap();
+
+        let errors = tracker.common_errors(0);
+        assert!(errors.is_empty(), "limit=0 should return empty");
+    }
+
+    #[test]
+    fn test_common_errors_no_errors() {
+        let mut tracker = OutcomeTracker::new();
+        let issue = create_test_issue("Test", "Test");
+        let attempt = create_test_attempt();
+        // Merged outcomes don't have error_type set (error_message is None)
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+
+        let errors = tracker.common_errors(10);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_set_embedding_nonexistent_id() {
+        let mut tracker = OutcomeTracker::new();
+        // Should not panic
+        let result = tracker.set_embedding(999, vec![1.0, 2.0]);
+        assert!(result.is_ok());
+        // Verify nothing was changed
+        assert!(tracker.all().is_empty());
+    }
+
+    #[test]
+    fn test_load_replaces_existing_outcomes() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+        assert_eq!(tracker.all().len(), 1);
+
+        // Load replaces everything
+        tracker.load(vec![]);
+        assert!(tracker.all().is_empty());
+    }
+
+    #[test]
+    fn test_load_empty_keeps_next_id_at_one() {
+        let mut tracker = OutcomeTracker::new();
+        tracker.load(vec![]);
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let id = tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+        assert_eq!(id, 1, "after loading empty, next_id should still be 1");
+    }
+
+    #[test]
+    fn test_success_rate_all_failed() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        for _ in 0..5 {
+            tracker
+                .record(FixOutcome::from_attempt(
+                    &attempt,
+                    &issue,
+                    "p",
+                    Outcome::Failed,
+                ))
+                .unwrap();
+        }
+        assert_eq!(tracker.success_rate(None), 0.0);
+    }
+
+    #[test]
+    fn test_success_rate_all_merged() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        for _ in 0..3 {
+            tracker
+                .record(FixOutcome::from_attempt(
+                    &attempt,
+                    &issue,
+                    "p",
+                    Outcome::Merged,
+                ))
+                .unwrap();
+        }
+        assert!((tracker.success_rate(None) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_success_rate_nonexistent_source() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+        assert_eq!(tracker.success_rate(Some("nonexistent")), 0.0);
+    }
+
+    #[test]
+    fn test_from_attempt_no_description() {
+        let attempt = create_test_attempt();
+        let issue = Issue {
+            id: "1".to_string(),
+            short_id: "1".to_string(),
+            title: "Title only".to_string(),
+            description: None,
+            url: "u".to_string(),
+            source: "t".to_string(),
+            priority: IssuePriority::Medium,
+            status: IssueStatus::Open,
+            metadata: Default::default(),
+            created_at: None,
+            updated_at: None,
+        };
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        assert!(outcome.issue_text.contains("Title only"));
+        assert!(outcome.error_type.is_none());
+    }
+
+    #[test]
+    fn test_from_attempt_no_error_message() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Failed);
+        // No error_message on attempt means no error_type on outcome
+        assert!(outcome.error_type.is_none());
+    }
+
+    #[test]
+    fn test_keyword_similarity_disjoint_sets() {
+        let attempt = create_test_attempt();
+        let issue1 = create_test_issue("PostgreSQL database timeout", "connection pool exhausted");
+        let issue2 = create_test_issue("JavaScript rendering crash", "React component lifecycle");
+        let o1 = FixOutcome::from_attempt(&attempt, &issue1, "p", Outcome::Merged);
+        let o2 = FixOutcome::from_attempt(&attempt, &issue2, "p", Outcome::Merged);
+        let sim = o1.similarity(&o2);
+        assert!(
+            sim < 0.1,
+            "disjoint keyword sets should have near-zero similarity, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_is_common_word_not_in_list() {
+        assert!(!is_common_word("postgresql"));
+        assert!(!is_common_word("database"));
+        assert!(!is_common_word("timeout"));
+        assert!(!is_common_word("kubernetes"));
+    }
+
+    #[test]
+    fn test_is_common_word_case_sensitive() {
+        // is_common_word is case-sensitive - uppercase versions should NOT match
+        assert!(!is_common_word("The"));
+        assert!(!is_common_word("IS"));
+        assert!(!is_common_word("Error"));
+    }
+
+    #[test]
+    fn test_find_similar_sorted_by_similarity_desc() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+
+        // Add outcomes with varying similarity to the search query
+        let issue_exact =
+            create_test_issue("PostgreSQL database timeout", "Connection pool exhausted");
+        let issue_partial =
+            create_test_issue("PostgreSQL connection issue", "Memory leak detected");
+        let issue_different =
+            create_test_issue("JavaScript CSS styling", "React component rendering");
+
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue_different,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue_exact,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue_partial,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+
+        let search = create_test_issue(
+            "PostgreSQL database timeout error",
+            "Connection to database pool exhausted",
+        );
+        let results = tracker.find_similar(&search, 10, 0.0);
+
+        // Results should be sorted by similarity descending
+        if results.len() >= 2 {
+            for i in 0..results.len() - 1 {
+                let sim_i = results[i].similarity_to_issue(&search);
+                let sim_next = results[i + 1].similarity_to_issue(&search);
+                assert!(
+                    sim_i >= sim_next,
+                    "results not sorted: {} < {}",
+                    sim_i,
+                    sim_next
+                );
+            }
+        }
+    }
 }

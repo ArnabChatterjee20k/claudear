@@ -1087,7 +1087,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AskConfig, CascadeConfig, ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig,
-        GitHubConfig, PushConfig, RegressionConfig, RetryConfig, SmsConfig,
+        GitHubConfig, LearningConfig, PushConfig, RegressionConfig, RetryConfig, SmsConfig,
     };
     use crate::notifier::Notifier;
     use crate::reports::Report;
@@ -1220,6 +1220,7 @@ mod tests {
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
+            learning: LearningConfig::default(),
         }
     }
 

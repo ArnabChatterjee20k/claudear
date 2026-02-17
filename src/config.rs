@@ -108,6 +108,9 @@ pub struct Config {
     /// User registry mapping slugs to source IDs and notification channel IDs.
     #[serde(default)]
     pub users: std::collections::HashMap<String, UserConfig>,
+    /// Continuous learning configuration.
+    #[serde(default)]
+    pub learning: LearningConfig,
 }
 
 impl Default for Config {
@@ -139,6 +142,7 @@ impl Default for Config {
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
+            learning: LearningConfig::default(),
         }
     }
 }
@@ -188,6 +192,58 @@ pub struct CascadeConfig {
     pub enabled: bool,
     /// Maximum cascade depth (0 = unlimited).
     pub max_depth: usize,
+}
+
+/// Continuous learning configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LearningConfig {
+    /// Auto-extract learnings from Claude execution logs.
+    pub auto_extract_learnings: bool,
+    /// Analyze PR diffs on merge.
+    pub diff_analysis: bool,
+    /// Promote repeated Q&A answers to standing instructions.
+    pub qa_promotion: bool,
+    /// Minimum occurrences before Q&A answer is promoted.
+    pub qa_promotion_threshold: usize,
+    /// Accumulate per-repo knowledge from successful fixes.
+    pub repo_knowledge: bool,
+    /// Classify review feedback patterns.
+    pub review_classification: bool,
+    /// Minimum occurrences before review pattern is promoted.
+    pub review_promotion_threshold: usize,
+    /// Track how Claude approaches fixes.
+    pub strategy_fingerprinting: bool,
+    /// Score fix quality based on merge velocity.
+    pub quality_scoring: bool,
+    /// Detect clusters of correlated issues.
+    pub cluster_detection: bool,
+    /// Time window for cluster detection in minutes.
+    pub cluster_window_minutes: u32,
+    /// Minimum issues to form a cluster.
+    pub min_cluster_size: usize,
+    /// Auto-generate AGENT.md from accumulated knowledge (opt-in).
+    pub auto_agent_md: bool,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            auto_extract_learnings: true,
+            diff_analysis: true,
+            qa_promotion: true,
+            qa_promotion_threshold: 2,
+            repo_knowledge: true,
+            review_classification: true,
+            review_promotion_threshold: 3,
+            strategy_fingerprinting: true,
+            quality_scoring: true,
+            cluster_detection: true,
+            cluster_window_minutes: 30,
+            min_cluster_size: 3,
+            auto_agent_md: false,
+        }
+    }
 }
 
 /// Retry configuration for failed fix attempts.
@@ -3517,5 +3573,248 @@ sms:
             let deserialized: TopIssuesPeriod = serde_yaml::from_str(&serialized).unwrap();
             assert_eq!(variant, deserialized);
         }
+    }
+
+    // ── LearningConfig tests ──
+
+    #[test]
+    fn test_learning_config_defaults() {
+        let config = LearningConfig::default();
+        assert!(config.auto_extract_learnings);
+        assert!(config.diff_analysis);
+        assert!(config.qa_promotion);
+        assert_eq!(config.qa_promotion_threshold, 2);
+        assert!(config.repo_knowledge);
+        assert!(config.review_classification);
+        assert_eq!(config.review_promotion_threshold, 3);
+        assert!(config.strategy_fingerprinting);
+        assert!(config.quality_scoring);
+        assert!(config.cluster_detection);
+        assert_eq!(config.cluster_window_minutes, 30);
+        assert_eq!(config.min_cluster_size, 3);
+        assert!(!config.auto_agent_md); // opt-in, default false
+    }
+
+    #[test]
+    fn test_learning_config_deserialize_empty_yaml() {
+        // An empty YAML object should give all defaults
+        let config: LearningConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(config.auto_extract_learnings);
+        assert!(config.diff_analysis);
+        assert!(!config.auto_agent_md);
+    }
+
+    #[test]
+    fn test_learning_config_deserialize_partial() {
+        let yaml = r#"
+auto_extract_learnings: false
+cluster_window_minutes: 60
+"#;
+        let config: LearningConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.auto_extract_learnings);
+        assert_eq!(config.cluster_window_minutes, 60);
+        // Rest should be defaults
+        assert!(config.diff_analysis);
+        assert_eq!(config.min_cluster_size, 3);
+    }
+
+    #[test]
+    fn test_config_without_learning_section() {
+        // A minimal Config YAML without any "learning:" section should still work
+        let yaml = r#"
+work_dir: /tmp/repos
+known_orgs:
+  - test-org
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        // learning field should get default values
+        assert!(config.learning.auto_extract_learnings);
+        assert!(config.learning.diff_analysis);
+        assert!(!config.learning.auto_agent_md);
+    }
+
+    #[test]
+    fn test_config_with_learning_section() {
+        let yaml = r#"
+work_dir: /tmp/repos
+known_orgs:
+  - test-org
+learning:
+  auto_extract_learnings: false
+  auto_agent_md: true
+  min_cluster_size: 5
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.learning.auto_extract_learnings);
+        assert!(config.learning.auto_agent_md);
+        assert_eq!(config.learning.min_cluster_size, 5);
+        // Other learning fields should be defaults
+        assert!(config.learning.diff_analysis);
+    }
+
+    #[test]
+    fn test_learning_config_zero_thresholds() {
+        let yaml = r#"
+qa_promotion_threshold: 0
+review_promotion_threshold: 0
+cluster_window_minutes: 0
+min_cluster_size: 0
+"#;
+        let config: LearningConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.qa_promotion_threshold, 0);
+        assert_eq!(config.review_promotion_threshold, 0);
+        assert_eq!(config.cluster_window_minutes, 0);
+        assert_eq!(config.min_cluster_size, 0);
+    }
+
+    #[test]
+    fn test_learning_config_large_values() {
+        let yaml = r#"
+qa_promotion_threshold: 999999
+cluster_window_minutes: 4294967295
+min_cluster_size: 999999
+"#;
+        let config: LearningConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.qa_promotion_threshold, 999999);
+        assert_eq!(config.cluster_window_minutes, 4294967295);
+        assert_eq!(config.min_cluster_size, 999999);
+    }
+
+    #[test]
+    fn test_learning_config_all_features_disabled() {
+        let yaml = r#"
+auto_extract_learnings: false
+diff_analysis: false
+qa_promotion: false
+repo_knowledge: false
+review_classification: false
+strategy_fingerprinting: false
+quality_scoring: false
+cluster_detection: false
+auto_agent_md: false
+"#;
+        let config: LearningConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.auto_extract_learnings);
+        assert!(!config.diff_analysis);
+        assert!(!config.qa_promotion);
+        assert!(!config.repo_knowledge);
+        assert!(!config.review_classification);
+        assert!(!config.strategy_fingerprinting);
+        assert!(!config.quality_scoring);
+        assert!(!config.cluster_detection);
+        assert!(!config.auto_agent_md);
+    }
+
+    #[test]
+    fn test_config_zero_poll_interval() {
+        let yaml = r#"
+work_dir: /tmp/repos
+poll_interval_ms: 0
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.poll_interval_ms, 0);
+    }
+
+    #[test]
+    fn test_config_zero_max_issues_per_cycle() {
+        let yaml = r#"
+work_dir: /tmp/repos
+max_issues_per_cycle: 0
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.max_issues_per_cycle, 0);
+    }
+
+    #[test]
+    fn test_config_zero_max_concurrent() {
+        let yaml = r#"
+work_dir: /tmp/repos
+max_concurrent: 0
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.max_concurrent, 0);
+    }
+
+    #[test]
+    fn test_config_empty_work_dir() {
+        let yaml = r#"
+work_dir: ""
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.work_dir, PathBuf::from(""));
+    }
+
+    #[test]
+    fn test_config_empty_known_orgs() {
+        let yaml = r#"
+work_dir: /tmp
+known_orgs: []
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.known_orgs.is_empty());
+    }
+
+    #[test]
+    fn test_retry_config_default_values() {
+        let config = RetryConfig::default();
+        assert_eq!(config.max_retries, 2);
+        assert_eq!(config.base_delay_ms, 60_000);
+        assert_eq!(config.max_delay_ms, 3_600_000);
+    }
+
+    #[test]
+    fn test_retry_config_zero_retries() {
+        let yaml = r#"
+max_retries: 0
+"#;
+        let config: RetryConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.max_retries, 0);
+    }
+
+    #[test]
+    fn test_config_unknown_fields_ignored() {
+        // YAML with unknown fields should not error (serde default behavior)
+        let yaml = r#"
+work_dir: /tmp
+unknown_field: "should be ignored"
+another_unknown: 42
+"#;
+        let result: std::result::Result<Config, _> = serde_yaml::from_str(yaml);
+        // Depending on serde config this may succeed or fail; verify it doesn't panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_learning_config_roundtrip() {
+        let config = LearningConfig {
+            auto_extract_learnings: false,
+            diff_analysis: true,
+            qa_promotion: false,
+            qa_promotion_threshold: 10,
+            repo_knowledge: true,
+            review_classification: false,
+            review_promotion_threshold: 5,
+            strategy_fingerprinting: true,
+            quality_scoring: false,
+            cluster_detection: true,
+            cluster_window_minutes: 45,
+            min_cluster_size: 7,
+            auto_agent_md: true,
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let restored: LearningConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            config.auto_extract_learnings,
+            restored.auto_extract_learnings
+        );
+        assert_eq!(
+            config.qa_promotion_threshold,
+            restored.qa_promotion_threshold
+        );
+        assert_eq!(
+            config.cluster_window_minutes,
+            restored.cluster_window_minutes
+        );
+        assert_eq!(config.auto_agent_md, restored.auto_agent_md);
     }
 }

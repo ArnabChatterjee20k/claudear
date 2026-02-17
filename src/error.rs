@@ -476,4 +476,124 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("inner failure"));
     }
+
+    // ── Edge case tests ──
+
+    #[test]
+    fn test_error_storage() {
+        let err = Error::storage("disk full");
+        assert!(matches!(err, Error::Storage(_)));
+        assert_eq!(err.to_string(), "Storage error: disk full");
+    }
+
+    #[test]
+    fn test_error_git() {
+        let err = Error::git("merge conflict");
+        assert!(matches!(err, Error::Git(_)));
+        assert_eq!(err.to_string(), "Git error: merge conflict");
+    }
+
+    #[test]
+    fn test_error_io_helper() {
+        let err = Error::io("permission denied");
+        assert!(matches!(err, Error::Other(_)));
+        assert!(err.to_string().contains("IO error"));
+        assert!(err.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn test_error_from_rusqlite_query_returned_no_rows() {
+        let db_err = rusqlite::Error::QueryReturnedNoRows;
+        let err: Error = db_err.into();
+        assert!(matches!(err, Error::Database(_)));
+    }
+
+    #[test]
+    fn test_error_from_io_various_kinds() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            let io_err = std::io::Error::new(kind, "test");
+            let err: Error = io_err.into();
+            assert!(matches!(err, Error::Io(_)));
+        }
+    }
+
+    #[test]
+    fn test_error_from_serde_json_eof() {
+        let err: Error = serde_json::from_str::<serde_json::Value>("")
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, Error::Json(_)));
+    }
+
+    #[test]
+    fn test_error_issue_not_found_display() {
+        let err = Error::IssueNotFound {
+            source_name: "sentry".to_string(),
+            issue_id: "PROJ-999".to_string(),
+        };
+        assert_eq!(err.to_string(), "Issue not found: sentry:PROJ-999");
+    }
+
+    #[test]
+    fn test_error_constructors_accept_both_str_and_string() {
+        let _ = Error::config("str");
+        let _ = Error::config(String::from("string"));
+        let _ = Error::source("s", "m");
+        let _ = Error::source(String::from("s"), String::from("m"));
+        let _ = Error::storage("str");
+        let _ = Error::storage(String::from("string"));
+        let _ = Error::git("str");
+        let _ = Error::git(String::from("string"));
+        let _ = Error::io("str");
+        let _ = Error::io(String::from("string"));
+    }
+
+    #[test]
+    fn test_error_empty_string_variants() {
+        let errors = vec![
+            Error::config(""),
+            Error::source("", ""),
+            Error::webhook(""),
+            Error::runner(""),
+            Error::notifier("", ""),
+            Error::issue_not_found("", ""),
+            Error::network(""),
+            Error::api(""),
+            Error::storage(""),
+            Error::git(""),
+            Error::io(""),
+            Error::Other(String::new()),
+        ];
+        for err in errors {
+            let _ = err.to_string();
+            let _ = format!("{:?}", err);
+        }
+    }
+
+    #[test]
+    fn test_error_is_std_error() {
+        fn assert_std_error<T: std::error::Error>() {}
+        assert_std_error::<Error>();
+    }
+
+    #[test]
+    fn test_result_type_with_question_mark() {
+        fn inner() -> Result<i32> {
+            let value: i32 = serde_json::from_str("42")?;
+            Ok(value)
+        }
+        assert_eq!(inner().unwrap(), 42);
+
+        fn inner_fail() -> Result<i32> {
+            let _: i32 = serde_json::from_str("invalid")?;
+            Ok(0)
+        }
+        assert!(inner_fail().is_err());
+    }
 }

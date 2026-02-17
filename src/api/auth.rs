@@ -502,7 +502,8 @@ mod tests {
     use crate::api::routes::create_api_router;
     use crate::config::{
         AskConfig, CascadeConfig, ClaudeConfig, Config, DiscordConfig, EmailConfig,
-        GitHubAppConfig, GitHubConfig, PushConfig, RegressionConfig, RetryConfig, SmsConfig,
+        GitHubAppConfig, GitHubConfig, LearningConfig, PushConfig, RegressionConfig, RetryConfig,
+        SmsConfig,
     };
     use crate::storage::SqliteTracker;
     use axum::body::Body;
@@ -539,6 +540,7 @@ mod tests {
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
+            learning: LearningConfig::default(),
         }
     }
 

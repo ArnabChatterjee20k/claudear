@@ -733,4 +733,218 @@ mod tests {
         // All subsequent should be capped
         assert_eq!(manager.get_delay(10), Duration::from_millis(5_000));
     }
+
+    // ── Edge case tests ──
+
+    #[test]
+    fn test_get_delay_zero_base() {
+        let config = RetryConfig {
+            max_retries: 5,
+            base_delay_ms: 0,
+            max_delay_ms: 10_000,
+        };
+        let manager = RetryManager::new(config, create_test_tracker());
+        assert_eq!(manager.get_delay(0), Duration::from_millis(0));
+        assert_eq!(manager.get_delay(5), Duration::from_millis(0));
+    }
+
+    #[test]
+    fn test_get_delay_zero_max() {
+        let config = RetryConfig {
+            max_retries: 5,
+            base_delay_ms: 1000,
+            max_delay_ms: 0,
+        };
+        let manager = RetryManager::new(config, create_test_tracker());
+        assert_eq!(manager.get_delay(0), Duration::from_millis(0));
+        assert_eq!(manager.get_delay(3), Duration::from_millis(0));
+    }
+
+    #[test]
+    fn test_get_delay_base_equals_max() {
+        let config = RetryConfig {
+            max_retries: 5,
+            base_delay_ms: 1000,
+            max_delay_ms: 1000,
+        };
+        let manager = RetryManager::new(config, create_test_tracker());
+        assert_eq!(manager.get_delay(0), Duration::from_millis(1000));
+        assert_eq!(manager.get_delay(1), Duration::from_millis(1000));
+        assert_eq!(manager.get_delay(10), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn test_get_delay_u64_max_base() {
+        let config = RetryConfig {
+            max_retries: 5,
+            base_delay_ms: u64::MAX,
+            max_delay_ms: u64::MAX,
+        };
+        let manager = RetryManager::new(config, create_test_tracker());
+        let delay = manager.get_delay(10);
+        assert_eq!(delay, Duration::from_millis(u64::MAX));
+    }
+
+    #[test]
+    fn test_should_retry_max_retries_zero() {
+        let config = RetryConfig {
+            max_retries: 0,
+            base_delay_ms: 1000,
+            max_delay_ms: 10_000,
+        };
+        let manager = RetryManager::new(config, create_test_tracker());
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "1".into(),
+            short_id: "T-1".into(),
+            source: "linear".into(),
+            attempted_at: Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Failed,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        assert!(!manager.should_retry(&attempt));
+    }
+
+    #[test]
+    fn test_get_next_retry_time_uses_last_retry_at() {
+        let config = RetryConfig {
+            max_retries: 5,
+            base_delay_ms: 60_000,
+            max_delay_ms: 3_600_000,
+        };
+        let manager = RetryManager::new(config, create_test_tracker());
+        let last_retry = Utc::now() - ChronoDuration::hours(2);
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "1".into(),
+            short_id: "T-1".into(),
+            source: "linear".into(),
+            attempted_at: Utc::now() - ChronoDuration::hours(5),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Failed,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 1,
+            last_retry_at: Some(last_retry),
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        let next = manager.get_next_retry_time(&attempt).unwrap();
+        let expected = last_retry + ChronoDuration::milliseconds(120_000);
+        let diff = (next - expected).num_seconds().abs();
+        assert!(diff < 2, "Next retry should be based on last_retry_at");
+    }
+
+    #[test]
+    fn test_get_next_retry_time_falls_back_to_attempted_at() {
+        let config = RetryConfig {
+            max_retries: 5,
+            base_delay_ms: 1_000,
+            max_delay_ms: 10_000,
+        };
+        let manager = RetryManager::new(config, create_test_tracker());
+        let attempted = Utc::now() - ChronoDuration::hours(1);
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "1".into(),
+            short_id: "T-1".into(),
+            source: "linear".into(),
+            attempted_at: attempted,
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Failed,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        let next = manager.get_next_retry_time(&attempt).unwrap();
+        let expected = attempted + ChronoDuration::milliseconds(1_000);
+        let diff = (next - expected).num_seconds().abs();
+        assert!(diff < 2);
+    }
+
+    #[test]
+    fn test_handle_failure_full_retry_lifecycle() {
+        let tracker = create_test_tracker();
+        let config = RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 1000,
+            max_delay_ms: 10_000,
+        };
+        let manager = RetryManager::new(config, tracker.clone());
+
+        tracker.record_attempt("linear", "1", "T-1").unwrap();
+        tracker.mark_failed("linear", "1", "err").unwrap();
+
+        // First failure
+        let d1 = manager.handle_failure("linear", "1", "e1").unwrap();
+        assert!(matches!(d1, RetryDecision::Retry { retry_count: 1, .. }));
+
+        // Execute retry
+        manager.prepare_retry("linear", "1").unwrap();
+        tracker.mark_failed("linear", "1", "e2").unwrap();
+
+        // Second failure
+        let d2 = manager.handle_failure("linear", "1", "e2").unwrap();
+        assert!(matches!(d2, RetryDecision::Retry { retry_count: 2, .. }));
+
+        // Execute second retry
+        manager.prepare_retry("linear", "1").unwrap();
+        tracker.mark_failed("linear", "1", "e3").unwrap();
+
+        // Third failure should be CannotFix
+        let d3 = manager.handle_failure("linear", "1", "e3").unwrap();
+        assert!(matches!(d3, RetryDecision::CannotFix));
+    }
+
+    #[test]
+    fn test_handle_regression() {
+        let tracker = create_test_tracker();
+        let config = RetryConfig {
+            max_retries: 2,
+            ..Default::default()
+        };
+        let manager = RetryManager::new(config, tracker.clone());
+
+        tracker.record_attempt("sentry", "1", "S-1").unwrap();
+        tracker
+            .mark_success("sentry", "1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_merged("sentry", "1").unwrap();
+
+        let decision = manager.handle_regression("sentry", "1").unwrap();
+        assert!(matches!(
+            decision,
+            RetryDecision::Retry { retry_count: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn test_prepare_retry_nonexistent() {
+        let tracker = create_test_tracker();
+        let config = RetryConfig::default();
+        let manager = RetryManager::new(config, tracker);
+        // Should not panic
+        let _ = manager.prepare_retry("linear", "nonexistent");
+    }
 }

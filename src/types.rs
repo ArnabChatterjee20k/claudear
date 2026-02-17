@@ -1333,6 +1333,194 @@ impl RegressionCheck {
     }
 }
 
+// ============================================================
+// Continuous Learning Types
+// ============================================================
+
+/// Category of file changes in a diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeCategory {
+    Tests,
+    Docs,
+    Config,
+    Dependencies,
+    Migrations,
+    NewCode,
+    Modification,
+}
+
+impl std::fmt::Display for ChangeCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tests => write!(f, "tests"),
+            Self::Docs => write!(f, "docs"),
+            Self::Config => write!(f, "config"),
+            Self::Dependencies => write!(f, "dependencies"),
+            Self::Migrations => write!(f, "migrations"),
+            Self::NewCode => write!(f, "new_code"),
+            Self::Modification => write!(f, "modification"),
+        }
+    }
+}
+
+/// Structured analysis of a PR diff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffAnalysis {
+    pub id: i64,
+    pub attempt_id: i64,
+    pub pr_url: String,
+    pub github_repo: String,
+    pub pr_number: i64,
+    pub files_changed: Vec<String>,
+    pub file_types: HashMap<String, usize>,
+    pub change_categories: Vec<ChangeCategory>,
+    pub diff_summary: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A standing instruction promoted from repeated Q&A or review patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotedInstruction {
+    pub id: i64,
+    pub repo: String,
+    pub source_type: String,
+    pub instruction_text: String,
+    pub occurrence_count: i64,
+    pub confidence: f64,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Per-repo accumulated knowledge entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoKnowledge {
+    pub id: i64,
+    pub repo: String,
+    pub knowledge_key: String,
+    pub knowledge_value: String,
+    pub source_type: String,
+    pub confidence: f64,
+    pub occurrence_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Category of review feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCategory {
+    MissingTests,
+    StyleIssue,
+    WrongApproach,
+    Incomplete,
+    Security,
+    Performance,
+    Documentation,
+    Other,
+}
+
+impl std::fmt::Display for ReviewCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingTests => write!(f, "missing_tests"),
+            Self::StyleIssue => write!(f, "style_issue"),
+            Self::WrongApproach => write!(f, "wrong_approach"),
+            Self::Incomplete => write!(f, "incomplete"),
+            Self::Security => write!(f, "security"),
+            Self::Performance => write!(f, "performance"),
+            Self::Documentation => write!(f, "documentation"),
+            Self::Other => write!(f, "other"),
+        }
+    }
+}
+
+impl ReviewCategory {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "missing_tests" => Self::MissingTests,
+            "style_issue" => Self::StyleIssue,
+            "wrong_approach" => Self::WrongApproach,
+            "incomplete" => Self::Incomplete,
+            "security" => Self::Security,
+            "performance" => Self::Performance,
+            "documentation" => Self::Documentation,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A classified review feedback pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewPattern {
+    pub id: i64,
+    pub github_repo: String,
+    pub category: ReviewCategory,
+    pub pattern_text: String,
+    pub example_comments: Vec<String>,
+    pub occurrence_count: i64,
+    pub promoted_to_instruction: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// How Claude approached fixing an issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyFingerprint {
+    pub id: i64,
+    pub attempt_id: i64,
+    pub files_explored: Vec<String>,
+    pub tests_run: i64,
+    pub tools_used: HashMap<String, i64>,
+    pub fix_approach: String,
+    pub strategy_summary: String,
+    pub fix_quality_score: Option<f64>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Quality score for a fix based on merge velocity and review feedback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixQualityScore {
+    pub score: f64,
+    pub merge_speed_component: f64,
+    pub review_cycles_component: f64,
+    pub approval_component: f64,
+}
+
+/// A cluster of correlated issues arriving in a time window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueCluster {
+    pub id: i64,
+    pub cluster_key: String,
+    pub source: String,
+    pub issue_ids: Vec<String>,
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+    pub resolved_by_issue_id: Option<String>,
+    pub resolved_by_attempt_id: Option<i64>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A member of an issue cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueClusterMember {
+    pub cluster_id: i64,
+    pub issue_id: String,
+    pub arrived_at: DateTime<Utc>,
+}
+
+/// Learnings extracted from Claude's execution log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedLearnings {
+    pub root_cause: Option<String>,
+    pub files_modified: Vec<String>,
+    pub strategy_used: Option<String>,
+    pub tests_added: bool,
+    pub key_decisions: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2292,5 +2480,911 @@ mod tests {
         assert!(validate_issue_id("ID-with-dash").is_ok());
         assert!(validate_issue_id("ID.with.dot").is_ok());
         assert!(validate_issue_id("ID:with:colon").is_ok());
+    }
+
+    // ── Learning types tests ──
+
+    #[test]
+    fn test_change_category_display() {
+        assert_eq!(ChangeCategory::Tests.to_string(), "tests");
+        assert_eq!(ChangeCategory::Docs.to_string(), "docs");
+        assert_eq!(ChangeCategory::Config.to_string(), "config");
+        assert_eq!(ChangeCategory::Dependencies.to_string(), "dependencies");
+        assert_eq!(ChangeCategory::Migrations.to_string(), "migrations");
+        assert_eq!(ChangeCategory::NewCode.to_string(), "new_code");
+        assert_eq!(ChangeCategory::Modification.to_string(), "modification");
+    }
+
+    #[test]
+    fn test_review_category_display() {
+        assert_eq!(ReviewCategory::MissingTests.to_string(), "missing_tests");
+        assert_eq!(ReviewCategory::StyleIssue.to_string(), "style_issue");
+        assert_eq!(ReviewCategory::WrongApproach.to_string(), "wrong_approach");
+        assert_eq!(ReviewCategory::Incomplete.to_string(), "incomplete");
+        assert_eq!(ReviewCategory::Security.to_string(), "security");
+        assert_eq!(ReviewCategory::Performance.to_string(), "performance");
+        assert_eq!(ReviewCategory::Documentation.to_string(), "documentation");
+        assert_eq!(ReviewCategory::Other.to_string(), "other");
+    }
+
+    #[test]
+    fn test_review_category_parse_roundtrip() {
+        let categories = vec![
+            ReviewCategory::MissingTests,
+            ReviewCategory::StyleIssue,
+            ReviewCategory::WrongApproach,
+            ReviewCategory::Incomplete,
+            ReviewCategory::Security,
+            ReviewCategory::Performance,
+            ReviewCategory::Documentation,
+            ReviewCategory::Other,
+        ];
+        for cat in categories {
+            let display = cat.to_string();
+            let parsed = ReviewCategory::parse(&display);
+            assert_eq!(cat, parsed, "Round-trip failed for {:?}", cat);
+        }
+    }
+
+    #[test]
+    fn test_review_category_parse_unknown() {
+        assert_eq!(
+            ReviewCategory::parse("unknown_category"),
+            ReviewCategory::Other
+        );
+        assert_eq!(ReviewCategory::parse(""), ReviewCategory::Other);
+    }
+
+    #[test]
+    fn test_change_category_serde_roundtrip() {
+        let cat = ChangeCategory::Tests;
+        let json = serde_json::to_string(&cat).unwrap();
+        let parsed: ChangeCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(cat, parsed);
+    }
+
+    #[test]
+    fn test_review_category_serde_roundtrip() {
+        let cat = ReviewCategory::Security;
+        let json = serde_json::to_string(&cat).unwrap();
+        let parsed: ReviewCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(cat, parsed);
+    }
+
+    #[test]
+    fn test_diff_analysis_serde() {
+        let analysis = DiffAnalysis {
+            id: 1,
+            attempt_id: 42,
+            pr_url: "https://github.com/org/repo/pull/1".to_string(),
+            github_repo: "org/repo".to_string(),
+            pr_number: 1,
+            files_changed: vec!["src/main.rs".to_string()],
+            file_types: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("rs".to_string(), 1);
+                m
+            },
+            change_categories: vec![ChangeCategory::Modification],
+            diff_summary: "1 file changed".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&analysis).unwrap();
+        let parsed: DiffAnalysis = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.attempt_id, 42);
+        assert_eq!(parsed.files_changed.len(), 1);
+        assert_eq!(parsed.change_categories[0], ChangeCategory::Modification);
+    }
+
+    #[test]
+    fn test_fix_quality_score_serde() {
+        let score = FixQualityScore {
+            score: 0.87,
+            merge_speed_component: 0.9,
+            review_cycles_component: 0.8,
+            approval_component: 1.0,
+        };
+        let json = serde_json::to_string(&score).unwrap();
+        let parsed: FixQualityScore = serde_json::from_str(&json).unwrap();
+        assert!((parsed.score - 0.87).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_strategy_fingerprint_serde() {
+        let fp = StrategyFingerprint {
+            id: 1,
+            attempt_id: 10,
+            files_explored: vec!["src/a.rs".to_string()],
+            tests_run: 3,
+            tools_used: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("Read".to_string(), 5);
+                m
+            },
+            fix_approach: "tdd".to_string(),
+            strategy_summary: "test".to_string(),
+            fix_quality_score: Some(0.9),
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&fp).unwrap();
+        let parsed: StrategyFingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.fix_approach, "tdd");
+        assert_eq!(*parsed.tools_used.get("Read").unwrap(), 5);
+    }
+
+    #[test]
+    fn test_issue_cluster_serde() {
+        let now = chrono::Utc::now();
+        let cluster = IssueCluster {
+            id: 1,
+            cluster_key: "cluster_abc".to_string(),
+            source: "sentry".to_string(),
+            issue_ids: vec!["a".to_string(), "b".to_string()],
+            window_start: now,
+            window_end: now + chrono::Duration::minutes(15),
+            resolved_by_issue_id: Some("a".to_string()),
+            resolved_by_attempt_id: Some(42),
+            status: "resolved".to_string(),
+            created_at: now,
+        };
+        let json = serde_json::to_string(&cluster).unwrap();
+        let parsed: IssueCluster = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cluster_key, "cluster_abc");
+        assert_eq!(parsed.issue_ids.len(), 2);
+        assert_eq!(parsed.resolved_by_issue_id, Some("a".to_string()));
+    }
+
+    #[test]
+    fn test_extracted_learnings_default() {
+        let learnings = ExtractedLearnings {
+            root_cause: None,
+            files_modified: vec![],
+            strategy_used: None,
+            tests_added: false,
+            key_decisions: vec![],
+        };
+        let json = serde_json::to_string(&learnings).unwrap();
+        let parsed: ExtractedLearnings = serde_json::from_str(&json).unwrap();
+        assert!(parsed.root_cause.is_none());
+        assert!(parsed.files_modified.is_empty());
+    }
+
+    #[test]
+    fn test_promoted_instruction_serde() {
+        let instruction = PromotedInstruction {
+            id: 1,
+            repo: "org/repo".to_string(),
+            source_type: "qa_promotion".to_string(),
+            instruction_text: "Always add tests".to_string(),
+            occurrence_count: 5,
+            confidence: 0.85,
+            is_active: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&instruction).unwrap();
+        let parsed: PromotedInstruction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.instruction_text, "Always add tests");
+        assert!(parsed.is_active);
+    }
+
+    // ── Edge case tests ──
+
+    #[test]
+    fn test_validate_issue_id_exactly_max_length() {
+        let id = "a".repeat(MAX_ISSUE_ID_LENGTH);
+        assert!(validate_issue_id(&id).is_ok());
+    }
+
+    #[test]
+    fn test_validate_issue_id_one_over_max() {
+        let id = "a".repeat(MAX_ISSUE_ID_LENGTH + 1);
+        assert!(validate_issue_id(&id).is_err());
+    }
+
+    #[test]
+    fn test_validate_issue_id_embedded_null_byte() {
+        assert!(validate_issue_id("abc\0def").is_err());
+    }
+
+    #[test]
+    fn test_validate_issue_id_only_dots() {
+        assert!(validate_issue_id("..").is_err());
+    }
+
+    #[test]
+    fn test_validate_issue_id_contains_backslash() {
+        assert!(validate_issue_id("a\\b").is_err());
+    }
+
+    #[test]
+    fn test_validate_issue_id_single_char() {
+        assert!(validate_issue_id("x").is_ok());
+    }
+
+    #[test]
+    fn test_validate_issue_id_unicode_chars() {
+        assert!(validate_issue_id("日本語").is_ok());
+    }
+
+    #[test]
+    fn test_validate_issue_id_whitespace() {
+        assert!(validate_issue_id("abc def").is_ok());
+    }
+
+    #[test]
+    fn test_validate_issue_id_double_dot_in_middle() {
+        assert!(validate_issue_id("foo..bar").is_err());
+    }
+
+    #[test]
+    fn test_fix_attempt_is_bug_sentry_source() {
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "123".into(),
+            short_id: "S-123".into(),
+            source: "sentry".into(),
+            attempted_at: Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        assert!(attempt.is_bug());
+    }
+
+    #[test]
+    fn test_fix_attempt_is_bug_with_bug_label() {
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "123".into(),
+            short_id: "P-123".into(),
+            source: "linear".into(),
+            attempted_at: Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec!["bug".into()],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        assert!(attempt.is_bug());
+    }
+
+    #[test]
+    fn test_fix_attempt_is_bug_case_insensitive() {
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "1".into(),
+            short_id: "T-1".into(),
+            source: "linear".into(),
+            attempted_at: Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec!["BUG".into()],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        assert!(attempt.is_bug());
+    }
+
+    #[test]
+    fn test_fix_attempt_is_bug_label_substring() {
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "1".into(),
+            short_id: "T-1".into(),
+            source: "linear".into(),
+            attempted_at: Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec!["hotfix-urgent".into()],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        assert!(attempt.is_bug());
+    }
+
+    #[test]
+    fn test_fix_attempt_is_not_bug_feature_label() {
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "1".into(),
+            short_id: "T-1".into(),
+            source: "linear".into(),
+            attempted_at: Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec!["feature".into(), "enhancement".into()],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        assert!(!attempt.is_bug());
+    }
+
+    #[test]
+    fn test_fix_attempt_is_bug_empty_labels() {
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "1".into(),
+            short_id: "T-1".into(),
+            source: "linear".into(),
+            attempted_at: Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        assert!(!attempt.is_bug());
+    }
+
+    #[test]
+    fn test_fix_attempt_is_bug_all_bug_labels() {
+        for label in [
+            "bug",
+            "defect",
+            "error",
+            "fix",
+            "hotfix",
+            "regression",
+            "issue",
+            "problem",
+            "incident",
+            "crash",
+            "broken",
+        ] {
+            let attempt = FixAttempt {
+                id: 1,
+                issue_id: "1".into(),
+                short_id: "T-1".into(),
+                source: "linear".into(),
+                attempted_at: Utc::now(),
+                pr_url: None,
+                github_repo: None,
+                github_pr_number: None,
+                status: FixAttemptStatus::Pending,
+                error_message: None,
+                merged_at: None,
+                resolved_at: None,
+                retry_count: 0,
+                last_retry_at: None,
+                issue_labels: vec![label.into()],
+                parent_attempt_id: None,
+                cascade_repo: None,
+            };
+            assert!(
+                attempt.is_bug(),
+                "Label '{}' should be detected as bug",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn test_claude_execution_complete() {
+        let mut exec = ClaudeExecution::new();
+        assert!(exec.completed_at.is_none());
+        assert!(exec.duration_secs.is_none());
+        exec.complete(Some(0), false);
+        assert!(exec.completed_at.is_some());
+        assert!(exec.duration_secs.is_some());
+        assert_eq!(exec.exit_code, Some(0));
+        assert!(!exec.timed_out);
+    }
+
+    #[test]
+    fn test_claude_execution_complete_timeout() {
+        let mut exec = ClaudeExecution::new();
+        exec.complete(None, true);
+        assert!(exec.timed_out);
+        assert!(exec.exit_code.is_none());
+        assert!(exec.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_claude_execution_complete_nonzero_exit() {
+        let mut exec = ClaudeExecution::new();
+        exec.complete(Some(1), false);
+        assert_eq!(exec.exit_code, Some(1));
+        assert!(!exec.timed_out);
+    }
+
+    #[test]
+    fn test_claude_execution_with_attempt_id() {
+        let exec = ClaudeExecution::new().with_attempt_id(42);
+        assert_eq!(exec.attempt_id, Some(42));
+    }
+
+    #[test]
+    fn test_claude_execution_default() {
+        let exec = ClaudeExecution::default();
+        assert_eq!(exec.id, 0);
+        assert!(exec.attempt_id.is_none());
+        assert!(!exec.timed_out);
+    }
+
+    #[test]
+    fn test_claude_execution_duration_non_negative() {
+        let mut exec = ClaudeExecution::new();
+        exec.complete(Some(0), false);
+        assert!(exec.duration_secs.unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn test_fix_attempt_status_display_roundtrip() {
+        for status in [
+            FixAttemptStatus::Pending,
+            FixAttemptStatus::Success,
+            FixAttemptStatus::Failed,
+            FixAttemptStatus::Merged,
+            FixAttemptStatus::Closed,
+            FixAttemptStatus::CannotFix,
+        ] {
+            let parsed: FixAttemptStatus = status.to_string().parse().unwrap();
+            assert_eq!(status, parsed);
+        }
+    }
+
+    #[test]
+    fn test_fix_attempt_status_serde_roundtrip() {
+        for status in [
+            FixAttemptStatus::Pending,
+            FixAttemptStatus::Success,
+            FixAttemptStatus::Failed,
+            FixAttemptStatus::Merged,
+            FixAttemptStatus::Closed,
+            FixAttemptStatus::CannotFix,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: FixAttemptStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, parsed);
+        }
+    }
+
+    #[test]
+    fn test_regression_watch_status_display_roundtrip() {
+        for status in [
+            RegressionWatchStatus::AwaitingRelease,
+            RegressionWatchStatus::Monitoring,
+            RegressionWatchStatus::Resolved,
+            RegressionWatchStatus::Regressed,
+        ] {
+            let parsed: RegressionWatchStatus = status.to_string().parse().unwrap();
+            assert_eq!(status, parsed);
+        }
+    }
+
+    #[test]
+    fn test_regression_watch_status_parse_invalid() {
+        assert!("unknown".parse::<RegressionWatchStatus>().is_err());
+        assert!("".parse::<RegressionWatchStatus>().is_err());
+    }
+
+    #[test]
+    fn test_regression_watch_status_default_value() {
+        assert_eq!(
+            RegressionWatchStatus::default(),
+            RegressionWatchStatus::AwaitingRelease
+        );
+    }
+
+    #[test]
+    fn test_issue_type_source_name() {
+        assert_eq!(IssueType::SentryIssue.source_name(), "sentry");
+        assert_eq!(IssueType::LinearBug.source_name(), "linear");
+    }
+
+    #[test]
+    fn test_issue_type_display_parse_roundtrip() {
+        for issue_type in [IssueType::SentryIssue, IssueType::LinearBug] {
+            let parsed: IssueType = issue_type.to_string().parse().unwrap();
+            assert_eq!(issue_type, parsed);
+        }
+    }
+
+    #[test]
+    fn test_issue_type_parse_invalid() {
+        assert!("unknown".parse::<IssueType>().is_err());
+        assert!("".parse::<IssueType>().is_err());
+    }
+
+    #[test]
+    fn test_change_category_display_all() {
+        assert_eq!(ChangeCategory::Tests.to_string(), "tests");
+        assert_eq!(ChangeCategory::Docs.to_string(), "docs");
+        assert_eq!(ChangeCategory::Config.to_string(), "config");
+        assert_eq!(ChangeCategory::Dependencies.to_string(), "dependencies");
+        assert_eq!(ChangeCategory::Migrations.to_string(), "migrations");
+        assert_eq!(ChangeCategory::NewCode.to_string(), "new_code");
+        assert_eq!(ChangeCategory::Modification.to_string(), "modification");
+    }
+
+    #[test]
+    fn test_change_category_serde_all_variants() {
+        for cat in [
+            ChangeCategory::Tests,
+            ChangeCategory::Docs,
+            ChangeCategory::Config,
+            ChangeCategory::Dependencies,
+            ChangeCategory::Migrations,
+            ChangeCategory::NewCode,
+            ChangeCategory::Modification,
+        ] {
+            let json = serde_json::to_string(&cat).unwrap();
+            let parsed: ChangeCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(cat, parsed);
+        }
+    }
+
+    #[test]
+    fn test_review_category_display_all() {
+        assert_eq!(ReviewCategory::MissingTests.to_string(), "missing_tests");
+        assert_eq!(ReviewCategory::StyleIssue.to_string(), "style_issue");
+        assert_eq!(ReviewCategory::WrongApproach.to_string(), "wrong_approach");
+        assert_eq!(ReviewCategory::Incomplete.to_string(), "incomplete");
+        assert_eq!(ReviewCategory::Security.to_string(), "security");
+        assert_eq!(ReviewCategory::Performance.to_string(), "performance");
+        assert_eq!(ReviewCategory::Documentation.to_string(), "documentation");
+        assert_eq!(ReviewCategory::Other.to_string(), "other");
+    }
+
+    #[test]
+    fn test_review_category_parse_all_variants() {
+        for cat in [
+            ReviewCategory::MissingTests,
+            ReviewCategory::StyleIssue,
+            ReviewCategory::WrongApproach,
+            ReviewCategory::Incomplete,
+            ReviewCategory::Security,
+            ReviewCategory::Performance,
+            ReviewCategory::Documentation,
+            ReviewCategory::Other,
+        ] {
+            let parsed = ReviewCategory::parse(&cat.to_string());
+            assert_eq!(cat, parsed);
+        }
+    }
+
+    #[test]
+    fn test_review_category_parse_unknown_returns_other() {
+        assert_eq!(ReviewCategory::parse("unknown"), ReviewCategory::Other);
+        assert_eq!(ReviewCategory::parse(""), ReviewCategory::Other);
+        assert_eq!(ReviewCategory::parse("foobar"), ReviewCategory::Other);
+    }
+
+    #[test]
+    fn test_activity_log_entry_builder_chain() {
+        let entry = ActivityLogEntry::new("test_type", "test message")
+            .with_source("linear".to_string())
+            .with_issue("issue-1".to_string(), "PROJ-1".to_string())
+            .with_metadata(serde_json::json!({"key": "value"}));
+        assert_eq!(entry.activity_type, "test_type");
+        assert_eq!(entry.source, Some("linear".to_string()));
+        assert_eq!(entry.issue_id, Some("issue-1".to_string()));
+        assert!(entry.metadata.is_some());
+    }
+
+    #[test]
+    fn test_activity_log_entry_minimal() {
+        let entry = ActivityLogEntry::new("type", "msg");
+        assert_eq!(entry.id, 0);
+        assert!(entry.source.is_none());
+        assert!(entry.issue_id.is_none());
+        assert!(entry.metadata.is_none());
+    }
+
+    #[test]
+    fn test_pr_record_new() {
+        let pr = PrRecord::new("https://github.com/org/repo/pull/1", "org/repo", 1);
+        assert_eq!(pr.status, "open");
+        assert_eq!(pr.approvals_count, 0);
+        assert_eq!(pr.review_cycles, 0);
+        assert!(pr.merged_at.is_none());
+    }
+
+    #[test]
+    fn test_pr_record_for_issue() {
+        let pr = PrRecord::for_issue("url", "org/repo", 1, "linear", "issue-1");
+        assert_eq!(pr.issue_source, Some("linear".to_string()));
+        assert_eq!(pr.issue_id, Some("issue-1".to_string()));
+    }
+
+    #[test]
+    fn test_error_pattern_new() {
+        let pattern = ErrorPattern::new("abc123");
+        assert_eq!(pattern.pattern_hash, "abc123");
+        assert_eq!(pattern.occurrence_count, 1);
+        assert!(pattern.error_type.is_none());
+    }
+
+    #[test]
+    fn test_processing_metric_builder() {
+        let metric = ProcessingMetric::new("queue_depth", 42.0)
+            .with_source("linear")
+            .with_tags(serde_json::json!({"env": "prod"}));
+        assert_eq!(metric.metric_name, "queue_depth");
+        assert_eq!(metric.metric_value, 42.0);
+        assert!(metric.tags.is_some());
+    }
+
+    #[test]
+    fn test_processing_metric_special_values() {
+        let nan = ProcessingMetric::new("test", f64::NAN);
+        assert!(nan.metric_value.is_nan());
+        let inf = ProcessingMetric::new("test", f64::INFINITY);
+        assert!(inf.metric_value.is_infinite());
+    }
+
+    #[test]
+    fn test_similar_issue_new() {
+        let si = SimilarIssue::new("a", "b", 0.95);
+        assert_eq!(si.source_issue_id, "a");
+        assert_eq!(si.similar_issue_id, "b");
+        assert_eq!(si.id, 0);
+    }
+
+    #[test]
+    fn test_issue_embedding_empty_vector() {
+        let e = IssueEmbedding::new("s", "i", vec![]);
+        assert!(e.embedding.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_experiment_new() {
+        let exp = PromptExperiment::new("exp", "control", "tpl", "hash");
+        assert!(exp.active);
+        assert_eq!(exp.success_count, 0);
+        assert_eq!(exp.failure_count, 0);
+    }
+
+    #[test]
+    fn test_regression_watch_new_defaults() {
+        let w = RegressionWatch::new(IssueType::SentryIssue, "i-1", 42);
+        assert_eq!(w.status, RegressionWatchStatus::AwaitingRelease);
+        assert!(w.pr_merged_at.is_none());
+    }
+
+    #[test]
+    fn test_release_tracking_new_fields() {
+        let rt = ReleaseTracking::new(1, "v1.0", "abc");
+        assert!(rt.released_at.is_some());
+    }
+
+    #[test]
+    fn test_regression_check_new_no_regression() {
+        let c = RegressionCheck::new(1, false);
+        assert!(!c.issue_still_exists);
+        assert!(c.checked_at.is_some());
+    }
+
+    #[test]
+    fn test_regression_check_regression_detected() {
+        let c = RegressionCheck::new(1, true);
+        assert!(c.issue_still_exists);
+    }
+
+    #[test]
+    fn test_blocking_question_serde_full() {
+        let q = BlockingQuestion {
+            question: "API?".into(),
+            context: Some("ctx".into()),
+            options: vec!["REST".into(), "GraphQL".into()],
+            why: Some("reason".into()),
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        let parsed: BlockingQuestion = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.options.len(), 2);
+    }
+
+    #[test]
+    fn test_blocking_question_serde_minimal() {
+        let q = BlockingQuestion {
+            question: "Yes?".into(),
+            context: None,
+            options: vec![],
+            why: None,
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(!json.contains("context"));
+        assert!(!json.contains("why"));
+    }
+
+    #[test]
+    fn test_match_result_not_matched_uses_normal_priority() {
+        let r = MatchResult::not_matched("no match");
+        assert!(!r.matches);
+        assert_eq!(r.priority, MatchPriority::Normal);
+    }
+
+    #[test]
+    fn test_issue_metadata_overwrite() {
+        let mut issue = Issue::new("1", "T-1", "Title", "url", "src");
+        issue.set_metadata("key", "first");
+        issue.set_metadata("key", "second");
+        assert_eq!(
+            issue.get_metadata::<String>("key"),
+            Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pr_analytics_default() {
+        let a = PrAnalytics::default();
+        assert_eq!(a.total, 0);
+        assert!(a.merge_rate.is_none());
+        assert!(a.by_repo.is_empty());
+    }
+
+    #[test]
+    fn test_analytics_summary_default() {
+        let s = AnalyticsSummary::default();
+        assert_eq!(s.success_rate, 0.0);
+        assert!(s.most_common_error.is_none());
+    }
+
+    #[test]
+    fn test_fix_quality_score_serde_roundtrip() {
+        let score = FixQualityScore {
+            score: 0.85,
+            merge_speed_component: 0.9,
+            review_cycles_component: 0.8,
+            approval_component: 1.0,
+        };
+        let json = serde_json::to_string(&score).unwrap();
+        let parsed: FixQualityScore = serde_json::from_str(&json).unwrap();
+        assert!((parsed.score - 0.85).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_issue_cluster_serde_roundtrip() {
+        let c = IssueCluster {
+            id: 1,
+            cluster_key: "k".into(),
+            source: "sentry".into(),
+            issue_ids: vec!["a".into(), "b".into()],
+            window_start: Utc::now(),
+            window_end: Utc::now(),
+            resolved_by_issue_id: None,
+            resolved_by_attempt_id: None,
+            status: "active".into(),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let parsed: IssueCluster = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.issue_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_strategy_fingerprint_serde_roundtrip() {
+        let mut tools = HashMap::new();
+        tools.insert("Read".into(), 5i64);
+        let fp = StrategyFingerprint {
+            id: 1,
+            attempt_id: 42,
+            files_explored: vec!["src/main.rs".into()],
+            tests_run: 2,
+            tools_used: tools,
+            fix_approach: "tdd".into(),
+            strategy_summary: "summary".into(),
+            fix_quality_score: Some(0.9),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&fp).unwrap();
+        let parsed: StrategyFingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(*parsed.tools_used.get("Read").unwrap(), 5);
+    }
+
+    #[test]
+    fn test_repo_knowledge_serde() {
+        let k = RepoKnowledge {
+            id: 1,
+            repo: "org/repo".into(),
+            knowledge_key: "test_pattern".into(),
+            knowledge_value: "cargo test".into(),
+            source_type: "diff".into(),
+            confidence: 0.9,
+            occurrence_count: 5,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&k).unwrap();
+        let parsed: RepoKnowledge = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.knowledge_key, "test_pattern");
+    }
+
+    #[test]
+    fn test_review_pattern_serde() {
+        let p = ReviewPattern {
+            id: 1,
+            github_repo: "org/repo".into(),
+            category: ReviewCategory::MissingTests,
+            pattern_text: "Add tests".into(),
+            example_comments: vec!["please add tests".into()],
+            occurrence_count: 3,
+            promoted_to_instruction: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: ReviewPattern = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.category, ReviewCategory::MissingTests);
+    }
+
+    #[test]
+    fn test_qa_match_serde() {
+        let entry = QaKnowledgeEntry {
+            id: 1,
+            source: "l".into(),
+            repo: None,
+            issue_id: "i".into(),
+            short_id: "I".into(),
+            question_text: "Q".into(),
+            question_norm: "q".into(),
+            question_embedding: None,
+            answer_text: "A".into(),
+            answer_norm: "a".into(),
+            answer_embedding: None,
+            channel: "ch".into(),
+            responder: None,
+            correlation_id: "c".into(),
+            asked_at: Utc::now(),
+            answered_at: Utc::now(),
+            success_count: 1,
+            failure_count: 0,
+            last_used_at: None,
+            metadata: None,
+        };
+        let m = QaMatch {
+            entry,
+            semantic_similarity: 0.95,
+            historical_success_rate: 1.0,
+            final_score: 0.97,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: QaMatch = serde_json::from_str(&json).unwrap();
+        assert!((parsed.final_score - 0.97).abs() < 0.001);
     }
 }
