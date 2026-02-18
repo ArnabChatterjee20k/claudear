@@ -104,6 +104,8 @@ enum ContentBlock {
 }
 
 /// Delta types within a `content_block_delta` event.
+/// Variant names mirror the upstream wire format (`text_delta`, `input_json_delta`).
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum Delta {
@@ -363,8 +365,9 @@ The PR title should include the issue ID: {}
             return None;
         }
 
-        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+        let now = chrono::Utc::now();
+        let day = now.format("%Y-%m-%d").to_string();
+        let timestamp = now.format("%Y%m%dT%H%M%S%.3fZ").to_string();
         let dir = root.join(CLAUDE_LOG_SUBDIR).join(day);
 
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -495,12 +498,13 @@ The PR title should include the issue ID: {}
         }
     }
 
-    async fn execute(
+    /// Build the per-invocation environment and derive a human-readable label
+    /// from the optional issue. Shared by `execute` and `execute_with_attempt`
+    /// to avoid duplicating the env-var / label logic.
+    fn prepare_env_and_label<'a>(
         &self,
-        prompt: &str,
-        issue: Option<&Issue>,
-        project_dir: &Path,
-    ) -> Result<ClaudeResult> {
+        issue: Option<&'a Issue>,
+    ) -> (HashMap<String, String>, &'a str) {
         let mut env = self.base_env.clone();
 
         if let Some(issue) = issue {
@@ -514,6 +518,16 @@ The PR title should include the issue ID: {}
         }
 
         let label = issue.map(|i| i.short_id.as_str()).unwrap_or("custom");
+        (env, label)
+    }
+
+    async fn execute(
+        &self,
+        prompt: &str,
+        issue: Option<&Issue>,
+        project_dir: &Path,
+    ) -> Result<ClaudeResult> {
+        let (env, label) = self.prepare_env_and_label(issue);
         self.execute_with_env(prompt, label, env, project_dir).await
     }
 
@@ -536,19 +550,7 @@ The PR title should include the issue ID: {}
         attempt_id: Option<i64>,
         project_dir: &Path,
     ) -> Result<ClaudeResult> {
-        let mut env = self.base_env.clone();
-
-        if let Some(issue) = issue {
-            let source_upper = issue.source.to_uppercase();
-            env.insert(format!("{}_ISSUE_ID", source_upper), issue.id.clone());
-            env.insert(
-                format!("{}_ISSUE_SHORT_ID", source_upper),
-                issue.short_id.clone(),
-            );
-            env.insert(format!("{}_ISSUE_URL", source_upper), issue.url.clone());
-        }
-
-        let label = issue.map(|i| i.short_id.as_str()).unwrap_or("custom");
+        let (env, label) = self.prepare_env_and_label(issue);
         self.execute_with_env_and_attempt(prompt, label, env, attempt_id, project_dir)
             .await
     }
@@ -1348,11 +1350,18 @@ The PR title should include the issue ID: {}
     }
 
     /// Compute a SHA256 hash of the prompt for grouping similar prompts.
+    /// Returns the first 16 hex characters (8 bytes of the digest).
     fn hash_prompt(prompt: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(prompt.as_bytes());
         let result = hasher.finalize();
-        format!("{:x}", result)[..16].to_string() // First 16 hex chars
+        // Format only the first 8 bytes directly instead of all 32.
+        let mut buf = String::with_capacity(16);
+        for byte in &result[..8] {
+            use std::fmt::Write;
+            let _ = write!(buf, "{:02x}", byte);
+        }
+        buf
     }
 
     /// Truncate a string to approximately max_len bytes, adding "..." if truncated.
@@ -1362,13 +1371,18 @@ The PR title should include the issue ID: {}
             s.to_string()
         } else {
             let end = max_len.saturating_sub(3);
-            // Find the nearest char boundary at or before `end`
-            let safe_end = s
-                .char_indices()
-                .take_while(|(i, _)| *i <= end)
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+            // Fast path: if `end` is already on a char boundary (common for ASCII),
+            // skip the O(n) char_indices walk entirely.
+            let safe_end = if s.is_char_boundary(end) {
+                end
+            } else {
+                // Find the nearest char boundary at or before `end`
+                s.char_indices()
+                    .take_while(|(i, _)| *i <= end)
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            };
             format!("{}...", &s[..safe_end])
         }
     }

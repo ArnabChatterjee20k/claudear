@@ -3,6 +3,16 @@
 use crate::types::Issue;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+/// Pre-compiled regex for `{{#each array}}...{{/each}}` loops.
+static EACH_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+    regex_lite::Regex::new(r"\{\{#each\s+(\w+)\}\}([\s\S]*?)\{\{/each\}\}").unwrap()
+});
+
+/// Pre-compiled regex for `{{#if field}}...{{/if}}` conditionals.
+static IF_REGEX: LazyLock<regex_lite::Regex> =
+    LazyLock::new(|| regex_lite::Regex::new(r"\{\{#if\s+(\w+)\}\}([\s\S]*?)\{\{/if\}\}").unwrap());
 
 /// Context for template rendering.
 #[derive(Debug, Clone)]
@@ -155,10 +165,7 @@ impl TemplateRenderer {
         // Process {{#each array}}...{{/each}} blocks
         // Supports accessing item properties via {{property}} or {{this.property}}
         // For simple arrays, use {{item}} or {{this}}
-        let each_regex =
-            regex_lite::Regex::new(r"\{\{#each\s+(\w+)\}\}([\s\S]*?)\{\{/each\}\}").unwrap();
-
-        result = each_regex
+        result = EACH_REGEX
             .replace_all(&result, |caps: &regex_lite::Captures| {
                 let array_name = &caps[1];
                 let loop_body = &caps[2];
@@ -218,9 +225,7 @@ impl TemplateRenderer {
         let mut result = template.to_string();
 
         // Process {{#if field}}...{{/if}} blocks
-        let if_regex = regex_lite::Regex::new(r"\{\{#if\s+(\w+)\}\}([\s\S]*?)\{\{/if\}\}").unwrap();
-
-        result = if_regex
+        result = IF_REGEX
             .replace_all(&result, |caps: &regex_lite::Captures| {
                 let field = &caps[1];
                 let content = &caps[2];
