@@ -41,7 +41,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 #[command(version)]
 struct Cli {
     /// Path to config file
-    #[arg(short, long, default_value = "claudear.yaml")]
+    #[arg(short, long, default_value = "claudear.toml")]
     config: String,
 
     /// Directory for log files (with daily rotation). Set to empty string to disable file logging.
@@ -1102,7 +1102,7 @@ async fn main() -> anyhow::Result<()> {
 
                 if config.known_orgs.is_empty() || config.auto_discover_paths.is_empty() {
                     anyhow::bail!(
-                        "known_orgs and auto_discover_paths must be configured in claudear.yaml"
+                        "known_orgs and auto_discover_paths must be configured in claudear.toml"
                     );
                 }
 

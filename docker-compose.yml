@@ -51,7 +51,7 @@ services:
     volumes:
       - ./data:/app/data
       - ${PROJECT_DIR:-.}:/app/project:ro
-      - ./claudear.yaml:/app/claudear.yaml:ro
+      - ./claudear.toml:/app/claudear.toml:ro
       # Cache embedding models between container restarts
       - embedding_cache:/home/appuser/.cache/fastembed
       # Persist Claude Code auth across container restarts

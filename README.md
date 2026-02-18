@@ -96,7 +96,7 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - Spawns real Claude Code processes with full tool access (read, edit, bash, etc.)
 - Configurable model selection: Sonnet, Opus, Haiku, or any model ID
 - Project-specific `AGENT.md` files customize Claude's coding conventions per repo
-- Global instructions and tool permissions via `claudear.yaml`
+- Global instructions and tool permissions via `claudear.toml`
 - Configurable execution timeout (default 6 hours)
 
 ### Multi-Repository Cascading
@@ -258,8 +258,8 @@ docker pull ghcr.io/abnegate/claudear:latest
 
 ```bash
 # 1. Create your config file
-cp claudear.example.yaml claudear.yaml
-# Edit claudear.yaml with your Linear API key, GitHub token, etc.
+cp claudear.example.toml claudear.toml
+# Edit claudear.toml with your Linear API key, GitHub token, etc.
 
 # 2. Seed existing issues (so Claudear doesn't process old issues)
 claudear seed
@@ -277,16 +277,16 @@ That's it. Label a Linear issue with `auto-implement` or `claude`, and Claudear 
 
 ## Configuration
 
-Claudear uses a YAML configuration file. Copy the example and customize:
+Claudear uses a TOML configuration file. Copy the example and customize:
 
 ```bash
-cp claudear.example.yaml claudear.yaml
+cp claudear.example.toml claudear.toml
 ```
 
-By default, Claudear looks for `claudear.yaml` in the current directory. Override with:
+By default, Claudear looks for `claudear.toml` in the current directory. Override with:
 
 ```bash
-claudear --config /path/to/config.yaml poll
+claudear --config /path/to/config.toml poll
 ```
 
 ### Environment Variable Overrides
@@ -306,17 +306,15 @@ All config values can be overridden with environment variables, useful for keepi
 
 ### Minimal Configuration
 
-```yaml
-work_dir: ~/.claudear/repos
+```toml
+work_dir = "~/.claudear/repos"
 
-known_orgs:
-  - your-github-org
+known_orgs = ["your-github-org"]
 
-auto_discover_paths:
-  - ~/projects
+auto_discover_paths = ["~/projects"]
 
-linear:
-  api_key: lin_api_xxxx
+[linear]
+api_key = "lin_api_xxxx"
 ```
 
 ### Configuration Reference
@@ -349,7 +347,7 @@ linear:
 | `cascade` | Enable/disable cascading, max depth |
 | `users` | User registry mapping across services |
 
-See [`claudear.example.yaml`](claudear.example.yaml) for a fully documented example with every option.
+See [`claudear.example.toml`](claudear.example.toml) for a fully documented example with every option.
 
 ---
 
@@ -596,16 +594,15 @@ claudear dry-run
 
 Map team members across services so notifications go to the right person.
 
-```yaml
-users:
-  jake:
-    linear_name: "Jake Barnwell"
-    github_username: "jakebarnby"
-    sentry_username: "jake"
-    discord_id: "123456789012345678"
-    email: "jake@example.com"
-    push_user_key: "pushover_user_key"
-    sms_number: "+1234567890"
+```toml
+[users.jake]
+linear_name = "Jake Barnwell"
+github_username = "jakebarnby"
+sentry_username = "jake"
+discord_id = "123456789012345678"
+email = "jake@example.com"
+push_user_key = "pushover_user_key"
+sms_number = "+1234567890"
 ```
 
 When an issue is assigned to a user, Claudear routes notifications to their configured channels.
@@ -684,27 +681,24 @@ Create an `AGENT.md` file in any repository root. Claudear prepends this to all 
 - Include tests with all changes
 ```
 
-### Global: claudear.yaml
+### Global: claudear.toml
 
-```yaml
-claude:
-  # Model selection
-  model: sonnet   # sonnet, opus, haiku, or full model ID
+```toml
+[claude]
+# Model selection
+model = "sonnet"   # sonnet, opus, haiku, or full model ID
 
-  # Custom instructions appended to the system prompt
-  instructions: "Always write tests. Follow existing code style."
+# Custom instructions appended to the system prompt
+instructions = "Always write tests. Follow existing code style."
 
-  # Or load from a file
-  instructions_file: "./claude-instructions.md"
+# Or load from a file
+instructions_file = "./claude-instructions.md"
 
-  # Tool permissions granted without prompting
-  permissions:
-    - "Bash(git *)"
-    - "Read"
-    - "Edit"
+# Tool permissions granted without prompting
+permissions = ["Bash(git *)", "Read", "Edit"]
 
-  # Skip all permission prompts (default: true)
-  skip_permissions: true
+# Skip all permission prompts (default: true)
+skip_permissions = true
 ```
 
 ---
@@ -795,7 +789,7 @@ docker build -t claudear .
 # Run with config file
 docker run -d \
   -p 3100:3100 \
-  -v $(pwd)/claudear.yaml:/app/claudear.yaml \
+  -v $(pwd)/claudear.toml:/app/claudear.toml \
   -v $(pwd):/app/project \
   -v claudear-data:/app/data \
   claudear
@@ -803,7 +797,7 @@ docker run -d \
 # Or with environment variable overrides
 docker run -d \
   -p 3100:3100 \
-  -v $(pwd)/claudear.yaml:/app/claudear.yaml \
+  -v $(pwd)/claudear.toml:/app/claudear.toml \
   -v $(pwd):/app/project \
   -v claudear-data:/app/data \
   -e LINEAR_API_KEY=your-key \

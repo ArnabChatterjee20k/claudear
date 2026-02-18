@@ -12,7 +12,7 @@ dist/
 
 /target
 .claude/plans
-claudear.yaml
+claudear.toml
 .idea
 .fastembed_cache
 logs

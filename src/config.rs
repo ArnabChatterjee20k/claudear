@@ -1,7 +1,7 @@
 //! Configuration loading and validation.
 //!
-//! Configuration is loaded from a YAML file (`claudear.yaml` by default).
-//! Environment variables can override any YAML values.
+//! Configuration is loaded from a TOML file (`claudear.toml` by default).
+//! Environment variables can override any TOML values.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Default config file name.
-pub const DEFAULT_CONFIG_FILE: &str = "claudear.yaml";
+pub const DEFAULT_CONFIG_FILE: &str = "claudear.toml";
 
 /// Claude CLI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -717,10 +717,10 @@ impl Default for RegressionConfig {
 }
 
 impl Config {
-    /// Load configuration from a YAML file with environment variable overrides.
+    /// Load configuration from a TOML file with environment variable overrides.
     ///
     /// This is the primary way to load configuration. It:
-    /// 1. Reads the YAML config file
+    /// 1. Reads the TOML config file
     /// 2. Applies any environment variable overrides
     /// 3. Validates required fields
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -733,9 +733,9 @@ impl Config {
             ))
         })?;
 
-        let mut config: Config = serde_yaml::from_str(&content).map_err(|e| {
+        let mut config: Config = toml::from_str(&content).map_err(|e| {
             Error::config(format!(
-                "Failed to parse YAML config '{}': {}",
+                "Failed to parse TOML config '{}': {}",
                 path.display(),
                 e
             ))
@@ -777,10 +777,10 @@ impl Config {
         Self::load(DEFAULT_CONFIG_FILE)
     }
 
-    /// Load configuration from YAML string (useful for testing).
-    pub fn from_yaml(yaml: &str) -> Result<Self> {
-        let mut config: Config = serde_yaml::from_str(yaml)
-            .map_err(|e| Error::config(format!("Failed to parse YAML: {}", e)))?;
+    /// Load configuration from TOML string (useful for testing).
+    pub fn from_toml(toml_str: &str) -> Result<Self> {
+        let mut config: Config = toml::from_str(toml_str)
+            .map_err(|e| Error::config(format!("Failed to parse TOML: {}", e)))?;
         config.apply_env_overrides();
         Ok(config)
     }
@@ -880,7 +880,7 @@ impl Config {
     }
 
     /// Apply environment variable overrides to the config.
-    /// Environment variables take precedence over YAML values.
+    /// Environment variables take precedence over TOML values.
     fn apply_env_overrides(&mut self) {
         // Core settings
         if let Ok(v) = env::var("WORK_DIR") {
@@ -1585,24 +1585,23 @@ mod tests {
         result
     }
 
-    fn create_temp_yaml(content: &str) -> NamedTempFile {
+    fn create_temp_toml(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(content.as_bytes()).unwrap();
         file
     }
 
     #[test]
-    fn test_from_yaml_minimal() {
+    fn test_from_toml_minimal() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/repos
-known_orgs:
-  - appwrite
-  - utopia-php
-linear:
-  api_key: lin_test_key
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+known_orgs = ["appwrite", "utopia-php"]
+
+[linear]
+api_key = "lin_test_key"
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(config.work_dir, PathBuf::from("/tmp/repos"));
             assert_eq!(config.known_orgs, vec!["appwrite", "utopia-php"]);
             assert!(config.linear.is_some());
@@ -1611,88 +1610,75 @@ linear:
     }
 
     #[test]
-    fn test_from_yaml_full_config() {
+    fn test_from_toml_full_config() {
         // Wrap in with_env to prevent env var interference from parallel tests
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /path/to/repos
-known_orgs:
-  - appwrite
-  - utopia-php
-auto_discover_paths:
-  - ~/Local
-  - ~/Projects
-poll_interval_ms: 600000
-webhook_port: 8080
-db_path: /custom/db.sqlite
-max_issues_per_cycle: 10
-max_concurrent: 3
-processing_delay_ms: 10000
+            let toml_str = r#"
+work_dir = "/path/to/repos"
+known_orgs = ["appwrite", "utopia-php"]
+auto_discover_paths = ["~/Local", "~/Projects"]
+poll_interval_ms = 600000
+webhook_port = 8080
+db_path = "/custom/db.sqlite"
+max_issues_per_cycle = 10
+max_concurrent = 3
+processing_delay_ms = 10000
 
-discord:
-  webhook_url: https://discord.com/api/webhooks/123/abc
-  user_id: "987654321"
+[discord]
+webhook_url = "https://discord.com/api/webhooks/123/abc"
+user_id = "987654321"
 
-email:
-  smtp_host: smtp.example.com
-  smtp_port: 465
-  smtp_username: user@example.com
-  smtp_password: secret
-  from_address: noreply@example.com
-  to_addresses:
-    - admin@example.com
-    - team@example.com
-  use_tls: true
+[email]
+smtp_host = "smtp.example.com"
+smtp_port = 465
+smtp_username = "user@example.com"
+smtp_password = "secret"
+from_address = "noreply@example.com"
+to_addresses = ["admin@example.com", "team@example.com"]
+use_tls = true
 
-sms:
-  account_sid: AC123
-  auth_token: token123
-  from_number: "+15555555555"
-  to_numbers:
-    - "+16666666666"
+[sms]
+account_sid = "AC123"
+auth_token = "token123"
+from_number = "+15555555555"
+to_numbers = ["+16666666666"]
 
-push:
-  api_token: pushover_token
-  user_key: user_key
-  device: iPhone
-  priority: 1
+[push]
+api_token = "pushover_token"
+user_key = "user_key"
+device = "iPhone"
+priority = 1
 
-github:
-  token: ghp_token123
-  poll_interval_ms: 30000
-  auto_resolve_on_merge: false
+[github]
+token = "ghp_token123"
+poll_interval_ms = 30000
+auto_resolve_on_merge = false
 
-retry:
-  max_retries: 5
-  base_delay_ms: 30000
-  max_delay_ms: 7200000
+[retry]
+max_retries = 5
+base_delay_ms = 30000
+max_delay_ms = 7200000
 
-linear:
-  enabled: true
-  api_key: lin_api_key
-  trigger_labels:
-    - auto
-    - implement
-  trigger_states:
-    - todo
-    - backlog
-  team_id: team_123
-  project_id: proj_456
-  webhook_secret: webhook_secret
+[linear]
+enabled = true
+api_key = "lin_api_key"
+trigger_labels = ["auto", "implement"]
+trigger_states = ["todo", "backlog"]
+team_id = "team_123"
+project_id = "proj_456"
+webhook_secret = "webhook_secret"
 
-sentry:
-  enabled: true
-  auth_token: sentry_token
-  org_slug: my-org
-  project_slugs:
-    - frontend
-    - backend
-  top_issues_count: 50
-  min_event_count: 5
-  escalation_threshold_percent: 25
-  client_secret: client_secret
+[sentry]
+enabled = true
+auth_token = "sentry_token"
+org_slug = "my-org"
+project_slugs = ["frontend", "backend"]
+top_issues_count = 50
+min_event_count = 5
+escalation_threshold_percent = 25
+client_secret = "client_secret"
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
 
             assert_eq!(config.work_dir, PathBuf::from("/path/to/repos"));
             assert_eq!(config.known_orgs, vec!["appwrite", "utopia-php"]);
@@ -1732,21 +1718,21 @@ sentry:
         });
     }
 
-    /// Helper to create a minimal valid config YAML for tests.
-    fn test_config_yaml() -> &'static str {
+    /// Helper to create a minimal valid config TOML for tests.
+    fn test_config_toml() -> &'static str {
         r#"
-work_dir: /tmp/repos
-known_orgs:
-  - appwrite
-linear:
-  api_key: test_key
+work_dir = "/tmp/repos"
+known_orgs = ["appwrite"]
+
+[linear]
+api_key = "test_key"
 "#
     }
 
     #[test]
-    fn test_from_yaml_with_defaults() {
+    fn test_from_toml_with_defaults() {
         with_env(&[], || {
-            let config = Config::from_yaml(test_config_yaml()).unwrap();
+            let config = Config::from_toml(test_config_toml()).unwrap();
 
             // Check that defaults are applied
             assert_eq!(config.poll_interval_ms, 300_000);
@@ -1770,21 +1756,20 @@ linear:
     }
 
     #[test]
-    fn test_from_yaml_invalid_yaml() {
+    fn test_from_toml_invalid_toml() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/repos
-known_orgs:
-  this is wrong: not valid
+            let toml_str = r#"
+work_dir = /tmp/repos
+this is not valid toml [[[
 "#;
-            let result = Config::from_yaml(yaml);
+            let result = Config::from_toml(toml_str);
             assert!(result.is_err());
         });
     }
 
     #[test]
     fn test_load_from_file() {
-        let file = create_temp_yaml(test_config_yaml());
+        let file = create_temp_toml(test_config_toml());
 
         with_env(&[], || {
             let config = Config::load(file.path()).unwrap();
@@ -1797,7 +1782,7 @@ known_orgs:
     #[test]
     fn test_load_file_not_found() {
         with_env(&[], || {
-            let result = Config::load("/nonexistent/path/config.yaml");
+            let result = Config::load("/nonexistent/path/config.toml");
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("Failed to read"));
         });
@@ -1805,11 +1790,10 @@ known_orgs:
 
     #[test]
     fn test_load_missing_work_dir() {
-        let yaml = r#"
-known_orgs:
-  - appwrite
+        let toml_str = r#"
+known_orgs = ["appwrite"]
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[], || {
             let result = Config::load(file.path());
@@ -1821,12 +1805,13 @@ known_orgs:
     #[test]
     fn test_load_without_known_orgs_succeeds() {
         // Config can load without known_orgs and auto_discover_paths
-        let yaml = r#"
-work_dir: /tmp/repos
-linear:
-  api_key: test_key
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[linear]
+api_key = "test_key"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[], || {
             let config = Config::load(file.path()).unwrap();
@@ -1839,10 +1824,10 @@ linear:
 
     #[test]
     fn test_env_override_work_dir() {
-        let yaml = r#"
-work_dir: /yaml/path
+        let toml_str = r#"
+work_dir = "/toml/path"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("WORK_DIR", "/env/path")], || {
             let config = Config::load(file.path()).unwrap();
@@ -1852,12 +1837,11 @@ work_dir: /yaml/path
 
     #[test]
     fn test_env_override_known_orgs() {
-        let yaml = r#"
-work_dir: /tmp/repos
-known_orgs:
-  - yaml-org
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+known_orgs = ["toml-org"]
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("KNOWN_ORGS", "env-org1, env-org2")], || {
             let config = Config::load(file.path()).unwrap();
@@ -1867,12 +1851,11 @@ known_orgs:
 
     #[test]
     fn test_env_override_auto_discover_paths() {
-        let yaml = r#"
-work_dir: /tmp/repos
-auto_discover_paths:
-  - ~/yaml/path
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+auto_discover_paths = ["~/toml/path"]
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[("AUTO_DISCOVER_PATHS", "~/env/path1, ~/env/path2")],
@@ -1888,14 +1871,15 @@ auto_discover_paths:
 
     #[test]
     fn test_env_override_core_settings() {
-        let yaml = r#"
-work_dir: /tmp/repos
-poll_interval_ms: 100000
-webhook_port: 3000
-linear:
-  api_key: lin_key
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+poll_interval_ms = 100000
+webhook_port = 3000
+
+[linear]
+api_key = "lin_key"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -1914,12 +1898,13 @@ linear:
 
     #[test]
     fn test_env_override_linear_api_key() {
-        let yaml = r#"
-work_dir: /tmp/repos
-linear:
-  api_key: yaml_key
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[linear]
+api_key = "toml_key"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("LINEAR_API_KEY", "env_key")], || {
             let config = Config::load(file.path()).unwrap();
@@ -1929,10 +1914,10 @@ linear:
 
     #[test]
     fn test_env_creates_linear_config_when_missing() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("LINEAR_API_KEY", "env_key")], || {
             let config = Config::load(file.path()).unwrap();
@@ -1943,13 +1928,14 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_sentry() {
-        let yaml = r#"
-work_dir: /tmp/repos
-sentry:
-  auth_token: yaml_token
-  org_slug: yaml-org
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[sentry]
+auth_token = "toml_token"
+org_slug = "toml-org"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -1967,10 +1953,10 @@ sentry:
 
     #[test]
     fn test_env_creates_sentry_config_when_missing() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -1987,14 +1973,16 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_discord() {
-        let yaml = r#"
-work_dir: /tmp/repos
-discord:
-  webhook_url: https://yaml.webhook
-linear:
-  api_key: key
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[discord]
+webhook_url = "https://toml.webhook"
+
+[linear]
+api_key = "key"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("DISCORD_WEBHOOK_URL", "https://env.webhook")], || {
             let config = Config::load(file.path()).unwrap();
@@ -2007,16 +1995,18 @@ linear:
 
     #[test]
     fn test_env_override_github() {
-        let yaml = r#"
-work_dir: /tmp/repos
-github:
-  token: yaml_token
-  poll_interval_ms: 30000
-  auto_resolve_on_merge: true
-linear:
-  api_key: key
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[github]
+token = "toml_token"
+poll_interval_ms = 30000
+auto_resolve_on_merge = true
+
+[linear]
+api_key = "key"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -2238,23 +2228,25 @@ linear:
     }
 
     #[test]
-    fn test_per_source_config_from_yaml() {
+    fn test_per_source_config_from_toml() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/repos
-max_issues_per_cycle: 5
-max_concurrent: 8
-linear:
-  api_key: lin_key
-  max_issues_per_cycle: 3
-  max_concurrent: 2
-sentry:
-  auth_token: sentry_tok
-  org_slug: org
-  max_issues_per_cycle: 2
-  max_concurrent: 6
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+max_issues_per_cycle = 5
+max_concurrent = 8
+
+[linear]
+api_key = "lin_key"
+max_issues_per_cycle = 3
+max_concurrent = 2
+
+[sentry]
+auth_token = "sentry_tok"
+org_slug = "org"
+max_issues_per_cycle = 2
+max_concurrent = 6
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
             assert_eq!(config.max_issues_per_cycle_for("sentry"), 2);
             assert_eq!(config.max_concurrent_for("linear"), 2);
@@ -2265,19 +2257,21 @@ sentry:
     #[test]
     fn test_per_source_config_partial_override() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/repos
-max_issues_per_cycle: 5
-max_concurrent: 8
-linear:
-  api_key: lin_key
-  max_issues_per_cycle: 3
-sentry:
-  auth_token: sentry_tok
-  org_slug: org
-  max_concurrent: 6
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+max_issues_per_cycle = 5
+max_concurrent = 8
+
+[linear]
+api_key = "lin_key"
+max_issues_per_cycle = 3
+
+[sentry]
+auth_token = "sentry_tok"
+org_slug = "org"
+max_concurrent = 6
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
             // Linear overrides issues but not concurrent
             assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
             assert_eq!(config.max_concurrent_for("linear"), 8);
@@ -2336,23 +2330,26 @@ sentry:
     }
 
     #[test]
-    fn test_poll_interval_ms_for_from_yaml() {
-        // Hold env mutex: from_yaml reads env vars which can race with other tests
+    fn test_poll_interval_ms_for_from_toml() {
+        // Hold env mutex: from_toml reads env vars which can race with other tests
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/repos
-poll_interval_ms: 300000
-discord:
-  poll_interval_ms: 30000
-linear:
-  api_key: lin_key
-  poll_interval_ms: 600000
-sentry:
-  auth_token: sentry_tok
-  org_slug: org
-  poll_interval_ms: 120000
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+poll_interval_ms = 300000
+
+[discord]
+poll_interval_ms = 30000
+
+[linear]
+api_key = "lin_key"
+poll_interval_ms = 600000
+
+[sentry]
+auth_token = "sentry_tok"
+org_slug = "org"
+poll_interval_ms = 120000
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(config.poll_interval_ms_for("discord"), 30_000);
             assert_eq!(config.poll_interval_ms_for("linear"), 600_000);
             assert_eq!(config.poll_interval_ms_for("sentry"), 120_000);
@@ -2363,7 +2360,7 @@ sentry:
     #[test]
     fn test_poll_interval_ms_for_env_override() {
         with_env(&[("DISCORD_POLL_INTERVAL_MS", "15000")], || {
-            let config = Config::from_yaml("work_dir: /tmp").unwrap();
+            let config = Config::from_toml("work_dir = \"/tmp\"").unwrap();
             assert_eq!(config.poll_interval_ms_for("discord"), 15_000);
             // Global unchanged
             assert_eq!(config.poll_interval_ms_for("unknown"), 300_000);
@@ -2550,26 +2547,22 @@ sentry:
     }
 
     #[test]
-    fn test_config_yaml_roundtrip() {
+    fn test_config_toml_roundtrip() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/repos
-known_orgs:
-  - appwrite
-  - utopia-php
-auto_discover_paths:
-  - ~/Local
-poll_interval_ms: 500000
-linear:
-  enabled: true
-  api_key: test_key
-  trigger_labels:
-    - label1
-    - label2
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+known_orgs = ["appwrite", "utopia-php"]
+auto_discover_paths = ["~/Local"]
+poll_interval_ms = 500000
+
+[linear]
+enabled = true
+api_key = "test_key"
+trigger_labels = ["label1", "label2"]
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
-            let serialized = serde_yaml::to_string(&config).unwrap();
-            let deserialized: Config = serde_yaml::from_str(&serialized).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
+            let serialized = toml::to_string(&config).unwrap();
+            let deserialized: Config = toml::from_str(&serialized).unwrap();
 
             assert_eq!(config.work_dir, deserialized.work_dir);
             assert_eq!(config.known_orgs, deserialized.known_orgs);
@@ -2585,10 +2578,10 @@ linear:
     #[test]
     fn test_retry_config_serialization() {
         let config = RetryConfig::default();
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        assert!(yaml.contains("max_retries"));
-        assert!(yaml.contains("base_delay_ms"));
-        assert!(yaml.contains("max_delay_ms"));
+        let toml_str = toml::to_string(&config).unwrap();
+        assert!(toml_str.contains("max_retries"));
+        assert!(toml_str.contains("base_delay_ms"));
+        assert!(toml_str.contains("max_delay_ms"));
     }
 
     #[test]
@@ -2602,7 +2595,7 @@ linear:
         assert_eq!(config.sentry_event_threshold, 1);
         assert!((config.similarity_threshold - 0.75).abs() < 0.01);
         // target_repos and github_search_repos should be empty by default
-        // (configured in YAML, not hardcoded)
+        // (configured in TOML, not hardcoded)
         assert!(config.target_repos.is_empty());
         assert!(config.github_token.is_none());
         assert!(config.github_search_repos.is_empty());
@@ -2637,30 +2630,27 @@ linear:
     #[test]
     fn test_regression_config_serialization() {
         let config = RegressionConfig::default();
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        assert!(yaml.contains("enabled"));
-        assert!(yaml.contains("check_interval_hours"));
-        assert!(yaml.contains("monitoring_duration_hours"));
-        assert!(yaml.contains("sentry_event_threshold"));
-        assert!(yaml.contains("similarity_threshold"));
-        assert!(yaml.contains("target_repos"));
+        let toml_str = toml::to_string(&config).unwrap();
+        assert!(toml_str.contains("enabled"));
+        assert!(toml_str.contains("check_interval_hours"));
+        assert!(toml_str.contains("monitoring_duration_hours"));
+        assert!(toml_str.contains("sentry_event_threshold"));
+        assert!(toml_str.contains("similarity_threshold"));
+        assert!(toml_str.contains("target_repos"));
     }
 
     #[test]
     fn test_regression_config_deserialization() {
-        let yaml = r#"
-enabled: true
-check_interval_hours: 2
-monitoring_duration_hours: 48
-sentry_event_threshold: 5
-similarity_threshold: 0.8
-target_repos:
-  - custom/repo
-github_search_repos:
-  - org/repo1
-  - org/repo2
+        let toml_str = r#"
+enabled = true
+check_interval_hours = 2
+monitoring_duration_hours = 48
+sentry_event_threshold = 5
+similarity_threshold = 0.8
+target_repos = ["custom/repo"]
+github_search_repos = ["org/repo1", "org/repo2"]
 "#;
-        let config: RegressionConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: RegressionConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert_eq!(config.check_interval_hours, 2);
         assert_eq!(config.monitoring_duration_hours, 48);
@@ -2678,16 +2668,17 @@ github_search_repos:
     }
 
     #[test]
-    fn test_config_regression_from_yaml() {
+    fn test_config_regression_from_toml() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/test
-regression:
-  enabled: false
-  check_interval_hours: 4
-  monitoring_duration_hours: 12
+            let toml_str = r#"
+work_dir = "/tmp/test"
+
+[regression]
+enabled = false
+check_interval_hours = 4
+monitoring_duration_hours = 12
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
             assert!(!config.regression.enabled);
             assert_eq!(config.regression.check_interval_hours, 4);
             assert_eq!(config.regression.monitoring_duration_hours, 12);
@@ -2789,20 +2780,21 @@ regression:
     }
 
     #[test]
-    fn test_github_app_config_from_yaml() {
+    fn test_github_app_config_from_toml() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/test
-github_app:
-  app_id: 12345
-  private_key_path: /path/to/key.pem
-  webhook_secret: secret123
-  installation_id: 67890
-  client_id: Iv1.abc123
-  client_secret: secret456
-  base_url: https://example.com
+            let toml_str = r#"
+work_dir = "/tmp/test"
+
+[github_app]
+app_id = 12345
+private_key_path = "/path/to/key.pem"
+webhook_secret = "secret123"
+installation_id = 67890
+client_id = "Iv1.abc123"
+client_secret = "secret456"
+base_url = "https://example.com"
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(config.github_app.app_id, Some(12345));
             assert_eq!(
                 config.github_app.private_key_path,
@@ -2827,10 +2819,10 @@ github_app:
 
     #[test]
     fn test_env_override_github_app() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -2883,19 +2875,18 @@ work_dir: /tmp/repos
     }
 
     #[test]
-    fn test_claude_config_from_yaml() {
+    fn test_claude_config_from_toml() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/test
-claude:
-  model: sonnet
-  instructions: "Always write tests."
-  permissions:
-    - "Bash(git *)"
-    - "Read"
-  skip_permissions: false
+            let toml_str = r#"
+work_dir = "/tmp/test"
+
+[claude]
+model = "sonnet"
+instructions = "Always write tests."
+permissions = ["Bash(git *)", "Read"]
+skip_permissions = false
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(config.claude.model, Some("sonnet".to_string()));
             assert_eq!(
                 config.claude.instructions,
@@ -2907,12 +2898,12 @@ claude:
     }
 
     #[test]
-    fn test_claude_config_yaml_defaults() {
+    fn test_claude_config_toml_defaults() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/test
+            let toml_str = r#"
+work_dir = "/tmp/test"
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
             assert!(config.claude.model.is_none());
             assert!(config.claude.instructions.is_none());
             assert!(config.claude.permissions.is_empty());
@@ -2922,10 +2913,10 @@ work_dir: /tmp/test
 
     #[test]
     fn test_env_override_claude_model() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("CLAUDE_MODEL", "opus")], || {
             let config = Config::load(file.path()).unwrap();
@@ -2935,10 +2926,10 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_claude_instructions() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("CLAUDE_INSTRUCTIONS", "Be concise.")], || {
             let config = Config::load(file.path()).unwrap();
@@ -2952,8 +2943,8 @@ work_dir: /tmp/repos
         let instructions_path = dir.path().join("my-instructions.md");
         fs::write(&instructions_path, "File content.").unwrap();
 
-        let config_path = dir.path().join("claudear.yaml");
-        fs::write(&config_path, "work_dir: /tmp/repos\n").unwrap();
+        let config_path = dir.path().join("claudear.toml");
+        fs::write(&config_path, "work_dir = \"/tmp/repos\"\n").unwrap();
 
         with_env(
             &[("CLAUDE_INSTRUCTIONS_FILE", "my-instructions.md")],
@@ -2974,10 +2965,10 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_claude_permissions() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("CLAUDE_PERMISSIONS", "Bash(git *), Read, Edit")], || {
             let config = Config::load(file.path()).unwrap();
@@ -2990,10 +2981,10 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_claude_skip_permissions() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("CLAUDE_SKIP_PERMISSIONS", "false")], || {
             let config = Config::load(file.path()).unwrap();
@@ -3003,12 +2994,13 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_claude_skip_permissions_true() {
-        let yaml = r#"
-work_dir: /tmp/repos
-claude:
-  skip_permissions: false
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[claude]
+skip_permissions = false
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("CLAUDE_SKIP_PERMISSIONS", "1")], || {
             let config = Config::load(file.path()).unwrap();
@@ -3023,11 +3015,11 @@ claude:
             let instructions_path = dir.path().join("instructions.md");
             fs::write(&instructions_path, "Be helpful and concise.").unwrap();
 
-            let yaml = format!(
-                "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"{}\"",
+            let toml_str = format!(
+                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"{}\"",
                 instructions_path.display()
             );
-            let config = Config::from_yaml(&yaml).unwrap();
+            let config = Config::from_toml(&toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, Some("Be helpful and concise.".to_string()));
         });
@@ -3040,8 +3032,9 @@ claude:
             let instructions_path = dir.path().join("my-instructions.md");
             fs::write(&instructions_path, "Write tests first.").unwrap();
 
-            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"my-instructions.md\"";
-            let config = Config::from_yaml(yaml).unwrap();
+            let toml_str =
+                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"my-instructions.md\"";
+            let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, Some("Write tests first.".to_string()));
         });
@@ -3054,8 +3047,8 @@ claude:
             let instructions_path = dir.path().join("base.md");
             fs::write(&instructions_path, "Base instructions from file.").unwrap();
 
-            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"base.md\"\n  instructions: \"Plus inline.\"";
-            let config = Config::from_yaml(yaml).unwrap();
+            let toml_str = "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"base.md\"\ninstructions = \"Plus inline.\"";
+            let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(
                 resolved,
@@ -3069,8 +3062,8 @@ claude:
         with_env(&[], || {
             let dir = tempfile::tempdir().unwrap();
 
-            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions: \"Just inline.\"";
-            let config = Config::from_yaml(yaml).unwrap();
+            let toml_str = "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions = \"Just inline.\"";
+            let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, Some("Just inline.".to_string()));
         });
@@ -3081,8 +3074,8 @@ claude:
         with_env(&[], || {
             let dir = tempfile::tempdir().unwrap();
 
-            let yaml = "work_dir: /tmp/repos";
-            let config = Config::from_yaml(yaml).unwrap();
+            let toml_str = "work_dir = \"/tmp/repos\"";
+            let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, None);
         });
@@ -3093,8 +3086,9 @@ claude:
         with_env(&[], || {
             let dir = tempfile::tempdir().unwrap();
 
-            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"nonexistent.md\"";
-            let config = Config::from_yaml(yaml).unwrap();
+            let toml_str =
+                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"nonexistent.md\"";
+            let config = Config::from_toml(toml_str).unwrap();
             let result = config.resolve_instructions_file(dir.path());
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("nonexistent.md"));
@@ -3108,8 +3102,9 @@ claude:
             let instructions_path = dir.path().join("empty.md");
             fs::write(&instructions_path, "").unwrap();
 
-            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"empty.md\"";
-            let config = Config::from_yaml(yaml).unwrap();
+            let toml_str =
+                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"empty.md\"";
+            let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, None);
         });
@@ -3121,9 +3116,9 @@ claude:
         let instructions_path = dir.path().join("my-instructions.md");
         fs::write(&instructions_path, "Instructions from file.").unwrap();
 
-        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"my-instructions.md\"\n  instructions: \"And inline.\"";
-        let config_path = dir.path().join("claudear.yaml");
-        fs::write(&config_path, yaml).unwrap();
+        let toml_str = "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"my-instructions.md\"\ninstructions = \"And inline.\"";
+        let config_path = dir.path().join("claudear.toml");
+        fs::write(&config_path, toml_str).unwrap();
 
         with_env(&[], || {
             let config = Config::load(&config_path).unwrap();
@@ -3137,23 +3132,23 @@ claude:
 
     #[test]
     fn test_users_config_deserialize() {
-        let yaml = r#"
-users:
-  jake:
-    linear_name: "Jake Barnwell"
-    github_username: "jakebarnby"
-    sentry_username: "jake"
-    discord_id: "123456789"
-    email: "jake@example.com"
-    push_user_key: "pushover_key"
-    sms_number: "+1234567890"
-  alice:
-    linear_name: "Alice Smith"
-    github_username: "alicesmith"
-    discord_id: "987654321"
-    email: "alice@example.com"
+        let toml_str = r#"
+[users.jake]
+linear_name = "Jake Barnwell"
+github_username = "jakebarnby"
+sentry_username = "jake"
+discord_id = "123456789"
+email = "jake@example.com"
+push_user_key = "pushover_key"
+sms_number = "+1234567890"
+
+[users.alice]
+linear_name = "Alice Smith"
+github_username = "alicesmith"
+discord_id = "987654321"
+email = "alice@example.com"
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.users.len(), 2);
         let jake = &config.users["jake"];
         assert_eq!(jake.linear_name.as_deref(), Some("Jake Barnwell"));
@@ -3176,48 +3171,46 @@ users:
 
     #[test]
     fn test_resolve_user_slug_in_discord_config() {
-        let yaml = r#"
-users:
-  jake:
-    discord_id: "123456789"
-    email: "jake@example.com"
-discord:
-  webhook_url: "https://discord.com/api/webhooks/123/abc"
-  user_id: "jake"
+        let toml_str = r#"
+[users.jake]
+discord_id = "123456789"
+email = "jake@example.com"
+
+[discord]
+webhook_url = "https://discord.com/api/webhooks/123/abc"
+user_id = "jake"
 "#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         assert_eq!(config.discord.user_id.as_deref(), Some("123456789"));
     }
 
     #[test]
     fn test_resolve_user_slug_not_found_keeps_raw_value() {
-        let yaml = r#"
-users:
-  jake:
-    discord_id: "123456789"
-discord:
-  webhook_url: "https://discord.com/api/webhooks/123/abc"
-  user_id: "999888777"
+        let toml_str = r#"
+[users.jake]
+discord_id = "123456789"
+
+[discord]
+webhook_url = "https://discord.com/api/webhooks/123/abc"
+user_id = "999888777"
 "#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         assert_eq!(config.discord.user_id.as_deref(), Some("999888777"));
     }
 
     #[test]
     fn test_resolve_user_slug_in_email_config() {
-        let yaml = r#"
-users:
-  jake:
-    email: "jake@resolved.com"
-email:
-  smtp_host: "smtp.example.com"
-  to_addresses:
-    - "jake"
-    - "other@example.com"
+        let toml_str = r#"
+[users.jake]
+email = "jake@resolved.com"
+
+[email]
+smtp_host = "smtp.example.com"
+to_addresses = ["jake", "other@example.com"]
 "#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         assert_eq!(
             config.email.to_addresses,
@@ -3227,42 +3220,40 @@ email:
 
     #[test]
     fn test_resolve_user_slug_in_push_config() {
-        let yaml = r#"
-users:
-  jake:
-    push_user_key: "resolved_push_key"
-push:
-  api_token: "token"
-  user_key: "jake"
+        let toml_str = r#"
+[users.jake]
+push_user_key = "resolved_push_key"
+
+[push]
+api_token = "token"
+user_key = "jake"
 "#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         assert_eq!(config.push.user_key.as_deref(), Some("resolved_push_key"));
     }
 
     #[test]
     fn test_resolve_user_slug_in_sms_config() {
-        let yaml = r#"
-users:
-  jake:
-    sms_number: "+1234567890"
-sms:
-  account_sid: "sid"
-  to_numbers:
-    - "jake"
-    - "+9876543210"
+        let toml_str = r#"
+[users.jake]
+sms_number = "+1234567890"
+
+[sms]
+account_sid = "sid"
+to_numbers = ["jake", "+9876543210"]
 "#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         assert_eq!(config.sms.to_numbers, vec!["+1234567890", "+9876543210"]);
     }
 
     #[test]
     fn test_env_override_imap_settings() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3290,10 +3281,10 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_ask_config() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3322,10 +3313,10 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_sms_settings() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3346,10 +3337,10 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_push_settings() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3370,10 +3361,10 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_retry_settings() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3392,12 +3383,13 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_linear_trigger_labels_and_states() {
-        let yaml = r#"
-work_dir: /tmp/repos
-linear:
-  api_key: yaml_key
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[linear]
+api_key = "toml_key"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3425,13 +3417,14 @@ linear:
 
     #[test]
     fn test_env_override_linear_enabled_flag() {
-        let yaml = r#"
-work_dir: /tmp/repos
-linear:
-  api_key: key
-  enabled: true
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[linear]
+api_key = "key"
+enabled = true
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("LINEAR_ENABLED", "false")], || {
             let config = Config::load(file.path()).unwrap();
@@ -3441,12 +3434,13 @@ linear:
 
     #[test]
     fn test_env_override_linear_trigger_assignee() {
-        let yaml = r#"
-work_dir: /tmp/repos
-linear:
-  api_key: key
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[linear]
+api_key = "key"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("LINEAR_TRIGGER_ASSIGNEE", "Jane Smith")], || {
             let config = Config::load(file.path()).unwrap();
@@ -3457,13 +3451,14 @@ linear:
 
     #[test]
     fn test_env_override_linear_trigger_assignee_empty() {
-        let yaml = r#"
-work_dir: /tmp/repos
-linear:
-  api_key: key
-  trigger_assignee: "Previous Value"
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[linear]
+api_key = "key"
+trigger_assignee = "Previous Value"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(&[("LINEAR_TRIGGER_ASSIGNEE", "")], || {
             let config = Config::load(file.path()).unwrap();
@@ -3475,13 +3470,14 @@ linear:
 
     #[test]
     fn test_env_override_sentry_detailed() {
-        let yaml = r#"
-work_dir: /tmp/repos
-sentry:
-  auth_token: yaml_token
-  org_slug: yaml-org
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[sentry]
+auth_token = "toml_token"
+org_slug = "toml-org"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3513,10 +3509,10 @@ sentry:
 
     #[test]
     fn test_env_override_additional_core_settings() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3541,14 +3537,16 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_empty_values_ignored() {
-        let yaml = r#"
-work_dir: /tmp/repos
-discord:
-  webhook_url: "https://keep-this.url"
-linear:
-  api_key: keep_key
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[discord]
+webhook_url = "https://keep-this.url"
+
+[linear]
+api_key = "keep_key"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3573,10 +3571,10 @@ linear:
 
     #[test]
     fn test_env_override_github_webhook_secret_and_review_trigger() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3593,10 +3591,10 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_email_smtp_settings() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3651,15 +3649,16 @@ work_dir: /tmp/repos
     }
 
     #[test]
-    fn test_cascade_config_from_yaml() {
+    fn test_cascade_config_from_toml() {
         with_env(&[], || {
-            let yaml = r#"
-work_dir: /tmp/test
-cascade:
-  enabled: true
-  max_depth: 3
+            let toml_str = r#"
+work_dir = "/tmp/test"
+
+[cascade]
+enabled = true
+max_depth = 3
 "#;
-            let config = Config::from_yaml(yaml).unwrap();
+            let config = Config::from_toml(toml_str).unwrap();
             assert!(config.cascade.enabled);
             assert_eq!(config.cascade.max_depth, 3);
         });
@@ -3710,10 +3709,10 @@ cascade:
 
     #[test]
     fn test_env_override_discord_bot_and_channel() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[
@@ -3730,10 +3729,10 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_env_override_github_app_private_key_path() {
-        let yaml = r#"
-work_dir: /tmp/repos
+        let toml_str = r#"
+work_dir = "/tmp/repos"
 "#;
-        let file = create_temp_yaml(yaml);
+        let file = create_temp_toml(toml_str);
 
         with_env(
             &[("GITHUB_APP_PRIVATE_KEY_PATH", "/path/to/key.pem")],
@@ -3778,16 +3777,17 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_resolve_user_slug_user_has_no_channel_id() {
-        let yaml = r#"
-users:
-  jake:
-    linear_name: "Jake B"
-discord:
-  user_id: "jake"
-push:
-  user_key: "jake"
+        let toml_str = r#"
+[users.jake]
+linear_name = "Jake B"
+
+[discord]
+user_id = "jake"
+
+[push]
+user_key = "jake"
 "#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         // User exists but has no discord_id, should keep slug
         assert_eq!(config.discord.user_id.as_deref(), Some("jake"));
@@ -3797,15 +3797,14 @@ push:
 
     #[test]
     fn test_resolve_user_slug_email_user_has_no_email() {
-        let yaml = r#"
-users:
-  jake:
-    linear_name: "Jake B"
-email:
-  to_addresses:
-    - "jake"
+        let toml_str = r#"
+[users.jake]
+linear_name = "Jake B"
+
+[email]
+to_addresses = ["jake"]
 "#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         // User exists but has no email field, should keep the slug as-is
         assert_eq!(config.email.to_addresses, vec!["jake"]);
@@ -3813,15 +3812,14 @@ email:
 
     #[test]
     fn test_resolve_user_slug_sms_user_has_no_number() {
-        let yaml = r#"
-users:
-  jake:
-    linear_name: "Jake B"
-sms:
-  to_numbers:
-    - "jake"
+        let toml_str = r#"
+[users.jake]
+linear_name = "Jake B"
+
+[sms]
+to_numbers = ["jake"]
 "#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         // User exists but has no sms_number, should keep the slug as-is
         assert_eq!(config.sms.to_numbers, vec!["jake"]);
@@ -3838,13 +3836,12 @@ sms:
     }
 
     #[test]
-    fn test_top_issues_period_serde_yaml_aliases() {
-        // Test that the serde aliases work in YAML
-        let period: TopIssuesPeriod = serde_yaml::from_str::<TopIssuesPeriod>(
-            &serde_yaml::to_string(&TopIssuesPeriod::OneHour).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(period, TopIssuesPeriod::OneHour);
+    fn test_top_issues_period_serde_toml_aliases() {
+        // TOML cannot serialize/deserialize bare enum values; wrap in a struct
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrapper {
+            period: TopIssuesPeriod,
+        }
 
         // Test roundtrip of all variants
         for variant in [
@@ -3854,10 +3851,15 @@ sms:
             TopIssuesPeriod::OneWeek,
             TopIssuesPeriod::OneMonth,
         ] {
-            let serialized = serde_yaml::to_string(&variant).unwrap();
-            let deserialized: TopIssuesPeriod = serde_yaml::from_str(&serialized).unwrap();
-            assert_eq!(variant, deserialized);
+            let wrapper = Wrapper { period: variant };
+            let serialized = toml::to_string(&wrapper).unwrap();
+            let deserialized: Wrapper = toml::from_str(&serialized).unwrap();
+            assert_eq!(variant, deserialized.period);
         }
+
+        // Test that aliases work in TOML context
+        let from_alias: Wrapper = toml::from_str("period = \"1h\"").unwrap();
+        assert_eq!(from_alias.period, TopIssuesPeriod::OneHour);
     }
 
     // ── LearningConfig tests ──
@@ -3881,9 +3883,9 @@ sms:
     }
 
     #[test]
-    fn test_learning_config_deserialize_empty_yaml() {
-        // An empty YAML object should give all defaults
-        let config: LearningConfig = serde_yaml::from_str("{}").unwrap();
+    fn test_learning_config_deserialize_empty_toml() {
+        // An empty TOML string should give all defaults
+        let config: LearningConfig = toml::from_str("").unwrap();
         assert!(config.auto_extract_learnings);
         assert!(config.diff_analysis);
         assert!(!config.auto_agent_md);
@@ -3891,11 +3893,11 @@ sms:
 
     #[test]
     fn test_learning_config_deserialize_partial() {
-        let yaml = r#"
-auto_extract_learnings: false
-cluster_window_minutes: 60
+        let toml_str = r#"
+auto_extract_learnings = false
+cluster_window_minutes = 60
 "#;
-        let config: LearningConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: LearningConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.auto_extract_learnings);
         assert_eq!(config.cluster_window_minutes, 60);
         // Rest should be defaults
@@ -3905,13 +3907,12 @@ cluster_window_minutes: 60
 
     #[test]
     fn test_config_without_learning_section() {
-        // A minimal Config YAML without any "learning:" section should still work
-        let yaml = r#"
-work_dir: /tmp/repos
-known_orgs:
-  - test-org
+        // A minimal Config TOML without any [learning] section should still work
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+known_orgs = ["test-org"]
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         // learning field should get default values
         assert!(config.learning.auto_extract_learnings);
         assert!(config.learning.diff_analysis);
@@ -3920,16 +3921,16 @@ known_orgs:
 
     #[test]
     fn test_config_with_learning_section() {
-        let yaml = r#"
-work_dir: /tmp/repos
-known_orgs:
-  - test-org
-learning:
-  auto_extract_learnings: false
-  auto_agent_md: true
-  min_cluster_size: 5
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+known_orgs = ["test-org"]
+
+[learning]
+auto_extract_learnings = false
+auto_agent_md = true
+min_cluster_size = 5
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert!(!config.learning.auto_extract_learnings);
         assert!(config.learning.auto_agent_md);
         assert_eq!(config.learning.min_cluster_size, 5);
@@ -3939,13 +3940,13 @@ learning:
 
     #[test]
     fn test_learning_config_zero_thresholds() {
-        let yaml = r#"
-qa_promotion_threshold: 0
-review_promotion_threshold: 0
-cluster_window_minutes: 0
-min_cluster_size: 0
+        let toml_str = r#"
+qa_promotion_threshold = 0
+review_promotion_threshold = 0
+cluster_window_minutes = 0
+min_cluster_size = 0
 "#;
-        let config: LearningConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: LearningConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.qa_promotion_threshold, 0);
         assert_eq!(config.review_promotion_threshold, 0);
         assert_eq!(config.cluster_window_minutes, 0);
@@ -3954,12 +3955,12 @@ min_cluster_size: 0
 
     #[test]
     fn test_learning_config_large_values() {
-        let yaml = r#"
-qa_promotion_threshold: 999999
-cluster_window_minutes: 4294967295
-min_cluster_size: 999999
+        let toml_str = r#"
+qa_promotion_threshold = 999999
+cluster_window_minutes = 4294967295
+min_cluster_size = 999999
 "#;
-        let config: LearningConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: LearningConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.qa_promotion_threshold, 999999);
         assert_eq!(config.cluster_window_minutes, 4294967295);
         assert_eq!(config.min_cluster_size, 999999);
@@ -3967,18 +3968,18 @@ min_cluster_size: 999999
 
     #[test]
     fn test_learning_config_all_features_disabled() {
-        let yaml = r#"
-auto_extract_learnings: false
-diff_analysis: false
-qa_promotion: false
-repo_knowledge: false
-review_classification: false
-strategy_fingerprinting: false
-quality_scoring: false
-cluster_detection: false
-auto_agent_md: false
+        let toml_str = r#"
+auto_extract_learnings = false
+diff_analysis = false
+qa_promotion = false
+repo_knowledge = false
+review_classification = false
+strategy_fingerprinting = false
+quality_scoring = false
+cluster_detection = false
+auto_agent_md = false
 "#;
-        let config: LearningConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: LearningConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.auto_extract_learnings);
         assert!(!config.diff_analysis);
         assert!(!config.qa_promotion);
@@ -3992,50 +3993,50 @@ auto_agent_md: false
 
     #[test]
     fn test_config_zero_poll_interval() {
-        let yaml = r#"
-work_dir: /tmp/repos
-poll_interval_ms: 0
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+poll_interval_ms = 0
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.poll_interval_ms, 0);
     }
 
     #[test]
     fn test_config_zero_max_issues_per_cycle() {
-        let yaml = r#"
-work_dir: /tmp/repos
-max_issues_per_cycle: 0
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+max_issues_per_cycle = 0
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.max_issues_per_cycle, 0);
     }
 
     #[test]
     fn test_config_zero_max_concurrent() {
-        let yaml = r#"
-work_dir: /tmp/repos
-max_concurrent: 0
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+max_concurrent = 0
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.max_concurrent, 0);
     }
 
     #[test]
     fn test_config_empty_work_dir() {
-        let yaml = r#"
-work_dir: ""
+        let toml_str = r#"
+work_dir = ""
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.work_dir, PathBuf::from(""));
     }
 
     #[test]
     fn test_config_empty_known_orgs() {
-        let yaml = r#"
-work_dir: /tmp
-known_orgs: []
+        let toml_str = r#"
+work_dir = "/tmp"
+known_orgs = []
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.known_orgs.is_empty());
     }
 
@@ -4049,23 +4050,23 @@ known_orgs: []
 
     #[test]
     fn test_retry_config_zero_retries() {
-        let yaml = r#"
-max_retries: 0
+        let toml_str = r#"
+max_retries = 0
 "#;
-        let config: RetryConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: RetryConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.max_retries, 0);
     }
 
     #[test]
     fn test_config_unknown_fields_ignored() {
-        // YAML with unknown fields should not error (serde default behavior)
-        let yaml = r#"
-work_dir: /tmp
-unknown_field: "should be ignored"
-another_unknown: 42
+        // TOML with unknown fields - toml crate by default rejects unknown fields with serde
+        let toml_str = r#"
+work_dir = "/tmp"
+unknown_field = "should be ignored"
+another_unknown = 42
 "#;
-        let result: std::result::Result<Config, _> = serde_yaml::from_str(yaml);
-        // Depending on serde config this may succeed or fail; verify it doesn't panic
+        let result: std::result::Result<Config, _> = toml::from_str(toml_str);
+        // TOML rejects unknown fields by default; verify it doesn't panic
         let _ = result;
     }
 
@@ -4086,8 +4087,8 @@ another_unknown: 42
             min_cluster_size: 7,
             auto_agent_md: true,
         };
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        let restored: LearningConfig = serde_yaml::from_str(&yaml).unwrap();
+        let toml_str = toml::to_string(&config).unwrap();
+        let restored: LearningConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(
             config.auto_extract_learnings,
             restored.auto_extract_learnings

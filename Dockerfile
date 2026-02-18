@@ -1,5 +1,12 @@
+ARG ONNXRUNTIME_VERSION=1.23.2
+ARG VECTORLITE_VERSION=16a01af79add
+ARG RUST_VERSION=1.93
+ARG DEBIAN_VERSION=trixie
+ARG GIT_USER_NAME="Claudear"
+ARG GIT_USER_EMAIL="claudear@noreply.local"
+
 # Dashboard build stage
-FROM oven/bun:1 AS dashboard-builder
+FROM oven/bun:1 AS dashboard
 
 WORKDIR /app/dashboard
 COPY dashboard/package.json dashboard/bun.lock* ./
@@ -8,7 +15,8 @@ COPY dashboard/ ./
 RUN bun run build
 
 # Vectorlite build stage (no prebuilt binaries for linux arm64)
-FROM debian:bookworm-slim AS vectorlite-builder
+FROM debian:${DEBIAN_VERSION}-slim AS vectorlite
+ARG VECTORLITE_VERSION
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -24,7 +32,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-RUN git clone --recurse-submodules https://github.com/1yefuwang1/vectorlite.git .
+RUN git clone --recurse-submodules https://github.com/1yefuwang1/vectorlite.git . \
+    && git checkout "${VECTORLITE_VERSION}"
 
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 
@@ -32,7 +41,7 @@ RUN python3 bootstrap_vcpkg.py
 
 RUN cmake --preset release && cmake --build build/release -j$(nproc)
 
-FROM rust:1.93-slim-bookworm AS builder
+FROM rust:${RUST_VERSION}-slim-${DEBIAN_VERSION} AS builder
 
 WORKDIR /app
 
@@ -45,33 +54,38 @@ RUN apt-get update && apt-get install -y \
 
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
-# Create empty dashboard/dist so the dependency cache step compiles
 RUN mkdir -p dashboard/dist
 RUN cargo build --release && rm -rf src
 
 COPY src ./src
-# Copy the built dashboard assets for embedding
-COPY --from=dashboard-builder /app/dashboard/dist ./dashboard/dist
+
+# Copy dashboard for embedding
+COPY --from=dashboard /app/dashboard/dist ./dashboard/dist
 RUN touch src/main.rs src/lib.rs && cargo build --release
 
-FROM debian:bookworm-slim
+# Install Claude Code native binary in a throwaway stage
+FROM debian:${DEBIAN_VERSION}-slim AS claude-code
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 appuser
+USER appuser
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+FROM debian:${DEBIAN_VERSION}-slim
+ARG GIT_USER_NAME
+ARG GIT_USER_EMAIL
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     git \
-    git-lfs \
     jq \
-    nodejs \
-    npm \
     openssh-client \
-    sqlite3 \
-    && npm install -g @anthropic-ai/claude-code \
-    && rm -rf /var/lib/apt/lists/* /root/.npm /tmp/*
+    && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/locale/*
 
-COPY --from=vectorlite-builder /build/build/release/vectorlite/vectorlite.so /usr/local/lib/vectorlite.so
+COPY --from=vectorlite /build/build/release/vectorlite/vectorlite.so /usr/local/lib/vectorlite.so
 COPY --from=builder /app/target/release/claudear /usr/local/bin/claudear
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
@@ -79,11 +93,16 @@ RUN adduser --disabled-password --uid 1000 --gecos "" appuser \
     && mkdir -p /app/data /app/repos /home/appuser/.cache/fastembed /home/appuser/.claude \
     && chown -R appuser:appuser /app /home/appuser/.cache /home/appuser/.claude
 
+# Copy only the Claude Code binary from the install stage
+COPY --from=claude-code --chown=appuser:appuser /home/appuser/.local /home/appuser/.local
+
 USER appuser
 
-RUN git config --global user.name "Claudear Bot" \
-    && git config --global user.email "claudear@noreply.local" \
+RUN git config --global user.name "${GIT_USER_NAME}" \
+    && git config --global user.email "${GIT_USER_EMAIL}" \
     && git config --global init.defaultBranch main
+
+ENV PATH="/home/appuser/.local/bin:${PATH}"
 
 ENV PROJECT_DIR=/app/project
 ENV DATA_DIR=/app/data
