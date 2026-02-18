@@ -8,7 +8,7 @@ mod index;
 mod relationships;
 
 pub use discovery::{DependencyDiscovery, DiscoveredDependency};
-pub use git::GitOps;
+pub use git::{worktree_path, GitOps};
 pub use index::{IndexedRepo, RepoIndex};
 pub use relationships::{
     CascadingChange, DependencyGraph, DependencyType, RepoRelationships, Repository,

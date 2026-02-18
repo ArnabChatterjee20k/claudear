@@ -18,3 +18,5 @@ claudear.yaml
 logs
 .worktrees/
 cobertura.xml
+vectorlite.dylib
+vectorlite.so

@@ -13,10 +13,10 @@ use std::sync::Arc;
 /// Configuration for regression scheduling.
 #[derive(Debug, Clone)]
 pub struct RegressionSchedulerConfig {
-    /// How often to check for regressions (in hours).
-    pub check_interval_hours: u32,
-    /// Total monitoring duration (in hours).
-    pub monitoring_duration_hours: u32,
+    /// How often to check for regressions (in seconds).
+    pub check_interval_secs: u64,
+    /// Total monitoring duration (in seconds).
+    pub monitoring_duration_secs: u64,
     /// Minimum events on Sentry to trigger regression.
     pub sentry_event_threshold: u32,
     /// Similarity threshold for semantic matching (0.0-1.0).
@@ -26,8 +26,8 @@ pub struct RegressionSchedulerConfig {
 impl Default for RegressionSchedulerConfig {
     fn default() -> Self {
         Self {
-            check_interval_hours: 1,
-            monitoring_duration_hours: 24,
+            check_interval_secs: 3600,       // 1 hour
+            monitoring_duration_secs: 86400, // 24 hours
             sentry_event_threshold: 1,
             similarity_threshold: 0.75,
         }
@@ -100,13 +100,14 @@ impl<C: RegressionChecker> RegressionScheduler<C> {
         };
 
         let now = Utc::now();
-        let hours_since_start = (now - monitoring_started).num_hours() as u32;
+        let secs_since_start = (now - monitoring_started).num_seconds().max(0) as u64;
 
         // Calculate the maximum number of checks for the monitoring window
-        let max_checks = self.config.monitoring_duration_hours / self.config.check_interval_hours;
+        let max_checks =
+            self.config.monitoring_duration_secs / self.config.check_interval_secs.max(1);
 
         // Check if we've already completed all checks
-        if check_number > max_checks {
+        if check_number as u64 > max_checks {
             // Already completed monitoring, should not happen but handle gracefully
             tracing::warn!(
                 watch_id = watch.id,
@@ -118,15 +119,15 @@ impl<C: RegressionChecker> RegressionScheduler<C> {
         }
 
         // Check if enough time has passed since monitoring started for this check number.
-        // Check N should happen after (N * check_interval_hours) hours have elapsed.
-        // e.g., check 1 after 1 hour, check 2 after 2 hours, etc.
-        let required_hours = check_number * self.config.check_interval_hours;
-        if hours_since_start < required_hours {
+        // Check N should happen after (N * check_interval_secs) seconds have elapsed.
+        // e.g., with 10s interval: check 1 after 10s, check 2 after 20s, etc.
+        let required_secs = check_number as u64 * self.config.check_interval_secs;
+        if secs_since_start < required_secs {
             // Not time for this check yet
             return Ok(None);
         }
 
-        let is_final_check = check_number == max_checks;
+        let is_final_check = check_number as u64 == max_checks;
 
         // Perform the regression check
         let regression_result = self.checker.check_regression(watch).await?;
@@ -178,7 +179,7 @@ impl<C: RegressionChecker> RegressionScheduler<C> {
             .get_regression_watches_by_status(RegressionWatchStatus::Monitoring)?;
 
         let now = Utc::now();
-        let check_interval = Duration::hours(self.config.check_interval_hours as i64);
+        let check_interval = Duration::seconds(self.config.check_interval_secs as i64);
 
         let mut due = Vec::new();
         for watch in watches {
@@ -240,8 +241,8 @@ mod tests {
     #[test]
     fn test_scheduler_config_default() {
         let config = RegressionSchedulerConfig::default();
-        assert_eq!(config.check_interval_hours, 1);
-        assert_eq!(config.monitoring_duration_hours, 24);
+        assert_eq!(config.check_interval_secs, 3600);
+        assert_eq!(config.monitoring_duration_secs, 86400);
         assert_eq!(config.sentry_event_threshold, 1);
         assert!((config.similarity_threshold - 0.75).abs() < 0.01);
     }
@@ -380,8 +381,8 @@ mod tests {
 
         let checker = MockChecker::new(false);
         let config = RegressionSchedulerConfig {
-            check_interval_hours: 1,
-            monitoring_duration_hours: 24,
+            check_interval_secs: 3600,
+            monitoring_duration_secs: 86400,
             ..Default::default()
         };
         let scheduler = RegressionScheduler::new(checker, tracker.clone(), config);

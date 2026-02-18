@@ -499,6 +499,10 @@ pub struct LinearConfig {
     pub api_key: String,
     /// Labels that trigger automation.
     pub trigger_labels: Vec<String>,
+    /// Optional assignee display name filter. When set, only issues assigned to
+    /// this user are processed. If set and `trigger_labels` is empty, label
+    /// matching is skipped.
+    pub trigger_assignee: Option<String>,
     /// States that trigger automation.
     pub trigger_states: Vec<String>,
     /// Optional team filter.
@@ -521,6 +525,7 @@ impl Default for LinearConfig {
             enabled: true,
             api_key: String::new(),
             trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
+            trigger_assignee: None,
             trigger_states: vec!["backlog".to_string(), "todo".to_string()],
             team_id: None,
             project_id: None,
@@ -653,6 +658,10 @@ pub struct RegressionConfig {
     pub check_interval_hours: u32,
     /// Total monitoring duration after release (in hours).
     pub monitoring_duration_hours: u32,
+    /// Override check interval in seconds (for testing). Takes precedence over check_interval_hours.
+    pub check_interval_secs: Option<u64>,
+    /// Override monitoring duration in seconds (for testing). Takes precedence over monitoring_duration_hours.
+    pub monitoring_duration_secs: Option<u64>,
     /// Minimum Sentry events to trigger regression detection.
     pub sentry_event_threshold: u32,
     /// Semantic similarity threshold for matching issues (0.0-1.0).
@@ -672,12 +681,31 @@ pub struct RegressionConfig {
     pub package_names: std::collections::HashMap<String, String>,
 }
 
+impl RegressionConfig {
+    /// Get the effective check interval in seconds.
+    /// Uses `check_interval_secs` if set, otherwise converts `check_interval_hours` to seconds.
+    pub fn effective_check_interval_secs(&self) -> u64 {
+        self.check_interval_secs
+            .unwrap_or((self.check_interval_hours as u64) * 3600)
+            .max(1)
+    }
+
+    /// Get the effective monitoring duration in seconds.
+    /// Uses `monitoring_duration_secs` if set, otherwise converts `monitoring_duration_hours` to seconds.
+    pub fn effective_monitoring_duration_secs(&self) -> u64 {
+        self.monitoring_duration_secs
+            .unwrap_or((self.monitoring_duration_hours as u64) * 3600)
+    }
+}
+
 impl Default for RegressionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             check_interval_hours: 1,
             monitoring_duration_hours: 24,
+            check_interval_secs: None,
+            monitoring_duration_secs: None,
             sentry_event_threshold: 1,
             similarity_threshold: 0.75,
             target_repos: Vec::new(),
@@ -1184,6 +1212,9 @@ impl Config {
                     linear.trigger_labels = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
+            if let Ok(v) = env::var("LINEAR_TRIGGER_ASSIGNEE") {
+                linear.trigger_assignee = Some(v).filter(|s| !s.is_empty());
+            }
             if let Ok(v) = env::var("LINEAR_TRIGGER_STATES") {
                 if !v.is_empty() {
                     linear.trigger_states = v.split(',').map(|s| s.trim().to_string()).collect();
@@ -1436,6 +1467,7 @@ mod tests {
         "LINEAR_API_KEY",
         "LINEAR_ENABLED",
         "LINEAR_TRIGGER_LABELS",
+        "LINEAR_TRIGGER_ASSIGNEE",
         "LINEAR_TRIGGER_STATES",
         "LINEAR_TEAM_ID",
         "LINEAR_PROJECT_ID",
@@ -2565,6 +2597,8 @@ linear:
         assert!(config.enabled);
         assert_eq!(config.check_interval_hours, 1);
         assert_eq!(config.monitoring_duration_hours, 24);
+        assert!(config.check_interval_secs.is_none());
+        assert!(config.monitoring_duration_secs.is_none());
         assert_eq!(config.sentry_event_threshold, 1);
         assert!((config.similarity_threshold - 0.75).abs() < 0.01);
         // target_repos and github_search_repos should be empty by default
@@ -2573,6 +2607,31 @@ linear:
         assert!(config.github_token.is_none());
         assert!(config.github_search_repos.is_empty());
         assert!(config.package_names.is_empty());
+    }
+
+    #[test]
+    fn test_regression_config_effective_seconds_defaults() {
+        let config = RegressionConfig::default();
+        // Without overrides, should convert hours to seconds
+        assert_eq!(config.effective_check_interval_secs(), 3600); // 1 hour
+        assert_eq!(config.effective_monitoring_duration_secs(), 86400); // 24 hours
+    }
+
+    #[test]
+    fn test_regression_config_effective_seconds_overrides() {
+        let mut config = RegressionConfig::default();
+        config.check_interval_secs = Some(10);
+        config.monitoring_duration_secs = Some(30);
+        assert_eq!(config.effective_check_interval_secs(), 10);
+        assert_eq!(config.effective_monitoring_duration_secs(), 30);
+    }
+
+    #[test]
+    fn test_regression_config_effective_check_interval_min_clamp() {
+        let mut config = RegressionConfig::default();
+        config.check_interval_secs = Some(0);
+        // Should clamp to 1 second minimum
+        assert_eq!(config.effective_check_interval_secs(), 1);
     }
 
     #[test]
@@ -3377,6 +3436,40 @@ linear:
         with_env(&[("LINEAR_ENABLED", "false")], || {
             let config = Config::load(file.path()).unwrap();
             assert!(!config.linear.as_ref().unwrap().enabled);
+        });
+    }
+
+    #[test]
+    fn test_env_override_linear_trigger_assignee() {
+        let yaml = r#"
+work_dir: /tmp/repos
+linear:
+  api_key: key
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(&[("LINEAR_TRIGGER_ASSIGNEE", "Jane Smith")], || {
+            let config = Config::load(file.path()).unwrap();
+            let linear = config.linear.unwrap();
+            assert_eq!(linear.trigger_assignee, Some("Jane Smith".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_env_override_linear_trigger_assignee_empty() {
+        let yaml = r#"
+work_dir: /tmp/repos
+linear:
+  api_key: key
+  trigger_assignee: "Previous Value"
+"#;
+        let file = create_temp_yaml(yaml);
+
+        with_env(&[("LINEAR_TRIGGER_ASSIGNEE", "")], || {
+            let config = Config::load(file.path()).unwrap();
+            let linear = config.linear.unwrap();
+            // Empty env var should clear the value
+            assert_eq!(linear.trigger_assignee, None);
         });
     }
 

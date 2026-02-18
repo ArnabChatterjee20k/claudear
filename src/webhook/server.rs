@@ -14,7 +14,7 @@ use crate::qa::{
     build_correlation_id, embed_text, find_reusable_qa, format_answer_context,
     format_reuse_context, format_timeout_context, normalize_text,
 };
-use crate::repo::GitOps;
+use crate::repo::{worktree_path, GitOps};
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
 use crate::types::{
@@ -694,7 +694,8 @@ async fn process_issue(
         }
     };
 
-    // Ensure repo is up to date: pull latest changes
+    // Fetch the parent repo (no checkout/reset — just update object store)
+    // then create an isolated per-issue worktree for Claude to work in.
     if let (Some(github_url), Some(default_branch), Some(repo_name)) = (
         resolution.github_url(),
         resolution.default_branch(),
@@ -703,16 +704,15 @@ async fn process_issue(
         tracing::info!(
             short_id = %issue.short_id,
             repo = %repo_name,
-            "Pulling latest changes"
+            "Fetching latest changes"
         );
 
-        if let Err(e) = GitOps::ensure_repo_at_path(&project_dir, github_url, default_branch).await
-        {
+        if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, github_url).await {
             tracing::error!(
                 short_id = %issue.short_id,
                 repo = %repo_name,
                 error = %e,
-                "Failed to update repository, skipping issue"
+                "Failed to fetch repository, skipping issue"
             );
             // Clean up processing flag before returning
             let mut processing = state.processing.write().await;
@@ -721,7 +721,34 @@ async fn process_issue(
             state.tracker.mark_failed(
                 source_name,
                 &issue.id,
-                &format!("Git pull failed: {}", e),
+                &format!("Git fetch failed: {}", e),
+            )?;
+            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed)
+                .await;
+            return Ok(());
+        }
+
+        // Create per-issue worktree
+        let wt_path = worktree_path(&state.config.work_dir, repo_name, &issue.short_id);
+        if let Err(e) = GitOps::create_worktree(
+            &project_dir,
+            &wt_path,
+            &format!("origin/{}", default_branch),
+        )
+        .await
+        {
+            tracing::error!(
+                short_id = %issue.short_id,
+                repo = %repo_name,
+                error = %e,
+                "Failed to create worktree, skipping issue"
+            );
+            let mut processing = state.processing.write().await;
+            processing.remove(&processing_key);
+            state.tracker.mark_failed(
+                source_name,
+                &issue.id,
+                &format!("Worktree creation failed: {}", e),
             )?;
             record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed)
                 .await;
@@ -754,6 +781,20 @@ async fn process_issue(
             }
         }
     }
+
+    // Use the per-issue worktree as the effective working directory for Claude.
+    let effective_project_dir = {
+        let wt = worktree_path(
+            &state.config.work_dir,
+            resolution.repo_name().unwrap_or("unknown"),
+            &issue.short_id,
+        );
+        if wt.exists() {
+            wt
+        } else {
+            project_dir.clone()
+        }
+    };
 
     // Note: processing flag and attempt already recorded by handle_webhook before spawning
     if let Some(assignee) = issue.get_metadata::<String>("assignee") {
@@ -841,7 +882,7 @@ async fn process_issue(
         let claude_result = loop {
             let prompt = state
                 .claude
-                .build_prompt_for_issue(&issue, &context, &project_dir);
+                .build_prompt_for_issue(&issue, &context, &effective_project_dir);
 
             // Enhance prompt with feedback learnings from past outcomes (semantic when possible)
             let prompt = {
@@ -867,7 +908,7 @@ async fn process_issue(
 
             let mut run_result = state
                 .claude
-                .execute_with_attempt(&prompt, Some(&issue), attempt_id, &project_dir)
+                .execute_with_attempt(&prompt, Some(&issue), attempt_id, &effective_project_dir)
                 .await?;
             run_result.used_qa_ids = used_qa_ids.clone();
 
@@ -1247,6 +1288,20 @@ async fn process_issue(
     .with_source(source_name.to_string())
     .with_tags(json!({ "status": final_status }));
     state.tracker.record_metric(&processing_time_metric).ok();
+
+    // Cleanup worktree
+    if let Some(repo_name) = resolution.repo_name() {
+        let wt_path = worktree_path(&state.config.work_dir, repo_name, &issue.short_id);
+        if wt_path.exists() {
+            if let Err(e) = GitOps::remove_worktree(&project_dir, &wt_path).await {
+                tracing::warn!(
+                    short_id = %issue.short_id,
+                    error = %e,
+                    "Failed to remove worktree"
+                );
+            }
+        }
+    }
 
     // Remove from processing
     {

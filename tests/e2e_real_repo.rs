@@ -157,6 +157,7 @@ struct E2eHarness {
     _path_guard: EnvVarGuard,
     _log_dir_guard: EnvVarGuard,
     repo_path: PathBuf,
+    remote_path: PathBuf,
     baseline_file_contents: String,
     source: Arc<TaskSource>,
     notifier: Arc<RecordingNotifier>,
@@ -179,6 +180,20 @@ fn run_git(cwd: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Read a file from a specific branch in a bare repo via `git show`.
+fn read_remote_file(bare_repo: &Path, branch: &str, file_path: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["show", &format!("{}:{}", branch, file_path)])
+        .current_dir(bare_repo)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        None
+    }
 }
 
 fn create_real_repo(temp_dir: &TempDir) -> (PathBuf, PathBuf) {
@@ -225,23 +240,27 @@ set -euo pipefail
 
 issue_id="${LINEAR_ISSUE_ID:-unknown}"
 
-# Helper: emit a stream-json text delta event
+# Helper: emit a stream-json assistant event (new CLI format)
 emit_text() {
   local text="$1"
-  printf '{"type":"content_block_delta","delta":{"type":"text_delta","text":"%s"}}\n' "$text"
+  printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$text"
 }
 
 # Helper: emit the final structured result wrapper
 emit_result() {
   local json="$1"
-  printf '{"result":"%s"}\n' "$(echo "$json" | sed 's/"/\\"/g')"
+  printf '{"type":"result","structured_output":%s}\n' "$json"
 }
 
 case "${issue_id}" in
   task-success)
+    git config user.email "e2e@example.com"
+    git config user.name "E2E Bot"
+    git checkout -b fix/${issue_id} 2>/dev/null || true
     echo "// e2e-success-marker" >> src/buggy.rs
     git add src/buggy.rs
     git commit -m "test: apply fix for ${issue_id}" >/dev/null 2>&1 || true
+    git push origin HEAD 2>/dev/null || true
     emit_text "PR_URL: https://github.com/test-org/my-repo/pull/42"
     emit_result '{"summary":"Fixed the bug and created PR","success":true,"pr_url":"https://github.com/test-org/my-repo/pull/42"}'
     ;;
@@ -352,6 +371,7 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
         _path_guard,
         _log_dir_guard,
         repo_path,
+        remote_path,
         baseline_file_contents,
         source,
         notifier,
@@ -382,8 +402,11 @@ async fn e2e_successful_task_updates_real_repo_and_tracker() {
         Some("https://github.com/test-org/my-repo/pull/42")
     );
 
-    let file = fs::read_to_string(harness.repo_path.join("src/buggy.rs")).unwrap();
-    assert!(file.contains("// e2e-success-marker"));
+    // Worktrees are cleaned up after processing, so check the remote bare repo
+    // for the pushed branch instead of the local working tree.
+    let remote_file = read_remote_file(&harness.remote_path, "fix/task-success", "src/buggy.rs")
+        .expect("fix branch not found in remote repo");
+    assert!(remote_file.contains("// e2e-success-marker"));
 
     let executions = harness
         .tracker
@@ -420,7 +443,9 @@ async fn e2e_multiple_mock_tasks_reset_repo_and_clear_task_state() {
         .trigger_issue("linear", "task-success")
         .await
         .expect("first task should succeed");
-    let changed_file = fs::read_to_string(harness.repo_path.join("src/buggy.rs")).unwrap();
+    // Worktrees are cleaned up after processing — check the remote bare repo
+    let changed_file = read_remote_file(&harness.remote_path, "fix/task-success", "src/buggy.rs")
+        .expect("fix branch not found in remote repo");
     assert!(changed_file.contains("// e2e-success-marker"));
 
     harness

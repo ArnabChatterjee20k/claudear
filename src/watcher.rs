@@ -13,7 +13,7 @@ use crate::qa::{
     build_correlation_id, embed_text, find_reusable_qa, format_answer_context,
     format_reuse_context, format_timeout_context, normalize_text,
 };
-use crate::repo::{GitOps, RepoIndex, RepoRelationships};
+use crate::repo::{worktree_path, GitOps, RepoIndex, RepoRelationships};
 use crate::retry::RetryManager;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::source::IssueSource;
@@ -775,8 +775,18 @@ impl Watcher {
 
         // Process the issue with the review feedback appended to context.
         if let Some(pr_url) = &attempt.pr_url {
+            // Look up the existing PR branch so the worktree can check it out
+            let existing_pr_branch = self.sqlite_tracker.as_ref().and_then(|sqlite| {
+                sqlite
+                    .get_pr(pr_url)
+                    .ok()
+                    .flatten()
+                    .and_then(|pr| pr.head_branch)
+            });
+
             tracing::info!(
                 pr_url = %pr_url,
+                branch = ?existing_pr_branch,
                 "Re-processing issue to address review feedback"
             );
 
@@ -816,6 +826,7 @@ impl Watcher {
                         &attempt.source,
                         &attempt.issue_id,
                         Some(feedback.to_string()),
+                        existing_pr_branch.clone(),
                     )
                     .await
                 {
@@ -1024,16 +1035,33 @@ impl Watcher {
             &github_url,
         )?;
 
-        // Ensure the downstream repo is up to date
-        if let Err(e) =
-            GitOps::ensure_repo_at_path(&project_dir, &github_url, &default_branch).await
-        {
+        // Fetch the downstream repo (no checkout/reset — just update object store)
+        if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, &github_url).await {
             tracing::warn!(
                 downstream = %downstream_repo_name,
                 error = %e,
-                "Failed to ensure repo is up to date, continuing anyway"
+                "Failed to fetch downstream repo, continuing anyway"
             );
         }
+
+        // Create a per-cascade worktree so concurrent cascades don't interfere
+        let cascade_id = format!("cascade-{}", parent_attempt.short_id);
+        let wt_path = worktree_path(&self.config.work_dir, downstream_repo_name, &cascade_id);
+        GitOps::create_worktree(
+            &project_dir,
+            &wt_path,
+            &format!("origin/{}", default_branch),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                downstream = %downstream_repo_name,
+                error = %e,
+                "Failed to create cascade worktree"
+            );
+            e
+        })?;
+        let effective_dir = &wt_path;
 
         // Build the cascade prompt
         let prompt = format!(
@@ -1067,7 +1095,7 @@ Create a PR with your changes."#,
         // Run Claude
         let result = self
             .claude
-            .execute_with_attempt(&prompt, None, Some(attempt_id), &project_dir)
+            .execute_with_attempt(&prompt, None, Some(attempt_id), effective_dir)
             .await?;
 
         if result.success {
@@ -1125,6 +1153,17 @@ Create a PR with your changes."#,
                 "Cascade fix failed"
             );
             sqlite.mark_cascade_failed(attempt_id, &error)?;
+        }
+
+        // Cleanup cascade worktree
+        if wt_path.exists() {
+            if let Err(e) = GitOps::remove_worktree(&project_dir, &wt_path).await {
+                tracing::warn!(
+                    downstream = %downstream_repo_name,
+                    error = %e,
+                    "Failed to remove cascade worktree"
+                );
+            }
         }
 
         Ok(())
@@ -1548,6 +1587,19 @@ Create a PR with your changes."#,
                         .tracker
                         .update_qa_outcome_stats_for_attempt(attempt.id, true);
 
+                    // Update prs record to merged
+                    if let Some(ref sqlite) = self.sqlite_tracker {
+                        if let Some(ref pr_url) = attempt.pr_url {
+                            if let Ok(Some(mut pr_record)) = sqlite.get_pr(pr_url) {
+                                pr_record.status = "merged".to_string();
+                                pr_record.merged_at = Some(chrono::Utc::now());
+                                if let Err(e) = sqlite.upsert_pr(&pr_record) {
+                                    tracing::warn!(error = %e, "Failed to update PR status to merged");
+                                }
+                            }
+                        }
+                    }
+
                     // For bug-type issues, create a regression watch instead of immediate auto-resolve.
                     let regression_watch_id = if attempt.is_bug() {
                         if let Some(ref sqlite_tracker) = self.sqlite_tracker {
@@ -1963,7 +2015,7 @@ Create a PR with your changes."#,
             let source_clone = Arc::clone(source);
             let this = self;
             let _ = this
-                .process_issue(source_clone, issue, match_result, None)
+                .process_issue(source_clone, issue, match_result, None, None)
                 .await;
 
             // Add delay between starting new issues (skip trailing delay after the last item)
@@ -2035,6 +2087,7 @@ Create a PR with your changes."#,
         mut issue: Issue,
         match_result: MatchResult,
         review_feedback: Option<String>,
+        existing_pr_branch: Option<String>,
     ) -> bool {
         let processing_started_at = std::time::Instant::now();
         let processing_key = format!("{}:{}", source.name(), issue.id);
@@ -2130,7 +2183,8 @@ Create a PR with your changes."#,
             }
         };
 
-        // Ensure repo is up to date: pull latest changes
+        // Fetch the parent repo (no checkout/reset — just update the object store)
+        // then create an isolated per-issue worktree for Claude to work in.
         if let (Some(github_url), Some(default_branch), Some(repo_name)) = (
             resolution.github_url(),
             resolution.default_branch(),
@@ -2150,13 +2204,11 @@ Create a PR with your changes."#,
             tracing::info!(
                 short_id = %issue.short_id,
                 repo = %repo_name,
-                "Pulling latest changes"
+                "Fetching latest changes"
             );
 
-            if let Err(e) =
-                GitOps::ensure_repo_at_path(&project_dir, github_url, default_branch).await
-            {
-                let pull_error = format!("Failed to pull repository: {}", e);
+            if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, github_url).await {
+                let pull_error = format!("Failed to fetch repository: {}", e);
                 self.record_issue_decision(
                     &issue,
                     "repo_sync_failed",
@@ -2173,16 +2225,70 @@ Create a PR with your changes."#,
                     tracing::warn!(
                         short_id = %issue.short_id,
                         error = %mark_err,
-                        "Failed to mark issue as failed after repository pull failure"
+                        "Failed to mark issue as failed after repository fetch failure"
                     );
                 }
                 tracing::error!(
                     short_id = %issue.short_id,
                     repo = %repo_name,
                     error = %e,
-                    "Failed to pull repository, skipping issue"
+                    "Failed to fetch repository, skipping issue"
                 );
                 // Clean up processing state before returning
+                {
+                    let mut processing = self.processing.write().await;
+                    processing.remove(&processing_key);
+                }
+                self.active_processing.fetch_sub(1, Ordering::SeqCst);
+                return true;
+            }
+
+            // For review reruns, fetch the PR branch; otherwise use the default branch.
+            let checkout_ref = if let Some(ref branch) = existing_pr_branch {
+                if let Err(e) = GitOps::fetch_branch(&project_dir, branch).await {
+                    tracing::warn!(
+                        short_id = %issue.short_id,
+                        error = %e,
+                        branch = %branch,
+                        "Failed to fetch PR branch, falling back to default"
+                    );
+                    format!("origin/{}", default_branch)
+                } else {
+                    format!("origin/{}", branch)
+                }
+            } else {
+                format!("origin/{}", default_branch)
+            };
+
+            // Create per-issue worktree
+            let wt_path = worktree_path(&self.config.work_dir, repo_name, &issue.short_id);
+            if let Err(e) = GitOps::create_worktree(&project_dir, &wt_path, &checkout_ref).await {
+                let wt_error = format!("Failed to create worktree: {}", e);
+                self.record_issue_decision(
+                    &issue,
+                    "worktree_failed",
+                    format!("Worktree creation failed for {}", issue.short_id),
+                    json!({
+                        "repo_name": repo_name,
+                        "error": wt_error.clone(),
+                    }),
+                );
+                if let Err(mark_err) = self
+                    .tracker
+                    .mark_failed(source.name(), &issue.id, &wt_error)
+                {
+                    tracing::warn!(
+                        short_id = %issue.short_id,
+                        error = %mark_err,
+                        "Failed to mark issue as failed after worktree creation failure"
+                    );
+                }
+                tracing::error!(
+                    short_id = %issue.short_id,
+                    repo = %repo_name,
+                    error = %e,
+                    "Failed to create worktree, skipping issue"
+                );
                 {
                     let mut processing = self.processing.write().await;
                     processing.remove(&processing_key);
@@ -2194,10 +2300,10 @@ Create a PR with your changes."#,
             self.record_issue_decision(
                 &issue,
                 "repo_sync_completed",
-                format!("Repository synced for {}", issue.short_id),
+                format!("Repository synced (worktree) for {}", issue.short_id),
                 json!({
                     "repo_name": repo_name,
-                    "project_dir": project_dir.display().to_string(),
+                    "project_dir": wt_path.display().to_string(),
                 }),
             );
 
@@ -2227,6 +2333,20 @@ Create a PR with your changes."#,
                 }
             }
         }
+
+        // Use the per-issue worktree as the effective working directory for Claude.
+        let effective_project_dir = {
+            let wt = worktree_path(
+                &self.config.work_dir,
+                resolution.repo_name().unwrap_or("unknown"),
+                &issue.short_id,
+            );
+            if wt.exists() {
+                wt
+            } else {
+                project_dir.clone()
+            }
+        };
 
         // Get the attempt ID for analytics tracking
         let attempt_id = self
@@ -2357,10 +2477,18 @@ Create a PR with your changes."#,
 
             // Append PR review feedback context for review-driven reruns.
             if let Some(ref feedback) = review_feedback {
-                context = format!(
-                    "{}\n\n## PR Review Feedback\n{}\n\nAddress all review feedback in this update.",
-                    context, feedback
+                let mut review_context = format!(
+                    "\n\n## PR Review Feedback\n{}\n\nAddress all review feedback in this update.",
+                    feedback
                 );
+                if let Some(ref branch) = existing_pr_branch {
+                    review_context.push_str(&format!(
+                        "\n\nIMPORTANT: You are updating an existing PR on branch `{}`. \
+                         Push your changes to this branch. Do NOT create a new branch or a new PR.",
+                        branch
+                    ));
+                }
+                context = format!("{}{}", context, review_context);
             }
 
             let repo_scope = resolution.repo_name().map(|v| v.to_string());
@@ -2397,7 +2525,7 @@ Create a PR with your changes."#,
 
             let mut rounds: u8 = 0;
             let (claude_result, last_prompt) = loop {
-                let prompt = self.claude.build_prompt_for_issue(&issue, &context, &project_dir);
+                let prompt = self.claude.build_prompt_for_issue(&issue, &context, &effective_project_dir);
 
                 // Enhance prompt with learnings from past outcomes (semantic when possible).
                 let prompt = {
@@ -2420,7 +2548,7 @@ Create a PR with your changes."#,
                 );
                 let mut run_result = self
                     .claude
-                    .execute_with_attempt(&prompt, Some(&issue), attempt_id, &project_dir)
+                    .execute_with_attempt(&prompt, Some(&issue), attempt_id, &effective_project_dir)
                     .await?;
                 run_result.used_qa_ids = used_qa_ids.clone();
 
@@ -2666,6 +2794,39 @@ Create a PR with your changes."#,
                         tracing::warn!(error = %e, "Failed to record pr_created metric");
                     }
 
+                    // Create prs table record
+                    if let Some(ref sqlite) = self.sqlite_tracker {
+                        if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(pr_url) {
+                            let mut pr_record = crate::types::PrRecord::for_issue(
+                                pr_url.clone(),
+                                &repo,
+                                pr_number,
+                                source.name(),
+                                &issue.id,
+                            );
+                            pr_record.attempt_id = attempt_id;
+
+                            // Fetch branch info from GitHub
+                            if let Some(ref gh) = self.github_client {
+                                match gh.get_pr_info(&repo, pr_number).await {
+                                    Ok(info) => {
+                                        pr_record.head_branch = info.head_branch;
+                                        pr_record.base_branch = info.base_branch;
+                                        pr_record.title = info.title;
+                                        pr_record.author = info.author;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "Failed to fetch PR info from GitHub");
+                                    }
+                                }
+                            }
+
+                            if let Err(e) = sqlite.upsert_pr(&pr_record) {
+                                tracing::warn!(error = %e, "Failed to upsert PR record");
+                            }
+                        }
+                    }
+
                     // Store embedding for future similarity lookups
                     if let Some(ref embedding_service) = self.issue_embedding_service {
                         match embedding_service.embed_issue(&issue, source.name()).await {
@@ -2839,7 +3000,21 @@ Create a PR with your changes."#,
             tracing::debug!(error = %e, "Failed to record processing_time metric");
         }
 
-        // Cleanup
+        // Cleanup worktree
+        if let Some(repo_name) = resolution.repo_name() {
+            let wt_path = worktree_path(&self.config.work_dir, repo_name, &issue.short_id);
+            if wt_path.exists() {
+                if let Err(e) = GitOps::remove_worktree(&project_dir, &wt_path).await {
+                    tracing::warn!(
+                        short_id = %issue.short_id,
+                        error = %e,
+                        "Failed to remove worktree"
+                    );
+                }
+            }
+        }
+
+        // Cleanup processing state
         {
             let mut processing = self.processing.write().await;
             processing.remove(&processing_key);
@@ -3151,6 +3326,16 @@ Create a PR with your changes."#,
                             tracing::warn!(error = %e, "Failed to store diff analysis");
                         }
 
+                        // Update prs record with files_changed from diff analysis
+                        if let Some(sqlite) = &self.sqlite_tracker {
+                            if let Ok(Some(mut pr_record)) = sqlite.get_pr(pr_url) {
+                                pr_record.files_changed = Some(analysis.files_changed.len() as i64);
+                                if let Err(e) = sqlite.upsert_pr(&pr_record) {
+                                    tracing::warn!(error = %e, "Failed to update PR files_changed");
+                                }
+                            }
+                        }
+
                         // Feed into repo knowledge
                         if learning.repo_knowledge {
                             if let Err(e) = crate::learning::RepoKnowledgeManager::learn_from_diff(
@@ -3285,7 +3470,7 @@ Create a PR with your changes."#,
 
     /// Manually trigger processing for a specific issue.
     pub async fn trigger_issue(&self, source_name: &str, issue_id: &str) -> Result<()> {
-        self.trigger_issue_with_feedback(source_name, issue_id, None)
+        self.trigger_issue_with_feedback(source_name, issue_id, None, None)
             .await
     }
 
@@ -3295,6 +3480,7 @@ Create a PR with your changes."#,
         source_name: &str,
         issue_id: &str,
         review_feedback: Option<String>,
+        existing_pr_branch: Option<String>,
     ) -> Result<()> {
         let source = self
             .sources
@@ -3313,7 +3499,13 @@ Create a PR with your changes."#,
         let match_result = MatchResult::matched("Manual trigger", MatchPriority::Urgent);
 
         let started = self
-            .process_issue(Arc::clone(source), issue, match_result, review_feedback)
+            .process_issue(
+                Arc::clone(source),
+                issue,
+                match_result,
+                review_feedback,
+                existing_pr_branch,
+            )
             .await;
         if !started {
             return Err(crate::error::Error::source(

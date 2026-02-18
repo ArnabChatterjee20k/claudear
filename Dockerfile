@@ -7,14 +7,44 @@ RUN bun install --frozen-lockfile
 COPY dashboard/ ./
 RUN bun run build
 
-# Rust build stage
-FROM rust:1.93 AS builder
+# Vectorlite build stage (no prebuilt binaries for linux arm64)
+FROM alpine:3.23 AS vectorlite-builder
+
+RUN apk add --no-cache \
+    build-base \
+    cmake \
+    curl \
+    git \
+    linux-headers \
+    ninja \
+    pkgconf \
+    python3 \
+    zip \
+    unzip
+
+WORKDIR /build
+
+RUN git clone --recurse-submodules https://github.com/1yefuwang1/vectorlite.git .
+
+ENV VCPKG_FORCE_SYSTEM_BINARIES=1
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+RUN python3 bootstrap_vcpkg.py
+
+RUN cmake --preset release && cmake --build build/release -j$(nproc)
+
+FROM rust:1.93-alpine AS builder
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+    build-base \
+    linux-headers \
+    musl-dev \
+    openssl-dev \
+    openssl-libs-static \
+    pkgconf \
+    perl
 
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
@@ -27,36 +57,38 @@ COPY src ./src
 COPY --from=dashboard-builder /app/dashboard/dist ./dashboard/dist
 RUN touch src/main.rs src/lib.rs && cargo build --release
 
-FROM debian:trixie-slim
+FROM alpine:3.23
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
+RUN apk add --no-cache \
     ca-certificates \
     curl \
     git \
     git-lfs \
+    jq \
+    libgcc \
+    libstdc++ \
+    nodejs \
+    npm \
     openssh-client \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+    sqlite \
+    && npm install -g @anthropic-ai/claude-code \
+    && rm -rf /root/.npm /tmp/*
 
-RUN npm install -g @anthropic-ai/claude-code
-
+COPY --from=vectorlite-builder /build/build/release/vectorlite/vectorlite.so /usr/local/lib/vectorlite.so
 COPY --from=builder /app/target/release/claudear /usr/local/bin/claudear
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN useradd -m -u 1000 appuser
-
-RUN mkdir -p /app/data /app/repos /home/appuser/.cache/fastembed /home/appuser/.claude && \
-    chown -R appuser:appuser /app /home/appuser/.cache /home/appuser/.claude
+RUN adduser -D -u 1000 appuser \
+    && mkdir -p /app/data /app/repos /home/appuser/.cache/fastembed /home/appuser/.claude \
+    && chown -R appuser:appuser /app /home/appuser/.cache /home/appuser/.claude
 
 USER appuser
 
-RUN git config --global user.name "Claudear Bot" && \
-    git config --global user.email "claudear@noreply.local" && \
-    git config --global init.defaultBranch main
+RUN git config --global user.name "Claudear Bot" \
+    && git config --global user.email "claudear@noreply.local" \
+    && git config --global init.defaultBranch main
 
 ENV PROJECT_DIR=/app/project
 ENV DATA_DIR=/app/data

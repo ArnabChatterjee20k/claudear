@@ -26,6 +26,7 @@
 //! ```
 
 pub mod api;
+pub mod api_events;
 pub mod config;
 pub mod discord;
 pub mod env_writer;

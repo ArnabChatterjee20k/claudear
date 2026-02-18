@@ -54,75 +54,46 @@ const RESULT_SCHEMA: &str = r#"{
     }
 }"#;
 
+/// Content block types within a CLI `assistant` event's `message.content[]`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum CliContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
+    #[serde(other)]
+    Other,
+}
+
+/// The `message` object carried by a CLI `assistant` event.
+#[derive(Debug, Deserialize)]
+struct CliMessage {
+    #[serde(default)]
+    content: Vec<CliContentBlock>,
+}
+
 /// Top-level NDJSON events emitted by `claude --output-format stream-json`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum StreamEvent {
-    #[serde(rename = "message_start")]
-    MessageStart {},
-    #[serde(rename = "content_block_start")]
-    ContentBlockStart {
+    #[serde(rename = "system")]
+    System {},
+    #[serde(rename = "assistant")]
+    Assistant {
         #[serde(default)]
-        content_block: Option<ContentBlock>,
+        message: Option<CliMessage>,
     },
-    #[serde(rename = "content_block_delta")]
-    ContentBlockDelta {
+    #[serde(rename = "user")]
+    User {},
+    #[serde(rename = "result")]
+    Result {
         #[serde(default)]
-        delta: Option<Delta>,
+        structured_output: Option<serde_json::Value>,
     },
-    #[serde(rename = "content_block_stop")]
-    ContentBlockStop {},
-    #[serde(rename = "message_delta")]
-    MessageDelta {},
-    #[serde(rename = "message_stop")]
-    MessageStop {},
     /// Forward-compat: ignore unknown event types.
     #[serde(other)]
     Unknown,
-}
-
-/// Content block types within a `content_block_start` event.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum ContentBlock {
-    #[serde(rename = "text")]
-    Text {
-        #[serde(default)]
-        #[allow(dead_code)]
-        text: String,
-    },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        #[serde(default)]
-        id: String,
-        #[serde(default)]
-        name: String,
-    },
-    /// Forward-compat catch-all.
-    #[serde(other)]
-    Other,
-}
-
-/// Delta types within a `content_block_delta` event.
-/// Variant names mirror the upstream wire format (`text_delta`, `input_json_delta`).
-#[allow(clippy::enum_variant_names)]
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum Delta {
-    #[serde(rename = "text_delta")]
-    TextDelta {
-        #[serde(default)]
-        text: String,
-    },
-    #[serde(rename = "input_json_delta")]
-    InputJsonDelta {
-        #[serde(default)]
-        #[allow(dead_code)]
-        partial_json: String,
-    },
-    /// Forward-compat catch-all.
-    #[serde(other)]
-    Other,
 }
 
 /// Deserialization target for the structured result produced by `--json-schema`.
@@ -599,6 +570,7 @@ The PR title should include the issue ID: {}
         self.tracker.record_activity(&activity).ok();
 
         let mut args = vec![
+            "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--json-schema".to_string(),
@@ -822,41 +794,55 @@ The PR title should include the issue ID: {}
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     match serde_json::from_str::<StreamEvent>(trimmed) {
-                        Ok(StreamEvent::ContentBlockDelta {
-                            delta: Some(Delta::TextDelta { ref text }),
-                        }) => {
-                            text_output.push_str(text);
-                            // Write decoded text to log file so learning parsers keep working.
-                            if let Some(file) = writer.as_mut() {
-                                if !write_failed && file.write_all(text.as_bytes()).await.is_err() {
-                                    write_failed = true;
-                                    ClaudeRunner::append_execution_event(
-                                        &stdout_event_writer,
-                                        label_stdout.as_str(),
-                                        "stdout_log_write_failed",
-                                        json!({}),
-                                    )
-                                    .await;
-                                    tracing::warn!(
-                                        component = "claude",
-                                        label = label_stdout.as_str(),
-                                        "Failed writing decoded text to execution log file"
-                                    );
+                        Ok(StreamEvent::Assistant { message }) => {
+                            if let Some(msg) = message {
+                                for block in &msg.content {
+                                    match block {
+                                        CliContentBlock::Text { ref text } => {
+                                            text_output.push_str(text);
+                                            if let Some(file) = writer.as_mut() {
+                                                if !write_failed
+                                                    && file
+                                                        .write_all(text.as_bytes())
+                                                        .await
+                                                        .is_err()
+                                                {
+                                                    write_failed = true;
+                                                    ClaudeRunner::append_execution_event(
+                                                        &stdout_event_writer,
+                                                        label_stdout.as_str(),
+                                                        "stdout_log_write_failed",
+                                                        json!({}),
+                                                    )
+                                                    .await;
+                                                    tracing::warn!(
+                                                        component = "claude",
+                                                        label = label_stdout.as_str(),
+                                                        "Failed writing decoded text to execution log file"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        CliContentBlock::ToolUse { ref id, ref name } => {
+                                            tracing::info!(
+                                                component = "claude",
+                                                label = label_stdout.as_str(),
+                                                tool_use_id = id.as_str(),
+                                                tool_name = name.as_str(),
+                                                "Tool use started"
+                                            );
+                                        }
+                                        CliContentBlock::Other => {}
+                                    }
                                 }
                             }
                         }
-                        Ok(StreamEvent::ContentBlockStart {
-                            content_block: Some(ContentBlock::ToolUse { ref id, ref name }),
-                        }) => {
-                            tracing::info!(
-                                component = "claude",
-                                label = label_stdout.as_str(),
-                                tool_use_id = id.as_str(),
-                                tool_name = name.as_str(),
-                                "Tool use started"
-                            );
+                        Ok(StreamEvent::Result { structured_output }) => {
+                            if let Some(obj) = structured_output {
+                                structured_result = Some(obj);
+                            }
                         }
-                        Ok(_) => { /* MessageStart, ContentBlockStop, etc. — ignored */ }
+                        Ok(_) => { /* System, User, Unknown — ignored */ }
                         Err(_) => {
                             // Not a valid stream event — try parsing as the final
                             // JSON wrapper. The Claude CLI emits the result at the
@@ -1424,85 +1410,122 @@ The PR title should include the issue ID: {}
 mod tests {
     use super::*;
 
-    // ── Stream event parsing tests ───────────────────────────────────
+    // ── CLI stream event parsing tests ──────────────────────────────
 
     #[test]
-    fn test_parse_stream_event_text_delta() {
-        let line = r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}"#;
+    fn test_parse_cli_assistant_text_event() {
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello world"}]}}"#;
         let event: StreamEvent = serde_json::from_str(line).unwrap();
         match event {
-            StreamEvent::ContentBlockDelta {
-                delta: Some(Delta::TextDelta { text }),
-            } => assert_eq!(text, "hello"),
-            other => panic!("Unexpected event: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_stream_event_message_stop() {
-        let line = r#"{"type":"message_stop"}"#;
-        let event: StreamEvent = serde_json::from_str(line).unwrap();
-        assert!(matches!(event, StreamEvent::MessageStop {}));
-    }
-
-    #[test]
-    fn test_parse_stream_event_tool_use_start() {
-        let line = r#"{"type":"content_block_start","content_block":{"type":"tool_use","id":"tu_1","name":"Bash"}}"#;
-        let event: StreamEvent = serde_json::from_str(line).unwrap();
-        match event {
-            StreamEvent::ContentBlockStart {
-                content_block: Some(ContentBlock::ToolUse { id, name }),
-            } => {
-                assert_eq!(id, "tu_1");
-                assert_eq!(name, "Bash");
+            StreamEvent::Assistant { message: Some(msg) } => {
+                assert_eq!(msg.content.len(), 1);
+                match &msg.content[0] {
+                    CliContentBlock::Text { text } => assert_eq!(text, "hello world"),
+                    other => panic!("Unexpected content block: {:?}", other),
+                }
             }
             other => panic!("Unexpected event: {:?}", other),
         }
     }
 
     #[test]
-    fn test_parse_stream_event_unknown_type_forward_compat() {
+    fn test_parse_cli_assistant_tool_use_event() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Bash"}]}}"#;
+        let event: StreamEvent = serde_json::from_str(line).unwrap();
+        match event {
+            StreamEvent::Assistant { message: Some(msg) } => {
+                assert_eq!(msg.content.len(), 1);
+                match &msg.content[0] {
+                    CliContentBlock::ToolUse { id, name } => {
+                        assert_eq!(id, "tu_1");
+                        assert_eq!(name, "Bash");
+                    }
+                    other => panic!("Unexpected content block: {:?}", other),
+                }
+            }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_assistant_multiple_content_blocks() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Running command..."},{"type":"tool_use","id":"tu_2","name":"Read"}]}}"#;
+        let event: StreamEvent = serde_json::from_str(line).unwrap();
+        match event {
+            StreamEvent::Assistant { message: Some(msg) } => {
+                assert_eq!(msg.content.len(), 2);
+                assert!(
+                    matches!(&msg.content[0], CliContentBlock::Text { text } if text == "Running command...")
+                );
+                assert!(
+                    matches!(&msg.content[1], CliContentBlock::ToolUse { id, name } if id == "tu_2" && name == "Read")
+                );
+            }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_system_event() {
+        let line = r#"{"type":"system","subtype":"init","session_id":"abc"}"#;
+        let event: StreamEvent = serde_json::from_str(line).unwrap();
+        assert!(matches!(event, StreamEvent::System {}));
+    }
+
+    #[test]
+    fn test_parse_cli_user_event() {
+        let line = r#"{"type":"user","message":{"role":"user"}}"#;
+        let event: StreamEvent = serde_json::from_str(line).unwrap();
+        assert!(matches!(event, StreamEvent::User {}));
+    }
+
+    #[test]
+    fn test_parse_cli_result_with_structured_output() {
+        let line = r#"{"type":"result","structured_output":{"summary":"done","success":true}}"#;
+        let event: StreamEvent = serde_json::from_str(line).unwrap();
+        match event {
+            StreamEvent::Result {
+                structured_output: Some(obj),
+            } => {
+                assert_eq!(obj["summary"], "done");
+                assert_eq!(obj["success"], true);
+            }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_result_without_structured_output() {
+        let line = r#"{"type":"result"}"#;
+        let event: StreamEvent = serde_json::from_str(line).unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::Result {
+                structured_output: None
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_cli_assistant_unknown_content_block() {
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
+        let event: StreamEvent = serde_json::from_str(line).unwrap();
+        match event {
+            StreamEvent::Assistant { message: Some(msg) } => {
+                assert_eq!(msg.content.len(), 1);
+                assert!(matches!(&msg.content[0], CliContentBlock::Other));
+            }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_unknown_event_forward_compat() {
         let line = r#"{"type":"some_future_event","data":"anything"}"#;
         let event: StreamEvent = serde_json::from_str(line).unwrap();
         assert!(matches!(event, StreamEvent::Unknown));
-    }
-
-    #[test]
-    fn test_parse_stream_event_message_start() {
-        let line = r#"{"type":"message_start"}"#;
-        let event: StreamEvent = serde_json::from_str(line).unwrap();
-        assert!(matches!(event, StreamEvent::MessageStart {}));
-    }
-
-    #[test]
-    fn test_parse_stream_event_content_block_stop() {
-        let line = r#"{"type":"content_block_stop"}"#;
-        let event: StreamEvent = serde_json::from_str(line).unwrap();
-        assert!(matches!(event, StreamEvent::ContentBlockStop {}));
-    }
-
-    #[test]
-    fn test_parse_stream_event_input_json_delta() {
-        let line = r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"key\":"}}"#;
-        let event: StreamEvent = serde_json::from_str(line).unwrap();
-        match event {
-            StreamEvent::ContentBlockDelta {
-                delta: Some(Delta::InputJsonDelta { partial_json }),
-            } => assert_eq!(partial_json, r#"{"key":"#),
-            other => panic!("Unexpected event: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_stream_event_text_block_start() {
-        let line = r#"{"type":"content_block_start","content_block":{"type":"text","text":""}}"#;
-        let event: StreamEvent = serde_json::from_str(line).unwrap();
-        match event {
-            StreamEvent::ContentBlockStart {
-                content_block: Some(ContentBlock::Text { text }),
-            } => assert_eq!(text, ""),
-            other => panic!("Unexpected event: {:?}", other),
-        }
     }
 
     // ── Structured result extraction tests ───────────────────────────

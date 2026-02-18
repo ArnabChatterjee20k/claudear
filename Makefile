@@ -57,6 +57,14 @@ test:
 test-all: test dashboard-test
 
 ## test-prod-e2e: Run real production smoke test (requires live service credentials)
+## Required env vars:
+##   CLAUDEAR_E2E_LINEAR_API_KEY      Linear API key
+##   CLAUDEAR_E2E_LINEAR_TEAM_ID      Linear team UUID
+##   CLAUDEAR_E2E_GITHUB_REPO         GitHub repo (owner/name)
+##   CLAUDEAR_E2E_GITHUB_TOKEN        GitHub PAT
+##   CLAUDEAR_E2E_DISCORD_BOT_TOKEN   Discord bot token (for Scenario 2)
+##   CLAUDEAR_E2E_DISCORD_CHANNEL_ID  Discord channel ID (for Scenario 2)
+##   Claude auth via ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or CLI session
 test-prod-e2e:
 	./scripts/prod-e2e-smoke.sh
 

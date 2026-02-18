@@ -64,6 +64,25 @@ pub struct GitHubClient<H: HttpClient = ReqwestHttpClient> {
 struct PullRequest {
     state: String,
     merged: bool,
+    head: Option<PullRequestRef>,
+    base: Option<PullRequestRef>,
+    title: Option<String>,
+    user: Option<GitHubUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestRef {
+    #[serde(rename = "ref")]
+    ref_name: String,
+}
+
+/// Lightweight PR info returned by `get_pr_info`.
+#[derive(Debug, Clone)]
+pub struct PrInfo {
+    pub head_branch: Option<String>,
+    pub base_branch: Option<String>,
+    pub title: Option<String>,
+    pub author: Option<String>,
 }
 
 /// A GitHub PR review.
@@ -232,6 +251,33 @@ impl<H: HttpClient> GitHubClient<H> {
             PrStatus::Closed
         } else {
             PrStatus::Open
+        })
+    }
+
+    /// Get lightweight PR info (branches, title, author).
+    pub async fn get_pr_info(&self, repo: &str, pr_number: i64) -> Result<PrInfo> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
+        let headers = self.build_headers(token);
+
+        let response = self.http.get(&url, headers).await?;
+
+        if !response.is_success() {
+            return Err(Error::Other(format!("GitHub API error: {}", response.body)));
+        }
+
+        let pr: PullRequest = response.json()?;
+
+        Ok(PrInfo {
+            head_branch: pr.head.map(|h| h.ref_name),
+            base_branch: pr.base.map(|b| b.ref_name),
+            title: pr.title,
+            author: pr.user.map(|u| u.login),
         })
     }
 

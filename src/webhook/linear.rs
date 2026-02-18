@@ -241,8 +241,26 @@ impl WebhookHandler for LinearWebhookHandler {
             }
         }
 
-        // Check labels
-        if !self.config.trigger_labels.is_empty() {
+        // Check assignee
+        if let Some(ref trigger_assignee) = self.config.trigger_assignee {
+            let issue_assignee: Option<String> = issue.get_metadata("assignee");
+            let assignee_matches = issue_assignee
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(trigger_assignee));
+
+            if !assignee_matches {
+                return MatchResult::not_matched(format!(
+                    "Assignee \"{}\" does not match trigger assignee \"{}\"",
+                    issue_assignee.as_deref().unwrap_or("unassigned"),
+                    trigger_assignee
+                ));
+            }
+        }
+
+        // Check labels (skip if trigger_assignee is set and trigger_labels is empty)
+        let skip_label_check =
+            self.config.trigger_assignee.is_some() && self.config.trigger_labels.is_empty();
+        if !skip_label_check && !self.config.trigger_labels.is_empty() {
             let label_matches = self.config.trigger_labels.iter().any(|trigger| {
                 labels
                     .iter()
@@ -771,5 +789,94 @@ mod tests {
 
         let result = handler.parse_payload(&payload).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_matches_criteria_trigger_assignee_no_labels() {
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test".to_string(),
+            trigger_labels: vec![],
+            trigger_assignee: Some("Jane Smith".to_string()),
+            trigger_states: vec!["backlog".to_string()],
+            webhook_secret: Some("test_secret".to_string()),
+            ..Default::default()
+        };
+        let handler = LinearWebhookHandler::new(config);
+
+        let mut issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "Fix bug",
+            "https://example.com",
+            "linear",
+        );
+        issue.set_metadata("assignee", "Jane Smith");
+        issue.set_metadata("state_type", "backlog");
+
+        let result = handler.matches_criteria(&issue);
+        assert!(result.matches);
+    }
+
+    #[test]
+    fn test_matches_criteria_trigger_assignee_wrong_assignee() {
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test".to_string(),
+            trigger_labels: vec![],
+            trigger_assignee: Some("Jane Smith".to_string()),
+            trigger_states: vec!["backlog".to_string()],
+            webhook_secret: Some("test_secret".to_string()),
+            ..Default::default()
+        };
+        let handler = LinearWebhookHandler::new(config);
+
+        let mut issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "Fix bug",
+            "https://example.com",
+            "linear",
+        );
+        issue.set_metadata("assignee", "John Doe");
+        issue.set_metadata("state_type", "backlog");
+
+        let result = handler.matches_criteria(&issue);
+        assert!(!result.matches);
+        assert!(result.reason.contains("Assignee"));
+    }
+
+    #[test]
+    fn test_matches_criteria_trigger_assignee_and_labels_both_required() {
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test".to_string(),
+            trigger_labels: vec!["auto-implement".to_string()],
+            trigger_assignee: Some("Jane Smith".to_string()),
+            trigger_states: vec!["backlog".to_string()],
+            webhook_secret: Some("test_secret".to_string()),
+            ..Default::default()
+        };
+        let handler = LinearWebhookHandler::new(config);
+
+        // Both match
+        let mut issue = Issue::new(
+            "123",
+            "PROJ-123",
+            "Fix bug",
+            "https://example.com",
+            "linear",
+        );
+        issue.set_metadata("assignee", "Jane Smith");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
+        issue.set_metadata("state_type", "backlog");
+
+        let result = handler.matches_criteria(&issue);
+        assert!(result.matches);
+
+        // Right assignee, wrong label
+        issue.set_metadata("labels", vec!["other".to_string()]);
+        let result = handler.matches_criteria(&issue);
+        assert!(!result.matches);
     }
 }

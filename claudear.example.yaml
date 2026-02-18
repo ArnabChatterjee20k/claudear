@@ -202,6 +202,11 @@ linear:
     - auto-implement
     - claude
 
+  # Optional: Only process issues assigned to this user (display name, case-insensitive).
+  # When set, trigger_labels becomes optional — issues matching the assignee are
+  # processed regardless of labels if trigger_labels is empty.
+  # trigger_assignee: "Jane Smith"
+
   # States that trigger automation
   trigger_states:
     - backlog

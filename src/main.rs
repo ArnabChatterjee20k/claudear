@@ -680,16 +680,17 @@ fn start_regression_monitoring(
     };
 
     // Create release tracker config (uses default dependency chains for transitive tracking)
+    let effective_check_secs = config.regression.effective_check_interval_secs();
     let release_config = ReleaseTrackerConfig {
         target_repos: config.regression.target_repos.clone(),
-        poll_interval_ms: config.regression.check_interval_hours as u64 * 60 * 60 * 1000, // Convert hours to ms
+        poll_interval_ms: effective_check_secs * 1000,
         ..Default::default()
     };
 
     // Create scheduler config
     let scheduler_config = RegressionSchedulerConfig {
-        check_interval_hours: config.regression.check_interval_hours,
-        monitoring_duration_hours: config.regression.monitoring_duration_hours,
+        check_interval_secs: effective_check_secs,
+        monitoring_duration_secs: config.regression.effective_monitoring_duration_secs(),
         sentry_event_threshold: config.regression.sentry_event_threshold,
         similarity_threshold: config.regression.similarity_threshold,
     };
@@ -751,12 +752,11 @@ fn start_regression_monitoring(
         scheduler_config.clone(),
     );
 
-    let configured_check_interval_hours = scheduler_config.check_interval_hours;
-    let check_interval_hours = configured_check_interval_hours.max(1);
-    if configured_check_interval_hours == 0 {
+    let check_interval_secs = scheduler_config.check_interval_secs.max(1);
+    if scheduler_config.check_interval_secs == 0 {
         tracing::warn!(
             component = "regression_monitor",
-            "check_interval_hours evaluated to 0, clamping to 1 hour to avoid timer panic"
+            "check_interval_secs evaluated to 0, clamping to 1 second to avoid timer panic"
         );
     }
 
@@ -766,12 +766,11 @@ fn start_regression_monitoring(
     // Start background task
     let handle = tokio::spawn(async move {
         let mut release_check_interval = interval(Duration::from_secs(300)); // Check for releases every 5 minutes
-        let mut regression_check_interval =
-            interval(Duration::from_secs(check_interval_hours as u64 * 60 * 60)); // Hourly regression checks
+        let mut regression_check_interval = interval(Duration::from_secs(check_interval_secs));
 
         tracing::info!(
             component = "regression_monitor",
-            check_interval_hours = check_interval_hours,
+            check_interval_secs = check_interval_secs,
             "Regression monitoring started"
         );
 
