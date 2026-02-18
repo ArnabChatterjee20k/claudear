@@ -225,15 +225,29 @@ set -euo pipefail
 
 issue_id="${LINEAR_ISSUE_ID:-unknown}"
 
+# Helper: emit a stream-json text delta event
+emit_text() {
+  local text="$1"
+  printf '{"type":"content_block_delta","delta":{"type":"text_delta","text":"%s"}}\n' "$text"
+}
+
+# Helper: emit the final structured result wrapper
+emit_result() {
+  local json="$1"
+  printf '{"result":"%s"}\n' "$(echo "$json" | sed 's/"/\\"/g')"
+}
+
 case "${issue_id}" in
   task-success)
     echo "// e2e-success-marker" >> src/buggy.rs
     git add src/buggy.rs
     git commit -m "test: apply fix for ${issue_id}" >/dev/null 2>&1 || true
-    echo "PR_URL: https://github.com/test-org/my-repo/pull/42"
+    emit_text "PR_URL: https://github.com/test-org/my-repo/pull/42"
+    emit_result '{"summary":"Fixed the bug and created PR","success":true,"pr_url":"https://github.com/test-org/my-repo/pull/42"}'
     ;;
   task-no-pr)
-    echo "Applied investigation for ${issue_id}, no PR raised"
+    emit_text "Applied investigation for ${issue_id}, no PR raised"
+    emit_result '{"summary":"Investigation complete, no PR needed","success":true,"pr_url":null}'
     ;;
   *)
     echo "Unhandled issue id: ${issue_id}" >&2

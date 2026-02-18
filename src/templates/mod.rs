@@ -23,10 +23,10 @@ Your task:
 3. Implement a fix for the issue
 4. Write or update tests if applicable
 5. Create a PR with your changes
+6. Ensure all checks pass on the PR
 
 The PR title should include the issue ID: {{short_id}}
 
-After creating the PR, output the PR URL on a line by itself starting with "PR_URL: ".
 "#;
 
 /// Default template for Linear issues (uses /issue skill).
@@ -35,7 +35,7 @@ pub const DEFAULT_LINEAR_TEMPLATE: &str = r#"{{#if has_agent_md}}
 
 ---
 {{/if}}
-Fix the following Linear issue:
+Address the following Linear issue:
 
 Issue: {{short_id}} - {{title}}
 URL: {{url}}
@@ -48,8 +48,7 @@ Description:
 
 {{context}}
 
-Create a PR that fixes this issue. Include "{{short_id}}" in the PR title.
-After creating the PR, output the PR URL on a line by itself starting with "PR_URL: ".
+Create a PR that addresses this issue. Include "{{short_id}}" in the PR title.
 "#;
 
 /// Default template for Sentry errors.
@@ -69,7 +68,7 @@ Event count: {{event_count}}
 Analyze the stack trace and error context to identify the root cause.
 Implement a fix that prevents this error from occurring.
 Write tests to verify the fix if applicable.
+Ensure all checks pass on the PR.
 
 Create a PR that fixes this error.
-After creating the PR, output the PR URL on a line by itself starting with "PR_URL: ".
 "#;
