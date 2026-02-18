@@ -100,6 +100,10 @@ imap = "2.4"
 native-tls = "0.2"
 mailparse = "0.16"
 
+# Vendor OpenSSL for Linux cross-compilation (native-tls uses openssl-sys on Linux)
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
 # Process checking on Unix
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
