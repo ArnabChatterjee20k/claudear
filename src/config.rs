@@ -1561,7 +1561,8 @@ mod tests {
 
     #[test]
     fn test_from_yaml_minimal() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/repos
 known_orgs:
   - appwrite
@@ -1569,11 +1570,12 @@ known_orgs:
 linear:
   api_key: lin_test_key
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert_eq!(config.work_dir, PathBuf::from("/tmp/repos"));
-        assert_eq!(config.known_orgs, vec!["appwrite", "utopia-php"]);
-        assert!(config.linear.is_some());
-        assert_eq!(config.linear.as_ref().unwrap().api_key, "lin_test_key");
+            let config = Config::from_yaml(yaml).unwrap();
+            assert_eq!(config.work_dir, PathBuf::from("/tmp/repos"));
+            assert_eq!(config.known_orgs, vec!["appwrite", "utopia-php"]);
+            assert!(config.linear.is_some());
+            assert_eq!(config.linear.as_ref().unwrap().api_key, "lin_test_key");
+        });
     }
 
     #[test]
@@ -1711,37 +1713,41 @@ linear:
 
     #[test]
     fn test_from_yaml_with_defaults() {
-        let config = Config::from_yaml(test_config_yaml()).unwrap();
+        with_env(&[], || {
+            let config = Config::from_yaml(test_config_yaml()).unwrap();
 
-        // Check that defaults are applied
-        assert_eq!(config.poll_interval_ms, 300_000);
-        assert_eq!(config.webhook_port, 3100);
-        assert_eq!(config.max_issues_per_cycle, 5);
-        assert_eq!(config.max_concurrent, 1);
-        assert_eq!(config.processing_delay_ms, 5000);
+            // Check that defaults are applied
+            assert_eq!(config.poll_interval_ms, 300_000);
+            assert_eq!(config.webhook_port, 3100);
+            assert_eq!(config.max_issues_per_cycle, 5);
+            assert_eq!(config.max_concurrent, 1);
+            assert_eq!(config.processing_delay_ms, 5000);
 
-        // Linear defaults
-        let linear = config.linear.unwrap();
-        assert!(linear.enabled);
-        assert_eq!(
-            linear.trigger_labels,
-            vec!["auto-implement".to_string(), "claude".to_string()]
-        );
-        assert_eq!(
-            linear.trigger_states,
-            vec!["backlog".to_string(), "todo".to_string()]
-        );
+            // Linear defaults
+            let linear = config.linear.unwrap();
+            assert!(linear.enabled);
+            assert_eq!(
+                linear.trigger_labels,
+                vec!["auto-implement".to_string(), "claude".to_string()]
+            );
+            assert_eq!(
+                linear.trigger_states,
+                vec!["backlog".to_string(), "todo".to_string()]
+            );
+        });
     }
 
     #[test]
     fn test_from_yaml_invalid_yaml() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/repos
 known_orgs:
   this is wrong: not valid
 "#;
-        let result = Config::from_yaml(yaml);
-        assert!(result.is_err());
+            let result = Config::from_yaml(yaml);
+            assert!(result.is_err());
+        });
     }
 
     #[test]
@@ -2201,7 +2207,8 @@ linear:
 
     #[test]
     fn test_per_source_config_from_yaml() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/repos
 max_issues_per_cycle: 5
 max_concurrent: 8
@@ -2215,16 +2222,18 @@ sentry:
   max_issues_per_cycle: 2
   max_concurrent: 6
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
-        assert_eq!(config.max_issues_per_cycle_for("sentry"), 2);
-        assert_eq!(config.max_concurrent_for("linear"), 2);
-        assert_eq!(config.max_concurrent_for("sentry"), 6);
+            let config = Config::from_yaml(yaml).unwrap();
+            assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
+            assert_eq!(config.max_issues_per_cycle_for("sentry"), 2);
+            assert_eq!(config.max_concurrent_for("linear"), 2);
+            assert_eq!(config.max_concurrent_for("sentry"), 6);
+        });
     }
 
     #[test]
     fn test_per_source_config_partial_override() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/repos
 max_issues_per_cycle: 5
 max_concurrent: 8
@@ -2236,13 +2245,14 @@ sentry:
   org_slug: org
   max_concurrent: 6
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        // Linear overrides issues but not concurrent
-        assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
-        assert_eq!(config.max_concurrent_for("linear"), 8);
-        // Sentry overrides concurrent but not issues
-        assert_eq!(config.max_issues_per_cycle_for("sentry"), 5);
-        assert_eq!(config.max_concurrent_for("sentry"), 6);
+            let config = Config::from_yaml(yaml).unwrap();
+            // Linear overrides issues but not concurrent
+            assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
+            assert_eq!(config.max_concurrent_for("linear"), 8);
+            // Sentry overrides concurrent but not issues
+            assert_eq!(config.max_issues_per_cycle_for("sentry"), 5);
+            assert_eq!(config.max_concurrent_for("sentry"), 6);
+        });
     }
 
     #[test]
@@ -2295,7 +2305,9 @@ sentry:
 
     #[test]
     fn test_poll_interval_ms_for_from_yaml() {
-        let yaml = r#"
+        // Hold env mutex: from_yaml reads env vars which can race with other tests
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/repos
 poll_interval_ms: 300000
 discord:
@@ -2308,11 +2320,12 @@ sentry:
   org_slug: org
   poll_interval_ms: 120000
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert_eq!(config.poll_interval_ms_for("discord"), 30_000);
-        assert_eq!(config.poll_interval_ms_for("linear"), 600_000);
-        assert_eq!(config.poll_interval_ms_for("sentry"), 120_000);
-        assert_eq!(config.poll_interval_ms_for("unknown"), 300_000);
+            let config = Config::from_yaml(yaml).unwrap();
+            assert_eq!(config.poll_interval_ms_for("discord"), 30_000);
+            assert_eq!(config.poll_interval_ms_for("linear"), 600_000);
+            assert_eq!(config.poll_interval_ms_for("sentry"), 120_000);
+            assert_eq!(config.poll_interval_ms_for("unknown"), 300_000);
+        });
     }
 
     #[test]
@@ -2506,7 +2519,8 @@ sentry:
 
     #[test]
     fn test_config_yaml_roundtrip() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/repos
 known_orgs:
   - appwrite
@@ -2521,18 +2535,19 @@ linear:
     - label1
     - label2
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        let serialized = serde_yaml::to_string(&config).unwrap();
-        let deserialized: Config = serde_yaml::from_str(&serialized).unwrap();
+            let config = Config::from_yaml(yaml).unwrap();
+            let serialized = serde_yaml::to_string(&config).unwrap();
+            let deserialized: Config = serde_yaml::from_str(&serialized).unwrap();
 
-        assert_eq!(config.work_dir, deserialized.work_dir);
-        assert_eq!(config.known_orgs, deserialized.known_orgs);
-        assert_eq!(config.auto_discover_paths, deserialized.auto_discover_paths);
-        assert_eq!(config.poll_interval_ms, deserialized.poll_interval_ms);
-        assert_eq!(
-            config.linear.as_ref().unwrap().api_key,
-            deserialized.linear.as_ref().unwrap().api_key
-        );
+            assert_eq!(config.work_dir, deserialized.work_dir);
+            assert_eq!(config.known_orgs, deserialized.known_orgs);
+            assert_eq!(config.auto_discover_paths, deserialized.auto_discover_paths);
+            assert_eq!(config.poll_interval_ms, deserialized.poll_interval_ms);
+            assert_eq!(
+                config.linear.as_ref().unwrap().api_key,
+                deserialized.linear.as_ref().unwrap().api_key
+            );
+        });
     }
 
     #[test]
@@ -2605,19 +2620,21 @@ github_search_repos:
 
     #[test]
     fn test_config_regression_from_yaml() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/test
 regression:
   enabled: false
   check_interval_hours: 4
   monitoring_duration_hours: 12
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert!(!config.regression.enabled);
-        assert_eq!(config.regression.check_interval_hours, 4);
-        assert_eq!(config.regression.monitoring_duration_hours, 12);
-        // Defaults should apply for unspecified fields
-        assert_eq!(config.regression.sentry_event_threshold, 1);
+            let config = Config::from_yaml(yaml).unwrap();
+            assert!(!config.regression.enabled);
+            assert_eq!(config.regression.check_interval_hours, 4);
+            assert_eq!(config.regression.monitoring_duration_hours, 12);
+            // Defaults should apply for unspecified fields
+            assert_eq!(config.regression.sentry_event_threshold, 1);
+        });
     }
 
     #[test]
@@ -2714,7 +2731,8 @@ regression:
 
     #[test]
     fn test_github_app_config_from_yaml() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/test
 github_app:
   app_id: 12345
@@ -2725,26 +2743,27 @@ github_app:
   client_secret: secret456
   base_url: https://example.com
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert_eq!(config.github_app.app_id, Some(12345));
-        assert_eq!(
-            config.github_app.private_key_path,
-            Some(PathBuf::from("/path/to/key.pem"))
-        );
-        assert_eq!(
-            config.github_app.webhook_secret,
-            Some("secret123".to_string())
-        );
-        assert_eq!(config.github_app.installation_id, Some(67890));
-        assert_eq!(config.github_app.client_id, Some("Iv1.abc123".to_string()));
-        assert_eq!(
-            config.github_app.client_secret,
-            Some("secret456".to_string())
-        );
-        assert_eq!(
-            config.github_app.base_url,
-            Some("https://example.com".to_string())
-        );
+            let config = Config::from_yaml(yaml).unwrap();
+            assert_eq!(config.github_app.app_id, Some(12345));
+            assert_eq!(
+                config.github_app.private_key_path,
+                Some(PathBuf::from("/path/to/key.pem"))
+            );
+            assert_eq!(
+                config.github_app.webhook_secret,
+                Some("secret123".to_string())
+            );
+            assert_eq!(config.github_app.installation_id, Some(67890));
+            assert_eq!(config.github_app.client_id, Some("Iv1.abc123".to_string()));
+            assert_eq!(
+                config.github_app.client_secret,
+                Some("secret456".to_string())
+            );
+            assert_eq!(
+                config.github_app.base_url,
+                Some("https://example.com".to_string())
+            );
+        });
     }
 
     #[test]
@@ -2806,7 +2825,8 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_claude_config_from_yaml() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/test
 claude:
   model: sonnet
@@ -2816,26 +2836,29 @@ claude:
     - "Read"
   skip_permissions: false
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert_eq!(config.claude.model, Some("sonnet".to_string()));
-        assert_eq!(
-            config.claude.instructions,
-            Some("Always write tests.".to_string())
-        );
-        assert_eq!(config.claude.permissions, vec!["Bash(git *)", "Read"]);
-        assert!(!config.claude.skip_permissions);
+            let config = Config::from_yaml(yaml).unwrap();
+            assert_eq!(config.claude.model, Some("sonnet".to_string()));
+            assert_eq!(
+                config.claude.instructions,
+                Some("Always write tests.".to_string())
+            );
+            assert_eq!(config.claude.permissions, vec!["Bash(git *)", "Read"]);
+            assert!(!config.claude.skip_permissions);
+        });
     }
 
     #[test]
     fn test_claude_config_yaml_defaults() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/test
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert!(config.claude.model.is_none());
-        assert!(config.claude.instructions.is_none());
-        assert!(config.claude.permissions.is_empty());
-        assert!(config.claude.skip_permissions);
+            let config = Config::from_yaml(yaml).unwrap();
+            assert!(config.claude.model.is_none());
+            assert!(config.claude.instructions.is_none());
+            assert!(config.claude.permissions.is_empty());
+            assert!(config.claude.skip_permissions);
+        });
     }
 
     #[test]
@@ -2936,87 +2959,101 @@ claude:
 
     #[test]
     fn test_resolve_instructions_file_reads_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let instructions_path = dir.path().join("instructions.md");
-        fs::write(&instructions_path, "Be helpful and concise.").unwrap();
+        with_env(&[], || {
+            let dir = tempfile::tempdir().unwrap();
+            let instructions_path = dir.path().join("instructions.md");
+            fs::write(&instructions_path, "Be helpful and concise.").unwrap();
 
-        let yaml = format!(
-            "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"{}\"",
-            instructions_path.display()
-        );
-        let config = Config::from_yaml(&yaml).unwrap();
-        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
-        assert_eq!(resolved, Some("Be helpful and concise.".to_string()));
+            let yaml = format!(
+                "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"{}\"",
+                instructions_path.display()
+            );
+            let config = Config::from_yaml(&yaml).unwrap();
+            let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+            assert_eq!(resolved, Some("Be helpful and concise.".to_string()));
+        });
     }
 
     #[test]
     fn test_resolve_instructions_file_relative_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let instructions_path = dir.path().join("my-instructions.md");
-        fs::write(&instructions_path, "Write tests first.").unwrap();
+        with_env(&[], || {
+            let dir = tempfile::tempdir().unwrap();
+            let instructions_path = dir.path().join("my-instructions.md");
+            fs::write(&instructions_path, "Write tests first.").unwrap();
 
-        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"my-instructions.md\"";
-        let config = Config::from_yaml(yaml).unwrap();
-        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
-        assert_eq!(resolved, Some("Write tests first.".to_string()));
+            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"my-instructions.md\"";
+            let config = Config::from_yaml(yaml).unwrap();
+            let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+            assert_eq!(resolved, Some("Write tests first.".to_string()));
+        });
     }
 
     #[test]
     fn test_resolve_instructions_file_combines_with_inline() {
-        let dir = tempfile::tempdir().unwrap();
-        let instructions_path = dir.path().join("base.md");
-        fs::write(&instructions_path, "Base instructions from file.").unwrap();
+        with_env(&[], || {
+            let dir = tempfile::tempdir().unwrap();
+            let instructions_path = dir.path().join("base.md");
+            fs::write(&instructions_path, "Base instructions from file.").unwrap();
 
-        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"base.md\"\n  instructions: \"Plus inline.\"";
-        let config = Config::from_yaml(yaml).unwrap();
-        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
-        assert_eq!(
-            resolved,
-            Some("Base instructions from file.\nPlus inline.".to_string())
-        );
+            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"base.md\"\n  instructions: \"Plus inline.\"";
+            let config = Config::from_yaml(yaml).unwrap();
+            let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+            assert_eq!(
+                resolved,
+                Some("Base instructions from file.\nPlus inline.".to_string())
+            );
+        });
     }
 
     #[test]
     fn test_resolve_instructions_file_inline_only() {
-        let dir = tempfile::tempdir().unwrap();
+        with_env(&[], || {
+            let dir = tempfile::tempdir().unwrap();
 
-        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions: \"Just inline.\"";
-        let config = Config::from_yaml(yaml).unwrap();
-        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
-        assert_eq!(resolved, Some("Just inline.".to_string()));
+            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions: \"Just inline.\"";
+            let config = Config::from_yaml(yaml).unwrap();
+            let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+            assert_eq!(resolved, Some("Just inline.".to_string()));
+        });
     }
 
     #[test]
     fn test_resolve_instructions_file_neither_set() {
-        let dir = tempfile::tempdir().unwrap();
+        with_env(&[], || {
+            let dir = tempfile::tempdir().unwrap();
 
-        let yaml = "work_dir: /tmp/repos";
-        let config = Config::from_yaml(yaml).unwrap();
-        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
-        assert_eq!(resolved, None);
+            let yaml = "work_dir: /tmp/repos";
+            let config = Config::from_yaml(yaml).unwrap();
+            let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+            assert_eq!(resolved, None);
+        });
     }
 
     #[test]
     fn test_resolve_instructions_file_not_found() {
-        let dir = tempfile::tempdir().unwrap();
+        with_env(&[], || {
+            let dir = tempfile::tempdir().unwrap();
 
-        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"nonexistent.md\"";
-        let config = Config::from_yaml(yaml).unwrap();
-        let result = config.resolve_instructions_file(dir.path());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("nonexistent.md"));
+            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"nonexistent.md\"";
+            let config = Config::from_yaml(yaml).unwrap();
+            let result = config.resolve_instructions_file(dir.path());
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("nonexistent.md"));
+        });
     }
 
     #[test]
     fn test_resolve_instructions_file_empty_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let instructions_path = dir.path().join("empty.md");
-        fs::write(&instructions_path, "").unwrap();
+        with_env(&[], || {
+            let dir = tempfile::tempdir().unwrap();
+            let instructions_path = dir.path().join("empty.md");
+            fs::write(&instructions_path, "").unwrap();
 
-        let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"empty.md\"";
-        let config = Config::from_yaml(yaml).unwrap();
-        let resolved = config.resolve_instructions_file(dir.path()).unwrap();
-        assert_eq!(resolved, None);
+            let yaml = "work_dir: /tmp/repos\nclaude:\n  instructions_file: \"empty.md\"";
+            let config = Config::from_yaml(yaml).unwrap();
+            let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+            assert_eq!(resolved, None);
+        });
     }
 
     #[test]
@@ -3522,15 +3559,17 @@ work_dir: /tmp/repos
 
     #[test]
     fn test_cascade_config_from_yaml() {
-        let yaml = r#"
+        with_env(&[], || {
+            let yaml = r#"
 work_dir: /tmp/test
 cascade:
   enabled: true
   max_depth: 3
 "#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert!(config.cascade.enabled);
-        assert_eq!(config.cascade.max_depth, 3);
+            let config = Config::from_yaml(yaml).unwrap();
+            assert!(config.cascade.enabled);
+            assert_eq!(config.cascade.max_depth, 3);
+        });
     }
 
     #[test]
