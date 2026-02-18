@@ -2335,17 +2335,22 @@ Create a PR with your changes."#,
         }
 
         // Use the per-issue worktree as the effective working directory for Claude.
-        let effective_project_dir = {
-            let wt = worktree_path(
-                &self.config.work_dir,
-                resolution.repo_name().unwrap_or("unknown"),
-                &issue.short_id,
-            );
-            if wt.exists() {
-                wt
-            } else {
-                project_dir.clone()
+        // Fall back to project_dir only when no repo was resolved (no worktree attempted).
+        let effective_project_dir = if let Some(repo_name) = resolution.repo_name() {
+            let wt = worktree_path(&self.config.work_dir, repo_name, &issue.short_id);
+            if !wt.exists() {
+                let err = format!("Worktree disappeared after creation: {:?}", wt);
+                tracing::error!(short_id = %issue.short_id, error = %err);
+                self.tracker
+                    .mark_failed(source.name(), &issue.id, &err)
+                    .ok();
+                self.processing.write().await.remove(&processing_key);
+                self.active_processing.fetch_sub(1, Ordering::SeqCst);
+                return true;
             }
+            wt
+        } else {
+            project_dir.clone()
         };
 
         // Get the attempt ID for analytics tracking

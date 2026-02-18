@@ -783,17 +783,22 @@ async fn process_issue(
     }
 
     // Use the per-issue worktree as the effective working directory for Claude.
-    let effective_project_dir = {
-        let wt = worktree_path(
-            &state.config.work_dir,
-            resolution.repo_name().unwrap_or("unknown"),
-            &issue.short_id,
-        );
-        if wt.exists() {
-            wt
-        } else {
-            project_dir.clone()
+    // Fall back to project_dir only when no repo was resolved (no worktree attempted).
+    let effective_project_dir = if let Some(repo_name) = resolution.repo_name() {
+        let wt = worktree_path(&state.config.work_dir, repo_name, &issue.short_id);
+        if !wt.exists() {
+            let err = format!("Worktree disappeared after creation: {:?}", wt);
+            tracing::error!(short_id = %issue.short_id, error = %err);
+            let mut processing = state.processing.write().await;
+            processing.remove(&processing_key);
+            state.tracker.mark_failed(source_name, &issue.id, &err)?;
+            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed)
+                .await;
+            return Ok(());
         }
+        wt
+    } else {
+        project_dir.clone()
     };
 
     // Note: processing flag and attempt already recorded by handle_webhook before spawning

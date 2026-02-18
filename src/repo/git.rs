@@ -11,6 +11,7 @@ pub struct GitOps;
 /// Validate a ref (branch name, tag, etc.) to prevent command injection.
 fn validate_ref(name: &str, label: &str) -> Result<()> {
     if name.is_empty()
+        || name == "@"
         || name.starts_with('-')
         || name.contains("..")
         || !name
@@ -178,10 +179,16 @@ impl GitOps {
 
         // If the directory still exists, forcefully remove it
         if worktree_path.exists() {
-            let has_worktrees_component = worktree_path
-                .components()
-                .any(|c| c.as_os_str().to_string_lossy().contains("-worktrees"));
-            if !has_worktrees_component {
+            let parent_dir = worktree_path
+                .parent()
+                .map(|p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .unwrap_or_default();
+            if !parent_dir.ends_with("-worktrees") {
                 return Err(Error::git(format!(
                     "Refusing to remove directory outside worktrees area: {:?}",
                     worktree_path
@@ -337,8 +344,9 @@ impl GitOps {
 ///
 /// Returns `work_dir/{short_repo_name}-worktrees/{issue_short_id}`.
 pub fn worktree_path(work_dir: &Path, repo_name: &str, issue_short_id: &str) -> PathBuf {
-    let short_name = repo_name.split('/').next_back().unwrap_or(repo_name);
-    let sanitized_id = issue_short_id.replace(['/', '\\', '.'], "_");
+    let raw_short_name = repo_name.split('/').next_back().unwrap_or(repo_name);
+    let short_name = raw_short_name.replace(['/', '\\', '\0'], "_");
+    let sanitized_id = issue_short_id.replace(['/', '\\', '.', '\0'], "_");
     work_dir
         .join(format!("{}-worktrees", short_name))
         .join(sanitized_id)

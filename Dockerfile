@@ -8,43 +8,40 @@ COPY dashboard/ ./
 RUN bun run build
 
 # Vectorlite build stage (no prebuilt binaries for linux arm64)
-FROM alpine:3.23 AS vectorlite-builder
+FROM debian:bookworm-slim AS vectorlite-builder
 
-RUN apk add --no-cache \
-    build-base \
+RUN apt-get update && apt-get install -y \
+    build-essential \
     cmake \
     curl \
     git \
-    linux-headers \
-    ninja \
-    pkgconf \
+    ninja-build \
+    pkg-config \
     python3 \
     zip \
-    unzip
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
 RUN git clone --recurse-submodules https://github.com/1yefuwang1/vectorlite.git .
 
-ENV VCPKG_FORCE_SYSTEM_BINARIES=1
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 RUN python3 bootstrap_vcpkg.py
 
 RUN cmake --preset release && cmake --build build/release -j$(nproc)
 
-FROM rust:1.93-alpine AS builder
+FROM rust:1.93-slim-bookworm AS builder
 
 WORKDIR /app
 
-RUN apk add --no-cache \
-    build-base \
-    linux-headers \
-    musl-dev \
-    openssl-dev \
-    openssl-libs-static \
-    pkgconf \
-    perl
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libssl-dev \
+    pkg-config \
+    perl \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
@@ -57,30 +54,28 @@ COPY src ./src
 COPY --from=dashboard-builder /app/dashboard/dist ./dashboard/dist
 RUN touch src/main.rs src/lib.rs && cargo build --release
 
-FROM alpine:3.23
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     git \
     git-lfs \
     jq \
-    libgcc \
-    libstdc++ \
     nodejs \
     npm \
     openssh-client \
-    sqlite \
+    sqlite3 \
     && npm install -g @anthropic-ai/claude-code \
-    && rm -rf /root/.npm /tmp/*
+    && rm -rf /var/lib/apt/lists/* /root/.npm /tmp/*
 
 COPY --from=vectorlite-builder /build/build/release/vectorlite/vectorlite.so /usr/local/lib/vectorlite.so
 COPY --from=builder /app/target/release/claudear /usr/local/bin/claudear
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN adduser -D -u 1000 appuser \
+RUN adduser --disabled-password --uid 1000 --gecos "" appuser \
     && mkdir -p /app/data /app/repos /home/appuser/.cache/fastembed /home/appuser/.claude \
     && chown -R appuser:appuser /app /home/appuser/.cache /home/appuser/.claude
 
