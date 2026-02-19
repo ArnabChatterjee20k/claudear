@@ -131,17 +131,18 @@ fn default_storage_dir() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DashboardConfig {
-    /// Estimated cost per minute of Claude compute.
-    pub cost_per_minute: f64,
-    /// Estimated engineering hours saved per merged fix.
-    pub hours_per_fix: f64,
+    /// Monthly cost of Claude Max plan (if applicable). Used to estimate per-fix
+    /// cost when total_cost_usd is not available from CLI. Set to 0 to disable.
+    pub max_plan_monthly_cost: f64,
+    /// Hourly engineer rate for cost-savings calculation.
+    pub hourly_engineer_rate: f64,
 }
 
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
-            cost_per_minute: 0.05,
-            hours_per_fix: 2.0,
+            max_plan_monthly_cost: 0.0,
+            hourly_engineer_rate: 75.0,
         }
     }
 }

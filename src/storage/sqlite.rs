@@ -3,6 +3,7 @@
 use super::{is_vectorlite_available, try_load_vectorlite, FixAttemptTracker};
 use crate::error::Result;
 use crate::feedback::{FixOutcome, Outcome};
+use crate::learning::cross_repo_correlator::CrossRepoCorrelation;
 use crate::types::{
     ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
     FixAttemptStatus, IssueEmbedding, PrReviewRecord, ProcessingMetric, PromptExperiment,
@@ -894,6 +895,94 @@ impl SqliteTracker {
             "UPDATE indexing_progress SET status = 'idle' WHERE status = 'running'",
             [],
         )?;
+
+        // Cross-repo failure correlations, code complexity, and evaluation tables
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS cross_repo_correlations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_a TEXT NOT NULL,
+                repo_b TEXT NOT NULL,
+                correlation_count INTEGER NOT NULL DEFAULT 1,
+                last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                window_hours INTEGER NOT NULL DEFAULT 24,
+                UNIQUE(repo_a, repo_b)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cross_repo_correlations_repos ON cross_repo_correlations(repo_a, repo_b);
+
+            CREATE TABLE IF NOT EXISTS code_complexity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                avg_cyclomatic REAL,
+                max_cyclomatic REAL,
+                avg_func_length REAL,
+                max_func_length REAL,
+                avg_nesting REAL,
+                max_nesting REAL,
+                total_lines INTEGER,
+                function_count INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(repo_id, file_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_code_complexity_repo ON code_complexity(repo_id);
+
+            CREATE TABLE IF NOT EXISTS eval_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER,
+                phase TEXT NOT NULL,
+                category TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                exit_code INTEGER NOT NULL DEFAULT -1,
+                passed INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                skipped INTEGER NOT NULL DEFAULT 0,
+                warnings INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0,
+                diagnostics_json TEXT NOT NULL DEFAULT '[]',
+                raw_output TEXT NOT NULL DEFAULT '',
+                duration_secs REAL NOT NULL DEFAULT 0.0,
+                line_coverage_pct REAL,
+                branch_coverage_pct REAL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_eval_snapshots_attempt ON eval_snapshots(attempt_id, phase);
+
+            CREATE TABLE IF NOT EXISTS eval_deltas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER,
+                repo TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                new_passes INTEGER NOT NULL DEFAULT 0,
+                new_failures INTEGER NOT NULL DEFAULT 0,
+                regressions_json TEXT NOT NULL DEFAULT '[]',
+                fixed_json TEXT NOT NULL DEFAULT '[]',
+                coverage_delta_pct REAL,
+                overall_improved INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_eval_deltas_attempt ON eval_deltas(attempt_id);
+            "#,
+        )?;
+
+        // Idempotent migration: add cost/token columns to claude_executions.
+        // ALTER TABLE ADD COLUMN is a no-op if the column already exists (error ignored).
+        for col_def in [
+            "total_cost_usd REAL",
+            "num_turns INTEGER",
+            "session_id TEXT",
+            "duration_api_ms INTEGER",
+            "input_tokens INTEGER",
+            "output_tokens INTEGER",
+            "cache_read_input_tokens INTEGER",
+            "cache_creation_input_tokens INTEGER",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE claude_executions ADD COLUMN {}", col_def),
+                [],
+            );
+        }
 
         // Update query planner statistics after schema creation
         // This helps SQLite make better query planning decisions
@@ -2395,10 +2484,10 @@ impl FixAttemptTracker for SqliteTracker {
     fn get_cost_estimate(
         &self,
         since_iso: &str,
-        cost_per_minute: f64,
+        max_plan_monthly_cost: f64,
         period_label: &str,
     ) -> Result<crate::types::CostEstimate> {
-        SqliteTracker::get_cost_estimate(self, since_iso, cost_per_minute, period_label)
+        SqliteTracker::get_cost_estimate(self, since_iso, max_plan_monthly_cost, period_label)
     }
 
     fn get_mttr_trend(&self, weeks: usize) -> Result<Vec<crate::types::MttrDataPoint>> {
@@ -2409,13 +2498,13 @@ impl FixAttemptTracker for SqliteTracker {
         SqliteTracker::get_repo_leaderboard(self)
     }
 
-    fn get_time_savings(
+    fn get_complexity_time_savings(
         &self,
         since_iso: &str,
-        hours_per_fix: f64,
+        hourly_rate: f64,
         period_label: &str,
     ) -> Result<crate::types::TimeSavings> {
-        SqliteTracker::get_time_savings(self, since_iso, hours_per_fix, period_label)
+        SqliteTracker::get_complexity_time_savings(self, since_iso, hourly_rate, period_label)
     }
 
     fn get_regression_watches_by_status(
@@ -2619,6 +2708,31 @@ impl FixAttemptTracker for SqliteTracker {
         reason: &str,
     ) -> Result<()> {
         SqliteTracker::record_suppression(self, source, issue_id, rule_name, reason)
+    }
+
+    fn get_recent_attempts_since(&self, since: &DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+        SqliteTracker::get_recent_attempts_since(self, since)
+    }
+
+    fn has_dependency(&self, repo_a: &str, repo_b: &str) -> Result<bool> {
+        SqliteTracker::has_dependency(self, repo_a, repo_b)
+    }
+
+    fn upsert_cross_repo_correlation(
+        &self,
+        repo_a: &str,
+        repo_b: &str,
+        window_hours: i64,
+    ) -> Result<CrossRepoCorrelation> {
+        SqliteTracker::upsert_cross_repo_correlation(self, repo_a, repo_b, window_hours)
+    }
+
+    fn get_cross_repo_correlations(
+        &self,
+        min_count: i64,
+        max_age_hours: i64,
+    ) -> Result<Vec<CrossRepoCorrelation>> {
+        SqliteTracker::get_cross_repo_correlations(self, min_count, max_age_hours)
     }
 }
 
@@ -2912,8 +3026,10 @@ impl SqliteTracker {
                 attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
                 stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
                 prompt_used, prompt_hash, model_version, working_directory, git_branch,
-                git_commit_before, git_commit_after, files_changed, lines_added, lines_removed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
+                total_cost_usd, num_turns, session_id, duration_api_ms,
+                input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 execution.attempt_id,
@@ -2939,6 +3055,14 @@ impl SqliteTracker {
                 execution.files_changed,
                 execution.lines_added,
                 execution.lines_removed,
+                execution.total_cost_usd,
+                execution.num_turns,
+                execution.session_id,
+                execution.duration_api_ms,
+                execution.input_tokens,
+                execution.output_tokens,
+                execution.cache_read_input_tokens,
+                execution.cache_creation_input_tokens,
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -2967,6 +3091,14 @@ impl SqliteTracker {
                 "files_changed": execution.files_changed,
                 "lines_added": execution.lines_added,
                 "lines_removed": execution.lines_removed,
+                "total_cost_usd": execution.total_cost_usd,
+                "num_turns": execution.num_turns,
+                "session_id": execution.session_id,
+                "duration_api_ms": execution.duration_api_ms,
+                "input_tokens": execution.input_tokens,
+                "output_tokens": execution.output_tokens,
+                "cache_read_input_tokens": execution.cache_read_input_tokens,
+                "cache_creation_input_tokens": execution.cache_creation_input_tokens,
             }),
         );
         Ok(id)
@@ -2980,7 +3112,9 @@ impl SqliteTracker {
             SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
                    stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
                    prompt_used, prompt_hash, model_version, working_directory, git_branch,
-                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed
+                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
+                   total_cost_usd, num_turns, session_id, duration_api_ms,
+                   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens
             FROM claude_executions
             WHERE attempt_id = ?
             ORDER BY started_at DESC
@@ -3012,6 +3146,14 @@ impl SqliteTracker {
                 files_changed: row.get(19)?,
                 lines_added: row.get(20)?,
                 lines_removed: row.get(21)?,
+                total_cost_usd: row.get(22)?,
+                num_turns: row.get(23)?,
+                session_id: row.get(24)?,
+                duration_api_ms: row.get(25)?,
+                input_tokens: row.get(26)?,
+                output_tokens: row.get(27)?,
+                cache_read_input_tokens: row.get(28)?,
+                cache_creation_input_tokens: row.get(29)?,
             })
         })?;
 
@@ -3034,7 +3176,9 @@ impl SqliteTracker {
             SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
                    stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
                    prompt_used, prompt_hash, model_version, working_directory, git_branch,
-                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed
+                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
+                   total_cost_usd, num_turns, session_id, duration_api_ms,
+                   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens
             FROM claude_executions
             WHERE attempt_id = ?1 AND id = ?2
             LIMIT 1
@@ -3066,6 +3210,14 @@ impl SqliteTracker {
                     files_changed: row.get(19)?,
                     lines_added: row.get(20)?,
                     lines_removed: row.get(21)?,
+                    total_cost_usd: row.get(22)?,
+                    num_turns: row.get(23)?,
+                    session_id: row.get(24)?,
+                    duration_api_ms: row.get(25)?,
+                    input_tokens: row.get(26)?,
+                    output_tokens: row.get(27)?,
+                    cache_read_input_tokens: row.get(28)?,
+                    cache_creation_input_tokens: row.get(29)?,
                 })
             })
             .optional()?;
@@ -6120,25 +6272,30 @@ impl SqliteTracker {
         Ok(count)
     }
 
-    /// Compute cost estimate from Claude execution durations.
+    /// Compute cost estimate from Claude execution data.
+    ///
+    /// Priority: (1) actual `total_cost_usd` from CLI, (2) plan-based estimate,
+    /// (3) duration-based fallback.
     pub fn get_cost_estimate(
         &self,
         since_iso: &str,
-        cost_per_minute: f64,
+        max_plan_monthly_cost: f64,
         period_label: &str,
     ) -> Result<crate::types::CostEstimate> {
         let conn = self.acquire_lock()?;
-        let total_duration_secs: f64 = conn
+
+        // Try actual API cost first
+        let (api_cost_sum, api_cost_count): (f64, i64) = conn
             .query_row(
                 r#"
-                SELECT COALESCE(SUM(duration_secs), 0.0)
+                SELECT COALESCE(SUM(total_cost_usd), 0.0), COUNT(total_cost_usd)
                 FROM claude_executions
-                WHERE started_at >= ?1 AND duration_secs IS NOT NULL
+                WHERE started_at >= ?1 AND total_cost_usd IS NOT NULL
                 "#,
                 params![since_iso],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap_or(0.0);
+            .unwrap_or((0.0, 0));
 
         let fix_count: i64 = conn
             .query_row(
@@ -6151,8 +6308,56 @@ impl SqliteTracker {
             )
             .unwrap_or(0);
 
-        let total_duration_mins = total_duration_secs / 60.0;
-        let total_cost = total_duration_mins * cost_per_minute;
+        let (total_cost, cost_source) = if api_cost_count > 0 {
+            (api_cost_sum, "api".to_string())
+        } else if max_plan_monthly_cost > 0.0 {
+            // Estimate from plan cost: amortize over total minutes used this month
+            let monthly_total_mins: f64 = conn
+                .query_row(
+                    r#"
+                    SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
+                    FROM claude_executions
+                    WHERE started_at >= datetime('now', '-30 days') AND duration_secs IS NOT NULL
+                    "#,
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0.0);
+
+            let period_mins: f64 = conn
+                .query_row(
+                    r#"
+                    SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
+                    FROM claude_executions
+                    WHERE started_at >= ?1 AND duration_secs IS NOT NULL
+                    "#,
+                    params![since_iso],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0.0);
+
+            if monthly_total_mins > 0.0 {
+                let cost_per_min = max_plan_monthly_cost / monthly_total_mins;
+                (period_mins * cost_per_min, "plan_estimate".to_string())
+            } else {
+                (0.0, "plan_estimate".to_string())
+            }
+        } else {
+            // Fallback: duration-based estimate at $0.05/min
+            let total_duration_mins: f64 = conn
+                .query_row(
+                    r#"
+                    SELECT COALESCE(SUM(duration_secs), 0.0) / 60.0
+                    FROM claude_executions
+                    WHERE started_at >= ?1 AND duration_secs IS NOT NULL
+                    "#,
+                    params![since_iso],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0.0);
+            (total_duration_mins * 0.05, "duration_estimate".to_string())
+        };
+
         let avg_cost_per_fix = if fix_count > 0 {
             total_cost / fix_count as f64
         } else {
@@ -6162,8 +6367,8 @@ impl SqliteTracker {
         Ok(crate::types::CostEstimate {
             total_cost,
             avg_cost_per_fix,
-            total_duration_mins,
-            cost_per_minute,
+            fix_count,
+            cost_source,
             period: period_label.to_string(),
         })
     }
@@ -6228,26 +6433,78 @@ impl SqliteTracker {
         Ok(rows.flatten().collect())
     }
 
-    /// Engineering time savings estimate.
-    pub fn get_time_savings(
+    /// Complexity-based engineering time savings estimate.
+    ///
+    /// For each merged fix, computes a complexity score from lines changed, files
+    /// changed, execution duration, review cycles, and retry count, then maps the
+    /// score to an estimated hours-saved value.
+    pub fn get_complexity_time_savings(
         &self,
         since_iso: &str,
-        hours_per_fix: f64,
+        hourly_rate: f64,
         period_label: &str,
     ) -> Result<crate::types::TimeSavings> {
         let conn = self.acquire_lock()?;
-        let merged_count: i64 = conn.query_row(
+        let mut stmt = conn.prepare(
             r#"
-            SELECT COUNT(*) FROM fix_attempts
-            WHERE status = 'merged' AND merged_at >= ?1
+            SELECT
+                fa.id,
+                COALESCE(p.lines_added, 0) + COALESCE(p.lines_removed, 0) as total_lines,
+                COALESCE(p.files_changed, 0) as files_changed,
+                COALESCE(ce.duration_secs, 0) as exec_duration,
+                COALESCE(p.review_cycles, 0) as review_cycles,
+                COALESCE(fa.retry_count, 0) as retry_count
+            FROM fix_attempts fa
+            LEFT JOIN prs p ON p.attempt_id = fa.id
+            LEFT JOIN claude_executions ce ON ce.attempt_id = fa.id
+            WHERE fa.status = 'merged' AND fa.merged_at >= ?1
             "#,
-            params![since_iso],
-            |row| row.get(0),
         )?;
+
+        let rows = stmt.query_map(params![since_iso], |row| {
+            Ok((
+                row.get::<_, i64>(0)?, // id
+                row.get::<_, f64>(1)?, // total_lines
+                row.get::<_, f64>(2)?, // files_changed
+                row.get::<_, f64>(3)?, // exec_duration
+                row.get::<_, f64>(4)?, // review_cycles
+                row.get::<_, f64>(5)?, // retry_count
+            ))
+        })?;
+
+        let mut merged_count: i64 = 0;
+        let mut hours_saved: f64 = 0.0;
+
+        for row in rows.flatten() {
+            merged_count += 1;
+            let (_id, total_lines, files_changed, exec_duration, review_cycles, retry_count) = row;
+
+            // If all signals are zero, default to 2.0h
+            if total_lines == 0.0
+                && files_changed == 0.0
+                && exec_duration == 0.0
+                && review_cycles == 0.0
+                && retry_count == 0.0
+            {
+                hours_saved += 2.0;
+                continue;
+            }
+
+            let score = 0.30 * normalize_signal(total_lines, &[0.0, 20.0, 100.0, 500.0, 2000.0])
+                + 0.20 * normalize_signal(files_changed, &[0.0, 2.0, 5.0, 15.0, 50.0])
+                + 0.25 * normalize_signal(exec_duration, &[0.0, 120.0, 600.0, 1800.0, 7200.0])
+                + 0.15 * normalize_signal(review_cycles, &[0.0, 1.0, 2.0, 4.0, 8.0])
+                + 0.10 * normalize_signal(retry_count, &[0.0, 0.0, 1.0, 2.0, 4.0]);
+
+            hours_saved += complexity_to_hours(score);
+        }
+
+        let cost_saved = hours_saved * hourly_rate;
+
         Ok(crate::types::TimeSavings {
             merged_count,
-            hours_saved: merged_count as f64 * hours_per_fix,
-            hours_per_fix,
+            hours_saved,
+            cost_saved,
             period: period_label.to_string(),
         })
     }
@@ -7775,6 +8032,194 @@ impl SqliteTracker {
         Ok(())
     }
 
+    // ── Cross-repo correlation storage ──────────────────────────────────
+
+    pub fn get_recent_attempts_since(&self, since: &DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut stmt = conn.prepare(
+            "SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
+                    github_pr_number, status, error_message, merged_at, resolved_at,
+                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+             FROM fix_attempts WHERE attempted_at >= ?1 ORDER BY attempted_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![since_str], Self::row_to_fix_attempt)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn has_dependency(&self, repo_a: &str, repo_b: &str) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        // Check if repo_a depends on repo_b (repo_b is upstream of repo_a)
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM repository_dependencies rd
+             JOIN repositories r1 ON rd.downstream_id = r1.id
+             JOIN repositories r2 ON rd.upstream_id = r2.id
+             WHERE r1.name = ?1 AND r2.name = ?2",
+            params![repo_a, repo_b],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn upsert_cross_repo_correlation(
+        &self,
+        repo_a: &str,
+        repo_b: &str,
+        window_hours: i64,
+    ) -> Result<CrossRepoCorrelation> {
+        let conn = self.acquire_lock()?;
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        conn.execute(
+            "INSERT INTO cross_repo_correlations (repo_a, repo_b, correlation_count, last_seen_at, window_hours)
+             VALUES (?1, ?2, 1, ?3, ?4)
+             ON CONFLICT(repo_a, repo_b) DO UPDATE SET
+                correlation_count = correlation_count + 1,
+                last_seen_at = excluded.last_seen_at,
+                window_hours = excluded.window_hours",
+            params![repo_a, repo_b, now, window_hours],
+        )?;
+
+        let row = conn.query_row(
+            "SELECT id, repo_a, repo_b, correlation_count, last_seen_at, window_hours FROM cross_repo_correlations WHERE repo_a = ?1 AND repo_b = ?2",
+            params![repo_a, repo_b],
+            |row| {
+                Ok(CrossRepoCorrelation {
+                    id: row.get(0)?,
+                    repo_a: row.get(1)?,
+                    repo_b: row.get(2)?,
+                    correlation_count: row.get(3)?,
+                    last_seen_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+                    window_hours: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(row)
+    }
+
+    pub fn get_cross_repo_correlations(
+        &self,
+        min_count: i64,
+        max_age_hours: i64,
+    ) -> Result<Vec<CrossRepoCorrelation>> {
+        let conn = self.acquire_lock()?;
+        let cutoff_modifier = format!("-{} hours", max_age_hours);
+        let mut stmt = conn.prepare(
+            "SELECT id, repo_a, repo_b, correlation_count, last_seen_at, window_hours
+             FROM cross_repo_correlations
+             WHERE correlation_count >= ?1 AND last_seen_at >= datetime('now', ?2)
+             ORDER BY correlation_count DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![min_count, cutoff_modifier], |row| {
+                Ok(CrossRepoCorrelation {
+                    id: row.get(0)?,
+                    repo_a: row.get(1)?,
+                    repo_b: row.get(2)?,
+                    correlation_count: row.get(3)?,
+                    last_seen_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+                    window_hours: row.get(5)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    // ── Code complexity storage ─────────────────────────────────────
+
+    pub fn store_code_complexity(
+        &self,
+        repo_id: i64,
+        file_path: &str,
+        fc: &crate::repo::code_index::complexity::FileComplexity,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO code_complexity (repo_id, file_path, avg_cyclomatic, max_cyclomatic, avg_func_length, max_func_length, avg_nesting, max_nesting, total_lines, function_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+            params![
+                repo_id,
+                file_path,
+                fc.avg_cyclomatic,
+                fc.max_cyclomatic,
+                fc.avg_func_length,
+                fc.max_func_length,
+                fc.avg_nesting,
+                fc.max_nesting,
+                fc.total_lines,
+                fc.function_count,
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ── Evaluation storage ──────────────────────────────────────────
+
+    pub fn store_eval_snapshot(
+        &self,
+        attempt_id: Option<i64>,
+        phase: &str,
+        snapshot: &crate::evaluation::EvalSnapshot,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let diagnostics_json =
+            serde_json::to_string(&snapshot.diagnostics).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "INSERT INTO eval_snapshots (attempt_id, phase, category, tool_name, exit_code, passed, failed, skipped, warnings, errors, diagnostics_json, raw_output, duration_secs, line_coverage_pct, branch_coverage_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                attempt_id,
+                phase,
+                snapshot.category.to_string(),
+                snapshot.tool_name,
+                snapshot.exit_code,
+                snapshot.passed,
+                snapshot.failed,
+                snapshot.skipped,
+                snapshot.warnings,
+                snapshot.errors,
+                diagnostics_json,
+                snapshot.raw_output,
+                snapshot.duration_secs,
+                snapshot.line_coverage_pct,
+                snapshot.branch_coverage_pct,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn store_eval_delta(
+        &self,
+        attempt_id: Option<i64>,
+        repo: &str,
+        delta: &crate::evaluation::EvalDelta,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let regressions_json =
+            serde_json::to_string(&delta.regressions).unwrap_or_else(|_| "[]".into());
+        let fixed_json = serde_json::to_string(&delta.fixed).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "INSERT INTO eval_deltas (attempt_id, repo, tool_name, category, new_passes, new_failures, regressions_json, fixed_json, coverage_delta_pct, overall_improved)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                attempt_id,
+                repo,
+                delta.after.tool_name,
+                delta.after.category.to_string(),
+                delta.new_passes,
+                delta.new_failures,
+                regressions_json,
+                fixed_json,
+                delta.coverage_delta_pct,
+                delta.is_improvement() as i32,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     // ── Code Indexing Storage ─────────────────────────────────────────
 
     /// Get or create a repository ID by name.
@@ -8259,6 +8704,40 @@ fn parse_language(s: &str) -> crate::repo::code_index::Language {
             tracing::error!(language = %other, "Unknown language in DB — data integrity issue; falling back to Rust");
             crate::repo::code_index::Language::Rust
         }
+    }
+}
+
+/// Normalize a value into the [0.0, 1.0] range based on threshold buckets.
+///
+/// The thresholds define 4 equal-width buckets:
+///   [t0..t1] → [0.0..0.25], [t1..t2] → [0.25..0.5], [t2..t3] → [0.5..0.75], [t3..t4] → [0.75..1.0]
+/// Values below t0 map to 0.0, above t4 map to 1.0.
+fn normalize_signal(value: f64, thresholds: &[f64; 5]) -> f64 {
+    if value <= thresholds[0] {
+        return 0.0;
+    }
+    for i in 1..5 {
+        if value <= thresholds[i] {
+            let lo = thresholds[i - 1];
+            let hi = thresholds[i];
+            if (hi - lo).abs() < f64::EPSILON {
+                return (i as f64) / 4.0;
+            }
+            let bucket_frac = (value - lo) / (hi - lo);
+            return ((i - 1) as f64 + bucket_frac) / 4.0;
+        }
+    }
+    1.0
+}
+
+/// Map a complexity score (0.0–1.0) to estimated hours saved.
+fn complexity_to_hours(score: f64) -> f64 {
+    match score {
+        s if s <= 0.2 => 0.5,
+        s if s <= 0.4 => 1.0,
+        s if s <= 0.6 => 2.0,
+        s if s <= 0.8 => 4.0,
+        _ => 8.0,
     }
 }
 
@@ -12891,5 +13370,248 @@ mod tests {
             attempt.error_message,
             Some("unable to fix this".to_string())
         );
+    }
+
+    // ── get_recent_attempts_since tests ────────────────────────────────
+
+    #[test]
+    fn test_get_recent_attempts_since_returns_recent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "issue-1", "P-1").unwrap();
+        tracker.record_attempt("linear", "issue-2", "P-2").unwrap();
+        // Both should be within the last hour
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let attempts = tracker.get_recent_attempts_since(&since).unwrap();
+        assert_eq!(attempts.len(), 2);
+    }
+
+    #[test]
+    fn test_get_recent_attempts_since_empty_when_old() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "issue-1", "P-1").unwrap();
+        // Nothing in the future
+        let since = Utc::now() + chrono::Duration::hours(1);
+        let attempts = tracker.get_recent_attempts_since(&since).unwrap();
+        assert!(attempts.is_empty());
+    }
+
+    // ── has_dependency tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_has_dependency_false_when_none() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        assert!(!tracker.has_dependency("org/repo-a", "org/repo-b").unwrap());
+    }
+
+    #[test]
+    fn test_has_dependency_true_when_exists() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // add_dependency(upstream, downstream, dep_type)
+        // This means downstream depends on upstream
+        tracker
+            .add_dependency("org/upstream", "org/downstream", "runtime")
+            .unwrap();
+        // has_dependency(repo_a, repo_b) checks if repo_a depends on repo_b
+        assert!(tracker
+            .has_dependency("org/downstream", "org/upstream")
+            .unwrap());
+        // Reverse should be false
+        assert!(!tracker
+            .has_dependency("org/upstream", "org/downstream")
+            .unwrap());
+    }
+
+    // ── cross-repo correlation tests ───────────────────────────────────
+
+    #[test]
+    fn test_upsert_cross_repo_correlation_creates_new() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let corr = tracker
+            .upsert_cross_repo_correlation("org/a", "org/b", 24)
+            .unwrap();
+        assert_eq!(corr.repo_a, "org/a");
+        assert_eq!(corr.repo_b, "org/b");
+        assert_eq!(corr.correlation_count, 1);
+        assert_eq!(corr.window_hours, 24);
+    }
+
+    #[test]
+    fn test_upsert_cross_repo_correlation_increments() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .upsert_cross_repo_correlation("org/a", "org/b", 24)
+            .unwrap();
+        tracker
+            .upsert_cross_repo_correlation("org/a", "org/b", 24)
+            .unwrap();
+        let corr = tracker
+            .upsert_cross_repo_correlation("org/a", "org/b", 24)
+            .unwrap();
+        assert_eq!(corr.correlation_count, 3);
+    }
+
+    #[test]
+    fn test_get_cross_repo_correlations_filters_by_count() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Create correlation with count 1
+        tracker
+            .upsert_cross_repo_correlation("org/a", "org/b", 24)
+            .unwrap();
+        // Query with min_count=2 should return empty
+        let results = tracker.get_cross_repo_correlations(2, 48).unwrap();
+        assert!(results.is_empty());
+        // Increment to 2
+        tracker
+            .upsert_cross_repo_correlation("org/a", "org/b", 24)
+            .unwrap();
+        let results = tracker.get_cross_repo_correlations(2, 48).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_get_cross_repo_correlations_multiple_pairs() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for _ in 0..3 {
+            tracker
+                .upsert_cross_repo_correlation("org/a", "org/b", 24)
+                .unwrap();
+        }
+        for _ in 0..5 {
+            tracker
+                .upsert_cross_repo_correlation("org/c", "org/d", 24)
+                .unwrap();
+        }
+        let results = tracker.get_cross_repo_correlations(3, 48).unwrap();
+        assert_eq!(results.len(), 2);
+        // Should be sorted by count DESC
+        assert_eq!(results[0].correlation_count, 5);
+        assert_eq!(results[1].correlation_count, 3);
+    }
+
+    // ── store_code_complexity tests ────────────────────────────────────
+
+    #[test]
+    fn test_store_code_complexity() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.upsert_repository("test/repo", None, None).unwrap();
+        let fc = crate::repo::code_index::complexity::FileComplexity {
+            file_path: "src/main.rs".into(),
+            total_lines: 100,
+            function_count: 5,
+            functions: Vec::new(),
+            avg_cyclomatic: 2.5,
+            max_cyclomatic: 8.0,
+            avg_func_length: 20.0,
+            max_func_length: 50.0,
+            avg_nesting: 1.5,
+            max_nesting: 4.0,
+        };
+        tracker
+            .store_code_complexity(repo_id, "src/main.rs", &fc)
+            .unwrap();
+        // Store again (should upsert without error)
+        tracker
+            .store_code_complexity(repo_id, "src/main.rs", &fc)
+            .unwrap();
+    }
+
+    // ── store_eval_snapshot tests ──────────────────────────────────────
+
+    #[test]
+    fn test_store_eval_snapshot() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let snapshot = crate::evaluation::EvalSnapshot {
+            category: crate::evaluation::EvalCategory::Test,
+            tool_name: "cargo test".into(),
+            exit_code: 0,
+            passed: 10,
+            failed: 0,
+            skipped: 2,
+            warnings: 1,
+            errors: 0,
+            diagnostics: Vec::new(),
+            raw_output: "all tests passed".into(),
+            duration_secs: 5.5,
+            line_coverage_pct: Some(85.0),
+            branch_coverage_pct: None,
+        };
+        let id = tracker
+            .store_eval_snapshot(Some(1), "before", &snapshot)
+            .unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn test_store_eval_snapshot_without_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let snapshot = crate::evaluation::EvalSnapshot::default();
+        let id = tracker
+            .store_eval_snapshot(None, "before", &snapshot)
+            .unwrap();
+        assert!(id > 0);
+    }
+
+    // ── store_eval_delta tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_store_eval_delta() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let before = crate::evaluation::EvalSnapshot {
+            category: crate::evaluation::EvalCategory::Test,
+            tool_name: "cargo test".into(),
+            exit_code: 1,
+            passed: 8,
+            failed: 2,
+            skipped: 0,
+            warnings: 0,
+            errors: 2,
+            diagnostics: Vec::new(),
+            raw_output: String::new(),
+            duration_secs: 3.0,
+            line_coverage_pct: Some(75.0),
+            branch_coverage_pct: None,
+        };
+        let after = crate::evaluation::EvalSnapshot {
+            category: crate::evaluation::EvalCategory::Test,
+            tool_name: "cargo test".into(),
+            exit_code: 0,
+            passed: 10,
+            failed: 0,
+            skipped: 0,
+            warnings: 0,
+            errors: 0,
+            diagnostics: Vec::new(),
+            raw_output: String::new(),
+            duration_secs: 4.0,
+            line_coverage_pct: Some(85.0),
+            branch_coverage_pct: None,
+        };
+        let delta = crate::evaluation::EvalDelta::compute(before, after);
+        let id = tracker
+            .store_eval_delta(Some(1), "test/repo", &delta)
+            .unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn test_store_eval_delta_with_diagnostics() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let diag = crate::evaluation::Diagnostic {
+            file: "src/lib.rs".into(),
+            line: Some(42),
+            column: Some(5),
+            severity: crate::evaluation::types::DiagnosticSeverity::Warning,
+            code: Some("W001".into()),
+            message: "unused variable".into(),
+        };
+        let before = crate::evaluation::EvalSnapshot {
+            diagnostics: vec![diag.clone()],
+            ..Default::default()
+        };
+        let after = crate::evaluation::EvalSnapshot::default();
+        let delta = crate::evaluation::EvalDelta::compute(before, after);
+        assert_eq!(delta.fixed.len(), 1);
+        let id = tracker.store_eval_delta(None, "test/repo", &delta).unwrap();
+        assert!(id > 0);
     }
 }

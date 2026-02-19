@@ -81,6 +81,19 @@ struct CliMessage {
     content: Vec<CliContentBlock>,
 }
 
+/// Token usage reported by the Claude CLI result event.
+#[derive(Debug, Deserialize)]
+struct CliUsage {
+    #[serde(default)]
+    input_tokens: Option<i64>,
+    #[serde(default)]
+    output_tokens: Option<i64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<i64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<i64>,
+}
+
 /// Top-level NDJSON events emitted by `claude --output-format stream-json`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -98,6 +111,16 @@ enum StreamEvent {
     Result {
         #[serde(default)]
         structured_output: Option<serde_json::Value>,
+        #[serde(default)]
+        total_cost_usd: Option<f64>,
+        #[serde(default)]
+        num_turns: Option<i64>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        duration_api_ms: Option<i64>,
+        #[serde(default)]
+        usage: Option<CliUsage>,
     },
     /// Forward-compat: ignore unknown event types.
     #[serde(other)]
@@ -121,6 +144,21 @@ struct ExecutionLogFiles {
     stdout: PathBuf,
     stderr: PathBuf,
     events: PathBuf,
+}
+
+/// Aggregated result from parsing the stdout stream.
+#[derive(Debug, Default)]
+struct StdoutParseResult {
+    text_output: String,
+    structured_result: Option<serde_json::Value>,
+    cost_usd: Option<f64>,
+    num_turns: Option<i64>,
+    session_id: Option<String>,
+    duration_api_ms: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_input_tokens: Option<i64>,
+    cache_creation_input_tokens: Option<i64>,
 }
 
 /// Configuration for the Claude runner.
@@ -738,6 +776,14 @@ The PR title should include the issue ID: {}
             let mut text_output = String::new();
             let mut line_number: u64 = 0;
             let mut structured_result: Option<serde_json::Value> = None;
+            let mut result_cost_usd: Option<f64> = None;
+            let mut result_num_turns: Option<i64> = None;
+            let mut result_session_id: Option<String> = None;
+            let mut result_duration_api_ms: Option<i64> = None;
+            let mut result_input_tokens: Option<i64> = None;
+            let mut result_output_tokens: Option<i64> = None;
+            let mut result_cache_read_tokens: Option<i64> = None;
+            let mut result_cache_creation_tokens: Option<i64> = None;
             let mut writer = match stdout_log_path {
                 Some(path) => match tokio::fs::OpenOptions::new()
                     .create(true)
@@ -845,9 +891,28 @@ The PR title should include the issue ID: {}
                                 }
                             }
                         }
-                        Ok(StreamEvent::Result { structured_output }) => {
+                        Ok(StreamEvent::Result {
+                            structured_output,
+                            total_cost_usd,
+                            num_turns,
+                            session_id,
+                            duration_api_ms,
+                            usage,
+                        }) => {
                             if let Some(obj) = structured_output {
                                 structured_result = Some(obj);
+                            }
+                            if let Some(cost) = total_cost_usd {
+                                result_cost_usd = Some(cost);
+                            }
+                            result_num_turns = num_turns;
+                            result_session_id = session_id;
+                            result_duration_api_ms = duration_api_ms;
+                            if let Some(u) = usage {
+                                result_input_tokens = u.input_tokens;
+                                result_output_tokens = u.output_tokens;
+                                result_cache_read_tokens = u.cache_read_input_tokens;
+                                result_cache_creation_tokens = u.cache_creation_input_tokens;
                             }
                         }
                         Ok(_) => { /* System, User, Unknown — ignored */ }
@@ -885,7 +950,18 @@ The PR title should include the issue ID: {}
                 }),
             )
             .await;
-            (text_output, structured_result)
+            StdoutParseResult {
+                text_output,
+                structured_result,
+                cost_usd: result_cost_usd,
+                num_turns: result_num_turns,
+                session_id: result_session_id,
+                duration_api_ms: result_duration_api_ms,
+                input_tokens: result_input_tokens,
+                output_tokens: result_output_tokens,
+                cache_read_input_tokens: result_cache_read_tokens,
+                cache_creation_input_tokens: result_cache_creation_tokens,
+            }
         });
 
         // Stream stderr
@@ -1128,7 +1204,7 @@ The PR title should include the issue ID: {}
             }
         };
 
-        let (text_output, structured_result) = match stdout_handle.await {
+        let stdout_result = match stdout_handle.await {
             Ok(result) => result,
             Err(e) => {
                 tracing::error!(
@@ -1137,9 +1213,21 @@ The PR title should include the issue ID: {}
                     error = %e,
                     "stdout reader task failed"
                 );
-                (String::new(), None)
+                StdoutParseResult::default()
             }
         };
+        let StdoutParseResult {
+            text_output,
+            structured_result,
+            cost_usd: result_cost_usd,
+            num_turns: result_num_turns,
+            session_id: result_session_id,
+            duration_api_ms: result_duration_api_ms,
+            input_tokens: result_input_tokens,
+            output_tokens: result_output_tokens,
+            cache_read_input_tokens: result_cache_read_tokens,
+            cache_creation_input_tokens: result_cache_creation_tokens,
+        } = stdout_result;
         let stderr_output = stderr_handle.await.unwrap_or_default();
 
         let exit_code = status.code().unwrap_or(-1);
@@ -1242,6 +1330,14 @@ The PR title should include the issue ID: {}
         } else {
             Some(Self::truncate(&stderr_output, EXECUTION_LOG_PREVIEW_LIMIT))
         };
+        execution.total_cost_usd = result_cost_usd;
+        execution.num_turns = result_num_turns;
+        execution.session_id = result_session_id;
+        execution.duration_api_ms = result_duration_api_ms;
+        execution.input_tokens = result_input_tokens;
+        execution.output_tokens = result_output_tokens;
+        execution.cache_read_input_tokens = result_cache_read_tokens;
+        execution.cache_creation_input_tokens = result_cache_creation_tokens;
 
         // Record the execution to the database (don't fail the main operation if this fails)
         if let Err(e) = self.tracker.record_execution(&execution) {
@@ -1507,6 +1603,7 @@ mod tests {
         match event {
             StreamEvent::Result {
                 structured_output: Some(obj),
+                ..
             } => {
                 assert_eq!(obj["summary"], "done");
                 assert_eq!(obj["success"], true);
@@ -1519,12 +1616,39 @@ mod tests {
     fn test_parse_cli_result_without_structured_output() {
         let line = r#"{"type":"result"}"#;
         let event: StreamEvent = serde_json::from_str(line).unwrap();
-        assert!(matches!(
-            event,
+        match event {
             StreamEvent::Result {
-                structured_output: None
+                structured_output: None,
+                ..
+            } => {}
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_result_with_cost_and_usage() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":2557,"duration_api_ms":2546,"num_turns":1,"result":"done","session_id":"sess-123","total_cost_usd":0.027,"usage":{"input_tokens":3,"cache_creation_input_tokens":2833,"cache_read_input_tokens":18758,"output_tokens":4}}"#;
+        let event: StreamEvent = serde_json::from_str(line).unwrap();
+        match event {
+            StreamEvent::Result {
+                total_cost_usd: Some(cost),
+                num_turns: Some(turns),
+                session_id: Some(ref sid),
+                duration_api_ms: Some(api_ms),
+                usage: Some(ref u),
+                ..
+            } => {
+                assert!((cost - 0.027).abs() < 1e-6);
+                assert_eq!(turns, 1);
+                assert_eq!(sid, "sess-123");
+                assert_eq!(api_ms, 2546);
+                assert_eq!(u.input_tokens, Some(3));
+                assert_eq!(u.output_tokens, Some(4));
+                assert_eq!(u.cache_read_input_tokens, Some(18758));
+                assert_eq!(u.cache_creation_input_tokens, Some(2833));
             }
-        ));
+            other => panic!("Unexpected event: {:?}", other),
+        }
     }
 
     #[test]
@@ -2631,5 +2755,1000 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.instructions.as_deref(), Some("Always write tests"));
+    }
+
+    // ── resolve_log_root() tests ────────────────────────────────────
+
+    #[test]
+    fn test_resolve_log_root_default_without_env_var() {
+        // Remove the env var if it happens to be set
+        let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
+        std::env::remove_var("CLAUDEAR_LOG_DIR");
+
+        let root = resolve_log_root();
+        assert_eq!(root, PathBuf::from(DEFAULT_LOG_DIR));
+
+        // Restore previous value
+        if let Some(val) = prev {
+            std::env::set_var("CLAUDEAR_LOG_DIR", val);
+        }
+    }
+
+    #[test]
+    fn test_resolve_log_root_with_env_var() {
+        let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
+        std::env::set_var("CLAUDEAR_LOG_DIR", "/tmp/custom-logs");
+
+        let root = resolve_log_root();
+        assert_eq!(root, PathBuf::from("/tmp/custom-logs"));
+
+        // Restore
+        if let Some(val) = prev {
+            std::env::set_var("CLAUDEAR_LOG_DIR", val);
+        } else {
+            std::env::remove_var("CLAUDEAR_LOG_DIR");
+        }
+    }
+
+    #[test]
+    fn test_resolve_log_root_private_matches_public() {
+        // The private method ClaudeRunner::resolve_log_root() should match
+        // the public function resolve_log_root() since they share the same logic.
+        let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
+        std::env::remove_var("CLAUDEAR_LOG_DIR");
+
+        let public_root = resolve_log_root();
+        let private_root = ClaudeRunner::resolve_log_root();
+        assert_eq!(public_root, private_root);
+
+        if let Some(val) = prev {
+            std::env::set_var("CLAUDEAR_LOG_DIR", val);
+        }
+    }
+
+    // ── StdoutParseResult default tests ──────────────────────────────
+
+    #[test]
+    fn test_stdout_parse_result_default() {
+        let result = StdoutParseResult::default();
+        assert!(result.text_output.is_empty());
+        assert!(result.structured_result.is_none());
+        assert!(result.cost_usd.is_none());
+        assert!(result.num_turns.is_none());
+        assert!(result.session_id.is_none());
+        assert!(result.duration_api_ms.is_none());
+        assert!(result.input_tokens.is_none());
+        assert!(result.output_tokens.is_none());
+        assert!(result.cache_read_input_tokens.is_none());
+        assert!(result.cache_creation_input_tokens.is_none());
+    }
+
+    // ── ExecutionLogFiles struct tests ────────────────────────────────
+
+    #[test]
+    fn test_execution_log_files_clone() {
+        let files = ExecutionLogFiles {
+            stdout: PathBuf::from("/tmp/test.stdout.log"),
+            stderr: PathBuf::from("/tmp/test.stderr.log"),
+            events: PathBuf::from("/tmp/test.events.jsonl"),
+        };
+        let cloned = files.clone();
+        assert_eq!(cloned.stdout, files.stdout);
+        assert_eq!(cloned.stderr, files.stderr);
+        assert_eq!(cloned.events, files.events);
+    }
+
+    #[test]
+    fn test_execution_log_files_debug() {
+        let files = ExecutionLogFiles {
+            stdout: PathBuf::from("/tmp/test.stdout.log"),
+            stderr: PathBuf::from("/tmp/test.stderr.log"),
+            events: PathBuf::from("/tmp/test.events.jsonl"),
+        };
+        let debug = format!("{:?}", files);
+        assert!(debug.contains("stdout"));
+        assert!(debug.contains("stderr"));
+        assert!(debug.contains("events"));
+    }
+
+    // ── create_execution_log_files tests ─────────────────────────────
+
+    #[test]
+    fn test_create_execution_log_files_produces_valid_paths() {
+        let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
+        let tmp_dir = std::env::temp_dir().join("claudear_test_exec_logs");
+        std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
+
+        let files = ClaudeRunner::create_execution_log_files("test-label");
+        assert!(files.is_some());
+
+        let files = files.unwrap();
+        assert!(files.stdout.to_str().unwrap().contains("test-label"));
+        assert!(files.stdout.to_str().unwrap().ends_with(".stdout.log"));
+        assert!(files.stderr.to_str().unwrap().ends_with(".stderr.log"));
+        assert!(files.events.to_str().unwrap().ends_with(".events.jsonl"));
+
+        // All paths should share the same parent directory
+        assert_eq!(files.stdout.parent(), files.stderr.parent());
+        assert_eq!(files.stderr.parent(), files.events.parent());
+
+        // The path should include the CLAUDE_LOG_SUBDIR
+        assert!(files.stdout.to_str().unwrap().contains(CLAUDE_LOG_SUBDIR));
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        if let Some(val) = prev {
+            std::env::set_var("CLAUDEAR_LOG_DIR", val);
+        } else {
+            std::env::remove_var("CLAUDEAR_LOG_DIR");
+        }
+    }
+
+    #[test]
+    fn test_create_execution_log_files_sanitizes_label_in_filenames() {
+        let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
+        let tmp_dir = std::env::temp_dir().join("claudear_test_sanitize_logs");
+        std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
+
+        let files = ClaudeRunner::create_execution_log_files("hello world/foo@bar");
+        assert!(files.is_some());
+        let files = files.unwrap();
+        let stem = files
+            .stdout
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        // The label portion should not contain spaces, slashes, or @
+        assert!(!stem.contains(' '));
+        assert!(!stem.contains('/'));
+        assert!(!stem.contains('@'));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        if let Some(val) = prev {
+            std::env::set_var("CLAUDEAR_LOG_DIR", val);
+        } else {
+            std::env::remove_var("CLAUDEAR_LOG_DIR");
+        }
+    }
+
+    // ── prepare_env_and_label tests ──────────────────────────────────
+
+    #[test]
+    fn test_prepare_env_and_label_with_issue() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let issue = Issue::new("id-42", "PROJ-42", "A bug", "https://ex.com", "linear");
+        let (env, label) = runner.prepare_env_and_label(Some(&issue));
+
+        assert_eq!(label, "PROJ-42");
+        assert_eq!(env.get("LINEAR_ISSUE_ID"), Some(&"id-42".to_string()));
+        assert_eq!(
+            env.get("LINEAR_ISSUE_SHORT_ID"),
+            Some(&"PROJ-42".to_string())
+        );
+        assert_eq!(
+            env.get("LINEAR_ISSUE_URL"),
+            Some(&"https://ex.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_prepare_env_and_label_without_issue() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let (env, label) = runner.prepare_env_and_label(None);
+
+        assert_eq!(label, "custom");
+        // Should not contain any issue-specific env vars
+        assert!(env.get("LINEAR_ISSUE_ID").is_none());
+    }
+
+    #[test]
+    fn test_prepare_env_and_label_sentry_source() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let issue = Issue::new("s-1", "SENTRY-1", "Error", "https://sentry.io/1", "sentry");
+        let (env, label) = runner.prepare_env_and_label(Some(&issue));
+
+        assert_eq!(label, "SENTRY-1");
+        assert_eq!(env.get("SENTRY_ISSUE_ID"), Some(&"s-1".to_string()));
+        assert_eq!(
+            env.get("SENTRY_ISSUE_SHORT_ID"),
+            Some(&"SENTRY-1".to_string())
+        );
+        assert_eq!(
+            env.get("SENTRY_ISSUE_URL"),
+            Some(&"https://sentry.io/1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_prepare_env_and_label_github_source() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let issue = Issue::new(
+            "789",
+            "#789",
+            "Feature",
+            "https://github.com/o/r/issues/789",
+            "github",
+        );
+        let (env, label) = runner.prepare_env_and_label(Some(&issue));
+
+        assert_eq!(label, "#789");
+        assert_eq!(env.get("GITHUB_ISSUE_ID"), Some(&"789".to_string()));
+        assert_eq!(env.get("GITHUB_ISSUE_SHORT_ID"), Some(&"#789".to_string()));
+    }
+
+    // ── build_prompt_for_issue public wrapper test ────────────────────
+
+    #[test]
+    fn test_build_prompt_for_issue_matches_build_prompt() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
+        let project_dir = Path::new("/tmp");
+
+        let from_public = runner.build_prompt_for_issue(&issue, "ctx", project_dir);
+        let from_private = runner.build_prompt(&issue, "ctx", project_dir);
+        assert_eq!(from_public, from_private);
+    }
+
+    // ── has_agent_md / get_agent_md with a real AGENT.md ─────────────
+
+    #[test]
+    fn test_has_agent_md_with_existing_file() {
+        let tmp_dir = std::env::temp_dir().join("claudear_test_agent_md");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::write(tmp_dir.join("AGENT.md"), "# Agent instructions\nDo things.").unwrap();
+
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        assert!(runner.has_agent_md(&tmp_dir));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_get_agent_md_with_existing_file() {
+        let tmp_dir = std::env::temp_dir().join("claudear_test_agent_md_get");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let content = "# Agent\nCustom instructions here.";
+        std::fs::write(tmp_dir.join("AGENT.md"), content).unwrap();
+
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let loaded = runner.get_agent_md(&tmp_dir);
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap(), content);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_get_agent_md_returns_none_for_missing() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        assert!(runner
+            .get_agent_md(Path::new("/nonexistent/path/xyz"))
+            .is_none());
+    }
+
+    // ── Deserialization edge cases ───────────────────────────────────
+
+    #[test]
+    fn test_cli_usage_all_none() {
+        let json = r#"{}"#;
+        let usage: CliUsage = serde_json::from_str(json).unwrap();
+        assert!(usage.input_tokens.is_none());
+        assert!(usage.output_tokens.is_none());
+        assert!(usage.cache_read_input_tokens.is_none());
+        assert!(usage.cache_creation_input_tokens.is_none());
+    }
+
+    #[test]
+    fn test_cli_usage_partial_fields() {
+        let json = r#"{"input_tokens": 100, "output_tokens": 50}"#;
+        let usage: CliUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(50));
+        assert!(usage.cache_read_input_tokens.is_none());
+        assert!(usage.cache_creation_input_tokens.is_none());
+    }
+
+    #[test]
+    fn test_cli_usage_all_fields() {
+        let json = r#"{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}"#;
+        let usage: CliUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(usage.cache_creation_input_tokens, Some(40));
+    }
+
+    #[test]
+    fn test_cli_message_empty_content() {
+        let json = r#"{"content":[]}"#;
+        let msg: CliMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.content.is_empty());
+    }
+
+    #[test]
+    fn test_cli_message_missing_content_field_defaults() {
+        let json = r#"{}"#;
+        let msg: CliMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.content.is_empty());
+    }
+
+    #[test]
+    fn test_stream_event_assistant_no_message() {
+        let json = r#"{"type":"assistant"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Assistant { message: None } => {}
+            other => panic!("Expected Assistant with no message, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stream_event_result_all_fields() {
+        let json = r#"{
+            "type": "result",
+            "structured_output": {"summary": "all done", "success": true},
+            "total_cost_usd": 0.123,
+            "num_turns": 5,
+            "session_id": "sess-abc",
+            "duration_api_ms": 9876,
+            "usage": {"input_tokens": 100, "output_tokens": 200, "cache_read_input_tokens": 300, "cache_creation_input_tokens": 400}
+        }"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Result {
+                structured_output: Some(ref so),
+                total_cost_usd: Some(cost),
+                num_turns: Some(turns),
+                session_id: Some(ref sid),
+                duration_api_ms: Some(api_ms),
+                usage: Some(ref u),
+            } => {
+                assert_eq!(so["summary"], "all done");
+                assert!((cost - 0.123).abs() < 1e-6);
+                assert_eq!(turns, 5);
+                assert_eq!(sid, "sess-abc");
+                assert_eq!(api_ms, 9876);
+                assert_eq!(u.input_tokens, Some(100));
+                assert_eq!(u.output_tokens, Some(200));
+                assert_eq!(u.cache_read_input_tokens, Some(300));
+                assert_eq!(u.cache_creation_input_tokens, Some(400));
+            }
+            other => panic!("Unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stream_event_result_no_optional_fields() {
+        let json = r#"{"type":"result"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Result {
+                structured_output: None,
+                total_cost_usd: None,
+                num_turns: None,
+                session_id: None,
+                duration_api_ms: None,
+                usage: None,
+            } => {}
+            other => panic!("Expected Result with all None, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stream_event_ignores_extra_fields() {
+        // Ensure forward-compat: extra fields in known events are silently ignored
+        let json =
+            r#"{"type":"system","subtype":"init","session_id":"xyz","extra_field":"ignored"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, StreamEvent::System {}));
+    }
+
+    #[test]
+    fn test_stream_event_user_ignores_extra_fields() {
+        let json = r#"{"type":"user","message":{"role":"user","content":"hello"},"extra":true}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, StreamEvent::User {}));
+    }
+
+    // ── StructuredResult edge cases ──────────────────────────────────
+
+    #[test]
+    fn test_structured_result_non_https_pr_url() {
+        let json =
+            r#"{"summary":"done","success":true,"pr_url":"http://github.com/org/repo/pull/1"}"#;
+        let sr: StructuredResult = serde_json::from_str(json).unwrap();
+        assert!(sr.success);
+        // The pr_url is stored as-is in StructuredResult; filtering to https happens in the runner
+        assert_eq!(
+            sr.pr_url.as_deref(),
+            Some("http://github.com/org/repo/pull/1")
+        );
+    }
+
+    #[test]
+    fn test_structured_result_empty_pr_url_string() {
+        let json = r#"{"summary":"done","success":true,"pr_url":""}"#;
+        let sr: StructuredResult = serde_json::from_str(json).unwrap();
+        assert_eq!(sr.pr_url.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_structured_result_blocking_question_minimal() {
+        let json =
+            r#"{"summary":"stuck","success":false,"blocking_question":{"question":"help?"}}"#;
+        let sr: StructuredResult = serde_json::from_str(json).unwrap();
+        let bq = sr.blocking_question.unwrap();
+        assert_eq!(bq.question, "help?");
+        assert!(bq.context.is_none());
+        assert!(bq.options.is_empty());
+        assert!(bq.why.is_none());
+    }
+
+    #[test]
+    fn test_structured_result_blocking_question_empty_options() {
+        let json = r#"{"summary":"stuck","success":false,"blocking_question":{"question":"q","context":null,"options":[],"why":null}}"#;
+        let sr: StructuredResult = serde_json::from_str(json).unwrap();
+        let bq = sr.blocking_question.unwrap();
+        assert_eq!(bq.question, "q");
+        assert!(bq.options.is_empty());
+    }
+
+    // ── extract_blocking_question edge cases ─────────────────────────
+
+    #[test]
+    fn test_extract_blocking_question_prefix_only_empty_payload() {
+        // "CLAUDEAR_QUESTION:" followed by whitespace only => None
+        let output = "CLAUDEAR_QUESTION:   ";
+        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_prefix_without_colon() {
+        let output = "CLAUDEAR_QUESTION {\"question\":\"test\"}";
+        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_multiple_lines_picks_first() {
+        let output = "CLAUDEAR_QUESTION: {\"question\":\"first\"}\nCLAUDEAR_QUESTION: {\"question\":\"second\"}";
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "first");
+    }
+
+    #[test]
+    fn test_extract_blocking_question_with_surrounding_whitespace() {
+        let output = "   CLAUDEAR_QUESTION:  {\"question\":\"trimmed\"}  ";
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "trimmed");
+    }
+
+    #[test]
+    fn test_extract_blocking_question_no_prefix_present() {
+        let output = "Just some regular output\nwithout any question markers\n";
+        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+    }
+
+    #[test]
+    fn test_extract_blocking_question_with_all_fields() {
+        let output = r#"CLAUDEAR_QUESTION: {"question":"Which DB?","context":"Found postgres and mysql","options":["postgres","mysql","sqlite"],"why":"Cannot determine from config"}"#;
+        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        assert_eq!(parsed.question, "Which DB?");
+        assert_eq!(parsed.context.as_deref(), Some("Found postgres and mysql"));
+        assert_eq!(parsed.options, vec!["postgres", "mysql", "sqlite"]);
+        assert_eq!(parsed.why.as_deref(), Some("Cannot determine from config"));
+    }
+
+    // ── compose_failure_message additional edge cases ─────────────────
+
+    #[test]
+    fn test_compose_failure_message_rate_limit_combined_empty_gives_default() {
+        // When both are empty but still trigger rate limit through combined being empty,
+        // this should not happen, but let's verify the fallback.
+        let msg = ClaudeRunner::compose_failure_message(1, "", "");
+        assert!(!msg.starts_with("Claude rate limit hit:"));
+        assert_eq!(msg, "Process exited with code 1");
+    }
+
+    #[test]
+    fn test_compose_failure_message_whitespace_stderr_ignored() {
+        let msg = ClaudeRunner::compose_failure_message(2, "actual output", "   ");
+        assert!(msg.contains("actual output"));
+        assert!(msg.contains("Process exited with code 2"));
+    }
+
+    #[test]
+    fn test_compose_failure_message_very_long_stdout_truncated() {
+        let long_stdout = "o".repeat(5000);
+        let msg = ClaudeRunner::compose_failure_message(1, &long_stdout, "");
+        assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 50); // +50 for prefix
+        assert!(msg.contains("Process exited with code 1"));
+    }
+
+    #[test]
+    fn test_compose_failure_message_rate_limit_429_in_stderr() {
+        let msg = ClaudeRunner::compose_failure_message(1, "", "HTTP 429");
+        assert!(msg.starts_with("Claude rate limit hit:"));
+    }
+
+    #[test]
+    fn test_compose_failure_message_exit_code_zero_with_stderr() {
+        // Even exit code 0 can produce a failure message if called
+        let msg = ClaudeRunner::compose_failure_message(0, "", "some stderr");
+        assert_eq!(msg, "some stderr");
+    }
+
+    #[test]
+    fn test_compose_failure_message_negative_exit_code() {
+        let msg = ClaudeRunner::compose_failure_message(-1, "", "");
+        assert_eq!(msg, "Process exited with code -1");
+    }
+
+    // ── truncate additional edge cases ───────────────────────────────
+
+    #[test]
+    fn test_truncate_max_len_of_0_non_empty_input() {
+        // max_len = 0 means we want 0 chars + "..." => the "..." itself
+        let result = ClaudeRunner::truncate("hello", 0);
+        assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn test_truncate_emoji_boundary() {
+        // Emoji is 4 bytes. With max_len=5, we have room for 2 chars before "...",
+        // but the emoji won't fit in 2 bytes, so we should get safe truncation.
+        let input = "\u{1F600}abc"; // grinning face (4 bytes) + "abc"
+        let result = ClaudeRunner::truncate(input, 5);
+        assert!(result.ends_with("..."));
+        // Must be valid UTF-8
+        assert!(result.len() <= 8); // at most the emoji (4) + "..." (3)
+    }
+
+    #[test]
+    fn test_truncate_all_multibyte() {
+        let input = "\u{00e9}\u{00e9}\u{00e9}\u{00e9}"; // "eeee" with accents, 2 bytes each = 8 bytes
+        let result = ClaudeRunner::truncate(input, 6);
+        assert!(result.ends_with("..."));
+        // Should safely truncate at a char boundary
+        assert!(result.is_char_boundary(0));
+    }
+
+    #[test]
+    fn test_truncate_max_len_of_1() {
+        let result = ClaudeRunner::truncate("abcdef", 1);
+        assert_eq!(result, "...");
+    }
+
+    // ── hash_prompt additional tests ─────────────────────────────────
+
+    #[test]
+    fn test_hash_prompt_very_long_string() {
+        let long = "x".repeat(100_000);
+        let h = ClaudeRunner::hash_prompt(&long);
+        assert_eq!(h.len(), 16);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_hash_prompt_whitespace_differences_produce_different_hashes() {
+        assert_ne!(
+            ClaudeRunner::hash_prompt("hello world"),
+            ClaudeRunner::hash_prompt("hello  world")
+        );
+    }
+
+    #[test]
+    fn test_hash_prompt_case_sensitive() {
+        assert_ne!(
+            ClaudeRunner::hash_prompt("Hello"),
+            ClaudeRunner::hash_prompt("hello")
+        );
+    }
+
+    // ── is_rate_limit_error additional tests ─────────────────────────
+
+    #[test]
+    fn test_is_rate_limit_error_mixed_case_embedded() {
+        assert!(ClaudeRunner::is_rate_limit_error(
+            "Error: The API returned a RateLimit error"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_quota_in_longer_message() {
+        assert!(ClaudeRunner::is_rate_limit_error(
+            "Your project quota exceeded the monthly limit"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_not_triggered_by_partial_substring() {
+        // "rate" alone should not trigger it
+        assert!(!ClaudeRunner::is_rate_limit_error("first rate code"));
+    }
+
+    // ── is_hard_error additional tests ───────────────────────────────
+
+    #[test]
+    fn test_is_hard_error_all_needles() {
+        // Verify every hard error needle is recognized
+        let needles = [
+            "failed to spawn claude",
+            "failed to wait for claude",
+            "failed to capture stdout",
+            "failed to capture stderr",
+            "process timed out",
+            "timed out after",
+            "connection reset",
+            "service unavailable",
+            "internal server error",
+            "network error",
+            "broken pipe",
+        ];
+        for needle in needles {
+            assert!(
+                ClaudeRunner::is_hard_error(needle),
+                "Expected hard error for: {}",
+                needle
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_hard_error_normal_compilation_errors_not_hard() {
+        let soft_errors = [
+            "error[E0308]: mismatched types",
+            "npm ERR! code ELIFECYCLE",
+            "FAILED: 3 tests",
+            "assertion failed at line 42",
+            "segfault",
+        ];
+        for msg in soft_errors {
+            assert!(
+                !ClaudeRunner::is_hard_error(msg),
+                "Should NOT be hard error: {}",
+                msg
+            );
+        }
+    }
+
+    // ── sanitize_label additional tests ──────────────────────────────
+
+    #[test]
+    fn test_sanitize_label_numbers_only() {
+        assert_eq!(ClaudeRunner::sanitize_label("12345"), "12345");
+    }
+
+    #[test]
+    fn test_sanitize_label_single_char() {
+        assert_eq!(ClaudeRunner::sanitize_label("a"), "a");
+        assert_eq!(ClaudeRunner::sanitize_label("@"), "_");
+    }
+
+    #[test]
+    fn test_sanitize_label_mixed_valid_and_invalid() {
+        assert_eq!(ClaudeRunner::sanitize_label("PROJ-123/fix"), "PROJ-123_fix");
+    }
+
+    #[test]
+    fn test_sanitize_label_65_chars_truncated() {
+        let label = "a".repeat(65);
+        let result = ClaudeRunner::sanitize_label(&label);
+        assert_eq!(result.len(), 64);
+    }
+
+    // ── ClaudeRunnerConfig full construction ─────────────────────────
+
+    #[test]
+    fn test_claude_runner_config_fully_specified() {
+        let config = ClaudeRunnerConfig {
+            timeout_secs: 300,
+            model: Some("claude-3-opus".to_string()),
+            instructions: Some("Be concise.".to_string()),
+            permissions: vec!["Bash".to_string(), "Read".to_string(), "Write".to_string()],
+            skip_permissions: true,
+        };
+        assert_eq!(config.timeout_secs, 300);
+        assert_eq!(config.model.as_deref(), Some("claude-3-opus"));
+        assert_eq!(config.instructions.as_deref(), Some("Be concise."));
+        assert_eq!(config.permissions.len(), 3);
+        assert!(config.skip_permissions);
+
+        // Clone preserves all fields
+        let cloned = config.clone();
+        assert_eq!(cloned.timeout_secs, 300);
+        assert_eq!(cloned.model, config.model);
+        assert_eq!(cloned.instructions, config.instructions);
+        assert_eq!(cloned.permissions, config.permissions);
+        assert_eq!(cloned.skip_permissions, config.skip_permissions);
+    }
+
+    // ── new_simple constructor test ──────────────────────────────────
+
+    #[test]
+    fn test_new_simple_creates_working_runner() {
+        let config = ClaudeRunnerConfig {
+            timeout_secs: 100,
+            model: Some("haiku".to_string()),
+            instructions: Some("test".to_string()),
+            permissions: vec!["Bash".to_string()],
+            skip_permissions: true,
+        };
+        let runner = ClaudeRunner::new_simple(config);
+        // Verify the runner works by calling methods that depend on proper initialization
+        assert!(!runner.has_agent_md(Path::new("/nonexistent")));
+        let issue = Issue::new("1", "T-1", "Bug", "https://example.com", "linear");
+        let prompt = runner.build_prompt(&issue, "ctx", Path::new("/tmp"));
+        assert!(!prompt.is_empty());
+    }
+
+    // ── RESULT_SCHEMA detailed validation ────────────────────────────
+
+    #[test]
+    fn test_result_schema_required_fields() {
+        let parsed: serde_json::Value = serde_json::from_str(RESULT_SCHEMA).unwrap();
+        let required = parsed["required"].as_array().unwrap();
+        let required_strs: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(required_strs.contains(&"summary"));
+        assert!(required_strs.contains(&"success"));
+    }
+
+    #[test]
+    fn test_result_schema_no_additional_properties() {
+        let parsed: serde_json::Value = serde_json::from_str(RESULT_SCHEMA).unwrap();
+        assert_eq!(parsed["additionalProperties"], false);
+    }
+
+    #[test]
+    fn test_result_schema_blocking_question_sub_schema() {
+        let parsed: serde_json::Value = serde_json::from_str(RESULT_SCHEMA).unwrap();
+        let bq = &parsed["properties"]["blocking_question"];
+        let bq_required = bq["required"].as_array().unwrap();
+        let bq_required_strs: Vec<&str> = bq_required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(bq_required_strs.contains(&"question"));
+        assert!(bq["properties"]["question"].is_object());
+        assert!(bq["properties"]["context"].is_object());
+        assert!(bq["properties"]["options"].is_object());
+        assert!(bq["properties"]["why"].is_object());
+        assert_eq!(bq["additionalProperties"], false);
+    }
+
+    // ── CliContentBlock deserialization tests ─────────────────────────
+
+    #[test]
+    fn test_cli_content_block_text_deserialization() {
+        let json = r#"{"type":"text","text":"hello"}"#;
+        let block: CliContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            CliContentBlock::Text { text } => assert_eq!(text, "hello"),
+            other => panic!("Expected Text, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_content_block_tool_use_deserialization() {
+        let json = r#"{"type":"tool_use","id":"tool-abc","name":"Grep"}"#;
+        let block: CliContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            CliContentBlock::ToolUse { id, name } => {
+                assert_eq!(id, "tool-abc");
+                assert_eq!(name, "Grep");
+            }
+            other => panic!("Expected ToolUse, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_content_block_other_types() {
+        // "thinking", "tool_result", or any future type should map to Other
+        for type_name in &["thinking", "tool_result", "image", "some_future_type"] {
+            let json = format!(r#"{{"type":"{}","data":"whatever"}}"#, type_name);
+            let block: CliContentBlock = serde_json::from_str(&json).unwrap();
+            assert!(
+                matches!(block, CliContentBlock::Other),
+                "Expected Other for type: {}",
+                type_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_content_block_text_empty_string() {
+        let json = r#"{"type":"text","text":""}"#;
+        let block: CliContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            CliContentBlock::Text { text } => assert!(text.is_empty()),
+            other => panic!("Expected Text, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_content_block_text_with_special_chars() {
+        let json = r#"{"type":"text","text":"line1\nline2\ttab\"quote\\"}"#;
+        let block: CliContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            CliContentBlock::Text { text } => {
+                assert!(text.contains('\n'));
+                assert!(text.contains('\t'));
+                assert!(text.contains('"'));
+                assert!(text.contains('\\'));
+            }
+            other => panic!("Expected Text, got: {:?}", other),
+        }
+    }
+
+    // ── CliMessage with multiple content blocks ──────────────────────
+
+    #[test]
+    fn test_cli_message_mixed_content() {
+        let json = r#"{"content":[
+            {"type":"text","text":"Analyzing..."},
+            {"type":"tool_use","id":"t1","name":"Bash"},
+            {"type":"thinking","thinking":"hmm"},
+            {"type":"text","text":"Done."}
+        ]}"#;
+        let msg: CliMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content.len(), 4);
+        assert!(
+            matches!(&msg.content[0], CliContentBlock::Text { text } if text == "Analyzing...")
+        );
+        assert!(matches!(&msg.content[1], CliContentBlock::ToolUse { name, .. } if name == "Bash"));
+        assert!(matches!(&msg.content[2], CliContentBlock::Other));
+        assert!(matches!(&msg.content[3], CliContentBlock::Text { text } if text == "Done."));
+    }
+
+    // ── StreamEvent realistic stream simulation ──────────────────────
+
+    #[test]
+    fn test_parse_realistic_ndjson_stream() {
+        // Simulate a sequence of NDJSON events as Claude CLI would emit
+        let lines = vec![
+            r#"{"type":"system","subtype":"init","session_id":"sess-001"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I'll analyze the issue."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Bash"}]}}"#,
+            r#"{"type":"user","message":{"role":"user"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"The fix is applied."}]}}"#,
+            r#"{"type":"result","structured_output":{"summary":"Fixed the bug","success":true,"pr_url":"https://github.com/org/repo/pull/42"},"total_cost_usd":0.05,"num_turns":3,"session_id":"sess-001","duration_api_ms":15000,"usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":2000,"cache_creation_input_tokens":100}}"#,
+        ];
+
+        let mut text_output = String::new();
+        let mut structured_result: Option<serde_json::Value> = None;
+        let mut cost = None;
+        let mut turns = None;
+
+        for line in lines {
+            let event: StreamEvent = serde_json::from_str(line).unwrap();
+            match event {
+                StreamEvent::Assistant { message: Some(msg) } => {
+                    for block in &msg.content {
+                        if let CliContentBlock::Text { text } = block {
+                            text_output.push_str(text);
+                        }
+                    }
+                }
+                StreamEvent::Result {
+                    structured_output,
+                    total_cost_usd,
+                    num_turns,
+                    ..
+                } => {
+                    structured_result = structured_output;
+                    cost = total_cost_usd;
+                    turns = num_turns;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(text_output, "I'll analyze the issue.The fix is applied.");
+        assert!(structured_result.is_some());
+        let sr: StructuredResult = serde_json::from_value(structured_result.unwrap()).unwrap();
+        assert!(sr.success);
+        assert_eq!(sr.summary, "Fixed the bug");
+        assert_eq!(
+            sr.pr_url.as_deref(),
+            Some("https://github.com/org/repo/pull/42")
+        );
+        assert!((cost.unwrap() - 0.05).abs() < 1e-6);
+        assert_eq!(turns, Some(3));
+    }
+
+    // ── extract_pr_url self-hosted GitLab test ───────────────────────
+
+    #[test]
+    fn test_extract_pr_url_self_hosted_gitlab_multiple_segments() {
+        let output = "MR: https://git.internal.company.io/engineering/backend/-/merge_requests/55";
+        let url = ClaudeRunner::extract_pr_url(output);
+        assert_eq!(
+            url.as_deref(),
+            Some("https://git.internal.company.io/engineering/backend/-/merge_requests/55")
+        );
+    }
+
+    #[test]
+    fn test_extract_pr_url_does_not_match_merge_request_without_dash_slash() {
+        // Ensure patterns require the /-/ separator for GitLab
+        let output = "https://gitlab.com/group/project/merge_requests/123";
+        let url = ClaudeRunner::extract_pr_url(output);
+        assert!(url.is_none());
+    }
+
+    // ── Constant values tests ────────────────────────────────────────
+
+    #[test]
+    fn test_default_log_dir_constant() {
+        assert_eq!(DEFAULT_LOG_DIR, "./logs");
+    }
+
+    #[test]
+    fn test_claude_log_subdir_constant() {
+        assert_eq!(CLAUDE_LOG_SUBDIR, "claude");
+    }
+
+    #[test]
+    fn test_execution_log_preview_limit_constant() {
+        assert_eq!(EXECUTION_LOG_PREVIEW_LIMIT, 2000);
+    }
+
+    // ── build_prompt fallback format verification ────────────────────
+
+    #[test]
+    fn test_build_prompt_fallback_contains_issue_source() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let issue = Issue::new("1", "LIN-1", "Bug", "https://ex.com", "linear");
+        let prompt = runner.build_prompt(
+            &issue,
+            "some context",
+            Path::new("/tmp/nonexistent_project_dir_xyz"),
+        );
+        // The fallback template should reference the source
+        assert!(
+            prompt.contains("linear") || prompt.contains("Linear"),
+            "Prompt should contain the issue source"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_fallback_contains_context() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let issue = Issue::new("1", "LIN-1", "Bug", "https://ex.com", "linear");
+        let prompt = runner.build_prompt(
+            &issue,
+            "detailed error trace here",
+            Path::new("/tmp/nonexistent_project_dir_xyz"),
+        );
+        assert!(
+            prompt.contains("detailed error trace here"),
+            "Prompt should contain the provided context"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_fallback_contains_short_id() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let issue = Issue::new("1", "PROJ-999", "Bug", "https://ex.com", "linear");
+        let prompt = runner.build_prompt(
+            &issue,
+            "context",
+            Path::new("/tmp/nonexistent_project_dir_xyz"),
+        );
+        assert!(
+            prompt.contains("PROJ-999"),
+            "Prompt should contain the issue short_id"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_fallback_instructs_pr_creation() {
+        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "linear");
+        let prompt =
+            runner.build_prompt(&issue, "ctx", Path::new("/tmp/nonexistent_project_dir_xyz"));
+        // The fallback should instruct the model to create a PR
+        assert!(
+            prompt.to_lowercase().contains("pr") || prompt.to_lowercase().contains("pull request"),
+            "Prompt should mention PR creation"
+        );
     }
 }

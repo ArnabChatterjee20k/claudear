@@ -2454,6 +2454,35 @@ Create a PR with your changes."#,
             project_dir.clone()
         };
 
+        // Run code quality evaluation baseline (BEFORE hook)
+        let eval_before_snapshots = if self.config.evaluation.enabled {
+            match crate::evaluation::CodeQualityEvaluator::run_baseline(
+                &effective_project_dir,
+                &self.config.evaluation,
+            )
+            .await
+            {
+                Ok(snapshots) => {
+                    tracing::info!(
+                        short_id = %issue.short_id,
+                        tools = snapshots.len(),
+                        "Evaluation baseline captured"
+                    );
+                    snapshots
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        short_id = %issue.short_id,
+                        error = %e,
+                        "Evaluation baseline failed, continuing without"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         // Get the attempt ID for analytics tracking
         let attempt_id = self
             .tracker
@@ -3093,6 +3122,37 @@ Create a PR with your changes."#,
                 self.record_error_pattern(source.name(), &issue.id, error);
             }
 
+            // Run code quality evaluation after fix (AFTER hook)
+            if !eval_before_snapshots.is_empty() {
+                let eval_attempt_id = attempt_id.unwrap_or(0);
+                let eval_repo = resolution.repo_name().unwrap_or("unknown");
+                match crate::evaluation::CodeQualityEvaluator::run_after_and_compute_deltas(
+                    &effective_project_dir,
+                    &self.config.evaluation,
+                    eval_before_snapshots.clone(),
+                    eval_attempt_id,
+                    eval_repo,
+                ).await {
+                    Ok(eval_result) => {
+                        if !eval_result.deltas.is_empty() {
+                            tracing::info!(
+                                short_id = %issue.short_id,
+                                improved = eval_result.overall_improved,
+                                deltas = eval_result.deltas.len(),
+                                "Evaluation complete"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            short_id = %issue.short_id,
+                            error = %e,
+                            "Post-fix evaluation failed"
+                        );
+                    }
+                }
+            }
+
             Ok::<_, crate::error::Error>(())
         }
         .await;
@@ -3411,6 +3471,35 @@ Create a PR with your changes."#,
                 }
             }
         }
+
+        // Cross-repo failure correlation
+        if learning.cross_repo_correlation {
+            match crate::learning::CrossRepoCorrelator::detect_correlations(
+                self.tracker.as_ref(),
+                learning.cross_repo_window_hours,
+            ) {
+                Ok(insights) if !insights.is_empty() => {
+                    for insight in &insights {
+                        tracing::info!(
+                            upstream = %insight.repo_a,
+                            downstream = %insight.repo_b,
+                            count = insight.correlation_count,
+                            "Cross-repo correlation detected"
+                        );
+                    }
+                    self.record_source_decision(
+                        "system",
+                        "cross_repo_correlation",
+                        format!("Detected {} cross-repo correlations", insights.len()),
+                        serde_json::json!({ "correlation_count": insights.len() }),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "Cross-repo correlation detection failed");
+                }
+            }
+        }
     }
 
     /// Run post-merge learning hooks (extract learnings, analyze diff, compute quality score).
@@ -3604,6 +3693,23 @@ Create a PR with your changes."#,
                         break;
                     }
                 }
+            }
+        }
+
+        // Cross-repo correlation context
+        if learning.cross_repo_correlation {
+            match crate::learning::CrossRepoCorrelator::get_active_insights(
+                self.tracker.as_ref(),
+                3,                                    // min_count
+                learning.cross_repo_window_hours * 2, // max_age = 2x window
+            ) {
+                Ok(insights) if !insights.is_empty() => {
+                    let ctx = crate::learning::CrossRepoCorrelator::format_context(&insights);
+                    if !ctx.is_empty() {
+                        extra_context.push_str(&ctx);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -5881,5 +5987,1657 @@ mod tests {
         let config = CascadeConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.max_depth, 0);
+    }
+
+    // =========================================================================
+    // Tests for truncate_error_for_activity
+    // =========================================================================
+
+    #[test]
+    fn test_truncate_error_short_message() {
+        let error = "short error";
+        let result = Watcher::truncate_error_for_activity(error);
+        assert_eq!(result, "short error");
+    }
+
+    #[test]
+    fn test_truncate_error_exactly_500_chars() {
+        let error = "a".repeat(500);
+        let result = Watcher::truncate_error_for_activity(&error);
+        assert_eq!(result.len(), 500);
+        assert!(!result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_error_over_500_chars() {
+        let error = "a".repeat(600);
+        let result = Watcher::truncate_error_for_activity(&error);
+        assert!(result.len() <= 500);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_error_empty_string() {
+        let result = Watcher::truncate_error_for_activity("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_truncate_error_unicode_boundary() {
+        // Build a string that has multibyte chars near the 500-char boundary
+        let mut error = "a".repeat(497);
+        // Add a 4-byte emoji right at the boundary
+        error.push('\u{1F600}'); // emoji: 4 bytes
+        error.push_str(&"b".repeat(100));
+        let result = Watcher::truncate_error_for_activity(&error);
+        assert!(result.ends_with("..."));
+        // Verify it doesn't panic and doesn't split a char
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    #[test]
+    fn test_truncate_error_501_chars() {
+        let error = "x".repeat(501);
+        let result = Watcher::truncate_error_for_activity(&error);
+        assert!(result.ends_with("..."));
+        // Should be at most 500 chars (497 + "...")
+        assert!(result.len() <= 500);
+    }
+
+    // =========================================================================
+    // Tests for is_running() and active_count() public accessors
+    // =========================================================================
+
+    #[test]
+    fn test_is_running_accessor() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        assert!(!watcher.is_running());
+        watcher.is_running.store(true, Ordering::SeqCst);
+        assert!(watcher.is_running());
+        watcher.stop();
+        assert!(!watcher.is_running());
+    }
+
+    #[test]
+    fn test_active_count_accessor() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        assert_eq!(watcher.active_count(), 0);
+        watcher.active_processing.fetch_add(3, Ordering::SeqCst);
+        assert_eq!(watcher.active_count(), 3);
+        watcher.active_processing.fetch_sub(1, Ordering::SeqCst);
+        assert_eq!(watcher.active_count(), 2);
+    }
+
+    // =========================================================================
+    // Tests for active_processing_for_source
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_active_processing_for_source_empty() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        assert_eq!(watcher.active_processing_for_source("test").await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_active_processing_for_source_counts_only_matching() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.insert("source_a:issue-1".to_string());
+            processing.insert("source_a:issue-2".to_string());
+            processing.insert("source_b:issue-3".to_string());
+            processing.insert("source_a:issue-4".to_string());
+        }
+
+        assert_eq!(watcher.active_processing_for_source("source_a").await, 3);
+        assert_eq!(watcher.active_processing_for_source("source_b").await, 1);
+        assert_eq!(watcher.active_processing_for_source("source_c").await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_active_processing_for_source_prefix_mismatch() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        {
+            let mut processing = watcher.processing.write().await;
+            // "test_source:" should NOT match "test:" prefix
+            processing.insert("test_source:issue-1".to_string());
+        }
+
+        assert_eq!(watcher.active_processing_for_source("test").await, 0);
+        assert_eq!(watcher.active_processing_for_source("test_source").await, 1);
+    }
+
+    // =========================================================================
+    // Tests for refresh_repos and sync_repos_to_db with None values
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_refresh_repos_no_inferrer_returns_zero() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let result = watcher.refresh_repos().await.unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_sync_repos_to_db_no_inferrer_returns_zero() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let result = watcher.sync_repos_to_db(true).unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_sync_repos_to_db_no_sqlite_tracker_returns_zero() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        // create_test_watcher sets sqlite_tracker to None
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+        assert!(watcher.sqlite_tracker.is_none());
+
+        let result = watcher.sync_repos_to_db(false).unwrap();
+        assert_eq!(result, 0);
+    }
+
+    // =========================================================================
+    // Tests for check_reviews with no review_watcher
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_check_reviews_no_watcher_returns_ok() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+        assert!(watcher.review_watcher.is_none());
+
+        let result = watcher.check_reviews().await;
+        assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Tests for check_pr_merges_and_cascade with no github client
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_check_pr_merges_no_github_client() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), sources, false);
+        assert!(watcher.github_client.is_none());
+
+        // Should succeed and record zero-value metrics
+        let result = watcher.check_pr_merges_and_cascade().await;
+        assert!(result.is_ok());
+
+        // Verify lifecycle metrics were still recorded
+        let checks = tracker.get_metrics("pr_status_checks", None, 10).unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].metric_value, 0.0);
+    }
+
+    // =========================================================================
+    // Tests for poll_housekeeping
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_poll_housekeeping_dry_run_skips_retries_and_cascades() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), sources, true);
+
+        let result = watcher.poll_housekeeping().await;
+        assert!(result.is_ok());
+
+        // In dry-run mode, no retries or cascade metrics should be recorded
+        let retries_found = tracker
+            .get_metrics("ready_retries_found", None, 10)
+            .unwrap();
+        assert!(
+            retries_found.is_empty(),
+            "dry_run should skip process_ready_retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poll_housekeeping_records_metrics() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), sources, false);
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        let result = watcher.poll_housekeeping().await;
+        assert!(result.is_ok());
+
+        // Verify housekeeping metrics
+        let duration = tracker
+            .get_metrics("housekeeping_cycle_duration_secs", None, 10)
+            .unwrap();
+        assert_eq!(duration.len(), 1);
+        assert!(duration[0].metric_value >= 0.0);
+
+        let active = tracker.get_metrics("active_processing", None, 10).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].metric_value, 0.0);
+    }
+
+    // =========================================================================
+    // Tests for check_and_auto_close_prs
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_check_and_auto_close_prs_no_pending() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let result = watcher.check_and_auto_close_prs().await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_and_auto_close_prs_no_matching_source() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Record a PR for a source that does NOT exist in sources list
+        tracker
+            .record_attempt("nonexistent_source", "1", "NE-1")
+            .unwrap();
+        tracker
+            .mark_success(
+                "nonexistent_source",
+                "1",
+                "https://github.com/org/repo/pull/99",
+            )
+            .unwrap();
+
+        let source = Arc::new(MockSource::new("different_source")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+
+        let result = watcher.check_and_auto_close_prs().await.unwrap();
+        // No matching source found, so no auto-close
+        assert!(result.is_empty());
+    }
+
+    // =========================================================================
+    // Tests for record_source_decision and record_issue_decision
+    // =========================================================================
+
+    #[test]
+    fn test_record_source_decision_does_not_panic() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        // Should not panic even with arbitrary values
+        watcher.record_source_decision(
+            "test_source",
+            "test_decision",
+            "Test message",
+            json!({"key": "value"}),
+        );
+    }
+
+    #[test]
+    fn test_record_issue_decision_does_not_panic() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let issue = test_issue();
+        watcher.record_issue_decision(
+            &issue,
+            "test_decision",
+            "Test message for issue",
+            json!({"outcome": "success"}),
+        );
+    }
+
+    // =========================================================================
+    // Tests for record_error_pattern
+    // =========================================================================
+
+    #[test]
+    fn test_record_error_pattern_does_not_panic() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        // Should not panic
+        watcher.record_error_pattern("linear", "ISSUE-42", "build failed: exit code 1");
+        watcher.record_error_pattern("sentry", "SENTRY-99", "timeout after 300s");
+        watcher.record_error_pattern("test", "T-1", "");
+    }
+
+    // =========================================================================
+    // Tests for Watcher::new with sqlite_tracker
+    // =========================================================================
+
+    #[test]
+    fn test_watcher_new_with_sqlite_tracker() {
+        let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = sqlite.clone() as Arc<dyn FixAttemptTracker>;
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = Watcher::new(WatcherOptions {
+            config: test_config(),
+            sources,
+            notifier,
+            tracker,
+            sqlite_tracker: Some(sqlite.clone()),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+
+        assert!(watcher.sqlite_tracker.is_some());
+        assert!(!watcher.dry_run);
+    }
+
+    // =========================================================================
+    // Tests for stop_and_drain
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_stop_and_drain_immediate_when_no_active() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = Arc::new(create_test_watcher(notifier, tracker, sources, false));
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // Should complete quickly since there's no active processing
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), watcher.stop_and_drain()).await;
+        assert!(result.is_ok(), "stop_and_drain timed out");
+        assert!(!watcher.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_drain_waits_for_active() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = Arc::new(create_test_watcher(notifier, tracker, sources, false));
+        watcher.is_running.store(true, Ordering::SeqCst);
+        watcher.active_processing.fetch_add(1, Ordering::SeqCst);
+
+        // Simulate task finishing after a short delay
+        let release = Arc::clone(&watcher);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            release.active_processing.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), watcher.stop_and_drain()).await;
+        assert!(result.is_ok(), "stop_and_drain timed out");
+        assert!(!watcher.is_running());
+        assert_eq!(watcher.active_count(), 0);
+    }
+
+    // =========================================================================
+    // Tests for group_review_feedback_by_pr edge cases
+    // =========================================================================
+
+    #[test]
+    fn test_group_review_feedback_empty_events() {
+        let events: Vec<crate::scm::ReviewEvent> = vec![];
+        let grouped = Watcher::group_review_feedback_by_pr(events);
+        assert!(grouped.is_empty());
+    }
+
+    #[test]
+    fn test_group_review_feedback_only_non_actionable() {
+        // CommentsAdded with empty comments does not require action
+        let events = vec![crate::scm::ReviewEvent::CommentsAdded {
+            pr_url: "https://github.com/org/repo/pull/1".to_string(),
+            repo: "org/repo".to_string(),
+            pr_number: 1,
+            comments: vec![],
+        }];
+
+        let grouped = Watcher::group_review_feedback_by_pr(events);
+        assert!(grouped.is_empty());
+    }
+
+    #[test]
+    fn test_group_review_feedback_multiple_prs() {
+        let make_review = |id: i64, state: &str, body: &str| crate::scm::CodeReview {
+            id,
+            state: state.to_string(),
+            body: Some(body.to_string()),
+            user: crate::scm::ReviewUser {
+                id: id,
+                login: format!("user{}", id),
+                user_type: Some("User".to_string()),
+            },
+            submitted_at: Some("2024-01-01T00:00:00Z".to_string()),
+            html_url: None,
+        };
+
+        let events = vec![
+            crate::scm::ReviewEvent::ReviewSubmitted {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                review: make_review(1, "CHANGES_REQUESTED", "fix the bug"),
+                inline_comments: vec![],
+            },
+            crate::scm::ReviewEvent::ReviewSubmitted {
+                pr_url: "https://github.com/org/repo/pull/2".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 2,
+                review: make_review(2, "CHANGES_REQUESTED", "needs tests"),
+                inline_comments: vec![],
+            },
+        ];
+
+        let grouped = Watcher::group_review_feedback_by_pr(events);
+        assert_eq!(grouped.len(), 2);
+        // Verify order is preserved
+        assert_eq!(grouped[0].0, "https://github.com/org/repo/pull/1");
+        assert_eq!(grouped[1].0, "https://github.com/org/repo/pull/2");
+        assert_eq!(grouped[0].2, 1); // 1 review for PR 1
+        assert_eq!(grouped[1].2, 1); // 1 review for PR 2
+    }
+
+    // =========================================================================
+    // Tests for is_terminal_attempt_status (additional edge cases)
+    // =========================================================================
+
+    #[test]
+    fn test_is_terminal_all_statuses() {
+        let non_terminal = [
+            FixAttemptStatus::Pending,
+            FixAttemptStatus::Success,
+            FixAttemptStatus::Failed,
+        ];
+        let terminal = [
+            FixAttemptStatus::Merged,
+            FixAttemptStatus::Closed,
+            FixAttemptStatus::CannotFix,
+        ];
+
+        for status in non_terminal {
+            assert!(
+                !Watcher::is_terminal_attempt_status(status),
+                "{:?} should NOT be terminal",
+                status
+            );
+        }
+        for status in terminal {
+            assert!(
+                Watcher::is_terminal_attempt_status(status),
+                "{:?} SHOULD be terminal",
+                status
+            );
+        }
+    }
+
+    // =========================================================================
+    // Tests for sort_by_priority advanced cases
+    // =========================================================================
+
+    #[test]
+    fn test_sort_by_priority_all_same_match_priority_different_issue_priority() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let mut issues = vec![
+            (
+                test_issue_with_priority("1", IssuePriority::None),
+                MatchResult::matched("Same", MatchPriority::Normal),
+            ),
+            (
+                test_issue_with_priority("2", IssuePriority::Critical),
+                MatchResult::matched("Same", MatchPriority::Normal),
+            ),
+            (
+                test_issue_with_priority("3", IssuePriority::High),
+                MatchResult::matched("Same", MatchPriority::Normal),
+            ),
+            (
+                test_issue_with_priority("4", IssuePriority::Low),
+                MatchResult::matched("Same", MatchPriority::Normal),
+            ),
+            (
+                test_issue_with_priority("5", IssuePriority::Medium),
+                MatchResult::matched("Same", MatchPriority::Normal),
+            ),
+        ];
+
+        watcher.sort_by_priority(&mut issues);
+
+        assert_eq!(issues[0].0.priority, IssuePriority::Critical);
+        assert_eq!(issues[1].0.priority, IssuePriority::High);
+        assert_eq!(issues[2].0.priority, IssuePriority::Medium);
+        assert_eq!(issues[3].0.priority, IssuePriority::Low);
+        assert_eq!(issues[4].0.priority, IssuePriority::None);
+    }
+
+    #[test]
+    fn test_sort_by_priority_match_priority_takes_precedence() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        // Issue with Low match priority but Critical issue priority
+        // should come AFTER issue with Urgent match priority but None issue priority
+        let mut issues = vec![
+            (
+                test_issue_with_priority("1", IssuePriority::Critical),
+                MatchResult::matched("Low match", MatchPriority::Low),
+            ),
+            (
+                test_issue_with_priority("2", IssuePriority::None),
+                MatchResult::matched("Urgent match", MatchPriority::Urgent),
+            ),
+        ];
+
+        watcher.sort_by_priority(&mut issues);
+
+        assert_eq!(issues[0].1.priority, MatchPriority::Urgent);
+        assert_eq!(issues[1].1.priority, MatchPriority::Low);
+    }
+
+    #[test]
+    fn test_sort_by_priority_stability_for_equal_items() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let mut issues = vec![
+            (
+                {
+                    let mut i = test_issue();
+                    i.id = "first".to_string();
+                    i
+                },
+                MatchResult::matched("Same", MatchPriority::Normal),
+            ),
+            (
+                {
+                    let mut i = test_issue();
+                    i.id = "second".to_string();
+                    i
+                },
+                MatchResult::matched("Same", MatchPriority::Normal),
+            ),
+        ];
+
+        watcher.sort_by_priority(&mut issues);
+
+        // Both have same priority, so the sort should be stable (order preserved)
+        assert_eq!(issues[0].0.id, "first");
+        assert_eq!(issues[1].0.id, "second");
+    }
+
+    // =========================================================================
+    // Tests for enhance_prompt_with_learning
+    // =========================================================================
+
+    #[test]
+    fn test_enhance_prompt_no_repo_returns_base() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let base = "Fix the bug in module X";
+        let issue = test_issue();
+        let result = watcher.enhance_prompt_with_learning(base, &issue, None);
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn test_enhance_prompt_with_repo_no_learning_enabled() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        // Default learning config has everything disabled
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let base = "Fix the bug in module X";
+        let issue = test_issue();
+        let result = watcher.enhance_prompt_with_learning(base, &issue, Some("my-repo"));
+        // With no learning enabled and no data, should return base prompt
+        assert_eq!(result, base);
+    }
+
+    // =========================================================================
+    // Tests for processing set concurrent behavior
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_processing_set_concurrent_insertions() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = Arc::new(create_test_watcher(notifier, tracker, sources, false));
+
+        // Concurrently insert 100 items
+        let mut handles = vec![];
+        for i in 0..100 {
+            let w = Arc::clone(&watcher);
+            handles.push(tokio::spawn(async move {
+                let mut processing = w.processing.write().await;
+                processing.insert(format!("test:{}", i));
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let processing = watcher.processing.read().await;
+        assert_eq!(processing.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_processing_set_insert_and_remove_same_key() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.insert("test:123".to_string());
+            assert!(processing.contains("test:123"));
+            processing.remove("test:123");
+            assert!(!processing.contains("test:123"));
+        }
+
+        // Re-insert should work
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.insert("test:123".to_string());
+        }
+
+        let processing = watcher.processing.read().await;
+        assert!(processing.contains("test:123"));
+    }
+
+    // =========================================================================
+    // Tests for WatcherOptions fields propagation
+    // =========================================================================
+
+    #[test]
+    fn test_watcher_options_config_propagation() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut config = test_config();
+        config.max_issues_per_cycle = 42;
+        config.max_concurrent = 7;
+        config.processing_delay_ms = 1500;
+        config.poll_interval_ms = 30000;
+        config.claude_timeout_secs = 999;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+
+        assert_eq!(watcher.config.max_issues_per_cycle, 42);
+        assert_eq!(watcher.config.max_concurrent, 7);
+        assert_eq!(watcher.config.processing_delay_ms, 1500);
+        assert_eq!(watcher.config.poll_interval_ms, 30000);
+        assert_eq!(watcher.config.claude_timeout_secs, 999);
+    }
+
+    #[test]
+    fn test_watcher_new_multiple_sources() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let sources: Vec<Arc<dyn IssueSource>> = vec![
+            Arc::new(MockSource::new("source_a")),
+            Arc::new(MockSource::new("source_b")),
+            Arc::new(MockSource::new("source_c")),
+        ];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        assert_eq!(watcher.sources.len(), 3);
+        assert_eq!(watcher.sources[0].name(), "source_a");
+        assert_eq!(watcher.sources[1].name(), "source_b");
+        assert_eq!(watcher.sources[2].name(), "source_c");
+    }
+
+    // =========================================================================
+    // Tests for trigger_cascade with no relationships/config
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_trigger_cascade_no_relationships_returns_ok() {
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+        assert!(watcher.relationships.is_none());
+
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-1".to_string(),
+            short_id: "ISSUE-1".to_string(),
+            source: "test".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: Some("https://github.com/org/repo/pull/1".to_string()),
+            github_repo: Some("org/repo".to_string()),
+            github_pr_number: Some(1),
+            status: FixAttemptStatus::Merged,
+            error_message: None,
+            merged_at: Some(chrono::Utc::now()),
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        let result = watcher
+            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cascade_disabled_returns_ok() {
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let mut config = test_config();
+        config.cascade.enabled = false;
+
+        let mut relationships = RepoRelationships::new();
+        relationships
+            .add_dependency(
+                "upstream",
+                "downstream",
+                crate::repo::DependencyType::Npm,
+                None,
+            )
+            .unwrap();
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources,
+            notifier,
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: Some(relationships),
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-1".to_string(),
+            short_id: "ISSUE-1".to_string(),
+            source: "test".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: Some("https://github.com/org/upstream/pull/1".to_string()),
+            github_repo: Some("org/upstream".to_string()),
+            github_pr_number: Some(1),
+            status: FixAttemptStatus::Merged,
+            error_message: None,
+            merged_at: Some(chrono::Utc::now()),
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        // Even with relationships, cascade disabled returns Ok
+        let result = watcher
+            .trigger_cascade(&attempt, "https://github.com/org/upstream/pull/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cascade_no_github_repo_returns_ok() {
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let mut config = test_config();
+        config.cascade.enabled = true;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources,
+            notifier,
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: Some(RepoRelationships::new()),
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-1".to_string(),
+            short_id: "ISSUE-1".to_string(),
+            source: "test".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: None,
+            github_repo: None, // No github_repo
+            github_pr_number: None,
+            status: FixAttemptStatus::Merged,
+            error_message: None,
+            merged_at: Some(chrono::Utc::now()),
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        let result = watcher.trigger_cascade(&attempt, "").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cascade_no_pr_number_returns_ok() {
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let mut config = test_config();
+        config.cascade.enabled = true;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources,
+            notifier,
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: Some(RepoRelationships::new()),
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-1".to_string(),
+            short_id: "ISSUE-1".to_string(),
+            source: "test".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: Some("https://github.com/org/repo/pull/1".to_string()),
+            github_repo: Some("org/repo".to_string()),
+            github_pr_number: None, // No PR number
+            status: FixAttemptStatus::Merged,
+            error_message: None,
+            merged_at: Some(chrono::Utc::now()),
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        let result = watcher
+            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cascade_no_dependants_returns_ok() {
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let mut config = test_config();
+        config.cascade.enabled = true;
+
+        // Empty relationships (no dependants)
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources,
+            notifier,
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: Some(RepoRelationships::new()),
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-1".to_string(),
+            short_id: "ISSUE-1".to_string(),
+            source: "test".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: Some("https://github.com/org/my-lib/pull/1".to_string()),
+            github_repo: Some("org/my-lib".to_string()),
+            github_pr_number: Some(1),
+            status: FixAttemptStatus::Merged,
+            error_message: None,
+            merged_at: Some(chrono::Utc::now()),
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        let result = watcher
+            .trigger_cascade(&attempt, "https://github.com/org/my-lib/pull/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Tests for get_cascade_depth
+    // =========================================================================
+
+    #[test]
+    fn test_get_cascade_depth_root() {
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "ISSUE-1".to_string(),
+            short_id: "ISSUE-1".to_string(),
+            source: "test".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+
+        assert_eq!(watcher.get_cascade_depth(&attempt), 0);
+    }
+
+    #[test]
+    fn test_get_cascade_depth_with_missing_parent() {
+        use crate::types::{FixAttempt, FixAttemptStatus};
+
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        // No sqlite_tracker means parent lookups always fail
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let attempt = FixAttempt {
+            id: 2,
+            issue_id: "ISSUE-2".to_string(),
+            short_id: "ISSUE-2".to_string(),
+            source: "test".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: Some(999), // Parent doesn't exist
+            cascade_repo: None,
+        };
+
+        // Should return 1 for the first hop, then break because parent is not found
+        assert_eq!(watcher.get_cascade_depth(&attempt), 1);
+    }
+
+    // =========================================================================
+    // Tests for poll_source skipping in-flight issues
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_poll_source_skips_inflight_issues() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issues = vec![
+            Issue::new(
+                "inflight-1",
+                "T-IF1",
+                "In-flight issue",
+                "http://example.com/if1",
+                "test",
+            ),
+            Issue::new(
+                "new-1",
+                "T-NEW1",
+                "New issue",
+                "http://example.com/new1",
+                "test",
+            ),
+        ];
+        let source = Arc::new(MockSource::with_issues("test", issues)) as Arc<dyn IssueSource>;
+        let sources = vec![source.clone()];
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), sources, true);
+
+        // Mark one issue as in-flight
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.insert("test:inflight-1".to_string());
+        }
+
+        watcher.poll_source(&source).await.unwrap();
+
+        // Only the non-inflight issue should be matched
+        let matched = tracker.get_metrics("issues_matched", None, 10).unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].metric_value, 1.0); // Only new-1 matched
+    }
+
+    // =========================================================================
+    // Tests for poll dry-run mode not processing issues
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_poll_dry_run_does_not_record_retries() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Create a failed attempt that would be retried
+        tracker
+            .record_attempt("mock", "retry-1", "MOCK-R1")
+            .unwrap();
+        tracker
+            .mark_failed("mock", "retry-1", "initial failure")
+            .unwrap();
+
+        let source = Arc::new(MockSource::new("mock")) as Arc<dyn IssueSource>;
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source],
+            notifier,
+            tracker: tracker.clone(),
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: true,
+        });
+
+        watcher.poll().await.unwrap();
+
+        // In dry-run mode, retries should not be processed
+        let retries = tracker
+            .get_metrics("ready_retries_found", None, 10)
+            .unwrap();
+        assert!(retries.is_empty(), "dry_run should skip retry processing");
+    }
+
+    // =========================================================================
+    // Tests for MockSource additional coverage
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_mock_source_fetch_issues_returns_all() {
+        let issues = vec![
+            Issue::new("1", "T-1", "Issue 1", "http://example.com/1", "test"),
+            Issue::new("2", "T-2", "Issue 2", "http://example.com/2", "test"),
+            Issue::new("3", "T-3", "Issue 3", "http://example.com/3", "test"),
+        ];
+        let source = MockSource::with_issues("test", issues);
+        let fetched = source.fetch_issues().await.unwrap();
+        assert_eq!(fetched.len(), 3);
+    }
+
+    #[test]
+    fn test_mock_source_display_name() {
+        let source = MockSource::new("my_source");
+        assert_eq!(source.display_name(), "my_source");
+    }
+
+    #[tokio::test]
+    async fn test_mock_source_get_issue_status() {
+        let issues = vec![Issue::new("1", "T-1", "Test", "http://example.com", "test")];
+        let source = MockSource::with_issues("test", issues);
+        let status = source.get_issue_status("1").await.unwrap();
+        assert!(status.contains("Open"));
+        assert_eq!(source.issue_status_call_count(), 1);
+    }
+
+    #[test]
+    fn test_mock_source_with_priority() {
+        let source = MockSource::with_priority("test", vec![], MatchPriority::Urgent);
+        let issue = test_issue();
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Urgent);
+    }
+
+    // =========================================================================
+    // Tests for MockNotifier additional coverage
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_mock_notifier_all_methods_increment_count() {
+        let notifier = MockNotifier::new(true);
+        let issue = test_issue();
+
+        notifier.notify_start(&issue).await.unwrap();
+        assert_eq!(notifier.get_call_count(), 1);
+
+        notifier
+            .notify_success(&issue, "http://pr.url")
+            .await
+            .unwrap();
+        assert_eq!(notifier.get_call_count(), 2);
+
+        notifier.notify_completed(&issue).await.unwrap();
+        assert_eq!(notifier.get_call_count(), 3);
+
+        notifier.notify_failed(&issue, "error msg").await.unwrap();
+        assert_eq!(notifier.get_call_count(), 4);
+
+        notifier.notify_status("status msg").await.unwrap();
+        assert_eq!(notifier.get_call_count(), 5);
+
+        notifier
+            .notify_urgent_issues(&[issue.clone()])
+            .await
+            .unwrap();
+        assert_eq!(notifier.get_call_count(), 6);
+
+        notifier
+            .notify_merged(&issue, "http://pr.url")
+            .await
+            .unwrap();
+        assert_eq!(notifier.get_call_count(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_mock_notifier_with_urgent_failure_fails() {
+        let notifier = MockNotifier::with_urgent_failure(true);
+        let issue = test_issue();
+
+        let result = notifier.notify_urgent_issues(&[issue]).await;
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Tests for SeedResult
+    // =========================================================================
+
+    #[test]
+    fn test_seed_result_by_source_tracking() {
+        let mut result = SeedResult::default();
+        result.total = 10;
+        result.by_source.insert("linear".to_string(), 6);
+        result.by_source.insert("sentry".to_string(), 4);
+
+        assert_eq!(result.total, 10);
+        assert_eq!(*result.by_source.get("linear").unwrap(), 6);
+        assert_eq!(*result.by_source.get("sentry").unwrap(), 4);
+        assert!(result.by_source.get("jira").is_none());
+    }
+
+    // =========================================================================
+    // Tests for Watcher::new initialization state
+    // =========================================================================
+
+    #[test]
+    fn test_watcher_new_initializes_all_fields() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let watcher = Watcher::new(WatcherOptions {
+            config: test_config(),
+            sources: vec![],
+            notifier,
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+
+        // Verify initial state
+        assert!(!watcher.is_running());
+        assert_eq!(watcher.active_count(), 0);
+        assert!(!watcher.dry_run);
+        assert!(watcher.inferrer.is_none());
+        assert!(watcher.embedding_client.is_none());
+        assert!(watcher.review_watcher.is_none());
+        assert!(watcher.issue_embedding_service.is_none());
+        assert!(watcher.relationships.is_none());
+        assert!(watcher.github_client.is_none());
+        assert!(watcher.sqlite_tracker.is_none());
+        assert!(watcher.sources.is_empty());
+    }
+
+    // =========================================================================
+    // Tests for trigger_issue_with_feedback
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_trigger_issue_with_feedback_unknown_source() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        let result = watcher
+            .trigger_issue_with_feedback("nonexistent", "123", Some("feedback".to_string()), None)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown source"));
+    }
+
+    #[tokio::test]
+    async fn test_trigger_issue_with_feedback_issue_not_found() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Source exists but has no issues
+        let source = Arc::new(MockSource::new("mock")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+
+        let result = watcher
+            .trigger_issue_with_feedback("mock", "nonexistent", None, None)
+            .await;
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Tests for poll_source with max_issues_per_cycle limits
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_poll_source_respects_per_source_max_issues() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issues: Vec<Issue> = (1..=10)
+            .map(|i| {
+                Issue::new(
+                    format!("{}", i),
+                    format!("T-{}", i),
+                    format!("Issue {}", i),
+                    format!("http://example.com/{}", i),
+                    "test",
+                )
+            })
+            .collect();
+        let source = Arc::new(MockSource::with_issues("test", issues)) as Arc<dyn IssueSource>;
+
+        let mut config = test_config();
+        config.max_issues_per_cycle = 3;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source.clone()],
+            notifier,
+            tracker: tracker.clone(),
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: true,
+        });
+
+        watcher.poll_source(&source).await.unwrap();
+
+        let queued = tracker.get_metrics("issues_queued", None, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].metric_value, 3.0); // Limited to 3
+    }
+
+    // =========================================================================
+    // Tests for process_issue returning false when already processing
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_process_issue_returns_false_when_already_processing() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issues = vec![Issue::new(
+            "1",
+            "T-1",
+            "Test Issue",
+            "http://example.com/1",
+            "mock",
+        )];
+        let source = Arc::new(MockSource::with_issues("mock", issues)) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source.clone()], false);
+
+        // Mark as already processing
+        {
+            let mut processing = watcher.processing.write().await;
+            processing.insert("mock:1".to_string());
+        }
+
+        let issue = Issue::new("1", "T-1", "Test Issue", "http://example.com/1", "mock");
+        let match_result = MatchResult::matched("Test", MatchPriority::Normal);
+
+        let result = watcher
+            .process_issue(source, issue, match_result, None, None)
+            .await;
+        assert!(
+            !result,
+            "process_issue should return false when issue already in-flight"
+        );
+    }
+
+    // =========================================================================
+    // Tests for cascade depth limit
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_trigger_cascade_depth_limit() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = sqlite.clone() as Arc<dyn FixAttemptTracker>;
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let mut config = test_config();
+        config.cascade.enabled = true;
+        config.cascade.max_depth = 1;
+
+        let mut relationships = RepoRelationships::new();
+        relationships
+            .add_dependency(
+                "upstream",
+                "downstream",
+                crate::repo::DependencyType::Npm,
+                None,
+            )
+            .unwrap();
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources,
+            notifier,
+            tracker,
+            sqlite_tracker: Some(sqlite.clone()),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: Some(relationships),
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: false,
+        });
+
+        // Record a root attempt and a child attempt so depth = 1
+        sqlite
+            .record_attempt("test", "root-issue", "ROOT-1")
+            .unwrap();
+        let root = sqlite.get_attempt("test", "root-issue").unwrap().unwrap();
+
+        // Create child attempt with parent_attempt_id set to root
+        sqlite
+            .record_cascade_attempt("test", "child-issue", "CHILD-1", root.id, "org/upstream")
+            .unwrap();
+        let child = sqlite.get_attempt("test", "child-issue").unwrap().unwrap();
+        assert_eq!(child.parent_attempt_id, Some(root.id));
+
+        // The child is at depth 1 already, and max_depth is 1
+        // So trigger_cascade should bail out early
+        let result = watcher
+            .trigger_cascade(&child, "https://github.com/org/upstream/pull/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Tests for start loop clamping
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_start_clamps_low_interval() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> =
+            vec![Arc::new(MockSource::new("mock")) as Arc<dyn IssueSource>];
+
+        let watcher = Arc::new(create_test_watcher(notifier, tracker, sources, true));
+
+        // Start with very small interval (should be clamped to 1000ms)
+        let runner = {
+            let w = Arc::clone(&watcher);
+            tokio::spawn(async move { w.start(Some(50)).await })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        watcher.stop();
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(3), runner).await;
+        assert!(joined.is_ok(), "watcher start did not stop in time");
+        assert!(joined.unwrap().expect("task join failed").is_ok());
+    }
+
+    // =========================================================================
+    // Tests for reset_attempt nonexistent
+    // =========================================================================
+
+    #[test]
+    fn test_reset_attempt_nonexistent_succeeds() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let sources: Vec<Arc<dyn IssueSource>> = vec![];
+
+        let watcher = create_test_watcher(notifier, tracker, sources, false);
+
+        // Resetting an attempt that was never recorded should succeed silently
+        let result = watcher.reset_attempt("test", "nonexistent");
+        assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Tests for poll_source with suppression rules
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_poll_source_applies_suppression_when_prioritisation_disabled() {
+        use crate::config::PrioritisationConfig;
+        use crate::types::{SuppressionField, SuppressionMatchMode, SuppressionRule};
+
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issues = vec![Issue::new(
+            "1",
+            "T-1",
+            "Suppress me please",
+            "http://example.com/1",
+            "test",
+        )];
+        let source = Arc::new(MockSource::with_issues("test", issues)) as Arc<dyn IssueSource>;
+
+        let mut config = test_config();
+        config.prioritisation = PrioritisationConfig {
+            enabled: false,
+            suppression_rules: vec![SuppressionRule {
+                name: "suppress-all".to_string(),
+                pattern: ".*".to_string(),
+                field: SuppressionField::Title,
+                match_mode: SuppressionMatchMode::Regex,
+                sources: vec![],
+                reason: "test suppression".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source.clone()],
+            notifier,
+            tracker: tracker.clone(),
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: true,
+        });
+
+        watcher.poll_source(&source).await.unwrap();
+
+        // Issue should be suppressed
+        let matched = tracker.get_metrics("issues_matched", None, 10).unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].metric_value, 0.0);
     }
 }

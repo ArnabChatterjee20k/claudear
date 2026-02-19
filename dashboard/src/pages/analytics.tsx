@@ -103,7 +103,7 @@ export default function AnalyticsPage() {
               icon={<DollarSign className="h-4 w-4 text-emerald-500" />}
               description={
                 summary.cost_estimate
-                  ? `$${summary.cost_estimate.total_cost.toFixed(2)} total (${summary.cost_estimate.period})`
+                  ? `$${summary.cost_estimate.total_cost.toFixed(2)} total · ${summary.cost_estimate.cost_source} (${summary.cost_estimate.period})`
                   : 'No cost data'
               }
             />

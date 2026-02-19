@@ -833,6 +833,10 @@ review_classification = true
 strategy_fingerprinting = true
 quality_scoring = true
 cluster_detection = true
+cross_repo_correlation = true
+
+[evaluation]
+enabled = false
 TOML
 }
 
@@ -1075,6 +1079,19 @@ EOF
   assert_db "$db_path" "content_clusters" "1=1" 0 "content_clusters: may populate" "false"
   assert_db "$db_path" "suppression_log" "1=1" 0 "suppression_log: may populate" "false"
 
+  # Code complexity: populated during code indexing
+  assert_db "$db_path" "code_complexity" "1=1" 0 "code_complexity: may populate during indexing" "false"
+
+  # Evaluation tables: disabled by default but schema must exist
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "eval_snapshots: none expected (evaluation disabled)" "false"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "eval_deltas: none expected (evaluation disabled)" "false"
+
+  # Similar issues: populated when embedding service is available
+  assert_db "$db_path" "similar_issues" "1=1" 0 "similar_issues: may populate" "false"
+
+  # Prompt experiments: admin feature, not populated during normal processing
+  assert_db "$db_path" "prompt_experiments" "1=1" 0 "prompt_experiments: none expected" "false"
+
   # --- Step 5: Checkpoint B - PR Created ---
   log_checkpoint "S1 Checkpoint B: PR Created"
 
@@ -1234,6 +1251,12 @@ EOF
   # Error patterns: may detect recurring errors
   assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate" "false"
 
+  # Release tracking: may be populated during regression watch creation
+  assert_db "$db_path" "release_tracking" "1=1" 0 "release_tracking: may populate" "false"
+
+  # Cross-repo correlations: not expected in single-repo scenario
+  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "cross_repo_correlations: none expected in single-repo" "false"
+
   # --- Step 12: Checkpoint F - Regression Watch Created ---
   log_checkpoint "S1 Checkpoint F: Regression Watch Created"
 
@@ -1299,9 +1322,20 @@ EOF
   # Verify code indexing state at end
   assert_db "$db_path" "code_symbols" "1=1" 0 "learnings: code_symbols" "false"
   assert_db "$db_path" "code_chunks" "1=1" 0 "learnings: code_chunks" "false"
+  assert_db "$db_path" "code_complexity" "1=1" 0 "learnings: code_complexity" "false"
+
+  # Verify evaluation state at end
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "learnings: eval_snapshots" "false"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "learnings: eval_deltas" "false"
 
   # Verify indexing_progress final state
   assert_db "$db_path" "indexing_progress" "id=1" 1 "learnings: indexing_progress singleton"
+
+  # Verify remaining tables touched during full lifecycle
+  assert_db "$db_path" "similar_issues" "1=1" 0 "learnings: similar_issues" "false"
+  assert_db "$db_path" "release_tracking" "1=1" 0 "learnings: release_tracking" "false"
+  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "learnings: cross_repo_correlations" "false"
+  assert_db "$db_path" "prompt_experiments" "1=1" 0 "learnings: prompt_experiments" "false"
 
   # --- Step 15: Kill Daemon ---
   kill_daemon "$daemon_pid"
@@ -1431,6 +1465,22 @@ EOF
   assert_db "$db_path" "severity_scores" "1=1" 0 "severity_scores: may populate" "false"
   assert_db "$db_path" "content_clusters" "1=1" 0 "content_clusters: may populate" "false"
   assert_db "$db_path" "suppression_log" "1=1" 0 "suppression_log: may populate" "false"
+
+  # Code complexity: populated during code indexing
+  assert_db "$db_path" "code_complexity" "1=1" 0 "code_complexity: may populate during indexing" "false"
+
+  # Evaluation tables: disabled by default
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "eval_snapshots: none expected (evaluation disabled)" "false"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "eval_deltas: none expected (evaluation disabled)" "false"
+
+  # Similar issues: populated when embedding service is available
+  assert_db "$db_path" "similar_issues" "1=1" 0 "similar_issues: may populate" "false"
+
+  # Prompt experiments: admin feature
+  assert_db "$db_path" "prompt_experiments" "1=1" 0 "prompt_experiments: none expected" "false"
+
+  # Question channel cursor: Discord source seeds cursor during first poll
+  assert_db "$db_path" "question_channel_cursor" "1=1" 0 "question_channel_cursor: may be seeded by Discord source" "false"
 
   # --- Step 5: Checkpoint B - Ask Flow Initiated (non-fatal) ---
   log_checkpoint "S2 Checkpoint B: Ask Flow (non-fatal)"
@@ -1688,9 +1738,20 @@ EOF
   # Verify code indexing state at end
   assert_db "$db_path" "code_symbols" "1=1" 0 "learnings: code_symbols" "false"
   assert_db "$db_path" "code_chunks" "1=1" 0 "learnings: code_chunks" "false"
+  assert_db "$db_path" "code_complexity" "1=1" 0 "learnings: code_complexity" "false"
+
+  # Verify evaluation state at end
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "learnings: eval_snapshots" "false"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "learnings: eval_deltas" "false"
 
   # Verify indexing_progress final state
   assert_db "$db_path" "indexing_progress" "id=1" 1 "learnings: indexing_progress singleton"
+
+  # Verify remaining tables touched during full lifecycle
+  assert_db "$db_path" "similar_issues" "1=1" 0 "learnings: similar_issues" "false"
+  assert_db "$db_path" "release_tracking" "1=1" 0 "learnings: release_tracking" "false"
+  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "learnings: cross_repo_correlations" "false"
+  assert_db "$db_path" "prompt_experiments" "1=1" 0 "learnings: prompt_experiments" "false"
 
   # --- Step 18: Kill Daemon ---
   kill_daemon "$daemon_pid"
@@ -1981,6 +2042,25 @@ EOF
     1 "prs: upstream PR merged with files_changed" "false"
 
   assert_db "$db_path" "activity_log" "1=1" 4 "activity_log: >= 4 entries"
+
+  # Cross-repo correlations: cascade scenario may detect correlated failures
+  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "cross_repo_correlations: may populate in cascade" "false"
+
+  # Verify learning and indexing tables at end of cascade
+  assert_db "$db_path" "diff_analyses" "1=1" 0 "diff_analyses: may populate" "false"
+  assert_db "$db_path" "strategy_fingerprints" "1=1" 0 "strategy_fingerprints: may populate" "false"
+  assert_db "$db_path" "feedback_outcomes" "1=1" 0 "feedback_outcomes: may populate" "false"
+  assert_db "$db_path" "repo_knowledge" "1=1" 0 "repo_knowledge: may populate" "false"
+  assert_db "$db_path" "review_patterns" "1=1" 0 "review_patterns: may populate" "false"
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "promoted_instructions: may populate" "false"
+  assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate" "false"
+  assert_db "$db_path" "processing_metrics" "1=1" 1 "processing_metrics: >= 1" "false"
+  assert_db "$db_path" "code_complexity" "1=1" 0 "code_complexity: may populate" "false"
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "eval_snapshots: may populate" "false"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "eval_deltas: may populate" "false"
+  assert_db "$db_path" "similar_issues" "1=1" 0 "similar_issues: may populate" "false"
+  assert_db "$db_path" "release_tracking" "1=1" 0 "release_tracking: may populate" "false"
+  assert_db "$db_path" "indexing_progress" "id=1" 1 "indexing_progress: singleton"
 
   # --- Step 10: Kill Daemon ---
   kill_daemon "$daemon_pid"

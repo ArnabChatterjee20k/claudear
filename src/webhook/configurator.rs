@@ -569,4 +569,511 @@ mod tests {
         assert_eq!(result.warnings[0], "warn1");
         assert_eq!(result.warnings[1], "warn2");
     }
+
+    // ── WebhookConfigurator::new() constructor tests ──
+
+    #[test]
+    fn test_configurator_new_stores_config_and_path() {
+        let config = test_config();
+        let configurator = WebhookConfigurator::new(config.clone(), "/tmp/test.env");
+
+        assert_eq!(
+            configurator.env_path,
+            std::path::PathBuf::from("/tmp/test.env")
+        );
+        assert_eq!(configurator.config.webhook_port, config.webhook_port);
+    }
+
+    #[test]
+    fn test_configurator_new_with_pathbuf() {
+        let config = test_config();
+        let path = std::path::PathBuf::from("/home/user/.env");
+        let configurator = WebhookConfigurator::new(config, path.clone());
+
+        assert_eq!(configurator.env_path, path);
+    }
+
+    #[test]
+    fn test_configurator_new_with_string() {
+        let config = test_config();
+        let configurator = WebhookConfigurator::new(config, String::from("/var/app/.env"));
+
+        assert_eq!(
+            configurator.env_path,
+            std::path::PathBuf::from("/var/app/.env")
+        );
+    }
+
+    #[test]
+    fn test_configurator_new_with_relative_path() {
+        let config = test_config();
+        let configurator = WebhookConfigurator::new(config, ".env");
+
+        assert_eq!(configurator.env_path, std::path::PathBuf::from(".env"));
+    }
+
+    #[test]
+    fn test_configurator_new_with_empty_path() {
+        let config = test_config();
+        let configurator = WebhookConfigurator::new(config, "");
+
+        assert_eq!(configurator.env_path, std::path::PathBuf::from(""));
+    }
+
+    #[test]
+    fn test_configurator_new_preserves_all_config_fields() {
+        let mut config = test_config();
+        config.webhook_port = 5555;
+        config.work_dir = "/custom/dir".into();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            api_key: "key-123".to_string(),
+            webhook_secret: Some("secret".to_string()),
+            ..Default::default()
+        });
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+
+        assert_eq!(configurator.config.webhook_port, 5555);
+        assert_eq!(
+            configurator.config.work_dir,
+            std::path::PathBuf::from("/custom/dir")
+        );
+        assert!(configurator.config.linear.is_some());
+        assert_eq!(
+            configurator.config.linear.as_ref().unwrap().api_key,
+            "key-123"
+        );
+    }
+
+    // ── needs_configuration() additional edge cases ──
+
+    #[test]
+    fn test_needs_configuration_linear_disabled_no_secret() {
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: false,
+            webhook_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(
+            !configurator.needs_configuration(),
+            "Linear disabled should not need config even without secret"
+        );
+    }
+
+    #[test]
+    fn test_needs_configuration_linear_disabled_with_secret() {
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: false,
+            webhook_secret: Some("has-secret".to_string()),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(
+            !configurator.needs_configuration(),
+            "Linear disabled with secret should not need config"
+        );
+    }
+
+    #[test]
+    fn test_needs_configuration_sentry_has_secret_linear_does_not() {
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            webhook_secret: None,
+            ..Default::default()
+        });
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            client_secret: Some("sentry-secret".to_string()),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(
+            configurator.needs_configuration(),
+            "Should need config if Linear lacks secret"
+        );
+    }
+
+    #[test]
+    fn test_needs_configuration_both_have_secrets() {
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            webhook_secret: Some("lin-secret".to_string()),
+            ..Default::default()
+        });
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            client_secret: Some("sen-secret".to_string()),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(
+            !configurator.needs_configuration(),
+            "Both with secrets should not need config"
+        );
+    }
+
+    #[test]
+    fn test_needs_configuration_only_linear_enabled_and_configured() {
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            webhook_secret: Some("secret".to_string()),
+            ..Default::default()
+        });
+        // No sentry at all
+        config.sentry = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(
+            !configurator.needs_configuration(),
+            "Only Linear enabled with secret should not need config"
+        );
+    }
+
+    #[test]
+    fn test_needs_configuration_only_sentry_enabled_and_configured() {
+        let mut config = test_config();
+        config.linear = None;
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(
+            !configurator.needs_configuration(),
+            "Only Sentry enabled with secret should not need config"
+        );
+    }
+
+    #[test]
+    fn test_needs_configuration_only_sentry_enabled_no_secret() {
+        let mut config = test_config();
+        config.linear = None;
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            client_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(
+            configurator.needs_configuration(),
+            "Only Sentry enabled without secret should need config"
+        );
+    }
+
+    // ── mask_secret additional edge cases ──
+
+    #[test]
+    fn test_mask_secret_six_chars() {
+        // 6 <= 12, so should be all asterisks
+        assert_eq!(mask_secret("abcdef"), "******");
+    }
+
+    #[test]
+    fn test_mask_secret_eleven_chars() {
+        assert_eq!(mask_secret("abcdefghijk"), "***********");
+    }
+
+    #[test]
+    fn test_mask_secret_fourteen_chars() {
+        // 14 > 12, so should show prefix...suffix
+        assert_eq!(mask_secret("abcdefghijklmn"), "abc...lmn");
+    }
+
+    #[test]
+    fn test_mask_secret_very_long_string() {
+        let secret = "a".repeat(1000);
+        let result = mask_secret(&secret);
+        assert_eq!(result, "aaa...aaa");
+    }
+
+    #[test]
+    fn test_mask_secret_with_special_chars() {
+        let secret = "!@#$%^&*()_+-=[]{}";
+        // 18 chars > 12, so should show prefix...suffix
+        let chars: Vec<char> = secret.chars().collect();
+        let prefix: String = chars[..3].iter().collect();
+        let suffix: String = chars[chars.len() - 3..].iter().collect();
+        let result = mask_secret(secret);
+        assert_eq!(result, format!("{}...{}", prefix, suffix));
+    }
+
+    #[test]
+    fn test_mask_secret_with_spaces() {
+        let secret = "secret with spaces here";
+        // 23 chars > 12, so should show prefix...suffix
+        let result = mask_secret(secret);
+        assert_eq!(result, "sec...ere");
+    }
+
+    #[test]
+    fn test_mask_secret_all_asterisks() {
+        let secret = "****";
+        // 4 <= 12, so should be all asterisks
+        assert_eq!(mask_secret(secret), "****");
+    }
+
+    #[test]
+    fn test_mask_secret_numeric_string() {
+        let secret = "1234567890123456";
+        // 16 > 12, so prefix...suffix
+        assert_eq!(mask_secret(secret), "123...456");
+    }
+
+    // ── WebhookSetupResult Debug trait ──
+
+    #[test]
+    fn test_webhook_setup_result_debug_format() {
+        let result = WebhookSetupResult::default();
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("WebhookSetupResult"));
+        assert!(debug_str.contains("linear_configured: false"));
+        assert!(debug_str.contains("sentry_configured: false"));
+    }
+
+    #[test]
+    fn test_webhook_setup_result_debug_with_values() {
+        let result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: Some("wh-999".to_string()),
+            linear_secret: Some("secret-val".to_string()),
+            sentry_configured: false,
+            sentry_project_count: 0,
+            sentry_secret: None,
+            warnings: vec!["warning-1".to_string()],
+        };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("linear_configured: true"));
+        assert!(debug_str.contains("wh-999"));
+        assert!(debug_str.contains("warning-1"));
+    }
+
+    // ── WebhookSetupResult field manipulation ──
+
+    #[test]
+    fn test_webhook_setup_result_warnings_can_be_added() {
+        let mut result = WebhookSetupResult::default();
+        assert!(result.warnings.is_empty());
+
+        result.warnings.push("warning 1".to_string());
+        result.warnings.push("warning 2".to_string());
+
+        assert_eq!(result.warnings.len(), 2);
+    }
+
+    #[test]
+    fn test_webhook_setup_result_partial_configuration() {
+        let result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: Some("wh-abc".to_string()),
+            linear_secret: Some("lin-secret-val".to_string()),
+            sentry_configured: false,
+            sentry_project_count: 0,
+            sentry_secret: None,
+            warnings: vec![],
+        };
+
+        assert!(result.linear_configured);
+        assert!(!result.sentry_configured);
+        assert!(result.linear_webhook_id.is_some());
+        assert!(result.sentry_secret.is_none());
+    }
+
+    #[test]
+    fn test_webhook_setup_result_sentry_only() {
+        let result = WebhookSetupResult {
+            linear_configured: false,
+            linear_webhook_id: None,
+            linear_secret: None,
+            sentry_configured: true,
+            sentry_project_count: 5,
+            sentry_secret: Some("sen-secret-val".to_string()),
+            warnings: vec![],
+        };
+
+        assert!(!result.linear_configured);
+        assert!(result.sentry_configured);
+        assert_eq!(result.sentry_project_count, 5);
+    }
+
+    // ── print_setup_result tests ──
+
+    #[test]
+    fn test_print_setup_result_linear_only() {
+        // Capture that this does not panic with linear-only config
+        let result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: Some("wh-123".to_string()),
+            linear_secret: Some("secret1234567890".to_string()),
+            sentry_configured: false,
+            sentry_project_count: 0,
+            sentry_secret: None,
+            warnings: vec![],
+        };
+
+        // Should not panic
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_sentry_only() {
+        let result = WebhookSetupResult {
+            linear_configured: false,
+            linear_webhook_id: None,
+            linear_secret: None,
+            sentry_configured: true,
+            sentry_project_count: 3,
+            sentry_secret: Some("sentry-secret-1234567890".to_string()),
+            warnings: vec![],
+        };
+
+        // Should not panic
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_both_configured() {
+        let result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: Some("wh-456".to_string()),
+            linear_secret: Some("linear-secret-1234567890".to_string()),
+            sentry_configured: true,
+            sentry_project_count: 2,
+            sentry_secret: Some("sentry-secret-1234567890".to_string()),
+            warnings: vec![],
+        };
+
+        // Should not panic
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_with_warnings() {
+        let result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: Some("wh-789".to_string()),
+            linear_secret: Some("secret1234567890".to_string()),
+            sentry_configured: false,
+            sentry_project_count: 0,
+            sentry_secret: None,
+            warnings: vec![
+                "Failed to configure Sentry: API error".to_string(),
+                "Rate limit exceeded".to_string(),
+            ],
+        };
+
+        // Should not panic
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_nothing_configured_no_warnings() {
+        let result = WebhookSetupResult::default();
+
+        // Should not panic, even with no configuration
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_with_no_webhook_id() {
+        let result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: None, // No webhook ID
+            linear_secret: Some("secret1234567890".to_string()),
+            sentry_configured: false,
+            sentry_project_count: 0,
+            sentry_secret: None,
+            warnings: vec![],
+        };
+
+        // Should not panic even without webhook ID
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_with_no_secrets() {
+        let result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: Some("wh-abc".to_string()),
+            linear_secret: None, // No secret
+            sentry_configured: true,
+            sentry_project_count: 1,
+            sentry_secret: None, // No secret
+            warnings: vec![],
+        };
+
+        // Should not panic even without secrets
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_with_short_secrets() {
+        // Secrets that are <= 12 chars should be fully masked
+        let result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: Some("wh-abc".to_string()),
+            linear_secret: Some("short".to_string()), // 5 chars, masked as *****
+            sentry_configured: true,
+            sentry_project_count: 1,
+            sentry_secret: Some("ab".to_string()), // 2 chars, masked as **
+            warnings: vec![],
+        };
+
+        // Should not panic
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_with_empty_secret_strings() {
+        let result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: Some("wh-abc".to_string()),
+            linear_secret: Some("".to_string()), // Empty secret
+            sentry_configured: true,
+            sentry_project_count: 1,
+            sentry_secret: Some("".to_string()), // Empty secret
+            warnings: vec![],
+        };
+
+        // Should not panic (mask_secret("") returns "****")
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_many_warnings() {
+        let result = WebhookSetupResult {
+            linear_configured: false,
+            linear_webhook_id: None,
+            linear_secret: None,
+            sentry_configured: false,
+            sentry_project_count: 0,
+            sentry_secret: None,
+            warnings: (0..10).map(|i| format!("Warning number {}", i)).collect(),
+        };
+
+        // Should not panic with many warnings
+        print_setup_result(&result);
+    }
+
+    #[test]
+    fn test_print_setup_result_sentry_zero_projects() {
+        let result = WebhookSetupResult {
+            linear_configured: false,
+            linear_webhook_id: None,
+            linear_secret: None,
+            sentry_configured: true,
+            sentry_project_count: 0,
+            sentry_secret: Some("secret1234567890".to_string()),
+            warnings: vec![],
+        };
+
+        // Should not panic even with 0 projects
+        print_setup_result(&result);
+    }
 }

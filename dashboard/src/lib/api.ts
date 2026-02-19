@@ -313,8 +313,8 @@ export interface RejectionReason {
 export interface CostEstimate {
   total_cost: number;
   avg_cost_per_fix: number;
-  total_duration_mins: number;
-  cost_per_minute: number;
+  fix_count: number;
+  cost_source: string;
   period: string;
 }
 
@@ -335,7 +335,7 @@ export interface RepoLeaderboardEntry {
 export interface TimeSavings {
   merged_count: number;
   hours_saved: number;
-  hours_per_fix: number;
+  cost_saved: number;
   period: string;
 }
 

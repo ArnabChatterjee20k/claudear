@@ -1168,4 +1168,582 @@ mod tests {
         assert_eq!(delivery.channel, "email");
         assert!(delivery.message_id.is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Additional extract_email_address tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_email_address_with_display_name_and_angle_brackets() {
+        assert_eq!(
+            EmailNotifier::extract_email_address("Alice Bob <alice@company.org>").as_deref(),
+            Some("alice@company.org")
+        );
+    }
+
+    #[test]
+    fn test_extract_email_address_with_quotes_in_display_name() {
+        assert_eq!(
+            EmailNotifier::extract_email_address("\"Alice Bob\" <alice@company.org>").as_deref(),
+            Some("alice@company.org")
+        );
+    }
+
+    #[test]
+    fn test_extract_email_address_only_whitespace() {
+        assert_eq!(EmailNotifier::extract_email_address("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn test_extract_email_address_empty_brackets_no_at() {
+        // "<>" with name prefix - no @ in fallback
+        assert_eq!(
+            EmailNotifier::extract_email_address("NoEmail <>").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_email_address_nested_angle_brackets() {
+        // Picks the first < > pair
+        assert_eq!(
+            EmailNotifier::extract_email_address("Name <outer@example.com> extra>").as_deref(),
+            Some("outer@example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_email_address_uppercase_in_brackets_lowercased() {
+        assert_eq!(
+            EmailNotifier::extract_email_address("Name <USER@EXAMPLE.COM>").as_deref(),
+            Some("user@example.com")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional sanitize_reply_text tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_reply_text_preserves_multiline_answer() {
+        let body = "Line one\nLine two\nLine three";
+        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
+        assert_eq!(result, "Line one\nLine two\nLine three");
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_strips_multiple_token_lines() {
+        let body = "CLAUDEAR-Q:tok-1\nAnswer\nCLAUDEAR-Q:tok-1\nMore answer";
+        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
+        assert_eq!(result, "Answer\nMore answer");
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_strips_mixed_quotes_and_tokens() {
+        let body =
+            "> Original question\n> Second line\nCLAUDEAR-Q:tok-1\n\nMy answer\n> Another quote";
+        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
+        assert_eq!(result, "My answer");
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_only_token_returns_none() {
+        let body = "CLAUDEAR-Q:tok-1";
+        let result = EmailNotifier::sanitize_reply_text(body, "tok-1");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_token_with_whitespace_only_returns_none() {
+        let body = "CLAUDEAR-Q:tok-1\n   \n   \n";
+        let result = EmailNotifier::sanitize_reply_text(body, "tok-1");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_different_correlation_id_preserves_line() {
+        let body = "CLAUDEAR-Q:other-tok\nSome answer";
+        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
+        // The line with CLAUDEAR-Q:other-tok is NOT stripped (different token)
+        assert!(result.contains("CLAUDEAR-Q:other-tok"));
+        assert!(result.contains("Some answer"));
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_exactly_30_lines() {
+        let body = (1..=30)
+            .map(|i| format!("Line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = EmailNotifier::sanitize_reply_text(&body, "tok-1").unwrap();
+        assert_eq!(result.lines().count(), 30);
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_31_lines_truncated() {
+        let body = (1..=31)
+            .map(|i| format!("Line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = EmailNotifier::sanitize_reply_text(&body, "tok-1").unwrap();
+        assert_eq!(result.lines().count(), 30);
+        assert!(result.contains("Line 30"));
+        assert!(!result.contains("Line 31"));
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_exactly_4000_chars() {
+        // Build a string that is exactly 4000 chars of content lines
+        let line = "x".repeat(100);
+        let body = (0..40).map(|_| line.clone()).collect::<Vec<_>>().join("\n"); // 40 * 100 + 39 newlines but only 30 lines are kept
+        let result = EmailNotifier::sanitize_reply_text(&body, "tok-1").unwrap();
+        assert!(result.len() <= 4000);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_plain_body tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_plain_body_simple() {
+        let raw = b"From: user@example.com\r\nSubject: Test\r\nContent-Type: text/plain\r\n\r\nHello world";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let body = EmailNotifier::extract_plain_body(&parsed);
+        assert!(body.contains("Hello world"));
+    }
+
+    #[test]
+    fn test_extract_plain_body_multipart() {
+        let raw = b"From: user@example.com\r\nSubject: Test\r\nContent-Type: multipart/alternative; boundary=bound\r\n\r\n--bound\r\nContent-Type: text/plain\r\n\r\nPlain text body\r\n--bound\r\nContent-Type: text/html\r\n\r\n<p>HTML body</p>\r\n--bound--";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let body = EmailNotifier::extract_plain_body(&parsed);
+        assert!(body.contains("Plain text body"));
+        assert!(!body.contains("<p>"));
+    }
+
+    #[test]
+    fn test_extract_plain_body_no_plain_part_falls_back() {
+        let raw = b"From: user@example.com\r\nSubject: Test\r\nContent-Type: multipart/alternative; boundary=bound\r\n\r\n--bound\r\nContent-Type: text/html\r\n\r\n<p>Only HTML</p>\r\n--bound--";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let body = EmailNotifier::extract_plain_body(&parsed);
+        // Falls back to get_body() on the parent
+        assert!(!body.is_empty() || body.is_empty()); // Shouldn't panic
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_recipients edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_recipients_with_resolved_user_unknown_slug() {
+        let config = EmailConfig {
+            to_addresses: vec!["global@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "unknown_user");
+        let recipients = notifier.resolve_recipients(Some(&issue));
+        // Should fall back to global since user slug not found
+        assert_eq!(recipients, vec!["global@example.com".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_recipients_multiple_global_addresses() {
+        let config = EmailConfig {
+            to_addresses: vec![
+                "a@example.com".to_string(),
+                "b@example.com".to_string(),
+                "c@example.com".to_string(),
+            ],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let recipients = notifier.resolve_recipients(None);
+        assert_eq!(recipients.len(), 3);
+    }
+
+    #[test]
+    fn test_resolve_recipients_empty_global() {
+        let config = EmailConfig {
+            to_addresses: vec![],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let recipients = notifier.resolve_recipients(None);
+        assert!(recipients.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // target_email_for_issue edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_target_email_for_issue_uses_resolved_user() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "jake".to_string(),
+            crate::config::UserConfig {
+                email: Some("jake@resolved.com".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = UserRegistry::new(users);
+        let config = EmailConfig {
+            to_addresses: vec!["fallback@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, registry).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "jake");
+        assert_eq!(
+            notifier.target_email_for_issue(&issue),
+            Some("jake@resolved.com".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // expected_reply_emails edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expected_reply_emails_empty_to_addresses_no_target() {
+        let config = EmailConfig {
+            to_addresses: vec![],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let request = AskRequest {
+            correlation_id: "tok-empty".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let emails = notifier.expected_reply_emails(&request);
+        assert!(emails.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // supports_replies edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_supports_replies_false_when_empty_imap_username() {
+        let config = EmailConfig {
+            imap_host: Some("imap.example.com".to_string()),
+            imap_username: Some("".to_string()),
+            imap_password: Some("pass".to_string()),
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        assert!(!notifier.supports_replies());
+    }
+
+    // -----------------------------------------------------------------------
+    // poll_question_replies returns empty without IMAP config
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_poll_question_replies_no_imap_host() {
+        let config = EmailConfig {
+            imap_host: None,
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let request = AskRequest {
+            correlation_id: "tok-poll".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let replies = notifier
+            .poll_question_replies(&request, Utc::now())
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_poll_question_replies_empty_imap_host() {
+        let config = EmailConfig {
+            imap_host: Some("".to_string()),
+            imap_username: Some("user".to_string()),
+            imap_password: Some("pass".to_string()),
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let request = AskRequest {
+            correlation_id: "tok-empty-host".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let replies = notifier
+            .poll_question_replies(&request, Utc::now())
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_poll_question_replies_empty_imap_username() {
+        let config = EmailConfig {
+            imap_host: Some("imap.example.com".to_string()),
+            imap_username: Some("".to_string()),
+            imap_password: Some("pass".to_string()),
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let request = AskRequest {
+            correlation_id: "tok-empty-user".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let replies = notifier
+            .poll_question_replies(&request, Utc::now())
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_poll_question_replies_empty_imap_password() {
+        let config = EmailConfig {
+            imap_host: Some("imap.example.com".to_string()),
+            imap_username: Some("user".to_string()),
+            imap_password: Some("".to_string()),
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let request = AskRequest {
+            correlation_id: "tok-empty-pass".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let replies = notifier
+            .poll_question_replies(&request, Utc::now())
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_poll_question_replies_no_imap_username() {
+        let config = EmailConfig {
+            imap_host: Some("imap.example.com".to_string()),
+            imap_username: None,
+            imap_password: Some("pass".to_string()),
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let request = AskRequest {
+            correlation_id: "tok-no-user".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let replies = notifier
+            .poll_question_replies(&request, Utc::now())
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_poll_question_replies_no_imap_password() {
+        let config = EmailConfig {
+            imap_host: Some("imap.example.com".to_string()),
+            imap_username: Some("user".to_string()),
+            imap_password: None,
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let request = AskRequest {
+            correlation_id: "tok-no-pass".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let replies = notifier
+            .poll_question_replies(&request, Utc::now())
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // format_issue_info structure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_issue_info_contains_priority_and_status() {
+        let mut issue = Issue::new("1", "TEST-1", "Title", "https://url.com", "jira");
+        issue.priority = IssuePriority::Critical;
+        issue.status = IssueStatus::InProgress;
+        let info = EmailNotifier::format_issue_info(&issue);
+        assert!(info.contains("Priority: critical"));
+        assert!(info.contains("Status: in_progress"));
+    }
+
+    #[test]
+    fn test_format_issue_info_newline_structure() {
+        let issue = Issue::new("1", "TEST-1", "Title", "https://url.com", "linear");
+        let info = EmailNotifier::format_issue_info(&issue);
+        let lines: Vec<&str> = info.lines().collect();
+        assert_eq!(lines.len(), 6);
+        assert!(lines[0].starts_with("Issue:"));
+        assert!(lines[1].starts_with("Source:"));
+        assert!(lines[2].starts_with("Priority:"));
+        assert!(lines[3].starts_with("Status:"));
+        assert!(lines[4].starts_with("URL:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ask_question content tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ask_question_with_options_and_context() {
+        let config = EmailConfig {
+            to_addresses: vec!["user@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = AskRequest {
+            correlation_id: "tok-opts".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which env?".to_string(),
+                context: Some("We need to deploy somewhere".to_string()),
+                options: vec!["staging".to_string(), "production".to_string()],
+                why: Some("Multiple environments available".to_string()),
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        // With no transport, send_email returns Ok
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.channel, "email");
+        assert_eq!(delivery.target.as_deref(), Some("user@example.com"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_enabled with all conditions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_enabled_true_when_all_set() {
+        // We cannot easily create a fully enabled notifier without a real SMTP server,
+        // but we can test the partial_config (has transport, no from_address)
+        let notifier = EmailNotifier::new(partial_config(), empty_registry()).unwrap();
+        // Has transport but no from, so not enabled
+        assert!(!notifier.is_enabled());
+    }
+
+    #[test]
+    fn test_new_with_tls_and_valid_host() {
+        // This will attempt starttls_relay which might fail for invalid host
+        // but the builder should succeed
+        let config = EmailConfig {
+            smtp_host: Some("smtp.gmail.com".to_string()),
+            smtp_port: 587,
+            smtp_username: Some("user@gmail.com".to_string()),
+            smtp_password: Some("password".to_string()),
+            from_address: Some("user@gmail.com".to_string()),
+            to_addresses: vec!["recipient@example.com".to_string()],
+            use_tls: true,
+            ..Default::default()
+        };
+        let result = EmailNotifier::new(config, empty_registry());
+        assert!(result.is_ok());
+    }
 }

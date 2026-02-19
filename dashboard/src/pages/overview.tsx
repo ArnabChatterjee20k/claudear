@@ -79,8 +79,11 @@ export default function OverviewPage() {
               <div>
                 <p className="text-sm font-medium text-green-700 dark:text-green-400">Engineering Hours Saved This Week</p>
                 <p className="text-3xl font-bold text-green-800 dark:text-green-300">{overview.time_savings.hours_saved.toFixed(1)}h</p>
+                <p className="text-lg font-semibold text-green-700 dark:text-green-400">
+                  ${overview.time_savings.cost_saved.toLocaleString()} saved
+                </p>
                 <p className="text-sm text-green-600 dark:text-green-500">
-                  {overview.time_savings.merged_count} merged fixes × {overview.time_savings.hours_per_fix}h per fix
+                  {overview.time_savings.merged_count} merged fixes
                 </p>
               </div>
             </div>

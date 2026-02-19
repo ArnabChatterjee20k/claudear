@@ -599,6 +599,30 @@ pub struct ClaudeExecution {
     /// Lines removed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines_removed: Option<i32>,
+    /// Total cost in USD reported by Claude CLI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    /// Number of conversation turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_turns: Option<i64>,
+    /// Claude session identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// API-side request duration in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_api_ms: Option<i64>,
+    /// Input tokens used (non-cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    /// Output tokens generated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    /// Tokens read from prompt cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<i64>,
+    /// Tokens written to prompt cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<i64>,
 }
 
 impl ClaudeExecution {
@@ -627,6 +651,14 @@ impl ClaudeExecution {
             files_changed: None,
             lines_added: None,
             lines_removed: None,
+            total_cost_usd: None,
+            num_turns: None,
+            session_id: None,
+            duration_api_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         }
     }
 
@@ -1363,8 +1395,8 @@ pub struct RejectionReason {
 pub struct CostEstimate {
     pub total_cost: f64,
     pub avg_cost_per_fix: f64,
-    pub total_duration_mins: f64,
-    pub cost_per_minute: f64,
+    pub fix_count: i64,
+    pub cost_source: String,
     pub period: String,
 }
 
@@ -1391,7 +1423,7 @@ pub struct RepoLeaderboardEntry {
 pub struct TimeSavings {
     pub merged_count: i64,
     pub hours_saved: f64,
-    pub hours_per_fix: f64,
+    pub cost_saved: f64,
     pub period: String,
 }
 

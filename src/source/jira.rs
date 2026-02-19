@@ -1699,4 +1699,869 @@ mod tests {
         let status = source.get_issue_status("PROJ-1").await.unwrap();
         assert_eq!(status, "new");
     }
+
+    // ── JQL escaping tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_escape_jql_value_no_special_chars() {
+        type JS = JiraSource<MockJiraClient>;
+        assert_eq!(JS::escape_jql_value("simple"), "simple");
+    }
+
+    #[test]
+    fn test_escape_jql_value_backslash() {
+        type JS = JiraSource<MockJiraClient>;
+        assert_eq!(JS::escape_jql_value("path\\file"), "path\\\\file");
+    }
+
+    #[test]
+    fn test_escape_jql_value_double_quote() {
+        type JS = JiraSource<MockJiraClient>;
+        assert_eq!(JS::escape_jql_value(r#"say "hello""#), r#"say \"hello\""#);
+    }
+
+    #[test]
+    fn test_escape_jql_value_both_special_chars() {
+        type JS = JiraSource<MockJiraClient>;
+        assert_eq!(JS::escape_jql_value(r#"path\"file"#), r#"path\\\"file"#);
+    }
+
+    #[test]
+    fn test_escape_jql_value_empty() {
+        type JS = JiraSource<MockJiraClient>;
+        assert_eq!(JS::escape_jql_value(""), "");
+    }
+
+    // ── Additional JQL building tests ─────────────────────────────────
+
+    #[test]
+    fn test_build_jql_no_statuses() {
+        let mut config = test_config();
+        config.trigger_statuses = Vec::new();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        assert!(!jql.contains("status in"));
+        assert!(jql.contains("resolution = Unresolved"));
+    }
+
+    #[test]
+    fn test_build_jql_no_assignee() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        assert!(!jql.contains("assignee ="));
+    }
+
+    #[test]
+    fn test_build_jql_all_filters_combined() {
+        let mut config = test_config();
+        config.trigger_assignee = Some("Jane".to_string());
+        config.issue_types = vec!["Bug".to_string()];
+        config.custom_jql = Some("priority = High".to_string());
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+
+        assert!(jql.contains("project in"));
+        assert!(jql.contains("resolution = Unresolved"));
+        assert!(jql.contains("status in"));
+        assert!(jql.contains("labels in"));
+        assert!(jql.contains("assignee = \"Jane\""));
+        assert!(jql.contains("issuetype in (\"Bug\")"));
+        assert!(jql.contains("(priority = High)"));
+        assert!(jql.contains("ORDER BY updated DESC"));
+    }
+
+    #[test]
+    fn test_build_jql_assignee_with_special_chars() {
+        let mut config = test_config();
+        config.trigger_assignee = Some(r#"Jane "Quick" Smith"#.to_string());
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        assert!(jql.contains(r#"assignee = "Jane \"Quick\" Smith""#));
+    }
+
+    #[test]
+    fn test_build_jql_custom_jql_balanced_parens() {
+        let mut config = test_config();
+        config.custom_jql = Some("(a = 1 AND (b = 2 OR c = 3))".to_string());
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        assert!(jql.contains("((a = 1 AND (b = 2 OR c = 3)))"));
+    }
+
+    #[test]
+    fn test_build_jql_custom_jql_empty_string() {
+        let mut config = test_config();
+        config.custom_jql = Some("".to_string());
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        // Empty custom_jql is balanced (depth remains 0), so it's included as "()"
+        assert!(jql.contains("()"));
+    }
+
+    #[test]
+    fn test_build_jql_minimal_config() {
+        let config = JiraConfig {
+            enabled: true,
+            base_url: "https://test.atlassian.net".to_string(),
+            email: "user@test.com".to_string(),
+            api_token: "token".to_string(),
+            auth_mode: "basic".to_string(),
+            project_keys: vec![],
+            trigger_labels: vec![],
+            trigger_statuses: vec![],
+            trigger_assignee: None,
+            issue_types: vec![],
+            custom_jql: None,
+            max_results: 50,
+            max_issues_per_cycle: None,
+            max_concurrent: None,
+            poll_interval_ms: None,
+        };
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        // Should only have resolution clause and ORDER BY
+        assert_eq!(jql, "resolution = Unresolved ORDER BY updated DESC");
+    }
+
+    // ── validate_custom_jql additional tests ──────────────────────────
+
+    #[test]
+    fn test_validate_custom_jql_deeply_nested() {
+        type JS = JiraSource<MockJiraClient>;
+        assert!(JS::validate_custom_jql("((((a))))"));
+    }
+
+    #[test]
+    fn test_validate_custom_jql_starts_with_close() {
+        type JS = JiraSource<MockJiraClient>;
+        assert!(!JS::validate_custom_jql(")a("));
+    }
+
+    #[test]
+    fn test_validate_custom_jql_multiple_groups() {
+        type JS = JiraSource<MockJiraClient>;
+        assert!(JS::validate_custom_jql("(a) AND (b) AND (c)"));
+    }
+
+    // ── Priority mapping edge cases ───────────────────────────────────
+
+    #[test]
+    fn test_priority_mapping_case_insensitive() {
+        assert_eq!(map_priority(Some("highest")), IssuePriority::Critical);
+        assert_eq!(map_priority(Some("HIGHEST")), IssuePriority::Critical);
+        assert_eq!(map_priority(Some("Highest")), IssuePriority::Critical);
+        assert_eq!(map_priority(Some("blocker")), IssuePriority::Critical);
+        assert_eq!(map_priority(Some("BLOCKER")), IssuePriority::Critical);
+        assert_eq!(map_priority(Some("high")), IssuePriority::High);
+        assert_eq!(map_priority(Some("HIGH")), IssuePriority::High);
+        assert_eq!(map_priority(Some("medium")), IssuePriority::Medium);
+        assert_eq!(map_priority(Some("MEDIUM")), IssuePriority::Medium);
+        assert_eq!(map_priority(Some("normal")), IssuePriority::Medium);
+        assert_eq!(map_priority(Some("NORMAL")), IssuePriority::Medium);
+        assert_eq!(map_priority(Some("low")), IssuePriority::Low);
+        assert_eq!(map_priority(Some("LOW")), IssuePriority::Low);
+        assert_eq!(map_priority(Some("lowest")), IssuePriority::Low);
+        assert_eq!(map_priority(Some("LOWEST")), IssuePriority::Low);
+        assert_eq!(map_priority(Some("trivial")), IssuePriority::Low);
+        assert_eq!(map_priority(Some("TRIVIAL")), IssuePriority::Low);
+    }
+
+    #[test]
+    fn test_priority_mapping_empty_string() {
+        assert_eq!(map_priority(Some("")), IssuePriority::None);
+    }
+
+    #[test]
+    fn test_priority_mapping_custom_string() {
+        assert_eq!(map_priority(Some("custom-priority")), IssuePriority::None);
+    }
+
+    // ── Status mapping edge cases ─────────────────────────────────────
+
+    #[test]
+    fn test_status_mapping_empty_string() {
+        assert_eq!(map_status(""), IssueStatus::Open);
+    }
+
+    #[test]
+    fn test_status_mapping_case_sensitive() {
+        // The function is case-sensitive
+        assert_eq!(map_status("New"), IssueStatus::Open); // Not "new"
+        assert_eq!(map_status("Done"), IssueStatus::Open); // Not "done"
+    }
+
+    // ── ADF extraction edge cases ─────────────────────────────────────
+
+    #[test]
+    fn test_extract_adf_text_number() {
+        let value = serde_json::json!(42);
+        assert_eq!(extract_adf_text(&value), "");
+    }
+
+    #[test]
+    fn test_extract_adf_text_boolean() {
+        let value = serde_json::json!(true);
+        assert_eq!(extract_adf_text(&value), "");
+    }
+
+    #[test]
+    fn test_extract_adf_text_array() {
+        let value = serde_json::json!(["hello", "world"]);
+        assert_eq!(extract_adf_text(&value), "");
+    }
+
+    #[test]
+    fn test_extract_adf_text_with_list() {
+        let value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "bulletList",
+                    "content": [
+                        {
+                            "type": "listItem",
+                            "content": [
+                                {
+                                    "type": "paragraph",
+                                    "content": [
+                                        {"type": "text", "text": "Item 1"}
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "type": "listItem",
+                            "content": [
+                                {
+                                    "type": "paragraph",
+                                    "content": [
+                                        {"type": "text", "text": "Item 2"}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let text = extract_adf_text(&value);
+        assert!(text.contains("Item 1"));
+        assert!(text.contains("Item 2"));
+    }
+
+    #[test]
+    fn test_extract_adf_text_with_code_block() {
+        let value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "codeBlock",
+                    "content": [
+                        {"type": "text", "text": "fn main() {}"}
+                    ]
+                }
+            ]
+        });
+        let text = extract_adf_text(&value);
+        assert!(text.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn test_extract_adf_text_with_blockquote() {
+        let value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "blockquote",
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {"type": "text", "text": "Quoted text"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let text = extract_adf_text(&value);
+        assert!(text.contains("Quoted text"));
+    }
+
+    #[test]
+    fn test_extract_adf_text_with_heading() {
+        let value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "heading",
+                    "content": [
+                        {"type": "text", "text": "Section Title"}
+                    ]
+                },
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {"type": "text", "text": "Body text"}
+                    ]
+                }
+            ]
+        });
+        let text = extract_adf_text(&value);
+        assert!(text.contains("Section Title"));
+        assert!(text.contains("Body text"));
+    }
+
+    #[test]
+    fn test_extract_adf_text_with_rule() {
+        let value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": "Before"}]
+                },
+                {"type": "rule"},
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": "After"}]
+                }
+            ]
+        });
+        let text = extract_adf_text(&value);
+        assert!(text.contains("Before"));
+        assert!(text.contains("After"));
+    }
+
+    #[test]
+    fn test_extract_adf_text_empty_object() {
+        let value = serde_json::json!({});
+        let text = extract_adf_text(&value);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn test_extract_adf_text_nested_inline_formatting() {
+        // ADF with marks (bold, italic) - marks are ignored, text extracted
+        let value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Bold text",
+                            "marks": [{"type": "strong"}]
+                        },
+                        {"type": "text", "text": " and "},
+                        {
+                            "type": "text",
+                            "text": "italic text",
+                            "marks": [{"type": "em"}]
+                        }
+                    ]
+                }
+            ]
+        });
+        let text = extract_adf_text(&value);
+        assert!(text.contains("Bold text"));
+        assert!(text.contains("italic text"));
+    }
+
+    // ── matches_criteria edge cases ───────────────────────────────────
+
+    #[test]
+    fn test_matches_criteria_high_priority() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("labels", "auto-implement");
+        issue.priority = IssuePriority::High;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::High);
+    }
+
+    #[test]
+    fn test_matches_criteria_low_priority() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("labels", "auto-implement");
+        issue.priority = IssuePriority::Low;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Normal);
+    }
+
+    #[test]
+    fn test_matches_criteria_none_priority() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("labels", "auto-implement");
+        issue.priority = IssuePriority::None;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Normal);
+    }
+
+    #[test]
+    fn test_matches_criteria_assignee_mismatch_no_labels_config() {
+        let mut config = test_config();
+        config.trigger_assignee = Some("Other User".to_string());
+        config.trigger_labels = Vec::new(); // No labels configured
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("assignee", "Different User");
+
+        let result = source.matches_criteria(&issue);
+        assert!(!result.matches);
+        assert!(result.reason.contains("Not assigned to"));
+    }
+
+    #[test]
+    fn test_matches_criteria_no_assignee_on_issue() {
+        let mut config = test_config();
+        config.trigger_assignee = Some("Target User".to_string());
+        config.trigger_labels = Vec::new();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("status_name", "To Do");
+        // No assignee metadata set
+
+        let result = source.matches_criteria(&issue);
+        assert!(!result.matches);
+    }
+
+    #[test]
+    fn test_matches_criteria_empty_labels_on_issue() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("labels", ""); // Empty labels
+
+        let result = source.matches_criteria(&issue);
+        assert!(!result.matches);
+    }
+
+    #[test]
+    fn test_matches_criteria_multiple_labels_second_matches() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("labels", "unrelated, claude"); // "claude" matches
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+    }
+
+    #[test]
+    fn test_matches_criteria_empty_statuses_config() {
+        let mut config = test_config();
+        config.trigger_statuses = Vec::new();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
+        issue.set_metadata("status_category", "indeterminate");
+        issue.set_metadata("status_name", "Any Status");
+        issue.set_metadata("labels", "auto-implement");
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+    }
+
+    // ── Issue mapping edge cases ──────────────────────────────────────
+
+    #[test]
+    fn test_map_issue_no_priority() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let json = serde_json::json!({
+            "id": "10001",
+            "key": "PROJ-1",
+            "self": "https://test.atlassian.net/rest/api/3/issue/10001",
+            "fields": {
+                "summary": "No priority issue",
+                "description": null,
+                "status": {
+                    "name": "To Do",
+                    "statusCategory": {"key": "new", "name": "To Do"}
+                },
+                "priority": null,
+                "issuetype": null,
+                "labels": null,
+                "assignee": null,
+                "reporter": null,
+                "project": {"key": "PROJ", "name": "Test Project"},
+                "created": null,
+                "updated": null,
+                "resolution": null,
+                "comment": null
+            }
+        });
+        let api_issue: JiraApiIssue = serde_json::from_value(json).unwrap();
+        let issue = source.map_issue(api_issue);
+
+        assert_eq!(issue.priority, IssuePriority::None);
+        assert!(issue.description.is_none());
+        assert!(issue.created_at.is_none());
+        assert!(issue.updated_at.is_none());
+        assert!(issue.get_metadata::<String>("priority_name").is_none());
+        assert!(issue.get_metadata::<String>("issue_type").is_none());
+        assert!(issue.get_metadata::<String>("assignee").is_none());
+        assert!(issue.get_metadata::<String>("reporter").is_none());
+        assert!(issue.get_metadata::<String>("resolution").is_none());
+    }
+
+    #[test]
+    fn test_map_issue_with_resolution() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let json = serde_json::json!({
+            "id": "10002",
+            "key": "PROJ-2",
+            "self": "https://test.atlassian.net/rest/api/3/issue/10002",
+            "fields": {
+                "summary": "Resolved issue",
+                "description": null,
+                "status": {
+                    "name": "Done",
+                    "statusCategory": {"key": "done", "name": "Done"}
+                },
+                "priority": {"name": "Low", "id": "4"},
+                "issuetype": {"name": "Story"},
+                "labels": ["feature", "release"],
+                "assignee": null,
+                "reporter": {"displayName": "Admin", "accountId": "admin123"},
+                "project": {"key": "PROJ", "name": "Test Project"},
+                "created": "2024-03-15T10:00:00.000+0000",
+                "updated": "2024-03-16T14:30:00.000+0000",
+                "resolution": {"name": "Fixed"},
+                "comment": null
+            }
+        });
+        let api_issue: JiraApiIssue = serde_json::from_value(json).unwrap();
+        let issue = source.map_issue(api_issue);
+
+        assert_eq!(issue.priority, IssuePriority::Low);
+        assert_eq!(issue.status, IssueStatus::Resolved);
+        assert_eq!(
+            issue.get_metadata::<String>("resolution"),
+            Some("Fixed".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("reporter"),
+            Some("Admin".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("issue_type"),
+            Some("Story".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("labels"),
+            Some("feature, release".to_string())
+        );
+        assert!(issue.created_at.is_some());
+        assert!(issue.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_map_issue_url_with_trailing_slash_on_base() {
+        let mut config = test_config();
+        config.base_url = "https://test.atlassian.net/".to_string(); // trailing slash
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let json = make_jira_issue_json("10001", "PROJ-1", "Test", "To Do", "new");
+        let api_issue: JiraApiIssue = serde_json::from_str(&json).unwrap();
+        let issue = source.map_issue(api_issue);
+
+        assert_eq!(issue.url, "https://test.atlassian.net/browse/PROJ-1");
+    }
+
+    // ── Context formatting edge cases ─────────────────────────────────
+
+    #[test]
+    fn test_format_jira_context_no_description() {
+        let issue = Issue::new(
+            "1",
+            "PROJ-1",
+            "No desc",
+            "https://jira/browse/PROJ-1",
+            "jira",
+        );
+        let context = format_jira_context(&issue);
+        assert!(!context.contains("## Description"));
+    }
+
+    #[test]
+    fn test_format_jira_context_empty_description() {
+        let mut issue = Issue::new(
+            "1",
+            "PROJ-1",
+            "Empty desc",
+            "https://jira/browse/PROJ-1",
+            "jira",
+        );
+        issue.description = Some("".to_string());
+        let context = format_jira_context(&issue);
+        assert!(!context.contains("## Description"));
+    }
+
+    #[test]
+    fn test_format_jira_context_project_without_key() {
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://jira/browse/PROJ-1", "jira");
+        issue.set_metadata("project_name", "My Project");
+        // No project_key set
+        let context = format_jira_context(&issue);
+        assert!(context.contains("**Project:** My Project"));
+        assert!(!context.contains("("));
+    }
+
+    #[test]
+    fn test_format_jira_context_empty_labels() {
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://jira/browse/PROJ-1", "jira");
+        issue.set_metadata("labels", "");
+        let context = format_jira_context(&issue);
+        assert!(!context.contains("**Labels:**"));
+    }
+
+    // ── Deserialization tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_jira_search_response_deserialization() {
+        let json = r#"{
+            "issues": [],
+            "total": 0
+        }"#;
+        let resp: JiraSearchResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.issues.is_empty());
+        assert_eq!(resp.total, 0);
+    }
+
+    #[test]
+    fn test_jira_search_response_with_issues() {
+        let issue_json = make_jira_issue_json("10001", "PROJ-1", "Bug", "To Do", "new");
+        let json = format!(r#"{{"issues": [{}], "total": 1}}"#, issue_json);
+        let resp: JiraSearchResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp.issues.len(), 1);
+        assert_eq!(resp.total, 1);
+    }
+
+    #[test]
+    fn test_jira_transitions_response_deserialization() {
+        let json = r#"{
+            "transitions": [
+                {
+                    "id": "31",
+                    "name": "Done",
+                    "to": {
+                        "statusCategory": {
+                            "key": "done",
+                            "name": "Done"
+                        }
+                    }
+                },
+                {
+                    "id": "21",
+                    "name": "In Progress",
+                    "to": {
+                        "statusCategory": {
+                            "key": "indeterminate",
+                            "name": "In Progress"
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let resp: JiraTransitionsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.transitions.len(), 2);
+        assert_eq!(resp.transitions[0].id, "31");
+        assert_eq!(resp.transitions[0].to.status_category.key, "done");
+    }
+
+    #[test]
+    fn test_jira_api_issue_deserialization_all_fields() {
+        let json = make_jira_issue_json(
+            "10001",
+            "PROJ-1",
+            "Full issue",
+            "In Progress",
+            "indeterminate",
+        );
+        let issue: JiraApiIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(issue.id, "10001");
+        assert_eq!(issue.key, "PROJ-1");
+        assert_eq!(issue.fields.summary, "Full issue");
+        assert_eq!(issue.fields.status.name, "In Progress");
+        assert_eq!(issue.fields.status.status_category.key, "indeterminate");
+        assert!(issue.fields.priority.is_some());
+        assert!(issue.fields.issuetype.is_some());
+        assert!(issue.fields.labels.is_some());
+        assert!(issue.fields.assignee.is_some());
+        assert!(issue.fields.reporter.is_some());
+        assert!(issue.fields.created.is_some());
+        assert!(issue.fields.updated.is_some());
+    }
+
+    #[test]
+    fn test_jira_api_issue_deserialization_minimal() {
+        let json = r#"{
+            "id": "1",
+            "key": "MIN-1",
+            "self": "https://test.atlassian.net/rest/api/3/issue/1",
+            "fields": {
+                "summary": "Minimal",
+                "description": null,
+                "status": {
+                    "name": "Open",
+                    "statusCategory": {"key": "new", "name": "To Do"}
+                },
+                "priority": null,
+                "issuetype": null,
+                "labels": null,
+                "assignee": null,
+                "reporter": null,
+                "project": {"key": "MIN", "name": "Minimal Project"},
+                "created": null,
+                "updated": null,
+                "resolution": null,
+                "comment": null
+            }
+        }"#;
+        let issue: JiraApiIssue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.id, "1");
+        assert_eq!(issue.key, "MIN-1");
+        assert!(issue.fields.priority.is_none());
+        assert!(issue.fields.issuetype.is_none());
+        assert!(issue.fields.assignee.is_none());
+    }
+
+    // ── Auth header tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_auth_header_default_is_basic() {
+        let mut config = test_config();
+        config.auth_mode = "anything_else".to_string();
+        let header = build_auth_header(&config);
+        assert!(header.starts_with("Basic "));
+    }
+
+    #[test]
+    fn test_auth_header_basic_encoding() {
+        let config = JiraConfig {
+            email: "test@example.com".to_string(),
+            api_token: "my-secret-token".to_string(),
+            auth_mode: "basic".to_string(),
+            ..test_config()
+        };
+        let header = build_auth_header(&config);
+        let encoded = BASE64.encode("test@example.com:my-secret-token".as_bytes());
+        assert_eq!(header, format!("Basic {}", encoded));
+    }
+
+    // ── Resolve issue transition failure ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_resolve_issue_transition_post_failure() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+
+        let transitions_url =
+            "https://test.atlassian.net/rest/api/3/issue/PROJ-1/transitions".to_string();
+        mock.mock_get(
+            &transitions_url,
+            200,
+            r#"{
+                "transitions": [
+                    {
+                        "id": "31",
+                        "name": "Done",
+                        "to": {
+                            "statusCategory": {
+                                "key": "done",
+                                "name": "Done"
+                            }
+                        }
+                    }
+                ]
+            }"#,
+        );
+        mock.mock_post(
+            &transitions_url,
+            400,
+            r#"{"errorMessages": ["Cannot transition"]}"#,
+        );
+
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.resolve_issue("PROJ-1").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to resolve issue"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_transitions_fetch_failure() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+        // No mock for transitions URL -> 404
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.resolve_issue("PROJ-1").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to fetch transitions"));
+    }
+
+    // ── max_results capping ──────────────────────────────────────────
+
+    #[test]
+    fn test_max_results_capped_at_100() {
+        let mut config = test_config();
+        config.max_results = 200; // Over 100
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        // The cap happens in search_issues, not build_jql, but we can verify jql is built
+        assert!(jql.contains("ORDER BY updated DESC"));
+    }
+
+    // ── ReqwestJiraClient default ────────────────────────────────────
+
+    #[test]
+    fn test_reqwest_jira_client_default() {
+        let client = ReqwestJiraClient::default();
+        assert!(std::mem::size_of_val(&client) > 0);
+    }
 }

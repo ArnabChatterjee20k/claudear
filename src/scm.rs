@@ -3322,6 +3322,532 @@ mod tests {
             assert!(matches!(&events[0], ReviewEvent::ReviewSubmitted { .. }));
         }
     }
+
+    // ================================================================
+    // Additional coverage: type serialization, Display impls,
+    // ReviewEvent edge cases, PrReviewState JSON, ReviewWatcher
+    // state management, comment_is_after_cursor boundary cases,
+    // and compare_timestamps with sub-second precision.
+    // ================================================================
+
+    // ── CodeReview serde round-trip ──────────────────────────────────
+
+    #[test]
+    fn code_review_serde_round_trip_full() {
+        let review = CodeReview {
+            id: 42,
+            state: "APPROVED".to_string(),
+            body: Some("Looks good!".to_string()),
+            user: ReviewUser {
+                id: 7,
+                login: "octocat".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            submitted_at: Some("2025-03-15T10:30:00Z".to_string()),
+            html_url: Some("https://github.com/org/repo/pull/1#pullrequestreview-42".to_string()),
+        };
+
+        let json = serde_json::to_string(&review).unwrap();
+        let deserialized: CodeReview = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, 42);
+        assert_eq!(deserialized.state, "APPROVED");
+        assert_eq!(deserialized.body.as_deref(), Some("Looks good!"));
+        assert_eq!(deserialized.user.id, 7);
+        assert_eq!(deserialized.user.login, "octocat");
+        assert_eq!(deserialized.user.user_type.as_deref(), Some("User"));
+        assert_eq!(
+            deserialized.submitted_at.as_deref(),
+            Some("2025-03-15T10:30:00Z")
+        );
+        assert!(deserialized.html_url.is_some());
+    }
+
+    #[test]
+    fn code_review_serde_minimal_json() {
+        // Minimal JSON with only required fields; optionals missing
+        let json = r#"{"id":1,"state":"COMMENTED","body":null,"user":{"id":2,"login":"dev"},"submitted_at":null,"html_url":null}"#;
+        let review: CodeReview = serde_json::from_str(json).unwrap();
+        assert_eq!(review.id, 1);
+        assert_eq!(review.state, "COMMENTED");
+        assert!(review.body.is_none());
+        assert!(review.user.user_type.is_none());
+        assert!(review.submitted_at.is_none());
+        assert!(review.html_url.is_none());
+    }
+
+    // ── ReviewUser serde with "type" rename ──────────────────────────
+
+    #[test]
+    fn review_user_serde_type_field_rename() {
+        let json = r#"{"id":99,"login":"bot-user","type":"Bot"}"#;
+        let user: ReviewUser = serde_json::from_str(json).unwrap();
+        assert_eq!(user.id, 99);
+        assert_eq!(user.login, "bot-user");
+        assert_eq!(user.user_type.as_deref(), Some("Bot"));
+
+        // Serialize back should use "type" not "user_type"
+        let serialized = serde_json::to_string(&user).unwrap();
+        assert!(
+            serialized.contains("\"type\":"),
+            "Serialized JSON should use 'type' key, got: {}",
+            serialized
+        );
+        assert!(
+            !serialized.contains("\"user_type\":"),
+            "Should not contain 'user_type' key"
+        );
+    }
+
+    #[test]
+    fn review_user_serde_missing_type_field() {
+        let json = r#"{"id":10,"login":"anon"}"#;
+        let user: ReviewUser = serde_json::from_str(json).unwrap();
+        assert_eq!(user.id, 10);
+        assert_eq!(user.login, "anon");
+        assert!(user.user_type.is_none());
+    }
+
+    // ── RemoteRepo serde ─────────────────────────────────────────────
+
+    #[test]
+    fn remote_repo_serde_round_trip() {
+        let repo = RemoteRepo {
+            id: 123,
+            full_name: "org/my-repo".to_string(),
+            name: "my-repo".to_string(),
+            default_branch: "main".to_string(),
+            clone_url: "https://github.com/org/my-repo.git".to_string(),
+            ssh_url: "git@github.com:org/my-repo.git".to_string(),
+            html_url: "https://github.com/org/my-repo".to_string(),
+            private: true,
+            archived: false,
+        };
+
+        let json = serde_json::to_string(&repo).unwrap();
+        let deserialized: RemoteRepo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, 123);
+        assert_eq!(deserialized.full_name, "org/my-repo");
+        assert_eq!(deserialized.name, "my-repo");
+        assert_eq!(deserialized.default_branch, "main");
+        assert!(deserialized.private);
+        assert!(!deserialized.archived);
+    }
+
+    #[test]
+    fn remote_repo_serde_ssh_url_defaults_empty() {
+        // ssh_url has #[serde(default)], so missing field should default to ""
+        let json = r#"{"id":1,"full_name":"o/r","name":"r","default_branch":"main","clone_url":"https://x","html_url":"https://y","private":false,"archived":false}"#;
+        let repo: RemoteRepo = serde_json::from_str(json).unwrap();
+        assert_eq!(repo.ssh_url, "");
+    }
+
+    // ── ReviewComment serde ──────────────────────────────────────────
+
+    #[test]
+    fn review_comment_serde_round_trip() {
+        let comment = ReviewComment {
+            id: 500,
+            path: "src/main.rs".to_string(),
+            position: Some(15),
+            original_position: Some(15),
+            body: "Fix this line".to_string(),
+            user: ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-02T00:00:00Z".to_string(),
+            html_url: "https://github.com/org/repo/pull/1#discussion_r500".to_string(),
+            pull_request_review_id: Some(42),
+            line: Some(15),
+            start_line: Some(10),
+            side: Some("RIGHT".to_string()),
+        };
+
+        let json = serde_json::to_string(&comment).unwrap();
+        let deserialized: ReviewComment = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, 500);
+        assert_eq!(deserialized.path, "src/main.rs");
+        assert_eq!(deserialized.position, Some(15));
+        assert_eq!(deserialized.pull_request_review_id, Some(42));
+        assert_eq!(deserialized.line, Some(15));
+        assert_eq!(deserialized.start_line, Some(10));
+        assert_eq!(deserialized.side.as_deref(), Some("RIGHT"));
+    }
+
+    #[test]
+    fn review_comment_serde_minimal_optional_fields() {
+        let json = r#"{
+            "id": 1,
+            "path": "file.rs",
+            "body": "comment",
+            "user": {"id": 2, "login": "u"},
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "html_url": "https://example.com"
+        }"#;
+        let comment: ReviewComment = serde_json::from_str(json).unwrap();
+        assert_eq!(comment.id, 1);
+        assert!(comment.position.is_none());
+        assert!(comment.original_position.is_none());
+        assert!(comment.pull_request_review_id.is_none());
+        assert!(comment.line.is_none());
+        assert!(comment.start_line.is_none());
+        assert!(comment.side.is_none());
+    }
+
+    // ── PrReviewState JSON deserialization from external payloads ────
+
+    #[test]
+    fn pr_review_state_deserialize_from_json() {
+        let json = r#"{
+            "pr_url": "https://github.com/org/repo/pull/10",
+            "repo": "org/repo",
+            "pr_number": 10,
+            "issue_id": "LIN-55",
+            "source": "linear",
+            "last_review_id": null,
+            "last_review_time": null,
+            "last_comment_id": null,
+            "last_comment_time": null,
+            "is_active": true
+        }"#;
+        let state: PrReviewState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.pr_url, "https://github.com/org/repo/pull/10");
+        assert_eq!(state.pr_number, 10);
+        assert_eq!(state.issue_id, "LIN-55");
+        assert!(state.is_active);
+        assert!(state.last_review_id.is_none());
+    }
+
+    #[test]
+    fn pr_review_state_deserialize_with_all_cursors_set() {
+        let json = r#"{
+            "pr_url": "https://github.com/org/repo/pull/3",
+            "repo": "org/repo",
+            "pr_number": 3,
+            "issue_id": "SENTRY-100",
+            "source": "sentry",
+            "last_review_id": 500,
+            "last_review_time": "2025-06-01T12:00:00Z",
+            "last_comment_id": 600,
+            "last_comment_time": "2025-06-01T13:00:00Z",
+            "is_active": false
+        }"#;
+        let state: PrReviewState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.last_review_id, Some(500));
+        assert_eq!(
+            state.last_review_time.as_deref(),
+            Some("2025-06-01T12:00:00Z")
+        );
+        assert_eq!(state.last_comment_id, Some(600));
+        assert!(!state.is_active);
+    }
+
+    // ── PrInfo ───────────────────────────────────────────────────────
+
+    #[test]
+    fn pr_info_all_none() {
+        let info = PrInfo {
+            head_branch: None,
+            base_branch: None,
+            title: None,
+            author: None,
+        };
+        assert!(info.head_branch.is_none());
+        assert!(info.base_branch.is_none());
+        assert!(info.title.is_none());
+        assert!(info.author.is_none());
+    }
+
+    #[test]
+    fn pr_info_debug_output() {
+        let info = PrInfo {
+            head_branch: Some("feature/test".to_string()),
+            base_branch: Some("main".to_string()),
+            title: Some("My PR".to_string()),
+            author: Some("dev".to_string()),
+        };
+        let debug = format!("{:?}", info);
+        assert!(debug.contains("feature/test"));
+        assert!(debug.contains("main"));
+        assert!(debug.contains("My PR"));
+    }
+
+    // ── PrStatusUpdate ───────────────────────────────────────────────
+
+    #[test]
+    fn pr_status_update_debug_format() {
+        let update = PrStatusUpdate {
+            source: "linear".to_string(),
+            issue_id: "LIN-99".to_string(),
+            short_id: "LIN-99".to_string(),
+            pr_url: "https://github.com/org/repo/pull/99".to_string(),
+            new_status: PrStatus::Merged,
+            should_resolve: true,
+            regression_watch_id: Some(42),
+        };
+        let debug = format!("{:?}", update);
+        assert!(debug.contains("Merged"));
+        assert!(debug.contains("LIN-99"));
+    }
+
+    // ── ReviewEvent: requires_action edge cases ──────────────────────
+
+    #[test]
+    fn review_event_requires_action_dismissed() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("DISMISSED", None),
+            inline_comments: vec![],
+        };
+        assert!(!event.requires_action());
+    }
+
+    #[test]
+    fn review_event_requires_action_pending() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("PENDING", None),
+            inline_comments: vec![],
+        };
+        assert!(!event.requires_action());
+    }
+
+    #[test]
+    fn review_event_requires_action_lowercase_changes_requested() {
+        // The code uppercases the state, so lowercase should still work
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("changes_requested", None),
+            inline_comments: vec![],
+        };
+        assert!(event.requires_action());
+    }
+
+    #[test]
+    fn review_event_requires_action_mixed_case_commented() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("Commented", None),
+            inline_comments: vec![],
+        };
+        assert!(event.requires_action());
+    }
+
+    // ── ReviewEvent: get_feedback_summary edge cases ─────────────────
+
+    #[test]
+    fn review_event_feedback_summary_review_with_inline_no_body() {
+        // Review with no body but with inline comments
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("CHANGES_REQUESTED", None),
+            inline_comments: vec![make_review_comment("src/lib.rs", "fix this", Some(5))],
+        };
+        let summary = event.get_feedback_summary();
+        assert!(summary.contains("@reviewer"));
+        assert!(summary.contains("CHANGES_REQUESTED"));
+        assert!(!summary.contains("Review comment:"));
+        assert!(summary.contains("Inline comments (1):"));
+        assert!(summary.contains("`src/lib.rs`"));
+        assert!(summary.contains("(line 5)"));
+    }
+
+    #[test]
+    fn review_event_feedback_summary_comments_added_no_line() {
+        let event = ReviewEvent::CommentsAdded {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            comments: vec![make_review_comment("README.md", "update this", None)],
+        };
+        let summary = event.get_feedback_summary();
+        assert!(summary.contains("`README.md`"));
+        assert!(summary.contains("update this"));
+        assert!(!summary.contains("(line"));
+    }
+
+    // ── ReviewEvent: pr_url on cloned events ─────────────────────────
+
+    #[test]
+    fn review_event_clone_preserves_pr_url() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "https://github.com/org/repo/pull/42".to_string(),
+            repo: "org/repo".to_string(),
+            pr_number: 42,
+            review: make_review("APPROVED", Some("LGTM")),
+            inline_comments: vec![],
+        };
+        let cloned = event.clone();
+        assert_eq!(cloned.pr_url(), "https://github.com/org/repo/pull/42");
+    }
+
+    // ── compare_timestamps: sub-second precision ─────────────────────
+
+    #[test]
+    fn compare_timestamps_subsecond_precision() {
+        let a = "2025-06-15T12:00:00.100Z";
+        let b = "2025-06-15T12:00:00.200Z";
+        assert_eq!(compare_timestamps(a, b), Ordering::Less);
+        assert_eq!(compare_timestamps(b, a), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_timestamps_nanosecond_equal() {
+        let ts = "2025-06-15T12:00:00.123456789Z";
+        assert_eq!(compare_timestamps(ts, ts), Ordering::Equal);
+    }
+
+    // ── timestamp_at_or_after: subsecond boundaries ──────────────────
+
+    #[test]
+    fn timestamp_at_or_after_subsecond_candidate_after() {
+        assert!(timestamp_at_or_after(
+            "2025-06-15T12:00:00.500Z",
+            "2025-06-15T12:00:00.499Z"
+        ));
+    }
+
+    #[test]
+    fn timestamp_at_or_after_subsecond_candidate_before() {
+        assert!(!timestamp_at_or_after(
+            "2025-06-15T12:00:00.499Z",
+            "2025-06-15T12:00:00.500Z"
+        ));
+    }
+
+    // ── PrReviewState: clone and mutation ─────────────────────────────
+
+    #[test]
+    fn pr_review_state_clone_independence() {
+        let state = PrReviewState::new("url", "repo", 1, "issue", "src");
+        let mut cloned = state.clone();
+        cloned.last_review_id = Some(99);
+        cloned.is_active = false;
+
+        // Original should be unaffected
+        assert!(state.last_review_id.is_none());
+        assert!(state.is_active);
+    }
+
+    // ── PrStatus: Copy semantics ─────────────────────────────────────
+
+    #[test]
+    fn pr_status_copy_semantics() {
+        let status = PrStatus::Open;
+        let copied = status; // Copy
+        assert_eq!(status, copied); // Both still valid
+        assert_eq!(status, PrStatus::Open);
+    }
+
+    // ── ReviewEvent debug output ─────────────────────────────────────
+
+    #[test]
+    fn review_event_debug_review_submitted() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "https://github.com/org/repo/pull/1".to_string(),
+            repo: "org/repo".to_string(),
+            pr_number: 1,
+            review: make_review("APPROVED", None),
+            inline_comments: vec![],
+        };
+        let debug = format!("{:?}", event);
+        assert!(debug.contains("ReviewSubmitted"));
+    }
+
+    #[test]
+    fn review_event_debug_comments_added() {
+        let event = ReviewEvent::CommentsAdded {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            comments: vec![],
+        };
+        let debug = format!("{:?}", event);
+        assert!(debug.contains("CommentsAdded"));
+    }
+
+    // ── PrReviewState: new with Into conversions ─────────────────────
+
+    #[test]
+    fn pr_review_state_new_accepts_string_types() {
+        let state = PrReviewState::new(
+            String::from("url"),
+            String::from("repo"),
+            42,
+            String::from("issue"),
+            String::from("linear"),
+        );
+        assert_eq!(state.pr_url, "url");
+        assert_eq!(state.repo, "repo");
+        assert_eq!(state.pr_number, 42);
+        assert_eq!(state.issue_id, "issue");
+        assert_eq!(state.source, "linear");
+    }
+
+    #[test]
+    fn pr_review_state_new_accepts_str_types() {
+        let state = PrReviewState::new("url", "repo", 0, "issue", "sentry");
+        assert_eq!(state.pr_number, 0);
+        assert_eq!(state.source, "sentry");
+    }
+
+    // ── ReviewComment: debug format ──────────────────────────────────
+
+    #[test]
+    fn review_comment_debug_contains_fields() {
+        let comment = make_review_comment("src/test.rs", "needs work", Some(42));
+        let debug = format!("{:?}", comment);
+        assert!(debug.contains("src/test.rs"));
+        assert!(debug.contains("needs work"));
+    }
+
+    // ── CodeReview: debug format ─────────────────────────────────────
+
+    #[test]
+    fn code_review_debug_contains_state() {
+        let review = make_review("CHANGES_REQUESTED", Some("Please fix"));
+        let debug = format!("{:?}", review);
+        assert!(debug.contains("CHANGES_REQUESTED"));
+        assert!(debug.contains("Please fix"));
+    }
+
+    // ── compare_timestamps: edge with empty strings ──────────────────
+
+    #[test]
+    fn compare_timestamps_empty_strings() {
+        assert_eq!(compare_timestamps("", ""), Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_timestamps_one_empty() {
+        // Empty string vs valid: falls back to lex comparison
+        let valid = "2025-01-01T00:00:00Z";
+        assert_eq!(compare_timestamps("", valid), Ordering::Less);
+        assert_eq!(compare_timestamps(valid, ""), Ordering::Greater);
+    }
+
+    // ── timestamp_at_or_after: empty strings ─────────────────────────
+
+    #[test]
+    fn timestamp_at_or_after_both_empty() {
+        assert!(timestamp_at_or_after("", ""));
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

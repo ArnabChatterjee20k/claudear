@@ -857,4 +857,352 @@ mod tests {
         let msg: SlackMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.text, ""); // #[serde(default)]
     }
+
+    // ================================================================
+    // Additional coverage: SlackHistoryResponse and SlackMessage
+    // deserialization edge cases, extract_title boundary behavior,
+    // listen_channel_id ordering, message_url formatting,
+    // is_bot_message with various field combinations, and
+    // message_to_issue with diverse inputs.
+    // ================================================================
+
+    // ── SlackHistoryResponse deserialization edge cases ──────────────
+
+    #[test]
+    fn test_history_response_deserialize_multiple_messages() {
+        let json = r#"{
+            "ok": true,
+            "messages": [
+                {"ts": "1.0", "text": "first", "user": "U1"},
+                {"ts": "2.0", "text": "second", "user": "U2"},
+                {"ts": "3.0", "text": "third", "bot_id": "B1"}
+            ]
+        }"#;
+        let resp: SlackHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.messages.len(), 3);
+        assert_eq!(resp.messages[0].ts, "1.0");
+        assert_eq!(resp.messages[1].text, "second");
+        assert!(resp.messages[2].bot_id.is_some());
+    }
+
+    #[test]
+    fn test_history_response_deserialize_error_with_messages_defaults() {
+        // Error response where messages field is absent
+        let json = r#"{"ok": false, "error": "not_authed"}"#;
+        let resp: SlackHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("not_authed"));
+        assert!(resp.messages.is_empty());
+    }
+
+    #[test]
+    fn test_history_response_deserialize_extra_fields_ignored() {
+        // Slack API may return extra fields we don't model
+        let json = r#"{"ok": true, "messages": [], "has_more": true, "pin_count": 5}"#;
+        let resp: SlackHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.messages.is_empty());
+    }
+
+    // ── SlackMessage deserialization edge cases ──────────────────────
+
+    #[test]
+    fn test_slack_message_deserialize_full_fields() {
+        let json = r#"{
+            "ts": "1709123456.789012",
+            "text": "Hello world",
+            "user": "U12345",
+            "bot_id": null,
+            "channel": "C99999"
+        }"#;
+        let msg: SlackMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.ts, "1709123456.789012");
+        assert_eq!(msg.text, "Hello world");
+        assert_eq!(msg.user.as_deref(), Some("U12345"));
+        assert!(msg.bot_id.is_none());
+        assert_eq!(msg.channel.as_deref(), Some("C99999"));
+    }
+
+    #[test]
+    fn test_slack_message_deserialize_bot_message() {
+        let json = r#"{"ts": "1.0", "text": "bot says hi", "bot_id": "B789"}"#;
+        let msg: SlackMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.bot_id.as_deref(), Some("B789"));
+        assert!(msg.user.is_none());
+    }
+
+    #[test]
+    fn test_slack_message_deserialize_unicode_text() {
+        let json = r#"{"ts": "1.0", "text": "Hello \u4e16\u754c"}"#;
+        let msg: SlackMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.text.contains('\u{4e16}')); // Chinese character
+    }
+
+    #[test]
+    fn test_slack_message_deserialize_empty_text() {
+        let json = r#"{"ts": "1.0", "text": ""}"#;
+        let msg: SlackMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.text, "");
+    }
+
+    // ── extract_title: boundary and content cases ────────────────────
+
+    #[test]
+    fn test_extract_title_exactly_97_chars_no_truncation() {
+        let s = "a".repeat(97);
+        let title = SlackSource::extract_title(&s);
+        assert_eq!(title.len(), 97);
+        assert!(!title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_title_multiline_long_first_line() {
+        let first_line = "x".repeat(150);
+        let input = format!("{}\nSecond line", first_line);
+        let title = SlackSource::extract_title(&input);
+        assert_eq!(title.len(), 100);
+        assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_title_only_newlines() {
+        let title = SlackSource::extract_title("\n\n\n");
+        assert_eq!(title, "");
+    }
+
+    #[test]
+    fn test_extract_title_special_characters() {
+        let input = "Bug: @user mentioned #channel <link|text>";
+        let title = SlackSource::extract_title(input);
+        assert_eq!(title, input);
+    }
+
+    // ── is_bot_message: systematic field combinations ────────────────
+
+    #[test]
+    fn test_is_bot_message_empty_bot_id_string() {
+        // bot_id = Some("") is still a Some, so is_bot_message returns true
+        let msg = SlackMessage {
+            ts: "1.0".to_string(),
+            text: "test".to_string(),
+            user: Some("U123".to_string()),
+            bot_id: Some("".to_string()),
+            channel: None,
+        };
+        assert!(SlackSource::is_bot_message(&msg));
+    }
+
+    // ── listen_channel_id: priority and edge cases ───────────────────
+
+    #[test]
+    fn test_listen_channel_id_empty_string_listen() {
+        let mut config = make_config();
+        config.listen_channel_id = Some("".to_string());
+        let source = SlackSource::new(config);
+        // Empty string is still Some, so listen_channel_id returns it
+        assert_eq!(source.listen_channel_id(), Some(""));
+    }
+
+    #[test]
+    fn test_listen_channel_id_only_channel_id_set() {
+        let mut config = make_config();
+        config.channel_id = Some("C_ONLY".to_string());
+        config.listen_channel_id = None;
+        let source = SlackSource::new(config);
+        assert_eq!(source.listen_channel_id(), Some("C_ONLY"));
+    }
+
+    // ── message_url: various timestamp formats ───────────────────────
+
+    #[test]
+    fn test_message_url_empty_timestamp() {
+        let source = SlackSource::new(make_config());
+        let url = source.message_url("C111", "");
+        assert_eq!(url, "https://myworkspace.slack.com/archives/C111/p");
+    }
+
+    #[test]
+    fn test_message_url_long_timestamp() {
+        let source = SlackSource::new(make_config());
+        let url = source.message_url("C111", "1234567890.123456");
+        assert_eq!(
+            url,
+            "https://myworkspace.slack.com/archives/C111/p1234567890123456"
+        );
+    }
+
+    // ── message_to_issue: comprehensive field mapping ────────────────
+
+    #[test]
+    fn test_message_to_issue_preserves_full_text_as_description() {
+        let source = SlackSource::new(make_config());
+        let long_text = "Line 1\nLine 2\nLine 3\nLine 4";
+        let msg = make_message("1234.5678", long_text, false);
+        let issue = source.message_to_issue(&msg, "C12345");
+
+        assert_eq!(issue.description.as_deref(), Some(long_text));
+        assert_eq!(issue.title, "Line 1");
+    }
+
+    #[test]
+    fn test_message_to_issue_url_uses_channel_parameter() {
+        let source = SlackSource::new(make_config());
+        let msg = make_message("1.0", "test", false);
+        let issue = source.message_to_issue(&msg, "CSPECIAL");
+
+        assert!(issue.url.contains("CSPECIAL"));
+        assert_eq!(
+            issue.get_metadata::<String>("channel_id"),
+            Some("CSPECIAL".to_string())
+        );
+    }
+
+    #[test]
+    fn test_message_to_issue_short_id_truncation() {
+        let source = SlackSource::new(make_config());
+        // Timestamp shorter than 8 chars
+        let msg = make_message("ab", "test", false);
+        let issue = source.message_to_issue(&msg, "C1");
+        assert_eq!(issue.short_id, "SLACK-ab");
+
+        // Timestamp exactly 8 chars
+        let msg2 = make_message("12345678", "test", false);
+        let issue2 = source.message_to_issue(&msg2, "C1");
+        assert_eq!(issue2.short_id, "SLACK-12345678");
+
+        // Timestamp longer than 8 chars
+        let msg3 = make_message("123456789", "test", false);
+        let issue3 = source.message_to_issue(&msg3, "C1");
+        assert_eq!(issue3.short_id, "SLACK-12345678");
+    }
+
+    // ── Constructor: client creation ─────────────────────────────────
+
+    #[test]
+    fn test_new_creates_source_with_defaults() {
+        let source = SlackSource::new(make_config());
+        assert!(source.last_seen_ts.read().unwrap().is_none());
+        assert_eq!(source.config.bot_token.as_deref(), Some("xoxb-test-token"));
+    }
+
+    #[test]
+    fn test_new_with_minimal_config() {
+        let config = SlackConfig {
+            bot_token: None,
+            channel_id: None,
+            source_enabled: false,
+            listen_channel_id: None,
+            workspace: None,
+            ..Default::default()
+        };
+        let source = SlackSource::new(config);
+        assert!(source.listen_channel_id().is_none());
+    }
+
+    // ── IssueSource trait: name and display_name ─────────────────────
+
+    #[test]
+    fn test_name_is_slack() {
+        let source = SlackSource::new(make_config());
+        assert_eq!(IssueSource::name(&source), "slack");
+    }
+
+    #[test]
+    fn test_display_name_is_slack_messages() {
+        let source = SlackSource::new(make_config());
+        assert_eq!(IssueSource::display_name(&source), "Slack Messages");
+    }
+
+    // ── build_issue_context: all fields present ──────────────────────
+
+    #[tokio::test]
+    async fn test_build_issue_context_all_fields() {
+        let source = SlackSource::new(make_config());
+        let mut issue = Issue::new(
+            "1709.123",
+            "SLACK-1709",
+            "Important bug",
+            "https://myworkspace.slack.com/archives/C12345/p1709123",
+            "slack",
+        );
+        issue.description = Some("Please fix the login page".to_string());
+        issue.set_metadata("author_id", "U99999");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+        assert!(context.contains("Slack Message Issue: Important bug"));
+        assert!(context.contains("Message:\nPlease fix the login page"));
+        assert!(context.contains("Author ID: U99999"));
+        assert!(context.contains("URL: https://myworkspace.slack.com/archives/C12345/p1709123"));
+    }
+
+    // ── Deserialization: realistic Slack API payloads ─────────────────
+
+    #[test]
+    fn test_history_response_realistic_payload() {
+        let json = r#"{
+            "ok": true,
+            "messages": [
+                {
+                    "ts": "1709123456.789012",
+                    "text": "Hey team, the deployment pipeline is broken. Can someone look at the CI config?",
+                    "user": "U08EXAMPLE1",
+                    "channel": "C08PROJCHAN"
+                },
+                {
+                    "ts": "1709123400.000001",
+                    "text": "Automated build report: all checks passed",
+                    "bot_id": "B08CIBOT001"
+                }
+            ],
+            "has_more": false,
+            "pin_count": 0,
+            "response_metadata": {
+                "next_cursor": ""
+            }
+        }"#;
+        let resp: SlackHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.messages.len(), 2);
+
+        let human_msg = &resp.messages[0];
+        assert_eq!(human_msg.user.as_deref(), Some("U08EXAMPLE1"));
+        assert!(!SlackSource::is_bot_message(human_msg));
+        assert!(human_msg.text.contains("deployment pipeline"));
+
+        let bot_msg = &resp.messages[1];
+        assert_eq!(bot_msg.bot_id.as_deref(), Some("B08CIBOT001"));
+        assert!(SlackSource::is_bot_message(bot_msg));
+    }
+
+    #[test]
+    fn test_history_response_rate_limited_error() {
+        let json = r#"{"ok": false, "error": "ratelimited"}"#;
+        let resp: SlackHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("ratelimited"));
+    }
+
+    #[test]
+    fn test_history_response_invalid_auth_error() {
+        let json = r#"{"ok": false, "error": "invalid_auth"}"#;
+        let resp: SlackHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("invalid_auth"));
+    }
+
+    // ── matches_criteria: ensure unconditional matching ───────────────
+
+    #[test]
+    fn test_matches_criteria_with_different_sources() {
+        let source = SlackSource::new(make_config());
+        for src in ["slack", "linear", "sentry", "jira", "unknown"] {
+            let issue = Issue::new("1", "S-1", "Test", "http://t.com", src);
+            assert!(
+                source.matches_criteria(&issue).matches,
+                "Should match for source '{}'",
+                src
+            );
+        }
+    }
 }

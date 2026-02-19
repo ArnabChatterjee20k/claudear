@@ -359,7 +359,11 @@ async fn overview_handler(
 
     let time_savings = state
         .tracker
-        .get_time_savings(&seven_days_ago, state.config.dashboard.hours_per_fix, "7d")
+        .get_complexity_time_savings(
+            &seven_days_ago,
+            state.config.dashboard.hourly_engineer_rate,
+            "7d",
+        )
         .ok();
 
     let agent_spawns_today = state
@@ -1226,7 +1230,7 @@ async fn analytics_summary_handler(
         .tracker
         .get_cost_estimate(
             &thirty_days_ago,
-            state.config.dashboard.cost_per_minute,
+            state.config.dashboard.max_plan_monthly_cost,
             "30d",
         )
         .ok();
@@ -4159,5 +4163,901 @@ mod tests {
         assert_eq!(metric.successful, 1);
         assert_eq!(metric.failed, 1);
         assert!((metric.success_rate - 50.0).abs() < 0.01);
+    }
+
+    // ─── Additional utility function tests ──────────────────────────
+
+    #[test]
+    fn test_sum_metric_values_empty() {
+        let metrics: Vec<crate::types::ProcessingMetric> = vec![];
+        assert!((sum_metric_values(&metrics) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_sum_metric_values_multiple() {
+        let metrics = vec![
+            crate::types::ProcessingMetric {
+                id: 0,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 10.0,
+                source: None,
+                tags: None,
+            },
+            crate::types::ProcessingMetric {
+                id: 1,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 20.5,
+                source: None,
+                tags: None,
+            },
+            crate::types::ProcessingMetric {
+                id: 2,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 5.5,
+                source: None,
+                tags: None,
+            },
+        ];
+        assert!((sum_metric_values(&metrics) - 36.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_average_metric_value_empty() {
+        let metrics: Vec<crate::types::ProcessingMetric> = vec![];
+        assert!(average_metric_value(&metrics).is_none());
+    }
+
+    #[test]
+    fn test_average_metric_value_single() {
+        let metrics = vec![crate::types::ProcessingMetric {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            metric_name: "test".to_string(),
+            metric_value: 42.0,
+            source: None,
+            tags: None,
+        }];
+        assert!((average_metric_value(&metrics).unwrap() - 42.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_average_metric_value_multiple() {
+        let metrics = vec![
+            crate::types::ProcessingMetric {
+                id: 0,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 10.0,
+                source: None,
+                tags: None,
+            },
+            crate::types::ProcessingMetric {
+                id: 1,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 30.0,
+                source: None,
+                tags: None,
+            },
+        ];
+        assert!((average_metric_value(&metrics).unwrap() - 20.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_max_metric_value_empty() {
+        let metrics: Vec<crate::types::ProcessingMetric> = vec![];
+        assert!(max_metric_value(&metrics).is_none());
+    }
+
+    #[test]
+    fn test_max_metric_value_multiple() {
+        let metrics = vec![
+            crate::types::ProcessingMetric {
+                id: 0,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 5.0,
+                source: None,
+                tags: None,
+            },
+            crate::types::ProcessingMetric {
+                id: 1,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 99.9,
+                source: None,
+                tags: None,
+            },
+            crate::types::ProcessingMetric {
+                id: 2,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 50.0,
+                source: None,
+                tags: None,
+            },
+        ];
+        assert!((max_metric_value(&metrics).unwrap() - 99.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_latest_metric_value_empty() {
+        let metrics: Vec<crate::types::ProcessingMetric> = vec![];
+        assert!(latest_metric_value(&metrics).is_none());
+    }
+
+    #[test]
+    fn test_latest_metric_value_returns_first() {
+        let metrics = vec![
+            crate::types::ProcessingMetric {
+                id: 0,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 77.7,
+                source: None,
+                tags: None,
+            },
+            crate::types::ProcessingMetric {
+                id: 1,
+                timestamp: chrono::Utc::now(),
+                metric_name: "test".to_string(),
+                metric_value: 88.8,
+                source: None,
+                tags: None,
+            },
+        ];
+        assert!((latest_metric_value(&metrics).unwrap() - 77.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_ratio_positive_denominator() {
+        let r = ratio(25.0, 50.0);
+        assert!(r.is_some());
+        assert!((r.unwrap() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_ratio_zero_denominator() {
+        assert!(ratio(25.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn test_ratio_negative_denominator() {
+        assert!(ratio(25.0, -1.0).is_none());
+    }
+
+    #[test]
+    fn test_ratio_zero_numerator() {
+        let r = ratio(0.0, 100.0);
+        assert!(r.is_some());
+        assert!((r.unwrap() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_processing_value_summary_single_value() {
+        let summary = compute_processing_value_summary(vec![42.0]);
+        assert_eq!(summary.samples, 1);
+        assert!((summary.avg_secs.unwrap() - 42.0).abs() < 0.01);
+        assert!((summary.max_secs.unwrap() - 42.0).abs() < 0.01);
+        assert!((summary.p50_secs.unwrap() - 42.0).abs() < 0.01);
+        assert!((summary.p95_secs.unwrap() - 42.0).abs() < 0.01);
+        assert!((summary.p99_secs.unwrap() - 42.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compute_processing_value_summary_two_values() {
+        let summary = compute_processing_value_summary(vec![10.0, 90.0]);
+        assert_eq!(summary.samples, 2);
+        assert!((summary.avg_secs.unwrap() - 50.0).abs() < 0.01);
+        assert!((summary.max_secs.unwrap() - 90.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compute_processing_time_summary_with_metrics() {
+        let metrics = vec![
+            crate::types::ProcessingMetric {
+                id: 0,
+                timestamp: chrono::Utc::now(),
+                metric_name: "processing_time".to_string(),
+                metric_value: 5.0,
+                source: None,
+                tags: None,
+            },
+            crate::types::ProcessingMetric {
+                id: 1,
+                timestamp: chrono::Utc::now(),
+                metric_name: "processing_time".to_string(),
+                metric_value: 15.0,
+                source: None,
+                tags: None,
+            },
+            crate::types::ProcessingMetric {
+                id: 2,
+                timestamp: chrono::Utc::now(),
+                metric_name: "processing_time".to_string(),
+                metric_value: 25.0,
+                source: None,
+                tags: None,
+            },
+        ];
+        let summary = compute_processing_time_summary(metrics);
+        assert_eq!(summary.samples, 3);
+        assert!((summary.avg_secs.unwrap() - 15.0).abs() < 0.01);
+        assert!((summary.max_secs.unwrap() - 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_telemetry_period_none_with_various_defaults() {
+        let (label, _) = parse_telemetry_period(None, "hour");
+        assert_eq!(label, "hour");
+
+        let (label, _) = parse_telemetry_period(None, "day");
+        assert_eq!(label, "day");
+
+        let (label, _) = parse_telemetry_period(None, "month");
+        assert_eq!(label, "month");
+
+        let (label, _) = parse_telemetry_period(None, "year");
+        assert_eq!(label, "week");
+    }
+
+    #[test]
+    fn test_parse_telemetry_period_case_insensitive() {
+        let (label, _) = parse_telemetry_period(Some("HOUR"), "week");
+        assert_eq!(label, "hour");
+
+        let (label, _) = parse_telemetry_period(Some("Day"), "week");
+        assert_eq!(label, "day");
+
+        let (label, _) = parse_telemetry_period(Some("MONTH"), "week");
+        assert_eq!(label, "month");
+    }
+
+    #[test]
+    fn test_floor_to_bucket_5_minute() {
+        use chrono::{TimeZone, Timelike};
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2024, 6, 15, 10, 13, 45)
+            .unwrap();
+        let floored = floor_to_bucket(ts, 5);
+        assert_eq!(floored.minute(), 10);
+        assert_eq!(floored.second(), 0);
+    }
+
+    #[test]
+    fn test_floor_to_bucket_already_on_boundary() {
+        use chrono::TimeZone;
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2024, 6, 15, 10, 30, 0)
+            .unwrap();
+        let floored = floor_to_bucket(ts, 15);
+        assert_eq!(floored, ts);
+    }
+
+    #[test]
+    fn test_floor_to_bucket_minimum_clamp() {
+        use chrono::{TimeZone, Timelike};
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2024, 6, 15, 10, 37, 42)
+            .unwrap();
+        let floored = floor_to_bucket(ts, 0);
+        assert_eq!(floored.second(), 0);
+    }
+
+    #[test]
+    fn test_tail_utf8_exact_boundary() {
+        let input = "abcde";
+        let (result, truncated) = tail_utf8(input, 5);
+        assert_eq!(result, "abcde");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_tail_utf8_one_under_boundary() {
+        let input = "abcdef";
+        let (result, truncated) = tail_utf8(input, 5);
+        assert!(truncated);
+        assert!(result.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn test_tail_utf8_multibyte_chars() {
+        let input = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}";
+        let (result, truncated) = tail_utf8(input, 8);
+        assert!(truncated);
+        assert!(result.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn test_tail_utf8_empty_string() {
+        let (result, truncated) = tail_utf8("", 100);
+        assert_eq!(result, "");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_redact_secrets_basic() {
+        let content = "api_token = \"sk-12345\"\nwebhook_secret = \"whsec_abc\"\nnormal_key = \"not_a_secret\"\n";
+        let redacted = redact_secrets(content);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("normal_key"));
+        assert!(!redacted.contains("sk-12345"));
+        assert!(!redacted.contains("whsec_abc"));
+    }
+
+    #[test]
+    fn test_redact_secrets_no_secrets() {
+        let content = "work_dir = \"/tmp/repos\"\npoll_interval_ms = 300000\n";
+        let redacted = redact_secrets(content);
+        assert!(!redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("/tmp/repos"));
+        assert!(redacted.contains("300000"));
+    }
+
+    #[test]
+    fn test_redact_secrets_password_key() {
+        let content = "password = \"my_secret_pass\"";
+        let redacted = redact_secrets(content);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("my_secret_pass"));
+    }
+
+    #[test]
+    fn test_redact_secrets_api_key() {
+        let content = "api_key = \"key-abc123\"";
+        let redacted = redact_secrets(content);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("key-abc123"));
+    }
+
+    #[test]
+    fn test_summarize_window_with_merged_and_cannotfix() {
+        let now = chrono::Utc::now();
+        let attempts = vec![
+            FixAttempt {
+                id: 1,
+                source: "linear".to_string(),
+                issue_id: "1".to_string(),
+                short_id: "P-1".to_string(),
+                status: FixAttemptStatus::Merged,
+                pr_url: None,
+                github_repo: None,
+                github_pr_number: None,
+                error_message: None,
+                attempted_at: now,
+                resolved_at: None,
+                merged_at: None,
+                retry_count: 0,
+                last_retry_at: None,
+                issue_labels: vec![],
+                parent_attempt_id: None,
+                cascade_repo: None,
+            },
+            FixAttempt {
+                id: 2,
+                source: "linear".to_string(),
+                issue_id: "2".to_string(),
+                short_id: "P-2".to_string(),
+                status: FixAttemptStatus::CannotFix,
+                pr_url: None,
+                github_repo: None,
+                github_pr_number: None,
+                error_message: None,
+                attempted_at: now,
+                resolved_at: None,
+                merged_at: None,
+                retry_count: 0,
+                last_retry_at: None,
+                issue_labels: vec![],
+                parent_attempt_id: None,
+                cascade_repo: None,
+            },
+            FixAttempt {
+                id: 3,
+                source: "linear".to_string(),
+                issue_id: "3".to_string(),
+                short_id: "P-3".to_string(),
+                status: FixAttemptStatus::Closed,
+                pr_url: None,
+                github_repo: None,
+                github_pr_number: None,
+                error_message: None,
+                attempted_at: now,
+                resolved_at: None,
+                merged_at: None,
+                retry_count: 0,
+                last_retry_at: None,
+                issue_labels: vec![],
+                parent_attempt_id: None,
+                cascade_repo: None,
+            },
+            FixAttempt {
+                id: 4,
+                source: "linear".to_string(),
+                issue_id: "4".to_string(),
+                short_id: "P-4".to_string(),
+                status: FixAttemptStatus::Pending,
+                pr_url: None,
+                github_repo: None,
+                github_pr_number: None,
+                error_message: None,
+                attempted_at: now,
+                resolved_at: None,
+                merged_at: None,
+                retry_count: 0,
+                last_retry_at: None,
+                issue_labels: vec![],
+                parent_attempt_id: None,
+                cascade_repo: None,
+            },
+        ];
+        let metric = summarize_window(&attempts, "7d", now - Duration::days(7));
+        assert_eq!(metric.processed, 3);
+        assert_eq!(metric.successful, 1);
+        assert_eq!(metric.failed, 3);
+        assert_eq!(metric.merged, 1);
+    }
+
+    #[test]
+    fn test_summarize_window_excludes_old_attempts() {
+        let now = chrono::Utc::now();
+        let old_time = now - Duration::hours(48);
+        let attempts = vec![FixAttempt {
+            id: 1,
+            source: "linear".to_string(),
+            issue_id: "1".to_string(),
+            short_id: "P-1".to_string(),
+            status: FixAttemptStatus::Success,
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            error_message: None,
+            attempted_at: old_time,
+            resolved_at: None,
+            merged_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        }];
+        let metric = summarize_window(&attempts, "1h", now - Duration::hours(1));
+        assert_eq!(metric.processed, 0);
+        assert_eq!(metric.successful, 0);
+    }
+
+    #[test]
+    fn test_summarize_window_throughput_calculation() {
+        let now = chrono::Utc::now();
+        let attempts = vec![FixAttempt {
+            id: 1,
+            source: "linear".to_string(),
+            issue_id: "1".to_string(),
+            short_id: "P-1".to_string(),
+            status: FixAttemptStatus::Success,
+            pr_url: None,
+            github_repo: None,
+            github_pr_number: None,
+            error_message: None,
+            attempted_at: now,
+            resolved_at: None,
+            merged_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        }];
+        let metric = summarize_window(&attempts, "1h", now - Duration::hours(1));
+        assert!((metric.throughput_per_hour - 1.0).abs() < 0.01);
+
+        let metric = summarize_window(&attempts, "24h", now - Duration::hours(24));
+        assert!((metric.throughput_per_hour - 1.0 / 24.0).abs() < 0.01);
+    }
+
+    // ─── Query deserialization tests ──────────────────────────────
+
+    #[test]
+    fn test_activity_query_deserialization() {
+        let query: ActivityQuery =
+            serde_json::from_str(r#"{"limit": 10, "source": "sentry"}"#).unwrap();
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.source, Some("sentry".to_string()));
+    }
+
+    #[test]
+    fn test_activity_query_defaults() {
+        let query: ActivityQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.limit.is_none());
+        assert!(query.source.is_none());
+    }
+
+    #[test]
+    fn test_metrics_query_deserialization() {
+        let query: MetricsQuery =
+            serde_json::from_str(r#"{"name": "processing_time", "period": "day", "limit": 100}"#)
+                .unwrap();
+        assert_eq!(query.name, Some("processing_time".to_string()));
+        assert_eq!(query.period, Some("day".to_string()));
+        assert_eq!(query.limit, Some(100));
+    }
+
+    #[test]
+    fn test_metrics_query_defaults() {
+        let query: MetricsQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.name.is_none());
+        assert!(query.period.is_none());
+        assert!(query.limit.is_none());
+    }
+
+    #[test]
+    fn test_errors_query_deserialization() {
+        let query: ErrorsQuery = serde_json::from_str(r#"{"limit": 25}"#).unwrap();
+        assert_eq!(query.limit, Some(25));
+    }
+
+    #[test]
+    fn test_errors_query_defaults() {
+        let query: ErrorsQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.limit.is_none());
+    }
+
+    #[test]
+    fn test_issues_query_deserialization() {
+        let query: IssuesQuery =
+            serde_json::from_str(r#"{"source": "linear", "page": 2, "per_page": 50}"#).unwrap();
+        assert_eq!(query.source, Some("linear".to_string()));
+        assert_eq!(query.page, Some(2));
+        assert_eq!(query.per_page, Some(50));
+    }
+
+    #[test]
+    fn test_issues_query_defaults() {
+        let query: IssuesQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.source.is_none());
+        assert!(query.page.is_none());
+        assert!(query.per_page.is_none());
+    }
+
+    #[test]
+    fn test_prs_query_deserialization() {
+        let query: PrsQuery = serde_json::from_str(r#"{"status": "open", "limit": 10}"#).unwrap();
+        assert_eq!(query.status, Some("open".to_string()));
+        assert_eq!(query.limit, Some(10));
+    }
+
+    #[test]
+    fn test_prs_query_defaults() {
+        let query: PrsQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.status.is_none());
+        assert!(query.limit.is_none());
+    }
+
+    #[test]
+    fn test_feedback_query_deserialization() {
+        let query: FeedbackQuery =
+            serde_json::from_str(r#"{"source": "sentry", "limit": 30}"#).unwrap();
+        assert_eq!(query.source, Some("sentry".to_string()));
+        assert_eq!(query.limit, Some(30));
+    }
+
+    #[test]
+    fn test_feedback_query_defaults() {
+        let query: FeedbackQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.source.is_none());
+        assert!(query.limit.is_none());
+    }
+
+    #[test]
+    fn test_regressions_query_deserialization() {
+        let query: RegressionsQuery = serde_json::from_str(r#"{"status": "monitoring"}"#).unwrap();
+        assert_eq!(query.status, Some("monitoring".to_string()));
+    }
+
+    #[test]
+    fn test_regressions_query_defaults() {
+        let query: RegressionsQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.status.is_none());
+    }
+
+    #[test]
+    fn test_inference_history_query_deserialization() {
+        let query: InferenceHistoryQuery = serde_json::from_str(r#"{"limit": 20}"#).unwrap();
+        assert_eq!(query.limit, Some(20));
+    }
+
+    #[test]
+    fn test_inference_history_query_defaults() {
+        let query: InferenceHistoryQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.limit.is_none());
+    }
+
+    #[test]
+    fn test_telemetry_timeseries_query_deserialization() {
+        let query: TelemetryTimeseriesQuery =
+            serde_json::from_str(r#"{"period": "day", "bucket_minutes": 30}"#).unwrap();
+        assert_eq!(query.period, Some("day".to_string()));
+        assert_eq!(query.bucket_minutes, Some(30));
+    }
+
+    #[test]
+    fn test_telemetry_timeseries_query_defaults() {
+        let query: TelemetryTimeseriesQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.period.is_none());
+        assert!(query.bucket_minutes.is_none());
+    }
+
+    #[test]
+    fn test_telemetry_period_query_deserialization() {
+        let query: TelemetryPeriodQuery = serde_json::from_str(r#"{"period": "month"}"#).unwrap();
+        assert_eq!(query.period, Some("month".to_string()));
+    }
+
+    #[test]
+    fn test_telemetry_period_query_defaults() {
+        let query: TelemetryPeriodQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.period.is_none());
+    }
+
+    #[test]
+    fn test_config_update_request_deserialization() {
+        let req: ConfigUpdateRequest =
+            serde_json::from_str(r#"{"content": "key = \"value\""}"#).unwrap();
+        assert_eq!(req.content, r#"key = "value""#);
+    }
+
+    // ─── Response type serialization tests ──────────────────────────
+
+    #[test]
+    fn test_database_status_skip_error_when_none() {
+        let status = DatabaseStatus {
+            status: "ok".to_string(),
+            error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn test_database_status_include_error_when_some() {
+        let status = DatabaseStatus {
+            status: "error".to_string(),
+            error: Some("Connection refused".to_string()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("error"));
+        assert!(json.contains("Connection refused"));
+    }
+
+    #[test]
+    fn test_telemetry_window_metric_serialization() {
+        let metric = TelemetryWindowMetric {
+            window: "1h".to_string(),
+            processed: 100,
+            successful: 80,
+            failed: 20,
+            merged: 50,
+            success_rate: 80.0,
+            error_rate: 20.0,
+            throughput_per_hour: 100.0,
+        };
+        let json = serde_json::to_string(&metric).unwrap();
+        assert!(json.contains("\"window\":\"1h\""));
+        assert!(json.contains("\"processed\":100"));
+        assert!(json.contains("\"throughput_per_hour\":100.0"));
+    }
+
+    #[test]
+    fn test_telemetry_queue_metrics_default() {
+        let queue = TelemetryQueueMetrics::default();
+        assert_eq!(queue.pending_attempts, 0);
+        assert_eq!(queue.retryable_attempts, 0);
+        assert_eq!(queue.ready_retries, 0);
+        assert_eq!(queue.open_prs, 0);
+        assert_eq!(queue.watches_awaiting_release, 0);
+    }
+
+    #[test]
+    fn test_processing_time_summary_default() {
+        let summary = ProcessingTimeSummary::default();
+        assert_eq!(summary.samples, 0);
+        assert!(summary.avg_secs.is_none());
+        assert!(summary.p50_secs.is_none());
+        assert!(summary.p95_secs.is_none());
+        assert!(summary.p99_secs.is_none());
+        assert!(summary.max_secs.is_none());
+    }
+
+    #[test]
+    fn test_telemetry_timeseries_point_default() {
+        let point = TelemetryTimeseriesPoint::default();
+        assert_eq!(point.total, 0);
+        assert_eq!(point.pending, 0);
+        assert_eq!(point.success, 0);
+        assert_eq!(point.failed, 0);
+        assert_eq!(point.merged, 0);
+        assert_eq!(point.closed, 0);
+        assert_eq!(point.cannot_fix, 0);
+    }
+
+    #[test]
+    fn test_telemetry_pipeline_totals_default() {
+        let totals = TelemetryPipelineTotals::default();
+        assert!((totals.fetched - 0.0).abs() < f64::EPSILON);
+        assert!((totals.matched - 0.0).abs() < f64::EPSILON);
+        assert!((totals.queued - 0.0).abs() < f64::EPSILON);
+        assert!((totals.processed - 0.0).abs() < f64::EPSILON);
+        assert!((totals.pr_created - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_telemetry_pipeline_conversion_default() {
+        let conv = TelemetryPipelineConversion::default();
+        assert!(conv.match_rate.is_none());
+        assert!(conv.queue_rate.is_none());
+        assert!(conv.processing_rate.is_none());
+        assert!(conv.pr_yield_rate.is_none());
+    }
+
+    #[test]
+    fn test_config_response_serialization() {
+        let resp = ConfigResponse {
+            content: "work_dir = \"/tmp\"".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("work_dir"));
+        assert!(json.contains("content"));
+    }
+
+    #[test]
+    fn test_attempt_execution_log_response_serialization() {
+        let resp = AttemptExecutionLogResponse {
+            attempt_id: 1,
+            execution_id: 2,
+            stream: "stdout".to_string(),
+            path: Some("/var/log/test.log".to_string()),
+            content: Some("hello world".to_string()),
+            truncated: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"attempt_id\":1"));
+        assert!(json.contains("\"execution_id\":2"));
+        assert!(json.contains("stdout"));
+        assert!(json.contains("hello world"));
+        assert!(json.contains("\"truncated\":false"));
+    }
+
+    #[test]
+    fn test_attempt_execution_log_response_no_content() {
+        let resp = AttemptExecutionLogResponse {
+            attempt_id: 1,
+            execution_id: 2,
+            stream: "stderr".to_string(),
+            path: None,
+            content: None,
+            truncated: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("stderr"));
+        assert!(json.contains("null"));
+    }
+
+    #[test]
+    fn test_source_telemetry_default() {
+        let st = SourceTelemetry::default();
+        assert_eq!(st.source, "");
+        assert_eq!(st.total, 0);
+        assert_eq!(st.pending, 0);
+        assert!((st.success_rate - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_telemetry_poll_load_default() {
+        let load = TelemetryPollLoad::default();
+        assert_eq!(load.poll_cycles, 0);
+        assert!(load.avg_cycle_secs.is_none());
+        assert!(load.p95_cycle_secs.is_none());
+        assert!(load.active_avg.is_none());
+    }
+
+    #[test]
+    fn test_issue_summary_serialization() {
+        let summary = IssueSummary {
+            id: 1,
+            source: "linear".to_string(),
+            issue_id: "LIN-123".to_string(),
+            short_id: Some("LIN-123".to_string()),
+            title: Some("Fix bug".to_string()),
+            description: None,
+            url: Some("https://linear.app/issue/LIN-123".to_string()),
+            priority: Some("high".to_string()),
+            status: Some("open".to_string()),
+            labels: Some(vec!["bug".to_string(), "urgent".to_string()]),
+            has_embedding: true,
+            created_at: "2024-01-01 00:00:00".to_string(),
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("LIN-123"));
+        assert!(json.contains("linear"));
+        assert!(json.contains("has_embedding"));
+        assert!(json.contains("true"));
+        assert!(json.contains("bug"));
+    }
+
+    #[test]
+    fn test_issues_response_serialization() {
+        let resp = IssuesResponse {
+            issues: vec![],
+            total: 0,
+            page: 1,
+            per_page: 100,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"total\":0"));
+        assert!(json.contains("\"page\":1"));
+        assert!(json.contains("\"per_page\":100"));
+    }
+
+    #[test]
+    fn test_telemetry_latency_histogram_bucket_serialization() {
+        let bucket = TelemetryLatencyHistogramBucket {
+            label: "<=15s".to_string(),
+            upper_bound_secs: Some(15.0),
+            count: 42,
+        };
+        let json = serde_json::to_string(&bucket).unwrap();
+        assert!(json.contains("<=15s"));
+        assert!(json.contains("15.0"));
+        assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn test_telemetry_latency_histogram_bucket_no_upper_bound() {
+        let bucket = TelemetryLatencyHistogramBucket {
+            label: ">5m".to_string(),
+            upper_bound_secs: None,
+            count: 3,
+        };
+        let json = serde_json::to_string(&bucket).unwrap();
+        assert!(json.contains(">5m"));
+        assert!(json.contains("null"));
+    }
+
+    #[tokio::test]
+    async fn test_issues_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/issues", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["total"], 0);
+        assert_eq!(resp["page"], 1);
+        assert_eq!(resp["per_page"], 100);
+    }
+
+    #[tokio::test]
+    async fn test_issues_endpoint_with_source_filter() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get(
+                "/api/issues?source=linear&page=1&per_page=10",
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

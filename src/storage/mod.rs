@@ -279,11 +279,11 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(0)
     }
 
-    /// Compute cost estimate from Claude execution durations.
+    /// Compute cost estimate from Claude execution data.
     fn get_cost_estimate(
         &self,
         _since_iso: &str,
-        _cost_per_minute: f64,
+        _max_plan_monthly_cost: f64,
         _period_label: &str,
     ) -> Result<crate::types::CostEstimate> {
         Ok(crate::types::CostEstimate::default())
@@ -299,11 +299,11 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Engineering time savings estimate.
-    fn get_time_savings(
+    /// Complexity-based engineering time savings estimate.
+    fn get_complexity_time_savings(
         &self,
         _since_iso: &str,
-        _hours_per_fix: f64,
+        _hourly_rate: f64,
         _period_label: &str,
     ) -> Result<crate::types::TimeSavings> {
         Ok(crate::types::TimeSavings::default())

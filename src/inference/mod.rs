@@ -1715,4 +1715,341 @@ mod tests {
         assert_eq!(inferrer.repo_count(), 2);
         assert!(!inferrer.has_embeddings());
     }
+
+    // ─── resolve_repo_for_issue tests ──
+
+    #[test]
+    fn test_resolve_repo_for_issue_no_inferrer_no_tracker() {
+        let issue = create_test_issue("linear", "Some issue", "description");
+        let result = resolve_repo_for_issue(None, &issue, None);
+        assert!(!result.is_resolved());
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_with_file_match() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Auth error", "");
+        issue
+            .metadata
+            .insert("filename".to_string(), json!("src/routes/auth.ts"));
+
+        let result = resolve_repo_for_issue(Some(&inferrer), &issue, None);
+        assert!(result.is_resolved());
+        assert_eq!(result.repo_name(), Some("appwrite/console"));
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_no_match() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let issue = create_test_issue("linear", "Unknown", "Nothing matches");
+        let result = resolve_repo_for_issue(Some(&inferrer), &issue, None);
+        assert!(!result.is_resolved());
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_with_embedding_fallback() {
+        let index = create_test_index();
+        let embeddings = vec![
+            RepoEmbedding {
+                name: "appwrite/console".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+            },
+            RepoEmbedding {
+                name: "appwrite/sdk-for-php".to_string(),
+                embedding: vec![0.0, 1.0, 0.0],
+            },
+        ];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        let issue = create_test_issue("linear", "Frontend issue", "");
+        let query_emb = vec![0.95, 0.05, 0.0];
+
+        let result =
+            resolve_repo_for_issue_with_embedding(Some(&inferrer), &issue, None, Some(&query_emb));
+        assert!(result.is_resolved());
+        assert_eq!(result.repo_name(), Some("appwrite/console"));
+    }
+
+    // ─── find_repo_by_project_name tests ──
+
+    #[test]
+    fn test_find_repo_by_project_no_match() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        // Use a project name that does not match anything
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("nonexistent-app"));
+
+        let result = inferrer.infer(&issue);
+        // Sentry project lookup will fail, so should fall through
+        // Since there are no file references either, should return None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_repo_by_project_bare_name_no_suffix() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        // "cloud" directly matches "appwrite/cloud"
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue.metadata.insert("project".to_string(), json!("cloud"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/cloud");
+    }
+
+    // ─── find_repo_by_partial_name tests ──
+
+    #[test]
+    fn test_infer_explicit_repo_reference() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        // Issue that mentions "appwrite/console" in the description
+        let issue = create_test_issue(
+            "linear",
+            "Bug in console",
+            "This is happening in appwrite/console repo",
+        );
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/console");
+    }
+
+    // ─── find_by_embedding edge case tests ──
+
+    #[test]
+    fn test_find_by_embedding_no_embeddings() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index); // No embeddings
+
+        let issue = create_test_issue("linear", "test", "");
+        let emb = vec![1.0, 0.0, 0.0];
+        let result = inferrer.infer_with_embedding(&issue, Some(&emb));
+        // No embeddings, so embedding-based fallback should not produce a match
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_by_embedding_multiple_repos_picks_best() {
+        let index = create_test_index();
+        let embeddings = vec![
+            RepoEmbedding {
+                name: "appwrite/console".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+            },
+            RepoEmbedding {
+                name: "appwrite/sdk-for-php".to_string(),
+                embedding: vec![0.0, 1.0, 0.0],
+            },
+        ];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        let issue = create_test_issue("linear", "test", "");
+        // This embedding is closer to sdk-for-php
+        let emb = vec![0.1, 0.99, 0.0];
+        let result = inferrer.infer_with_embedding(&issue, Some(&emb));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/sdk-for-php");
+    }
+
+    // ─── Confidence enum tests ──
+
+    #[test]
+    fn test_confidence_copy() {
+        let c = Confidence::High;
+        let c2 = c;
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn test_confidence_debug() {
+        let dbg = format!("{:?}", Confidence::Medium);
+        assert_eq!(dbg, "Medium");
+    }
+
+    // ─── InferredRepo tests ──
+
+    #[test]
+    fn test_inferred_repo_clone() {
+        let repo = IndexedRepo::new("test/repo", "/path");
+        let inferred = InferredRepo {
+            repo: repo.clone(),
+            confidence: Confidence::High,
+            reason: "test reason".to_string(),
+            matched_file: Some("file.rs".to_string()),
+        };
+        let cloned = inferred.clone();
+        assert_eq!(cloned.repo.name, "test/repo");
+        assert_eq!(cloned.confidence, Confidence::High);
+        assert_eq!(cloned.reason, "test reason");
+        assert_eq!(cloned.matched_file, Some("file.rs".to_string()));
+    }
+
+    #[test]
+    fn test_inferred_repo_debug() {
+        let repo = IndexedRepo::new("test/repo", "/path");
+        let inferred = InferredRepo {
+            repo,
+            confidence: Confidence::Low,
+            reason: "fuzzy match".to_string(),
+            matched_file: None,
+        };
+        let dbg = format!("{:?}", inferred);
+        assert!(dbg.contains("Low"));
+        assert!(dbg.contains("fuzzy match"));
+    }
+
+    // ─── RepoResolution tests ──
+
+    #[test]
+    fn test_repo_resolution_debug() {
+        let res = RepoResolution::Skip {
+            reason: "test skip".to_string(),
+        };
+        let dbg = format!("{:?}", res);
+        assert!(dbg.contains("Skip"));
+        assert!(dbg.contains("test skip"));
+    }
+
+    #[test]
+    fn test_repo_resolution_resolved_repo_id_none() {
+        let res = RepoResolution::Resolved {
+            project_dir: PathBuf::from("/path"),
+            repo_name: "org/repo".to_string(),
+            repo_id: None,
+            github_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+        };
+        assert!(res.is_resolved());
+        assert_eq!(res.repo_name(), Some("org/repo"));
+    }
+
+    // ─── resolve_repo_for_cascade edge cases ──
+
+    #[test]
+    fn test_resolve_repo_for_cascade_returns_correct_fields() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let result = resolve_repo_for_cascade(Some(&inferrer), "appwrite/console");
+        assert!(result.is_resolved());
+
+        match result {
+            RepoResolution::Resolved {
+                project_dir,
+                repo_name,
+                repo_id,
+                github_url,
+                default_branch,
+            } => {
+                assert_eq!(project_dir, PathBuf::from("/path/console"));
+                assert_eq!(repo_name, "appwrite/console");
+                assert!(repo_id.is_none()); // Cascade doesn't do DB lookup
+                assert!(!github_url.is_empty());
+                assert!(!default_branch.is_empty());
+            }
+            _ => panic!("Expected Resolved variant"),
+        }
+    }
+
+    // ─── with_index tests ──
+
+    #[test]
+    fn test_with_index_returns_error_on_closure_error() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+        let result: crate::error::Result<()> =
+            inferrer.with_index(|_| Err(crate::error::Error::Other("test error".to_string())));
+        assert!(result.is_err());
+    }
+
+    // ─── RepoEmbedding tests ──
+
+    #[test]
+    fn test_repo_embedding_clone() {
+        let emb = RepoEmbedding {
+            name: "test/repo".to_string(),
+            embedding: vec![1.0, 2.0, 3.0],
+        };
+        let cloned = emb.clone();
+        assert_eq!(cloned.name, "test/repo");
+        assert_eq!(cloned.embedding, vec![1.0, 2.0, 3.0]);
+    }
+
+    // ─── Inferrer constructor edge cases ──
+
+    #[test]
+    fn test_inferrer_empty_index() {
+        let index = RepoIndex::new();
+        let inferrer = RepoInferrer::new(index);
+        assert_eq!(inferrer.repo_count(), 0);
+        assert!(!inferrer.has_embeddings());
+
+        let issue = create_test_issue("linear", "test", "test description");
+        assert!(inferrer.infer(&issue).is_none());
+    }
+
+    #[test]
+    fn test_inferrer_with_discovery_has_embeddings() {
+        let index = create_test_index();
+        let embeddings = vec![RepoEmbedding {
+            name: "appwrite/console".to_string(),
+            embedding: vec![1.0, 0.0],
+        }];
+        let inferrer = RepoInferrer::with_discovery(
+            index,
+            embeddings,
+            vec!["org".to_string()],
+            vec!["/path".to_string()],
+        );
+        assert!(inferrer.has_embeddings());
+        assert_eq!(inferrer.embedding_count(), 1);
+    }
+
+    // ─── Infer from description (no metadata) ──
+
+    #[test]
+    fn test_infer_from_description_file_path() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        // File path is extracted from the description text
+        let issue = create_test_issue(
+            "linear",
+            "Error in auth module",
+            "Stack trace shows error at src/routes/auth.ts line 42",
+        );
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/console");
+    }
+
+    // ─── find_unknown_repos tests ──
+
+    #[test]
+    fn test_find_unknown_repos_all_unknown() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+        let context = IssueContext {
+            filenames: vec![],
+            functions: vec![],
+            repos: vec!["unknown/a".to_string(), "unknown/b".to_string()],
+            keywords: vec![],
+            raw_text: String::new(),
+        };
+        let unknown = inferrer.find_unknown_repos(&context);
+        assert_eq!(unknown.len(), 2);
+        assert!(unknown.contains(&"unknown/a".to_string()));
+        assert!(unknown.contains(&"unknown/b".to_string()));
+    }
 }

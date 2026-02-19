@@ -1230,4 +1230,406 @@ mod tests {
             "Occurrence count should be incremented on conflict"
         );
     }
+
+    // ================================================================
+    // Additional coverage: classify_error nuance, compute_error_hash
+    // digit-run collapsing, TrendAnalysis symmetry, TimePeriod
+    // ordering, AnalyticsService metrics_by_source, and throughput
+    // with specific period.
+    // ================================================================
+
+    // ── classify_error: additional keyword combinations ──────────────
+
+    #[test]
+    fn test_classify_error_network_without_connection() {
+        assert_eq!(classify_error("network unreachable"), "network_error");
+    }
+
+    #[test]
+    fn test_classify_error_claude_keyword() {
+        assert_eq!(classify_error("Claude returned 500"), "claude_error");
+    }
+
+    #[test]
+    fn test_classify_error_permission_keyword() {
+        assert_eq!(
+            classify_error("permission denied: /etc/shadow"),
+            "permission_error"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_build_without_compile() {
+        assert_eq!(classify_error("build step 3 failed"), "build_failure");
+    }
+
+    #[test]
+    fn test_classify_error_git_keyword_alone() {
+        assert_eq!(classify_error("git push failed"), "git_error");
+    }
+
+    #[test]
+    fn test_classify_error_conflict_alone() {
+        // "conflict in Cargo.lock" contains "cargo" which matches build_failure
+        // before "conflict" matches git_error (priority order)
+        assert_eq!(classify_error("conflict in Cargo.lock"), "build_failure");
+        // Pure "conflict" without "cargo" matches git_error
+        assert_eq!(classify_error("conflict in file.rs"), "git_error");
+    }
+
+    #[test]
+    fn test_classify_error_test_keyword_alone() {
+        assert_eq!(classify_error("test suite failed"), "test_failure");
+    }
+
+    #[test]
+    fn test_classify_error_assertion_alone() {
+        assert_eq!(classify_error("assertion error in module"), "test_failure");
+    }
+
+    #[test]
+    fn test_classify_error_unrecognized_punctuation() {
+        assert_eq!(classify_error("!!!???..."), "unknown");
+    }
+
+    // ── compute_error_hash: digit-run collapsing detail ──────────────
+
+    #[test]
+    fn test_compute_error_hash_mixed_digits_and_text() {
+        // "Error 42 on line 100" -> "error <N> on line <N>"
+        // "Error 99 on line 200" -> "error <N> on line <N>"
+        let hash1 = compute_error_hash("Error 42 on line 100");
+        let hash2 = compute_error_hash("Error 99 on line 200");
+        assert_eq!(
+            hash1, hash2,
+            "Digit runs should be collapsed: 'error <N> on line <N>'"
+        );
+    }
+
+    #[test]
+    fn test_compute_error_hash_adjacent_digit_runs() {
+        // "12 34" -> "<N> <N>"
+        // "56 78" -> "<N> <N>"
+        let hash1 = compute_error_hash("12 34");
+        let hash2 = compute_error_hash("56 78");
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_compute_error_hash_single_digit_run() {
+        // "error 1" and "error 99999" both become "error <N>"
+        let hash1 = compute_error_hash("error 1");
+        let hash2 = compute_error_hash("error 99999");
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_compute_error_hash_no_digits_unchanged() {
+        let hash1 = compute_error_hash("pure text error");
+        let hash2 = compute_error_hash("pure text error");
+        assert_eq!(hash1, hash2);
+
+        let hash3 = compute_error_hash("different text error");
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_compute_error_hash_special_chars_preserved() {
+        // Special characters are preserved in the normalization
+        let hash1 = compute_error_hash("error: file not found!");
+        let hash2 = compute_error_hash("error: something else!");
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_compute_error_hash_tabs_and_newlines_as_whitespace() {
+        let hash1 = compute_error_hash("error\tin\nfile");
+        let hash2 = compute_error_hash("error in file");
+        assert_eq!(
+            hash1, hash2,
+            "Tabs and newlines should be normalized to single spaces"
+        );
+    }
+
+    // ── TrendAnalysis: symmetry and edge cases ───────────────────────
+
+    #[test]
+    fn test_trend_analysis_equal_values_stable() {
+        let trend = TrendAnalysis::new(50.0, 50.0);
+        assert_eq!(trend.change_percent, 0.0);
+        assert_eq!(trend.direction, TrendDirection::Stable);
+    }
+
+    #[test]
+    fn test_trend_analysis_negative_to_positive() {
+        // current=50, previous=-100
+        // change = (50 - (-100)) / |-100| * 100 = 150%
+        let trend = TrendAnalysis::new(50.0, -100.0);
+        assert!(
+            (trend.change_percent - 150.0).abs() < 0.01,
+            "Expected 150%, got {}",
+            trend.change_percent
+        );
+        assert_eq!(trend.direction, TrendDirection::Up);
+    }
+
+    #[test]
+    fn test_trend_analysis_positive_to_negative() {
+        // current=-50, previous=100
+        // change = (-50 - 100) / 100 * 100 = -150%
+        let trend = TrendAnalysis::new(-50.0, 100.0);
+        assert!(
+            (trend.change_percent - (-150.0)).abs() < 0.01,
+            "Expected -150%, got {}",
+            trend.change_percent
+        );
+        assert_eq!(trend.direction, TrendDirection::Down);
+    }
+
+    #[test]
+    fn test_trend_analysis_small_fractional_change_stable() {
+        // 1% change should be stable (within 5% threshold)
+        let trend = TrendAnalysis::new(101.0, 100.0);
+        assert_eq!(trend.direction, TrendDirection::Stable);
+        assert!((trend.change_percent - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_trend_analysis_fields_accessible() {
+        let trend = TrendAnalysis::new(200.0, 100.0);
+        assert_eq!(trend.current, 200.0);
+        assert_eq!(trend.previous, 100.0);
+        assert!((trend.change_percent - 100.0).abs() < 0.01);
+    }
+
+    // ── TrendDirection: PartialEq ────────────────────────────────────
+
+    #[test]
+    fn test_trend_direction_partial_eq() {
+        assert_eq!(TrendDirection::Up, TrendDirection::Up);
+        assert_eq!(TrendDirection::Down, TrendDirection::Down);
+        assert_eq!(TrendDirection::Stable, TrendDirection::Stable);
+        assert_ne!(TrendDirection::Up, TrendDirection::Down);
+        assert_ne!(TrendDirection::Up, TrendDirection::Stable);
+        assert_ne!(TrendDirection::Down, TrendDirection::Stable);
+    }
+
+    #[test]
+    fn test_trend_direction_debug_format() {
+        assert_eq!(format!("{:?}", TrendDirection::Up), "Up");
+        assert_eq!(format!("{:?}", TrendDirection::Down), "Down");
+        assert_eq!(format!("{:?}", TrendDirection::Stable), "Stable");
+    }
+
+    #[test]
+    fn test_trend_direction_clone() {
+        let dir = TrendDirection::Up;
+        let cloned = dir;
+        assert_eq!(dir, cloned);
+    }
+
+    // ── TimePeriod: ordering and exhaustiveness ──────────────────────
+
+    #[test]
+    fn test_time_period_duration_ordering() {
+        // Hour < Day < Week < Month
+        assert!(TimePeriod::Hour.duration() < TimePeriod::Day.duration());
+        assert!(TimePeriod::Day.duration() < TimePeriod::Week.duration());
+        assert!(TimePeriod::Week.duration() < TimePeriod::Month.duration());
+    }
+
+    #[test]
+    fn test_time_period_start_time_ordering() {
+        // Longer periods have earlier start times
+        let hour_start = TimePeriod::Hour.start_time();
+        let day_start = TimePeriod::Day.start_time();
+        let week_start = TimePeriod::Week.start_time();
+        let month_start = TimePeriod::Month.start_time();
+
+        assert!(month_start < week_start);
+        assert!(week_start < day_start);
+        assert!(day_start < hour_start);
+    }
+
+    #[test]
+    fn test_time_period_debug_format() {
+        assert_eq!(format!("{:?}", TimePeriod::Hour), "Hour");
+        assert_eq!(format!("{:?}", TimePeriod::Day), "Day");
+        assert_eq!(format!("{:?}", TimePeriod::Week), "Week");
+        assert_eq!(format!("{:?}", TimePeriod::Month), "Month");
+    }
+
+    #[test]
+    fn test_time_period_clone() {
+        let period = TimePeriod::Week;
+        let cloned = period;
+        assert_eq!(cloned.duration().num_days(), 7);
+    }
+
+    // ── AnalyticsService: metrics_by_source ──────────────────────────
+
+    #[test]
+    fn test_metrics_by_source_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let service = AnalyticsService::new(&tracker);
+        let result = service
+            .metrics_by_source("latency", TimePeriod::Day)
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_metrics_by_source_with_data() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let mut m1 = ProcessingMetric::new("latency", 100.0);
+        m1.source = Some("linear".to_string());
+        let mut m2 = ProcessingMetric::new("latency", 200.0);
+        m2.source = Some("linear".to_string());
+        let mut m3 = ProcessingMetric::new("latency", 300.0);
+        m3.source = Some("sentry".to_string());
+
+        tracker.record_metric(&m1).unwrap();
+        tracker.record_metric(&m2).unwrap();
+        tracker.record_metric(&m3).unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let result = service
+            .metrics_by_source("latency", TimePeriod::Day)
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        let linear_avg = result.get("linear").unwrap();
+        assert!(
+            (*linear_avg - 150.0).abs() < 0.01,
+            "linear average should be 150.0, got {}",
+            linear_avg
+        );
+        let sentry_avg = result.get("sentry").unwrap();
+        assert!(
+            (*sentry_avg - 300.0).abs() < 0.01,
+            "sentry average should be 300.0, got {}",
+            sentry_avg
+        );
+    }
+
+    #[test]
+    fn test_metrics_by_source_no_source_field_excluded() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Metric without source field set
+        let m = ProcessingMetric::new("latency", 100.0);
+        tracker.record_metric(&m).unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let result = service
+            .metrics_by_source("latency", TimePeriod::Day)
+            .unwrap();
+        // Metrics without a source are excluded from by_source aggregation
+        assert!(
+            result.is_empty(),
+            "Metrics without source should not appear in by_source"
+        );
+    }
+
+    // ── AnalyticsService: throughput with different periods ──────────
+
+    #[test]
+    fn test_calculate_throughput_day_period() {
+        use crate::types::ActivityLogEntry;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        for i in 0..24 {
+            let entry =
+                ActivityLogEntry::new("processing_completed", format!("Processed item {}", i));
+            tracker.record_activity(&entry).unwrap();
+        }
+
+        let service = AnalyticsService::new(&tracker);
+        let throughput = service.calculate_throughput(TimePeriod::Day).unwrap();
+        // 24 activities / 24 hours = 1.0 per hour
+        assert!(
+            (throughput - 1.0).abs() < 0.01,
+            "Throughput should be 1.0/hr for 24 items over 24 hours, got {}",
+            throughput
+        );
+    }
+
+    // ── AnalyticsService: error rate with no errors ──────────────────
+
+    #[test]
+    fn test_calculate_error_rate_no_errors() {
+        use crate::types::ActivityLogEntry;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        for _ in 0..10 {
+            let entry = ActivityLogEntry::new("processing_completed", "success");
+            tracker.record_activity(&entry).unwrap();
+        }
+
+        let service = AnalyticsService::new(&tracker);
+        let rate = service.calculate_error_rate(TimePeriod::Hour).unwrap();
+        assert!(
+            rate.abs() < 0.001,
+            "Error rate should be 0.0 when no errors, got {}",
+            rate
+        );
+    }
+
+    // ── AnalyticsService: average_metric single value ────────────────
+
+    #[test]
+    fn test_average_metric_single_value() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let m = ProcessingMetric::new("latency", 42.5);
+        tracker.record_metric(&m).unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let avg = service.average_metric("latency", TimePeriod::Day).unwrap();
+        assert_eq!(avg, Some(42.5));
+    }
+
+    // ── compute_error_hash: determinism ──────────────────────────────
+
+    #[test]
+    fn test_compute_error_hash_deterministic() {
+        let msg = "fatal error: segmentation fault at address 0xDEADBEEF";
+        let hash1 = compute_error_hash(msg);
+        let hash2 = compute_error_hash(msg);
+        assert_eq!(hash1, hash2, "Same input must produce same hash");
+    }
+
+    #[test]
+    fn test_compute_error_hash_hex_only_output() {
+        let hash = compute_error_hash("any arbitrary error message here");
+        assert_eq!(hash.len(), 32);
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash should be hex-only, got: {}",
+            hash
+        );
+    }
+
+    // ── TrendAnalysis: debug format ──────────────────────────────────
+
+    #[test]
+    fn test_trend_analysis_debug_format() {
+        let trend = TrendAnalysis::new(110.0, 100.0);
+        let debug = format!("{:?}", trend);
+        assert!(debug.contains("TrendAnalysis"));
+        assert!(debug.contains("current"));
+        assert!(debug.contains("previous"));
+        assert!(debug.contains("change_percent"));
+        assert!(debug.contains("direction"));
+    }
+
+    #[test]
+    fn test_trend_analysis_clone() {
+        let trend = TrendAnalysis::new(50.0, 25.0);
+        let cloned = trend.clone();
+        assert_eq!(cloned.current, 50.0);
+        assert_eq!(cloned.previous, 25.0);
+        assert_eq!(cloned.direction, trend.direction);
+        assert!((cloned.change_percent - trend.change_percent).abs() < 0.001);
+    }
 }
