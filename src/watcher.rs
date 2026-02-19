@@ -917,21 +917,13 @@ impl Watcher {
         // Try full owner/repo name first (used when dependencies are loaded from DB),
         // fall back to short name for backwards compatibility with hardcoded defaults.
         let repo_short_name = github_repo.split('/').next_back().unwrap_or(&github_repo);
-        let dependants = {
+        let (dependants, graph_key) = {
             let full = relationships.get_dependants(&github_repo);
             if !full.is_empty() {
-                full
+                (full, github_repo.to_string())
             } else {
-                relationships.get_dependants(repo_short_name)
-            }
-        };
-        // Which key actually matched in the graph
-        let graph_key = {
-            let full = relationships.get_dependants(&github_repo);
-            if !full.is_empty() {
-                github_repo.to_string()
-            } else {
-                repo_short_name.to_string()
+                let short = relationships.get_dependants(repo_short_name);
+                (short, repo_short_name.to_string())
             }
         };
         if dependants.is_empty() {
@@ -954,7 +946,7 @@ impl Watcher {
 
         for dependant in dependants {
             let dep_type = graph
-                .get_first_hop_dependency_type(&graph_key)
+                .get_first_hop_dependency_type_to_target(&graph_key, &dependant.name)
                 .map(|t| t.as_str())
                 .unwrap_or("unknown");
 

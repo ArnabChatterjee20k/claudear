@@ -316,7 +316,7 @@ pub async fn update_profile_handler(
     // If changing password, require current_password verification
     let password_hash = match &body.password {
         Some(new_pw) => {
-            if new_pw.len() < 8 {
+            if new_pw.len() < 8 || new_pw.len() > 72 {
                 return Err(StatusCode::BAD_REQUEST);
             }
             // Rate limit password change to prevent bcrypt CPU exhaustion
@@ -337,7 +337,7 @@ pub async fn update_profile_handler(
             let valid = bcrypt::verify(current_pw, &current_user.password_hash)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             if !valid {
-                return Err(StatusCode::UNAUTHORIZED);
+                return Err(StatusCode::FORBIDDEN);
             }
 
             Some(
@@ -348,11 +348,13 @@ pub async fn update_profile_handler(
         None => None,
     };
 
+    let trimmed_name = body.name.as_deref().map(str::trim);
+
     db.update_user(
         user.id,
         None,
         password_hash.as_deref(),
-        body.name.as_deref(),
+        trimmed_name,
         None,
         None,
     )
@@ -390,6 +392,11 @@ pub async fn upload_avatar_handler(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?
     {
+        // Only process the "avatar" field
+        if field.name() != Some("avatar") {
+            continue;
+        }
+
         let content_type = field
             .content_type()
             .unwrap_or("application/octet-stream")
@@ -425,20 +432,17 @@ pub async fn upload_avatar_handler(
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        // Delete old avatar files for this user
-        let prefix = format!("{}.", user.id);
-        let avatars_dir_clone = avatars_dir.clone();
-        if let Ok(mut entries) = tokio::fs::read_dir(&avatars_dir_clone).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with(&prefix) {
-                        let _ = tokio::fs::remove_file(entry.path()).await;
-                    }
-                }
+        // Delete old avatar file using the path stored in DB (avoids prefix-matching bugs)
+        if let Some(ref old_url) = user.avatar_url {
+            if let Some(old_filename) = old_url.rsplit('/').next() {
+                let old_path = avatars_dir.join(old_filename);
+                let _ = tokio::fs::remove_file(&old_path).await;
             }
         }
 
-        let filename = format!("{}.{}", user.id, ext);
+        // Use random token in filename to prevent enumeration
+        let random_token = hex::encode(rand::random::<[u8; 8]>());
+        let filename = format!("{}_{}.{}", user.id, random_token, ext);
         let file_path = avatars_dir.join(&filename);
         tokio::fs::write(&file_path, &data)
             .await

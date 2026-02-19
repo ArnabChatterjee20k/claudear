@@ -129,7 +129,8 @@ pub fn create_api_router_with_dashboard(
         )
         .route(
             "/api/auth/avatar",
-            axum::routing::post(upload_avatar_handler),
+            axum::routing::post(upload_avatar_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(6 * 1024 * 1024)),
         )
         // Config routes (admin only)
         .route(

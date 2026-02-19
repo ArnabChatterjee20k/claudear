@@ -36,3 +36,13 @@ export function formatMins(mins: number | null): string {
   if (mins < 1440) return `${(mins / 60).toFixed(1)}h`
   return `${(mins / 1440).toFixed(1)}d`
 }
+
+export function getInitials(name: string): string {
+  return name
+    .split(' ')
+    .map((w) => w[0])
+    .filter(Boolean)
+    .slice(0, 2)
+    .join('')
+    .toUpperCase()
+}

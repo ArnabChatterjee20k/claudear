@@ -1,18 +1,9 @@
 import { useState, useRef } from 'react'
 import { useAuth } from '../lib/auth'
 import { uploadAvatar } from '../lib/api'
+import { getInitials } from '../lib/formatters'
 import { PageHeader } from '../components/layout/page-header'
 import { Camera, Check, Loader2 } from 'lucide-react'
-
-function getInitials(name: string): string {
-  return name
-    .split(' ')
-    .map((w) => w[0])
-    .filter(Boolean)
-    .slice(0, 2)
-    .join('')
-    .toUpperCase()
-}
 
 export default function SettingsPage() {
   const { user, updateProfile, refreshUser } = useAuth()

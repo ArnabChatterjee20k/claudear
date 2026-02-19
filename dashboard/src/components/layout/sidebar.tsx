@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from '../../router'
 import { useAuth } from '../../lib/auth'
+import { getInitials } from '../../lib/formatters'
 import {
   Activity, BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
@@ -142,7 +143,7 @@ export function Sidebar() {
               <img src={user.avatar_url} alt={user.name} className="h-8 w-8 rounded-full object-cover shrink-0" />
             ) : (
               <div className="h-8 w-8 rounded-full bg-primary/10 text-primary flex items-center justify-center text-xs font-semibold shrink-0">
-                {user?.name?.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase()}
+                {getInitials(user?.name ?? '')}
               </div>
             )}
             <div className="min-w-0 text-left">

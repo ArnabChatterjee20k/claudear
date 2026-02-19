@@ -882,6 +882,13 @@ check_claude_executions_count() {
   [[ "$count" -ge "$min" ]]
 }
 
+check_fix_attempt_has_pr_non_cascade() {
+  local db="$1" source="$2" issue_id="$3"
+  local pr_url
+  pr_url="$(db_query "$db" "SELECT pr_url FROM fix_attempts WHERE source='${source}' AND issue_id='${issue_id}' AND cascade_repo IS NULL AND pr_url IS NOT NULL AND pr_url != '' ORDER BY id DESC LIMIT 1")"
+  [[ -n "$pr_url" ]]
+}
+
 check_cascade_attempt_exists() {
   local db="$1" source="$2" issue_id="$3"
   local count
