@@ -1,7 +1,10 @@
-import { useState, useMemo } from 'react'
+import { useState } from 'react'
 import useSWR from 'swr'
 import {
+  fetchIssues,
   fetchAttempts,
+  type IssuesResponse,
+  type IssueSummary,
   type AttemptsResponse,
   type AttemptSummary,
 } from '../lib/api'
@@ -14,60 +17,39 @@ import { Card, CardContent } from '../components/ui/card'
 import { Skeleton } from '../components/ui/skeleton'
 import { formatDate } from '../lib/formatters'
 
-interface IssueGroup {
-  key: string
-  source: string
-  short_id: string
-  title: string
-  attempts: AttemptSummary[]
-  latest_status: string
-  last_attempted_at: string
-}
-
-function groupAttemptsByIssue(attempts: AttemptSummary[]): IssueGroup[] {
-  const map = new Map<string, IssueGroup>()
-  for (const a of attempts) {
-    const key = `${a.source}:${a.short_id}`
-    const existing = map.get(key)
-    if (existing) {
-      existing.attempts.push(a)
-      if (new Date(a.attempted_at) > new Date(existing.last_attempted_at)) {
-        existing.latest_status = a.status
-        existing.last_attempted_at = a.attempted_at
-        existing.title = a.title || existing.title
-      }
-    } else {
-      map.set(key, {
-        key,
-        source: a.source,
-        short_id: a.short_id,
-        title: a.title || a.short_id,
-        attempts: [a],
-        latest_status: a.status,
-        last_attempted_at: a.attempted_at,
-      })
-    }
-  }
-  return Array.from(map.values()).sort(
-    (a, b) => new Date(b.last_attempted_at).getTime() - new Date(a.last_attempted_at).getTime(),
-  )
-}
-
 export default function IssuesPage() {
-  const [selectedIssue, setSelectedIssue] = useState<IssueGroup | null>(null)
+  const [selectedIssue, setSelectedIssue] = useState<IssueSummary | null>(null)
 
-  const { data, error, isLoading } = useSWR<AttemptsResponse>(
-    'issues-all-attempts',
-    () => fetchAttempts({ per_page: 1000 }),
+  const { data, error, isLoading } = useSWR<IssuesResponse>(
+    'issues-list',
+    () => fetchIssues({ per_page: 100 }),
     { refreshInterval: 30000 },
   )
 
-  const issues = useMemo(
-    () => (data ? groupAttemptsByIssue(data.attempts) : []),
-    [data],
+  // Fetch attempts for the selected issue when the modal opens
+  const { data: attemptsData } = useSWR<AttemptsResponse>(
+    selectedIssue
+      ? `issues-attempts-${selectedIssue.source}-${selectedIssue.issue_id}`
+      : null,
+    () =>
+      fetchAttempts({
+        source: selectedIssue!.source,
+        per_page: 100,
+      }),
+    { refreshInterval: 0 },
   )
 
-  const columns: Column<IssueGroup>[] = [
+  // Filter attempts for the selected issue
+  const issueAttempts: AttemptSummary[] = attemptsData
+    ? attemptsData.attempts.filter(
+        a =>
+          a.source === selectedIssue?.source &&
+          (a.short_id === selectedIssue?.short_id ||
+            a.short_id === selectedIssue?.issue_id),
+      )
+    : []
+
+  const columns: Column<IssueSummary>[] = [
     {
       key: 'source',
       header: 'Source',
@@ -80,40 +62,65 @@ export default function IssuesPage() {
     {
       key: 'short_id',
       header: 'Issue ID',
-      render: row => <span className="font-mono text-sm">{row.short_id}</span>,
+      render: row => (
+        <span className="font-mono text-sm">{row.short_id || row.issue_id}</span>
+      ),
     },
     {
       key: 'title',
       header: 'Title',
-      render: row => (
-        <span className="text-sm" title={row.title}>
-          {row.title.length > 60 ? row.title.slice(0, 60) + '...' : row.title}
-        </span>
-      ),
+      render: row => {
+        const title = row.title || row.short_id || row.issue_id
+        return (
+          <span className="text-sm" title={title}>
+            {title.length > 60 ? title.slice(0, 60) + '...' : title}
+          </span>
+        )
+      },
       className: 'max-w-sm',
     },
     {
-      key: 'attempts_count',
-      header: 'Attempts',
-      render: row => <span className="text-sm font-medium">{row.attempts.length}</span>,
-      sortable: true,
+      key: 'priority',
+      header: 'Priority',
+      render: row => (
+        <span className="text-sm capitalize">{row.priority || 'none'}</span>
+      ),
     },
     {
-      key: 'latest_status',
-      header: 'Latest Status',
-      render: row => <StatusBadge status={row.latest_status} />,
+      key: 'status',
+      header: 'Status',
+      render: row => <StatusBadge status={row.status || 'open'} />,
     },
     {
-      key: 'last_attempted_at',
-      header: 'Last Attempted',
-      render: row => <TimeAgo date={row.last_attempted_at} />,
+      key: 'url',
+      header: 'Link',
+      render: row =>
+        row.url ? (
+          <a
+            href={row.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-primary hover:underline text-xs"
+            onClick={e => e.stopPropagation()}
+          >
+            View
+          </a>
+        ) : null,
+    },
+    {
+      key: 'created_at',
+      header: 'Created',
+      render: row => <TimeAgo date={row.created_at} />,
       sortable: true,
     },
   ]
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Issues" description="Originating issues grouped from fix attempts" />
+      <PageHeader
+        title="Issues"
+        description={`Tracked issues from connected sources${data ? ` (${data.total} total)` : ''}`}
+      />
 
       {error && (
         <div className="text-destructive text-sm">Failed to load issues.</div>
@@ -132,8 +139,8 @@ export default function IssuesPage() {
           <CardContent className="p-4">
             <DataTable
               columns={columns}
-              data={issues}
-              keyFn={row => row.key}
+              data={data.issues}
+              keyFn={row => `${row.source}:${row.issue_id}`}
               emptyMessage="No issues found"
               onRowClick={row => setSelectedIssue(row)}
             />
@@ -144,7 +151,11 @@ export default function IssuesPage() {
       <Modal
         open={!!selectedIssue}
         onClose={() => setSelectedIssue(null)}
-        title={selectedIssue ? `${selectedIssue.source}: ${selectedIssue.short_id}` : undefined}
+        title={
+          selectedIssue
+            ? `${selectedIssue.source}: ${selectedIssue.short_id || selectedIssue.issue_id}`
+            : undefined
+        }
       >
         {selectedIssue && (
           <div className="space-y-4">
@@ -155,50 +166,103 @@ export default function IssuesPage() {
               </div>
               <div>
                 <p className="text-sm text-muted-foreground">Issue ID</p>
-                <p className="text-sm font-mono">{selectedIssue.short_id}</p>
+                <p className="text-sm font-mono">
+                  {selectedIssue.short_id || selectedIssue.issue_id}
+                </p>
               </div>
               <div className="sm:col-span-2">
                 <p className="text-sm text-muted-foreground">Title</p>
-                <p className="text-sm">{selectedIssue.title}</p>
+                <p className="text-sm">
+                  {selectedIssue.title || selectedIssue.short_id || selectedIssue.issue_id}
+                </p>
+              </div>
+              {selectedIssue.description && (
+                <div className="sm:col-span-2">
+                  <p className="text-sm text-muted-foreground">Description</p>
+                  <p className="text-sm whitespace-pre-wrap line-clamp-6">
+                    {selectedIssue.description}
+                  </p>
+                </div>
+              )}
+              <div>
+                <p className="text-sm text-muted-foreground">Priority</p>
+                <p className="text-sm capitalize">{selectedIssue.priority || 'none'}</p>
               </div>
               <div>
-                <p className="text-sm text-muted-foreground">Latest Status</p>
-                <StatusBadge status={selectedIssue.latest_status} />
+                <p className="text-sm text-muted-foreground">Status</p>
+                <StatusBadge status={selectedIssue.status || 'open'} />
               </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Total Attempts</p>
-                <p className="text-sm font-medium">{selectedIssue.attempts.length}</p>
-              </div>
+              {selectedIssue.labels && selectedIssue.labels.length > 0 && (
+                <div className="sm:col-span-2">
+                  <p className="text-sm text-muted-foreground">Labels</p>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {selectedIssue.labels.map(label => (
+                      <span
+                        key={label}
+                        className="px-2 py-0.5 rounded text-xs bg-muted text-muted-foreground"
+                      >
+                        {label}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {selectedIssue.url && (
+                <div className="sm:col-span-2">
+                  <p className="text-sm text-muted-foreground">URL</p>
+                  <a
+                    href={selectedIssue.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-primary hover:underline break-all"
+                  >
+                    {selectedIssue.url}
+                  </a>
+                </div>
+              )}
             </div>
 
-            <div>
-              <p className="text-sm font-medium mb-2">Attempts</p>
-              <div className="space-y-2">
-                {selectedIssue.attempts
-                  .sort((a, b) => new Date(b.attempted_at).getTime() - new Date(a.attempted_at).getTime())
-                  .map(a => (
-                    <div key={a.id} className="flex items-center gap-3 border rounded-md p-2 text-sm">
-                      <StatusBadge status={a.status} />
-                      <span className="text-muted-foreground">{formatDate(a.attempted_at)}</span>
-                      {a.pr_url && (
-                        <a
-                          href={a.pr_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-primary hover:underline text-xs"
-                        >
-                          PR
-                        </a>
-                      )}
-                      {a.retry_count > 0 && (
-                        <span className="text-xs text-muted-foreground">
-                          retry #{a.retry_count}
+            {issueAttempts.length > 0 && (
+              <div>
+                <p className="text-sm font-medium mb-2">
+                  Fix Attempts ({issueAttempts.length})
+                </p>
+                <div className="space-y-2">
+                  {issueAttempts
+                    .sort(
+                      (a, b) =>
+                        new Date(b.attempted_at).getTime() -
+                        new Date(a.attempted_at).getTime(),
+                    )
+                    .map(a => (
+                      <div
+                        key={a.id}
+                        className="flex items-center gap-3 border rounded-md p-2 text-sm"
+                      >
+                        <StatusBadge status={a.status} />
+                        <span className="text-muted-foreground">
+                          {formatDate(a.attempted_at)}
                         </span>
-                      )}
-                    </div>
-                  ))}
+                        {a.pr_url && (
+                          <a
+                            href={a.pr_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-primary hover:underline text-xs"
+                          >
+                            PR
+                          </a>
+                        )}
+                        {a.retry_count > 0 && (
+                          <span className="text-xs text-muted-foreground">
+                            retry #{a.retry_count}
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                </div>
               </div>
-            </div>
+            )}
           </div>
         )}
       </Modal>

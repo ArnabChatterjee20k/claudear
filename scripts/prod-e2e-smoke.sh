@@ -909,8 +909,8 @@ EOF
   assert_db "$db_path" "processing_metrics" \
     "metric_name='issues_fetched'" 1 "processing_metrics: issues_fetched recorded" "false"
 
-  assert_db "$db_path" "issue_embeddings" \
-    "source='linear' AND issue_id='${S1_ISSUE_ID}'" 0 "issue_embeddings: embedding created" "false"
+  assert_db "$db_path" "issues" \
+    "source='linear' AND issue_id='${S1_ISSUE_ID}'" 0 "issues: issue record created" "false"
 
   # --- Step 5: Checkpoint B - PR Created ---
   log_checkpoint "S1 Checkpoint B: PR Created"

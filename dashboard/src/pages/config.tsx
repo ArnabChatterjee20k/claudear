@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import useSWR from 'swr'
 import { fetchConfig, saveConfig, type ConfigResponse } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
@@ -8,7 +8,7 @@ import { Badge } from '../components/ui/badge'
 import {
   Settings, Save, RotateCcw, FileText, AlertTriangle,
   CheckCircle2, Server, GitBranch, Bell, Shield,
-  Cpu, Bot, RefreshCw, Eye, Pencil, X,
+  Cpu, Bot, RefreshCw, Eye, X,
 } from 'lucide-react'
 
 interface TomlSection {
@@ -109,25 +109,39 @@ function serializeArrayValue(items: string[]): string {
   return `[${items.map(i => `"${i}"`).join(', ')}]`
 }
 
+/** Build a map of sectionKey.fieldKey -> value from parsed TOML content. */
+function buildFieldMap(content: string): Record<string, string> {
+  const map: Record<string, string> = {}
+  const sections = parseSections(content)
+  for (const section of sections) {
+    const fields = parseFields(section.lines)
+    for (const field of fields) {
+      map[`${section.key}.${field.key}`] = field.value
+    }
+  }
+  return map
+}
+
 function FieldInput({
   field,
   onChange,
-  readOnly,
+  changed,
 }: {
   field: ParsedField
   onChange: (key: string, newValue: string) => void
-  readOnly?: boolean
+  changed?: boolean
 }) {
+  const changedRing = changed ? 'ring-2 ring-amber-400/50' : ''
+
   if (field.type === 'boolean') {
     const checked = field.value === 'true'
     return (
       <button
         type="button"
-        onClick={() => !readOnly && onChange(field.key, checked ? 'false' : 'true')}
-        disabled={readOnly}
-        className={`relative w-10 h-5 rounded-full transition-colors ${
+        onClick={() => onChange(field.key, checked ? 'false' : 'true')}
+        className={`relative w-10 h-5 rounded-full transition-colors cursor-pointer ${
           checked ? 'bg-primary' : 'bg-muted-foreground/30'
-        } ${readOnly ? 'opacity-70 cursor-default' : 'cursor-pointer'}`}
+        } ${changedRing}`}
       >
         <span
           className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
@@ -144,11 +158,7 @@ function FieldInput({
         type="number"
         value={field.value}
         onChange={e => onChange(field.key, e.target.value)}
-        readOnly={readOnly}
-        tabIndex={readOnly ? -1 : undefined}
-        className={`w-full px-3 py-1.5 text-sm border rounded-md bg-background ${
-          readOnly ? 'text-muted-foreground cursor-default' : 'focus:outline-none focus:ring-2 focus:ring-primary/30'
-        }`}
+        className={`w-full px-3 py-1.5 text-sm border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 ${changedRing}`}
       />
     )
   }
@@ -158,9 +168,9 @@ function FieldInput({
     const [newItem, setNewItem] = useState('')
 
     return (
-      <div className="space-y-2">
+      <div className={`space-y-2 ${changed ? 'rounded-md ring-2 ring-amber-400/50 p-1.5 -m-1.5' : ''}`}>
         <div className="flex flex-wrap gap-1">
-          {items.length === 0 && readOnly && (
+          {items.length === 0 && (
             <span className="text-xs text-muted-foreground italic">Empty</span>
           )}
           {items.map((item, i) => (
@@ -169,49 +179,45 @@ function FieldInput({
               className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs bg-muted border"
             >
               {item}
-              {!readOnly && (
-                <button
-                  onClick={() => {
-                    const next = items.filter((_, j) => j !== i)
-                    onChange(field.key, serializeArrayValue(next))
-                  }}
-                  className="text-muted-foreground hover:text-foreground"
-                >
-                  <X className="h-3 w-3" />
-                </button>
-              )}
+              <button
+                onClick={() => {
+                  const next = items.filter((_, j) => j !== i)
+                  onChange(field.key, serializeArrayValue(next))
+                }}
+                className="text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3 w-3" />
+              </button>
             </span>
           ))}
         </div>
-        {!readOnly && (
-          <div className="flex gap-1">
-            <input
-              type="text"
-              value={newItem}
-              onChange={e => setNewItem(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && newItem.trim()) {
-                  e.preventDefault()
-                  onChange(field.key, serializeArrayValue([...items, newItem.trim()]))
-                  setNewItem('')
-                }
-              }}
-              placeholder="Add item..."
-              className="flex-1 px-2 py-1 text-xs border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
-            />
-            <button
-              onClick={() => {
-                if (newItem.trim()) {
-                  onChange(field.key, serializeArrayValue([...items, newItem.trim()]))
-                  setNewItem('')
-                }
-              }}
-              className="px-2 py-1 text-xs border rounded-md hover:bg-muted"
-            >
-              Add
-            </button>
-          </div>
-        )}
+        <div className="flex gap-1">
+          <input
+            type="text"
+            value={newItem}
+            onChange={e => setNewItem(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && newItem.trim()) {
+                e.preventDefault()
+                onChange(field.key, serializeArrayValue([...items, newItem.trim()]))
+                setNewItem('')
+              }
+            }}
+            placeholder="Add item..."
+            className="flex-1 px-2 py-1 text-xs border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
+          />
+          <button
+            onClick={() => {
+              if (newItem.trim()) {
+                onChange(field.key, serializeArrayValue([...items, newItem.trim()]))
+                setNewItem('')
+              }
+            }}
+            className="px-2 py-1 text-xs border rounded-md hover:bg-muted"
+          >
+            Add
+          </button>
+        </div>
       </div>
     )
   }
@@ -223,11 +229,7 @@ function FieldInput({
       type={field.isSecret ? 'password' : 'text'}
       value={displayValue}
       onChange={e => onChange(field.key, `"${e.target.value}"`)}
-      readOnly={readOnly}
-      tabIndex={readOnly ? -1 : undefined}
-      className={`w-full px-3 py-1.5 text-sm border rounded-md bg-background ${
-        readOnly ? 'text-muted-foreground cursor-default' : 'focus:outline-none focus:ring-2 focus:ring-primary/30'
-      }`}
+      className={`w-full px-3 py-1.5 text-sm border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 ${changedRing}`}
     />
   )
 }
@@ -268,14 +270,18 @@ function getMeta(key: string) {
 
 function SectionFormCard({
   section,
-  editing,
+  savedFieldMap,
   onChange,
 }: {
   section: TomlSection
-  editing: boolean
+  savedFieldMap: Record<string, string>
   onChange: (newLines: string[]) => void
 }) {
   const fields = parseFields(section.lines)
+  const hasChanges = fields.some(f => {
+    const savedValue = savedFieldMap[`${section.key}.${f.key}`]
+    return savedValue !== undefined && savedValue !== f.value
+  })
 
   const handleFieldChange = (key: string, newValue: string) => {
     const newLines = section.lines.map(line => {
@@ -289,12 +295,17 @@ function SectionFormCard({
   }
 
   return (
-    <Card className={editing ? 'ring-2 ring-primary/20' : ''}>
+    <Card className={hasChanges ? 'ring-2 ring-amber-400/40' : ''}>
       <CardHeader className="pb-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             {section.icon}
             <CardTitle className="text-base">{section.label}</CardTitle>
+            {hasChanges && (
+              <Badge variant="outline" className="text-[10px] text-amber-600 border-amber-300 bg-amber-50">
+                Modified
+              </Badge>
+            )}
           </div>
           <Badge variant="outline" className="text-xs font-mono">
             {section.key === '_top' ? 'root' : `[${section.key}]`}
@@ -307,28 +318,25 @@ function SectionFormCard({
       <CardContent>
         {fields.length > 0 ? (
           <div className="space-y-3">
-            {fields.map(field => (
-              <div key={field.key}>
-                <div className="flex items-center gap-2 mb-1">
-                  <label className="text-xs font-medium font-mono">{field.key}</label>
-                  {field.isSecret && (
-                    <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">secret</span>
+            {fields.map(field => {
+              const savedValue = savedFieldMap[`${section.key}.${field.key}`]
+              const fieldChanged = savedValue !== undefined && savedValue !== field.value
+              return (
+                <div key={field.key}>
+                  <div className="flex items-center gap-2 mb-1">
+                    <label className="text-xs font-medium font-mono">{field.key}</label>
+                    {field.isSecret && (
+                      <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">secret</span>
+                    )}
+                  </div>
+                  {field.comment && (
+                    <p className="text-[11px] text-muted-foreground mb-1">{field.comment}</p>
                   )}
+                  <FieldInput field={field} onChange={handleFieldChange} changed={fieldChanged} />
                 </div>
-                {field.comment && (
-                  <p className="text-[11px] text-muted-foreground mb-1">{field.comment}</p>
-                )}
-                <FieldInput field={field} onChange={handleFieldChange} readOnly={!editing} />
-              </div>
-            ))}
+              )
+            })}
           </div>
-        ) : editing ? (
-          <textarea
-            value={section.lines.join('\n')}
-            onChange={e => onChange(e.target.value.split('\n'))}
-            className="w-full font-mono text-xs bg-muted/50 border rounded-md p-3 min-h-[120px] resize-y focus:outline-none focus:ring-2 focus:ring-primary/30"
-            spellCheck={false}
-          />
         ) : (
           <p className="text-xs text-muted-foreground italic">Empty section</p>
         )}
@@ -344,9 +352,20 @@ export default function ConfigPage() {
   const [saveResult, setSaveResult] = useState<{ ok: boolean; message: string } | null>(null)
   const [mode, setMode] = useState<'sections' | 'raw'>('sections')
 
-  const isEditing = editContent !== null
-  const content = isEditing ? editContent : (data?.content ?? '')
+  const savedContent = data?.content ?? ''
+  const content = editContent ?? savedContent
   const sections = parseSections(content)
+  const hasUnsavedChanges = content !== savedContent
+
+  // Build a field map from the last-saved content for change detection
+  const savedFieldMap = useMemo(() => buildFieldMap(savedContent), [savedContent])
+
+  // Initialise edit state from server data on first load
+  useEffect(() => {
+    if (data?.content && editContent === null) {
+      setEditContent(data.content)
+    }
+  }, [data?.content])  // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (saveResult) {
@@ -362,7 +381,6 @@ export default function ConfigPage() {
     try {
       const result = await saveConfig(editContent)
       setSaveResult(result)
-      setEditContent(null)
       mutate()
     } catch (e: any) {
       const msg = e?.message || 'Unknown error'
@@ -378,12 +396,18 @@ export default function ConfigPage() {
     }
   }, [editContent, mutate])
 
+  const handleDiscard = useCallback(() => {
+    setEditContent(savedContent)
+    setSaveResult(null)
+  }, [savedContent])
+
   const handleSectionChange = useCallback((sectionIdx: number, newLines: string[]) => {
-    const allSections = parseSections(editContent ?? '')
+    const current = editContent ?? savedContent
+    const allSections = parseSections(current)
     allSections[sectionIdx] = { ...allSections[sectionIdx], lines: newLines }
     const rebuilt = allSections.map(s => s.lines.join('\n')).join('\n')
     setEditContent(rebuilt)
-  }, [editContent])
+  }, [editContent, savedContent])
 
   return (
     <div className="space-y-6">
@@ -396,6 +420,12 @@ export default function ConfigPage() {
             <FileText className="h-3.5 w-3.5" />
             <span className="font-mono">{data.path}</span>
           </div>
+        )}
+
+        {hasUnsavedChanges && (
+          <Badge variant="outline" className="text-xs text-amber-600 border-amber-300 bg-amber-50">
+            Unsaved changes
+          </Badge>
         )}
 
         <div className="flex-1" />
@@ -416,33 +446,22 @@ export default function ConfigPage() {
           </button>
         </div>
 
-        {!isEditing ? (
-          <button
-            onClick={() => setEditContent(data?.content ?? '')}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
-          >
-            <Pencil className="h-3.5 w-3.5" />
-            Edit
-          </button>
-        ) : (
-          <>
-            <button
-              onClick={() => { setEditContent(null); setSaveResult(null) }}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border hover:bg-muted transition-colors"
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              Discard
-            </button>
-            <button
-              onClick={handleSave}
-              disabled={saving}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-green-600 text-white hover:bg-green-700 disabled:opacity-50 transition-colors"
-            >
-              <Save className="h-3.5 w-3.5" />
-              {saving ? 'Saving...' : 'Save'}
-            </button>
-          </>
-        )}
+        <button
+          onClick={handleDiscard}
+          disabled={!hasUnsavedChanges}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border hover:bg-muted transition-colors disabled:opacity-40 disabled:pointer-events-none"
+        >
+          <RotateCcw className="h-3.5 w-3.5" />
+          Discard
+        </button>
+        <button
+          onClick={handleSave}
+          disabled={saving || !hasUnsavedChanges}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-green-600 text-white hover:bg-green-700 disabled:opacity-40 disabled:pointer-events-none transition-colors"
+        >
+          <Save className="h-3.5 w-3.5" />
+          {saving ? 'Saving...' : 'Save'}
+        </button>
       </div>
 
       {/* Save result toast */}
@@ -485,7 +504,7 @@ export default function ConfigPage() {
             <SectionFormCard
               key={section.key + '-' + idx}
               section={section}
-              editing={isEditing}
+              savedFieldMap={savedFieldMap}
               onChange={(newLines) => handleSectionChange(idx, newLines)}
             />
           ))}
@@ -502,18 +521,12 @@ export default function ConfigPage() {
             </div>
           </CardHeader>
           <CardContent>
-            {isEditing ? (
-              <textarea
-                value={editContent}
-                onChange={e => setEditContent(e.target.value)}
-                className="w-full font-mono text-xs bg-muted/50 border rounded-md p-4 min-h-[600px] resize-y focus:outline-none focus:ring-2 focus:ring-primary/30"
-                spellCheck={false}
-              />
-            ) : (
-              <pre className="text-xs font-mono text-muted-foreground bg-muted/30 rounded-md p-4 overflow-x-auto whitespace-pre max-h-[700px] overflow-y-auto">
-                {content || 'No content'}
-              </pre>
-            )}
+            <textarea
+              value={content}
+              onChange={e => setEditContent(e.target.value)}
+              className="w-full font-mono text-xs bg-muted/50 border rounded-md p-4 min-h-[600px] resize-y focus:outline-none focus:ring-2 focus:ring-primary/30"
+              spellCheck={false}
+            />
           </CardContent>
         </Card>
       )}

@@ -16,7 +16,7 @@ path = "src/lib.rs"
 tokio = { version = "1", features = ["full", "process", "signal"] }
 
 # HTTP server & client
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 reqwest = { version = "0.13", features = ["json", "form"] }
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
@@ -36,6 +36,7 @@ serde_json = "1"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+indicatif = "0.17"
 
 # Configuration
 toml = "0.8"

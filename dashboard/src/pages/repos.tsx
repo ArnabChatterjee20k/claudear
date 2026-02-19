@@ -1,12 +1,15 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import useSWR from 'swr'
 import {
   fetchRepos,
   fetchRepoStats,
   fetchDependencies,
+  getWsBase,
+  INDEXING_PROGRESS_WS_PATH,
   type StoredIndexedRepo,
   type IndexStats,
   type StoredDependency,
+  type IndexingProgress,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
 import { StatsCard } from '../components/shared/stats-card'
@@ -15,13 +18,100 @@ import { DataTable, type Column } from '../components/shared/data-table'
 import { Modal } from '../components/shared/modal'
 import { Tabs } from '../components/ui/tabs'
 import { Skeleton } from '../components/ui/skeleton'
+import { Card, CardContent } from '../components/ui/card'
 import { formatNumber, formatDate } from '../lib/formatters'
-import { Database, FileText, Clock, ExternalLink } from 'lucide-react'
+import { Database, FileText, Clock, ExternalLink, Loader2 } from 'lucide-react'
 
 const tabItems = [
   { value: 'repos', label: 'Repositories' },
   { value: 'deps', label: 'Dependencies' },
 ]
+
+function IndexingProgressBar({ progress }: { progress: IndexingProgress }) {
+  const pct =
+    progress.total_repos > 0
+      ? Math.round((progress.indexed_repos / progress.total_repos) * 100)
+      : 0
+
+  return (
+    <Card className="border-blue-200 bg-blue-50/50 dark:border-blue-900 dark:bg-blue-950/30">
+      <CardContent className="p-4 space-y-3">
+        <div className="flex items-center gap-2">
+          <Loader2 className="h-4 w-4 text-blue-500 animate-spin" />
+          <span className="text-sm font-medium">Indexing in progress</span>
+          <span className="text-sm text-muted-foreground ml-auto">
+            {progress.indexed_repos} / {progress.total_repos} repos ({pct}%)
+          </span>
+        </div>
+
+        <div className="h-2 bg-blue-100 dark:bg-blue-900/50 rounded-full overflow-hidden">
+          <div
+            className="h-full bg-blue-500 rounded-full transition-all duration-500 ease-out"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+
+        <div className="flex items-center justify-between text-xs text-muted-foreground">
+          {progress.current_repo && (
+            <span>
+              Current: <span className="font-mono font-medium text-foreground">{progress.current_repo}</span>
+              {progress.current_repo_files > 0 && (
+                <span className="ml-1">({formatNumber(progress.current_repo_files)} files)</span>
+              )}
+            </span>
+          )}
+          <span>{formatNumber(progress.total_files_indexed)} files indexed so far</span>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function useIndexingProgress() {
+  const [progress, setProgress] = useState<IndexingProgress | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>()
+  const mountedRef = useRef(true)
+  const lastStatusRef = useRef<string | null>(null)
+
+  const connect = useCallback(() => {
+    if (!mountedRef.current) return
+    const ws = new WebSocket(`${getWsBase()}${INDEXING_PROGRESS_WS_PATH}`)
+    wsRef.current = ws
+
+    ws.onmessage = (event) => {
+      try {
+        const data: IndexingProgress = JSON.parse(event.data)
+        lastStatusRef.current = data.status
+        setProgress(data)
+      } catch { /* ignore malformed messages */ }
+    }
+
+    ws.onclose = () => {
+      wsRef.current = null
+      if (!mountedRef.current) return
+      // Only reconnect if the last known status was "running" or we never
+      // received data (null). When idle, there is nothing to stream.
+      if (lastStatusRef.current === 'running' || lastStatusRef.current === null) {
+        reconnectTimer.current = setTimeout(connect, 3000)
+      }
+    }
+
+    ws.onerror = () => ws.close()
+  }, [])
+
+  useEffect(() => {
+    mountedRef.current = true
+    connect()
+    return () => {
+      mountedRef.current = false
+      clearTimeout(reconnectTimer.current)
+      wsRef.current?.close()
+    }
+  }, [connect])
+
+  return progress
+}
 
 export default function ReposPage() {
   const [selectedRepo, setSelectedRepo] = useState<StoredIndexedRepo | null>(null)
@@ -43,6 +133,10 @@ export default function ReposPage() {
     fetchDependencies,
     { refreshInterval: 60000 },
   )
+
+  const indexingProgress = useIndexingProgress()
+
+  const isIndexing = indexingProgress?.status === 'running'
 
   const repoColumns: Column<StoredIndexedRepo>[] = [
     {
@@ -116,6 +210,8 @@ export default function ReposPage() {
   return (
     <div className="space-y-6">
       <PageHeader title="Repositories" description="Repository index and dependencies" />
+
+      {isIndexing && <IndexingProgressBar progress={indexingProgress!} />}
 
       {statsLoading && (
         <div className="grid gap-4 md:grid-cols-3">

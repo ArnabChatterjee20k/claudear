@@ -18,8 +18,8 @@ use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
 use crate::scm::{PrReviewState, ReviewWatcher};
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
 use crate::types::{
-    validate_issue_id, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
-    QaKnowledgeEntry,
+    validate_issue_id, ActivityLogEntry, AskRequest, ErrorPattern, Issue, IssueEmbedding,
+    ProcessingMetric, QaKnowledgeEntry,
 };
 use crate::users::UserRegistry;
 use axum::{
@@ -590,6 +590,18 @@ async fn webhook_handler(
         );
     }
 
+    // Persist full issue content to the issues table (independent of embeddings)
+    if let Some(db) = state
+        .tracker
+        .as_any()
+        .downcast_ref::<crate::storage::SqliteTracker>()
+    {
+        let stored = IssueEmbedding::from_issue(&issue);
+        if let Err(e) = db.store_issue(&stored) {
+            tracing::debug!(error = %e, "Failed to store issue content");
+        }
+    }
+
     // Accept and process in background
     let short_id = issue.short_id.clone();
     let state_clone = Arc::clone(&state);
@@ -931,8 +943,8 @@ async fn process_issue(
                     .issue_embedding_service
                     .as_ref()
                     .and_then(|svc| svc.get_embedding(source_name, &issue.id).ok().flatten());
-                match issue_emb {
-                    Some(emb) => analyzer.enhance_prompt(&prompt, &issue, &emb.embedding),
+                match issue_emb.and_then(|emb| emb.embedding) {
+                    Some(ref emb) => analyzer.enhance_prompt(&prompt, &issue, emb),
                     None => prompt,
                 }
             };
@@ -1382,8 +1394,9 @@ async fn record_feedback_outcome_from_attempt(
             .issue_embedding_service
             .as_ref()
             .and_then(|svc| svc.get_embedding(source_name, &issue.id).ok().flatten())
+            .and_then(|existing| existing.embedding)
         {
-            Some(existing) => Some(existing.embedding),
+            Some(existing) => Some(existing),
             None => embedding_client.embed(&fix_outcome.issue_text).await.ok(),
         };
         if let Some(emb) = embedding {

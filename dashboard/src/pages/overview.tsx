@@ -5,6 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../co
 import { StatsCard } from '../components/shared/stats-card'
 import { StatusBadge } from '../components/shared/status-badge'
 import { getTimeAgo } from '../components/shared/time-ago'
+import { parseUTCDate } from '../lib/formatters'
 import { PageHeader } from '../components/layout/page-header'
 import {
   Activity,
@@ -239,7 +240,7 @@ function StatusCard({ status, count }: { status: string; count: number }) {
 }
 
 function AttemptRow({ attempt }: { attempt: AttemptSummary }) {
-  const date = new Date(attempt.attempted_at)
+  const date = parseUTCDate(attempt.attempted_at)
   const timeAgo = getTimeAgo(date)
 
   return (

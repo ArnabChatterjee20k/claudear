@@ -5,6 +5,7 @@ import {
   type AnalyticsSummary,
   type ProcessingMetric,
 } from '../lib/api'
+import { parseUTCDate } from '../lib/formatters'
 import { PageHeader } from '../components/layout/page-header'
 import { StatsCard } from '../components/shared/stats-card'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
@@ -34,7 +35,7 @@ export default function AnalyticsPage() {
   )
 
   const chartData = (metrics || []).map(m => ({
-    time: new Date(m.timestamp).toLocaleString(undefined, {
+    time: parseUTCDate(m.timestamp).toLocaleString(undefined, {
       month: 'short',
       day: 'numeric',
       hour: '2-digit',

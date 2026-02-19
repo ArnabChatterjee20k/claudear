@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { fetchUsers, createUser, updateUser, deleteUser, type UserRecord } from '../lib/api'
+import { parseUTCDate } from '../lib/formatters'
 import { useAuth } from '../lib/auth'
 import { Plus, Pencil, Trash2, X } from 'lucide-react'
 
@@ -86,7 +87,7 @@ export default function UsersPage() {
                       u.role === 'admin' ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'
                     }`}>{u.role}</span>
                   </td>
-                  <td className="p-3 text-muted-foreground">{new Date(u.created_at).toLocaleDateString()}</td>
+                  <td className="p-3 text-muted-foreground">{parseUTCDate(u.created_at).toLocaleDateString()}</td>
                   <td className="p-3 text-right space-x-1">
                     <button
                       onClick={() => { setEditingUser(u); setShowForm(true) }}

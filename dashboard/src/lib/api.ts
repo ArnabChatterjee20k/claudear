@@ -1,5 +1,11 @@
 const API_BASE = '/api';
 
+export function getWsBase(): string {
+  const loc = window.location;
+  const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${loc.host}`;
+}
+
 // ─── Existing types ──────────────────────────────────
 
 export interface Stats {
@@ -52,6 +58,29 @@ export interface Overview {
 
 export interface AttemptsResponse {
   attempts: AttemptSummary[];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
+export interface IssueSummary {
+  id: number;
+  source: string;
+  issue_id: string;
+  short_id: string | null;
+  title: string | null;
+  description: string | null;
+  url: string | null;
+  priority: string | null;
+  status: string | null;
+  labels: string[] | null;
+  has_embedding: boolean;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface IssuesResponse {
+  issues: IssueSummary[];
   total: number;
   page: number;
   per_page: number;
@@ -340,6 +369,17 @@ export interface StoredDependency {
   created_at: string;
 }
 
+export interface IndexingProgress {
+  status: string;
+  total_repos: number;
+  indexed_repos: number;
+  current_repo: string | null;
+  current_repo_files: number;
+  total_files_indexed: number;
+  started_at: string | null;
+  updated_at: string | null;
+}
+
 export interface InferenceStats {
   total_attempts: number;
   with_feedback: number;
@@ -606,6 +646,18 @@ export async function fetchAttempts(params?: {
   return fetchJson(`${API_BASE}/attempts?${searchParams}`);
 }
 
+export async function fetchIssues(params?: {
+  source?: string;
+  page?: number;
+  per_page?: number;
+}): Promise<IssuesResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.source) searchParams.set('source', params.source);
+  if (params?.page) searchParams.set('page', params.page.toString());
+  if (params?.per_page) searchParams.set('per_page', params.per_page.toString());
+  return fetchJson(`${API_BASE}/issues?${searchParams}`);
+}
+
 export async function getHealth(): Promise<Health> {
   return fetchJson(`${API_BASE}/health`);
 }
@@ -713,6 +765,8 @@ export async function fetchRepoStats(): Promise<IndexStats> {
 export async function fetchDependencies(): Promise<StoredDependency[]> {
   return fetchJson(`${API_BASE}/repos/dependencies`);
 }
+
+export const INDEXING_PROGRESS_WS_PATH = '/api/repos/indexing-progress';
 
 export async function fetchInferenceStats(): Promise<InferenceStats> {
   return fetchJson(`${API_BASE}/inference/stats`);

@@ -637,10 +637,9 @@ impl RepoInferrer {
     /// Sentry projects map 1:1 with top-level repos. This function tries to match
     /// a project name like "cloud-staging" or "console-production" to a repo.
     ///
-    /// Matching strategies:
-    /// 1. Exact match (project name == repo name after stripping org)
-    /// 2. Project name ends with repo name (e.g., "cloud-staging" matches "appwrite/cloud")
-    /// 3. Repo name ends with project name (e.g., "appwrite/cloud" matches "cloud")
+    /// Only performs exact matching (project name == repo simple name after stripping
+    /// environment suffixes). Fuzzy/substring matching is intentionally avoided to
+    /// prevent false positives (e.g., "cloud" matching "cloudevents").
     fn find_repo_by_project_name(&self, index: &RepoIndex, project: &str) -> Option<IndexedRepo> {
         // Normalize: strip environment suffixes like -staging, -production, etc.
         let suffixes = [
@@ -682,22 +681,6 @@ impl RepoInferrer {
                     normalized = %normalized,
                     repo = %repo.name,
                     "Matched project to repo by simple name"
-                );
-                return Some((*repo).clone());
-            }
-        }
-
-        // Try fuzzy match: check if normalized project name is contained in repo name
-        for repo in &repos {
-            let repo_lower = repo.name.to_lowercase();
-            if repo_lower.contains(&normalized)
-                || normalized.contains(repo_lower.split('/').next_back().unwrap_or(&repo_lower))
-            {
-                tracing::debug!(
-                    project = %project,
-                    normalized = %normalized,
-                    repo = %repo.name,
-                    "Matched project to repo by fuzzy match"
                 );
                 return Some((*repo).clone());
             }

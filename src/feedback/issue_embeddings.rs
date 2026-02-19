@@ -89,10 +89,19 @@ impl IssueEmbeddingService {
         // Generate embedding
         let embedding_vec = self.embedding_client.embed(&text).await?;
 
-        // Create embedding record
+        // Create embedding record with full issue content
         let mut embedding = IssueEmbedding::new(source, &issue.id, embedding_vec);
         embedding.short_id = Some(issue.short_id.clone());
         embedding.title = Some(issue.title.clone());
+        embedding.description = issue.description.clone();
+        embedding.url = Some(issue.url.clone());
+        embedding.priority = Some(issue.priority.to_string());
+        embedding.status = Some(issue.status.to_string());
+        embedding.updated_at = issue.updated_at;
+        let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
+        if !labels.is_empty() {
+            embedding.labels = serde_json::to_string(&labels).ok();
+        }
         embedding.embedding_model = Some(self.embedding_client.model().to_string());
         embedding.created_at = Utc::now();
 
@@ -133,6 +142,15 @@ impl IssueEmbeddingService {
             let mut embedding = IssueEmbedding::new(source, &issue.id, embedding_vec);
             embedding.short_id = Some(issue.short_id.clone());
             embedding.title = Some(issue.title.clone());
+            embedding.description = issue.description.clone();
+            embedding.url = Some(issue.url.clone());
+            embedding.priority = Some(issue.priority.to_string());
+            embedding.status = Some(issue.status.to_string());
+            embedding.updated_at = issue.updated_at;
+            let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
+            if !labels.is_empty() {
+                embedding.labels = serde_json::to_string(&labels).ok();
+            }
             embedding.embedding_model = Some(model_name.clone());
             embedding.created_at = now;
             results.push(embedding);

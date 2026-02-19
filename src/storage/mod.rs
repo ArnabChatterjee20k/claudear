@@ -8,8 +8,8 @@ pub use analytics::{
     classify_error, compute_error_hash, AnalyticsService, TimePeriod, TrendAnalysis, TrendDirection,
 };
 pub use sqlite::{
-    ConfidenceBreakdown, DiagnosticCounts, IndexStats, InferenceHistoryEntry, InferenceStats,
-    SqliteTracker, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
+    ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
+    InferenceStats, SqliteTracker, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
 };
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 
@@ -296,6 +296,27 @@ pub trait FixAttemptTracker: Send + Sync {
             file_count: 0,
             last_indexed_at: None,
         })
+    }
+
+    /// Get current indexing progress.
+    fn get_indexing_progress(&self) -> Result<IndexingProgress> {
+        Ok(IndexingProgress {
+            status: "idle".to_string(),
+            total_repos: 0,
+            indexed_repos: 0,
+            current_repo: None,
+            current_repo_files: 0,
+            total_files_indexed: 0,
+            started_at: None,
+            updated_at: None,
+        })
+    }
+
+    /// Subscribe to real-time indexing progress updates via a watch channel.
+    /// Default implementation returns a receiver that never changes (dead channel).
+    fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
+        let (_, rx) = tokio::sync::watch::channel(IndexingProgress::default());
+        rx
     }
 
     /// List all dependencies.

@@ -95,14 +95,17 @@ fn generate_session_token() -> String {
 /// held across await points since all trait methods are synchronous.
 pub struct SqliteTracker {
     conn: Mutex<Connection>,
+    indexing_tx: tokio::sync::watch::Sender<IndexingProgress>,
 }
 
 impl SqliteTracker {
     /// Create a new SQLite tracker with the given database path.
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(db_path)?;
+        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
             conn: Mutex::new(conn),
+            indexing_tx,
         };
         tracker.init()?;
         Ok(tracker)
@@ -111,11 +114,18 @@ impl SqliteTracker {
     /// Create an in-memory SQLite tracker (for testing).
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        let (indexing_tx, _) = tokio::sync::watch::channel(IndexingProgress::default());
         let tracker = Self {
             conn: Mutex::new(conn),
+            indexing_tx,
         };
         tracker.init()?;
         Ok(tracker)
+    }
+
+    /// Subscribe to real-time indexing progress updates.
+    pub fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
+        self.indexing_tx.subscribe()
     }
 
     /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
@@ -344,19 +354,25 @@ impl SqliteTracker {
             );
             CREATE INDEX IF NOT EXISTS idx_pr_review_comments_pr ON pr_review_comments(pr_url);
 
-            -- Issue embeddings - vector embeddings for similarity
-            CREATE TABLE IF NOT EXISTS issue_embeddings (
+            -- Issues - issue content and optional vector embeddings for similarity
+            CREATE TABLE IF NOT EXISTS issues (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source TEXT NOT NULL,
                 issue_id TEXT NOT NULL,
                 short_id TEXT,
                 title TEXT,
-                embedding BLOB NOT NULL,
+                description TEXT,
+                url TEXT,
+                priority TEXT DEFAULT 'none',
+                status TEXT DEFAULT 'open',
+                labels TEXT,
+                embedding BLOB,
                 embedding_model TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT,
                 UNIQUE(source, issue_id)
             );
-            CREATE INDEX IF NOT EXISTS idx_embeddings_source ON issue_embeddings(source);
+            CREATE INDEX IF NOT EXISTS idx_issues_source ON issues(source);
 
             -- Error patterns - recurring error analysis
             CREATE TABLE IF NOT EXISTS error_patterns (
@@ -874,6 +890,53 @@ impl SqliteTracker {
             }
         }
 
+        // Migrate issue_embeddings → issues (rename table + add content columns)
+        let issue_table_migrations: &[(&str, &str)] = &[
+            (
+                "issues (rename)",
+                "ALTER TABLE issue_embeddings RENAME TO issues",
+            ),
+            (
+                "issues.description",
+                "ALTER TABLE issues ADD COLUMN description TEXT",
+            ),
+            ("issues.url", "ALTER TABLE issues ADD COLUMN url TEXT"),
+            (
+                "issues.priority",
+                "ALTER TABLE issues ADD COLUMN priority TEXT DEFAULT 'none'",
+            ),
+            (
+                "issues.status",
+                "ALTER TABLE issues ADD COLUMN status TEXT DEFAULT 'open'",
+            ),
+            ("issues.labels", "ALTER TABLE issues ADD COLUMN labels TEXT"),
+            (
+                "issues.updated_at",
+                "ALTER TABLE issues ADD COLUMN updated_at TEXT",
+            ),
+        ];
+        for (migration_name, sql) in issue_table_migrations {
+            if let Err(e) = conn.execute(sql, []) {
+                let err_msg = e.to_string();
+                // Ignore expected errors: table already renamed (fresh DB) or column already exists
+                if !err_msg.contains("no such table: issue_embeddings")
+                    && !err_msg.contains("duplicate column name")
+                {
+                    tracing::error!(
+                        migration = migration_name,
+                        error = %e,
+                        "Failed to run issue table migration"
+                    );
+                }
+            }
+        }
+        // Ensure the index exists on the (possibly renamed) table
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_issues_source ON issues(source)",
+            [],
+        )
+        .ok();
+
         // Prioritisation engine tables
         conn.execute_batch(
             r#"
@@ -964,7 +1027,27 @@ impl SqliteTracker {
                 embedding BLOB NOT NULL,
                 embedding_model TEXT NOT NULL
             );
+
+            -- Indexing progress tracking (single row, upserted)
+            CREATE TABLE IF NOT EXISTS indexing_progress (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                status TEXT NOT NULL DEFAULT 'idle',
+                total_repos INTEGER NOT NULL DEFAULT 0,
+                indexed_repos INTEGER NOT NULL DEFAULT 0,
+                current_repo TEXT,
+                current_repo_files INTEGER NOT NULL DEFAULT 0,
+                total_files_indexed INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT OR IGNORE INTO indexing_progress (id) VALUES (1);
             "#,
+        )?;
+
+        // Reset any stuck "running" indexing progress rows from a previous crash
+        conn.execute(
+            "UPDATE indexing_progress SET status = 'idle' WHERE status = 'running'",
+            [],
         )?;
 
         // Update query planner statistics after schema creation
@@ -989,6 +1072,36 @@ impl SqliteTracker {
                 );
                 Utc::now()
             })
+    }
+
+    /// Parse an optional embedding BLOB from a row column.
+    fn parse_optional_embedding(
+        row: &rusqlite::Row<'_>,
+        col: usize,
+    ) -> std::result::Result<Option<Vec<f32>>, rusqlite::Error> {
+        let bytes: Option<Vec<u8>> = row.get(col)?;
+        match bytes {
+            None => Ok(None),
+            Some(b) if b.is_empty() => Ok(None),
+            Some(b) => {
+                if !b.len().is_multiple_of(4) {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        col,
+                        "embedding".to_string(),
+                        rusqlite::types::Type::Blob,
+                    ));
+                }
+                let embedding: Vec<f32> = b
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        let arr: [u8; 4] =
+                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
+                        f32::from_le_bytes(arr)
+                    })
+                    .collect();
+                Ok(Some(embedding))
+            }
+        }
     }
 
     fn parse_optional_datetime(s: Option<String>) -> Option<DateTime<Utc>> {
@@ -1242,7 +1355,7 @@ impl SqliteTracker {
                     r#"
                     INSERT INTO {table}(rowid, embedding)
                     SELECT id, embedding
-                    FROM issue_embeddings
+                    FROM issues
                     WHERE embedding IS NOT NULL
                       AND length(embedding) = ?1
                     "#,
@@ -2400,6 +2513,14 @@ impl FixAttemptTracker for SqliteTracker {
         SqliteTracker::get_index_stats(self)
     }
 
+    fn get_indexing_progress(&self) -> Result<IndexingProgress> {
+        SqliteTracker::get_indexing_progress(self)
+    }
+
+    fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
+        SqliteTracker::subscribe_indexing_progress(self)
+    }
+
     fn list_all_dependencies(&self) -> Result<Vec<StoredDependency>> {
         SqliteTracker::list_all_dependencies(self)
     }
@@ -3273,40 +3394,62 @@ impl SqliteTracker {
     pub fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
-        // Serialize the embedding vector to bytes (pre-allocated)
-        let mut embedding_bytes = Vec::with_capacity(embedding.embedding.len() * 4);
-        for f in &embedding.embedding {
-            embedding_bytes.extend_from_slice(&f.to_le_bytes());
-        }
+        // Serialize the embedding vector to bytes if present
+        let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|emb| {
+            let mut bytes = Vec::with_capacity(emb.len() * 4);
+            for f in emb {
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            bytes
+        });
+
+        let updated_at_str = embedding
+            .updated_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
 
         conn.execute(
             r#"
-            INSERT INTO issue_embeddings (source, issue_id, short_id, title, embedding, embedding_model, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO issues (source, issue_id, short_id, title, description, url, priority, status, labels, embedding, embedding_model, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(source, issue_id) DO UPDATE SET
-                embedding = excluded.embedding,
-                embedding_model = excluded.embedding_model,
-                created_at = excluded.created_at
+                short_id = COALESCE(excluded.short_id, short_id),
+                title = COALESCE(excluded.title, title),
+                description = COALESCE(excluded.description, description),
+                url = COALESCE(excluded.url, url),
+                priority = COALESCE(excluded.priority, priority),
+                status = COALESCE(excluded.status, status),
+                labels = COALESCE(excluded.labels, labels),
+                embedding = COALESCE(excluded.embedding, embedding),
+                embedding_model = COALESCE(excluded.embedding_model, embedding_model),
+                updated_at = COALESCE(excluded.updated_at, updated_at)
             "#,
             params![
                 embedding.source,
                 embedding.issue_id,
                 embedding.short_id,
                 embedding.title,
+                embedding.description,
+                embedding.url,
+                embedding.priority,
+                embedding.status,
+                embedding.labels,
                 embedding_bytes,
                 embedding.embedding_model,
                 embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                updated_at_str,
             ],
         )?;
 
         // Dual-write: upsert into HNSW vector table (get row ID reliably via SELECT)
         let row_id: i64 = conn.query_row(
-            "SELECT id FROM issue_embeddings WHERE source = ?1 AND issue_id = ?2",
+            "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
             params![embedding.source, embedding.issue_id],
             |row| row.get(0),
         )?;
-        if let Err(e) = Self::upsert_issue_vector_embedding(&conn, row_id, &embedding.embedding) {
-            tracing::debug!(error = %e, "Failed to upsert issue vector embedding");
+        if let Some(ref emb) = embedding.embedding {
+            if let Err(e) = Self::upsert_issue_vector_embedding(&conn, row_id, emb) {
+                tracing::debug!(error = %e, "Failed to upsert issue vector embedding");
+            }
         }
 
         Ok(row_id)
@@ -3326,41 +3469,61 @@ impl SqliteTracker {
         {
             let mut stmt = tx.prepare_cached(
                 r#"
-                INSERT INTO issue_embeddings (source, issue_id, short_id, title, embedding, embedding_model, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO issues (source, issue_id, short_id, title, description, url, priority, status, labels, embedding, embedding_model, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 ON CONFLICT(source, issue_id) DO UPDATE SET
-                    embedding = excluded.embedding,
-                    embedding_model = excluded.embedding_model,
-                    created_at = excluded.created_at
+                    short_id = COALESCE(excluded.short_id, short_id),
+                    title = COALESCE(excluded.title, title),
+                    description = COALESCE(excluded.description, description),
+                    url = COALESCE(excluded.url, url),
+                    priority = COALESCE(excluded.priority, priority),
+                    status = COALESCE(excluded.status, status),
+                    labels = COALESCE(excluded.labels, labels),
+                    embedding = COALESCE(excluded.embedding, embedding),
+                    embedding_model = COALESCE(excluded.embedding_model, embedding_model),
+                    updated_at = COALESCE(excluded.updated_at, updated_at)
                 "#,
             )?;
 
             for embedding in embeddings {
-                let mut embedding_bytes = Vec::with_capacity(embedding.embedding.len() * 4);
-                for f in &embedding.embedding {
-                    embedding_bytes.extend_from_slice(&f.to_le_bytes());
-                }
+                let embedding_bytes: Option<Vec<u8>> = embedding.embedding.as_ref().map(|emb| {
+                    let mut bytes = Vec::with_capacity(emb.len() * 4);
+                    for f in emb {
+                        bytes.extend_from_slice(&f.to_le_bytes());
+                    }
+                    bytes
+                });
+
+                let updated_at_str = embedding
+                    .updated_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
 
                 stmt.execute(params![
                     embedding.source,
                     embedding.issue_id,
                     embedding.short_id,
                     embedding.title,
+                    embedding.description,
+                    embedding.url,
+                    embedding.priority,
+                    embedding.status,
+                    embedding.labels,
                     embedding_bytes,
                     embedding.embedding_model,
                     embedding.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    updated_at_str,
                 ])?;
 
                 // Dual-write: upsert into HNSW vector table
                 let row_id: i64 = tx.query_row(
-                    "SELECT id FROM issue_embeddings WHERE source = ?1 AND issue_id = ?2",
+                    "SELECT id FROM issues WHERE source = ?1 AND issue_id = ?2",
                     params![embedding.source, embedding.issue_id],
                     |row| row.get(0),
                 )?;
-                if let Err(e) =
-                    Self::upsert_issue_vector_embedding(&tx, row_id, &embedding.embedding)
-                {
-                    tracing::debug!(error = %e, "Failed to upsert issue vector embedding in batch");
+                if let Some(ref emb) = embedding.embedding {
+                    if let Err(e) = Self::upsert_issue_vector_embedding(&tx, row_id, emb) {
+                        tracing::debug!(error = %e, "Failed to upsert issue vector embedding in batch");
+                    }
                 }
             }
         }
@@ -3374,30 +3537,18 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at
-            FROM issue_embeddings
+            SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                   description, url, priority, status, labels, updated_at
+            FROM issues
             WHERE source = ? AND issue_id = ?
             "#,
         )?;
 
         let result = stmt
             .query_row(params![source, issue_id], |row| {
-                let embedding_bytes: Vec<u8> = row.get(5)?;
-                if !embedding_bytes.len().is_multiple_of(4) {
-                    return Err(rusqlite::Error::InvalidColumnType(
-                        5,
-                        "embedding".to_string(),
-                        rusqlite::types::Type::Blob,
-                    ));
-                }
-                let embedding: Vec<f32> = embedding_bytes
-                    .chunks_exact(4)
-                    .map(|chunk| {
-                        let arr: [u8; 4] =
-                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                        f32::from_le_bytes(arr)
-                    })
-                    .collect();
+                let embedding = Self::parse_optional_embedding(row, 5)?;
+
+                let updated_at: Option<String> = row.get(13)?;
 
                 Ok(IssueEmbedding {
                     id: row.get(0)?,
@@ -3405,9 +3556,15 @@ impl SqliteTracker {
                     issue_id: row.get(2)?,
                     short_id: row.get(3)?,
                     title: row.get(4)?,
+                    description: row.get(8)?,
+                    url: row.get(9)?,
+                    priority: row.get(10)?,
+                    status: row.get(11)?,
+                    labels: row.get(12)?,
                     embedding,
                     embedding_model: row.get(6)?,
                     created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
+                    updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
                 })
             })
             .ok();
@@ -3441,8 +3598,9 @@ impl SqliteTracker {
         let query = match source {
             Some(_) => {
                 r#"
-                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at
-                FROM issue_embeddings
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                       description, url, priority, status, labels, updated_at
+                FROM issues
                 WHERE source = ?
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
@@ -3450,8 +3608,9 @@ impl SqliteTracker {
             }
             None => {
                 r#"
-                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at
-                FROM issue_embeddings
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                       description, url, priority, status, labels, updated_at
+                FROM issues
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
             "#
@@ -3461,24 +3620,8 @@ impl SqliteTracker {
         let mut stmt = conn.prepare(query)?;
 
         let row_mapper = |row: &rusqlite::Row<'_>| {
-            let embedding_bytes: Vec<u8> = row.get(5)?;
-
-            // Validate embedding data integrity: must be divisible by 4 (f32 = 4 bytes)
-            if !embedding_bytes.len().is_multiple_of(4) {
-                return Err(rusqlite::Error::InvalidColumnType(
-                    5,
-                    "embedding".to_string(),
-                    rusqlite::types::Type::Blob,
-                ));
-            }
-
-            let embedding: Vec<f32> = embedding_bytes
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let arr: [u8; 4] = chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                    f32::from_le_bytes(arr)
-                })
-                .collect();
+            let embedding = Self::parse_optional_embedding(row, 5)?;
+            let updated_at: Option<String> = row.get(13)?;
 
             Ok(IssueEmbedding {
                 id: row.get(0)?,
@@ -3486,9 +3629,15 @@ impl SqliteTracker {
                 issue_id: row.get(2)?,
                 short_id: row.get(3)?,
                 title: row.get(4)?,
+                description: row.get(8)?,
+                url: row.get(9)?,
+                priority: row.get(10)?,
+                status: row.get(11)?,
+                labels: row.get(12)?,
                 embedding,
                 embedding_model: row.get(6)?,
                 created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
+                updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
             })
         };
 
@@ -3500,6 +3649,89 @@ impl SqliteTracker {
         // Collect results, propagating any errors from corrupted embeddings
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| crate::error::Error::Storage(format!("Failed to read embeddings: {}", e)))
+    }
+
+    /// Store an issue (convenience wrapper around store_embedding).
+    pub fn store_issue(&self, issue: &IssueEmbedding) -> Result<i64> {
+        self.store_embedding(issue)
+    }
+
+    /// List issues with pagination, sorted by updated_at DESC, then created_at DESC.
+    pub fn list_issues(
+        &self,
+        source: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IssueEmbedding>> {
+        let conn = self.acquire_lock()?;
+
+        let query = match source {
+            Some(_) => {
+                r#"
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                       description, url, priority, status, labels, updated_at
+                FROM issues
+                WHERE source = ?
+                ORDER BY COALESCE(updated_at, created_at) DESC
+                LIMIT ? OFFSET ?
+                "#
+            }
+            None => {
+                r#"
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                       description, url, priority, status, labels, updated_at
+                FROM issues
+                ORDER BY COALESCE(updated_at, created_at) DESC
+                LIMIT ? OFFSET ?
+                "#
+            }
+        };
+
+        let mut stmt = conn.prepare(query)?;
+
+        let row_mapper = |row: &rusqlite::Row<'_>| {
+            let embedding = Self::parse_optional_embedding(row, 5)?;
+            let updated_at: Option<String> = row.get(13)?;
+
+            Ok(IssueEmbedding {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                issue_id: row.get(2)?,
+                short_id: row.get(3)?,
+                title: row.get(4)?,
+                description: row.get(8)?,
+                url: row.get(9)?,
+                priority: row.get(10)?,
+                status: row.get(11)?,
+                labels: row.get(12)?,
+                embedding,
+                embedding_model: row.get(6)?,
+                created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
+                updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
+            })
+        };
+
+        let rows = match source {
+            Some(s) => stmt.query_map(params![s, limit as i64, offset as i64], row_mapper)?,
+            None => stmt.query_map(params![limit as i64, offset as i64], row_mapper)?,
+        };
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::error::Error::Storage(format!("Failed to list issues: {}", e)))
+    }
+
+    /// Count issues, optionally filtered by source.
+    pub fn count_issues(&self, source: Option<&str>) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = match source {
+            Some(s) => conn.query_row(
+                "SELECT COUNT(*) FROM issues WHERE source = ?",
+                params![s],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?,
+        };
+        Ok(count as usize)
     }
 
     /// Find similar issue embeddings using the HNSW vector index.
@@ -3539,9 +3771,10 @@ impl SqliteTracker {
                 WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
             )
             SELECT e.id, e.source, e.issue_id, e.short_id, e.title, e.embedding,
-                   e.embedding_model, e.created_at, c.similarity
+                   e.embedding_model, e.created_at, c.similarity,
+                   e.description, e.url, e.priority, e.status, e.labels, e.updated_at
             FROM candidates c
-            JOIN issue_embeddings e ON e.id = c.emb_id
+            JOIN issues e ON e.id = c.emb_id
             WHERE e.source = ?4
               AND (?5 IS NULL OR e.issue_id != ?5)
               AND c.similarity >= ?6
@@ -3570,15 +3803,8 @@ impl SqliteTracker {
                 limit as i64
             ],
             |row| {
-                let embedding_bytes: Vec<u8> = row.get(5)?;
-                let embedding: Vec<f32> = embedding_bytes
-                    .chunks_exact(4)
-                    .map(|chunk| {
-                        let arr: [u8; 4] =
-                            chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-                        f32::from_le_bytes(arr)
-                    })
-                    .collect();
+                let embedding = Self::parse_optional_embedding(row, 5)?;
+                let updated_at: Option<String> = row.get(14)?;
 
                 let ie = IssueEmbedding {
                     id: row.get(0)?,
@@ -3586,9 +3812,15 @@ impl SqliteTracker {
                     issue_id: row.get(2)?,
                     short_id: row.get(3)?,
                     title: row.get(4)?,
+                    description: row.get(9)?,
+                    url: row.get(10)?,
+                    priority: row.get(11)?,
+                    status: row.get(12)?,
+                    labels: row.get(13)?,
                     embedding,
                     embedding_model: row.get(6)?,
                     created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
+                    updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
                 };
                 let similarity: f64 = row.get(8)?;
                 Ok((ie, similarity))
@@ -5334,6 +5566,170 @@ impl SqliteTracker {
         })
     }
 
+    /// Start indexing progress tracking.
+    pub fn start_indexing_progress(&self, total_repos: usize) -> Result<()> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE indexing_progress SET
+                status = 'running',
+                total_repos = ?1,
+                indexed_repos = 0,
+                current_repo = NULL,
+                current_repo_files = 0,
+                total_files_indexed = 0,
+                started_at = ?2,
+                updated_at = ?2
+            WHERE id = 1
+            "#,
+            params![total_repos as i64, &now],
+        )?;
+        drop(conn);
+        let new_value = IndexingProgress {
+            status: "running".to_string(),
+            total_repos,
+            started_at: Some(now.clone()),
+            updated_at: Some(now),
+            ..Default::default()
+        };
+        self.indexing_tx.send_if_modified(|current| {
+            if *current != new_value {
+                *current = new_value;
+                true
+            } else {
+                false
+            }
+        });
+        Ok(())
+    }
+
+    /// Update indexing progress for a specific repo.
+    pub fn update_indexing_progress(
+        &self,
+        indexed_repos: usize,
+        current_repo: &str,
+        current_repo_files: usize,
+        total_files_indexed: usize,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let conn = self.acquire_lock()?;
+        // Read total_repos and started_at from DB (avoid borrowing the watch channel
+        // while the conn lock is held).
+        let (db_total_repos, db_started_at): (i64, Option<String>) = conn.query_row(
+            "SELECT total_repos, started_at FROM indexing_progress WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        conn.execute(
+            r#"
+            UPDATE indexing_progress SET
+                indexed_repos = ?1,
+                current_repo = ?2,
+                current_repo_files = ?3,
+                total_files_indexed = ?4,
+                updated_at = ?5
+            WHERE id = 1
+            "#,
+            params![
+                indexed_repos as i64,
+                current_repo,
+                current_repo_files as i64,
+                total_files_indexed as i64,
+                &now,
+            ],
+        )?;
+        drop(conn);
+        let new_value = IndexingProgress {
+            status: "running".to_string(),
+            total_repos: db_total_repos as usize,
+            indexed_repos,
+            current_repo: Some(current_repo.to_string()),
+            current_repo_files,
+            total_files_indexed,
+            started_at: db_started_at,
+            updated_at: Some(now),
+        };
+        self.indexing_tx.send_if_modified(|current| {
+            if *current != new_value {
+                *current = new_value;
+                true
+            } else {
+                false
+            }
+        });
+        Ok(())
+    }
+
+    /// Mark indexing as complete.
+    pub fn finish_indexing_progress(&self) -> Result<()> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let conn = self.acquire_lock()?;
+        // Read values from DB before the UPDATE (avoid borrowing the watch channel
+        // while the conn lock is held).
+        let (db_total_repos, db_indexed_repos, db_total_files_indexed): (i64, i64, i64) =
+            conn.query_row(
+                "SELECT total_repos, indexed_repos, total_files_indexed FROM indexing_progress WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        conn.execute(
+            r#"
+            UPDATE indexing_progress SET
+                status = 'idle',
+                current_repo = NULL,
+                started_at = NULL,
+                updated_at = ?1
+            WHERE id = 1
+            "#,
+            params![&now],
+        )?;
+        drop(conn);
+        let new_value = IndexingProgress {
+            status: "idle".to_string(),
+            total_repos: db_total_repos as usize,
+            indexed_repos: db_indexed_repos as usize,
+            total_files_indexed: db_total_files_indexed as usize,
+            updated_at: Some(now),
+            ..Default::default()
+        };
+        self.indexing_tx.send_if_modified(|current| {
+            if *current != new_value {
+                *current = new_value;
+                true
+            } else {
+                false
+            }
+        });
+        Ok(())
+    }
+
+    /// Get current indexing progress.
+    pub fn get_indexing_progress(&self) -> Result<IndexingProgress> {
+        let conn = self.acquire_lock()?;
+        let row = conn.query_row(
+            r#"
+            SELECT status, total_repos, indexed_repos, current_repo,
+                   current_repo_files, total_files_indexed, started_at, updated_at
+            FROM indexing_progress WHERE id = 1
+            "#,
+            [],
+            |row| {
+                Ok(IndexingProgress {
+                    status: row.get(0)?,
+                    total_repos: row.get::<_, i64>(1)? as usize,
+                    indexed_repos: row.get::<_, i64>(2)? as usize,
+                    current_repo: row.get(3)?,
+                    current_repo_files: row.get::<_, i64>(4)? as usize,
+                    total_files_indexed: row.get::<_, i64>(5)? as usize,
+                    started_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            },
+        )?;
+        Ok(row)
+    }
+
     /// Record an inference attempt.
     #[allow(clippy::too_many_arguments)]
     pub fn record_inference_attempt(
@@ -5540,10 +5936,7 @@ impl SqliteTracker {
                 row.get(0)
             })?;
 
-        let issue_embeddings: i64 =
-            conn.query_row("SELECT COUNT(*) FROM issue_embeddings", [], |row| {
-                row.get(0)
-            })?;
+        let issues: i64 = conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?;
 
         let similar_issues: i64 =
             conn.query_row("SELECT COUNT(*) FROM similar_issues", [], |row| row.get(0))?;
@@ -5597,7 +5990,7 @@ impl SqliteTracker {
             claude_executions,
             pr_reviews,
             pr_review_states,
-            issue_embeddings,
+            issues,
             similar_issues,
             repositories,
             repo_files,
@@ -6563,6 +6956,34 @@ pub struct IndexStats {
     pub last_indexed_at: Option<String>,
 }
 
+/// Current indexing progress.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IndexingProgress {
+    pub status: String,
+    pub total_repos: usize,
+    pub indexed_repos: usize,
+    pub current_repo: Option<String>,
+    pub current_repo_files: usize,
+    pub total_files_indexed: usize,
+    pub started_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl Default for IndexingProgress {
+    fn default() -> Self {
+        Self {
+            status: "idle".to_string(),
+            total_repos: 0,
+            indexed_repos: 0,
+            current_repo: None,
+            current_repo_files: 0,
+            total_files_indexed: 0,
+            started_at: None,
+            updated_at: None,
+        }
+    }
+}
+
 /// Inference statistics.
 #[derive(Debug, Clone, Serialize)]
 pub struct InferenceStats {
@@ -6655,7 +7076,7 @@ pub struct DiagnosticCounts {
     pub claude_executions: i64,
     pub pr_reviews: i64,
     pub pr_review_states: i64,
-    pub issue_embeddings: i64,
+    pub issues: i64,
     pub similar_issues: i64,
     pub repositories: i64,
     pub repo_files: i64,
@@ -10145,9 +10566,15 @@ mod tests {
             issue_id: "emb-1".to_string(),
             short_id: Some("LIN-1".to_string()),
             title: Some("Fix login bug".to_string()),
-            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            embedding: Some(vec![0.1, 0.2, 0.3, 0.4]),
             embedding_model: Some("text-embedding-3-small".to_string()),
             created_at: Utc::now(),
+            updated_at: None,
         };
 
         let id = tracker.store_embedding(&embedding).unwrap();
@@ -10158,9 +10585,10 @@ mod tests {
         assert_eq!(retrieved.issue_id, "emb-1");
         assert_eq!(retrieved.short_id, Some("LIN-1".to_string()));
         assert_eq!(retrieved.title, Some("Fix login bug".to_string()));
-        assert_eq!(retrieved.embedding.len(), 4);
-        assert!((retrieved.embedding[0] - 0.1).abs() < f32::EPSILON);
-        assert!((retrieved.embedding[3] - 0.4).abs() < f32::EPSILON);
+        let emb = retrieved.embedding.unwrap();
+        assert_eq!(emb.len(), 4);
+        assert!((emb[0] - 0.1).abs() < f32::EPSILON);
+        assert!((emb[3] - 0.4).abs() < f32::EPSILON);
         assert_eq!(
             retrieved.embedding_model,
             Some("text-embedding-3-small".to_string())
@@ -10176,9 +10604,15 @@ mod tests {
             issue_id: "emb-1".to_string(),
             short_id: Some("LIN-1".to_string()),
             title: Some("Original title".to_string()),
-            embedding: vec![1.0, 2.0],
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            embedding: Some(vec![1.0, 2.0]),
             embedding_model: Some("model-v1".to_string()),
             created_at: Utc::now(),
+            updated_at: None,
         };
         tracker.store_embedding(&original).unwrap();
 
@@ -10188,15 +10622,22 @@ mod tests {
             issue_id: "emb-1".to_string(),
             short_id: Some("LIN-1".to_string()),
             title: Some("Original title".to_string()),
-            embedding: vec![3.0, 4.0, 5.0],
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            embedding: Some(vec![3.0, 4.0, 5.0]),
             embedding_model: Some("model-v2".to_string()),
             created_at: Utc::now(),
+            updated_at: None,
         };
         tracker.store_embedding(&updated).unwrap();
 
         let retrieved = tracker.get_embedding("linear", "emb-1").unwrap().unwrap();
-        assert_eq!(retrieved.embedding.len(), 3);
-        assert!((retrieved.embedding[0] - 3.0).abs() < f32::EPSILON);
+        let emb = retrieved.embedding.unwrap();
+        assert_eq!(emb.len(), 3);
+        assert!((emb[0] - 3.0).abs() < f32::EPSILON);
         assert_eq!(retrieved.embedding_model, Some("model-v2".to_string()));
     }
 
@@ -10217,9 +10658,15 @@ mod tests {
                 issue_id: format!("emb-{}", i),
                 short_id: None,
                 title: None,
-                embedding: vec![i as f32],
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                embedding: Some(vec![i as f32]),
                 embedding_model: None,
                 created_at: Utc::now(),
+                updated_at: None,
             };
             tracker.store_embedding(&emb).unwrap();
         }
@@ -10245,9 +10692,15 @@ mod tests {
                 issue_id: format!("emb-{}", i),
                 short_id: None,
                 title: None,
-                embedding: vec![1.0],
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                embedding: Some(vec![1.0]),
                 embedding_model: None,
                 created_at: Utc::now(),
+                updated_at: None,
             };
             tracker.store_embedding(&emb).unwrap();
         }

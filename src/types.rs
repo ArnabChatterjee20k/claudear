@@ -871,12 +871,24 @@ pub struct IssueEmbedding {
     pub short_id: Option<String>,
     /// Issue title.
     pub title: Option<String>,
-    /// The embedding vector (serialized float32).
-    pub embedding: Vec<f32>,
+    /// Issue description or error message.
+    pub description: Option<String>,
+    /// URL to view the issue in its source.
+    pub url: Option<String>,
+    /// Priority level (none, low, medium, high, critical).
+    pub priority: Option<String>,
+    /// Current status (open, in_progress, resolved, ignored).
+    pub status: Option<String>,
+    /// Labels as JSON array text.
+    pub labels: Option<String>,
+    /// The embedding vector (serialized float32). None if issue stored without embedding.
+    pub embedding: Option<Vec<f32>>,
     /// Model used to generate the embedding.
     pub embedding_model: Option<String>,
     /// When the embedding was created.
     pub created_at: DateTime<Utc>,
+    /// When the issue was last updated.
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 impl IssueEmbedding {
@@ -892,9 +904,41 @@ impl IssueEmbedding {
             issue_id: issue_id.into(),
             short_id: None,
             title: None,
-            embedding,
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            embedding: Some(embedding),
             embedding_model: None,
             created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+
+    /// Create an IssueEmbedding from an Issue, storing content fields without an embedding.
+    pub fn from_issue(issue: &Issue) -> Self {
+        let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
+        let labels_json = if labels.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&labels).ok()
+        };
+        Self {
+            id: 0,
+            source: issue.source.clone(),
+            issue_id: issue.id.clone(),
+            short_id: Some(issue.short_id.clone()),
+            title: Some(issue.title.clone()),
+            description: issue.description.clone(),
+            url: Some(issue.url.clone()),
+            priority: Some(issue.priority.to_string()),
+            status: Some(issue.status.to_string()),
+            labels: labels_json,
+            embedding: None,
+            embedding_model: None,
+            created_at: issue.created_at.unwrap_or_else(Utc::now),
+            updated_at: issue.updated_at,
         }
     }
 }
@@ -3322,7 +3366,7 @@ mod tests {
     #[test]
     fn test_issue_embedding_empty_vector() {
         let e = IssueEmbedding::new("s", "i", vec![]);
-        assert!(e.embedding.is_empty());
+        assert!(e.embedding.as_ref().unwrap().is_empty());
     }
 
     #[test]

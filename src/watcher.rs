@@ -21,7 +21,8 @@ use crate::source::IssueSource;
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
 use crate::types::{
     ActivityLogEntry, AskRequest, ErrorPattern, FixAttemptStats, FixAttemptStatus, Issue,
-    IssueType, MatchPriority, MatchResult, ProcessingMetric, QaKnowledgeEntry, RegressionWatch,
+    IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric, QaKnowledgeEntry,
+    RegressionWatch,
 };
 use crate::users::UserRegistry;
 use chrono::Utc;
@@ -2209,6 +2210,14 @@ Create a PR with your changes."#,
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
 
+        // Persist full issue content to the issues table (independent of embeddings)
+        if let Some(ref sqlite) = self.sqlite_tracker {
+            let stored = IssueEmbedding::from_issue(&issue);
+            if let Err(e) = sqlite.store_issue(&stored) {
+                tracing::debug!(error = %e, "Failed to store issue content");
+            }
+        }
+
         // Infer the target repository using the shared resolution function
         let resolution =
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, self.sqlite_tracker.as_ref());
@@ -2623,8 +2632,8 @@ Create a PR with your changes."#,
                         .issue_embedding_service
                         .as_ref()
                         .and_then(|svc| svc.get_embedding(source.name(), &issue.id).ok().flatten());
-                    match issue_emb {
-                        Some(emb) => analyzer.enhance_prompt(&prompt, &issue, &emb.embedding),
+                    match issue_emb.and_then(|emb| emb.embedding) {
+                        Some(ref emb) => analyzer.enhance_prompt(&prompt, &issue, emb),
                         None => prompt,
                     }
                 };
@@ -3235,8 +3244,9 @@ Create a PR with your changes."#,
                 .issue_embedding_service
                 .as_ref()
                 .and_then(|svc| svc.get_embedding(&attempt.source, &issue.id).ok().flatten())
+                .and_then(|existing| existing.embedding)
             {
-                Some(existing) => Some(existing.embedding),
+                Some(existing) => Some(existing),
                 None => embedding_client.embed(&fix_outcome.issue_text).await.ok(),
             };
             if let Some(emb) = embedding {

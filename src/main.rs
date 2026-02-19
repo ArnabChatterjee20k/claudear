@@ -1093,6 +1093,17 @@ async fn main() -> anyhow::Result<()> {
     if let Commands::Repos(ref repos_cmd) = cli.command {
         let db_tracker = SqliteTracker::new(&config.db_path)?;
 
+        /// Guard that calls `finish_indexing_progress` on drop so error paths
+        /// (via `?`) never leave the DB stuck in "running" status.
+        struct IndexingGuard<'a> {
+            tracker: &'a SqliteTracker,
+        }
+        impl<'a> Drop for IndexingGuard<'a> {
+            fn drop(&mut self) {
+                let _ = self.tracker.finish_indexing_progress();
+            }
+        }
+
         match repos_cmd {
             ReposCommands::List => {
                 // First show indexed repos from the database
@@ -1123,6 +1134,9 @@ async fn main() -> anyhow::Result<()> {
             }
 
             ReposCommands::Index { force } => {
+                use claudear::DependencyDiscovery;
+                use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
                 println!("\nBuilding repository index...");
                 println!("  Known orgs: {:?}", config.known_orgs);
                 println!("  Scanning: {:?}", config.auto_discover_paths);
@@ -1140,20 +1154,75 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                println!("\nDiscovered {} repositories:", index.len());
+                let repos = index.list();
+                let total_repos = repos.len();
 
-                // Save to database
+                // Track progress in DB for dashboard
+                let _ = db_tracker.start_indexing_progress(total_repos);
+                let _indexing_guard = IndexingGuard {
+                    tracker: &db_tracker,
+                };
+
+                let multi = MultiProgress::new();
+
+                // Overall progress bar
+                let overall_style = ProgressStyle::with_template(
+                    "{prefix:.bold} [{bar:40.cyan/dim}] {pos}/{len} repos ({msg})",
+                )
+                .unwrap()
+                .progress_chars("=> ");
+                let overall_pb = multi.add(ProgressBar::new(total_repos as u64));
+                overall_pb.set_style(overall_style);
+                overall_pb.set_prefix("Indexing");
+
+                // Current repo progress bar
+                let repo_style = ProgressStyle::with_template(
+                    "  {prefix:.dim} [{bar:35.green/dim}] {pos}/{len} files",
+                )
+                .unwrap()
+                .progress_chars("=> ");
+                let repo_pb = multi.add(ProgressBar::new(0));
+                repo_pb.set_style(repo_style);
+
                 let mut saved_count = 0;
-                for repo in index.list() {
+                let mut skipped_count = 0;
+                let mut total_files_saved: usize = 0;
+
+                for repo in &repos {
                     // Check if already indexed (skip unless force)
                     if !force {
                         if let Ok(Some(_)) = db_tracker.get_indexed_repo(&repo.name) {
-                            println!("  {} - skipped (already indexed)", repo.name);
+                            skipped_count += 1;
+                            overall_pb.inc(1);
+                            overall_pb.set_message(format!(
+                                "{} saved, {} skipped",
+                                saved_count, skipped_count
+                            ));
+                            // Notify dashboard so progress bar doesn't jump
+                            let _ = db_tracker.update_indexing_progress(
+                                saved_count + skipped_count,
+                                &repo.name,
+                                0,
+                                total_files_saved,
+                            );
                             continue;
                         }
                     }
 
-                    // Save repo and its files
+                    // Update current repo progress
+                    repo_pb.set_length(repo.files.len() as u64);
+                    repo_pb.set_position(0);
+                    repo_pb.set_prefix(repo.name.clone());
+
+                    // Update dashboard progress
+                    let _ = db_tracker.update_indexing_progress(
+                        saved_count + skipped_count,
+                        &repo.name,
+                        repo.files.len(),
+                        total_files_saved,
+                    );
+
+                    // Save repo metadata
                     let repo_id = db_tracker.save_indexed_repo(
                         &repo.name,
                         &repo.path.to_string_lossy(),
@@ -1177,14 +1246,69 @@ async fn main() -> anyhow::Result<()> {
                     // Save file index
                     db_tracker.save_repo_files(repo_id, &files_with_types)?;
 
-                    println!("  {} - {} files indexed", repo.name, repo.files.len());
+                    total_files_saved += repo.files.len();
+                    repo_pb.set_position(repo.files.len() as u64);
+
                     saved_count += 1;
+                    overall_pb.inc(1);
+                    overall_pb
+                        .set_message(format!("{} saved, {} skipped", saved_count, skipped_count));
                 }
 
+                repo_pb.finish_and_clear();
+                overall_pb.finish_with_message(format!(
+                    "{} saved, {} skipped, {} total files",
+                    saved_count, skipped_count, total_files_saved
+                ));
+
                 println!(
-                    "\nIndexed {} repositories to {:?}",
-                    saved_count, config.db_path
+                    "\nIndexed {} repositories ({} files) to {:?}",
+                    saved_count, total_files_saved, config.db_path
                 );
+
+                // Auto-discover dependencies between indexed repos
+                let dep_pb = multi.add(ProgressBar::new_spinner());
+                dep_pb.set_style(
+                    ProgressStyle::with_template("{spinner:.blue} {msg}")
+                        .unwrap()
+                        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+                );
+                dep_pb.set_message("Discovering dependencies...");
+                dep_pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+                let discovery = DependencyDiscovery::new(config.known_orgs.clone());
+                match discovery.scan_directories(&config.auto_discover_paths) {
+                    Ok(discovered) if !discovered.is_empty() => {
+                        let mut dep_count = 0;
+                        for dep in &discovered {
+                            if let Err(e) =
+                                db_tracker.add_dependency(&dep.depends_on, &dep.repo, &dep.dep_type)
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    upstream = %dep.depends_on,
+                                    downstream = %dep.repo,
+                                    "Failed to save dependency"
+                                );
+                            } else {
+                                dep_count += 1;
+                            }
+                        }
+                        dep_pb.finish_with_message(format!(
+                            "Discovered and saved {} dependencies",
+                            dep_count
+                        ));
+                    }
+                    Ok(_) => {
+                        dep_pb.finish_with_message("No dependencies found between indexed repos.")
+                    }
+                    Err(e) => dep_pb.finish_with_message(format!(
+                        "Warning: dependency discovery failed: {}",
+                        e
+                    )),
+                }
+
+                // Guard will call finish_indexing_progress() on drop
             }
 
             ReposCommands::Search { query } => {
@@ -1578,7 +1702,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("  claude_executions:  {}", counts.claude_executions);
                 println!("  pr_reviews:         {}", counts.pr_reviews);
                 println!("  pr_review_states:   {}", counts.pr_review_states);
-                println!("  issue_embeddings:   {}", counts.issue_embeddings);
+                println!("  issues:             {}", counts.issues);
                 println!("  similar_issues:     {}", counts.similar_issues);
                 println!("  repositories:       {}", counts.repositories);
                 println!("  repo_files:         {}", counts.repo_files);

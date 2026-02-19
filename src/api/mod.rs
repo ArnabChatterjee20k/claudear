@@ -102,10 +102,14 @@ impl ApiServer {
             ])
             .allow_credentials(true);
 
+        // Subscribe to indexing progress from the tracker's watch channel
+        let indexing_rx = self.tracker.subscribe_indexing_progress();
+
         let app = create_api_router_with_dashboard(
             self.config.clone(),
             self.tracker.clone(),
             self.config_path,
+            indexing_rx,
             self.dashboard_dir.clone(),
         )
         .layer(cors)

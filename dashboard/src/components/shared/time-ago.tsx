@@ -1,4 +1,4 @@
-import { formatDate } from '../../lib/formatters'
+import { formatDate, parseUTCDate } from '../../lib/formatters'
 
 export function getTimeAgo(date: Date): string {
   const seconds = Math.floor((new Date().getTime() - date.getTime()) / 1000)
@@ -9,7 +9,7 @@ export function getTimeAgo(date: Date): string {
 }
 
 export function TimeAgo({ date }: { date: string | Date }) {
-  const d = typeof date === 'string' ? new Date(date) : date
+  const d = typeof date === 'string' ? parseUTCDate(date) : date
   return (
     <span className="text-sm text-muted-foreground" title={formatDate(d)}>
       {getTimeAgo(d)}

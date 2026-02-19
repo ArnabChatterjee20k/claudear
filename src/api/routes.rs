@@ -6,8 +6,12 @@ use crate::retry::RetryManager;
 use crate::storage::{FixAttemptTracker, SqliteTracker};
 use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, RegressionWatchStatus};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket},
+        Path, Query, State, WebSocketUpgrade,
+    },
     http::StatusCode,
+    response::IntoResponse,
     routing::get,
     Json, Router,
 };
@@ -28,6 +32,8 @@ pub struct ApiState {
     pub start_time: Instant,
     /// Path to the config file on disk (for read/write from dashboard).
     pub config_path: PathBuf,
+    /// Watch channel for real-time indexing progress pushed from SQLite hooks.
+    pub indexing_rx: tokio::sync::watch::Receiver<crate::storage::IndexingProgress>,
 }
 
 /// Create the API router.
@@ -35,8 +41,9 @@ pub fn create_api_router(
     config: Config,
     tracker: Arc<dyn FixAttemptTracker>,
     config_path: PathBuf,
+    indexing_rx: tokio::sync::watch::Receiver<crate::storage::IndexingProgress>,
 ) -> Router {
-    create_api_router_with_dashboard(config, tracker, config_path, None)
+    create_api_router_with_dashboard(config, tracker, config_path, indexing_rx, None)
 }
 
 /// Create the API router with optional dashboard static file serving.
@@ -44,6 +51,7 @@ pub fn create_api_router_with_dashboard(
     config: Config,
     tracker: Arc<dyn FixAttemptTracker>,
     config_path: PathBuf,
+    indexing_rx: tokio::sync::watch::Receiver<crate::storage::IndexingProgress>,
     dashboard_dir: Option<PathBuf>,
 ) -> Router {
     let state = ApiState {
@@ -51,6 +59,7 @@ pub fn create_api_router_with_dashboard(
         tracker,
         start_time: Instant::now(),
         config_path,
+        indexing_rx,
     };
 
     let api_routes = Router::new()
@@ -73,6 +82,7 @@ pub fn create_api_router_with_dashboard(
         .route("/api/analytics/summary", get(analytics_summary_handler))
         .route("/api/metrics", get(metrics_handler))
         .route("/api/errors", get(errors_handler))
+        .route("/api/issues", get(issues_handler))
         .route("/api/prs", get(prs_handler))
         .route("/api/prs/analytics", get(pr_analytics_handler))
         .route("/api/feedback", get(feedback_handler))
@@ -84,6 +94,10 @@ pub fn create_api_router_with_dashboard(
         .route("/api/experiments", get(experiments_handler))
         .route("/api/repos", get(repos_handler))
         .route("/api/repos/stats", get(repo_stats_handler))
+        .route(
+            "/api/repos/indexing-progress",
+            get(indexing_progress_handler),
+        )
         .route("/api/repos/dependencies", get(dependencies_handler))
         .route("/api/inference/stats", get(inference_stats_handler))
         .route("/api/inference/history", get(inference_history_handler))
@@ -718,6 +732,38 @@ struct ErrorsQuery {
 }
 
 #[derive(Deserialize)]
+struct IssuesQuery {
+    source: Option<String>,
+    page: Option<usize>,
+    per_page: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct IssueSummary {
+    id: i64,
+    source: String,
+    issue_id: String,
+    short_id: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    url: Option<String>,
+    priority: Option<String>,
+    status: Option<String>,
+    labels: Option<Vec<String>>,
+    has_embedding: bool,
+    created_at: String,
+    updated_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct IssuesResponse {
+    issues: Vec<IssueSummary>,
+    total: usize,
+    page: usize,
+    per_page: usize,
+}
+
+#[derive(Deserialize)]
 struct PrsQuery {
     status: Option<String>,
     limit: Option<usize>,
@@ -1143,6 +1189,64 @@ async fn errors_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn issues_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+    Query(query): Query<IssuesQuery>,
+) -> Result<Json<IssuesResponse>, StatusCode> {
+    let db = state
+        .tracker
+        .as_any()
+        .downcast_ref::<SqliteTracker>()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(100).min(500);
+    let offset = (page - 1) * per_page;
+
+    let total = db
+        .count_issues(query.source.as_deref())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let rows = db
+        .list_issues(query.source.as_deref(), per_page, offset)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let issues: Vec<IssueSummary> = rows
+        .into_iter()
+        .map(|ie| {
+            let labels: Option<Vec<String>> = ie
+                .labels
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
+            IssueSummary {
+                id: ie.id,
+                source: ie.source,
+                issue_id: ie.issue_id,
+                short_id: ie.short_id,
+                title: ie.title,
+                description: ie.description,
+                url: ie.url,
+                priority: ie.priority,
+                status: ie.status,
+                labels,
+                has_embedding: ie.embedding.is_some(),
+                created_at: ie.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                updated_at: ie
+                    .updated_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+            }
+        })
+        .collect();
+
+    Ok(Json(IssuesResponse {
+        issues,
+        total,
+        page,
+        per_page,
+    }))
+}
+
 async fn prs_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
@@ -1259,6 +1363,72 @@ async fn dependencies_handler(
         .list_all_dependencies()
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn indexing_progress_handler(
+    _user: AuthUser,
+    ws: WebSocketUpgrade,
+    State(state): State<ApiState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| indexing_progress_ws(socket, state.indexing_rx))
+}
+
+async fn indexing_progress_ws(
+    mut socket: WebSocket,
+    mut rx: tokio::sync::watch::Receiver<crate::storage::IndexingProgress>,
+) {
+    // Send current state immediately on connect
+    {
+        let progress = rx.borrow_and_update().clone();
+        if let Ok(json) = serde_json::to_string(&progress) {
+            if socket.send(Message::Text(json.into())).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    // The first tick fires immediately; consume it so we don't send a spurious ping.
+    ping_interval.tick().await;
+
+    // Wait for changes pushed from SQLite write hooks
+    loop {
+        tokio::select! {
+            // Watch channel notified — a write method updated progress
+            result = rx.changed() => {
+                if result.is_err() {
+                    // Sender dropped (server shutting down)
+                    break;
+                }
+                let progress = rx.borrow_and_update().clone();
+                let json = match serde_json::to_string(&progress) {
+                    Ok(j) => j,
+                    Err(_) => break,
+                };
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+                // If idle, we've sent the final state — close gracefully
+                if progress.status == "idle" {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+            // Keepalive ping every 30 seconds
+            _ = ping_interval.tick() => {
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+            }
+            // Client sent something (close frame or disconnect)
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {} // ignore pings, text, etc.
+                }
+            }
+        }
+    }
 }
 
 async fn inference_stats_handler(
@@ -2034,7 +2204,7 @@ mod tests {
         GitHubAppConfig, GitHubConfig, LearningConfig, PrioritisationConfig, PushConfig,
         RegressionConfig, RetryConfig, SlackConfig, SmsConfig,
     };
-    use crate::storage::SqliteTracker;
+    use crate::storage::{IndexingProgress, SqliteTracker};
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -2082,6 +2252,12 @@ mod tests {
         Arc::new(SqliteTracker::in_memory().unwrap())
     }
 
+    fn test_indexing_rx(
+        tracker: &Arc<dyn FixAttemptTracker>,
+    ) -> tokio::sync::watch::Receiver<IndexingProgress> {
+        tracker.subscribe_indexing_progress()
+    }
+
     /// Create an authenticated test router with CookieManagerLayer and a session cookie.
     /// Returns (router, session_cookie_value).
     fn create_authenticated_router(tracker: &Arc<dyn FixAttemptTracker>) -> (Router, String) {
@@ -2094,8 +2270,14 @@ mod tests {
             .unwrap();
         let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
 
-        let router = create_api_router(config, tracker.clone(), PathBuf::from("claudear.toml"))
-            .layer(CookieManagerLayer::new());
+        let indexing_rx = test_indexing_rx(tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
 
         (router, token)
     }
@@ -2586,8 +2768,10 @@ mod tests {
     async fn test_unauthenticated_returns_401() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let router = create_api_router(config, tracker, PathBuf::from("claudear.toml"))
-            .layer(CookieManagerLayer::new());
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router =
+            create_api_router(config, tracker, PathBuf::from("claudear.toml"), indexing_rx)
+                .layer(CookieManagerLayer::new());
 
         let response = router
             .oneshot(
@@ -2984,10 +3168,12 @@ mod tests {
             .unwrap();
         let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
 
+        let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
             config,
             tracker.clone(),
             PathBuf::from("/tmp/nonexistent_claudear_test_config.toml"),
+            indexing_rx,
         )
         .layer(CookieManagerLayer::new());
 
@@ -3015,7 +3201,8 @@ mod tests {
         let config_path = std::env::temp_dir().join("claudear_test_config.toml");
         std::fs::write(&config_path, "# test config\nwork_dir = \"/tmp\"\n").unwrap();
 
-        let router = create_api_router(config, tracker.clone(), config_path.clone())
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(config, tracker.clone(), config_path.clone(), indexing_rx)
             .layer(CookieManagerLayer::new());
 
         let response = router
@@ -3043,8 +3230,14 @@ mod tests {
             .unwrap();
         let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
 
-        let router = create_api_router(config, tracker.clone(), PathBuf::from("claudear.toml"))
-            .layer(CookieManagerLayer::new());
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
 
         let response = router
             .oneshot(auth_get("/api/config", &token))
@@ -3087,8 +3280,14 @@ mod tests {
             .unwrap();
         let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
 
-        let router = create_api_router(config, tracker.clone(), PathBuf::from("claudear.toml"))
-            .layer(CookieManagerLayer::new());
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
 
         let request = Request::builder()
             .method("PUT")
@@ -3532,8 +3731,10 @@ mod tests {
     async fn test_unauthenticated_activity_returns_401() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let router = create_api_router(config, tracker, PathBuf::from("claudear.toml"))
-            .layer(CookieManagerLayer::new());
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router =
+            create_api_router(config, tracker, PathBuf::from("claudear.toml"), indexing_rx)
+                .layer(CookieManagerLayer::new());
 
         let response = router
             .oneshot(
@@ -3552,8 +3753,10 @@ mod tests {
     async fn test_unauthenticated_config_returns_401() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let router = create_api_router(config, tracker, PathBuf::from("claudear.toml"))
-            .layer(CookieManagerLayer::new());
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router =
+            create_api_router(config, tracker, PathBuf::from("claudear.toml"), indexing_rx)
+                .layer(CookieManagerLayer::new());
 
         let response = router
             .oneshot(
@@ -3572,8 +3775,10 @@ mod tests {
     async fn test_unauthenticated_experiments_returns_401() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let router = create_api_router(config, tracker, PathBuf::from("claudear.toml"))
-            .layer(CookieManagerLayer::new());
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router =
+            create_api_router(config, tracker, PathBuf::from("claudear.toml"), indexing_rx)
+                .layer(CookieManagerLayer::new());
 
         let response = router
             .oneshot(

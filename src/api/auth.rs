@@ -556,10 +556,12 @@ mod tests {
     ) {
         let tracker: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
             std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
+        let indexing_rx = tracker.subscribe_indexing_progress();
         let router = create_api_router(
             test_config(),
             tracker.clone(),
             std::path::PathBuf::from("claudear.toml"),
+            indexing_rx,
         )
         .layer(CookieManagerLayer::new());
         (router, tracker)

@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { parseUTCDate } from '../lib/formatters'
 import useSWR from 'swr'
 import {
   fetchTelemetryOverview,
@@ -106,7 +107,7 @@ export default function TelemetryPage() {
 
   const chartData = useMemo(() => {
     return (series?.points || []).map(p => ({
-      time: new Date(p.bucket_start).toLocaleString(undefined, {
+      time: parseUTCDate(p.bucket_start).toLocaleString(undefined, {
         month: 'short',
         day: 'numeric',
         hour: '2-digit',
@@ -517,7 +518,7 @@ export default function TelemetryPage() {
                     <div key={err.id} className="border rounded p-3">
                       <div className="text-sm font-medium">{err.error_type || 'unknown'}</div>
                       <div className="text-xs text-muted-foreground">
-                        count {err.occurrence_count} · last {new Date(err.last_seen).toLocaleString()}
+                        count {err.occurrence_count} · last {parseUTCDate(err.last_seen).toLocaleString()}
                       </div>
                       {err.error_message && (
                         <div className="text-sm mt-1 line-clamp-2">{err.error_message}</div>
