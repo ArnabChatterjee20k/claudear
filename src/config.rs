@@ -15,6 +15,7 @@ pub const DEFAULT_CONFIG_FILE: &str = "claudear.toml";
 /// Claude CLI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ClaudeConfig {
     /// Model to use (e.g., sonnet, opus, haiku, or full model ID).
     pub model: Option<String>,
@@ -27,21 +28,10 @@ pub struct ClaudeConfig {
     /// Tool permissions granted without prompting (--allowedTools).
     #[serde(default)]
     pub permissions: Vec<String>,
-    /// Skip all permission prompts (default: true for backwards compat).
+    /// Skip all permission prompts (default: false).
     pub skip_permissions: bool,
 }
 
-impl Default for ClaudeConfig {
-    fn default() -> Self {
-        Self {
-            model: None,
-            instructions: None,
-            instructions_file: None,
-            permissions: Vec::new(),
-            skip_permissions: true,
-        }
-    }
-}
 
 /// Main configuration for the application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,10 +116,32 @@ pub struct Config {
     /// General-purpose storage directory for user uploads (avatars, etc.).
     #[serde(default = "default_storage_dir")]
     pub storage_dir: PathBuf,
+    /// Dashboard display configuration.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
     PathBuf::from("./storage")
+}
+
+/// Dashboard display & estimation configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DashboardConfig {
+    /// Estimated cost per minute of Claude compute.
+    pub cost_per_minute: f64,
+    /// Estimated engineering hours saved per merged fix.
+    pub hours_per_fix: f64,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            cost_per_minute: 0.05,
+            hours_per_fix: 2.0,
+        }
+    }
 }
 
 impl Default for Config {
@@ -168,6 +180,7 @@ impl Default for Config {
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
             storage_dir: default_storage_dir(),
+            dashboard: DashboardConfig::default(),
         }
     }
 }
@@ -3498,7 +3511,7 @@ work_dir = "/tmp/repos"
         assert!(config.model.is_none());
         assert!(config.instructions.is_none());
         assert!(config.permissions.is_empty());
-        assert!(config.skip_permissions);
+        assert!(!config.skip_permissions);
     }
 
     #[test]
@@ -3507,7 +3520,7 @@ work_dir = "/tmp/repos"
         assert!(config.claude.model.is_none());
         assert!(config.claude.instructions.is_none());
         assert!(config.claude.permissions.is_empty());
-        assert!(config.claude.skip_permissions);
+        assert!(!config.claude.skip_permissions);
     }
 
     #[test]
@@ -3543,7 +3556,7 @@ work_dir = "/tmp/test"
             assert!(config.claude.model.is_none());
             assert!(config.claude.instructions.is_none());
             assert!(config.claude.permissions.is_empty());
-            assert!(config.claude.skip_permissions);
+            assert!(!config.claude.skip_permissions);
         });
     }
 

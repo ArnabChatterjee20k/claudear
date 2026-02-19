@@ -2380,6 +2380,44 @@ impl FixAttemptTracker for SqliteTracker {
         SqliteTracker::get_pr_analytics(self)
     }
 
+    fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
+        SqliteTracker::get_avg_time_to_pr(self)
+    }
+
+    fn get_rejection_reasons(&self, limit: usize) -> Result<Vec<crate::types::RejectionReason>> {
+        SqliteTracker::get_rejection_reasons(self, limit)
+    }
+
+    fn get_agent_spawn_count(&self, since_iso: &str) -> Result<i64> {
+        SqliteTracker::get_agent_spawn_count(self, since_iso)
+    }
+
+    fn get_cost_estimate(
+        &self,
+        since_iso: &str,
+        cost_per_minute: f64,
+        period_label: &str,
+    ) -> Result<crate::types::CostEstimate> {
+        SqliteTracker::get_cost_estimate(self, since_iso, cost_per_minute, period_label)
+    }
+
+    fn get_mttr_trend(&self, weeks: usize) -> Result<Vec<crate::types::MttrDataPoint>> {
+        SqliteTracker::get_mttr_trend(self, weeks)
+    }
+
+    fn get_repo_leaderboard(&self) -> Result<Vec<crate::types::RepoLeaderboardEntry>> {
+        SqliteTracker::get_repo_leaderboard(self)
+    }
+
+    fn get_time_savings(
+        &self,
+        since_iso: &str,
+        hours_per_fix: f64,
+        period_label: &str,
+    ) -> Result<crate::types::TimeSavings> {
+        SqliteTracker::get_time_savings(self, since_iso, hours_per_fix, period_label)
+    }
+
     fn get_regression_watches_by_status(
         &self,
         status: crate::types::RegressionWatchStatus,
@@ -4861,6 +4899,10 @@ impl SqliteTracker {
             avg_time_to_merge_hours: None, // Would need more complex calculation
             most_common_error,
             success_rate_by_source,
+            avg_time_to_pr_mins: None,
+            cost_estimate: None,
+            mttr_trend: Vec::new(),
+            repo_leaderboard: Vec::new(),
         })
     }
 
@@ -6019,6 +6061,194 @@ impl SqliteTracker {
             avg_review_cycles,
             merge_rate,
             by_repo,
+            avg_time_to_pr_mins: None,
+            rejection_reasons: Vec::new(),
+        })
+    }
+
+    /// Average time from issue attempt to PR creation in minutes.
+    pub fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<f64> = conn
+            .query_row(
+                r#"
+                SELECT AVG((julianday(p.created_at) - julianday(fa.attempted_at)) * 24.0 * 60.0)
+                FROM prs p
+                JOIN fix_attempts fa ON fa.id = p.attempt_id
+                WHERE p.created_at IS NOT NULL AND fa.attempted_at IS NOT NULL
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        Ok(result)
+    }
+
+    /// Top PR rejection/review-change reason categories.
+    pub fn get_rejection_reasons(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::types::RejectionReason>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT category, SUM(occurrence_count) as total
+            FROM review_patterns
+            GROUP BY category
+            ORDER BY total DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(crate::types::RejectionReason {
+                category: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Count agent (Claude) spawns since a given ISO timestamp.
+    pub fn get_agent_spawn_count(&self, since_iso: &str) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM claude_executions WHERE started_at >= ?1",
+            params![since_iso],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Compute cost estimate from Claude execution durations.
+    pub fn get_cost_estimate(
+        &self,
+        since_iso: &str,
+        cost_per_minute: f64,
+        period_label: &str,
+    ) -> Result<crate::types::CostEstimate> {
+        let conn = self.acquire_lock()?;
+        let total_duration_secs: f64 = conn
+            .query_row(
+                r#"
+                SELECT COALESCE(SUM(duration_secs), 0.0)
+                FROM claude_executions
+                WHERE started_at >= ?1 AND duration_secs IS NOT NULL
+                "#,
+                params![since_iso],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+
+        let fix_count: i64 = conn
+            .query_row(
+                r#"
+                SELECT COUNT(*) FROM fix_attempts
+                WHERE status IN ('success', 'merged') AND attempted_at >= ?1
+                "#,
+                params![since_iso],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let total_duration_mins = total_duration_secs / 60.0;
+        let total_cost = total_duration_mins * cost_per_minute;
+        let avg_cost_per_fix = if fix_count > 0 {
+            total_cost / fix_count as f64
+        } else {
+            0.0
+        };
+
+        Ok(crate::types::CostEstimate {
+            total_cost,
+            avg_cost_per_fix,
+            total_duration_mins,
+            cost_per_minute,
+            period: period_label.to_string(),
+        })
+    }
+
+    /// MTTR trend grouped by ISO week buckets.
+    pub fn get_mttr_trend(&self, weeks: usize) -> Result<Vec<crate::types::MttrDataPoint>> {
+        let conn = self.acquire_lock()?;
+        let modifier = format!("-{} days", weeks * 7);
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                date(fa.merged_at, 'weekday 0', '-6 days') as week_start,
+                AVG((julianday(fa.merged_at) - julianday(fa.attempted_at)) * 24.0 * 60.0) as avg_mins,
+                COUNT(*) as cnt
+            FROM fix_attempts fa
+            WHERE fa.status = 'merged'
+              AND fa.merged_at IS NOT NULL
+              AND fa.attempted_at IS NOT NULL
+              AND fa.merged_at >= datetime('now', ?1)
+            GROUP BY week_start
+            ORDER BY week_start ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![modifier], |row| {
+            Ok(crate::types::MttrDataPoint {
+                period_start: row.get(0)?,
+                mttr_minutes: row.get(1)?,
+                sample_count: row.get(2)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Per-repository leaderboard.
+    pub fn get_repo_leaderboard(&self) -> Result<Vec<crate::types::RepoLeaderboardEntry>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                fa.github_repo,
+                COUNT(*) as total,
+                CAST(SUM(CASE WHEN fa.status IN ('success','merged') THEN 1 ELSE 0 END) AS REAL) / NULLIF(COUNT(*), 0) as success_rate,
+                CAST(SUM(CASE WHEN fa.status = 'merged' THEN 1 ELSE 0 END) AS REAL) /
+                    NULLIF(SUM(CASE WHEN fa.status IN ('merged','closed') THEN 1 ELSE 0 END), 0) as merge_rate,
+                AVG(CASE WHEN p.time_to_merge_mins IS NOT NULL THEN p.time_to_merge_mins END) as avg_ttm
+            FROM fix_attempts fa
+            LEFT JOIN prs p ON p.attempt_id = fa.id
+            WHERE fa.github_repo IS NOT NULL AND fa.github_repo != ''
+            GROUP BY fa.github_repo
+            ORDER BY total DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::types::RepoLeaderboardEntry {
+                repo: row.get(0)?,
+                total: row.get(1)?,
+                success_rate: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                merge_rate: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                avg_time_to_merge_mins: row.get(4)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Engineering time savings estimate.
+    pub fn get_time_savings(
+        &self,
+        since_iso: &str,
+        hours_per_fix: f64,
+        period_label: &str,
+    ) -> Result<crate::types::TimeSavings> {
+        let conn = self.acquire_lock()?;
+        let merged_count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM fix_attempts
+            WHERE status = 'merged' AND merged_at >= ?1
+            "#,
+            params![since_iso],
+            |row| row.get(0),
+        )?;
+        Ok(crate::types::TimeSavings {
+            merged_count,
+            hours_saved: merged_count as f64 * hours_per_fix,
+            hours_per_fix,
+            period: period_label.to_string(),
         })
     }
 

@@ -23,6 +23,10 @@ const LOGIN_RATE_LIMIT_MAX_ATTEMPTS: usize = 10;
 /// Duration of the rate limit window in seconds.
 const LOGIN_RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
 
+/// Maximum number of unique keys (email addresses) tracked in the rate limiter.
+/// When exceeded, the oldest entries are evicted to prevent memory exhaustion.
+const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 10_000;
+
 /// In-memory rate limiter for login attempts, keyed by email address.
 /// This protects against brute force attacks on specific accounts and
 /// mitigates CPU exhaustion from repeated bcrypt verification.
@@ -53,6 +57,24 @@ fn check_login_rate_limit(key: &str) -> bool {
     }
 
     attempts.push(now);
+
+    // Sweep expired entries from other keys to prevent unbounded memory growth
+    limiter.retain(|_, v| !v.is_empty() && v.iter().any(|t| now.duration_since(*t) < window));
+
+    // Cap total entries to prevent memory exhaustion from distributed attacks
+    if limiter.len() > LOGIN_RATE_LIMIT_MAX_KEYS {
+        // Find and remove entries with the oldest most-recent attempt
+        let mut entries: Vec<(String, Instant)> = limiter
+            .iter()
+            .filter_map(|(k, v)| v.last().map(|t| (k.clone(), *t)))
+            .collect();
+        entries.sort_by_key(|(_, t)| *t);
+        let to_remove = limiter.len() - LOGIN_RATE_LIMIT_MAX_KEYS;
+        for (k, _) in entries.into_iter().take(to_remove) {
+            limiter.remove(&k);
+        }
+    }
+
     true
 }
 
@@ -557,8 +579,8 @@ pub async fn create_user_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Validate password (minimum 8 characters)
-    if body.password.len() < 8 {
+    // Validate password (minimum 8, maximum 72 characters — bcrypt limit)
+    if body.password.len() < 8 || body.password.len() > 72 {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -623,6 +645,13 @@ pub async fn update_user_handler(
     // Validate role if provided
     if let Some(ref role) = body.role {
         if role != "admin" && role != "viewer" {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // Validate password length if provided (minimum 8, maximum 72 — bcrypt limit)
+    if let Some(ref pw) = body.password {
+        if pw.len() < 8 || pw.len() > 72 {
             return Err(StatusCode::BAD_REQUEST);
         }
     }
@@ -762,6 +791,7 @@ mod tests {
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
+            dashboard: crate::config::DashboardConfig::default(),
         }
     }
 

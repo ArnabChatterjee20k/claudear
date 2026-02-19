@@ -261,6 +261,53 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(PrAnalytics::default())
     }
 
+    // ─── Dashboard metrics extension methods (default no-ops) ───
+
+    /// Average time from issue attempt to PR creation in minutes.
+    fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
+        Ok(None)
+    }
+
+    /// Top rejection/review-change reason categories.
+    fn get_rejection_reasons(&self, _limit: usize) -> Result<Vec<crate::types::RejectionReason>> {
+        Ok(Vec::new())
+    }
+
+    /// Count Claude agent spawns since a given ISO timestamp.
+    fn get_agent_spawn_count(&self, _since_iso: &str) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Compute cost estimate from Claude execution durations.
+    fn get_cost_estimate(
+        &self,
+        _since_iso: &str,
+        _cost_per_minute: f64,
+        _period_label: &str,
+    ) -> Result<crate::types::CostEstimate> {
+        Ok(crate::types::CostEstimate::default())
+    }
+
+    /// MTTR trend grouped by week.
+    fn get_mttr_trend(&self, _weeks: usize) -> Result<Vec<crate::types::MttrDataPoint>> {
+        Ok(Vec::new())
+    }
+
+    /// Per-repository leaderboard.
+    fn get_repo_leaderboard(&self) -> Result<Vec<crate::types::RepoLeaderboardEntry>> {
+        Ok(Vec::new())
+    }
+
+    /// Engineering time savings estimate.
+    fn get_time_savings(
+        &self,
+        _since_iso: &str,
+        _hours_per_fix: f64,
+        _period_label: &str,
+    ) -> Result<crate::types::TimeSavings> {
+        Ok(crate::types::TimeSavings::default())
+    }
+
     /// Get regression watches by status.
     fn get_regression_watches_by_status(
         &self,

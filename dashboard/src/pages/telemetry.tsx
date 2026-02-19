@@ -18,6 +18,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../co
 import { Skeleton } from '../components/ui/skeleton'
 import {
   Activity,
+  Bot,
   Clock3,
   GitPullRequest,
   RefreshCw,
@@ -220,6 +221,18 @@ export default function TelemetryPage() {
               }
               icon={<TrendingUp className="h-4 w-4 text-emerald-500" />}
               description={`${overview.pr_analytics.merged} merged`}
+            />
+            <StatsCard
+              title="Agent Spawns Today"
+              value={formatCount(overview.agent_spawns_today)}
+              icon={<Bot className="h-4 w-4 text-blue-500" />}
+              description="Claude invocations (24h)"
+            />
+            <StatsCard
+              title="Agent Spawns This Week"
+              value={formatCount(overview.agent_spawns_this_week)}
+              icon={<Bot className="h-4 w-4 text-violet-500" />}
+              description="Claude invocations (7d)"
             />
             <StatsCard
               title="Poll Cycles"

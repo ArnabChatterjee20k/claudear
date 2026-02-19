@@ -54,6 +54,8 @@ export interface Overview {
   merge_rate: number;
   recent_attempts: AttemptSummary[];
   sources: SourceSummary[];
+  time_savings?: TimeSavings | null;
+  agent_spawns_today?: number;
 }
 
 export interface AttemptsResponse {
@@ -231,6 +233,10 @@ export interface AnalyticsSummary {
   avg_time_to_merge_hours: number | null;
   most_common_error: string | null;
   success_rate_by_source: Record<string, number>;
+  avg_time_to_pr_mins?: number | null;
+  cost_estimate?: CostEstimate | null;
+  mttr_trend?: MttrDataPoint[];
+  repo_leaderboard?: RepoLeaderboardEntry[];
 }
 
 export interface ProcessingMetric {
@@ -295,6 +301,42 @@ export interface PrAnalytics {
   avg_review_cycles: number | null;
   merge_rate: number | null;
   by_repo: Record<string, number>;
+  avg_time_to_pr_mins?: number | null;
+  rejection_reasons?: RejectionReason[];
+}
+
+export interface RejectionReason {
+  category: string;
+  count: number;
+}
+
+export interface CostEstimate {
+  total_cost: number;
+  avg_cost_per_fix: number;
+  total_duration_mins: number;
+  cost_per_minute: number;
+  period: string;
+}
+
+export interface MttrDataPoint {
+  period_start: string;
+  mttr_minutes: number;
+  sample_count: number;
+}
+
+export interface RepoLeaderboardEntry {
+  repo: string;
+  total: number;
+  success_rate: number;
+  merge_rate: number;
+  avg_time_to_merge_mins: number | null;
+}
+
+export interface TimeSavings {
+  merged_count: number;
+  hours_saved: number;
+  hours_per_fix: number;
+  period: string;
 }
 
 export interface FixOutcome {
@@ -480,6 +522,8 @@ export interface TelemetryOverview {
   metric_counts_last_24h: Record<string, number>;
   diagnostics?: Record<string, unknown> | null;
   pr_analytics: PrAnalytics;
+  agent_spawns_today?: number;
+  agent_spawns_this_week?: number;
 }
 
 export interface TelemetryTimeseries {

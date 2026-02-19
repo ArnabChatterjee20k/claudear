@@ -188,6 +188,8 @@ struct OverviewResponse {
     merge_rate: f64,
     recent_attempts: Vec<AttemptSummary>,
     sources: Vec<SourceSummary>,
+    time_savings: Option<crate::types::TimeSavings>,
+    agent_spawns_today: i64,
 }
 
 #[derive(Serialize, Clone)]
@@ -347,12 +349,32 @@ async fn overview_handler(
         })
         .collect();
 
+    let now_utc = chrono::Utc::now();
+    let seven_days_ago = (now_utc - chrono::Duration::days(7))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let twenty_four_h_ago = (now_utc - chrono::Duration::hours(24))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+
+    let time_savings = state
+        .tracker
+        .get_time_savings(&seven_days_ago, state.config.dashboard.hours_per_fix, "7d")
+        .ok();
+
+    let agent_spawns_today = state
+        .tracker
+        .get_agent_spawn_count(&twenty_four_h_ago)
+        .unwrap_or(0);
+
     Ok(Json(OverviewResponse {
         stats,
         success_rate,
         merge_rate,
         recent_attempts: recent,
         sources,
+        time_savings,
+        agent_spawns_today,
     }))
 }
 
@@ -904,6 +926,8 @@ struct TelemetryOverviewResponse {
     metric_counts_last_24h: HashMap<String, i64>,
     diagnostics: Option<crate::storage::DiagnosticCounts>,
     pr_analytics: crate::types::PrAnalytics,
+    agent_spawns_today: i64,
+    agent_spawns_this_week: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -1096,6 +1120,31 @@ async fn attempt_execution_log_handler(
         _ => None,
     };
 
+    // Validate that the log path is within the expected log root directory
+    // to prevent path traversal attacks via crafted database records.
+    if let Some(ref path) = log_path {
+        let log_root = crate::runner::resolve_log_root();
+        let canonical_root = tokio::fs::canonicalize(&log_root)
+            .await
+            .unwrap_or(std::path::absolute(&log_root).unwrap_or_else(|_| log_root.clone()));
+        match tokio::fs::canonicalize(path).await {
+            Ok(canonical_path) => {
+                if !canonical_path.starts_with(&canonical_root) {
+                    tracing::warn!(
+                        path = %path,
+                        log_root = %canonical_root.display(),
+                        "Execution log path traversal blocked"
+                    );
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+            Err(_) => {
+                // File doesn't exist or can't be resolved; fall through to normal read
+                // which will produce a fallback_preview
+            }
+        }
+    }
+
     let mut truncated = false;
     let content = if let Some(path) = &log_path {
         match tokio::fs::read_to_string(path).await {
@@ -1163,11 +1212,28 @@ async fn analytics_summary_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::types::AnalyticsSummary>, StatusCode> {
-    state
+    let mut summary = state
         .tracker
         .get_analytics_summary()
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    summary.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr().unwrap_or(None);
+
+    let thirty_days_ago = (chrono::Utc::now() - chrono::Duration::days(30))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    summary.cost_estimate = state
+        .tracker
+        .get_cost_estimate(
+            &thirty_days_ago,
+            state.config.dashboard.cost_per_minute,
+            "30d",
+        )
+        .ok();
+    summary.mttr_trend = state.tracker.get_mttr_trend(8).unwrap_or_default();
+    summary.repo_leaderboard = state.tracker.get_repo_leaderboard().unwrap_or_default();
+
+    Ok(Json(summary))
 }
 
 async fn metrics_handler(
@@ -1286,11 +1352,15 @@ async fn pr_analytics_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::types::PrAnalytics>, StatusCode> {
-    state
+    let mut analytics = state
         .tracker
         .get_pr_analytics()
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    analytics.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr().unwrap_or(None);
+    analytics.rejection_reasons = state.tracker.get_rejection_reasons(10).unwrap_or_default();
+
+    Ok(Json(analytics))
 }
 
 async fn feedback_handler(
@@ -1663,6 +1733,21 @@ async fn telemetry_overview_handler(
         .downcast_ref::<SqliteTracker>()
         .and_then(|db| db.get_diagnostic_counts().ok());
 
+    let twenty_four_h_ago_iso = (now - Duration::hours(24))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let seven_days_ago_iso = (now - Duration::days(7))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let agent_spawns_today = state
+        .tracker
+        .get_agent_spawn_count(&twenty_four_h_ago_iso)
+        .unwrap_or(0);
+    let agent_spawns_this_week = state
+        .tracker
+        .get_agent_spawn_count(&seven_days_ago_iso)
+        .unwrap_or(0);
+
     let response = TelemetryOverviewResponse {
         generated_at: now.to_rfc3339(),
         uptime_secs: state.start_time.elapsed().as_secs(),
@@ -1675,6 +1760,8 @@ async fn telemetry_overview_handler(
         metric_counts_last_24h,
         diagnostics,
         pr_analytics,
+        agent_spawns_today,
+        agent_spawns_this_week,
     };
 
     Ok(Json(response))
@@ -2220,7 +2307,16 @@ async fn put_config_handler(
         )
     })?;
 
-    tokio::fs::write(&state.config_path, &body.content)
+    // Re-serialize the validated config to ensure only parsed fields are written to disk.
+    // This prevents injection of arbitrary content via raw user input.
+    let re_serialized = toml::to_string_pretty(&parsed).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to serialize config: {}", e) })),
+        )
+    })?;
+
+    tokio::fs::write(&state.config_path, &re_serialized)
         .await
         .map_err(|e| {
             (
@@ -2284,6 +2380,7 @@ mod tests {
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
+            dashboard: crate::config::DashboardConfig::default(),
         }
     }
 
@@ -2620,6 +2717,8 @@ mod tests {
             merge_rate: 75.0,
             recent_attempts: vec![],
             sources: vec![],
+            time_savings: None,
+            agent_spawns_today: 0,
         };
         let json = serde_json::to_string(&overview).unwrap();
         assert!(json.contains("85.5"));

@@ -12,9 +12,10 @@ import { StatusBadge } from '../components/shared/status-badge'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { Modal } from '../components/shared/modal'
 import { Select } from '../components/ui/select'
-import { Card, CardContent } from '../components/ui/card'
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
 import { Skeleton } from '../components/ui/skeleton'
 import { formatMins, formatDate } from '../lib/formatters'
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import {
   GitPullRequest,
   GitMerge,
@@ -124,7 +125,7 @@ export default function PrsPage() {
       )}
 
       {analytics && (
-        <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-6">
+        <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-7">
           <StatsCard
             title="Total PRs"
             value={analytics.total}
@@ -165,7 +166,35 @@ export default function PrsPage() {
             icon={<TrendingUp className="h-4 w-4 text-green-500" />}
             description="Merged / total"
           />
+          <StatsCard
+            title="Avg Time to PR"
+            value={formatMins(analytics.avg_time_to_pr_mins ?? null)}
+            icon={<Clock className="h-4 w-4 text-indigo-500" />}
+            description="Issue → PR creation"
+          />
         </div>
+      )}
+
+      {analytics && (analytics.rejection_reasons ?? []).length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>PR Rejection Reasons</CardTitle>
+            <CardDescription>Top review-change categories by frequency</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={analytics.rejection_reasons} layout="vertical">
+                  <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                  <XAxis type="number" tick={{ fontSize: 12 }} className="text-muted-foreground" />
+                  <YAxis type="category" dataKey="category" tick={{ fontSize: 12 }} className="text-muted-foreground" width={150} />
+                  <Tooltip />
+                  <Bar dataKey="count" fill="#f97316" radius={[0, 4, 4, 0]} name="Count" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </CardContent>
+        </Card>
       )}
 
       <div className="flex items-center gap-4">

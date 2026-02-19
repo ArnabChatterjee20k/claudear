@@ -856,6 +856,12 @@ pub struct PrAnalytics {
 
     /// PRs by repository.
     pub by_repo: HashMap<String, i64>,
+    /// Average time from issue attempt to PR creation in minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_time_to_pr_mins: Option<f64>,
+    /// PR rejection/review-change reason breakdown.
+    #[serde(default)]
+    pub rejection_reasons: Vec<RejectionReason>,
 }
 
 /// Issue embedding for similarity search.
@@ -1331,6 +1337,62 @@ pub struct AnalyticsSummary {
     pub most_common_error: Option<String>,
     /// Success rate by source.
     pub success_rate_by_source: HashMap<String, f64>,
+    /// Average time from issue creation to PR creation in minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_time_to_pr_mins: Option<f64>,
+    /// Cost estimate breakdown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_estimate: Option<CostEstimate>,
+    /// Weekly MTTR trend data.
+    #[serde(default)]
+    pub mttr_trend: Vec<MttrDataPoint>,
+    /// Per-repo leaderboard.
+    #[serde(default)]
+    pub repo_leaderboard: Vec<RepoLeaderboardEntry>,
+}
+
+/// PR rejection/review-change reason category.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RejectionReason {
+    pub category: String,
+    pub count: i64,
+}
+
+/// Estimated cost breakdown for automated fixes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CostEstimate {
+    pub total_cost: f64,
+    pub avg_cost_per_fix: f64,
+    pub total_duration_mins: f64,
+    pub cost_per_minute: f64,
+    pub period: String,
+}
+
+/// A single data point in the MTTR (mean time to resolve) trend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MttrDataPoint {
+    pub period_start: String,
+    pub mttr_minutes: f64,
+    pub sample_count: i64,
+}
+
+/// Per-repository leaderboard entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoLeaderboardEntry {
+    pub repo: String,
+    pub total: i64,
+    pub success_rate: f64,
+    pub merge_rate: f64,
+    pub avg_time_to_merge_mins: Option<f64>,
+}
+
+/// Engineering time savings estimate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TimeSavings {
+    pub merged_count: i64,
+    pub hours_saved: f64,
+    pub hours_per_fix: f64,
+    pub period: String,
 }
 
 /// Status of a regression watch.

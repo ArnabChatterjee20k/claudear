@@ -115,7 +115,7 @@ impl ApiServer {
         .layer(cors)
         .layer(CookieManagerLayer::new());
 
-        let addr = format!("0.0.0.0:{}", self.port);
+        let addr = format!("127.0.0.1:{}", self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied && self.port < 1024 {
                 std::io::Error::new(
@@ -131,7 +131,7 @@ impl ApiServer {
             }
         })?;
 
-        tracing::info!("Dashboard API server listening on port {}", self.port);
+        tracing::info!("Dashboard API server listening on {}", addr);
         if self.dashboard_dir.is_some() {
             tracing::info!(
                 "Serving dashboard from filesystem at http://localhost:{}",

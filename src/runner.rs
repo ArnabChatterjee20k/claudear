@@ -19,6 +19,14 @@ const DEFAULT_LOG_DIR: &str = "./logs";
 const CLAUDE_LOG_SUBDIR: &str = "claude";
 const EXECUTION_LOG_PREVIEW_LIMIT: usize = 2000;
 
+/// Resolve the root directory for execution logs.
+/// Used by both the runner and the API to validate log file paths.
+pub fn resolve_log_root() -> PathBuf {
+    std::env::var("CLAUDEAR_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_DIR))
+}
+
 /// JSON schema for Claude's structured output. Constrained decoding guarantees the
 /// final response matches this schema, replacing both the CLAUDEAR_QUESTION protocol
 /// and the PR_URL instruction.
@@ -126,7 +134,7 @@ pub struct ClaudeRunnerConfig {
     pub instructions: Option<String>,
     /// Tool permissions granted without prompting (--allowedTools).
     pub permissions: Vec<String>,
-    /// Skip all permission prompts (default: true for backwards compat).
+    /// Skip all permission prompts (default: false).
     pub skip_permissions: bool,
 }
 
@@ -137,7 +145,7 @@ impl Default for ClaudeRunnerConfig {
             model: None,
             instructions: None,
             permissions: Vec::new(),
-            skip_permissions: true,
+            skip_permissions: false,
         }
     }
 }
@@ -2582,7 +2590,7 @@ mod tests {
         assert!(config.model.is_none());
         assert!(config.instructions.is_none());
         assert!(config.permissions.is_empty());
-        assert!(config.skip_permissions);
+        assert!(!config.skip_permissions);
     }
 
     #[test]
@@ -2593,7 +2601,7 @@ mod tests {
         };
         assert_eq!(config.timeout_secs, 60);
         assert!(config.model.is_none());
-        assert!(config.skip_permissions);
+        assert!(!config.skip_permissions);
     }
 
     #[test]

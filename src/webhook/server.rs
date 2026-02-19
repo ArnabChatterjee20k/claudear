@@ -24,7 +24,7 @@ use crate::types::{
 use crate::users::UserRegistry;
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
@@ -214,9 +214,10 @@ impl WebhookServer {
                 "/webhook/:source",
                 post(webhook_handler).layer(concurrency_layer),
             )
+            .layer(DefaultBodyLimit::max(512 * 1024)) // 512 KB body size limit
             .with_state(state.clone());
 
-        let addr = format!("0.0.0.0:{}", self.port);
+        let addr = format!("127.0.0.1:{}", self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied && self.port < 1024 {
                 std::io::Error::new(
@@ -232,7 +233,7 @@ impl WebhookServer {
             }
         })?;
 
-        tracing::info!(port = self.port, "Webhook server listening");
+        tracing::info!("Webhook server listening on {}", addr);
         tracing::info!(
             work_dir = ?state.config.work_dir,
             known_orgs = state.config.known_orgs.len(),
@@ -1693,6 +1694,7 @@ mod tests {
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
+            dashboard: crate::config::DashboardConfig::default(),
         }
     }
 
