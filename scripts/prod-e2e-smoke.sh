@@ -389,6 +389,7 @@ start_daemon() {
 
     docker run -d \
       --name "$name" \
+      -p "${port}:${port}" \
       -v "${mount_dir}:${mount_dir}" \
       --env-file "$env_file" \
       "${DOCKER_IMAGE}" \

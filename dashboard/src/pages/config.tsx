@@ -82,7 +82,7 @@ function parseFields(lines: string[]): ParsedField[] {
       continue
     }
 
-    const match = trimmed.match(/^([^=]+?)\s*=\s*(.+)$/)
+    const match = trimmed.match(/^([^=]+?)\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\[[^\]]*\]|[^#]+?)(?:\s*#.*)?$/)
     if (match) {
       const key = match[1].trim()
       const value = match[2].trim()
@@ -103,7 +103,13 @@ function parseFields(lines: string[]): ParsedField[] {
 function parseArrayValue(value: string): string[] {
   const inner = value.replace(/^\[/, '').replace(/\]$/, '').trim()
   if (!inner) return []
-  return inner.split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean)
+  const items: string[] = []
+  const regex = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,]+/g
+  let m: RegExpExecArray | null
+  while ((m = regex.exec(inner)) !== null) {
+    items.push(m[0].trim().replace(/^["']|["']$/g, ''))
+  }
+  return items.filter(Boolean)
 }
 
 function serializeArrayValue(items: string[]): string {
@@ -236,12 +242,15 @@ function FieldInput({
   }
 
   // String / unknown
-  const displayValue = field.value.replace(/^["']|["']$/g, '')
+  const displayValue = field.value.replace(/^["']|["']$/g, '').replace(/\\"/g, '"').replace(/\\\\/g, '\\')
   return (
     <input
       type={field.isSecret ? 'password' : 'text'}
       value={displayValue}
-      onChange={e => onChange(field.key, `"${e.target.value}"`)}
+      onChange={e => {
+        const escaped = e.target.value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+        onChange(field.key, `"${escaped}"`)
+      }}
       className={`w-full px-3 py-1.5 text-sm border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 ${changedRing}`}
     />
   )
@@ -395,7 +404,10 @@ export default function ConfigPage() {
     try {
       const result = await saveConfig(editContent)
       setSaveResult(result)
-      mutate()
+      const freshData = await mutate()
+      if (freshData?.content) {
+        setEditContent(freshData.content)
+      }
     } catch (e: any) {
       setSaveResult({ ok: false, message: e?.message || 'Unknown error' })
     } finally {

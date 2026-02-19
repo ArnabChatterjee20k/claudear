@@ -617,7 +617,8 @@ pub struct GitLabConfig {
     /// States that trigger automation (e.g., "opened").
     pub trigger_states: Vec<String>,
     /// Poll interval for checking MR status (ms).
-    pub poll_interval_ms: u64,
+    /// When `None`, falls back to the global `poll_interval_ms`.
+    pub poll_interval_ms: Option<u64>,
     /// Whether to auto-resolve issues when MRs merge.
     pub auto_resolve_on_merge: bool,
     /// Webhook secret for verifying GitLab webhook requests.
@@ -642,7 +643,7 @@ impl Default for GitLabConfig {
             groups: Vec::new(),
             trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
             trigger_states: vec!["opened".to_string()],
-            poll_interval_ms: 60000,
+            poll_interval_ms: None,
             auto_resolve_on_merge: false,
             webhook_secret: None,
             review_trigger: "/claudear".to_string(),
@@ -664,7 +665,7 @@ impl GitLabConfig {
             groups: vec!["mygroup".to_string()],
             trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
             trigger_states: vec!["opened".to_string()],
-            poll_interval_ms: 60000,
+            poll_interval_ms: Some(60000),
             auto_resolve_on_merge: true,
             webhook_secret: Some("test_secret".to_string()),
             review_trigger: "/claudear".to_string(),
@@ -1824,7 +1825,7 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
-                gitlab.poll_interval_ms = v;
+                gitlab.poll_interval_ms = Some(v);
             }
             if let Ok(v) = env::var("GITLAB_AUTO_RESOLVE_ON_MERGE") {
                 gitlab.auto_resolve_on_merge = v.to_lowercase() == "true" || v == "1";
@@ -2047,7 +2048,7 @@ impl Config {
             "gitlab" => self
                 .gitlab
                 .as_ref()
-                .map(|c| c.poll_interval_ms)
+                .and_then(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
             _ => self.poll_interval_ms,
         }

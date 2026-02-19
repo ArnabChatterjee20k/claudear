@@ -230,6 +230,30 @@ impl<H: JiraHttpClient> JiraSource<H> {
         value.replace('\\', "\\\\").replace('"', "\\\"")
     }
 
+    /// Validate that a custom JQL string has balanced parentheses.
+    ///
+    /// SECURITY NOTE: `custom_jql` is user-authored raw JQL that is injected directly
+    /// into the query. Unlike other config fields, it cannot be escaped because users
+    /// need full JQL expression syntax (operators, functions, etc.). We perform basic
+    /// structural validation (balanced parentheses) to catch accidental misconfiguration.
+    /// Operators should ensure `custom_jql` values come from trusted configuration only.
+    fn validate_custom_jql(jql: &str) -> bool {
+        let mut depth: i32 = 0;
+        for ch in jql.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        depth == 0
+    }
+
     /// Build a JQL query from the configuration.
     fn build_jql(&self) -> String {
         let mut clauses = Vec::new();
@@ -293,9 +317,17 @@ impl<H: JiraHttpClient> JiraSource<H> {
             clauses.push(format!("issuetype in ({})", types));
         }
 
-        // Custom JQL
+        // Custom JQL - injected raw; validated for balanced parentheses only.
+        // See `validate_custom_jql` for security considerations.
         if let Some(ref custom) = self.config.custom_jql {
-            clauses.push(format!("({})", custom));
+            if Self::validate_custom_jql(custom) {
+                clauses.push(format!("({})", custom));
+            } else {
+                tracing::warn!(
+                    "Ignoring custom_jql with unbalanced parentheses: {:?}",
+                    custom
+                );
+            }
         }
 
         let mut jql = clauses.join(" AND ");
@@ -1054,6 +1086,35 @@ mod tests {
         let source = JiraSource::with_http_client(config, MockJiraClient::new());
         let jql = source.build_jql();
         assert!(jql.contains("(priority = High)"));
+    }
+
+    #[test]
+    fn test_build_jql_rejects_unbalanced_custom_jql() {
+        let mut config = test_config();
+        config.custom_jql = Some("priority = High) OR (status = Open".to_string());
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        // Unbalanced parens should be rejected, so custom_jql is not in the output
+        assert!(!jql.contains("priority = High"));
+    }
+
+    #[test]
+    fn test_validate_custom_jql_balanced() {
+        type JS = JiraSource<MockJiraClient>;
+        assert!(JS::validate_custom_jql("priority = High"));
+        assert!(JS::validate_custom_jql("(priority = High)"));
+        assert!(JS::validate_custom_jql("(a = 1) AND (b = 2)"));
+        assert!(JS::validate_custom_jql("((nested))"));
+        assert!(JS::validate_custom_jql(""));
+    }
+
+    #[test]
+    fn test_validate_custom_jql_unbalanced() {
+        type JS = JiraSource<MockJiraClient>;
+        assert!(!JS::validate_custom_jql("(unclosed"));
+        assert!(!JS::validate_custom_jql("extra)"));
+        assert!(!JS::validate_custom_jql(")("));
+        assert!(!JS::validate_custom_jql("((a)"));
     }
 
     #[test]
