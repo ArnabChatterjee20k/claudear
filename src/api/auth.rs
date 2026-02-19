@@ -3,7 +3,7 @@
 use crate::storage::SqliteTracker;
 use axum::{
     extract::{FromRequestParts, Path, State},
-    http::{request::Parts, StatusCode},
+    http::{request::Parts, HeaderMap, StatusCode},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -27,10 +27,23 @@ const LOGIN_RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
 /// When exceeded, the oldest entries are evicted to prevent memory exhaustion.
 const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 10_000;
 
+/// Maximum number of login attempts per IP address within the rate limit window.
+/// More generous than per-email to avoid blocking legitimate users behind shared IPs.
+const IP_RATE_LIMIT_MAX_ATTEMPTS: usize = 100;
+
+/// Duration of the IP rate limit window in seconds.
+const IP_RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
+
 /// In-memory rate limiter for login attempts, keyed by email address.
 /// This protects against brute force attacks on specific accounts and
 /// mitigates CPU exhaustion from repeated bcrypt verification.
 static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// In-memory rate limiter for login attempts, keyed by client IP address.
+/// This prevents a single IP from brute-forcing across many email addresses
+/// and limits distributed credential-stuffing attacks.
+static IP_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Check if a login attempt is allowed for the given key (email).
@@ -76,6 +89,77 @@ fn check_login_rate_limit(key: &str) -> bool {
     }
 
     true
+}
+
+/// Check if a login attempt is allowed for the given IP address.
+/// Returns true if the attempt is within rate limits, false if it should be rejected.
+fn check_ip_rate_limit(ip: &str) -> bool {
+    let mut limiter = match IP_RATE_LIMITER.lock() {
+        Ok(l) => l,
+        Err(poisoned) => {
+            tracing::warn!("IP rate limiter mutex was poisoned, recovering");
+            poisoned.into_inner()
+        }
+    };
+
+    let now = Instant::now();
+    let window = std::time::Duration::from_secs(IP_RATE_LIMIT_WINDOW_SECS);
+
+    let attempts = limiter.entry(ip.to_string()).or_default();
+
+    // Remove attempts outside the window
+    attempts.retain(|t| now.duration_since(*t) < window);
+
+    if attempts.len() >= IP_RATE_LIMIT_MAX_ATTEMPTS {
+        return false;
+    }
+
+    attempts.push(now);
+
+    // Sweep expired entries from other keys to prevent unbounded memory growth
+    limiter.retain(|_, v| !v.is_empty() && v.iter().any(|t| now.duration_since(*t) < window));
+
+    // Cap total entries to prevent memory exhaustion from distributed attacks
+    if limiter.len() > LOGIN_RATE_LIMIT_MAX_KEYS {
+        let mut entries: Vec<(String, Instant)> = limiter
+            .iter()
+            .filter_map(|(k, v)| v.last().map(|t| (k.clone(), *t)))
+            .collect();
+        entries.sort_by_key(|(_, t)| *t);
+        let to_remove = limiter.len() - LOGIN_RATE_LIMIT_MAX_KEYS;
+        for (k, _) in entries.into_iter().take(to_remove) {
+            limiter.remove(&k);
+        }
+    }
+
+    true
+}
+
+/// Extract the client IP address from request headers.
+/// Checks `x-forwarded-for` first, then `x-real-ip`, then falls back to "unknown".
+fn extract_client_ip(headers: &HeaderMap) -> String {
+    if let Some(forwarded) = headers.get("x-forwarded-for") {
+        if let Ok(value) = forwarded.to_str() {
+            // x-forwarded-for can contain multiple IPs; the first is the client
+            if let Some(first_ip) = value.split(',').next() {
+                let ip = first_ip.trim();
+                if !ip.is_empty() {
+                    return ip.to_string();
+                }
+            }
+        }
+    }
+
+    if let Some(real_ip) = headers.get("x-real-ip") {
+        if let Ok(value) = real_ip.to_str() {
+            let ip = value.trim();
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
+        }
+    }
+
+    "unknown".to_string()
 }
 
 // ─── Extractors ──────────────────────────────────
@@ -217,11 +301,20 @@ pub struct MessageResponse {
 pub async fn login_handler(
     State(state): State<ApiState>,
     cookies: Cookies,
+    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
+    let client_ip = extract_client_ip(&headers);
+
+    // Rate limit login attempts by IP to prevent distributed brute force across many emails
+    if !check_ip_rate_limit(&client_ip) {
+        tracing::warn!(ip = %client_ip, "Login IP rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     // Rate limit login attempts by email to prevent brute force and bcrypt CPU exhaustion
     if !check_login_rate_limit(&body.email) {
-        tracing::warn!(email = %body.email, "Login rate limit exceeded");
+        tracing::warn!(email = %body.email, ip = %client_ip, "Login rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -234,19 +327,35 @@ pub async fn login_handler(
     // Look up user by email
     let user = db
         .get_user_by_email(&body.email)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Verify password (spawn_blocking to avoid blocking the async runtime)
+    // Always perform bcrypt verification to prevent timing oracle that reveals user existence.
+    // When no user is found, verify against a dummy hash to equalize response time.
+    let (hash_to_verify, user_found) = match user {
+        Some(ref u) => (u.password_hash.clone(), true),
+        None => {
+            // Pre-computed bcrypt hash of "dummy" with cost 12. The actual value doesn't matter;
+            // the goal is to spend the same CPU time as a real verification to prevent
+            // attackers from enumerating valid email addresses via response timing.
+            (
+                "$2b$12$K4v3LB7TzMIXvbQZDz1F9eZ8cU2smBGz.iAU5h1DhGGCk5mPIFY3K".to_string(),
+                false,
+            )
+        }
+    };
+
     let pw = body.password.clone();
-    let hash = user.password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(&pw, &hash))
+    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(&pw, &hash_to_verify))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if !valid {
+        .unwrap_or(false);
+
+    if !user_found || !valid {
         return Err(StatusCode::UNAUTHORIZED);
     }
+
+    // SAFETY: user_found is true so user is Some
+    let user = user.unwrap();
 
     // Create session
     let expires_at = chrono::Utc::now() + chrono::Duration::days(SESSION_MAX_AGE_DAYS);
@@ -790,6 +899,7 @@ mod tests {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
         }

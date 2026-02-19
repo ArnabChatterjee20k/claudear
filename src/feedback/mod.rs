@@ -18,4 +18,7 @@ pub use issue_embeddings::{
     format_similar_issues_context, IssueEmbeddingConfig, IssueEmbeddingService,
     SimilarIssueWithDetails,
 };
-pub use outcomes::{FixOutcome, Outcome, OutcomeTracker};
+pub use outcomes::{
+    build_error_reference_embeddings, categorize_error_semantic, FixOutcome, Outcome,
+    OutcomeTracker,
+};

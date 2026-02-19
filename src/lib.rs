@@ -31,6 +31,7 @@ pub mod config;
 pub mod discord;
 pub mod env_writer;
 pub mod error;
+pub mod evaluation;
 pub mod feedback;
 pub mod github;
 pub mod github_app;
@@ -57,9 +58,12 @@ pub mod users;
 pub mod watcher;
 pub mod webhook;
 
-pub use config::{CascadeConfig, CodeIndexConfig, Config, RetryConfig};
+pub use config::{CascadeConfig, CodeIndexConfig, Config, EvaluationConfig, RetryConfig};
 pub use discord::{DiscordClient, ThreadManager, ThreadState};
 pub use error::{Error, Result};
+pub use evaluation::{
+    CodeQualityEvaluator, Diagnostic, EvalCategory, EvalDelta, EvalSnapshot, EvaluationResult,
+};
 pub use feedback::{
     cosine_similarity, euclidean_distance, format_similar_issues_context, normalize,
     EmbeddingClient, EmbeddingConfig, EmbeddingResult, FeedbackAnalyzer, FixOutcome,

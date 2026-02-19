@@ -1718,6 +1718,19 @@ impl ReviewCategory {
             _ => Self::Other,
         }
     }
+
+    /// Return all classified variants (excluding Other).
+    pub fn classified_variants() -> &'static [ReviewCategory] {
+        &[
+            ReviewCategory::MissingTests,
+            ReviewCategory::StyleIssue,
+            ReviewCategory::WrongApproach,
+            ReviewCategory::Incomplete,
+            ReviewCategory::Security,
+            ReviewCategory::Performance,
+            ReviewCategory::Documentation,
+        ]
+    }
 }
 
 /// A classified review feedback pattern.

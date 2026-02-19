@@ -1,9 +1,10 @@
 //! Content-based issue clustering.
 //!
 //! Groups issues that share `(error_type, culprit)` and have similar titles,
-//! using Jaccard token similarity.
+//! using Jaccard token similarity or embedding-based cosine similarity.
 
 use crate::config::PrioritisationConfig;
+use crate::feedback::cosine_similarity;
 use crate::types::{ContentCluster, Issue, MatchResult};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -11,11 +12,14 @@ use std::collections::HashMap;
 /// Detect content clusters among a set of candidate issues.
 ///
 /// Phase 1: bucket by `(error_type, culprit)` exact match.
-/// Phase 2: verify title similarity within each bucket via Jaccard.
+/// Phase 2: verify similarity within each bucket. Prefers embedding-based
+/// cosine similarity when embeddings are available for all sampled issues;
+/// otherwise falls back to Jaccard token similarity on titles.
 /// Discard buckets below `min_content_cluster_size` or below `cluster_similarity_threshold`.
 pub fn detect(
     candidates: &[(Issue, MatchResult)],
     config: &PrioritisationConfig,
+    embeddings: &HashMap<String, Vec<f32>>,
 ) -> Vec<ContentCluster> {
     // Phase 1: bucket by (error_type, culprit) exact match.
     let mut buckets: HashMap<(String, String), Vec<usize>> = HashMap::new();
@@ -46,7 +50,7 @@ pub fn detect(
             continue;
         }
 
-        // Phase 2: compute average pairwise title similarity.
+        // Phase 2: compute average pairwise similarity.
         // Cap the sample to avoid O(N^2) blow-up on large buckets.
         let sampled_indices: &[usize] = if indices.len() > MAX_BUCKET_SAMPLE {
             &indices[..MAX_BUCKET_SAMPLE]
@@ -58,7 +62,13 @@ pub fn detect(
             .map(|&i| candidates[i].0.title.as_str())
             .collect();
 
-        let avg_sim = average_pairwise_similarity(&titles);
+        // Try embedding-based similarity first; fall back to Jaccard on titles.
+        let sampled_ids: Vec<&str> = sampled_indices
+            .iter()
+            .map(|&i| candidates[i].0.id.as_str())
+            .collect();
+        let avg_sim = average_pairwise_embedding_similarity(&sampled_ids, embeddings)
+            .unwrap_or_else(|| average_pairwise_similarity(&titles));
 
         if avg_sim < config.cluster_similarity_threshold {
             continue;
@@ -170,6 +180,49 @@ fn average_pairwise_similarity(titles: &[&str]) -> f64 {
     total / count as f64
 }
 
+/// Compute cosine similarity between two issues using their embedding vectors.
+///
+/// Returns `Some(similarity)` if both IDs have embeddings, `None` otherwise.
+fn embedding_similarity(
+    id_a: &str,
+    id_b: &str,
+    embeddings: &HashMap<String, Vec<f32>>,
+) -> Option<f64> {
+    let vec_a = embeddings.get(id_a)?;
+    let vec_b = embeddings.get(id_b)?;
+    Some(cosine_similarity(vec_a, vec_b) as f64)
+}
+
+/// Compute average pairwise embedding similarity for a list of issue IDs.
+///
+/// Returns `Some(avg)` if all pairs have embeddings, `None` if any pair is missing
+/// (caller should fall back to Jaccard).
+fn average_pairwise_embedding_similarity(
+    issue_ids: &[&str],
+    embeddings: &HashMap<String, Vec<f32>>,
+) -> Option<f64> {
+    if issue_ids.len() < 2 {
+        return Some(1.0);
+    }
+
+    let mut total = 0.0;
+    let mut count = 0u64;
+
+    for i in 0..issue_ids.len() {
+        for j in (i + 1)..issue_ids.len() {
+            let sim = embedding_similarity(issue_ids[i], issue_ids[j], embeddings)?;
+            total += sim;
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return Some(0.0);
+    }
+
+    Some(total / count as f64)
+}
+
 /// Get the set of issue IDs that belong to any cluster.
 pub fn clustered_issue_ids(clusters: &[ContentCluster]) -> std::collections::HashSet<String> {
     clusters
@@ -243,7 +296,7 @@ mod tests {
             cluster_similarity_threshold: 0.3,
             ..Default::default()
         };
-        let clusters = detect(&candidates, &config);
+        let clusters = detect(&candidates, &config, &HashMap::new());
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].issue_ids.len(), 2);
     }
@@ -259,7 +312,7 @@ mod tests {
             cluster_similarity_threshold: 0.90,
             ..Default::default()
         };
-        let clusters = detect(&candidates, &config);
+        let clusters = detect(&candidates, &config, &HashMap::new());
         assert!(clusters.is_empty());
     }
 
@@ -272,7 +325,7 @@ mod tests {
             "x",
         )];
         let config = PrioritisationConfig::default();
-        let clusters = detect(&candidates, &config);
+        let clusters = detect(&candidates, &config, &HashMap::new());
         assert!(clusters.is_empty());
     }
 
@@ -296,7 +349,7 @@ mod tests {
             cluster_similarity_threshold: 0.3,
             ..Default::default()
         };
-        let clusters = detect(&candidates, &config);
+        let clusters = detect(&candidates, &config, &HashMap::new());
         assert_eq!(clusters.len(), 1);
         // With 60 issues but a sample cap of 50, only 50 should be in the cluster
         assert_eq!(
@@ -305,6 +358,100 @@ mod tests {
             "Cluster membership should be limited to the sampling cap (50), got {}",
             clusters[0].issue_ids.len()
         );
+    }
+
+    #[test]
+    fn detect_clusters_with_embeddings() {
+        // Two issues with identical (error_type, culprit) and high cosine similarity
+        // but completely different titles (would fail Jaccard).
+        let candidates = vec![
+            make_candidate("e1", "completely different title", "TypeError", "handler"),
+            make_candidate("e2", "another unrelated heading", "TypeError", "handler"),
+        ];
+
+        // Create embedding vectors with high cosine similarity.
+        // [1, 0, 0] dot [0.99, 0.14, 0] / (1 * sqrt(0.99^2 + 0.14^2)) ~= 0.99
+        let mut embeddings: HashMap<String, Vec<f32>> = HashMap::new();
+        embeddings.insert("e1".into(), vec![1.0, 0.0, 0.0]);
+        embeddings.insert("e2".into(), vec![0.99, 0.14, 0.0]);
+
+        let config = PrioritisationConfig {
+            min_content_cluster_size: 2,
+            cluster_similarity_threshold: 0.90,
+            ..Default::default()
+        };
+
+        // With empty embeddings, Jaccard on these titles would be far below 0.90
+        // so no cluster would be formed.
+        let clusters_jaccard = detect(&candidates, &config, &HashMap::new());
+        assert!(
+            clusters_jaccard.is_empty(),
+            "Jaccard fallback should NOT cluster these dissimilar titles"
+        );
+
+        // With embeddings, cosine similarity is ~0.99 which exceeds the 0.90 threshold.
+        let clusters_emb = detect(&candidates, &config, &embeddings);
+        assert_eq!(
+            clusters_emb.len(),
+            1,
+            "Embedding path should form a cluster"
+        );
+        assert_eq!(clusters_emb[0].issue_ids.len(), 2);
+        assert!(clusters_emb[0].avg_similarity > 0.90);
+    }
+
+    #[test]
+    fn embedding_similarity_partial_fallback() {
+        // When only one issue has an embedding, the system should fall back to Jaccard.
+        let candidates = vec![
+            make_candidate(
+                "f1",
+                "TypeError in payment handler",
+                "TypeError",
+                "payment.handler",
+            ),
+            make_candidate(
+                "f2",
+                "TypeError in payment processor",
+                "TypeError",
+                "payment.handler",
+            ),
+        ];
+
+        let mut embeddings: HashMap<String, Vec<f32>> = HashMap::new();
+        // Only f1 has an embedding, f2 does not.
+        embeddings.insert("f1".into(), vec![1.0, 0.0, 0.0]);
+
+        let config = PrioritisationConfig {
+            min_content_cluster_size: 2,
+            cluster_similarity_threshold: 0.3,
+            ..Default::default()
+        };
+
+        // Should still form a cluster via Jaccard fallback since titles are similar.
+        let clusters = detect(&candidates, &config, &embeddings);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].issue_ids.len(), 2);
+    }
+
+    #[test]
+    fn embedding_similarity_function_basic() {
+        let mut embeddings: HashMap<String, Vec<f32>> = HashMap::new();
+        embeddings.insert("a".into(), vec![1.0, 0.0, 0.0]);
+        embeddings.insert("b".into(), vec![1.0, 0.0, 0.0]);
+        embeddings.insert("c".into(), vec![0.0, 1.0, 0.0]);
+
+        // Identical vectors -> similarity 1.0
+        let sim = embedding_similarity("a", "b", &embeddings);
+        assert!((sim.unwrap() - 1.0).abs() < 0.001);
+
+        // Orthogonal vectors -> similarity 0.0
+        let sim = embedding_similarity("a", "c", &embeddings);
+        assert!(sim.unwrap().abs() < 0.001);
+
+        // Missing ID -> None
+        let sim = embedding_similarity("a", "missing", &embeddings);
+        assert!(sim.is_none());
     }
 
     #[test]

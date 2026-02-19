@@ -32,7 +32,6 @@ pub struct ClaudeConfig {
     pub skip_permissions: bool,
 }
 
-
 /// Main configuration for the application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -113,6 +112,9 @@ pub struct Config {
     /// Code indexing configuration.
     #[serde(default)]
     pub code_index: CodeIndexConfig,
+    /// Self-evaluation configuration.
+    #[serde(default)]
+    pub evaluation: EvaluationConfig,
     /// General-purpose storage directory for user uploads (avatars, etc.).
     #[serde(default = "default_storage_dir")]
     pub storage_dir: PathBuf,
@@ -179,6 +181,7 @@ impl Default for Config {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            evaluation: EvaluationConfig::default(),
             storage_dir: default_storage_dir(),
             dashboard: DashboardConfig::default(),
         }
@@ -262,6 +265,10 @@ pub struct LearningConfig {
     pub min_cluster_size: usize,
     /// Auto-generate AGENT.md from accumulated knowledge (opt-in).
     pub auto_agent_md: bool,
+    /// Enable cross-repo failure correlation detection.
+    pub cross_repo_correlation: bool,
+    /// Time window for cross-repo correlation in hours.
+    pub cross_repo_window_hours: i64,
 }
 
 impl Default for LearningConfig {
@@ -280,6 +287,8 @@ impl Default for LearningConfig {
             cluster_window_minutes: 30,
             min_cluster_size: 3,
             auto_agent_md: false,
+            cross_repo_correlation: true,
+            cross_repo_window_hours: 24,
         }
     }
 }
@@ -302,6 +311,58 @@ impl Default for CodeIndexConfig {
             enabled: true,
             max_file_size_kb: 1024,
             batch_size: 32,
+        }
+    }
+}
+
+/// Self-evaluation configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvaluationConfig {
+    /// Enable evaluation (opt-in, can be slow).
+    pub enabled: bool,
+    /// Run test before/after comparison.
+    pub test_delta: bool,
+    /// Run lint before/after comparison.
+    pub lint_delta: bool,
+    /// Run static analysis before/after comparison.
+    pub static_analysis_delta: bool,
+    /// Run coverage before/after comparison (slowest).
+    pub coverage_delta: bool,
+    /// Timeout per tool in seconds.
+    pub tool_timeout_secs: u64,
+    /// Total timeout for all tools in seconds.
+    pub total_timeout_secs: u64,
+    /// Post evaluation results as PR comment.
+    pub post_pr_comment: bool,
+    /// Fail the fix attempt on regression.
+    pub fail_on_regression: bool,
+    /// Custom test command override.
+    pub custom_test_cmd: Option<String>,
+    /// Custom lint command override.
+    pub custom_lint_cmd: Option<String>,
+    /// Custom static analysis command override.
+    pub custom_analysis_cmd: Option<String>,
+    /// Custom coverage command override.
+    pub custom_coverage_cmd: Option<String>,
+}
+
+impl Default for EvaluationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            test_delta: true,
+            lint_delta: true,
+            static_analysis_delta: true,
+            coverage_delta: false,
+            tool_timeout_secs: 300,
+            total_timeout_secs: 900,
+            post_pr_comment: true,
+            fail_on_regression: false,
+            custom_test_cmd: None,
+            custom_lint_cmd: None,
+            custom_analysis_cmd: None,
+            custom_coverage_cmd: None,
         }
     }
 }
@@ -4735,6 +4796,8 @@ another_unknown = 42
             cluster_window_minutes: 45,
             min_cluster_size: 7,
             auto_agent_md: true,
+            cross_repo_correlation: true,
+            cross_repo_window_hours: 48,
         };
         let toml_str = toml::to_string(&config).unwrap();
         let restored: LearningConfig = toml::from_str(&toml_str).unwrap();

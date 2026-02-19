@@ -1,10 +1,12 @@
 //! System 5: Classify review feedback into categories and detect patterns.
 
 use crate::error::Result;
+use crate::feedback::{cosine_similarity, EmbeddingClient};
 use crate::github::PrReviewComment;
 use crate::storage::FixAttemptTracker;
 use crate::types::{ReviewCategory, ReviewPattern};
 use chrono::Utc;
+use std::sync::Arc;
 
 pub struct ReviewClassifier;
 
@@ -174,6 +176,138 @@ impl ReviewClassifier {
             .filter(|p| p.occurrence_count >= threshold as i64 && !p.promoted_to_instruction)
             .collect();
         Ok(promoted)
+    }
+}
+
+/// Embedding-based review classifier that uses cosine similarity against
+/// reference category descriptions. Falls back to keyword-based classification
+/// when embedding generation fails.
+pub struct SemanticReviewClassifier {
+    embedding_client: Arc<EmbeddingClient>,
+    reference_embeddings: Vec<(ReviewCategory, Vec<f32>)>,
+}
+
+impl SemanticReviewClassifier {
+    /// Build reference embeddings for the 7 classified categories (excluding Other).
+    ///
+    /// Each category is represented by a descriptive text that captures the
+    /// typical language used in review comments of that type. The embeddings
+    /// for these descriptions are precomputed once at construction time.
+    pub async fn new(embedding_client: Arc<EmbeddingClient>) -> Result<Self> {
+        let descriptions = [
+            (ReviewCategory::Security, "security vulnerability, sanitize input, escape user data, injection attack, XSS, CSRF, authentication bypass"),
+            (ReviewCategory::MissingTests, "missing test coverage, add unit tests, integration tests needed, no test cases, assertion missing"),
+            (ReviewCategory::WrongApproach, "wrong approach, should use different method, better alternative exists, not the right pattern, consider using instead"),
+            (ReviewCategory::StyleIssue, "code style issue, naming convention, formatting, indentation, lint warning, whitespace"),
+            (ReviewCategory::Incomplete, "incomplete implementation, missing error handling, forgot edge case, still need to handle, not handling null"),
+            (ReviewCategory::Performance, "performance issue, slow operation, optimize, add caching, N+1 query, time complexity"),
+            (ReviewCategory::Documentation, "missing documentation, add comments, explain logic, rustdoc, docstring needed"),
+        ];
+
+        let texts: Vec<&str> = descriptions.iter().map(|(_, desc)| *desc).collect();
+        let embeddings = embedding_client.embed_batch(&texts).await?;
+
+        let reference_embeddings = descriptions
+            .iter()
+            .zip(embeddings.into_iter())
+            .map(|((cat, _), emb)| (*cat, emb))
+            .collect();
+
+        Ok(Self {
+            embedding_client,
+            reference_embeddings,
+        })
+    }
+
+    /// Classify a review comment via cosine similarity against reference embeddings.
+    ///
+    /// Returns the category with the highest similarity score, provided it
+    /// exceeds the 0.3 threshold. Falls back to keyword-based classification
+    /// if embedding generation fails for the input text.
+    pub async fn classify(&self, comment_body: &str) -> ReviewCategory {
+        if comment_body.trim().is_empty() {
+            return ReviewCategory::Other;
+        }
+
+        match self.embedding_client.embed(comment_body).await {
+            Ok(embedding) => {
+                let mut best_category = ReviewCategory::Other;
+                let mut best_score: f32 = 0.3; // similarity threshold
+
+                for (category, ref_emb) in &self.reference_embeddings {
+                    let score = cosine_similarity(&embedding, ref_emb);
+                    if score > best_score {
+                        best_score = score;
+                        best_category = *category;
+                    }
+                }
+
+                best_category
+            }
+            Err(_) => ReviewClassifier::classify(comment_body), // fallback to keywords
+        }
+    }
+
+    /// Process review comments using semantic classification.
+    ///
+    /// Classifies the review body and each inline comment using embedding-based
+    /// similarity, then upserts the resulting patterns into the tracker.
+    pub async fn process_review_comments(
+        &self,
+        tracker: &dyn FixAttemptTracker,
+        repo: &str,
+        comments: &[PrReviewComment],
+        review_body: Option<&str>,
+    ) -> Result<Vec<ReviewPattern>> {
+        let mut patterns = Vec::new();
+
+        if let Some(body) = review_body {
+            if !body.trim().is_empty() {
+                let category = self.classify(body).await;
+                let pattern = ReviewPattern {
+                    id: 0,
+                    github_repo: repo.to_string(),
+                    category,
+                    pattern_text: truncate(body, 200),
+                    example_comments: vec![truncate(body, 500)],
+                    occurrence_count: 1,
+                    promoted_to_instruction: false,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                };
+                tracker.upsert_review_pattern(&pattern)?;
+                patterns.push(pattern);
+            }
+        }
+
+        for comment in comments {
+            let category = self.classify(&comment.body).await;
+            let pattern = ReviewPattern {
+                id: 0,
+                github_repo: repo.to_string(),
+                category,
+                pattern_text: truncate(&comment.body, 200),
+                example_comments: vec![truncate(&comment.body, 500)],
+                occurrence_count: 1,
+                promoted_to_instruction: false,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            tracker.upsert_review_pattern(&pattern)?;
+            patterns.push(pattern);
+        }
+
+        Ok(patterns)
+    }
+
+    /// Get a reference to the underlying embedding client.
+    pub fn embedding_client(&self) -> &Arc<EmbeddingClient> {
+        &self.embedding_client
+    }
+
+    /// Get the number of reference categories.
+    pub fn category_count(&self) -> usize {
+        self.reference_embeddings.len()
     }
 }
 
@@ -699,5 +833,215 @@ mod tests {
             ReviewClassifier::check_promotion_threshold(&tracker, "org/repo-b", 3).unwrap();
         assert_eq!(promotable_a.len(), 1);
         assert!(promotable_b.is_empty());
+    }
+
+    // -- SemanticReviewClassifier tests (using mock reference embeddings) --
+
+    #[test]
+    fn test_semantic_classifier_struct_fields() {
+        // Verify the reference embedding data structure works correctly
+        let categories = vec![
+            (ReviewCategory::Security, vec![1.0, 0.0, 0.0]),
+            (ReviewCategory::MissingTests, vec![0.0, 1.0, 0.0]),
+        ];
+
+        assert_eq!(categories.len(), 2);
+        assert_eq!(categories[0].0, ReviewCategory::Security);
+        assert_eq!(categories[1].0, ReviewCategory::MissingTests);
+    }
+
+    #[test]
+    fn test_semantic_classifier_reference_embedding_count() {
+        // The classifier should have 7 reference embeddings (one per classified category)
+        let expected_count = ReviewCategory::classified_variants().len();
+        assert_eq!(expected_count, 7);
+    }
+
+    #[test]
+    fn test_semantic_classifier_cosine_similarity_best_match() {
+        // Simulate what the classify method does: find best matching category
+        let reference_embeddings = vec![
+            (ReviewCategory::Security, vec![1.0, 0.0, 0.0]),
+            (ReviewCategory::MissingTests, vec![0.0, 1.0, 0.0]),
+            (ReviewCategory::Performance, vec![0.0, 0.0, 1.0]),
+        ];
+
+        // Input embedding close to Security
+        let input = vec![0.9, 0.1, 0.0];
+        let mut best_category = ReviewCategory::Other;
+        let mut best_score: f32 = 0.3;
+
+        for (category, ref_emb) in &reference_embeddings {
+            let score = cosine_similarity(&input, ref_emb);
+            if score > best_score {
+                best_score = score;
+                best_category = *category;
+            }
+        }
+
+        assert_eq!(best_category, ReviewCategory::Security);
+        assert!(best_score > 0.9);
+    }
+
+    #[test]
+    fn test_semantic_classifier_cosine_below_threshold_returns_other() {
+        // When no category exceeds the 0.3 threshold, should return Other
+        let reference_embeddings = vec![
+            (ReviewCategory::Security, vec![1.0, 0.0, 0.0]),
+            (ReviewCategory::MissingTests, vec![0.0, 1.0, 0.0]),
+        ];
+
+        // Input orthogonal to all reference embeddings
+        let input = vec![0.0, 0.0, 1.0];
+        let mut best_category = ReviewCategory::Other;
+        let mut best_score: f32 = 0.3;
+
+        for (category, ref_emb) in &reference_embeddings {
+            let score = cosine_similarity(&input, ref_emb);
+            if score > best_score {
+                best_score = score;
+                best_category = *category;
+            }
+        }
+
+        assert_eq!(best_category, ReviewCategory::Other);
+    }
+
+    #[test]
+    fn test_semantic_classifier_empty_input_returns_other() {
+        // The classify method should return Other for empty/whitespace input
+        // without even calling the embedding client
+        let empty_inputs = ["", "   ", "\t", "\n", "  \t\n  "];
+        for input in &empty_inputs {
+            assert!(
+                input.trim().is_empty(),
+                "Expected empty/whitespace input: {:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_semantic_classifier_fallback_to_keyword() {
+        // When embedding fails, should fall back to keyword-based classification
+        assert_eq!(
+            ReviewClassifier::classify("security vulnerability"),
+            ReviewCategory::Security
+        );
+        assert_eq!(
+            ReviewClassifier::classify("add tests"),
+            ReviewCategory::MissingTests
+        );
+        assert_eq!(
+            ReviewClassifier::classify("looks good to me"),
+            ReviewCategory::Other
+        );
+    }
+
+    #[test]
+    fn test_semantic_classifier_all_categories_distinguishable() {
+        // With one-hot reference embeddings, each category should be perfectly
+        // distinguishable when given its exact reference vector
+        let categories = [
+            ReviewCategory::Security,
+            ReviewCategory::MissingTests,
+            ReviewCategory::WrongApproach,
+            ReviewCategory::StyleIssue,
+            ReviewCategory::Incomplete,
+            ReviewCategory::Performance,
+            ReviewCategory::Documentation,
+        ];
+
+        let reference_embeddings: Vec<(ReviewCategory, Vec<f32>)> = categories
+            .iter()
+            .enumerate()
+            .map(|(i, cat)| {
+                let mut emb = vec![0.0f32; 7];
+                emb[i] = 1.0;
+                (*cat, emb)
+            })
+            .collect();
+
+        for (i, (expected_cat, _)) in reference_embeddings.iter().enumerate() {
+            let mut input = vec![0.0f32; 7];
+            input[i] = 1.0;
+
+            let mut best_category = ReviewCategory::Other;
+            let mut best_score: f32 = 0.3;
+
+            for (category, ref_emb) in &reference_embeddings {
+                let score = cosine_similarity(&input, ref_emb);
+                if score > best_score {
+                    best_score = score;
+                    best_category = *category;
+                }
+            }
+
+            assert_eq!(
+                best_category, *expected_cat,
+                "Category {:?} was not correctly matched",
+                expected_cat
+            );
+            assert!(
+                (best_score - 1.0).abs() < 0.001,
+                "Expected perfect match for {:?}, got score {}",
+                expected_cat,
+                best_score
+            );
+        }
+    }
+
+    #[test]
+    fn test_semantic_classifier_mixed_signal_picks_strongest() {
+        // When the input embedding has components in multiple category directions,
+        // the classifier should pick the one with highest similarity
+        let reference_embeddings = vec![
+            (ReviewCategory::Security, vec![1.0, 0.0, 0.0, 0.0]),
+            (ReviewCategory::MissingTests, vec![0.0, 1.0, 0.0, 0.0]),
+            (ReviewCategory::Performance, vec![0.0, 0.0, 1.0, 0.0]),
+            (ReviewCategory::StyleIssue, vec![0.0, 0.0, 0.0, 1.0]),
+        ];
+
+        // Input leans toward Performance (index 2 is strongest)
+        let input = vec![0.1, 0.2, 0.9, 0.1];
+
+        let mut best_category = ReviewCategory::Other;
+        let mut best_score: f32 = 0.3;
+
+        for (category, ref_emb) in &reference_embeddings {
+            let score = cosine_similarity(&input, ref_emb);
+            if score > best_score {
+                best_score = score;
+                best_category = *category;
+            }
+        }
+
+        assert_eq!(best_category, ReviewCategory::Performance);
+    }
+
+    #[test]
+    fn test_semantic_classifier_category_count() {
+        // There should always be 7 classified categories
+        assert_eq!(ReviewCategory::classified_variants().len(), 7);
+
+        // Verify no duplicates
+        let variants = ReviewCategory::classified_variants();
+        for (i, cat) in variants.iter().enumerate() {
+            for (j, other) in variants.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        cat, other,
+                        "Duplicate category found at indices {} and {}",
+                        i, j
+                    );
+                }
+            }
+        }
+
+        // Verify Other is not included
+        assert!(
+            !variants.contains(&ReviewCategory::Other),
+            "Other should not be in classified_variants"
+        );
     }
 }

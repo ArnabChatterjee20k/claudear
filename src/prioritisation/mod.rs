@@ -27,6 +27,7 @@ pub fn prioritise(
     config: &PrioritisationConfig,
     candidates: Vec<(Issue, MatchResult)>,
     tracker: &dyn FixAttemptTracker,
+    embeddings: &std::collections::HashMap<String, Vec<f32>>,
 ) -> (Vec<PrioritisedIssue>, Vec<(Issue, SuppressionResult)>) {
     // Step 1: Suppress -- consume candidates without cloning by partitioning
     // into kept and suppressed via the suppression engine.
@@ -53,7 +54,7 @@ pub fn prioritise(
 
     // Step 2 + 3: Detect content clusters (needs full candidate list for grouping)
     let clusters = if config.content_clustering {
-        content_cluster::detect(&kept, config)
+        content_cluster::detect(&kept, config, embeddings)
     } else {
         Vec::new()
     };
@@ -229,7 +230,12 @@ mod tests {
             ),
         ];
         let tracker = NoOpTracker;
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(suppressed.is_empty());
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].issue.id, "crit");
@@ -259,7 +265,12 @@ mod tests {
             ),
         ];
         let tracker = NoOpTracker;
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].issue.id, "real");
         assert_eq!(suppressed.len(), 1);
@@ -281,7 +292,12 @@ mod tests {
         let tracker = NoOpTracker;
         // Even when disabled at the config level, the function itself still works.
         // The caller decides whether to call it based on config.enabled.
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
     }
 
@@ -308,7 +324,12 @@ mod tests {
 
         let candidates = vec![docs_candidate, auth_candidate];
         let tracker = NoOpTracker;
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].issue.id, "auth");
         assert_eq!(result[0].blast_radius, crate::types::BlastRadius::Critical);
     }
@@ -319,7 +340,8 @@ mod tests {
     fn test_empty_candidates() {
         let config = PrioritisationConfig::default();
         let tracker = NoOpTracker;
-        let (result, suppressed) = prioritise(&config, vec![], &tracker);
+        let (result, suppressed) =
+            prioritise(&config, vec![], &tracker, &std::collections::HashMap::new());
         assert!(result.is_empty(), "empty input must produce empty output");
         assert!(suppressed.is_empty());
     }
@@ -334,7 +356,12 @@ mod tests {
             IssuePriority::High,
             MatchPriority::High,
         )];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         assert!(suppressed.is_empty());
         assert_eq!(result[0].issue.id, "only");
@@ -368,7 +395,12 @@ mod tests {
             make_candidate("b", "Bug B", IssuePriority::Low, MatchPriority::Low),
             make_candidate("c", "Bug C", IssuePriority::Critical, MatchPriority::Urgent),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             result.is_empty(),
             "all candidates should be suppressed, got {} remaining",
@@ -416,7 +448,12 @@ mod tests {
         issue2.set_metadata("culprit", "payment.handler");
 
         let candidates = vec![(issue1, mr1), (issue2, mr2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(result.len(), 2);
         // Both should have a cluster_key set
@@ -473,7 +510,12 @@ mod tests {
         issue2.set_metadata("culprit", "payment.handler");
 
         let candidates = vec![(issue1, mr1), (issue2, mr2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(result.len(), 2);
         for pi in &result {
@@ -510,7 +552,12 @@ mod tests {
                 MatchPriority::High,
             ),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(suppressed.is_empty());
         assert_eq!(result.len(), 4);
 
@@ -567,7 +614,12 @@ mod tests {
                 MatchPriority::Normal,
             ),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(
             suppressed.len(),
@@ -714,7 +766,12 @@ mod tests {
         issue2.set_metadata("culprit", "payment.handler");
 
         let tracker = ClusterTrackingTracker::new();
-        let (result, _) = prioritise(&config, vec![(issue1, mr1), (issue2, mr2)], &tracker);
+        let (result, _) = prioritise(
+            &config,
+            vec![(issue1, mr1), (issue2, mr2)],
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(result.len(), 2);
 
@@ -747,7 +804,12 @@ mod tests {
         dup2.0.title = "Second".into();
 
         let candidates = vec![dup1, dup2];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(suppressed.is_empty());
         // Duplicate issue IDs are deduplicated: the match_map is keyed by id,
         // so the second insert overwrites the first. On rebuild the first issue
@@ -781,7 +843,12 @@ mod tests {
         issue.set_metadata("filename", "src/auth/login.rs");
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         assert!(
             result[0].severity_score.score.is_finite(),
@@ -806,7 +873,12 @@ mod tests {
         issue.set_metadata("user_count", 0i64);
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         let score = &result[0].severity_score;
         assert!(
@@ -833,7 +905,12 @@ mod tests {
         issue.set_metadata("escalation_rate", -1.0);
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         let score = &result[0].severity_score;
         assert!(
@@ -861,7 +938,12 @@ mod tests {
             ),
             make_candidate("low", "Low bug", IssuePriority::Low, MatchPriority::Low),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 2);
         // IssuePriority::None (0.0) + MatchPriority::Low (0.25) < Low (0.25) + Low (0.25)
         assert_eq!(result[0].issue.id, "low");
@@ -893,7 +975,12 @@ mod tests {
         issue.set_metadata("filename", "src/auth/login.rs");
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         let score = &result[0].severity_score;
 
         assert!(score.severity_component > 0.0, "severity should be > 0");
@@ -932,7 +1019,12 @@ mod tests {
             ),
             make_candidate("low", "Low", IssuePriority::Low, MatchPriority::Low),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 2);
         for pi in &result {
             assert!(
@@ -959,7 +1051,12 @@ mod tests {
             make_candidate("high", "High", IssuePriority::High, MatchPriority::High),
             make_candidate("low", "Low", IssuePriority::Low, MatchPriority::Low),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].issue.id, "high");
         assert_eq!(result[1].issue.id, "low");
 
@@ -1012,7 +1109,12 @@ mod tests {
         issue2.set_metadata("culprit", "handler");
 
         let candidates = vec![(issue1, mr1), (issue2, mr2)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             result.is_empty(),
@@ -1066,7 +1168,12 @@ mod tests {
         issue2.set_metadata("culprit", "handler");
 
         let candidates = vec![(issue1, mr1), (issue2, mr2)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(result.len(), 1, "one issue should remain");
         assert_eq!(suppressed.len(), 1, "one issue should be suppressed");
@@ -1109,7 +1216,12 @@ mod tests {
             make_clusterable("k2", "ValueError in parser engine"),
             make_clusterable("k3", "ValueError in third parser path"),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "k3");
@@ -1137,7 +1249,12 @@ mod tests {
             make_candidate("b", "Bug B", IssuePriority::Medium, MatchPriority::Normal),
             make_candidate("c", "Bug C", IssuePriority::Medium, MatchPriority::Normal),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 3);
         // All should have equal scores
         let scores: Vec<f64> = result.iter().map(|pi| pi.severity_score.score).collect();
@@ -1166,7 +1283,12 @@ mod tests {
                 MatchPriority::Urgent,
             ),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 5);
 
         let expected_order = ["crit", "high", "med", "low", "none"];
@@ -1235,7 +1357,12 @@ mod tests {
         );
 
         let candidates = vec![(c1, mr1), (c2, mr2), solo];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 3);
 
         // Clustered Low issues get: 0.30 * severity + 0.50 * 1.0 (cluster_boost)
@@ -1292,7 +1419,12 @@ mod tests {
         issue2.set_metadata("culprit", "payment.handler");
 
         let candidates = vec![(issue1, mr1), (issue2, mr2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 2);
         // Titles are similar but not 99%+ so no cluster should form
         for pi in &result {
@@ -1333,7 +1465,12 @@ mod tests {
             make_similar("m2", "beta"),
             make_similar("m3", "gamma"),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 3);
         for pi in &result {
             assert!(
@@ -1369,7 +1506,12 @@ mod tests {
         docs.set_metadata("filename", "README.md");
 
         let candidates = vec![(auth, mr_auth), (docs, mr_docs)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 2);
 
         // With blast_radius_weight=0, the blast_radius classification still
@@ -1398,7 +1540,12 @@ mod tests {
             IssuePriority::None,
             MatchPriority::Low,
         )];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         let score = &result[0].severity_score;
 
@@ -1466,7 +1613,12 @@ mod tests {
         };
 
         let candidates = vec![(issue, mr), (issue2, mr2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(result.len() >= 1);
 
         let score = &result[0].severity_score;
@@ -1529,7 +1681,12 @@ mod tests {
             },
         ];
 
-        let (result, _) = prioritise(&config, test_cases, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            test_cases,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         for pi in &result {
             let s = &pi.severity_score;
             assert!(
@@ -1582,7 +1739,12 @@ mod tests {
             })
             .collect();
 
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 100);
 
         // Verify descending order
@@ -1630,7 +1792,12 @@ mod tests {
             })
             .collect();
 
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             suppressed.len(),
             25,
@@ -1697,7 +1864,12 @@ mod tests {
             issue.set_metadata("filename", *filename);
 
             let candidates = vec![(issue, mr)];
-            let (result, _) = prioritise(&config, candidates, &tracker);
+            let (result, _) = prioritise(
+                &config,
+                candidates,
+                &tracker,
+                &std::collections::HashMap::new(),
+            );
             assert_eq!(result.len(), 1);
             assert_eq!(
                 result[0].blast_radius, *expected_br,
@@ -1717,7 +1889,12 @@ mod tests {
             IssuePriority::Medium,
             MatchPriority::Normal,
         )];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].blast_radius,
@@ -1758,7 +1935,12 @@ mod tests {
             IssuePriority::High,
             MatchPriority::High,
         )];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(result.is_empty());
         assert_eq!(suppressed.len(), 1);
         assert_eq!(
@@ -1795,7 +1977,12 @@ mod tests {
         let linear_mr = MatchResult::matched("test", MatchPriority::Normal);
 
         let candidates = vec![(sentry_issue, sentry_mr), (linear_issue, linear_mr)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.source, "sentry");
@@ -1830,7 +2017,12 @@ mod tests {
                 MatchPriority::Normal,
             ),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 2);
         // No error_type or culprit metadata, so clustering should skip them
         for pi in &result {
@@ -1866,7 +2058,12 @@ mod tests {
             make_typed("v2", "ValueError in handler beta", "ValueError"),
         ];
 
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 4);
 
         // Group by cluster_key
@@ -1921,7 +2118,12 @@ mod tests {
         i2.set_metadata("culprit", "parser.module");
 
         let candidates = vec![(i1, m1), (i2, m2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         let key = result[0]
             .cluster_key
@@ -1961,7 +2163,12 @@ mod tests {
         i2.set_metadata("culprit", "payment.handler");
 
         let candidates = vec![(i1, m1), (i2, m2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         // Both have culprit and similar titles, should cluster
         assert!(
@@ -2015,7 +2222,12 @@ mod tests {
         );
 
         let candidates = vec![(fatal_unhandled, mr1), (error_handled, mr2), (warning, mr3)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(result.len(), 3);
         assert_eq!(
@@ -2050,7 +2262,12 @@ mod tests {
             ),
             make_candidate("low", "Bug", IssuePriority::Medium, MatchPriority::Low),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].issue.id, "urgent");
         assert_eq!(result[1].issue.id, "low");
         assert!(
@@ -2073,7 +2290,12 @@ mod tests {
             make_candidate("a", "Bug A", IssuePriority::High, MatchPriority::High),
             make_candidate("b", "Bug B", IssuePriority::Low, MatchPriority::Low),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 2);
         assert!(suppressed.is_empty());
     }
@@ -2093,8 +2315,18 @@ mod tests {
             ]
         };
 
-        let (result1, _) = prioritise(&config, make_batch(), &tracker);
-        let (result2, _) = prioritise(&config, make_batch(), &tracker);
+        let (result1, _) = prioritise(
+            &config,
+            make_batch(),
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
+        let (result2, _) = prioritise(
+            &config,
+            make_batch(),
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(result1.len(), result2.len());
         for (a, b) in result1.iter().zip(result2.iter()) {
@@ -2140,7 +2372,12 @@ mod tests {
         low_freq.set_metadata("event_count", 2i64);
 
         let candidates = vec![(high_freq, mr1), (low_freq, mr2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].issue.id, "high-freq");
         assert_eq!(result[1].issue.id, "low-freq");
     }
@@ -2176,7 +2413,12 @@ mod tests {
                 MatchPriority::High,
             ),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].issue.id, "real");
         assert_eq!(suppressed.len(), 1);
@@ -2199,7 +2441,12 @@ mod tests {
         let mr = MatchResult::matched("specific-reason", MatchPriority::Urgent);
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].match_result.reason, "specific-reason");
         assert_eq!(result[0].match_result.priority, MatchPriority::Urgent);
@@ -2490,7 +2737,12 @@ mod tests {
         let mr2 = MatchResult::matched("test", MatchPriority::Normal);
 
         let candidates = vec![(issue, mr), (issue2, mr2)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "d1");
         assert_eq!(result.len(), 1);
@@ -2520,7 +2772,12 @@ mod tests {
             make_candidate("c2", "Bug 2", IssuePriority::Medium, MatchPriority::Normal);
 
         let candidates = vec![(issue, mr), (issue2, mr2)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "c1");
         assert_eq!(result.len(), 1);
@@ -2547,7 +2804,12 @@ mod tests {
         issue.set_metadata("filename", "src/generated/types.rs");
 
         let candidates = vec![(issue, mr)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(result.len(), 0);
     }
@@ -2576,7 +2838,12 @@ mod tests {
         issue2.set_metadata("error_type", "TypeError");
 
         let candidates = vec![(issue, mr), (issue2, mr2)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "e1");
         assert_eq!(result.len(), 1);
@@ -2603,7 +2870,12 @@ mod tests {
         issue.set_metadata("project", "legacy-app");
 
         let candidates = vec![(issue, mr)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(result.len(), 0);
     }
@@ -2628,7 +2900,12 @@ mod tests {
         issue.set_metadata("labels", vec!["bug".to_string(), "wontfix".to_string()]);
 
         let candidates = vec![(issue, mr)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(result.len(), 0);
     }
@@ -2657,7 +2934,12 @@ mod tests {
         issue2.set_metadata("environment", "production");
 
         let candidates = vec![(issue, mr), (issue2, mr2)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "m1");
         assert_eq!(result.len(), 1);
@@ -2689,7 +2971,12 @@ mod tests {
             ),
             make_candidate("x2", "crash", IssuePriority::Medium, MatchPriority::Normal),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         // Only the one with exact title "crash" should be suppressed
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "x2");
@@ -2717,7 +3004,12 @@ mod tests {
             IssuePriority::Medium,
             MatchPriority::Normal,
         )];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         // Invalid regex should fail to compile, so nothing is suppressed
         assert!(suppressed.is_empty(), "invalid regex should not suppress");
         assert_eq!(result.len(), 1);
@@ -2735,7 +3027,12 @@ mod tests {
         issue.set_metadata("function", "auth.login_handler");
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             result[0].blast_radius,
             crate::types::BlastRadius::Critical,
@@ -2753,7 +3050,12 @@ mod tests {
         issue.set_metadata("culprit", "billing.charge_customer");
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             result[0].blast_radius,
             crate::types::BlastRadius::Critical,
@@ -2778,7 +3080,12 @@ mod tests {
                 make_candidate(id, "Bug", IssuePriority::Medium, MatchPriority::Normal);
             issue.set_metadata("filename", filename);
             let candidates = vec![(issue, mr)];
-            let (result, _) = prioritise(&config, candidates, &tracker);
+            let (result, _) = prioritise(
+                &config,
+                candidates,
+                &tracker,
+                &std::collections::HashMap::new(),
+            );
             assert_eq!(
                 result[0].blast_radius,
                 crate::types::BlastRadius::Infrastructure,
@@ -2805,7 +3112,12 @@ mod tests {
                 make_candidate(id, "Bug", IssuePriority::Medium, MatchPriority::Normal);
             issue.set_metadata("filename", filename);
             let candidates = vec![(issue, mr)];
-            let (result, _) = prioritise(&config, candidates, &tracker);
+            let (result, _) = prioritise(
+                &config,
+                candidates,
+                &tracker,
+                &std::collections::HashMap::new(),
+            );
             assert_eq!(
                 result[0].blast_radius,
                 crate::types::BlastRadius::Test,
@@ -2831,7 +3143,12 @@ mod tests {
                 make_candidate(id, "Bug", IssuePriority::Medium, MatchPriority::Normal);
             issue.set_metadata("filename", filename);
             let candidates = vec![(issue, mr)];
-            let (result, _) = prioritise(&config, candidates, &tracker);
+            let (result, _) = prioritise(
+                &config,
+                candidates,
+                &tracker,
+                &std::collections::HashMap::new(),
+            );
             assert_eq!(
                 result[0].blast_radius,
                 crate::types::BlastRadius::Cosmetic,
@@ -2858,7 +3175,12 @@ mod tests {
                 make_candidate(id, "Bug", IssuePriority::Medium, MatchPriority::Normal);
             issue.set_metadata("filename", filename);
             let candidates = vec![(issue, mr)];
-            let (result, _) = prioritise(&config, candidates, &tracker);
+            let (result, _) = prioritise(
+                &config,
+                candidates,
+                &tracker,
+                &std::collections::HashMap::new(),
+            );
             assert_eq!(
                 result[0].blast_radius,
                 crate::types::BlastRadius::Core,
@@ -2879,7 +3201,12 @@ mod tests {
         // "auth" is critical, "deploy" is infra -- critical should win
         issue.set_metadata("filename", "deploy/auth/service.rs");
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].blast_radius, crate::types::BlastRadius::Critical);
     }
 
@@ -2903,7 +3230,12 @@ mod tests {
             make_candidate("cp1", "Bug", IssuePriority::Medium, MatchPriority::Normal);
         issue.set_metadata("filename", "src/payments/main.rs");
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].blast_radius, crate::types::BlastRadius::Critical);
     }
 
@@ -2923,7 +3255,12 @@ mod tests {
             make_candidate("ep1", "Bug", IssuePriority::Medium, MatchPriority::Normal);
         issue.set_metadata("filename", "src/auth/login.rs");
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         // With all path lists empty, should fall through to Peripheral
         assert_eq!(
             result[0].blast_radius,
@@ -2950,7 +3287,12 @@ mod tests {
             IssuePriority::Critical,
             MatchPriority::Urgent,
         )];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             result[0].severity_score.score < 0.0,
             "negative weight should produce negative score, got {}",
@@ -2975,7 +3317,12 @@ mod tests {
             IssuePriority::Critical,
             MatchPriority::Urgent,
         )];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             result[0].severity_score.score.is_finite(),
             "even with very large weight, score should be finite"
@@ -3003,7 +3350,12 @@ mod tests {
         lo_users.set_metadata("user_count", 5i64);
 
         let candidates = vec![(hi_users, mr1), (lo_users, mr2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].issue.id, "hu");
         assert_eq!(result[1].issue.id, "lu");
     }
@@ -3029,7 +3381,12 @@ mod tests {
         cosmetic.set_metadata("filename", "README.md");
 
         let candidates = vec![(cosmetic, mr2), (critical, mr1)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             result[0].issue.id, "cr",
             "Critical blast radius should rank first"
@@ -3056,7 +3413,12 @@ mod tests {
         let (plain, mr2) = make_candidate("p", "Bug", IssuePriority::Low, MatchPriority::Low);
 
         let candidates = vec![(plain, mr2), (fatal, mr1)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].issue.id, "f");
         assert_eq!(result[1].issue.id, "p");
     }
@@ -3101,7 +3463,12 @@ mod tests {
         );
 
         let candidates = vec![(solo, mr3), (c1, mr1), (c2, mr2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 3);
         // Clustered issues should have higher scores
         let solo_pi = result.iter().find(|pi| pi.issue.id == "solo").unwrap();
@@ -3126,7 +3493,12 @@ mod tests {
         issue.set_metadata("escalation_rate", 5.0);
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         let fc = result[0].severity_score.frequency_component;
         assert!(
             fc <= 1.0,
@@ -3156,7 +3528,12 @@ mod tests {
         );
 
         let candidates = vec![(issue, mr), (plain, mr2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         // error level issue should rank higher due to regression component
         assert_eq!(result[0].issue.id, "lvl");
         assert_eq!(result[1].issue.id, "plain");
@@ -3179,7 +3556,12 @@ mod tests {
             make_candidate("h", "Handled", IssuePriority::Medium, MatchPriority::Normal);
 
         let candidates = vec![(issue, mr), (plain, mr2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].issue.id, "uh");
         assert_eq!(result[1].issue.id, "h");
     }
@@ -3216,7 +3598,12 @@ mod tests {
         );
 
         let candidates = vec![(plain, mr3), (warn_issue, mr2), (error_issue, mr1)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result[0].issue.id, "err");
         assert_eq!(result[1].issue.id, "warn");
         assert_eq!(result[2].issue.id, "plain");
@@ -3251,7 +3638,12 @@ mod tests {
         i2.set_metadata("error_type", "NullPointerException");
 
         let candidates = vec![(i1, m1), (i2, m2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         // Both have same error_type and no culprit, should cluster
         assert!(
@@ -3320,7 +3712,12 @@ mod tests {
                 "cache",
             ),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 6);
 
         // Collect unique cluster keys
@@ -3356,7 +3753,12 @@ mod tests {
         issue.set_metadata("culprit", "alone");
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         // min_content_cluster_size=1 means a single issue forms a cluster
         assert!(
@@ -3394,7 +3796,12 @@ mod tests {
         i2.set_metadata("culprit", "same.culprit");
 
         let candidates = vec![(i1, m1), (i2, m2)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         // With threshold=0, even dissimilar titles should cluster
         assert!(
             result[0].cluster_key.is_some(),
@@ -3418,7 +3825,12 @@ mod tests {
         issue.set_metadata("filename", "src/api/routes.rs");
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         let s = &result[0].severity_score;
 
         // Manually compute expected score
@@ -3456,7 +3868,12 @@ mod tests {
             IssuePriority::High,
             MatchPriority::Normal,
         )];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             (result[0].severity_score.severity_component - 0.65).abs() < 1e-10,
             "severity_component should be 0.65, got {}",
@@ -3483,7 +3900,12 @@ mod tests {
         let mr = MatchResult::matched("reason-check", MatchPriority::High);
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         let pi = &result[0];
 
         assert_eq!(pi.issue.id, "id-check");
@@ -3519,7 +3941,12 @@ mod tests {
             IssuePriority::Medium,
             MatchPriority::Normal,
         )];
-        let (_, suppressed) = prioritise(&config, candidates, &tracker);
+        let (_, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 1);
         let (issue, sr) = &suppressed[0];
         assert_eq!(issue.id, "sr1");
@@ -3550,7 +3977,12 @@ mod tests {
             })
             .collect();
 
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 500);
 
         // Verify monotonically non-increasing
@@ -3594,7 +4026,12 @@ mod tests {
             })
             .collect();
 
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 30);
 
         // Verify all clustered
@@ -3649,7 +4086,12 @@ mod tests {
             (jira_issue, jira_mr),
             make_candidate("r1", "Real bug", IssuePriority::High, MatchPriority::High),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 2);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].issue.id, "r1");
@@ -3681,7 +4123,12 @@ mod tests {
             IssuePriority::Medium,
             MatchPriority::Normal,
         )];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         // Empty pattern with Contains mode: "" is contained in any string
         // This is technically valid -- the issue IS suppressed.
         // Verify the pipeline handles it consistently.
@@ -3743,7 +4190,12 @@ mod tests {
                 MatchPriority::Low,
             ),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
 
         // n1 should be suppressed
         assert_eq!(suppressed.len(), 1);
@@ -3777,7 +4229,12 @@ mod tests {
         let mr = MatchResult::not_matched("not relevant");
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         assert!(!result[0].match_result.matches);
         assert_eq!(result[0].match_result.reason, "not relevant");
@@ -3810,7 +4267,12 @@ mod tests {
             })
             .collect();
 
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 5);
         // All should have same score since everything else is equal
         let base_score = result[0].severity_score.score;
@@ -3844,7 +4306,12 @@ mod tests {
         let mr = MatchResult::matched("test", MatchPriority::Normal);
 
         let candidates = vec![(issue, mr)];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         // Source comparison is case-insensitive (eq_ignore_ascii_case)
         assert_eq!(
             suppressed.len(),
@@ -3877,7 +4344,12 @@ mod tests {
         };
 
         let candidates = vec![mk("s1", "sentry"), mk("l1", "linear"), mk("g1", "github")];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             suppressed.len(),
             2,
@@ -3900,7 +4372,12 @@ mod tests {
             IssuePriority::Medium,
             MatchPriority::Normal,
         )];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].issue.title, "");
         assert!(result[0].severity_score.score.is_finite());
@@ -3933,7 +4410,12 @@ mod tests {
                 MatchPriority::Normal,
             ),
         ];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(result.len(), 3);
         for pi in &result {
             assert!(pi.severity_score.score.is_finite());
@@ -3969,7 +4451,12 @@ mod tests {
                 MatchPriority::Normal,
             ),
         ];
-        let (result, suppressed) = prioritise(&config, candidates, &tracker);
+        let (result, suppressed) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "u1");
         assert_eq!(result.len(), 1);
@@ -4157,7 +4644,12 @@ mod tests {
         issue.set_metadata("event_count", 1000.5f64);
 
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         assert!(result[0].severity_score.frequency_component > 0.0);
     }
 
@@ -4172,7 +4664,12 @@ mod tests {
         let tracker = NoOpTracker;
         let mr = MatchResult::matched("test", MatchPriority::Normal);
         let candidates = vec![(issue, mr)];
-        let (result, _) = prioritise(&config, candidates, &tracker);
+        let (result, _) = prioritise(
+            &config,
+            candidates,
+            &tracker,
+            &std::collections::HashMap::new(),
+        );
         // severity_component = 0.6*0.0 + 0.4*0.5 = 0.2
         assert!(
             (result[0].severity_score.severity_component - 0.2).abs() < 1e-10,

@@ -30,7 +30,10 @@ fn ipc_runtime_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("claudear-{}", uid));
     if !dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            tracing::warn!("Failed to create IPC runtime dir {:?}: {}", dir, e);
+            // SECURITY: Falling back to the system temp dir is unsafe because it is
+            // world-readable, which could allow other users to access or tamper with
+            // the IPC socket. This should be treated as a critical failure.
+            tracing::error!("Failed to create IPC runtime dir {:?}: {} — falling back to world-readable temp dir", dir, e);
             return std::env::temp_dir();
         }
         // Set directory permissions to 0700 (owner-only)

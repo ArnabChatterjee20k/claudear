@@ -1,7 +1,7 @@
 //! Outcome tracking for fix attempts.
 
 use crate::error::Result;
-use crate::feedback::cosine_similarity;
+use crate::feedback::{cosine_similarity, EmbeddingClient};
 use crate::types::{FixAttempt, Issue};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -277,6 +277,62 @@ fn is_common_word(word: &str) -> bool {
     ];
 
     COMMON_WORDS.contains(&word)
+}
+
+/// Categorize an error message using semantic similarity against reference embeddings.
+///
+/// Embeds the error message with the provided `EmbeddingClient`, then computes
+/// cosine similarity against each reference embedding. Returns the category of
+/// the best match if similarity exceeds 0.3, otherwise returns `"unknown"`.
+pub async fn categorize_error_semantic(
+    error_message: &str,
+    client: &EmbeddingClient,
+    reference_embeddings: &[(String, Vec<f32>)],
+) -> Result<String> {
+    let error_embedding = client.embed(error_message).await?;
+
+    let mut best_category = "unknown".to_string();
+    let mut best_similarity: f32 = 0.3; // threshold
+
+    for (category, ref_embedding) in reference_embeddings {
+        let similarity = cosine_similarity(&error_embedding, ref_embedding);
+        if similarity > best_similarity {
+            best_similarity = similarity;
+            best_category = category.clone();
+        }
+    }
+
+    Ok(best_category)
+}
+
+/// Build reference embeddings for error categorization.
+///
+/// Defines 8 category description strings and embeds them in a single batch call,
+/// returning a mapping from category name to its embedding vector.
+pub async fn build_error_reference_embeddings(
+    client: &EmbeddingClient,
+) -> Result<Vec<(String, Vec<f32>)>> {
+    let categories = [
+        ("timeout", "network timeout, connection timed out, request deadline exceeded, slow response"),
+        ("permission", "permission denied, access denied, authentication failed, authorization error, forbidden"),
+        ("syntax", "syntax error, parse error, unexpected token, invalid syntax, malformed input"),
+        ("test_failure", "test failed, test failure, assertion error, test case not passing, spec failure"),
+        ("build_failure", "build failed, compilation error, link error, build process failure"),
+        ("not_found", "not found, missing file, missing module, missing dependency, module not found"),
+        ("conflict", "merge conflict, git conflict, conflicting changes, conflict resolution needed"),
+        ("dependency", "dependency version mismatch, incompatible dependency, package version conflict"),
+    ];
+
+    let descriptions: Vec<&str> = categories.iter().map(|(_, desc)| *desc).collect();
+    let embeddings = client.embed_batch(&descriptions).await?;
+
+    let result: Vec<(String, Vec<f32>)> = categories
+        .iter()
+        .zip(embeddings.into_iter())
+        .map(|((name, _), embedding)| (name.to_string(), embedding))
+        .collect();
+
+    Ok(result)
 }
 
 /// Tracks fix outcomes in memory (can be persisted to DB later).
@@ -1466,5 +1522,245 @@ mod tests {
         assert!(!is_common_word("The"));
         assert!(!is_common_word("IS"));
         assert!(!is_common_word("Error"));
+    }
+
+    // ── Semantic error categorization tests (using mock embeddings) ──
+
+    #[test]
+    fn test_categorize_error_semantic_best_match() {
+        // We test categorize_error_semantic with mock data by calling the
+        // inner logic directly: embed the error message as a known vector,
+        // provide reference embeddings, and verify the best match is returned.
+        //
+        // Since categorize_error_semantic requires an EmbeddingClient (which
+        // needs model download), we replicate its core matching logic here
+        // with handcrafted vectors.
+
+        // Mock reference embeddings: 3-dimensional for simplicity
+        let reference_embeddings: Vec<(String, Vec<f32>)> = vec![
+            ("timeout".to_string(), vec![1.0, 0.0, 0.0]),
+            ("permission".to_string(), vec![0.0, 1.0, 0.0]),
+            ("syntax".to_string(), vec![0.0, 0.0, 1.0]),
+            ("test_failure".to_string(), vec![0.7, 0.7, 0.0]),
+            ("build_failure".to_string(), vec![0.5, 0.0, 0.5]),
+        ];
+
+        // Simulate an error embedding very close to "timeout"
+        let error_embedding = vec![0.95, 0.05, 0.0];
+
+        let mut best_category = "unknown".to_string();
+        let mut best_similarity: f32 = 0.3;
+
+        for (category, ref_embedding) in &reference_embeddings {
+            let similarity = cosine_similarity(&error_embedding, ref_embedding);
+            if similarity > best_similarity {
+                best_similarity = similarity;
+                best_category = category.clone();
+            }
+        }
+
+        assert_eq!(best_category, "timeout");
+        assert!(best_similarity > 0.9);
+    }
+
+    #[test]
+    fn test_categorize_error_semantic_returns_unknown_below_threshold() {
+        // When no reference embedding is similar enough, "unknown" should be returned.
+        let reference_embeddings: Vec<(String, Vec<f32>)> = vec![
+            ("timeout".to_string(), vec![1.0, 0.0, 0.0]),
+            ("permission".to_string(), vec![0.0, 1.0, 0.0]),
+        ];
+
+        // An error embedding orthogonal to all references
+        let error_embedding = vec![0.0, 0.0, 1.0];
+
+        let mut best_category = "unknown".to_string();
+        let mut best_similarity: f32 = 0.3;
+
+        for (category, ref_embedding) in &reference_embeddings {
+            let similarity = cosine_similarity(&error_embedding, ref_embedding);
+            if similarity > best_similarity {
+                best_similarity = similarity;
+                best_category = category.clone();
+            }
+        }
+
+        assert_eq!(best_category, "unknown");
+    }
+
+    #[test]
+    fn test_categorize_error_semantic_picks_highest_similarity() {
+        // When multiple references have similarity > 0.3, the highest wins.
+        let reference_embeddings: Vec<(String, Vec<f32>)> = vec![
+            ("timeout".to_string(), vec![0.8, 0.2, 0.0]),
+            ("permission".to_string(), vec![0.7, 0.3, 0.0]),
+            ("build_failure".to_string(), vec![0.9, 0.1, 0.0]),
+        ];
+
+        let error_embedding = vec![1.0, 0.0, 0.0];
+
+        let mut best_category = "unknown".to_string();
+        let mut best_similarity: f32 = 0.3;
+
+        for (category, ref_embedding) in &reference_embeddings {
+            let similarity = cosine_similarity(&error_embedding, ref_embedding);
+            if similarity > best_similarity {
+                best_similarity = similarity;
+                best_category = category.clone();
+            }
+        }
+
+        // build_failure [0.9, 0.1, 0.0] is closest to [1.0, 0.0, 0.0]
+        assert_eq!(best_category, "build_failure");
+    }
+
+    #[test]
+    fn test_categorize_error_semantic_empty_references() {
+        // With no reference embeddings, result should be "unknown".
+        let reference_embeddings: Vec<(String, Vec<f32>)> = vec![];
+        let error_embedding = vec![1.0, 0.0, 0.0];
+
+        let mut best_category = "unknown".to_string();
+        let mut best_similarity: f32 = 0.3;
+
+        for (category, ref_embedding) in &reference_embeddings {
+            let similarity = cosine_similarity(&error_embedding, ref_embedding);
+            if similarity > best_similarity {
+                best_similarity = similarity;
+                best_category = category.clone();
+            }
+        }
+
+        assert_eq!(best_category, "unknown");
+    }
+
+    #[test]
+    fn test_categorize_error_semantic_exact_match() {
+        // When error embedding exactly matches a reference, similarity should be ~1.0.
+        let reference_embeddings: Vec<(String, Vec<f32>)> = vec![
+            ("timeout".to_string(), vec![1.0, 0.0, 0.0]),
+            ("syntax".to_string(), vec![0.0, 1.0, 0.0]),
+        ];
+
+        let error_embedding = vec![0.0, 1.0, 0.0]; // exactly matches syntax
+
+        let mut best_category = "unknown".to_string();
+        let mut best_similarity: f32 = 0.3;
+
+        for (category, ref_embedding) in &reference_embeddings {
+            let similarity = cosine_similarity(&error_embedding, ref_embedding);
+            if similarity > best_similarity {
+                best_similarity = similarity;
+                best_category = category.clone();
+            }
+        }
+
+        assert_eq!(best_category, "syntax");
+        assert!((best_similarity - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_categorize_error_semantic_all_eight_categories() {
+        // Verify we can distinguish all 8 categories with distinct reference vectors.
+        let reference_embeddings: Vec<(String, Vec<f32>)> = vec![
+            (
+                "timeout".to_string(),
+                vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "permission".to_string(),
+                vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "syntax".to_string(),
+                vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "test_failure".to_string(),
+                vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "build_failure".to_string(),
+                vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "not_found".to_string(),
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            ),
+            (
+                "conflict".to_string(),
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            ),
+            (
+                "dependency".to_string(),
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ),
+        ];
+
+        // Test each category by providing a vector aligned with it
+        let expected = [
+            "timeout",
+            "permission",
+            "syntax",
+            "test_failure",
+            "build_failure",
+            "not_found",
+            "conflict",
+            "dependency",
+        ];
+
+        for (i, expected_cat) in expected.iter().enumerate() {
+            let mut error_embedding = vec![0.0f32; 8];
+            error_embedding[i] = 1.0;
+
+            let mut best_category = "unknown".to_string();
+            let mut best_similarity: f32 = 0.3;
+
+            for (category, ref_embedding) in &reference_embeddings {
+                let similarity = cosine_similarity(&error_embedding, ref_embedding);
+                if similarity > best_similarity {
+                    best_similarity = similarity;
+                    best_category = category.clone();
+                }
+            }
+
+            assert_eq!(
+                best_category, *expected_cat,
+                "expected {} for dimension {}, got {}",
+                expected_cat, i, best_category
+            );
+        }
+    }
+
+    #[test]
+    fn test_categorize_error_semantic_threshold_boundary() {
+        // Test behavior right at the 0.3 threshold boundary.
+        let reference_embeddings: Vec<(String, Vec<f32>)> =
+            vec![("timeout".to_string(), vec![1.0, 0.0, 0.0])];
+
+        // A vector that produces similarity just barely above 0.3 with [1, 0, 0]
+        // cos(theta) = 0.3 means theta ~ 72.5 degrees
+        // Use [0.3, 0.954, 0.0] which has cosine similarity ~0.3 with [1, 0, 0]
+        let error_embedding = vec![0.3, 0.954, 0.0];
+        let sim = cosine_similarity(&error_embedding, &reference_embeddings[0].1);
+
+        let mut best_category = "unknown".to_string();
+        let mut best_similarity: f32 = 0.3;
+
+        for (category, ref_embedding) in &reference_embeddings {
+            let similarity = cosine_similarity(&error_embedding, ref_embedding);
+            if similarity > best_similarity {
+                best_similarity = similarity;
+                best_category = category.clone();
+            }
+        }
+
+        // The similarity is approximately 0.3 - if it's exactly 0.3 it should NOT match
+        // (we use > not >=), if slightly above it should match.
+        if sim > 0.3 {
+            assert_eq!(best_category, "timeout");
+        } else {
+            assert_eq!(best_category, "unknown");
+        }
     }
 }

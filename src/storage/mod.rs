@@ -15,6 +15,7 @@ pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 
 use crate::error::Result;
 use crate::feedback::FixOutcome;
+use crate::learning::cross_repo_correlator::CrossRepoCorrelation;
 use crate::types::{
     ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
     FixAttemptStatus, PrAnalytics, PrReviewRecord, ProcessingMetric, PromptExperiment,
@@ -571,6 +572,44 @@ pub trait FixAttemptTracker: Send + Sync {
         _reason: &str,
     ) -> Result<()> {
         Ok(())
+    }
+
+    // ─── Cross-repo correlation methods (default no-ops) ───
+
+    /// Get recent fix attempts since a cutoff time.
+    fn get_recent_attempts_since(&self, _since: &DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+        Ok(Vec::new())
+    }
+
+    /// Check if repo_a depends on repo_b.
+    fn has_dependency(&self, _repo_a: &str, _repo_b: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Upsert a cross-repo correlation record, incrementing the count.
+    fn upsert_cross_repo_correlation(
+        &self,
+        _repo_a: &str,
+        _repo_b: &str,
+        _window_hours: i64,
+    ) -> Result<CrossRepoCorrelation> {
+        Ok(CrossRepoCorrelation {
+            id: 0,
+            repo_a: _repo_a.to_string(),
+            repo_b: _repo_b.to_string(),
+            correlation_count: 0,
+            last_seen_at: Utc::now(),
+            window_hours: _window_hours,
+        })
+    }
+
+    /// Get cross-repo correlations above a minimum count and within max age.
+    fn get_cross_repo_correlations(
+        &self,
+        _min_count: i64,
+        _max_age_hours: i64,
+    ) -> Result<Vec<CrossRepoCorrelation>> {
+        Ok(Vec::new())
     }
 }
 

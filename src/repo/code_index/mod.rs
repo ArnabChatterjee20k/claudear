@@ -4,7 +4,9 @@
 //! creates AST-aware chunks at semantic boundaries, embeds those chunks for vector similarity
 //! search, and persists everything in SQLite. Incremental re-indexing via file hashing.
 
+pub mod analyzer;
 mod chunker;
+pub mod complexity;
 mod languages;
 mod parser;
 pub mod types;
