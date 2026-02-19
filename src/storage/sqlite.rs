@@ -186,7 +186,11 @@ impl SqliteTracker {
                 merged_at TEXT,
                 resolved_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
-                issue_labels TEXT  -- JSON array of labels for bug detection
+                last_retry_at TEXT,
+                issue_labels TEXT,  -- JSON array of labels for bug detection
+                parent_attempt_id INTEGER REFERENCES fix_attempts(id),
+                cascade_repo TEXT,
+                reset_at TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_fix_attempts_status ON fix_attempts(status);
@@ -196,6 +200,8 @@ impl SqliteTracker {
             -- Hot path for attempts list endpoints: filter by status/source, sort by attempted_at.
             CREATE INDEX IF NOT EXISTS idx_fix_attempts_status_attempted ON fix_attempts(status, attempted_at DESC);
             CREATE INDEX IF NOT EXISTS idx_fix_attempts_source_status_attempted ON fix_attempts(source, status, attempted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fix_attempts_parent ON fix_attempts(parent_attempt_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fix_attempts_unique_original ON fix_attempts(source, issue_id) WHERE cascade_repo IS NULL;
 
             -- Feedback outcomes table for learning from past fixes
             CREATE TABLE IF NOT EXISTS feedback_outcomes (
@@ -209,6 +215,8 @@ impl SqliteTracker {
                 error_type TEXT,
                 learnings TEXT,
                 keywords TEXT,
+                strategy_fingerprint_id INTEGER,
+                embedding BLOB,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -574,7 +582,8 @@ impl SqliteTracker {
                 -- Content metrics
                 files_changed INTEGER,
                 lines_added INTEGER,
-                lines_removed INTEGER
+                lines_removed INTEGER,
+                fix_quality_score REAL
             );
             CREATE INDEX IF NOT EXISTS idx_prs_status ON prs(status);
             CREATE INDEX IF NOT EXISTS idx_prs_repo ON prs(github_repo);
@@ -635,6 +644,7 @@ impl SqliteTracker {
                 password_hash TEXT NOT NULL,
                 name TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'viewer',
+                avatar_url TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -662,104 +672,6 @@ impl SqliteTracker {
             CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_cleanup
                 ON webhook_deliveries(received_at);
             "#,
-        )?;
-
-        // Add new columns if they don't exist (migration for existing DBs)
-        // Note: These will fail with "duplicate column name" if column already exists,
-        // which is expected and safe to ignore. Other errors are logged.
-        let migrations = [
-            // fix_attempts migrations
-            (
-                "fix_attempts.github_repo",
-                "ALTER TABLE fix_attempts ADD COLUMN github_repo TEXT",
-            ),
-            (
-                "fix_attempts.github_pr_number",
-                "ALTER TABLE fix_attempts ADD COLUMN github_pr_number INTEGER",
-            ),
-            (
-                "fix_attempts.merged_at",
-                "ALTER TABLE fix_attempts ADD COLUMN merged_at TEXT",
-            ),
-            (
-                "fix_attempts.resolved_at",
-                "ALTER TABLE fix_attempts ADD COLUMN resolved_at TEXT",
-            ),
-            (
-                "fix_attempts.retry_count",
-                "ALTER TABLE fix_attempts ADD COLUMN retry_count INTEGER DEFAULT 0",
-            ),
-            (
-                "fix_attempts.last_retry_at",
-                "ALTER TABLE fix_attempts ADD COLUMN last_retry_at TEXT",
-            ),
-            (
-                "fix_attempts.issue_labels",
-                "ALTER TABLE fix_attempts ADD COLUMN issue_labels TEXT",
-            ),
-            // repositories migrations (unified table)
-            (
-                "repositories.default_branch",
-                "ALTER TABLE repositories ADD COLUMN default_branch TEXT DEFAULT 'main'",
-            ),
-            (
-                "repositories.file_count",
-                "ALTER TABLE repositories ADD COLUMN file_count INTEGER DEFAULT 0",
-            ),
-            (
-                "repositories.last_indexed_at",
-                "ALTER TABLE repositories ADD COLUMN last_indexed_at TEXT",
-            ),
-            // cascade support
-            (
-                "fix_attempts.parent_attempt_id",
-                "ALTER TABLE fix_attempts ADD COLUMN parent_attempt_id INTEGER REFERENCES fix_attempts(id)",
-            ),
-            (
-                "fix_attempts.cascade_repo",
-                "ALTER TABLE fix_attempts ADD COLUMN cascade_repo TEXT",
-            ),
-            (
-                "claude_executions.stdout_log_path",
-                "ALTER TABLE claude_executions ADD COLUMN stdout_log_path TEXT",
-            ),
-            (
-                "claude_executions.stderr_log_path",
-                "ALTER TABLE claude_executions ADD COLUMN stderr_log_path TEXT",
-            ),
-            (
-                "claude_executions.event_log_path",
-                "ALTER TABLE claude_executions ADD COLUMN event_log_path TEXT",
-            ),
-            // Soft-reset support: tracks when an attempt was reset for re-processing
-            (
-                "fix_attempts.reset_at",
-                "ALTER TABLE fix_attempts ADD COLUMN reset_at TEXT",
-            ),
-        ];
-
-        for (column_name, sql) in migrations {
-            if let Err(e) = conn.execute(sql, []) {
-                // "duplicate column name" is expected if column already exists
-                if !e.to_string().contains("duplicate column name") {
-                    tracing::error!(
-                        column = column_name,
-                        error = %e,
-                        "Failed to run migration"
-                    );
-                }
-            }
-        }
-
-        // Cascade index (safe to run multiple times)
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_fix_attempts_parent ON fix_attempts(parent_attempt_id);",
-        )?;
-
-        // Partial unique index: uniqueness on (source, issue_id) only for non-cascade rows.
-        // Cascade rows (cascade_repo IS NOT NULL) share the parent's source+issue_id.
-        conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fix_attempts_unique_original ON fix_attempts(source, issue_id) WHERE cascade_repo IS NULL;",
         )?;
 
         // ============================================================
@@ -869,87 +781,6 @@ impl SqliteTracker {
             CREATE INDEX IF NOT EXISTS idx_issue_cluster_members_cluster ON issue_cluster_members(cluster_id);
             "#,
         )?;
-
-        // Learning column migrations
-        let learning_migrations = [
-            (
-                "prs.fix_quality_score",
-                "ALTER TABLE prs ADD COLUMN fix_quality_score REAL",
-            ),
-            (
-                "feedback_outcomes.strategy_fingerprint_id",
-                "ALTER TABLE feedback_outcomes ADD COLUMN strategy_fingerprint_id INTEGER",
-            ),
-            (
-                "feedback_outcomes.embedding",
-                "ALTER TABLE feedback_outcomes ADD COLUMN embedding BLOB",
-            ),
-        ];
-        for (column_name, sql) in learning_migrations {
-            if let Err(e) = conn.execute(sql, []) {
-                if !e.to_string().contains("duplicate column name") {
-                    tracing::error!(
-                        column = column_name,
-                        error = %e,
-                        "Failed to run learning migration"
-                    );
-                }
-            }
-        }
-
-        // User avatar migration
-        if let Err(e) = conn.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT", []) {
-            if !e.to_string().contains("duplicate column name") {
-                tracing::error!(error = %e, "Failed to run users.avatar_url migration");
-            }
-        }
-
-        // Migrate issue_embeddings → issues (rename table + add content columns)
-        let issue_table_migrations: &[(&str, &str)] = &[
-            (
-                "issues (rename)",
-                "ALTER TABLE issue_embeddings RENAME TO issues",
-            ),
-            (
-                "issues.description",
-                "ALTER TABLE issues ADD COLUMN description TEXT",
-            ),
-            ("issues.url", "ALTER TABLE issues ADD COLUMN url TEXT"),
-            (
-                "issues.priority",
-                "ALTER TABLE issues ADD COLUMN priority TEXT DEFAULT 'none'",
-            ),
-            (
-                "issues.status",
-                "ALTER TABLE issues ADD COLUMN status TEXT DEFAULT 'open'",
-            ),
-            ("issues.labels", "ALTER TABLE issues ADD COLUMN labels TEXT"),
-            (
-                "issues.updated_at",
-                "ALTER TABLE issues ADD COLUMN updated_at TEXT",
-            ),
-        ];
-        for (migration_name, sql) in issue_table_migrations {
-            if let Err(e) = conn.execute(sql, []) {
-                let err_msg = e.to_string();
-                // Ignore expected errors: table already renamed (fresh DB) or column already exists
-                if !err_msg.contains("no such table: issue_embeddings")
-                    && !err_msg.contains("duplicate column name")
-                {
-                    tracing::error!(
-                        migration = migration_name,
-                        error = %e,
-                        "Failed to run issue table migration"
-                    );
-                }
-            }
-        }
-        // Ensure the index exists on the (possibly renamed) table
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_issues_source ON issues(source)",
-            [],
-        )
-        .ok();
 
         // Prioritisation engine tables
         conn.execute_batch(

@@ -1863,7 +1863,9 @@ EOF
   # --- Step 5: Checkpoint B - Upstream PR Created ---
   log_checkpoint "S3 Checkpoint B: Upstream PR Created"
 
-  wait_for_pr_verbose "$db_path" "linear" "$S3_ISSUE_ID" "$WAIT_TIMEOUT" "$POLL_INTERVAL" "$daemon_log"
+  # Use cascade-safe checker: only wait for a PR on the non-cascade (upstream) row
+  wait_for "upstream PR (non-cascade)" "$WAIT_TIMEOUT" "$POLL_INTERVAL" \
+    check_fix_attempt_has_pr_non_cascade "$db_path" "linear" "$S3_ISSUE_ID"
 
   local S3_PR_URL S3_PR_NUMBER S3_PR_BRANCH
   S3_PR_URL="$(db_query "$db_path" "SELECT pr_url FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NULL AND pr_url IS NOT NULL AND pr_url != '' ORDER BY id DESC LIMIT 1")"
@@ -1911,7 +1913,11 @@ EOF
   # Verify cascade_repo points to downstream
   local cascade_repo_val
   cascade_repo_val="$(db_query "$db_path" "SELECT cascade_repo FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NOT NULL LIMIT 1")"
-  log "  Cascade repo: ${cascade_repo_val}"
+  if [[ "$cascade_repo_val" != *"${REPO_NAME_2}"* ]]; then
+    warn "Cascade repo mismatch: expected to contain '${REPO_NAME_2}', got '${cascade_repo_val}'"
+  else
+    log "  DB OK: cascade_repo matches expected downstream (${cascade_repo_val})"
+  fi
 
   # Verify parent_attempt_id links back correctly
   local parent_id cascade_parent_id
@@ -1969,7 +1975,10 @@ EOF
   assert_db "$db_path" "repositories" "1=1" 2 "repositories: 2 repos"
   assert_db "$db_path" "repository_dependencies" "1=1" 1 "repository_dependencies: 1 dependency"
 
-  assert_db "$db_path" "prs" "status='merged'" 1 "prs: upstream PR merged" "false"
+  # Upstream PR learning (files_changed populated asynchronously)
+  assert_db "$db_path" "prs" \
+    "pr_url='${S3_PR_URL}' AND status='merged' AND files_changed > 0" \
+    1 "prs: upstream PR merged with files_changed" "false"
 
   assert_db "$db_path" "activity_log" "1=1" 4 "activity_log: >= 4 entries"
 

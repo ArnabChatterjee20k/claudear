@@ -215,8 +215,12 @@ pub async fn login_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // Verify password
-    let valid = bcrypt::verify(&body.password, &user.password_hash)
+    // Verify password (spawn_blocking to avoid blocking the async runtime)
+    let pw = body.password.clone();
+    let hash = user.password_hash.clone();
+    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(&pw, &hash))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if !valid {
         return Err(StatusCode::UNAUTHORIZED);
@@ -334,16 +338,26 @@ pub async fn update_profile_handler(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                 .ok_or(StatusCode::NOT_FOUND)?;
 
-            let valid = bcrypt::verify(current_pw, &current_user.password_hash)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let current_pw_owned = current_pw.to_string();
+            let stored_hash = current_user.password_hash.clone();
+            let valid = tokio::task::spawn_blocking(move || {
+                bcrypt::verify(&current_pw_owned, &stored_hash)
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             if !valid {
                 return Err(StatusCode::FORBIDDEN);
             }
 
-            Some(
-                bcrypt::hash(new_pw, bcrypt::DEFAULT_COST)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-            )
+            let new_pw_owned = new_pw.clone();
+            let hashed = tokio::task::spawn_blocking(move || {
+                bcrypt::hash(&new_pw_owned, bcrypt::DEFAULT_COST)
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Some(hashed)
         }
         None => None,
     };
@@ -568,9 +582,13 @@ pub async fn create_user_handler(
         return Err(StatusCode::CONFLICT);
     }
 
-    // Hash password
-    let password_hash = bcrypt::hash(&body.password, bcrypt::DEFAULT_COST)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Hash password (spawn_blocking to avoid blocking the async runtime)
+    let pw = body.password.clone();
+    let password_hash =
+        tokio::task::spawn_blocking(move || bcrypt::hash(&pw, bcrypt::DEFAULT_COST))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let id = db
         .create_user(&body.email, &password_hash, &body.name, &body.role)
@@ -615,12 +633,17 @@ pub async fn update_user_handler(
         .downcast_ref::<SqliteTracker>()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Hash password if provided
+    // Hash password if provided (use spawn_blocking to avoid blocking the async runtime)
     let password_hash = match &body.password {
-        Some(pw) => Some(
-            bcrypt::hash(pw, bcrypt::DEFAULT_COST)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-        ),
+        Some(pw) => {
+            let pw = pw.clone();
+            Some(
+                tokio::task::spawn_blocking(move || bcrypt::hash(pw, bcrypt::DEFAULT_COST))
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            )
+        }
         None => None,
     };
 
