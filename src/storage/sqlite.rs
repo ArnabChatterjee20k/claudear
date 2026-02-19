@@ -23,6 +23,14 @@ static PR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
         .expect("PR URL regex should be valid")
 });
 
+/// Compiled regex for parsing GitLab MR URLs (compiled once, reused).
+/// Matches: https://gitlab.com/group/project/-/merge_requests/123
+/// Also matches self-hosted: https://gitlab.example.com/group/sub/project/-/merge_requests/123
+static MR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+    regex_lite::Regex::new(r"https?://[^/]+/(.+?)/-/merge_requests/(\d+)")
+        .expect("MR URL regex should be valid")
+});
+
 /// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
 const MAX_PR_URL_LENGTH: usize = 2048;
 const DEFAULT_LOG_DIR: &str = "./logs";
@@ -36,6 +44,9 @@ const ISSUE_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const OUTCOME_VECTOR_TABLE: &str = "outcome_embedding_vectors";
 const OUTCOME_VECTOR_EF_SEARCH: usize = 200;
 const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
+const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
+const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
+const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
 /// A user row from the database.
 #[derive(Debug, Clone, Serialize)]
@@ -863,6 +874,99 @@ impl SqliteTracker {
             }
         }
 
+        // Prioritisation engine tables
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS content_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_key TEXT NOT NULL,
+                source TEXT NOT NULL,
+                representative_issue_id TEXT NOT NULL,
+                issue_ids TEXT NOT NULL DEFAULT '[]',
+                error_type TEXT,
+                culprit TEXT,
+                avg_similarity REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(cluster_key, source)
+            );
+            CREATE INDEX IF NOT EXISTS idx_content_clusters_source ON content_clusters(source, status);
+            CREATE INDEX IF NOT EXISTS idx_content_clusters_key ON content_clusters(cluster_key);
+
+            CREATE TABLE IF NOT EXISTS severity_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                issue_id TEXT NOT NULL,
+                score REAL NOT NULL,
+                severity_component REAL NOT NULL DEFAULT 0.0,
+                frequency_component REAL NOT NULL DEFAULT 0.0,
+                regression_component REAL NOT NULL DEFAULT 0.0,
+                blast_radius_component REAL NOT NULL DEFAULT 0.0,
+                cluster_boost REAL NOT NULL DEFAULT 0.0,
+                blast_radius TEXT NOT NULL DEFAULT 'core',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(source, issue_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_severity_scores_source ON severity_scores(source);
+
+            CREATE TABLE IF NOT EXISTS suppression_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                issue_id TEXT NOT NULL,
+                rule_name TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(source, issue_id, rule_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_suppression_log_source ON suppression_log(source);
+
+            -- Code indexing: extracted symbols
+            CREATE TABLE IF NOT EXISTS code_symbols (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                file_path TEXT NOT NULL,
+                symbol_name TEXT NOT NULL,
+                symbol_kind TEXT NOT NULL,
+                parent_symbol TEXT,
+                language TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                signature TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_code_symbols_repo ON code_symbols(repo_id);
+            CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(symbol_name);
+            CREATE INDEX IF NOT EXISTS idx_code_symbols_kind ON code_symbols(symbol_kind);
+            CREATE INDEX IF NOT EXISTS idx_code_symbols_file ON code_symbols(repo_id, file_path);
+
+            -- Code indexing: semantic chunks for embedding
+            CREATE TABLE IF NOT EXISTS code_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                file_path TEXT NOT NULL,
+                chunk_type TEXT NOT NULL,
+                symbol_name TEXT,
+                language TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                chunk_text TEXT NOT NULL,
+                context_text TEXT NOT NULL,
+                file_hash TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_code_chunks_repo ON code_chunks(repo_id);
+            CREATE INDEX IF NOT EXISTS idx_code_chunks_file ON code_chunks(repo_id, file_path);
+            CREATE INDEX IF NOT EXISTS idx_code_chunks_symbol ON code_chunks(symbol_name);
+            CREATE INDEX IF NOT EXISTS idx_code_chunks_hash ON code_chunks(repo_id, file_path, file_hash);
+
+            -- Code indexing: chunk embeddings
+            CREATE TABLE IF NOT EXISTS code_chunk_embeddings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chunk_id INTEGER NOT NULL UNIQUE REFERENCES code_chunks(id) ON DELETE CASCADE,
+                embedding BLOB NOT NULL,
+                embedding_model TEXT NOT NULL
+            );
+            "#,
+        )?;
+
         // Update query planner statistics after schema creation
         // This helps SQLite make better query planning decisions
         conn.execute("ANALYZE", [])?;
@@ -962,17 +1066,29 @@ impl SqliteTracker {
         }
     }
 
-    /// Parse a GitHub PR URL to extract repo and PR number.
-    /// Supports: https://github.com/owner/repo/pull/123
+    /// Parse a GitHub PR or GitLab MR URL to extract repo/project and number.
+    /// Supports:
+    /// - GitHub: https://github.com/owner/repo/pull/123
+    /// - GitLab: https://gitlab.com/group/project/-/merge_requests/123
+    /// - Self-hosted GitLab: https://gitlab.example.com/group/project/-/merge_requests/123
     pub fn parse_pr_url(url: &str) -> Option<(String, i64)> {
         // Reject excessively long URLs to prevent ReDoS and memory issues
         if url.len() > MAX_PR_URL_LENGTH {
             return None;
         }
-        let caps = PR_URL_REGEX.captures(url)?;
-        let repo = caps.get(1)?.as_str().to_string();
-        let pr_number: i64 = caps.get(2)?.as_str().parse().ok()?;
-        Some((repo, pr_number))
+        // Try GitHub PR URL first
+        if let Some(caps) = PR_URL_REGEX.captures(url) {
+            let repo = caps.get(1)?.as_str().to_string();
+            let pr_number: i64 = caps.get(2)?.as_str().parse().ok()?;
+            return Some((repo, pr_number));
+        }
+        // Try GitLab MR URL
+        if let Some(caps) = MR_URL_REGEX.captures(url) {
+            let project = caps.get(1)?.as_str().to_string();
+            let mr_iid: i64 = caps.get(2)?.as_str().parse().ok()?;
+            return Some((project, mr_iid));
+        }
+        None
     }
 
     fn embedding_to_blob(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
@@ -2416,6 +2532,41 @@ impl FixAttemptTracker for SqliteTracker {
     ) -> Result<Vec<(String, DateTime<Utc>)>> {
         SqliteTracker::get_recent_issue_arrivals(self, source, window_minutes)
     }
+
+    fn store_content_cluster(&self, cluster: &crate::types::ContentCluster) -> Result<i64> {
+        SqliteTracker::store_content_cluster(self, cluster)
+    }
+
+    fn get_active_content_clusters(
+        &self,
+        source: &str,
+    ) -> Result<Vec<crate::types::ContentCluster>> {
+        SqliteTracker::get_active_content_clusters(self, source)
+    }
+
+    fn resolve_content_cluster(&self, cluster_id: i64) -> Result<()> {
+        SqliteTracker::resolve_content_cluster(self, cluster_id)
+    }
+
+    fn store_severity_score(
+        &self,
+        source: &str,
+        issue_id: &str,
+        score: &crate::types::SeverityScore,
+        blast_radius: crate::types::BlastRadius,
+    ) -> Result<()> {
+        SqliteTracker::store_severity_score(self, source, issue_id, score, blast_radius)
+    }
+
+    fn record_suppression(
+        &self,
+        source: &str,
+        issue_id: &str,
+        rule_name: &str,
+        reason: &str,
+    ) -> Result<()> {
+        SqliteTracker::record_suppression(self, source, issue_id, rule_name, reason)
+    }
 }
 
 impl SqliteTracker {
@@ -2929,7 +3080,7 @@ impl SqliteTracker {
     /// Save or update a PR review state for persistence.
     ///
     /// Uses upsert semantics - creates new record or updates existing based on pr_url.
-    pub fn save_pr_review_state(&self, state: &crate::github::PrReviewState) -> Result<()> {
+    pub fn save_pr_review_state(&self, state: &crate::scm::PrReviewState) -> Result<()> {
         let conn = self.acquire_lock()?;
         conn.execute(
             r#"
@@ -2974,7 +3125,7 @@ impl SqliteTracker {
     }
 
     /// Get all active PR review states for restoration on startup.
-    pub fn get_active_pr_review_states(&self) -> Result<Vec<crate::github::PrReviewState>> {
+    pub fn get_active_pr_review_states(&self) -> Result<Vec<crate::scm::PrReviewState>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
@@ -3020,7 +3171,7 @@ impl SqliteTracker {
     pub fn record_pr_review_comment(
         &self,
         pr_url: &str,
-        comment: &crate::github::PrReviewComment,
+        comment: &crate::scm::ReviewComment,
     ) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
@@ -3103,8 +3254,8 @@ impl SqliteTracker {
     /// last_review_id, last_review_time, last_comment_id, last_comment_time, is_active
     fn row_to_pr_review_state(
         row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<crate::github::PrReviewState> {
-        Ok(crate::github::PrReviewState {
+    ) -> rusqlite::Result<crate::scm::PrReviewState> {
+        Ok(crate::scm::PrReviewState {
             pr_url: row.get(0)?,
             repo: row.get(1)?,
             pr_number: row.get(2)?,
@@ -7038,6 +7189,595 @@ impl SqliteTracker {
             .collect();
         Ok(rows)
     }
+
+    // ── Prioritisation engine storage ──────────────────────────────────
+
+    pub fn store_content_cluster(&self, cluster: &crate::types::ContentCluster) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let ids_json = serde_json::to_string(&cluster.issue_ids).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "INSERT OR REPLACE INTO content_clusters (cluster_key, source, representative_issue_id, issue_ids, error_type, culprit, avg_similarity, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                cluster.cluster_key,
+                cluster.source,
+                cluster.representative_issue_id,
+                ids_json,
+                cluster.error_type,
+                cluster.culprit,
+                cluster.avg_similarity,
+                cluster.status,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_active_content_clusters(
+        &self,
+        source: &str,
+    ) -> Result<Vec<crate::types::ContentCluster>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, cluster_key, source, representative_issue_id, issue_ids, error_type, culprit, avg_similarity, status, created_at
+             FROM content_clusters WHERE source = ?1 AND status = 'active' ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![source], |row| {
+                Ok(crate::types::ContentCluster {
+                    id: row.get(0)?,
+                    cluster_key: row.get(1)?,
+                    source: row.get(2)?,
+                    representative_issue_id: row.get(3)?,
+                    issue_ids: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                    error_type: row.get(5)?,
+                    culprit: row.get(6)?,
+                    avg_similarity: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: Self::parse_datetime(&row.get::<_, String>(9)?),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn resolve_content_cluster(&self, cluster_id: i64) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE content_clusters SET status = 'resolved' WHERE id = ?1",
+            params![cluster_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn store_severity_score(
+        &self,
+        source: &str,
+        issue_id: &str,
+        score: &crate::types::SeverityScore,
+        blast_radius: crate::types::BlastRadius,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO severity_scores (source, issue_id, score, severity_component, frequency_component, regression_component, blast_radius_component, cluster_boost, blast_radius, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))",
+            params![
+                source,
+                issue_id,
+                score.score,
+                score.severity_component,
+                score.frequency_component,
+                score.regression_component,
+                score.blast_radius_component,
+                score.cluster_boost,
+                blast_radius.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_suppression(
+        &self,
+        source: &str,
+        issue_id: &str,
+        rule_name: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO suppression_log (source, issue_id, rule_name, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            params![source, issue_id, rule_name, reason],
+        )?;
+        Ok(())
+    }
+
+    // ── Code Indexing Storage ─────────────────────────────────────────
+
+    /// Get or create a repository ID by name.
+    pub fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
+        self.upsert_repository(name, None, None)
+    }
+
+    /// Check if a file's hash matches the currently stored hash (for incremental indexing).
+    /// Returns true only if chunks exist AND every chunk has an embedding,
+    /// ensuring partially-embedded files are re-indexed.
+    pub fn code_chunk_hash_matches(
+        &self,
+        repo_id: i64,
+        file_path: &str,
+        file_hash: &str,
+    ) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let (chunk_count, embedded_count): (i64, i64) = conn.query_row(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM code_chunks
+                 WHERE repo_id = ?1 AND file_path = ?2 AND file_hash = ?3),
+                (SELECT COUNT(*) FROM code_chunks c
+                 JOIN code_chunk_embeddings e ON e.chunk_id = c.id
+                 WHERE c.repo_id = ?1 AND c.file_path = ?2 AND c.file_hash = ?3)
+            "#,
+            params![repo_id, file_path, file_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(chunk_count > 0 && chunk_count == embedded_count)
+    }
+
+    /// Delete all code symbols, chunks, and embeddings for a specific file.
+    pub fn delete_code_data_for_file(&self, repo_id: i64, file_path: &str) -> Result<()> {
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Embeddings are CASCADE-deleted via code_chunks FK.
+        tx.execute(
+            "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
+            params![repo_id, file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
+            params![repo_id, file_path],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete code chunks (and their CASCADE-deleted embeddings) by chunk IDs.
+    pub fn delete_code_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+        if chunk_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire_lock()?;
+        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "DELETE FROM code_chunks WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    /// Remove code data for files that no longer exist in the repository.
+    pub fn cleanup_stale_code_data(&self, repo_id: i64, current_paths: &[String]) -> Result<()> {
+        let mut conn = self.acquire_lock()?;
+
+        if current_paths.is_empty() {
+            // No source files found — delete ALL code data for this repo.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM code_symbols WHERE repo_id = ?1",
+                params![repo_id],
+            )?;
+            tx.execute(
+                "DELETE FROM code_chunks WHERE repo_id = ?1",
+                params![repo_id],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+
+        // Get all file paths we have indexed for this repo.
+        // Query outside the write transaction to avoid holding a write lock during the read.
+        let indexed_paths: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1
+                 UNION
+                 SELECT DISTINCT file_path FROM code_symbols WHERE repo_id = ?1",
+            )?;
+            let rows: Vec<String> = stmt
+                .query_map(params![repo_id], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+
+        let current_set: std::collections::HashSet<&str> =
+            current_paths.iter().map(|s| s.as_str()).collect();
+
+        let stale_paths: Vec<&String> = indexed_paths
+            .iter()
+            .filter(|p| !current_set.contains(p.as_str()))
+            .collect();
+
+        if !stale_paths.is_empty() {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for path in &stale_paths {
+                tx.execute(
+                    "DELETE FROM code_symbols WHERE repo_id = ?1 AND file_path = ?2",
+                    params![repo_id, path],
+                )?;
+                tx.execute(
+                    "DELETE FROM code_chunks WHERE repo_id = ?1 AND file_path = ?2",
+                    params![repo_id, path],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Batch-save extracted code symbols.
+    pub fn save_code_symbols(&self, symbols: &[crate::repo::code_index::CodeSymbol]) -> Result<()> {
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO code_symbols (repo_id, file_path, symbol_name, symbol_kind, parent_symbol, language, start_line, end_line, signature)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )?;
+
+            for sym in symbols {
+                stmt.execute(params![
+                    sym.repo_id,
+                    &sym.file_path,
+                    &sym.symbol_name,
+                    sym.symbol_kind.as_str(),
+                    sym.parent_symbol.as_deref(),
+                    sym.language.as_str(),
+                    sym.start_line as i64,
+                    sym.end_line as i64,
+                    sym.signature.as_deref(),
+                ])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Batch-save code chunks. Returns the assigned IDs.
+    pub fn save_code_chunks(
+        &self,
+        chunks: &[crate::repo::code_index::CodeChunk],
+    ) -> Result<Vec<i64>> {
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let mut ids = Vec::with_capacity(chunks.len());
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO code_chunks (repo_id, file_path, chunk_type, symbol_name, language, start_line, end_line, chunk_text, context_text, file_hash)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+            )?;
+
+            for chunk in chunks {
+                stmt.execute(params![
+                    chunk.repo_id,
+                    &chunk.file_path,
+                    &chunk.chunk_type,
+                    chunk.symbol_name.as_deref(),
+                    chunk.language.as_str(),
+                    chunk.start_line as i64,
+                    chunk.end_line as i64,
+                    &chunk.chunk_text,
+                    &chunk.context_text,
+                    &chunk.file_hash,
+                ])?;
+                ids.push(tx.last_insert_rowid());
+            }
+        }
+
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Save embeddings for code chunks and insert into the HNSW vector index.
+    pub fn save_code_chunk_embeddings(
+        &self,
+        pairs: &[(i64, &[f32])],
+        model_name: &str,
+    ) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.acquire_lock()?;
+
+        let dimension = pairs[0].1.len();
+        let _ = Self::ensure_code_chunk_vector_table(&conn, dimension);
+
+        let has_vector_table = Self::table_exists(&conn, CODE_CHUNK_VECTOR_TABLE)?;
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO code_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
+            )?;
+
+            for &(chunk_id, embedding) in pairs {
+                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+                stmt.execute(params![chunk_id, blob, model_name])?;
+
+                if has_vector_table {
+                    let emb_id = tx.last_insert_rowid();
+                    let insert_sql = format!(
+                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
+                        CODE_CHUNK_VECTOR_TABLE
+                    );
+                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
+                        tracing::warn!(error = %e, chunk_id, "Failed to insert into code chunk vector table — aborting batch");
+                        // Drop tx without commit to roll back the entire batch,
+                        // so embeddings and vector index stay consistent.
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Lazily create the HNSW vector table for code chunk embeddings.
+    fn ensure_code_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
+        if dimension == 0 {
+            return Ok(false);
+        }
+
+        if Self::table_exists(conn, CODE_CHUNK_VECTOR_TABLE)? {
+            return Ok(true);
+        }
+
+        if !is_vectorlite_available(conn) {
+            match try_load_vectorlite(conn) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Unable to load vectorlite for code chunk search");
+                    return Ok(false);
+                }
+            }
+        }
+
+        let sql = format!(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
+                embedding float32[{dimension}] cosine,
+                hnsw(max_elements=100000, ef_construction=200, M=16)
+            )
+            "#,
+            table = CODE_CHUNK_VECTOR_TABLE,
+            dimension = dimension
+        );
+
+        match conn.execute_batch(&sql) {
+            Ok(()) => {
+                // Backfill existing embeddings.
+                let backfill = format!(
+                    r#"
+                    INSERT INTO {table}(rowid, embedding)
+                    SELECT id, embedding
+                    FROM code_chunk_embeddings
+                    WHERE length(embedding) = ?1
+                    "#,
+                    table = CODE_CHUNK_VECTOR_TABLE
+                );
+                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
+                    tracing::debug!(error = %e, "Failed to backfill code chunk vector embeddings");
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to create code chunk vector table");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Search code chunks by vector similarity using HNSW index.
+    pub fn search_code_chunks(
+        &self,
+        query_embedding: &[f32],
+        repo_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::repo::code_index::CodeSearchResult>> {
+        use crate::repo::code_index::types::{CodeChunk, CodeSearchResult};
+
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
+        let limit = limit.min(1000);
+
+        let conn = self.acquire_lock()?;
+
+        if !Self::ensure_code_chunk_vector_table(&conn, query_embedding.len())? {
+            // Vectorlite unavailable — fall back to empty results.
+            return Ok(Vec::new());
+        }
+
+        let query_blob: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let candidate_limit = limit * CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
+
+        let sql = format!(
+            r#"
+            WITH candidates AS (
+                SELECT rowid AS emb_id,
+                       MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
+                FROM {table}
+                WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
+            )
+            SELECT c.similarity,
+                   ch.id, ch.repo_id, ch.file_path, ch.chunk_type, ch.symbol_name,
+                   ch.language, ch.start_line, ch.end_line, ch.chunk_text,
+                   ch.context_text, ch.file_hash
+            FROM candidates c
+            JOIN code_chunk_embeddings e ON e.id = c.emb_id
+            JOIN code_chunks ch ON ch.id = e.chunk_id
+            WHERE (?4 IS NULL OR ch.repo_id = ?4)
+            ORDER BY c.similarity DESC
+            LIMIT ?5
+            "#,
+            table = CODE_CHUNK_VECTOR_TABLE
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to prepare code chunk vector search");
+                return Ok(Vec::new());
+            }
+        };
+
+        let rows = match stmt.query_map(
+            params![
+                query_blob,
+                candidate_limit as i64,
+                CODE_CHUNK_VECTOR_EF_SEARCH as i64,
+                repo_id,
+                limit as i64,
+            ],
+            |row| {
+                let similarity: f64 = row.get(0)?;
+                let lang_str: String = row.get(6)?;
+
+                Ok(CodeSearchResult {
+                    chunk: CodeChunk {
+                        id: row.get(1)?,
+                        repo_id: row.get(2)?,
+                        file_path: row.get(3)?,
+                        chunk_type: row.get(4)?,
+                        symbol_name: row.get(5)?,
+                        language: parse_language(&lang_str),
+                        start_line: row.get::<_, i64>(7)? as usize,
+                        end_line: row.get::<_, i64>(8)? as usize,
+                        chunk_text: row.get(9)?,
+                        context_text: row.get(10)?,
+                        file_hash: row.get(11)?,
+                    },
+                    score: similarity,
+                })
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "Code chunk vector search failed");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(r) => results.push(r),
+                Err(e) => tracing::debug!(error = %e, "Failed to read code chunk vector row"),
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Find code symbols by name (substring match).
+    pub fn find_code_symbols(
+        &self,
+        name: &str,
+        kind: Option<crate::repo::code_index::SymbolKind>,
+        repo_id: Option<i64>,
+    ) -> Result<Vec<crate::repo::code_index::CodeSymbol>> {
+        use crate::repo::code_index::types::CodeSymbol;
+
+        let conn = self.acquire_lock()?;
+        // Escape LIKE special characters in user input to prevent wildcard injection.
+        let escaped = name
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{}%", escaped);
+
+        let sql = r#"
+            SELECT id, repo_id, file_path, symbol_name, symbol_kind, parent_symbol,
+                   language, start_line, end_line, signature
+            FROM code_symbols
+            WHERE symbol_name LIKE ?1 ESCAPE '\'
+              AND (?2 IS NULL OR symbol_kind = ?2)
+              AND (?3 IS NULL OR repo_id = ?3)
+            ORDER BY symbol_name
+            LIMIT 100
+        "#;
+
+        let kind_str = kind.map(|k| k.as_str().to_string());
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![pattern, kind_str, repo_id], |row| {
+            let lang_str: String = row.get(6)?;
+            let kind_str: String = row.get(4)?;
+            Ok(CodeSymbol {
+                id: row.get(0)?,
+                repo_id: row.get(1)?,
+                file_path: row.get(2)?,
+                symbol_name: row.get(3)?,
+                symbol_kind: crate::repo::code_index::SymbolKind::from_str_loose(&kind_str)
+                    .unwrap_or(crate::repo::code_index::SymbolKind::Function),
+                parent_symbol: row.get(5)?,
+                language: parse_language(&lang_str),
+                start_line: row.get::<_, i64>(7)? as usize,
+                end_line: row.get::<_, i64>(8)? as usize,
+                signature: row.get(9)?,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for sym in rows.flatten() {
+            results.push(sym);
+        }
+        Ok(results)
+    }
+}
+
+/// Parse a language string from the DB back into a Language enum.
+fn parse_language(s: &str) -> crate::repo::code_index::Language {
+    match s {
+        "Rust" => crate::repo::code_index::Language::Rust,
+        "TypeScript" => crate::repo::code_index::Language::TypeScript,
+        "TSX" => crate::repo::code_index::Language::Tsx,
+        "JavaScript" => crate::repo::code_index::Language::JavaScript,
+        "Python" => crate::repo::code_index::Language::Python,
+        "Go" => crate::repo::code_index::Language::Go,
+        "Java" => crate::repo::code_index::Language::Java,
+        "C" => crate::repo::code_index::Language::C,
+        "C++" => crate::repo::code_index::Language::Cpp,
+        "Ruby" => crate::repo::code_index::Language::Ruby,
+        "PHP" => crate::repo::code_index::Language::Php,
+        "Swift" => crate::repo::code_index::Language::Swift,
+        "Kotlin" => crate::repo::code_index::Language::Kotlin,
+        other => {
+            tracing::warn!(language = %other, "Unknown language in DB, falling back to Rust");
+            crate::repo::code_index::Language::Rust
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7705,10 +8445,10 @@ mod tests {
     }
 
     #[test]
-    fn test_get_pending_prs_no_github_info() {
+    fn test_get_pending_prs_gitlab_mr_url() {
         let tracker = SqliteTracker::in_memory().unwrap();
 
-        // Create attempt with non-GitHub PR URL
+        // Create attempt with GitLab MR URL (now parsed successfully)
         tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
         tracker
             .mark_success(
@@ -7718,9 +8458,11 @@ mod tests {
             )
             .unwrap();
 
-        // Should not be included because github_repo is None
+        // GitLab MR URLs are now parsed into github_repo/github_pr_number fields
         let pending_prs = tracker.get_pending_prs().unwrap();
-        assert!(pending_prs.is_empty());
+        assert_eq!(pending_prs.len(), 1);
+        assert_eq!(pending_prs[0].github_repo, Some("org/repo".to_string()));
+        assert_eq!(pending_prs[0].github_pr_number, Some(42));
     }
 
     #[test]
@@ -8425,7 +9167,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // Create a PR review state
-        let state = crate::github::PrReviewState::new(
+        let state = crate::scm::PrReviewState::new(
             "https://github.com/owner/repo/pull/123",
             "owner/repo",
             123,
@@ -8452,7 +9194,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // Create and save initial state
-        let mut state = crate::github::PrReviewState::new(
+        let mut state = crate::scm::PrReviewState::new(
             "https://github.com/owner/repo/pull/456",
             "owner/repo",
             456,
@@ -8488,14 +9230,14 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // Create and save two states
-        let state1 = crate::github::PrReviewState::new(
+        let state1 = crate::scm::PrReviewState::new(
             "https://github.com/owner/repo/pull/1",
             "owner/repo",
             1,
             "issue-1",
             "linear",
         );
-        let state2 = crate::github::PrReviewState::new(
+        let state2 = crate::scm::PrReviewState::new(
             "https://github.com/owner/repo/pull/2",
             "owner/repo",
             2,
@@ -8522,13 +9264,13 @@ mod tests {
     fn test_record_pr_review_comment() {
         let tracker = SqliteTracker::in_memory().unwrap();
 
-        let comment = crate::github::PrReviewComment {
+        let comment = crate::scm::ReviewComment {
             id: 12345,
             path: "src/main.rs".to_string(),
             position: Some(10),
             original_position: None,
             body: "Consider using a const here".to_string(),
-            user: crate::github::GitHubUser {
+            user: crate::scm::ReviewUser {
                 id: 1,
                 login: "reviewer1".to_string(),
                 user_type: Some("User".to_string()),
@@ -8563,13 +9305,13 @@ mod tests {
 
         // Create multiple comments
         for i in 1..=3 {
-            let comment = crate::github::PrReviewComment {
+            let comment = crate::scm::ReviewComment {
                 id: i * 100,
                 path: format!("src/file{}.rs", i),
                 position: Some(i),
                 original_position: None,
                 body: format!("Comment {}", i),
-                user: crate::github::GitHubUser {
+                user: crate::scm::ReviewUser {
                     id: i,
                     login: format!("reviewer{}", i),
                     user_type: Some("User".to_string()),
@@ -8599,13 +9341,13 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         let pr_url = "https://github.com/owner/repo/pull/1";
-        let comment = crate::github::PrReviewComment {
+        let comment = crate::scm::ReviewComment {
             id: 999,
             path: "src/main.rs".to_string(),
             position: None,
             original_position: None,
             body: "Original comment".to_string(),
-            user: crate::github::GitHubUser {
+            user: crate::scm::ReviewUser {
                 id: 1,
                 login: "author".to_string(),
                 user_type: Some("User".to_string()),
@@ -8622,7 +9364,7 @@ mod tests {
         tracker.record_pr_review_comment(pr_url, &comment).unwrap();
 
         // Update the comment (same id, different body)
-        let updated_comment = crate::github::PrReviewComment {
+        let updated_comment = crate::scm::ReviewComment {
             body: "Updated comment body".to_string(),
             updated_at: "2024-01-15T11:00:00Z".to_string(),
             ..comment
@@ -10218,6 +10960,55 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    #[test]
+    fn test_parse_pr_url_gitlab_standard() {
+        let result =
+            SqliteTracker::parse_pr_url("https://gitlab.com/group/project/-/merge_requests/42");
+        assert_eq!(result, Some(("group/project".to_string(), 42)));
+    }
+
+    #[test]
+    fn test_parse_pr_url_gitlab_self_hosted() {
+        let result =
+            SqliteTracker::parse_pr_url("https://gitlab.example.com/org/repo/-/merge_requests/7");
+        assert_eq!(result, Some(("org/repo".to_string(), 7)));
+    }
+
+    #[test]
+    fn test_parse_pr_url_gitlab_nested_groups() {
+        let result = SqliteTracker::parse_pr_url(
+            "https://gitlab.com/group/subgroup/project/-/merge_requests/99",
+        );
+        assert_eq!(result, Some(("group/subgroup/project".to_string(), 99)));
+    }
+
+    #[test]
+    fn test_parse_pr_url_gitlab_deeply_nested() {
+        let result = SqliteTracker::parse_pr_url("https://gitlab.com/a/b/c/d/-/merge_requests/1");
+        assert_eq!(result, Some(("a/b/c/d".to_string(), 1)));
+    }
+
+    #[test]
+    fn test_parse_pr_url_gitlab_http() {
+        let result =
+            SqliteTracker::parse_pr_url("http://gitlab.internal/team/repo/-/merge_requests/5");
+        assert_eq!(result, Some(("team/repo".to_string(), 5)));
+    }
+
+    #[test]
+    fn test_parse_pr_url_gitlab_without_dash_prefix() {
+        let result =
+            SqliteTracker::parse_pr_url("https://gitlab.com/group/project/merge_requests/1");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_pr_url_gitlab_large_mr_number() {
+        let result =
+            SqliteTracker::parse_pr_url("https://gitlab.com/org/repo/-/merge_requests/999999");
+        assert_eq!(result, Some(("org/repo".to_string(), 999999)));
+    }
+
     // ---------------------------------------------------------------
     // Attempt lifecycle
     // ---------------------------------------------------------------
@@ -11505,9 +12296,9 @@ mod tests {
             .unwrap();
         let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
         assert_eq!(attempt.status, FixAttemptStatus::Success);
-        // Non-GitHub URL should not extract github_repo
-        assert!(attempt.github_repo.is_none());
-        assert!(attempt.github_pr_number.is_none());
+        // GitLab MR URLs are now parsed into github_repo/github_pr_number
+        assert_eq!(attempt.github_repo, Some("org/repo".to_string()));
+        assert_eq!(attempt.github_pr_number, Some(1));
     }
 
     #[test]

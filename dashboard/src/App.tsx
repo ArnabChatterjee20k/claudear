@@ -1,4 +1,4 @@
-import { Router } from './router'
+import { Router, RouterProvider } from './router'
 import { AppShell } from './components/layout/app-shell'
 import { AuthProvider, useAuth } from './lib/auth'
 import LoginPage from './pages/login'
@@ -15,9 +15,12 @@ import InferencePage from './pages/inference'
 import ActivityPage from './pages/activity'
 import UsersPage from './pages/users'
 import TelemetryPage from './pages/telemetry'
+import ConfigPage from './pages/config'
+import IssuesPage from './pages/issues'
 
 const routes: Record<string, () => JSX.Element> = {
   '/': OverviewPage,
+  '/issues': IssuesPage,
   '/attempts': AttemptsPage,
   '/prs': PrsPage,
   '/analytics': AnalyticsPage,
@@ -29,6 +32,7 @@ const routes: Record<string, () => JSX.Element> = {
   '/inference': InferencePage,
   '/activity': ActivityPage,
   '/telemetry': TelemetryPage,
+  '/config': ConfigPage,
   '/users': UsersPage,
 }
 
@@ -48,9 +52,11 @@ function AuthenticatedApp() {
   }
 
   return (
-    <AppShell>
-      <Router routes={routes} />
-    </AppShell>
+    <RouterProvider>
+      <AppShell>
+        <Router routes={routes} />
+      </AppShell>
+    </RouterProvider>
   )
 }
 

@@ -7,6 +7,7 @@
 //!
 //! - `ConsoleNotifier` - Prints to stdout (always enabled)
 //! - `DiscordNotifier` - Sends Discord webhook messages
+//! - `SlackNotifier` - Sends Slack Block Kit messages
 //! - `EmailNotifier` - Sends email via SMTP
 //! - `SmsNotifier` - Sends SMS via Twilio
 //! - `PushNotifier` - Sends push notifications via Pushover
@@ -49,6 +50,7 @@ mod console;
 mod discord;
 mod email;
 mod push;
+mod slack;
 mod sms;
 
 pub use ask_orchestrator::send_to_all_and_wait_first_reply;
@@ -56,6 +58,7 @@ pub use console::ConsoleNotifier;
 pub use discord::DiscordNotifier;
 pub use email::EmailNotifier;
 pub use push::PushNotifier;
+pub use slack::SlackNotifier;
 pub use sms::SmsNotifier;
 
 use crate::error::Result;
@@ -72,6 +75,7 @@ pub(crate) fn get_source_emoji(source: &str) -> &'static str {
         "sentry" => "\u{1F534}", // red circle
         "github" => "\u{1F419}", // octopus
         "jira" => "\u{1F3AB}",   // ticket
+        "slack" => "\u{1F4AC}",  // speech balloon
         _ => "\u{1F4CC}",        // pushpin
     }
 }
@@ -854,5 +858,808 @@ mod tests {
         assert!(!text.is_empty());
         // Should contain some of the stats
         assert!(text.contains("10") || text.contains("8") || text.contains("5"));
+    }
+
+    // ── get_source_emoji tests ──
+
+    #[test]
+    fn test_get_source_emoji_linear() {
+        assert_eq!(get_source_emoji("linear"), "\u{1F4CB}");
+    }
+
+    #[test]
+    fn test_get_source_emoji_sentry() {
+        assert_eq!(get_source_emoji("sentry"), "\u{1F534}");
+    }
+
+    #[test]
+    fn test_get_source_emoji_github() {
+        assert_eq!(get_source_emoji("github"), "\u{1F419}");
+    }
+
+    #[test]
+    fn test_get_source_emoji_jira() {
+        assert_eq!(get_source_emoji("jira"), "\u{1F3AB}");
+    }
+
+    #[test]
+    fn test_get_source_emoji_slack() {
+        assert_eq!(get_source_emoji("slack"), "\u{1F4AC}");
+    }
+
+    #[test]
+    fn test_get_source_emoji_unknown_source() {
+        assert_eq!(get_source_emoji("unknown"), "\u{1F4CC}");
+    }
+
+    #[test]
+    fn test_get_source_emoji_empty_string() {
+        assert_eq!(get_source_emoji(""), "\u{1F4CC}");
+    }
+
+    #[test]
+    fn test_get_source_emoji_case_insensitive() {
+        assert_eq!(get_source_emoji("Linear"), "\u{1F4CB}");
+        assert_eq!(get_source_emoji("SENTRY"), "\u{1F534}");
+        assert_eq!(get_source_emoji("GitHub"), "\u{1F419}");
+        assert_eq!(get_source_emoji("JIRA"), "\u{1F3AB}");
+        assert_eq!(get_source_emoji("Slack"), "\u{1F4AC}");
+    }
+
+    #[test]
+    fn test_get_source_emoji_mixed_case() {
+        assert_eq!(get_source_emoji("LiNeAr"), "\u{1F4CB}");
+        assert_eq!(get_source_emoji("sEnTrY"), "\u{1F534}");
+    }
+
+    // ── Default trait implementation tests ──
+
+    #[tokio::test]
+    async fn test_default_ask_question_returns_none() {
+        let notifier = MockNotifier::new("test", true);
+        let issue = test_issue();
+        let request = AskRequest {
+            correlation_id: "corr-1".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "123".to_string(),
+            short_id: "TEST-123".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "What should we do?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+
+        let result = notifier.ask_question(&issue, &request).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_default_poll_question_replies_returns_empty() {
+        let notifier = MockNotifier::new("test", true);
+        let request = AskRequest {
+            correlation_id: "corr-1".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "123".to_string(),
+            short_id: "TEST-123".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "What?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+
+        let result = notifier
+            .poll_question_replies(&request, chrono::Utc::now())
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_supports_replies_false() {
+        let notifier = MockNotifier::new("test", true);
+        assert!(!notifier.supports_replies());
+    }
+
+    // ── Mock that supports ask/reply for CompositeNotifier ask_question tests ──
+
+    struct AskMockNotifier {
+        name: String,
+        delivery: Option<AskDelivery>,
+        replies: Vec<AskReply>,
+        _supports_replies: bool,
+        should_fail: bool,
+    }
+
+    impl AskMockNotifier {
+        fn with_delivery(name: &str, delivery: AskDelivery) -> Self {
+            Self {
+                name: name.to_string(),
+                delivery: Some(delivery),
+                replies: vec![],
+                _supports_replies: false,
+                should_fail: false,
+            }
+        }
+
+        fn with_replies(name: &str, replies: Vec<AskReply>) -> Self {
+            Self {
+                name: name.to_string(),
+                delivery: None,
+                replies,
+                _supports_replies: true,
+                should_fail: false,
+            }
+        }
+
+        fn no_delivery(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                delivery: None,
+                replies: vec![],
+                _supports_replies: false,
+                should_fail: false,
+            }
+        }
+
+        fn failing(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                delivery: None,
+                replies: vec![],
+                _supports_replies: true,
+                should_fail: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Notifier for AskMockNotifier {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        async fn notify_start(&self, _issue: &Issue) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_success(&self, _issue: &Issue, _pr_url: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_completed(&self, _issue: &Issue) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_failed(&self, _issue: &Issue, _error: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_status(&self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_urgent_issues(&self, _issues: &[Issue]) -> Result<()> {
+            Ok(())
+        }
+        async fn ask_question(
+            &self,
+            _issue: &Issue,
+            _request: &AskRequest,
+        ) -> Result<Option<AskDelivery>> {
+            if self.should_fail {
+                return Err(crate::error::Error::config("ask failed"));
+            }
+            Ok(self.delivery.clone())
+        }
+        async fn poll_question_replies(
+            &self,
+            _request: &AskRequest,
+            _since: DateTime<Utc>,
+        ) -> Result<Vec<AskReply>> {
+            if self.should_fail {
+                return Err(crate::error::Error::config("poll failed"));
+            }
+            Ok(self.replies.clone())
+        }
+        fn supports_replies(&self) -> bool {
+            self._supports_replies
+        }
+    }
+
+    fn test_ask_request() -> AskRequest {
+        AskRequest {
+            correlation_id: "corr-123".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "123".to_string(),
+            short_id: "TEST-123".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Should we proceed?".to_string(),
+                context: Some("context".to_string()),
+                options: vec!["Yes".to_string(), "No".to_string()],
+                why: Some("Need confirmation".to_string()),
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        }
+    }
+
+    // ── CompositeNotifier::ask_question tests ──
+
+    #[tokio::test]
+    async fn test_composite_ask_question_empty() {
+        let composite = CompositeNotifier::new();
+        let result = composite
+            .ask_question(&test_issue(), &test_ask_request())
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_composite_ask_question_no_delivery() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(AskMockNotifier::no_delivery("mock1")));
+        composite.add(Arc::new(AskMockNotifier::no_delivery("mock2")));
+
+        let result = composite
+            .ask_question(&test_issue(), &test_ask_request())
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_composite_ask_question_returns_first_delivery() {
+        let mut composite = CompositeNotifier::new();
+        let delivery = AskDelivery {
+            channel: "discord".to_string(),
+            target: Some("user-1".to_string()),
+            message_id: Some("msg-1".to_string()),
+        };
+        composite.add(Arc::new(AskMockNotifier::with_delivery(
+            "discord", delivery,
+        )));
+        composite.add(Arc::new(AskMockNotifier::no_delivery("email")));
+
+        let result = composite
+            .ask_question(&test_issue(), &test_ask_request())
+            .await;
+        assert!(result.is_ok());
+        let delivery = result.unwrap();
+        assert!(delivery.is_some());
+        let d = delivery.unwrap();
+        assert_eq!(d.channel, "discord");
+        assert_eq!(d.target, Some("user-1".to_string()));
+        assert_eq!(d.message_id, Some("msg-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_composite_ask_question_with_multiple_deliveries() {
+        let mut composite = CompositeNotifier::new();
+        let delivery1 = AskDelivery {
+            channel: "discord".to_string(),
+            target: Some("user-1".to_string()),
+            message_id: Some("msg-1".to_string()),
+        };
+        let delivery2 = AskDelivery {
+            channel: "slack".to_string(),
+            target: Some("user-2".to_string()),
+            message_id: Some("msg-2".to_string()),
+        };
+        composite.add(Arc::new(AskMockNotifier::with_delivery(
+            "discord", delivery1,
+        )));
+        composite.add(Arc::new(AskMockNotifier::with_delivery("slack", delivery2)));
+
+        let result = composite
+            .ask_question(&test_issue(), &test_ask_request())
+            .await;
+        assert!(result.is_ok());
+        // Should return the first delivery encountered
+        let delivery = result.unwrap();
+        assert!(delivery.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_composite_ask_question_handles_errors_gracefully() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(AskMockNotifier::failing("failing")));
+        let delivery = AskDelivery {
+            channel: "discord".to_string(),
+            target: None,
+            message_id: None,
+        };
+        composite.add(Arc::new(AskMockNotifier::with_delivery(
+            "discord", delivery,
+        )));
+
+        let result = composite
+            .ask_question(&test_issue(), &test_ask_request())
+            .await;
+        // Should still return Ok even when one notifier fails
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_composite_ask_question_all_fail() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(AskMockNotifier::failing("fail1")));
+        composite.add(Arc::new(AskMockNotifier::failing("fail2")));
+
+        let result = composite
+            .ask_question(&test_issue(), &test_ask_request())
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    // ── CompositeNotifier::poll_question_replies tests ──
+
+    #[tokio::test]
+    async fn test_composite_poll_replies_empty() {
+        let composite = CompositeNotifier::new();
+        let result = composite
+            .poll_question_replies(&test_ask_request(), chrono::Utc::now())
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_composite_poll_replies_no_reply_capable_notifiers() {
+        let mut composite = CompositeNotifier::new();
+        // MockNotifier does not support replies
+        composite.add(Arc::new(MockNotifier::new("mock1", true)));
+        composite.add(Arc::new(MockNotifier::new("mock2", true)));
+
+        let result = composite
+            .poll_question_replies(&test_ask_request(), chrono::Utc::now())
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_composite_poll_replies_aggregates_from_multiple() {
+        let mut composite = CompositeNotifier::new();
+        let replies1 = vec![AskReply {
+            correlation_id: "corr-123".to_string(),
+            channel: "discord".to_string(),
+            responder: Some("user-1".to_string()),
+            answer: "Yes".to_string(),
+            replied_at: chrono::Utc::now(),
+        }];
+        let replies2 = vec![AskReply {
+            correlation_id: "corr-123".to_string(),
+            channel: "slack".to_string(),
+            responder: Some("user-2".to_string()),
+            answer: "No".to_string(),
+            replied_at: chrono::Utc::now(),
+        }];
+
+        composite.add(Arc::new(AskMockNotifier::with_replies("discord", replies1)));
+        composite.add(Arc::new(AskMockNotifier::with_replies("slack", replies2)));
+
+        let result = composite
+            .poll_question_replies(&test_ask_request(), chrono::Utc::now())
+            .await;
+        assert!(result.is_ok());
+        let replies = result.unwrap();
+        assert_eq!(replies.len(), 2);
+        // Verify both channels contributed
+        let channels: Vec<&str> = replies.iter().map(|r| r.channel.as_str()).collect();
+        assert!(channels.contains(&"discord"));
+        assert!(channels.contains(&"slack"));
+    }
+
+    #[tokio::test]
+    async fn test_composite_poll_replies_filters_non_reply_notifiers() {
+        let mut composite = CompositeNotifier::new();
+
+        // This notifier does NOT support replies (supports_replies = false)
+        composite.add(Arc::new(AskMockNotifier::no_delivery("no-reply")));
+
+        // This one DOES support replies
+        let replies = vec![AskReply {
+            correlation_id: "corr-123".to_string(),
+            channel: "discord".to_string(),
+            responder: Some("user-1".to_string()),
+            answer: "Go ahead".to_string(),
+            replied_at: chrono::Utc::now(),
+        }];
+        composite.add(Arc::new(AskMockNotifier::with_replies("discord", replies)));
+
+        let result = composite
+            .poll_question_replies(&test_ask_request(), chrono::Utc::now())
+            .await;
+        assert!(result.is_ok());
+        let replies = result.unwrap();
+        // Only the reply-capable notifier's replies should appear
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].channel, "discord");
+    }
+
+    #[tokio::test]
+    async fn test_composite_poll_replies_handles_errors() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(AskMockNotifier::failing("failing")));
+        let replies = vec![AskReply {
+            correlation_id: "corr-123".to_string(),
+            channel: "slack".to_string(),
+            responder: None,
+            answer: "Looks good".to_string(),
+            replied_at: chrono::Utc::now(),
+        }];
+        composite.add(Arc::new(AskMockNotifier::with_replies("slack", replies)));
+
+        let result = composite
+            .poll_question_replies(&test_ask_request(), chrono::Utc::now())
+            .await;
+        assert!(result.is_ok());
+        // Should still get replies from the working notifier
+        let replies = result.unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].answer, "Looks good");
+    }
+
+    #[tokio::test]
+    async fn test_composite_poll_replies_all_fail() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(AskMockNotifier::failing("fail1")));
+        composite.add(Arc::new(AskMockNotifier::failing("fail2")));
+
+        let result = composite
+            .poll_question_replies(&test_ask_request(), chrono::Utc::now())
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    // ── CompositeNotifier::supports_replies tests ──
+
+    #[test]
+    fn test_composite_supports_replies_empty() {
+        let composite = CompositeNotifier::new();
+        assert!(!composite.supports_replies());
+    }
+
+    #[test]
+    fn test_composite_supports_replies_none_support() {
+        let mut composite = CompositeNotifier::new();
+        // MockNotifier doesn't support replies
+        composite.add(Arc::new(MockNotifier::new("mock1", true)));
+        composite.add(Arc::new(MockNotifier::new("mock2", true)));
+        assert!(!composite.supports_replies());
+    }
+
+    #[test]
+    fn test_composite_supports_replies_some_support() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(MockNotifier::new("mock1", true)));
+        composite.add(Arc::new(AskMockNotifier::with_replies(
+            "reply-mock",
+            vec![],
+        )));
+        assert!(composite.supports_replies());
+    }
+
+    #[test]
+    fn test_composite_supports_replies_all_support() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(AskMockNotifier::with_replies("r1", vec![])));
+        composite.add(Arc::new(AskMockNotifier::with_replies("r2", vec![])));
+        assert!(composite.supports_replies());
+    }
+
+    // ── Error handling across multiple broadcast methods ──
+
+    #[tokio::test]
+    async fn test_composite_broadcast_errors_do_not_affect_other_notifiers() {
+        let mut composite = CompositeNotifier::new();
+        let working = Arc::new(MockNotifier::new("working", true));
+        let working_clone = Arc::clone(&working);
+        composite.add(Arc::new(FailingNotifier::new("failing")));
+        composite.add(working);
+
+        // All methods should succeed and the working notifier should still be called
+        assert!(composite
+            .notify_success(&test_issue(), "https://pr.url")
+            .await
+            .is_ok());
+        assert_eq!(working_clone.get_call_count(), 1);
+
+        assert!(composite.notify_completed(&test_issue()).await.is_ok());
+        assert_eq!(working_clone.get_call_count(), 2);
+
+        assert!(composite
+            .notify_failed(&test_issue(), "error msg")
+            .await
+            .is_ok());
+        assert_eq!(working_clone.get_call_count(), 3);
+
+        assert!(composite.notify_status("status").await.is_ok());
+        assert_eq!(working_clone.get_call_count(), 4);
+
+        assert!(composite
+            .notify_urgent_issues(&[test_issue()])
+            .await
+            .is_ok());
+        assert_eq!(working_clone.get_call_count(), 5);
+
+        assert!(composite
+            .notify_merged(&test_issue(), "https://pr.url")
+            .await
+            .is_ok());
+        assert_eq!(working_clone.get_call_count(), 6);
+    }
+
+    // ── Multiple sequential broadcasts accumulate call counts ──
+
+    #[tokio::test]
+    async fn test_composite_multiple_broadcasts_accumulate() {
+        let mut composite = CompositeNotifier::new();
+        let mock = Arc::new(MockNotifier::new("mock", true));
+        let mock_clone = Arc::clone(&mock);
+        composite.add(mock);
+
+        composite.notify_start(&test_issue()).await.unwrap();
+        composite.notify_start(&test_issue()).await.unwrap();
+        composite.notify_start(&test_issue()).await.unwrap();
+
+        assert_eq!(mock_clone.get_call_count(), 3);
+    }
+
+    // ── Test that all failing notifiers still let composite return Ok ──
+
+    #[tokio::test]
+    async fn test_composite_all_fail_for_every_method() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(FailingNotifier::new("fail1")));
+        composite.add(Arc::new(FailingNotifier::new("fail2")));
+
+        assert!(composite.notify_start(&test_issue()).await.is_ok());
+        assert!(composite.notify_success(&test_issue(), "url").await.is_ok());
+        assert!(composite.notify_completed(&test_issue()).await.is_ok());
+        assert!(composite.notify_failed(&test_issue(), "err").await.is_ok());
+        assert!(composite.notify_status("msg").await.is_ok());
+        assert!(composite.notify_urgent_issues(&[]).await.is_ok());
+        assert!(composite.notify_merged(&test_issue(), "url").await.is_ok());
+    }
+
+    // ── Test Notifier trait as dyn object ──
+
+    #[tokio::test]
+    async fn test_notifier_as_trait_object() {
+        let mock: Arc<dyn Notifier> = Arc::new(MockNotifier::new("dyn_test", true));
+        assert_eq!(mock.name(), "dyn_test");
+        assert!(mock.is_enabled());
+        assert!(!mock.supports_replies());
+        assert!(mock.notify_start(&test_issue()).await.is_ok());
+    }
+
+    // ── Test CompositeNotifier as Notifier trait object ──
+
+    #[tokio::test]
+    async fn test_composite_as_trait_object() {
+        let mut composite = CompositeNotifier::new();
+        composite.add(Arc::new(MockNotifier::new("inner", true)));
+
+        let notifier: Arc<dyn Notifier> = Arc::new(composite);
+        assert_eq!(notifier.name(), "composite");
+        assert!(notifier.is_enabled());
+        assert!(notifier.notify_start(&test_issue()).await.is_ok());
+    }
+
+    // ── Verify is_enabled mirrors notifier list state ──
+
+    #[test]
+    fn test_composite_is_enabled_reflects_internal_state() {
+        let mut composite = CompositeNotifier::new();
+        assert!(!composite.is_enabled());
+
+        composite.add(Arc::new(MockNotifier::new("disabled", false)));
+        assert!(!composite.is_enabled()); // disabled not added
+
+        composite.add(Arc::new(MockNotifier::new("enabled", true)));
+        assert!(composite.is_enabled());
+    }
+
+    // ── Test with many notifiers (stress/fanout) ──
+
+    #[tokio::test]
+    async fn test_composite_broadcast_many_notifiers() {
+        let mut composite = CompositeNotifier::new();
+        let mocks: Vec<Arc<MockNotifier>> = (0..20)
+            .map(|i| Arc::new(MockNotifier::new(&format!("mock{}", i), true)))
+            .collect();
+
+        for mock in &mocks {
+            composite.add(Arc::clone(mock) as Arc<dyn Notifier>);
+        }
+
+        composite
+            .notify_failed(&test_issue(), "test error")
+            .await
+            .unwrap();
+
+        for (i, mock) in mocks.iter().enumerate() {
+            assert_eq!(
+                mock.get_call_count(),
+                1,
+                "Mock {} should have been called exactly once",
+                i
+            );
+        }
+    }
+
+    // ── Test poll_question_replies with multiple replies per notifier ──
+
+    #[tokio::test]
+    async fn test_composite_poll_replies_multiple_per_notifier() {
+        let mut composite = CompositeNotifier::new();
+        let replies = vec![
+            AskReply {
+                correlation_id: "corr-1".to_string(),
+                channel: "discord".to_string(),
+                responder: Some("alice".to_string()),
+                answer: "Yes".to_string(),
+                replied_at: chrono::Utc::now(),
+            },
+            AskReply {
+                correlation_id: "corr-1".to_string(),
+                channel: "discord".to_string(),
+                responder: Some("bob".to_string()),
+                answer: "No".to_string(),
+                replied_at: chrono::Utc::now(),
+            },
+            AskReply {
+                correlation_id: "corr-1".to_string(),
+                channel: "discord".to_string(),
+                responder: Some("charlie".to_string()),
+                answer: "Maybe".to_string(),
+                replied_at: chrono::Utc::now(),
+            },
+        ];
+        composite.add(Arc::new(AskMockNotifier::with_replies("discord", replies)));
+
+        let result = composite
+            .poll_question_replies(&test_ask_request(), chrono::Utc::now())
+            .await;
+        assert!(result.is_ok());
+        let all_replies = result.unwrap();
+        assert_eq!(all_replies.len(), 3);
+    }
+
+    // ── Test AskDelivery fields ──
+
+    #[tokio::test]
+    async fn test_composite_ask_question_delivery_with_no_target() {
+        let mut composite = CompositeNotifier::new();
+        let delivery = AskDelivery {
+            channel: "push".to_string(),
+            target: None,
+            message_id: None,
+        };
+        composite.add(Arc::new(AskMockNotifier::with_delivery("push", delivery)));
+
+        let result = composite
+            .ask_question(&test_issue(), &test_ask_request())
+            .await;
+        assert!(result.is_ok());
+        let d = result.unwrap().unwrap();
+        assert_eq!(d.channel, "push");
+        assert!(d.target.is_none());
+        assert!(d.message_id.is_none());
+    }
+
+    // ── Test notify_merged default impl formats correctly ──
+
+    #[tokio::test]
+    async fn test_default_notify_merged_formats_message() {
+        // Create a notifier that captures the status message
+        struct CapturingNotifier {
+            last_message: std::sync::Mutex<Option<String>>,
+        }
+
+        #[async_trait]
+        impl Notifier for CapturingNotifier {
+            fn name(&self) -> &str {
+                "capturing"
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            async fn notify_start(&self, _issue: &Issue) -> Result<()> {
+                Ok(())
+            }
+            async fn notify_success(&self, _issue: &Issue, _pr_url: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn notify_completed(&self, _issue: &Issue) -> Result<()> {
+                Ok(())
+            }
+            async fn notify_failed(&self, _issue: &Issue, _error: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn notify_status(&self, message: &str) -> Result<()> {
+                *self.last_message.lock().unwrap() = Some(message.to_string());
+                Ok(())
+            }
+            async fn notify_urgent_issues(&self, _issues: &[Issue]) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let notifier = CapturingNotifier {
+            last_message: std::sync::Mutex::new(None),
+        };
+
+        let issue = test_issue();
+        notifier
+            .notify_merged(&issue, "https://github.com/org/repo/pull/42")
+            .await
+            .unwrap();
+
+        let msg = notifier.last_message.lock().unwrap().clone().unwrap();
+        assert!(msg.contains("TEST-123"));
+        assert!(msg.contains("https://github.com/org/repo/pull/42"));
+        assert!(msg.contains("PR merged"));
+    }
+
+    // ── Test empty urgent issues list via composite ──
+
+    #[tokio::test]
+    async fn test_composite_notify_urgent_issues_empty_list() {
+        let mut composite = CompositeNotifier::new();
+        let mock = Arc::new(MockNotifier::new("mock", true));
+        let mock_clone = Arc::clone(&mock);
+        composite.add(mock);
+
+        let result = composite.notify_urgent_issues(&[]).await;
+        assert!(result.is_ok());
+        assert_eq!(mock_clone.get_call_count(), 1);
+    }
+
+    // ── Test composite with single notifier for each method ──
+
+    #[tokio::test]
+    async fn test_composite_single_notifier_all_methods() {
+        let mut composite = CompositeNotifier::new();
+        let mock = Arc::new(MockNotifier::new("solo", true));
+        let mock_clone = Arc::clone(&mock);
+        composite.add(mock);
+
+        composite.notify_start(&test_issue()).await.unwrap();
+        composite
+            .notify_success(&test_issue(), "pr-url")
+            .await
+            .unwrap();
+        composite.notify_completed(&test_issue()).await.unwrap();
+        composite.notify_failed(&test_issue(), "err").await.unwrap();
+        composite.notify_status("msg").await.unwrap();
+        composite.notify_urgent_issues(&[]).await.unwrap();
+        composite
+            .notify_merged(&test_issue(), "pr-url")
+            .await
+            .unwrap();
+
+        // notify_merged default calls notify_status, so 7 total calls
+        // (start + success + completed + failed + status + urgent + merged->status)
+        assert_eq!(mock_clone.get_call_count(), 7);
     }
 }

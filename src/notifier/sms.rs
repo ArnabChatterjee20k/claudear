@@ -978,6 +978,7 @@ mod tests {
             asked_at: chrono::Utc::now(),
             target_discord_id: None,
             target_email: None,
+            target_slack_id: None,
         };
         notifier.ask_question(&issue, &request).await.unwrap();
 
@@ -1008,6 +1009,7 @@ mod tests {
             asked_at: chrono::Utc::now(),
             target_discord_id: None,
             target_email: None,
+            target_slack_id: None,
         };
         let delivery = notifier
             .ask_question(&issue, &request)

@@ -91,9 +91,12 @@ impl QaPromoter {
         let mut output = String::from("# Standing Instructions (from repeated Q&A)\n\n");
 
         for instruction in instructions {
+            // Replace newlines with spaces to keep each instruction on a single
+            // bullet-point line (embedded newlines would break the markdown list).
+            let text = instruction.instruction_text.replace('\n', " ");
             output.push_str(&format!(
                 "- {} (confidence: {:.0}%, seen {} times)\n",
-                instruction.instruction_text,
+                text,
                 instruction.confidence * 100.0,
                 instruction.occurrence_count
             ));
@@ -390,5 +393,259 @@ mod tests {
 
         let count = QaPromoter::scan_and_promote(&tracker, None, 2, 0.8).unwrap();
         assert_eq!(count, 0);
+    }
+
+    // ── compute_confidence edge cases ──
+
+    fn make_qa_match(success_rate: f64) -> crate::types::QaMatch {
+        crate::types::QaMatch {
+            entry: crate::types::QaKnowledgeEntry {
+                id: 0,
+                source: "linear".to_string(),
+                repo: Some("org/repo".to_string()),
+                issue_id: "iss".to_string(),
+                short_id: "I".to_string(),
+                question_text: "q".to_string(),
+                question_norm: "q".to_string(),
+                question_embedding: None,
+                answer_text: "a".to_string(),
+                answer_norm: "a".to_string(),
+                answer_embedding: None,
+                channel: "discord".to_string(),
+                responder: Some("user".to_string()),
+                correlation_id: "c".to_string(),
+                asked_at: Utc::now(),
+                answered_at: Utc::now(),
+                success_count: 0,
+                failure_count: 0,
+                last_used_at: None,
+                metadata: None,
+            },
+            semantic_similarity: 0.9,
+            historical_success_rate: success_rate,
+            final_score: 0.9,
+        }
+    }
+
+    fn make_qa_match_with_embedding(
+        success_rate: f64,
+        embedding: Option<Vec<f32>>,
+    ) -> crate::types::QaMatch {
+        let mut m = make_qa_match(success_rate);
+        m.entry.question_embedding = embedding;
+        m
+    }
+
+    #[test]
+    fn test_compute_confidence_empty_entries() {
+        // Empty slice: count_confidence = 0/5 = 0.0, avg_success = 0.0 (guarded)
+        // total = 0.0 * 0.6 + 0.0 * 0.4 = 0.0
+        let entries: Vec<crate::types::QaMatch> = vec![];
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        let confidence = QaPromoter::compute_confidence(&refs);
+        assert!(
+            confidence.abs() < f64::EPSILON,
+            "expected 0.0 for empty entries, got {}",
+            confidence
+        );
+    }
+
+    #[test]
+    fn test_compute_confidence_above_count_cap() {
+        // 10 entries: count_confidence = min(10/5, 1.0) = 1.0 (capped at 1.0)
+        // avg success = 0.5
+        // total = 1.0 * 0.6 + 0.5 * 0.4 = 0.6 + 0.2 = 0.8
+        let entries: Vec<crate::types::QaMatch> = (0..10).map(|_| make_qa_match(0.5)).collect();
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        let confidence = QaPromoter::compute_confidence(&refs);
+        assert!(
+            (confidence - 0.8).abs() < 0.01,
+            "expected ~0.8 for 10 entries with 0.5 success, got {}",
+            confidence
+        );
+    }
+
+    #[test]
+    fn test_compute_confidence_all_zero_success() {
+        // 3 entries: count_confidence = 3/5 = 0.6
+        // avg success = 0.0
+        // total = 0.6 * 0.6 + 0.0 * 0.4 = 0.36
+        let entries: Vec<crate::types::QaMatch> = (0..3).map(|_| make_qa_match(0.0)).collect();
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        let confidence = QaPromoter::compute_confidence(&refs);
+        assert!(
+            (confidence - 0.36).abs() < 0.01,
+            "expected ~0.36, got {}",
+            confidence
+        );
+    }
+
+    #[test]
+    fn test_compute_confidence_single_entry_perfect_success() {
+        // 1 entry: count_confidence = 1/5 = 0.2
+        // avg success = 1.0
+        // total = 0.2 * 0.6 + 1.0 * 0.4 = 0.12 + 0.4 = 0.52
+        let entries = vec![make_qa_match(1.0)];
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        let confidence = QaPromoter::compute_confidence(&refs);
+        assert!(
+            (confidence - 0.52).abs() < 0.01,
+            "expected ~0.52, got {}",
+            confidence
+        );
+    }
+
+    // ── check_embedding_similarity ──
+
+    #[test]
+    fn test_check_embedding_similarity_less_than_2_embeddings() {
+        // Only one entry with an embedding — falls back to true
+        let entries = vec![make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0]))];
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        assert!(
+            QaPromoter::check_embedding_similarity(&refs, 0.9),
+            "< 2 embeddings should return true (fallback)"
+        );
+    }
+
+    #[test]
+    fn test_check_embedding_similarity_two_identical_embeddings() {
+        // Two identical embeddings → cosine similarity = 1.0
+        let entries = vec![
+            make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0])),
+            make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0])),
+        ];
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        // threshold=0.9, similarity=1.0 → true
+        assert!(
+            QaPromoter::check_embedding_similarity(&refs, 0.9),
+            "identical embeddings should have similarity 1.0 >= 0.9"
+        );
+        // threshold=1.0, similarity=1.0 → true (exactly at threshold)
+        assert!(
+            QaPromoter::check_embedding_similarity(&refs, 1.0),
+            "identical embeddings should have similarity 1.0 >= 1.0"
+        );
+    }
+
+    #[test]
+    fn test_check_embedding_similarity_only_first_has_embedding() {
+        // First entry has embedding, second doesn't → only 1 in the
+        // filtered vec → falls back to true
+        let entries = vec![
+            make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0])),
+            make_qa_match_with_embedding(0.9, None),
+        ];
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        assert!(
+            QaPromoter::check_embedding_similarity(&refs, 0.9),
+            "< 2 embeddings after filtering should return true"
+        );
+    }
+
+    #[test]
+    fn test_check_embedding_similarity_no_entries() {
+        // Zero entries → 0 embeddings → returns true (fallback)
+        let entries: Vec<crate::types::QaMatch> = vec![];
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        assert!(
+            QaPromoter::check_embedding_similarity(&refs, 0.9),
+            "empty entries should return true (fallback)"
+        );
+    }
+
+    // ── format_promoted_context edge cases ──
+
+    #[test]
+    fn test_format_promoted_context_zero_confidence() {
+        let instructions = vec![PromotedInstruction {
+            id: 1,
+            repo: "org/repo".to_string(),
+            source_type: "qa_promotion".to_string(),
+            instruction_text: "Always lint before commit".to_string(),
+            occurrence_count: 1,
+            confidence: 0.0,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let ctx = QaPromoter::format_promoted_context(&instructions);
+        assert!(
+            ctx.contains("0%"),
+            "0.0 confidence should display as 0%, got: {}",
+            ctx
+        );
+        assert!(ctx.contains("Always lint before commit"));
+    }
+
+    #[test]
+    fn test_format_promoted_context_full_confidence() {
+        let instructions = vec![PromotedInstruction {
+            id: 1,
+            repo: "org/repo".to_string(),
+            source_type: "qa_promotion".to_string(),
+            instruction_text: "Use async everywhere".to_string(),
+            occurrence_count: 100,
+            confidence: 1.0,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let ctx = QaPromoter::format_promoted_context(&instructions);
+        assert!(
+            ctx.contains("100%"),
+            "1.0 confidence should display as 100%, got: {}",
+            ctx
+        );
+        assert!(ctx.contains("100 times"));
+    }
+
+    #[test]
+    fn test_format_promoted_context_very_long_text() {
+        let long_text = "x".repeat(10_000);
+        let instructions = vec![PromotedInstruction {
+            id: 1,
+            repo: "org/repo".to_string(),
+            source_type: "qa_promotion".to_string(),
+            instruction_text: long_text.clone(),
+            occurrence_count: 2,
+            confidence: 0.5,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let ctx = QaPromoter::format_promoted_context(&instructions);
+        assert!(
+            ctx.contains(&long_text),
+            "long text should be included verbatim"
+        );
+        assert!(ctx.len() > 10_000);
+    }
+
+    #[test]
+    fn test_format_promoted_context_special_characters() {
+        // Instruction with newlines, markdown, and special chars.
+        // Newlines are replaced with spaces to keep bullet-point format intact.
+        let special_text = "Use `cargo test`\nNot **pytest**\n- bullet\n> quote";
+        let instructions = vec![PromotedInstruction {
+            id: 1,
+            repo: "org/repo".to_string(),
+            source_type: "qa_promotion".to_string(),
+            instruction_text: special_text.to_string(),
+            occurrence_count: 3,
+            confidence: 0.75,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let ctx = QaPromoter::format_promoted_context(&instructions);
+        // Newlines should be replaced with spaces
+        assert!(
+            !ctx.contains("test`\nNot"),
+            "Newlines inside instruction text should be replaced with spaces"
+        );
+        assert!(ctx.contains("Use `cargo test` Not **pytest** - bullet > quote"));
+        assert!(ctx.contains("75%"));
+        assert!(ctx.contains("3 times"));
     }
 }

@@ -1386,6 +1386,10 @@ The PR title should include the issue ID: {}
             regex_lite::Regex::new(r"https://gitlab\.com/[^\s]+/-/merge_requests/\d+[^\s]*")
                 .unwrap()
         });
+        // Also match self-hosted GitLab instances
+        static GITLAB_MR_GENERIC_RE: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+            regex_lite::Regex::new(r"https://[^\s]+/-/merge_requests/\d+[^\s]*").unwrap()
+        });
 
         // Try explicit PR_URL format first
         if let Some(captures) = PR_URL_EXPLICIT_RE.captures(output) {
@@ -1397,8 +1401,13 @@ The PR title should include the issue ID: {}
             return Some(m.as_str().to_string());
         }
 
-        // Try GitLab MR URL pattern
+        // Try GitLab MR URL pattern (gitlab.com)
         if let Some(m) = GITLAB_MR_RE.find(output) {
+            return Some(m.as_str().to_string());
+        }
+
+        // Try self-hosted GitLab MR URL pattern
+        if let Some(m) = GITLAB_MR_GENERIC_RE.find(output) {
             return Some(m.as_str().to_string());
         }
 
@@ -1993,10 +2002,13 @@ mod tests {
 
     #[test]
     fn test_extract_pr_url_gitlab_self_hosted() {
-        assert!(ClaudeRunner::extract_pr_url(
-            "MR: https://gitlab.mycompany.com/group/project/-/merge_requests/123"
-        )
-        .is_none());
+        let url = ClaudeRunner::extract_pr_url(
+            "MR: https://gitlab.mycompany.com/group/project/-/merge_requests/123",
+        );
+        assert_eq!(
+            url.as_deref(),
+            Some("https://gitlab.mycompany.com/group/project/-/merge_requests/123")
+        );
     }
 
     #[test]

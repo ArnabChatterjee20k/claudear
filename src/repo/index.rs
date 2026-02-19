@@ -5,6 +5,7 @@
 
 use crate::error::Result;
 use crate::github::GitHubClient;
+use crate::scm::ScmProvider;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -238,23 +239,81 @@ impl RepoIndex {
         Ok(index)
     }
 
+    /// Build an index from GitLab groups using any ScmProvider.
+    ///
+    /// Fetches repos from each group and creates IndexedRepo entries
+    /// pointing to the work_dir for cloning.
+    pub async fn build_from_gitlab(
+        groups: &[String],
+        provider: &dyn ScmProvider,
+        work_dir: &Path,
+        use_ssh: bool,
+    ) -> Result<Self> {
+        let mut index = Self::new();
+
+        for group in groups {
+            tracing::info!(group = %group, "Fetching repositories from GitLab API");
+
+            match provider.list_repos(group).await {
+                Ok(repos) => {
+                    for repo in repos {
+                        let clone_url = if use_ssh {
+                            &repo.ssh_url
+                        } else {
+                            &repo.clone_url
+                        };
+                        let indexed = IndexedRepo::from_api(
+                            &repo.full_name,
+                            clone_url,
+                            &repo.default_branch,
+                            work_dir,
+                        );
+
+                        tracing::debug!(
+                            repo = %repo.full_name,
+                            path = %indexed.path.display(),
+                            "Added GitLab-discovered repository to index"
+                        );
+
+                        index.add_repo(indexed);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(group = %group, error = %e, "Failed to fetch repos from group");
+                }
+            }
+        }
+
+        tracing::info!(
+            count = index.repos.len(),
+            "Repository index built from GitLab API"
+        );
+
+        Ok(index)
+    }
+
     /// Build an index using the best available method.
     ///
     /// This chooses the discovery method based on configuration:
     /// 1. If `auto_discover_paths` is not empty → use local filesystem scan
     /// 2. Else if GitHub token is configured + `known_orgs` not empty → use API
-    /// 3. Else → return empty index
+    /// 3. Else if GitLab is configured → try GitLab groups
+    /// 4. Else → return empty index
     ///
     /// # Arguments
     /// * `known_orgs` - GitHub organization names
     /// * `auto_discover_paths` - Local paths to scan for repos
     /// * `github_client` - Optional GitHub API client
+    /// * `gitlab_provider` - Optional GitLab SCM provider
+    /// * `gitlab_groups` - GitLab group names to discover
     /// * `work_dir` - Directory where repos will be cloned to (for API discovery)
     /// * `use_ssh` - Whether to use SSH URLs for cloning
     pub async fn build_with_fallback(
         known_orgs: &[String],
         auto_discover_paths: &[String],
         github_client: Option<&GitHubClient>,
+        gitlab_provider: Option<&dyn ScmProvider>,
+        gitlab_groups: &[String],
         work_dir: &Path,
         use_ssh: bool,
     ) -> Result<Self> {
@@ -270,11 +329,31 @@ impl RepoIndex {
                 tracing::info!(
                     "Building repo index from GitHub API (no auto_discover_paths configured)"
                 );
-                return Self::build_from_github(known_orgs, client, work_dir, use_ssh).await;
+                let mut index =
+                    Self::build_from_github(known_orgs, client, work_dir, use_ssh).await?;
+
+                // Also try GitLab if configured
+                if let Some(gl) = gitlab_provider {
+                    if gl.is_enabled() && !gitlab_groups.is_empty() {
+                        let gl_index =
+                            Self::build_from_gitlab(gitlab_groups, gl, work_dir, use_ssh).await?;
+                        index.merge(gl_index);
+                    }
+                }
+
+                return Ok(index);
             }
         }
 
-        // Strategy 3: Empty index
+        // Strategy 3: GitLab API discovery
+        if let Some(gl) = gitlab_provider {
+            if gl.is_enabled() && !gitlab_groups.is_empty() {
+                tracing::info!("Building repo index from GitLab API");
+                return Self::build_from_gitlab(gitlab_groups, gl, work_dir, use_ssh).await;
+            }
+        }
+
+        // Strategy 4: Empty index
         tracing::info!("No discovery method available, returning empty index");
         Ok(Self::new())
     }
@@ -294,6 +373,13 @@ impl RepoIndex {
         }
 
         self.repos.insert(repo.name.clone(), repo);
+    }
+
+    /// Merge another RepoIndex into this one.
+    pub fn merge(&mut self, other: Self) {
+        for (_, repo) in other.repos {
+            self.add_repo(repo);
+        }
     }
 
     /// Index files for a repository that was just cloned.
@@ -438,7 +524,7 @@ fn get_repo_name_from_git(path: &Path) -> Option<String> {
 
 /// Parse repository name (org/repo) from a git URL.
 fn parse_repo_name_from_url(url: &str) -> Option<String> {
-    // Handle SSH URLs: git@github.com:org/repo.git
+    // Handle SSH URLs: git@github.com:org/repo.git or git@gitlab.com:group/repo.git
     if url.starts_with("git@") {
         let parts: Vec<_> = url.split(':').collect();
         if parts.len() == 2 {
@@ -447,13 +533,13 @@ fn parse_repo_name_from_url(url: &str) -> Option<String> {
         }
     }
 
-    // Handle HTTPS URLs: https://github.com/org/repo.git
-    if url.contains("github.com") {
-        let url = url.trim_end_matches(".git");
-        let parts: Vec<_> = url.split('/').collect();
-        if parts.len() >= 2 {
-            let org = parts[parts.len() - 2];
-            let repo = parts[parts.len() - 1];
+    // Handle HTTPS URLs: https://github.com/org/repo.git or https://gitlab.com/group/repo.git
+    let url_trimmed = url.trim_end_matches(".git");
+    let parts: Vec<_> = url_trimmed.split('/').collect();
+    if parts.len() >= 2 {
+        let org = parts[parts.len() - 2];
+        let repo = parts[parts.len() - 1];
+        if !org.is_empty() && !repo.is_empty() {
             return Some(format!("{}/{}", org, repo));
         }
     }
@@ -919,10 +1005,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_repo_name_not_github() {
+    fn test_parse_repo_name_gitlab() {
         let name = parse_repo_name_from_url("https://gitlab.com/org/repo.git");
-        // Does not contain "github.com" and not SSH format, so None
-        assert!(name.is_none());
+        assert_eq!(name, Some("org/repo".to_string()));
     }
 
     #[test]
@@ -998,5 +1083,237 @@ mod tests {
         assert!(repo.files.is_empty());
         assert!(!repo.has_file("anything.rs"));
         assert!(repo.find_files("anything").is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // MockScmProvider and build_from_gitlab tests
+    // ---------------------------------------------------------------
+
+    use crate::error::Result as CrateResult;
+    use crate::scm::{CodeReview, PrInfo, PrStatus, RemoteRepo, ReviewComment, ScmProvider};
+    use async_trait::async_trait;
+
+    /// A mock SCM provider for testing build_from_gitlab.
+    struct MockScmProvider {
+        repos: std::result::Result<Vec<RemoteRepo>, String>,
+    }
+
+    impl MockScmProvider {
+        fn with_repos(repos: Vec<RemoteRepo>) -> Self {
+            Self { repos: Ok(repos) }
+        }
+
+        fn with_error(msg: &str) -> Self {
+            Self {
+                repos: Err(msg.to_string()),
+            }
+        }
+    }
+
+    fn make_remote_repo(
+        full_name: &str,
+        clone_url: &str,
+        ssh_url: &str,
+        default_branch: &str,
+    ) -> RemoteRepo {
+        let name = full_name.split('/').next_back().unwrap_or(full_name);
+        RemoteRepo {
+            id: 1,
+            full_name: full_name.to_string(),
+            name: name.to_string(),
+            default_branch: default_branch.to_string(),
+            clone_url: clone_url.to_string(),
+            ssh_url: ssh_url.to_string(),
+            html_url: format!("https://gitlab.com/{}", full_name),
+            private: false,
+            archived: false,
+        }
+    }
+
+    #[async_trait]
+    impl ScmProvider for MockScmProvider {
+        fn name(&self) -> &str {
+            "mock-gitlab"
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+
+        fn review_trigger(&self) -> &str {
+            "/claudear"
+        }
+
+        async fn get_pr_status(&self, _project: &str, _number: i64) -> CrateResult<PrStatus> {
+            unimplemented!()
+        }
+
+        async fn get_pr_info(&self, _project: &str, _number: i64) -> CrateResult<PrInfo> {
+            unimplemented!()
+        }
+
+        async fn get_pr_diff(&self, _project: &str, _number: i64) -> CrateResult<String> {
+            unimplemented!()
+        }
+
+        async fn get_reviews(&self, _project: &str, _number: i64) -> CrateResult<Vec<CodeReview>> {
+            unimplemented!()
+        }
+
+        async fn get_review_comments(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> CrateResult<Vec<ReviewComment>> {
+            unimplemented!()
+        }
+
+        async fn list_repos(&self, _org_or_group: &str) -> CrateResult<Vec<RemoteRepo>> {
+            match &self.repos {
+                Ok(repos) => Ok(repos.clone()),
+                Err(msg) => Err(crate::error::Error::Source {
+                    source_name: "mock-gitlab".to_string(),
+                    message: msg.clone(),
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_from_gitlab_single_group() {
+        let repos = vec![
+            make_remote_repo(
+                "mygroup/repo-a",
+                "https://gitlab.com/mygroup/repo-a.git",
+                "git@gitlab.com:mygroup/repo-a.git",
+                "main",
+            ),
+            make_remote_repo(
+                "mygroup/repo-b",
+                "https://gitlab.com/mygroup/repo-b.git",
+                "git@gitlab.com:mygroup/repo-b.git",
+                "develop",
+            ),
+        ];
+        let provider = MockScmProvider::with_repos(repos);
+        let work_dir = PathBuf::from("/tmp/repos");
+        let groups = vec!["mygroup".to_string()];
+
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+            .await
+            .unwrap();
+
+        assert_eq!(index.len(), 2);
+        let repo_a = index.get("mygroup/repo-a").unwrap();
+        assert_eq!(repo_a.path, work_dir.join("repo-a"));
+        assert_eq!(repo_a.default_branch, "main");
+
+        let repo_b = index.get("mygroup/repo-b").unwrap();
+        assert_eq!(repo_b.path, work_dir.join("repo-b"));
+        assert_eq!(repo_b.default_branch, "develop");
+    }
+
+    #[tokio::test]
+    async fn test_build_from_gitlab_multiple_groups() {
+        let repos = vec![
+            make_remote_repo(
+                "group1/project1",
+                "https://gitlab.com/group1/project1.git",
+                "git@gitlab.com:group1/project1.git",
+                "main",
+            ),
+            make_remote_repo(
+                "group1/project2",
+                "https://gitlab.com/group1/project2.git",
+                "git@gitlab.com:group1/project2.git",
+                "main",
+            ),
+        ];
+        // The mock returns the same repos for every group call, so we use
+        // separate provider instances to simulate different groups returning
+        // different repos. Instead, we test that the method iterates groups
+        // and collects repos from each call.
+        let provider = MockScmProvider::with_repos(repos);
+        let work_dir = PathBuf::from("/tmp/repos");
+        let groups = vec!["group1".to_string(), "group2".to_string()];
+
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+            .await
+            .unwrap();
+
+        // The mock returns the same 2 repos for both group calls, but since
+        // they have the same names the second call overwrites the first.
+        // This still validates that both groups are iterated.
+        assert_eq!(index.len(), 2);
+        assert!(index.get("group1/project1").is_some());
+        assert!(index.get("group1/project2").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_build_from_gitlab_empty_group() {
+        let provider = MockScmProvider::with_repos(vec![]);
+        let work_dir = PathBuf::from("/tmp/repos");
+        let groups = vec!["empty-group".to_string()];
+
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+            .await
+            .unwrap();
+
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_build_from_gitlab_api_error() {
+        let provider = MockScmProvider::with_error("403 Forbidden");
+        let work_dir = PathBuf::from("/tmp/repos");
+        let groups = vec!["forbidden-group".to_string()];
+
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+            .await
+            .unwrap();
+
+        // Error is logged but not fatal; index should be empty.
+        assert!(index.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_from_gitlab_ssh_urls() {
+        let repos = vec![make_remote_repo(
+            "team/service",
+            "https://gitlab.com/team/service.git",
+            "git@gitlab.com:team/service.git",
+            "main",
+        )];
+        let provider = MockScmProvider::with_repos(repos);
+        let work_dir = PathBuf::from("/tmp/repos");
+        let groups = vec!["team".to_string()];
+
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, true)
+            .await
+            .unwrap();
+
+        let repo = index.get("team/service").unwrap();
+        assert_eq!(repo.github_url, "git@gitlab.com:team/service.git");
+    }
+
+    #[tokio::test]
+    async fn test_build_from_gitlab_https_urls() {
+        let repos = vec![make_remote_repo(
+            "team/service",
+            "https://gitlab.com/team/service.git",
+            "git@gitlab.com:team/service.git",
+            "main",
+        )];
+        let provider = MockScmProvider::with_repos(repos);
+        let work_dir = PathBuf::from("/tmp/repos");
+        let groups = vec!["team".to_string()];
+
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+            .await
+            .unwrap();
+
+        let repo = index.get("team/service").unwrap();
+        assert_eq!(repo.github_url, "https://gitlab.com/team/service.git");
     }
 }

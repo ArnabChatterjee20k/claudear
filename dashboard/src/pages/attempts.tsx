@@ -198,6 +198,7 @@ export default function AttemptsPage() {
                 data={data.attempts}
                 keyFn={row => row.id}
                 emptyMessage="No attempts found"
+                pageSize={0}
               />
             </CardContent>
           </Card>

@@ -1,29 +1,66 @@
+import { useState, useEffect } from 'react'
 import { useRouter } from '../../router'
 import { useAuth } from '../../lib/auth'
 import {
   Activity, BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
-  Users, LogOut, Gauge,
+  Users, LogOut, Gauge, Settings, Sun, Moon, Ticket,
 } from 'lucide-react'
 
-const navItems = [
-  { path: '/', label: 'Overview', icon: LayoutDashboard },
-  { path: '/attempts', label: 'Attempts', icon: ListChecks },
-  { path: '/prs', label: 'PRs', icon: GitPullRequest },
-  { path: '/analytics', label: 'Analytics', icon: BarChart3 },
-  { path: '/errors', label: 'Errors', icon: AlertTriangle },
-  { path: '/feedback', label: 'Feedback', icon: MessageSquare },
-  { path: '/regressions', label: 'Regressions', icon: Shield },
-  { path: '/experiments', label: 'Experiments', icon: FlaskConical },
-  { path: '/repos', label: 'Repos', icon: FolderGit2 },
-  { path: '/inference', label: 'Inference', icon: Brain },
-  { path: '/activity', label: 'Activity', icon: ScrollText },
-  { path: '/telemetry', label: 'Telemetry', icon: Gauge },
-] as const
+type NavGroup = {
+  label?: string
+  items: { path: string; label: string; icon: typeof LayoutDashboard }[]
+}
+
+const navGroups: NavGroup[] = [
+  {
+    items: [
+      { path: '/', label: 'Overview', icon: LayoutDashboard },
+    ],
+  },
+  {
+    label: 'Work',
+    items: [
+      { path: '/issues', label: 'Issues', icon: Ticket },
+      { path: '/attempts', label: 'Attempts', icon: ListChecks },
+      { path: '/prs', label: 'PRs', icon: GitPullRequest },
+    ],
+  },
+  {
+    label: 'Insights',
+    items: [
+      { path: '/analytics', label: 'Analytics', icon: BarChart3 },
+      { path: '/errors', label: 'Errors', icon: AlertTriangle },
+      { path: '/regressions', label: 'Regressions', icon: Shield },
+      { path: '/feedback', label: 'Feedback', icon: MessageSquare },
+    ],
+  },
+  {
+    label: 'Platform',
+    items: [
+      { path: '/experiments', label: 'Experiments', icon: FlaskConical },
+      { path: '/inference', label: 'Inference', icon: Brain },
+      { path: '/repos', label: 'Repos', icon: FolderGit2 },
+    ],
+  },
+  {
+    label: 'Monitoring',
+    items: [
+      { path: '/activity', label: 'Activity', icon: ScrollText },
+      { path: '/telemetry', label: 'Telemetry', icon: Gauge },
+    ],
+  },
+]
 
 export function Sidebar() {
   const { path, navigate } = useRouter()
   const { user, logout } = useAuth()
+  const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', dark)
+    localStorage.setItem('theme', dark ? 'dark' : 'light')
+  }, [dark])
 
   return (
     <aside className="w-56 border-r bg-card flex flex-col">
@@ -33,36 +70,65 @@ export function Sidebar() {
           Claudear
         </h1>
       </div>
-      <nav className="flex-1 p-2 space-y-0.5 overflow-y-auto">
-        {navItems.map(({ path: itemPath, label, icon: Icon }) => {
-          const isActive = path === itemPath
-          return (
-            <button
-              key={itemPath}
-              onClick={() => navigate(itemPath)}
-              className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
-                isActive
-                  ? 'bg-primary/10 text-primary font-medium'
-                  : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-              }`}
-            >
-              <Icon className="h-4 w-4 shrink-0" />
-              {label}
-            </button>
-          )
-        })}
+      <nav className="flex-1 p-2 overflow-y-auto">
+        {navGroups.map((group, gi) => (
+          <div key={gi} className={gi > 0 ? 'mt-3' : ''}>
+            {group.label && (
+              <div className="mb-1 px-3 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+                {group.label}
+              </div>
+            )}
+            <div className="space-y-0.5">
+              {group.items.map(({ path: itemPath, label, icon: Icon }) => {
+                const isActive = path === itemPath
+                return (
+                  <button
+                    key={itemPath}
+                    onClick={() => navigate(itemPath)}
+                    className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
+                      isActive
+                        ? 'bg-primary/10 text-primary font-medium'
+                        : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                    }`}
+                  >
+                    <Icon className="h-4 w-4 shrink-0" />
+                    {label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        ))}
         {user?.role === 'admin' && (
-          <button
-            onClick={() => navigate('/users')}
-            className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
-              path === '/users'
-                ? 'bg-primary/10 text-primary font-medium'
-                : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-            }`}
-          >
-            <Users className="h-4 w-4 shrink-0" />
-            Users
-          </button>
+          <div className="mt-3">
+            <div className="mb-1 px-3 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+              Admin
+            </div>
+            <div className="space-y-0.5">
+              <button
+                onClick={() => navigate('/config')}
+                className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
+                  path === '/config'
+                    ? 'bg-primary/10 text-primary font-medium'
+                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                }`}
+              >
+                <Settings className="h-4 w-4 shrink-0" />
+                Config
+              </button>
+              <button
+                onClick={() => navigate('/users')}
+                className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
+                  path === '/users'
+                    ? 'bg-primary/10 text-primary font-medium'
+                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                }`}
+              >
+                <Users className="h-4 w-4 shrink-0" />
+                Users
+              </button>
+            </div>
+          </div>
         )}
       </nav>
       <div className="p-3 border-t">
@@ -71,13 +137,22 @@ export function Sidebar() {
             <div className="text-sm font-medium truncate">{user?.name}</div>
             <div className="text-xs text-muted-foreground truncate">{user?.email}</div>
           </div>
-          <button
-            onClick={logout}
-            className="p-1.5 rounded hover:bg-muted text-muted-foreground"
-            title="Sign out"
-          >
-            <LogOut className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-0.5">
+            <button
+              onClick={() => setDark(d => !d)}
+              className="p-1.5 rounded hover:bg-muted text-muted-foreground"
+              title={dark ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+            </button>
+            <button
+              onClick={logout}
+              className="p-1.5 rounded hover:bg-muted text-muted-foreground"
+              title="Sign out"
+            >
+              <LogOut className="h-4 w-4" />
+            </button>
+          </div>
         </div>
       </div>
     </aside>

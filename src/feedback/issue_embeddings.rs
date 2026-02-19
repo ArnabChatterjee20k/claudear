@@ -428,4 +428,336 @@ mod tests {
         assert!(context.contains("merged"));
         assert!(context.contains("pull/42"));
     }
+
+    // ---------------------------------------------------------------
+    // build_embedding_text edge cases
+    // ---------------------------------------------------------------
+
+    fn make_issue(title: &str) -> Issue {
+        Issue {
+            id: "123".to_string(),
+            short_id: "PROJ-123".to_string(),
+            title: title.to_string(),
+            description: None,
+            url: "https://example.com".to_string(),
+            source: "linear".to_string(),
+            priority: IssuePriority::High,
+            status: IssueStatus::Open,
+            metadata: HashMap::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn test_build_embedding_text_title_only() {
+        let issue = make_issue("Title only issue");
+        let text = build_embedding_text(&issue);
+        assert_eq!(text, "Title only issue");
+    }
+
+    #[test]
+    fn test_build_embedding_text_with_description_no_metadata() {
+        let mut issue = make_issue("Bug report");
+        issue.description = Some("Detailed description here".to_string());
+        let text = build_embedding_text(&issue);
+        assert_eq!(text, "Bug report\n\nDetailed description here");
+    }
+
+    #[test]
+    fn test_build_embedding_text_empty_description() {
+        let mut issue = make_issue("Empty desc");
+        issue.description = Some("".to_string());
+        let text = build_embedding_text(&issue);
+        // Should include the "\n\n" separator even though description is empty
+        assert_eq!(text, "Empty desc\n\n");
+    }
+
+    #[test]
+    fn test_build_embedding_text_with_labels() {
+        let mut issue = make_issue("Labeled issue");
+        issue.metadata.insert(
+            "labels".to_string(),
+            serde_json::json!(["bug", "critical", "auth"]),
+        );
+        let text = build_embedding_text(&issue);
+        assert!(text.contains("Labels: bug, critical, auth"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_empty_labels_array() {
+        let mut issue = make_issue("No labels");
+        issue
+            .metadata
+            .insert("labels".to_string(), serde_json::json!([]));
+        let text = build_embedding_text(&issue);
+        // Empty array should NOT produce a "Labels:" line
+        assert!(!text.contains("Labels:"));
+        assert_eq!(text, "No labels");
+    }
+
+    #[test]
+    fn test_build_embedding_text_long_stack_trace_truncated() {
+        let mut issue = make_issue("Stack overflow");
+        let long_stack = "x".repeat(3000);
+        issue
+            .metadata
+            .insert("stack_trace".to_string(), serde_json::json!(long_stack));
+        let text = build_embedding_text(&issue);
+        // The stack portion should be truncated to 2000 chars + "..."
+        assert!(text.ends_with("..."));
+        // Original 3000-char stack should not appear in full
+        assert!(!text.contains(&"x".repeat(3000)));
+        // But 2000 chars of it should be present
+        assert!(text.contains(&"x".repeat(2000)));
+    }
+
+    #[test]
+    fn test_build_embedding_text_stack_trace_exactly_2000_not_truncated() {
+        let mut issue = make_issue("Exact stack");
+        let exact_stack = "y".repeat(2000);
+        issue
+            .metadata
+            .insert("stack_trace".to_string(), serde_json::json!(exact_stack));
+        let text = build_embedding_text(&issue);
+        // Exactly 2000 chars should NOT be truncated
+        assert!(!text.ends_with("..."));
+        assert!(text.contains(&"y".repeat(2000)));
+    }
+
+    #[test]
+    fn test_build_embedding_text_error_message() {
+        let mut issue = make_issue("Error issue");
+        issue.metadata.insert(
+            "error_message".to_string(),
+            serde_json::json!("NullPointerException at line 99"),
+        );
+        let text = build_embedding_text(&issue);
+        assert!(text.contains("NullPointerException at line 99"));
+        assert_eq!(text, "Error issue\n\nNullPointerException at line 99");
+    }
+
+    #[test]
+    fn test_build_embedding_text_all_metadata_fields() {
+        let mut issue = make_issue("Full metadata");
+        issue.description = Some("A comprehensive bug".to_string());
+        issue
+            .metadata
+            .insert("labels".to_string(), serde_json::json!(["bug", "p0"]));
+        issue.metadata.insert(
+            "stack_trace".to_string(),
+            serde_json::json!("panic at core.rs:10"),
+        );
+        issue.metadata.insert(
+            "error_message".to_string(),
+            serde_json::json!("thread 'main' panicked"),
+        );
+
+        let text = build_embedding_text(&issue);
+        assert!(text.contains("Full metadata"));
+        assert!(text.contains("A comprehensive bug"));
+        assert!(text.contains("Labels: bug, p0"));
+        assert!(text.contains("panic at core.rs:10"));
+        assert!(text.contains("thread 'main' panicked"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_non_array_labels_skipped() {
+        let mut issue = make_issue("String labels");
+        // labels is a plain string, not an array
+        issue
+            .metadata
+            .insert("labels".to_string(), serde_json::json!("bug"));
+        let text = build_embedding_text(&issue);
+        // Should not contain Labels: because as_array() returns None for a string
+        assert!(!text.contains("Labels:"));
+        assert_eq!(text, "String labels");
+    }
+
+    #[test]
+    fn test_build_embedding_text_non_string_stack_trace_skipped() {
+        let mut issue = make_issue("Numeric stack");
+        // stack_trace is numeric, not a string
+        issue
+            .metadata
+            .insert("stack_trace".to_string(), serde_json::json!(42));
+        let text = build_embedding_text(&issue);
+        // Should not include the numeric value because as_str() returns None
+        assert_eq!(text, "Numeric stack");
+    }
+
+    // ---------------------------------------------------------------
+    // format_similar_issues_context edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_format_similar_issues_context_empty() {
+        let context = format_similar_issues_context(&[]);
+        assert_eq!(context, "");
+    }
+
+    #[test]
+    fn test_format_similar_issues_context_single_all_fields() {
+        let mut emb = IssueEmbedding::new("linear", "456", vec![0.1, 0.2]);
+        emb.short_id = Some("PROJ-456".to_string());
+        emb.title = Some("Previous auth bug".to_string());
+
+        let similar = vec![SimilarIssueWithDetails {
+            embedding: emb,
+            similarity: 0.92,
+            outcome: Some("success".to_string()),
+            pr_url: Some("https://github.com/org/repo/pull/99".to_string()),
+        }];
+
+        let context = format_similar_issues_context(&similar);
+        assert!(context.contains("PROJ-456"));
+        assert!(context.contains("92%"));
+        assert!(context.contains("**Title:** Previous auth bug"));
+        assert!(context.contains("**Outcome:** success"));
+        assert!(context.contains("**PR:** https://github.com/org/repo/pull/99"));
+    }
+
+    #[test]
+    fn test_format_similar_issues_context_no_optional_fields() {
+        // No title, no outcome, no pr_url on the embedding
+        let emb = IssueEmbedding::new("sentry", "789", vec![0.3]);
+
+        let similar = vec![SimilarIssueWithDetails {
+            embedding: emb,
+            similarity: 0.75,
+            outcome: None,
+            pr_url: None,
+        }];
+
+        let context = format_similar_issues_context(&similar);
+        // Should still render without panicking
+        assert!(context.contains("789")); // falls back to issue_id
+        assert!(context.contains("75%"));
+        assert!(!context.contains("**Title:**"));
+        assert!(!context.contains("**Outcome:**"));
+        assert!(!context.contains("**PR:**"));
+    }
+
+    #[test]
+    fn test_format_similar_issues_context_multiple_numbered() {
+        let similar = vec![
+            SimilarIssueWithDetails {
+                embedding: IssueEmbedding::new("linear", "a1", vec![0.1]),
+                similarity: 0.90,
+                outcome: None,
+                pr_url: None,
+            },
+            SimilarIssueWithDetails {
+                embedding: IssueEmbedding::new("linear", "b2", vec![0.2]),
+                similarity: 0.80,
+                outcome: None,
+                pr_url: None,
+            },
+            SimilarIssueWithDetails {
+                embedding: IssueEmbedding::new("linear", "c3", vec![0.3]),
+                similarity: 0.70,
+                outcome: None,
+                pr_url: None,
+            },
+        ];
+
+        let context = format_similar_issues_context(&similar);
+        assert!(context.contains("### 1. a1"));
+        assert!(context.contains("### 2. b2"));
+        assert!(context.contains("### 3. c3"));
+    }
+
+    #[test]
+    fn test_format_similar_issues_context_uses_short_id() {
+        let mut emb = IssueEmbedding::new("linear", "long-uuid", vec![0.1]);
+        emb.short_id = Some("PROJ-42".to_string());
+
+        let similar = vec![SimilarIssueWithDetails {
+            embedding: emb,
+            similarity: 0.88,
+            outcome: None,
+            pr_url: None,
+        }];
+
+        let context = format_similar_issues_context(&similar);
+        assert!(context.contains("PROJ-42"));
+        // The long uuid should NOT appear as the header identifier
+        assert!(!context.contains("long-uuid"));
+    }
+
+    #[test]
+    fn test_format_similar_issues_context_falls_back_to_issue_id() {
+        // short_id is None, so it should fall back to issue_id
+        let emb = IssueEmbedding::new("sentry", "fallback-id", vec![0.1]);
+
+        let similar = vec![SimilarIssueWithDetails {
+            embedding: emb,
+            similarity: 0.77,
+            outcome: None,
+            pr_url: None,
+        }];
+
+        let context = format_similar_issues_context(&similar);
+        assert!(context.contains("fallback-id"));
+    }
+
+    #[test]
+    fn test_format_similar_issues_context_similarity_100_percent() {
+        let similar = vec![SimilarIssueWithDetails {
+            embedding: IssueEmbedding::new("linear", "dup", vec![0.1]),
+            similarity: 1.0,
+            outcome: None,
+            pr_url: None,
+        }];
+
+        let context = format_similar_issues_context(&similar);
+        assert!(context.contains("100%"));
+    }
+
+    #[test]
+    fn test_format_similar_issues_context_similarity_0_percent() {
+        let similar = vec![SimilarIssueWithDetails {
+            embedding: IssueEmbedding::new("linear", "unrelated", vec![0.1]),
+            similarity: 0.0,
+            outcome: None,
+            pr_url: None,
+        }];
+
+        let context = format_similar_issues_context(&similar);
+        assert!(context.contains("0%"));
+    }
+
+    // ---------------------------------------------------------------
+    // IssueEmbeddingConfig defaults
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_config_default_min_similarity() {
+        let config = IssueEmbeddingConfig::default();
+        assert!(
+            (config.min_similarity - 0.7).abs() < f64::EPSILON,
+            "default min_similarity should be 0.7"
+        );
+    }
+
+    #[test]
+    fn test_config_default_max_similar_issues() {
+        let config = IssueEmbeddingConfig::default();
+        assert_eq!(config.max_similar_issues, 5);
+    }
+
+    #[test]
+    fn test_config_default_skip_similarity_threshold() {
+        let config = IssueEmbeddingConfig::default();
+        assert!(
+            (config.skip_similarity_threshold - 0.90).abs() < f64::EPSILON,
+            "default skip_similarity_threshold should be 0.90"
+        );
+    }
+
+    #[test]
+    fn test_config_default_enabled() {
+        let config = IssueEmbeddingConfig::default();
+        assert!(config.enabled, "default enabled should be true");
+    }
 }

@@ -5,7 +5,7 @@ const RouterContext = createContext<{ path: string; navigate: (path: string) => 
   navigate: () => {},
 })
 
-export function useHash() {
+function useHash() {
   const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
 
   useEffect(() => {
@@ -25,18 +25,19 @@ export function useRouter() {
   return useContext(RouterContext)
 }
 
+export function RouterProvider({ children }: { children: React.ReactNode }) {
+  const value = useHash()
+  return <RouterContext.Provider value={value}>{children}</RouterContext.Provider>
+}
+
 export function Router({
   routes,
 }: {
   routes: Record<string, () => JSX.Element>
 }) {
-  const { path, navigate } = useHash()
+  const { path } = useRouter()
 
   const Component = routes[path] ?? routes['/']
 
-  return (
-    <RouterContext.Provider value={{ path, navigate }}>
-      {Component ? <Component /> : null}
-    </RouterContext.Provider>
-  )
+  return Component ? <Component /> : null
 }

@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import useSWR from 'swr'
 import {
   fetchInferenceStats,
@@ -9,9 +10,11 @@ import { PageHeader } from '../components/layout/page-header'
 import { StatsCard } from '../components/shared/stats-card'
 import { TimeAgo } from '../components/shared/time-ago'
 import { DataTable, type Column } from '../components/shared/data-table'
+import { Modal } from '../components/shared/modal'
 import { Badge } from '../components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
 import { Skeleton } from '../components/ui/skeleton'
+import { formatDate } from '../lib/formatters'
 import {
   Brain,
   Target,
@@ -30,6 +33,8 @@ const confidenceColors: Record<string, string> = {
 }
 
 export default function InferencePage() {
+  const [selectedEntry, setSelectedEntry] = useState<InferenceHistoryEntry | null>(null)
+
   const { data: stats, isLoading: statsLoading } = useSWR<InferenceStats>(
     'inference-stats',
     fetchInferenceStats,
@@ -99,26 +104,6 @@ export default function InferencePage() {
         </span>
       ),
       sortable: true,
-    },
-    {
-      key: 'extracted_keywords',
-      header: 'Keywords',
-      render: row => {
-        if (!row.extracted_keywords) return <span className="text-muted-foreground text-sm">--</span>
-        const keywords = row.extracted_keywords.split(',').map(k => k.trim()).filter(Boolean)
-        return (
-          <div className="flex flex-wrap gap-1">
-            {keywords.slice(0, 3).map(kw => (
-              <Badge key={kw} variant="secondary">
-                {kw}
-              </Badge>
-            ))}
-            {keywords.length > 3 && (
-              <span className="text-xs text-muted-foreground">+{keywords.length - 3}</span>
-            )}
-          </div>
-        )
-      },
     },
     {
       key: 'created_at',
@@ -198,10 +183,84 @@ export default function InferencePage() {
               data={history}
               keyFn={row => row.id}
               emptyMessage="No inference history recorded"
+              onRowClick={row => setSelectedEntry(row)}
             />
           </CardContent>
         </Card>
       )}
+
+      <Modal
+        open={!!selectedEntry}
+        onClose={() => setSelectedEntry(null)}
+        title={selectedEntry ? `Inference: ${selectedEntry.issue_id}` : undefined}
+      >
+        {selectedEntry && (
+          <div className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <p className="text-sm text-muted-foreground">Issue ID</p>
+                <p className="text-sm font-mono">{selectedEntry.issue_id}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Source</p>
+                <p className="text-sm capitalize">{selectedEntry.issue_source}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Inferred Repo</p>
+                <p className="text-sm font-medium">{selectedEntry.inferred_repo_name || '--'}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Confidence</p>
+                {selectedEntry.confidence ? (
+                  <span
+                    className={`px-2 py-0.5 rounded text-xs font-medium ${
+                      confidenceColors[selectedEntry.confidence] || 'bg-gray-100 text-gray-800'
+                    }`}
+                  >
+                    {selectedEntry.confidence}
+                  </span>
+                ) : (
+                  <p className="text-sm text-muted-foreground">--</p>
+                )}
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Correct</p>
+                <p className="text-sm">
+                  {selectedEntry.was_correct === true
+                    ? 'Yes'
+                    : selectedEntry.was_correct === false
+                      ? 'No'
+                      : '--'}
+                </p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Duration</p>
+                <p className="text-sm">{selectedEntry.duration_ms != null ? `${selectedEntry.duration_ms}ms` : '--'}</p>
+              </div>
+              {selectedEntry.inference_reason && (
+                <div className="sm:col-span-2">
+                  <p className="text-sm text-muted-foreground">Inference Reason</p>
+                  <p className="text-sm whitespace-pre-wrap">{selectedEntry.inference_reason}</p>
+                </div>
+              )}
+              {selectedEntry.extracted_keywords && (
+                <div className="sm:col-span-2">
+                  <p className="text-sm text-muted-foreground mb-1">Keywords</p>
+                  <div className="flex flex-wrap gap-1">
+                    {selectedEntry.extracted_keywords.split(',').map(kw => kw.trim()).filter(Boolean).map(kw => (
+                      <Badge key={kw} variant="secondary">{kw}</Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div>
+                <p className="text-sm text-muted-foreground">Created</p>
+                <p className="text-sm">{formatDate(selectedEntry.created_at)}</p>
+              </div>
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }

@@ -34,11 +34,13 @@ pub mod error;
 pub mod feedback;
 pub mod github;
 pub mod github_app;
+pub mod gitlab;
 pub mod http;
 pub mod inference;
 pub mod ipc;
 pub mod learning;
 pub mod notifier;
+pub mod prioritisation;
 pub mod qa;
 pub mod regression;
 pub mod release;
@@ -46,6 +48,7 @@ pub mod repo;
 pub mod reports;
 pub mod retry;
 pub mod runner;
+pub mod scm;
 pub mod source;
 pub mod storage;
 pub mod templates;
@@ -54,7 +57,7 @@ pub mod users;
 pub mod watcher;
 pub mod webhook;
 
-pub use config::{CascadeConfig, Config, RetryConfig};
+pub use config::{CascadeConfig, CodeIndexConfig, Config, RetryConfig};
 pub use discord::{DiscordClient, ThreadManager, ThreadState};
 pub use error::{Error, Result};
 pub use feedback::{
@@ -63,10 +66,13 @@ pub use feedback::{
     IssueEmbeddingConfig, IssueEmbeddingService, Outcome, PromptSuggestion, SimilarIssue,
     SimilarIssueWithDetails,
 };
-pub use github::{
-    GitHubClient, GitHubUser, PrMonitor, PrReview, PrReviewComment, PrReviewState, PrStatus,
-    PrStatusUpdate, ReviewEvent, ReviewWatcher,
+pub use github::GitHubClient;
+pub use gitlab::GitLabClient;
+pub use scm::{
+    CodeReview, OrgRepo, PrInfo, PrMonitor, PrReview, PrReviewComment, PrReviewState, PrStatus,
+    PrStatusUpdate, RemoteRepo, ReviewComment, ReviewEvent, ReviewUser, ReviewWatcher, ScmProvider,
 };
+// Backward-compat alias
 pub use github_app::{
     AppManifest, AppPermissions, CachedToken, GitHubAppAuth, GitHubAppClient, HookAttributes,
     SetupState,
@@ -85,6 +91,7 @@ pub use repo::{
 };
 pub use reports::{Report, ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler};
 pub use retry::{RetryDecision, RetryManager};
+pub use scm::GitHubUser;
 pub use storage::{
     classify_error, compute_error_hash, AnalyticsService, FixAttemptTracker, SqliteTracker,
     StoredDependency, StoredRepository, TimePeriod, TrendAnalysis, TrendDirection,

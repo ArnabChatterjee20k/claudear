@@ -1558,4 +1558,2257 @@ mod tests {
             .await;
         assert!(result.is_ok());
     }
+
+    // ========================================================================
+    // Capturing mock for verifying request payloads
+    // ========================================================================
+
+    /// Shared state for the capturing mock, held via Arc so tests can
+    /// inspect captured requests after passing the mock to the manager.
+    struct CapturedRequests {
+        post_responses: std::sync::Mutex<HashMap<String, crate::http::HttpResponse>>,
+        patch_responses: std::sync::Mutex<HashMap<String, crate::http::HttpResponse>>,
+        captured_posts: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+        captured_patches: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl CapturedRequests {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                post_responses: std::sync::Mutex::new(HashMap::new()),
+                patch_responses: std::sync::Mutex::new(HashMap::new()),
+                captured_posts: std::sync::Mutex::new(Vec::new()),
+                captured_patches: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn mock_post(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
+            self.post_responses.lock().unwrap().insert(
+                url.into(),
+                crate::http::HttpResponse {
+                    status,
+                    body: body.into(),
+                },
+            );
+        }
+
+        fn mock_patch(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
+            self.patch_responses.lock().unwrap().insert(
+                url.into(),
+                crate::http::HttpResponse {
+                    status,
+                    body: body.into(),
+                },
+            );
+        }
+
+        fn get_captured_posts(&self) -> Vec<(String, serde_json::Value)> {
+            self.captured_posts.lock().unwrap().clone()
+        }
+
+        fn get_captured_patches(&self) -> Vec<(String, serde_json::Value)> {
+            self.captured_patches.lock().unwrap().clone()
+        }
+    }
+
+    /// A mock HTTP client that captures request bodies for assertions.
+    /// Uses Arc<CapturedRequests> so the test can retain a handle.
+    struct CapturingMockClient {
+        inner: Arc<CapturedRequests>,
+    }
+
+    impl CapturingMockClient {
+        fn new(inner: Arc<CapturedRequests>) -> Self {
+            Self { inner }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DiscordHttpClient for CapturingMockClient {
+        async fn get(&self, _url: &str) -> crate::error::Result<crate::http::HttpResponse> {
+            Ok(crate::http::HttpResponse {
+                status: 404,
+                body: "Not found".to_string(),
+            })
+        }
+
+        async fn post(
+            &self,
+            url: &str,
+            body: serde_json::Value,
+        ) -> crate::error::Result<crate::http::HttpResponse> {
+            self.inner
+                .captured_posts
+                .lock()
+                .unwrap()
+                .push((url.to_string(), body));
+            let responses = self.inner.post_responses.lock().unwrap();
+            if let Some(r) = responses.get(url) {
+                Ok(crate::http::HttpResponse {
+                    status: r.status,
+                    body: r.body.clone(),
+                })
+            } else {
+                Ok(crate::http::HttpResponse {
+                    status: 404,
+                    body: "Not found".to_string(),
+                })
+            }
+        }
+
+        async fn patch(
+            &self,
+            url: &str,
+            body: serde_json::Value,
+        ) -> crate::error::Result<crate::http::HttpResponse> {
+            self.inner
+                .captured_patches
+                .lock()
+                .unwrap()
+                .push((url.to_string(), body));
+            let responses = self.inner.patch_responses.lock().unwrap();
+            if let Some(r) = responses.get(url) {
+                Ok(crate::http::HttpResponse {
+                    status: r.status,
+                    body: r.body.clone(),
+                })
+            } else {
+                Ok(crate::http::HttpResponse {
+                    status: 404,
+                    body: "Not found".to_string(),
+                })
+            }
+        }
+    }
+
+    fn create_capturing_manager(
+        captured: &Arc<CapturedRequests>,
+        user_id: Option<String>,
+    ) -> ThreadManager<CapturingMockClient> {
+        let mock = CapturingMockClient::new(Arc::clone(captured));
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        ThreadManager::with_client(client, "channel123", user_id)
+    }
+
+    // ========================================================================
+    // Thread creation - content verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_create_pr_thread_name_format() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let issue = create_test_issue();
+        let _result = manager
+            .create_pr_thread(&issue, "https://github.com/test/pr/42", 42)
+            .await
+            .unwrap();
+
+        // Verify the thread creation payload includes correct name format
+        let posts = captured.get_captured_posts();
+        let (url, body) = &posts[0];
+        assert!(url.contains("/threads"));
+        assert_eq!(body["name"].as_str().unwrap(), "PR #42: TEST-123 (linear)");
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_thread_initial_embed_content() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let issue = create_test_issue();
+        let _result = manager
+            .create_pr_thread(&issue, "https://github.com/test/pr/1", 1)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        // Second POST is the message to the thread
+        let (url, body) = &posts[1];
+        assert!(url.contains("/messages"));
+
+        // Verify content
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("New PR created for issue TEST-123"));
+        assert!(!content.contains("<@")); // No mention without user_id
+
+        // Verify embed
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "PR Created: TEST-123");
+        assert_eq!(embed["description"].as_str().unwrap(), "Fix the bug");
+        assert_eq!(
+            embed["url"].as_str().unwrap(),
+            "https://github.com/test/pr/1"
+        );
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::SUCCESS as u64);
+
+        // Verify fields
+        let fields = embed["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0]["name"].as_str().unwrap(), "Issue");
+        assert!(fields[0]["value"].as_str().unwrap().contains("TEST-123"));
+        assert_eq!(fields[1]["name"].as_str().unwrap(), "Source");
+        assert_eq!(fields[1]["value"].as_str().unwrap(), "linear");
+        assert_eq!(fields[2]["name"].as_str().unwrap(), "Priority");
+
+        // Verify footer
+        assert_eq!(embed["footer"]["text"].as_str().unwrap(), "Claudear");
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_thread_with_user_mention_content() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, Some("user456".to_string()));
+        let issue = create_test_issue();
+        let _result = manager
+            .create_pr_thread(&issue, "https://github.com/test/pr/1", 1)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[1];
+        let content = body["content"].as_str().unwrap();
+        assert!(content.starts_with("<@user456>"));
+        assert!(content.contains("New PR created for issue TEST-123"));
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_thread_stores_state_correctly() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let issue = create_test_issue();
+        let state = manager
+            .create_pr_thread(&issue, "https://github.com/test/pr/1", 1)
+            .await
+            .unwrap();
+
+        assert_eq!(state.thread_id, "thread-456");
+        assert_eq!(state.thread_name, "test-thread");
+        assert_eq!(state.channel_id, "channel123");
+        assert_eq!(state.pr_url, "https://github.com/test/pr/1");
+        assert_eq!(state.issue_id, "issue-123");
+        assert_eq!(state.source, "linear");
+        assert!(state.is_active);
+        assert_eq!(state.last_message_id, Some("msg-789".to_string()));
+
+        // Verify it's stored and retrievable
+        let retrieved = manager
+            .get_thread_state("https://github.com/test/pr/1")
+            .await;
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().thread_id, "thread-456");
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_thread_duplicate_returns_existing_without_api_call() {
+        let captured = CapturedRequests::new();
+        // No mock responses needed -- should not make API calls for duplicate
+        let manager = create_capturing_manager(&captured, None);
+
+        let state = ThreadState::new(
+            "existing-thread",
+            "PR: Existing",
+            "channel123",
+            "https://github.com/test/pr/1",
+            "issue-123",
+            "linear",
+        );
+        manager.load_threads(vec![state]).await;
+
+        let issue = create_test_issue();
+        let result = manager
+            .create_pr_thread(&issue, "https://github.com/test/pr/1", 1)
+            .await
+            .unwrap();
+
+        assert_eq!(result.thread_id, "existing-thread");
+
+        // Verify no API calls were made
+        let posts = captured.get_captured_posts();
+        assert!(posts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_thread_message_send_failure_propagates() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            500,
+            "Internal Server Error",
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let issue = create_test_issue();
+        let result = manager
+            .create_pr_thread(&issue, "https://github.com/test/pr/1", 1)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Review notification - content verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_review_submitted_approved_embed_color() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_submitted("https://pr/1", "alice", "approved", None)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "Review Approved");
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::SUCCESS as u64);
+        assert_eq!(embed["fields"][0]["value"].as_str().unwrap(), "alice");
+        assert_eq!(embed["fields"][1]["value"].as_str().unwrap(), "approved");
+
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content, "Review Approved by alice");
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_changes_requested_embed_color() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_submitted(
+                "https://pr/1",
+                "bob",
+                "changes_requested",
+                Some("Fix the tests"),
+            )
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "Changes Requested");
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::WARNING as u64);
+        assert_eq!(embed["description"].as_str().unwrap(), "Fix the tests");
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_commented_embed_color() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_submitted("https://pr/1", "carol", "commented", Some("LGTM"))
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "Review Comment");
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::INFO as u64);
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_dismissed_embed_color() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_submitted("https://pr/1", "dave", "dismissed", None)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "Review Dismissed");
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::PURPLE as u64);
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_unknown_state_uses_review_color() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_submitted("https://pr/1", "eve", "pending", None)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "Review Submitted");
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::REVIEW as u64);
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_with_mention_includes_mention_in_content() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, Some("user456".to_string()));
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_submitted("https://pr/1", "alice", "approved", None)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let content = body["content"].as_str().unwrap();
+        assert!(content.starts_with("<@user456>"));
+        assert!(content.contains("Review Approved by alice"));
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_body_truncation_at_1000_chars() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let long_body = "x".repeat(1500);
+        manager
+            .notify_review_submitted("https://pr/1", "reviewer", "commented", Some(&long_body))
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let description = body["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.len() <= 1003); // 997 chars + "..."
+        assert!(description.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_empty_body_no_description() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_submitted("https://pr/1", "reviewer", "commented", Some(""))
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        // Empty body should not produce a description field in the embed
+        assert!(body["embeds"][0]["description"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_none_body_no_description() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_submitted("https://pr/1", "reviewer", "approved", None)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        assert!(body["embeds"][0]["description"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_case_insensitive_state() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        // Use uppercase -- the code lowercases before matching
+        manager
+            .notify_review_submitted("https://pr/1", "reviewer", "APPROVED", None)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        assert_eq!(
+            body["embeds"][0]["title"].as_str().unwrap(),
+            "Review Approved"
+        );
+        assert_eq!(
+            body["embeds"][0]["color"].as_u64().unwrap(),
+            colors::SUCCESS as u64
+        );
+    }
+
+    // ========================================================================
+    // Review comment - content verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_review_comment_with_file_path_embed() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_comment(
+                "https://pr/1",
+                "alice",
+                Some("src/main.rs"),
+                "Fix this line",
+            )
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "Review Comment");
+        assert_eq!(embed["description"].as_str().unwrap(), "Fix this line");
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::INFO as u64);
+
+        let fields = embed["fields"].as_array().unwrap();
+        // "By" field + "File" field
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0]["name"].as_str().unwrap(), "By");
+        assert_eq!(fields[0]["value"].as_str().unwrap(), "alice");
+        assert_eq!(fields[1]["name"].as_str().unwrap(), "File");
+        assert_eq!(fields[1]["value"].as_str().unwrap(), "`src/main.rs`");
+
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content, "Comment from alice");
+    }
+
+    #[tokio::test]
+    async fn test_review_comment_without_file_has_no_file_field() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_review_comment("https://pr/1", "bob", None, "General comment")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let fields = body["embeds"][0]["fields"].as_array().unwrap();
+        // Only "By" field, no "File" field
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["name"].as_str().unwrap(), "By");
+    }
+
+    #[tokio::test]
+    async fn test_review_comment_truncates_long_comment() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let long_comment = "a".repeat(2000);
+        manager
+            .notify_review_comment("https://pr/1", "reviewer", None, &long_comment)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let description = body["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.len() <= 1003);
+        assert!(description.ends_with("..."));
+    }
+
+    // ========================================================================
+    // Agent started - content verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_agent_started_embed_content() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_agent_started("https://pr/1", "Addressing review feedback on auth module")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "Agent Working");
+        assert_eq!(
+            embed["description"].as_str().unwrap(),
+            "Addressing review feedback on auth module"
+        );
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::INFO as u64);
+
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content, "Agent started working on review feedback");
+    }
+
+    #[tokio::test]
+    async fn test_agent_started_with_mention() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, Some("user789".to_string()));
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_agent_started("https://pr/1", "Working on it")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let content = body["content"].as_str().unwrap();
+        assert!(content.starts_with("<@user789>"));
+    }
+
+    // ========================================================================
+    // Agent completed - content verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_agent_completed_with_commit_url_embed() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_agent_completed(
+                "https://pr/1",
+                Some("https://github.com/test/repo/commit/abc123"),
+            )
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "Agent Completed");
+        assert_eq!(
+            embed["description"].as_str().unwrap(),
+            "Review feedback has been addressed"
+        );
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::SUCCESS as u64);
+
+        let fields = embed["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["name"].as_str().unwrap(), "Commit");
+        assert!(fields[0]["value"]
+            .as_str()
+            .unwrap()
+            .contains("View changes"));
+        assert!(fields[0]["value"].as_str().unwrap().contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_completed_without_commit_url_no_field() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_agent_completed("https://pr/1", None)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        // No commit field
+        assert!(embed["fields"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_agent_completed_with_mention() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, Some("user999".to_string()));
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_agent_completed("https://pr/1", None)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content, "<@user999> Agent completed review feedback");
+    }
+
+    // ========================================================================
+    // Agent failed - content verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_agent_failed_embed_content() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_agent_failed("https://pr/1", "Compilation error in src/main.rs")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "Agent Failed");
+        assert_eq!(
+            embed["description"].as_str().unwrap(),
+            "Compilation error in src/main.rs"
+        );
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::ERROR as u64);
+
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content, "Agent failed to address review feedback");
+    }
+
+    #[tokio::test]
+    async fn test_agent_failed_truncates_long_error() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let long_error = "E".repeat(2000);
+        manager
+            .notify_agent_failed("https://pr/1", &long_error)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let description = body["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.len() <= 1003);
+        assert!(description.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_agent_failed_with_mention() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, Some("user111".to_string()));
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_agent_failed("https://pr/1", "Oops")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let content = body["content"].as_str().unwrap();
+        assert!(content.starts_with("<@user111>"));
+        assert!(content.contains("Agent failed"));
+    }
+
+    // ========================================================================
+    // PR merged - content verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_pr_merged_embed_content() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager.notify_pr_merged("https://pr/1").await.unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "PR Merged");
+        assert_eq!(
+            embed["description"].as_str().unwrap(),
+            "The pull request has been merged. Issue resolved."
+        );
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::SUCCESS as u64);
+
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content, "PR merged!");
+    }
+
+    #[tokio::test]
+    async fn test_pr_merged_archives_thread() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager.notify_pr_merged("https://pr/1").await.unwrap();
+
+        // Verify archive PATCH was sent
+        let patches = captured.get_captured_patches();
+        assert_eq!(patches.len(), 1);
+        let (url, body) = &patches[0];
+        assert!(url.contains("thread-1"));
+        assert_eq!(body["archived"], true);
+    }
+
+    #[tokio::test]
+    async fn test_pr_merged_marks_thread_inactive() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        // Thread should be active before merge
+        let before = manager.get_thread_state("https://pr/1").await.unwrap();
+        assert!(before.is_active);
+
+        manager.notify_pr_merged("https://pr/1").await.unwrap();
+
+        // Thread should be inactive after merge
+        let after = manager.get_thread_state("https://pr/1").await.unwrap();
+        assert!(!after.is_active);
+    }
+
+    #[tokio::test]
+    async fn test_pr_merged_with_mention() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, Some("user456".to_string()));
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager.notify_pr_merged("https://pr/1").await.unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content, "<@user456> PR merged!");
+    }
+
+    // ========================================================================
+    // PR closed - content verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_pr_closed_embed_content() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager.notify_pr_closed("https://pr/1").await.unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["title"].as_str().unwrap(), "PR Closed");
+        assert_eq!(
+            embed["description"].as_str().unwrap(),
+            "The pull request was closed without merging."
+        );
+        assert_eq!(embed["color"].as_u64().unwrap(), colors::WARNING as u64);
+
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content, "PR closed without merging");
+    }
+
+    #[tokio::test]
+    async fn test_pr_closed_archives_thread() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager.notify_pr_closed("https://pr/1").await.unwrap();
+
+        let patches = captured.get_captured_patches();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].1["archived"], true);
+    }
+
+    #[tokio::test]
+    async fn test_pr_closed_marks_thread_inactive() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager.notify_pr_closed("https://pr/1").await.unwrap();
+
+        let after = manager.get_thread_state("https://pr/1").await.unwrap();
+        assert!(!after.is_active);
+    }
+
+    #[tokio::test]
+    async fn test_pr_closed_with_mention() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, Some("user123".to_string()));
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager.notify_pr_closed("https://pr/1").await.unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content, "<@user123> PR closed without merging");
+    }
+
+    // ========================================================================
+    // send_to_thread - content verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_send_to_thread_sends_correct_content() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .send_to_thread("https://pr/1", "Custom message here")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (url, body) = &posts[0];
+        assert!(url.contains("thread-1/messages"));
+        assert_eq!(body["content"].as_str().unwrap(), "Custom message here");
+        // Text-only message, no embeds
+        assert!(body["embeds"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_send_to_thread_not_found_error_message() {
+        let captured = CapturedRequests::new();
+        let manager = create_capturing_manager(&captured, None);
+
+        let result = manager
+            .send_to_thread("https://unknown/pr/999", "Hello")
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("No thread found"));
+        assert!(err.contains("https://unknown/pr/999"));
+    }
+
+    // ========================================================================
+    // user_mention() edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_user_mention_with_numeric_id() {
+        let mock = MockDiscordClient::new();
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let manager = ThreadManager::with_client(client, "channel", Some("123456789".to_string()));
+        assert_eq!(manager.user_mention(), Some("<@123456789>".to_string()));
+    }
+
+    #[test]
+    fn test_user_mention_with_empty_string_id() {
+        let mock = MockDiscordClient::new();
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let manager = ThreadManager::with_client(client, "channel", Some("".to_string()));
+        // Even an empty string produces a mention format
+        assert_eq!(manager.user_mention(), Some("<@>".to_string()));
+    }
+
+    #[test]
+    fn test_user_mention_format_is_discord_compatible() {
+        let mock = MockDiscordClient::new();
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let manager = ThreadManager::with_client(client, "channel", Some("12345".to_string()));
+        let mention = manager.user_mention().unwrap();
+        assert!(mention.starts_with("<@"));
+        assert!(mention.ends_with(">"));
+        assert_eq!(mention, "<@12345>");
+    }
+
+    // ========================================================================
+    // Thread state tracking
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_load_threads_overwrites_existing() {
+        let manager = ThreadManager::new("token", "channel", None).unwrap();
+
+        let state1 = ThreadState::new("t1", "PR: 1", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state1]).await;
+
+        let state2 = ThreadState::new("t2", "PR: 1 Updated", "ch", "https://pr/1", "i2", "sentry");
+        manager.load_threads(vec![state2]).await;
+
+        let result = manager.get_thread_state("https://pr/1").await.unwrap();
+        assert_eq!(result.thread_id, "t2");
+        assert_eq!(result.issue_id, "i2");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_threads_for_different_prs() {
+        let manager = ThreadManager::new("token", "channel", None).unwrap();
+
+        let state1 = ThreadState::new("t1", "PR: 1", "ch", "https://pr/1", "i1", "linear");
+        let state2 = ThreadState::new("t2", "PR: 2", "ch", "https://pr/2", "i2", "sentry");
+        let state3 = ThreadState::new("t3", "PR: 3", "ch", "https://pr/3", "i3", "github");
+
+        manager.load_threads(vec![state1, state2, state3]).await;
+
+        assert_eq!(
+            manager
+                .get_thread_state("https://pr/1")
+                .await
+                .unwrap()
+                .thread_id,
+            "t1"
+        );
+        assert_eq!(
+            manager
+                .get_thread_state("https://pr/2")
+                .await
+                .unwrap()
+                .thread_id,
+            "t2"
+        );
+        assert_eq!(
+            manager
+                .get_thread_state("https://pr/3")
+                .await
+                .unwrap()
+                .thread_id,
+            "t3"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_active_threads_excludes_merged() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+
+        let state1 = ThreadState::new("thread-1", "PR: 1", "ch", "https://pr/1", "i1", "linear");
+        let state2 = ThreadState::new("thread-2", "PR: 2", "ch", "https://pr/2", "i2", "linear");
+        manager.load_threads(vec![state1, state2]).await;
+
+        // Merge PR 1
+        manager.notify_pr_merged("https://pr/1").await.unwrap();
+
+        let active = manager.get_active_threads().await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].thread_id, "thread-2");
+    }
+
+    #[tokio::test]
+    async fn test_get_all_threads_includes_inactive() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-1",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+
+        let state1 = ThreadState::new("thread-1", "PR: 1", "ch", "https://pr/1", "i1", "linear");
+        let state2 = ThreadState::new("thread-2", "PR: 2", "ch", "https://pr/2", "i2", "linear");
+        manager.load_threads(vec![state1, state2]).await;
+
+        manager.notify_pr_merged("https://pr/1").await.unwrap();
+
+        // get_all_threads includes the inactive thread since it was active when loaded
+        let all = manager.get_all_threads().await;
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_thread_state_after_create() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let issue = create_test_issue();
+        let _state = manager
+            .create_pr_thread(&issue, "https://pr/1", 1)
+            .await
+            .unwrap();
+
+        // Thread should appear in active threads
+        let active = manager.get_active_threads().await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].pr_url, "https://pr/1");
+    }
+
+    // ========================================================================
+    // Edge cases - unicode content
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_review_comment_with_unicode_content() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let unicode_comment = "This has emoji: \u{1F600} and CJK: \u{4F60}\u{597D} and accents: \u{00E9}\u{00E8}\u{00EA}";
+        manager
+            .notify_review_comment("https://pr/1", "reviewer", None, unicode_comment)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let description = body["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.contains("\u{1F600}"));
+        assert!(description.contains("\u{4F60}\u{597D}"));
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_thread_with_unicode_issue_title() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let mut issue = create_test_issue();
+        issue.title = "Fix bug: \u{1F41B} in authentication \u{6D4B}\u{8BD5}".to_string();
+
+        let _result = manager
+            .create_pr_thread(&issue, "https://pr/1", 1)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[1]; // message post
+        let description = body["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.contains("\u{1F41B}"));
+    }
+
+    #[tokio::test]
+    async fn test_unicode_truncation_safety() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        // Create a string that's > 1000 chars with multi-byte chars near the boundary
+        let mut long_body = "a".repeat(995);
+        long_body.push_str("\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}"); // Each is 4 bytes
+        assert!(long_body.len() > 1000);
+
+        let result = manager
+            .notify_review_submitted("https://pr/1", "reviewer", "commented", Some(&long_body))
+            .await;
+        assert!(result.is_ok()); // Should not panic on char boundary
+    }
+
+    // ========================================================================
+    // Edge cases - empty strings
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_agent_started_empty_description() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let result = manager.notify_agent_started("https://pr/1", "").await;
+        assert!(result.is_ok());
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        assert_eq!(body["embeds"][0]["description"].as_str().unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn test_agent_failed_empty_error() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let result = manager.notify_agent_failed("https://pr/1", "").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_to_thread_empty_message() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let result = manager.send_to_thread("https://pr/1", "").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_review_comment_empty_comment() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let result = manager
+            .notify_review_comment("https://pr/1", "reviewer", None, "")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Edge cases - various error scenarios
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_create_pr_thread_thread_creation_api_rate_limit() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            429,
+            r#"{"message": "You are being rate limited.", "retry_after": 1.0}"#,
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let issue = create_test_issue();
+        let result = manager.create_pr_thread(&issue, "https://pr/1", 1).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_notifications_to_same_thread() {
+        let captured = CapturedRequests::new();
+        // The mock returns the same response for any POST to this thread
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        // Send multiple notifications in sequence
+        manager
+            .notify_agent_started("https://pr/1", "Working")
+            .await
+            .unwrap();
+        manager
+            .notify_review_submitted("https://pr/1", "reviewer", "approved", None)
+            .await
+            .unwrap();
+        manager
+            .notify_agent_completed("https://pr/1", None)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        assert_eq!(posts.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_notification_to_different_threads() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-2/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state1 = ThreadState::new("thread-1", "PR: 1", "ch", "https://pr/1", "i1", "linear");
+        let state2 = ThreadState::new("thread-2", "PR: 2", "ch", "https://pr/2", "i2", "linear");
+        manager.load_threads(vec![state1, state2]).await;
+
+        manager
+            .notify_agent_started("https://pr/1", "Working on PR 1")
+            .await
+            .unwrap();
+        manager
+            .notify_agent_started("https://pr/2", "Working on PR 2")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        assert_eq!(posts.len(), 2);
+        assert!(posts[0].0.contains("thread-1"));
+        assert!(posts[1].0.contains("thread-2"));
+    }
+
+    // ========================================================================
+    // Exact color constant validation
+    // ========================================================================
+
+    #[test]
+    fn test_color_constants_are_valid_hex_colors() {
+        // Discord colors must be in range 0x000000..=0xFFFFFF
+        assert!(colors::SUCCESS <= 0xFFFFFF);
+        assert!(colors::ERROR <= 0xFFFFFF);
+        assert!(colors::INFO <= 0xFFFFFF);
+        assert!(colors::WARNING <= 0xFFFFFF);
+        assert!(colors::PURPLE <= 0xFFFFFF);
+        assert!(colors::REVIEW <= 0xFFFFFF);
+    }
+
+    #[test]
+    fn test_each_color_is_unique() {
+        let all_colors = vec![
+            colors::SUCCESS,
+            colors::ERROR,
+            colors::INFO,
+            colors::WARNING,
+            colors::PURPLE,
+            colors::REVIEW,
+        ];
+        let unique: std::collections::HashSet<_> = all_colors.iter().collect();
+        assert_eq!(
+            unique.len(),
+            all_colors.len(),
+            "All colors should be unique"
+        );
+    }
+
+    // ========================================================================
+    // with_client constructor
+    // ========================================================================
+
+    #[test]
+    fn test_with_client_no_user_id() {
+        let mock = MockDiscordClient::new();
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let manager: ThreadManager<MockDiscordClient> =
+            ThreadManager::with_client(client, "ch123", None);
+        assert_eq!(manager.channel_id, "ch123");
+        assert!(manager.user_id.is_none());
+        assert!(manager.user_mention().is_none());
+    }
+
+    #[test]
+    fn test_with_client_accepts_string_types() {
+        let mock = MockDiscordClient::new();
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let channel = String::from("my-channel");
+        let manager = ThreadManager::with_client(client, channel, Some("uid".into()));
+        assert_eq!(manager.channel_id, "my-channel");
+        assert_eq!(manager.user_id, Some("uid".to_string()));
+    }
+
+    // ========================================================================
+    // Thread lifecycle: create, notify, merge/close
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_full_lifecycle_create_notify_merge() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-456",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, Some("user1".to_string()));
+        let issue = create_test_issue();
+
+        // Step 1: Create thread
+        let state = manager
+            .create_pr_thread(&issue, "https://pr/1", 42)
+            .await
+            .unwrap();
+        assert!(state.is_active);
+        assert_eq!(state.thread_id, "thread-456");
+
+        // Step 2: Review submitted
+        manager
+            .notify_review_submitted("https://pr/1", "alice", "changes_requested", Some("Fix it"))
+            .await
+            .unwrap();
+
+        // Step 3: Agent works on feedback
+        manager
+            .notify_agent_started("https://pr/1", "Addressing review")
+            .await
+            .unwrap();
+
+        // Step 4: Agent completes
+        manager
+            .notify_agent_completed("https://pr/1", Some("https://commit/abc"))
+            .await
+            .unwrap();
+
+        // Step 5: Review approved
+        manager
+            .notify_review_submitted("https://pr/1", "alice", "approved", None)
+            .await
+            .unwrap();
+
+        // Step 6: PR merged
+        manager.notify_pr_merged("https://pr/1").await.unwrap();
+
+        // Verify thread is now inactive
+        let final_state = manager.get_thread_state("https://pr/1").await.unwrap();
+        assert!(!final_state.is_active);
+
+        // Verify all the API calls were made
+        let posts = captured.get_captured_posts();
+        // 1 thread creation + 1 initial message + 4 notification messages = 6
+        assert_eq!(posts.len(), 7); // thread create POST + 6 message POSTs
+        let patches = captured.get_captured_patches();
+        assert_eq!(patches.len(), 1); // archive
+    }
+
+    #[tokio::test]
+    async fn test_full_lifecycle_create_notify_close() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+        captured.mock_patch(
+            "https://discord.com/api/v10/channels/thread-456",
+            200,
+            mock_thread_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let issue = create_test_issue();
+
+        // Create and then close
+        manager
+            .create_pr_thread(&issue, "https://pr/1", 1)
+            .await
+            .unwrap();
+
+        manager
+            .notify_agent_failed("https://pr/1", "Build failed")
+            .await
+            .unwrap();
+
+        // Update mock to point at the thread ID used by the created thread
+        manager.notify_pr_closed("https://pr/1").await.unwrap();
+
+        let final_state = manager.get_thread_state("https://pr/1").await.unwrap();
+        assert!(!final_state.is_active);
+    }
+
+    // ========================================================================
+    // Concurrent access (basic test)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_concurrent_thread_state_reads() {
+        let manager = ThreadManager::new("token", "channel", None).unwrap();
+
+        let state1 = ThreadState::new("t1", "PR: 1", "ch", "https://pr/1", "i1", "linear");
+        let state2 = ThreadState::new("t2", "PR: 2", "ch", "https://pr/2", "i2", "linear");
+        manager.load_threads(vec![state1, state2]).await;
+
+        // Simulate concurrent reads
+        let mgr = &manager;
+        let (r1, r2, r3) = tokio::join!(
+            mgr.get_thread_state("https://pr/1"),
+            mgr.get_thread_state("https://pr/2"),
+            mgr.get_active_threads()
+        );
+
+        assert!(r1.is_some());
+        assert!(r2.is_some());
+        assert_eq!(r3.len(), 2);
+    }
+
+    // ========================================================================
+    // Embed footer and timestamp verification
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_all_notification_embeds_have_claudear_footer() {
+        let captured = CapturedRequests::new();
+        // Allow multiple posts to the same thread
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        // Trigger several notifications
+        manager
+            .notify_review_submitted("https://pr/1", "r", "approved", None)
+            .await
+            .unwrap();
+        manager
+            .notify_review_comment("https://pr/1", "r", None, "Hi")
+            .await
+            .unwrap();
+        manager
+            .notify_agent_started("https://pr/1", "Task")
+            .await
+            .unwrap();
+        manager
+            .notify_agent_completed("https://pr/1", None)
+            .await
+            .unwrap();
+        manager
+            .notify_agent_failed("https://pr/1", "Error")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        for (i, (_, body)) in posts.iter().enumerate() {
+            let footer = body["embeds"][0]["footer"]["text"].as_str();
+            assert_eq!(
+                footer,
+                Some("Claudear"),
+                "Post {} should have Claudear footer",
+                i
+            );
+
+            let timestamp = body["embeds"][0]["timestamp"].as_str();
+            assert!(timestamp.is_some(), "Post {} should have a timestamp", i);
+        }
+    }
+
+    // ========================================================================
+    // Thread name format edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_create_pr_thread_name_with_special_chars_in_issue() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let mut issue = create_test_issue();
+        issue.short_id = "PROJ-999".to_string();
+        issue.source = "jira".to_string();
+
+        let _result = manager
+            .create_pr_thread(&issue, "https://pr/999", 999)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let name = body["name"].as_str().unwrap();
+        assert_eq!(name, "PR #999: PROJ-999 (jira)");
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_thread_high_pr_number() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let issue = create_test_issue();
+
+        let _result = manager
+            .create_pr_thread(&issue, "https://pr/99999", 99999)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let name = body["name"].as_str().unwrap();
+        assert_eq!(name, "PR #99999: TEST-123 (linear)");
+    }
+
+    // ========================================================================
+    // Verify issue fields propagate to embeds
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_create_pr_thread_propagates_issue_url_to_field() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let mut issue = create_test_issue();
+        issue.url = "https://linear.app/test/issue/PROJ-42".to_string();
+        issue.short_id = "PROJ-42".to_string();
+
+        let _result = manager
+            .create_pr_thread(&issue, "https://pr/42", 42)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[1]; // message post
+        let issue_field = &body["embeds"][0]["fields"][0];
+        let value = issue_field["value"].as_str().unwrap();
+        assert!(value.contains("PROJ-42"));
+        assert!(value.contains("https://linear.app/test/issue/PROJ-42"));
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_thread_propagates_priority() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let mut issue = create_test_issue();
+        issue.priority = IssuePriority::Critical;
+
+        let _result = manager
+            .create_pr_thread(&issue, "https://pr/1", 1)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[1];
+        let priority_field = &body["embeds"][0]["fields"][2];
+        assert_eq!(priority_field["name"].as_str().unwrap(), "Priority");
+        assert_eq!(priority_field["value"].as_str().unwrap(), "critical");
+    }
+
+    // ========================================================================
+    // Verify thread uses correct channel for API calls
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_thread_creation_uses_configured_channel() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/my-custom-channel/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let mock = CapturingMockClient::new(Arc::clone(&captured));
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let manager: ThreadManager<CapturingMockClient> =
+            ThreadManager::with_client(client, "my-custom-channel", None);
+
+        let issue = create_test_issue();
+        let result = manager.create_pr_thread(&issue, "https://pr/1", 1).await;
+        assert!(result.is_ok());
+
+        let posts = captured.get_captured_posts();
+        assert!(posts[0].0.contains("my-custom-channel/threads"));
+    }
+
+    // ========================================================================
+    // Notification sends to correct thread ID
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_notifications_target_correct_thread_id() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/specific-thread-id/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new(
+            "specific-thread-id",
+            "PR: Test",
+            "ch",
+            "https://pr/1",
+            "i1",
+            "linear",
+        );
+        manager.load_threads(vec![state]).await;
+
+        manager
+            .notify_agent_started("https://pr/1", "Working")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        assert!(posts[0].0.contains("specific-thread-id/messages"));
+    }
+
+    // ========================================================================
+    // Review comment with empty file path
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_review_comment_with_empty_file_path() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        // Empty string file path - still adds the field
+        manager
+            .notify_review_comment("https://pr/1", "reviewer", Some(""), "Comment")
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let fields = body["embeds"][0]["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 2); // "By" + "File"
+        assert_eq!(fields[1]["value"].as_str().unwrap(), "``");
+    }
+
+    // ========================================================================
+    // Exactly 1000 char body (boundary test)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_review_submitted_body_exactly_1000_chars_no_truncation() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let body_1000 = "x".repeat(1000);
+        manager
+            .notify_review_submitted("https://pr/1", "reviewer", "commented", Some(&body_1000))
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let description = body["embeds"][0]["description"].as_str().unwrap();
+        assert_eq!(description.len(), 1000);
+        assert!(!description.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_review_submitted_body_1001_chars_truncated() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let body_1001 = "x".repeat(1001);
+        manager
+            .notify_review_submitted("https://pr/1", "reviewer", "commented", Some(&body_1001))
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let description = body["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.len() <= 1003);
+        assert!(description.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_review_comment_exactly_1000_chars_no_truncation() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let comment_1000 = "y".repeat(1000);
+        manager
+            .notify_review_comment("https://pr/1", "reviewer", None, &comment_1000)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let description = body["embeds"][0]["description"].as_str().unwrap();
+        assert_eq!(description.len(), 1000);
+        assert!(!description.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_agent_failed_error_exactly_1000_chars_no_truncation() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-1/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let state = ThreadState::new("thread-1", "PR: Test", "ch", "https://pr/1", "i1", "linear");
+        manager.load_threads(vec![state]).await;
+
+        let error_1000 = "E".repeat(1000);
+        manager
+            .notify_agent_failed("https://pr/1", &error_1000)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0];
+        let description = body["embeds"][0]["description"].as_str().unwrap();
+        assert_eq!(description.len(), 1000);
+        assert!(!description.ends_with("..."));
+    }
+
+    // ========================================================================
+    // DiscordClient.http is pub(crate)-accessible for CapturingMockClient
+    // via ThreadManager.client field visibility
+    // Verify the thread types in create_thread call
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_create_pr_thread_uses_public_thread_type() {
+        let captured = CapturedRequests::new();
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/channel123/threads",
+            200,
+            mock_thread_json(),
+        );
+        captured.mock_post(
+            "https://discord.com/api/v10/channels/thread-456/messages",
+            200,
+            mock_message_json(),
+        );
+
+        let manager = create_capturing_manager(&captured, None);
+        let issue = create_test_issue();
+        manager
+            .create_pr_thread(&issue, "https://pr/1", 1)
+            .await
+            .unwrap();
+
+        let posts = captured.get_captured_posts();
+        let (_, body) = &posts[0]; // thread creation
+                                   // Public thread type = 11
+        assert_eq!(body["type"].as_u64().unwrap(), 11);
+        // Auto archive duration = 10080 (7 days)
+        assert_eq!(body["auto_archive_duration"].as_u64().unwrap(), 10080);
+    }
 }

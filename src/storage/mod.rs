@@ -462,6 +462,48 @@ pub trait FixAttemptTracker: Send + Sync {
     ) -> Result<Vec<(String, DateTime<Utc>)>> {
         Ok(Vec::new())
     }
+
+    // ── Prioritisation engine storage ──────────────────────────────────
+
+    /// Store a content cluster detected by the prioritisation engine.
+    fn store_content_cluster(&self, _cluster: &crate::types::ContentCluster) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Get active (unresolved) content clusters for a source.
+    fn get_active_content_clusters(
+        &self,
+        _source: &str,
+    ) -> Result<Vec<crate::types::ContentCluster>> {
+        Ok(Vec::new())
+    }
+
+    /// Resolve a content cluster by its database ID.
+    fn resolve_content_cluster(&self, _cluster_id: i64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Store the severity score and blast radius for an issue.
+    fn store_severity_score(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+        _score: &crate::types::SeverityScore,
+        _blast_radius: crate::types::BlastRadius,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Record that an issue was suppressed by a rule.
+    fn record_suppression(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+        _rule_name: &str,
+        _reason: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

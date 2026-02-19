@@ -1,8 +1,13 @@
-import { readFileSync, writeFileSync, mkdirSync, cpSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync } from "fs";
 import { join } from "path";
+import { createHash } from "crypto";
 
 const outdir = join(import.meta.dir, "dist");
 const srcdir = import.meta.dir;
+
+// 0. Clean dist/ to remove stale artifacts
+rmSync(outdir, { recursive: true, force: true });
+mkdirSync(join(outdir, "assets"), { recursive: true });
 
 // 1. Bundle the JS/TS entry point
 const result = await Bun.build({
@@ -23,7 +28,15 @@ if (!result.success) {
   process.exit(1);
 }
 
-// 2. Build CSS with Tailwind
+// 2. Delete any raw CSS files extracted by Bun's bundler (unprocessed duplicates)
+const assetsDir = join(outdir, "assets");
+for (const file of readdirSync(assetsDir)) {
+  if (file.startsWith("main-") && file.endsWith(".css")) {
+    unlinkSync(join(assetsDir, file));
+  }
+}
+
+// 3. Build CSS with Tailwind
 const tailwindResult = Bun.spawnSync({
   cmd: [
     "bunx",
@@ -44,7 +57,14 @@ if (tailwindResult.exitCode !== 0) {
   process.exit(1);
 }
 
-// 3. Find generated JS entry file
+// 4. Hash the CSS filename for cache-busting
+const cssContent = readFileSync(join(outdir, "assets/index.css"));
+const cssHash = createHash("md5").update(cssContent).digest("hex").slice(0, 8);
+const cssFilename = `index-${cssHash}.css`;
+const { renameSync } = await import("fs");
+renameSync(join(outdir, "assets/index.css"), join(outdir, "assets", cssFilename));
+
+// 5. Find generated JS entry file
 const jsEntry = result.outputs.find(
   (o) => o.kind === "entry-point" && o.path.endsWith(".js"),
 );
@@ -55,25 +75,21 @@ if (!jsEntry) {
 
 const jsFilename = jsEntry.path.split("/").pop()!;
 
-// 4. Process index.html — replace script/css references with built assets
+// 6. Process index.html — inject CSS in <head>, JS in <body>
 let html = readFileSync(join(srcdir, "index.html"), "utf-8");
 html = html
   .replace(
-    '<script type="module" src="/src/main.tsx"></script>',
-    `<link rel="stylesheet" href="/assets/index.css">\n    <script type="module" src="/assets/${jsFilename}"></script>`,
+    '<link rel="icon" type="image/svg+xml" href="/vite.svg" />',
+    `<link rel="icon" type="image/svg+xml" href="/favicon.svg" />\n    <link rel="stylesheet" href="/assets/${cssFilename}">`,
   )
   .replace(
-    '<link rel="icon" type="image/svg+xml" href="/vite.svg" />',
-    '<link rel="icon" type="image/svg+xml" href="/favicon.svg" />',
+    '<script type="module" src="/src/main.tsx"></script>',
+    `<script type="module" src="/assets/${jsFilename}"></script>`,
   );
 
 writeFileSync(join(outdir, "index.html"), html);
 
-// 5. Copy static assets
-try {
-  mkdirSync(outdir, { recursive: true });
-} catch {}
-// Copy favicon if it exists
+// 7. Copy static assets
 try {
   cpSync(join(srcdir, "public"), outdir, { recursive: true });
 } catch {}
@@ -83,3 +99,4 @@ for (const output of result.outputs) {
   const size = (output.size / 1024).toFixed(1);
   console.log(`  ${output.path.replace(outdir, "dist")} (${size} KB)`);
 }
+console.log(`  dist/assets/${cssFilename} (${(cssContent.length / 1024).toFixed(1)} KB)`);

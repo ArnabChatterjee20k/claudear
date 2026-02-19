@@ -26,23 +26,31 @@ pub struct ApiState {
     pub tracker: Arc<dyn FixAttemptTracker>,
     /// Instant when the server started, for uptime calculation.
     pub start_time: Instant,
+    /// Path to the config file on disk (for read/write from dashboard).
+    pub config_path: PathBuf,
 }
 
 /// Create the API router.
-pub fn create_api_router(config: Config, tracker: Arc<dyn FixAttemptTracker>) -> Router {
-    create_api_router_with_dashboard(config, tracker, None)
+pub fn create_api_router(
+    config: Config,
+    tracker: Arc<dyn FixAttemptTracker>,
+    config_path: PathBuf,
+) -> Router {
+    create_api_router_with_dashboard(config, tracker, config_path, None)
 }
 
 /// Create the API router with optional dashboard static file serving.
 pub fn create_api_router_with_dashboard(
     config: Config,
     tracker: Arc<dyn FixAttemptTracker>,
+    config_path: PathBuf,
     dashboard_dir: Option<PathBuf>,
 ) -> Router {
     let state = ApiState {
         config,
         tracker,
         start_time: Instant::now(),
+        config_path,
     };
 
     let api_routes = Router::new()
@@ -90,6 +98,11 @@ pub fn create_api_router_with_dashboard(
         .route("/api/auth/login", axum::routing::post(login_handler))
         .route("/api/auth/logout", axum::routing::post(logout_handler))
         .route("/api/auth/me", axum::routing::get(me_handler))
+        // Config routes (admin only)
+        .route(
+            "/api/config",
+            axum::routing::get(get_config_handler).put(put_config_handler),
+        )
         // User CRUD routes
         .route(
             "/api/users",
@@ -1956,12 +1969,70 @@ async fn telemetry_latency_handler(
     }))
 }
 
+// ─── Config handlers ──────────────────────────────────
+
+#[derive(Serialize)]
+struct ConfigResponse {
+    content: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ConfigUpdateRequest {
+    content: String,
+}
+
+/// GET /api/config — return the raw TOML config file content.
+async fn get_config_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+) -> Result<Json<ConfigResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let content = std::fs::read_to_string(&state.config_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to read config: {}", e) })),
+        )
+    })?;
+
+    Ok(Json(ConfigResponse {
+        content,
+        path: state.config_path.display().to_string(),
+    }))
+}
+
+/// PUT /api/config — validate and write the TOML config file.
+async fn put_config_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Json(body): Json<ConfigUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Validate the TOML parses as a valid Config before writing
+    toml::from_str::<Config>(&body.content).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
+        )
+    })?;
+
+    std::fs::write(&state.config_path, &body.content).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to write config: {}", e) })),
+        )
+    })?;
+
+    Ok(Json(
+        serde_json::json!({ "ok": true, "message": "Config saved. Restart to apply changes." }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        AskConfig, CascadeConfig, ClaudeConfig, DiscordConfig, EmailConfig, GitHubAppConfig,
-        GitHubConfig, LearningConfig, PushConfig, RegressionConfig, RetryConfig, SmsConfig,
+        AskConfig, CascadeConfig, ClaudeConfig, CodeIndexConfig, DiscordConfig, EmailConfig,
+        GitHubAppConfig, GitHubConfig, LearningConfig, PrioritisationConfig, PushConfig,
+        RegressionConfig, RetryConfig, SlackConfig, SmsConfig,
     };
     use crate::storage::SqliteTracker;
     use axum::body::Body;
@@ -1986,6 +2057,7 @@ mod tests {
             claude_timeout_secs: 21600,
             claude: ClaudeConfig::default(),
             discord: DiscordConfig::default(),
+            slack: SlackConfig::default(),
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
             push: PushConfig::default(),
@@ -1995,10 +2067,14 @@ mod tests {
             retry: RetryConfig::default(),
             linear: None,
             sentry: None,
+            jira: None,
+            gitlab: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
+            prioritisation: PrioritisationConfig::default(),
+            code_index: CodeIndexConfig::default(),
         }
     }
 
@@ -2018,7 +2094,8 @@ mod tests {
             .unwrap();
         let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
 
-        let router = create_api_router(config, tracker.clone()).layer(CookieManagerLayer::new());
+        let router = create_api_router(config, tracker.clone(), PathBuf::from("claudear.toml"))
+            .layer(CookieManagerLayer::new());
 
         (router, token)
     }
@@ -2509,7 +2586,8 @@ mod tests {
     async fn test_unauthenticated_returns_401() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let router = create_api_router(config, tracker).layer(CookieManagerLayer::new());
+        let router = create_api_router(config, tracker, PathBuf::from("claudear.toml"))
+            .layer(CookieManagerLayer::new());
 
         let response = router
             .oneshot(
@@ -2537,5 +2615,1205 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("empty"));
         assert!(json.contains("0"));
+    }
+
+    // ─── New integration tests for uncovered handlers ──────────────────────────
+
+    #[tokio::test]
+    async fn test_activity_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/activity", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_activity_endpoint_with_limit() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/activity?limit=5", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_activity_endpoint_with_source_filter() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/activity?source=linear", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_analytics_summary_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/analytics/summary", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let summary: crate::types::AnalyticsSummary = serde_json::from_slice(&body).unwrap();
+        assert_eq!(summary.total_processed, 0);
+        assert_eq!(summary.total_successful, 0);
+        assert_eq!(summary.total_merged, 0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/metrics", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let metrics: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(metrics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_with_name_filter() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get(
+                "/api/metrics?name=processing_time&period=day&limit=10",
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_errors_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/errors", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let errors: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_errors_endpoint_with_limit() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/errors?limit=10", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_prs_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router.oneshot(auth_get("/api/prs", &token)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let prs: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(prs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prs_endpoint_with_status_filter() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/prs?status=open&limit=5", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_pr_analytics_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/prs/analytics", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let analytics: crate::types::PrAnalytics = serde_json::from_slice(&body).unwrap();
+        assert_eq!(analytics.open, 0);
+    }
+
+    #[tokio::test]
+    async fn test_feedback_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/feedback", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let feedback: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(feedback.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_feedback_endpoint_with_filters() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/feedback?source=linear&limit=10", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_regressions_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/regressions", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let regressions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(regressions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_regressions_endpoint_with_status_filter() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/regressions?status=awaiting_release", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_regressions_endpoint_invalid_status() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/regressions?status=invalid_status", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_regression_checks_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/regressions/1/checks", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let checks: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(checks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_experiments_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/experiments", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let experiments: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(experiments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_repos_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/repos", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let repos: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(repos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_repo_stats_endpoint() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/repos/stats", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_dependencies_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/repos/dependencies", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let deps: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_inference_stats_endpoint() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/inference/stats", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_inference_history_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/inference/history", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let history: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_inference_history_endpoint_with_limit() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/inference/history?limit=10", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_config_endpoint_admin() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+
+        // Use a nonexistent config path to test the error case
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("/tmp/nonexistent_claudear_test_config.toml"),
+        )
+        .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        // Config file doesn't exist on disk, so expect 500
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_get_config_endpoint_admin_success() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        // Write a temp config file
+        let config_path = std::env::temp_dir().join("claudear_test_config.toml");
+        std::fs::write(&config_path, "# test config\nwork_dir = \"/tmp\"\n").unwrap();
+
+        let router = create_api_router(config, tracker.clone(), config_path.clone())
+            .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resp["content"].as_str().unwrap().contains("work_dir"));
+        assert!(resp["path"].as_str().is_some());
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    async fn test_get_config_endpoint_viewer_forbidden() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let router = create_api_router(config, tracker.clone(), PathBuf::from("claudear.toml"))
+            .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_endpoint_invalid_toml() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/api/config")
+            .header("cookie", format!("claudear_session={}", token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "content": "this is not valid toml [[[["
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_endpoint_viewer_forbidden() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let router = create_api_router(config, tracker.clone(), PathBuf::from("claudear.toml"))
+            .layer(CookieManagerLayer::new());
+
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/api/config")
+            .header("cookie", format!("claudear_session={}", token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "content": "key = \"value\""
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_attempt_full_detail_not_found() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/attempts/99999/detail", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_attempt_execution_log_not_found() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Attempt doesn't exist
+        let response = router
+            .oneshot(auth_get("/api/attempts/99999/logs/1/stdout", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_attempt_execution_log_invalid_stream() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/attempts/1/logs/1/invalid_stream", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ─── Tests with seeded data ──────────────────────────────────
+
+    /// Helper to seed a fix attempt and return the tracker.
+    fn seed_attempt(
+        tracker: &Arc<dyn FixAttemptTracker>,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+    ) {
+        tracker.record_attempt(source, issue_id, short_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stats_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        seed_attempt(&tracker, "linear", "issue-2", "PROJ-2");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/stats", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let stats: FixAttemptStats = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.success, 1);
+        assert_eq!(stats.pending, 1);
+    }
+
+    #[tokio::test]
+    async fn test_overview_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_merged("linear", "issue-1").unwrap();
+
+        seed_attempt(&tracker, "sentry", "issue-2", "SENTRY-1");
+        tracker
+            .mark_failed("sentry", "issue-2", "Build failed")
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/stats/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("success_rate"));
+        assert!(body_str.contains("merge_rate"));
+        assert!(body_str.contains("recent_attempts"));
+        assert!(body_str.contains("sources"));
+    }
+
+    #[tokio::test]
+    async fn test_attempts_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        seed_attempt(&tracker, "sentry", "issue-2", "SENTRY-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/attempts", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"total\":2"));
+    }
+
+    #[tokio::test]
+    async fn test_attempts_status_filter_with_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        seed_attempt(&tracker, "linear", "issue-2", "PROJ-2");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/attempts?status=success", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"total\":1"));
+    }
+
+    #[tokio::test]
+    async fn test_attempts_source_filter_with_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        seed_attempt(&tracker, "sentry", "issue-2", "SENTRY-1");
+
+        let response = router
+            .oneshot(auth_get("/api/attempts?source=sentry", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"total\":1"));
+    }
+
+    #[tokio::test]
+    async fn test_attempt_detail_with_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+
+        let response = router
+            .oneshot(auth_get("/api/attempts/1", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let attempt: FixAttempt = serde_json::from_slice(&body).unwrap();
+        assert_eq!(attempt.source, "linear");
+        assert_eq!(attempt.short_id, "PROJ-1");
+        assert_eq!(attempt.status, FixAttemptStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_attempt_full_detail_with_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        // Use attempt ID 1 (assuming it's the first one recorded).
+        // Note: the ID might be 2 if the user creation in create_authenticated_router
+        // interferes, but record_attempt in the fix_attempts table is separate.
+        let response = router
+            .oneshot(auth_get("/api/attempts/1/detail", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"attempt\""));
+        assert!(body_str.contains("\"executions\""));
+        assert!(body_str.contains("\"reviews\""));
+    }
+
+    #[tokio::test]
+    async fn test_retries_with_seeded_failed_attempt() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_failed("linear", "issue-1", "Build failed")
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/retries", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("retryable"));
+        assert!(body_str.contains("ready"));
+        assert!(body_str.contains("max_retries"));
+    }
+
+    #[tokio::test]
+    async fn test_activity_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let entry = crate::types::ActivityLogEntry::new("issue_received", "Received PROJ-1")
+            .with_source("linear")
+            .with_issue("issue-1", "PROJ-1");
+        tracker.record_activity(&entry).unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/activity", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["activity_type"], "issue_received");
+        assert_eq!(entries[0]["message"], "Received PROJ-1");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let metric = crate::types::ProcessingMetric {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            metric_name: "processing_time".to_string(),
+            metric_value: 42.5,
+            source: Some("linear".to_string()),
+            tags: None,
+        };
+        tracker.record_metric(&metric).unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/metrics?name=processing_time", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let metrics: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0]["metric_name"], "processing_time");
+    }
+
+    #[tokio::test]
+    async fn test_errors_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let error_pattern = crate::types::ErrorPattern {
+            id: 0,
+            pattern_hash: "abc123".to_string(),
+            error_type: Some("build_failure".to_string()),
+            error_message: Some("Failed to compile".to_string()),
+            first_seen: chrono::Utc::now(),
+            last_seen: chrono::Utc::now(),
+            occurrence_count: 3,
+            sources: Some(vec!["linear".to_string()]),
+            example_issue_ids: None,
+            resolution_hints: None,
+        };
+        tracker.record_error_pattern(&error_pattern).unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/errors", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let errors: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["pattern_hash"], "abc123");
+    }
+
+    #[tokio::test]
+    async fn test_overview_rates_computation() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Seed 4 attempts, 2 success, 1 merged, 1 failed
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        seed_attempt(&tracker, "linear", "issue-2", "PROJ-2");
+        seed_attempt(&tracker, "linear", "issue-3", "PROJ-3");
+        seed_attempt(&tracker, "linear", "issue-4", "PROJ-4");
+
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker
+            .mark_success("linear", "issue-2", "https://github.com/org/repo/pull/2")
+            .unwrap();
+        tracker.mark_merged("linear", "issue-2").unwrap();
+        tracker
+            .mark_failed("linear", "issue-3", "Build failed")
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/stats/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let overview: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // success_rate = (success + merged) / total * 100 = (1 + 1) / 4 * 100 = 50.0
+        let success_rate = overview["success_rate"].as_f64().unwrap();
+        assert!(success_rate > 0.0);
+
+        // stats.total should be 4
+        assert_eq!(overview["stats"]["total"], 4);
+    }
+
+    #[tokio::test]
+    async fn test_sources_response_structure() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/sources", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        // Default config has no sources configured, so sources array should be empty
+        assert!(body_str.contains("\"sources\":[]"));
+    }
+
+    #[tokio::test]
+    async fn test_health_reports_database_ok() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/health", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["database"]["status"], "ok");
+        assert!(health["uptime_secs"].as_u64().is_some());
+        assert!(health["version"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_attempts_pagination_page_2() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Seed 3 attempts
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        seed_attempt(&tracker, "linear", "issue-2", "PROJ-2");
+        seed_attempt(&tracker, "linear", "issue-3", "PROJ-3");
+
+        let response = router
+            .oneshot(auth_get("/api/attempts?page=2&per_page=2", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["page"], 2);
+        assert_eq!(resp["per_page"], 2);
+        assert_eq!(resp["total"], 3);
+        // Page 2 with per_page=2 should have 1 result
+        let attempts = resp["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_activity_returns_401() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let router = create_api_router(config, tracker, PathBuf::from("claudear.toml"))
+            .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_config_returns_401() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let router = create_api_router(config, tracker, PathBuf::from("claudear.toml"))
+            .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_experiments_returns_401() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let router = create_api_router(config, tracker, PathBuf::from("claudear.toml"))
+            .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/experiments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_analytics_summary_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_merged("linear", "issue-1").unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/analytics/summary", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let summary: crate::types::AnalyticsSummary = serde_json::from_slice(&body).unwrap();
+        assert_eq!(summary.total_merged, 1);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_timeseries_with_different_periods() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Test hour period
+        let response = router
+            .oneshot(auth_get(
+                "/api/telemetry/timeseries?period=hour&bucket_minutes=5",
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["period"], "hour");
+        assert_eq!(resp["bucket_minutes"], 5);
+        assert!(resp["points"].as_array().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_pipeline_with_different_periods() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/pipeline?period=month", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["period"], "month");
+        assert!(resp["totals"].is_object());
+        assert!(resp["conversion"].is_object());
+        assert!(resp["poll_load"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_latency_default_period() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // No period parameter - should default to "week"
+        let response = router
+            .oneshot(auth_get("/api/telemetry/latency", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["period"], "week");
+        assert!(resp["overall"].is_object());
+        assert!(resp["histogram"].as_array().unwrap().len() > 0);
+    }
+
+    // ─── Utility function tests ──────────────────────────────────
+
+    #[test]
+    fn test_tail_utf8_short_string() {
+        let (result, truncated) = tail_utf8("hello", 100);
+        assert_eq!(result, "hello");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_tail_utf8_long_string() {
+        let long = "a".repeat(1000);
+        let (result, truncated) = tail_utf8(&long, 100);
+        assert!(truncated);
+        assert!(result.contains("...[truncated]"));
+        // The tail should contain at most ~100 bytes of the original plus the prefix
+        assert!(result.len() <= 200);
+    }
+
+    #[test]
+    fn test_parse_telemetry_period_known() {
+        let (label, _duration) = parse_telemetry_period(Some("hour"), "week");
+        assert_eq!(label, "hour");
+
+        let (label, _duration) = parse_telemetry_period(Some("day"), "week");
+        assert_eq!(label, "day");
+
+        let (label, _duration) = parse_telemetry_period(Some("month"), "week");
+        assert_eq!(label, "month");
+
+        let (label, _duration) = parse_telemetry_period(Some("week"), "day");
+        assert_eq!(label, "week");
+    }
+
+    #[test]
+    fn test_parse_telemetry_period_unknown_falls_back() {
+        let (label, _duration) = parse_telemetry_period(Some("year"), "day");
+        assert_eq!(label, "day");
+
+        let (label, _duration) = parse_telemetry_period(None, "hour");
+        assert_eq!(label, "hour");
+    }
+
+    #[test]
+    fn test_floor_to_bucket() {
+        use chrono::{TimeZone, Timelike};
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2024, 6, 15, 10, 37, 42)
+            .unwrap();
+
+        // Floor to 15-minute buckets
+        let floored = floor_to_bucket(ts, 15);
+        assert_eq!(floored.minute(), 30);
+        assert_eq!(floored.second(), 0);
+
+        // Floor to 60-minute buckets
+        let floored = floor_to_bucket(ts, 60);
+        assert_eq!(floored.minute(), 0);
+        assert_eq!(floored.second(), 0);
+    }
+
+    #[test]
+    fn test_compute_processing_value_summary_empty() {
+        let summary = compute_processing_value_summary(vec![]);
+        assert_eq!(summary.samples, 0);
+        assert!(summary.avg_secs.is_none());
+        assert!(summary.max_secs.is_none());
+    }
+
+    #[test]
+    fn test_compute_processing_value_summary_with_data() {
+        let summary = compute_processing_value_summary(vec![10.0, 20.0, 30.0, 40.0, 50.0]);
+        assert_eq!(summary.samples, 5);
+        assert!((summary.avg_secs.unwrap() - 30.0).abs() < 0.01);
+        assert!((summary.max_secs.unwrap() - 50.0).abs() < 0.01);
+        assert!(summary.p50_secs.is_some());
+        assert!(summary.p95_secs.is_some());
+        assert!(summary.p99_secs.is_some());
+    }
+
+    #[test]
+    fn test_ratio_function() {
+        assert!((ratio(50.0, 100.0).unwrap() - 0.5).abs() < 0.001);
+        assert!(ratio(10.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn test_summarize_window_empty() {
+        let attempts: Vec<FixAttempt> = vec![];
+        let metric = summarize_window(&attempts, "1h", chrono::Utc::now() - Duration::hours(1));
+        assert_eq!(metric.window, "1h");
+        assert_eq!(metric.processed, 0);
+        assert_eq!(metric.successful, 0);
+        assert_eq!(metric.failed, 0);
+    }
+
+    #[test]
+    fn test_summarize_window_with_attempts() {
+        let now = chrono::Utc::now();
+        let attempts = vec![
+            FixAttempt {
+                id: 1,
+                source: "linear".to_string(),
+                issue_id: "1".to_string(),
+                short_id: "P-1".to_string(),
+                status: FixAttemptStatus::Success,
+                pr_url: None,
+                github_repo: None,
+                github_pr_number: None,
+                error_message: None,
+                attempted_at: now,
+                resolved_at: None,
+                merged_at: None,
+                retry_count: 0,
+                last_retry_at: None,
+                issue_labels: vec![],
+                parent_attempt_id: None,
+                cascade_repo: None,
+            },
+            FixAttempt {
+                id: 2,
+                source: "linear".to_string(),
+                issue_id: "2".to_string(),
+                short_id: "P-2".to_string(),
+                status: FixAttemptStatus::Failed,
+                pr_url: None,
+                github_repo: None,
+                github_pr_number: None,
+                error_message: Some("error".to_string()),
+                attempted_at: now,
+                resolved_at: None,
+                merged_at: None,
+                retry_count: 0,
+                last_retry_at: None,
+                issue_labels: vec![],
+                parent_attempt_id: None,
+                cascade_repo: None,
+            },
+        ];
+        let metric = summarize_window(&attempts, "24h", now - Duration::hours(24));
+        assert_eq!(metric.window, "24h");
+        assert_eq!(metric.processed, 2);
+        assert_eq!(metric.successful, 1);
+        assert_eq!(metric.failed, 1);
+        assert!((metric.success_rate - 50.0).abs() < 0.01);
     }
 }

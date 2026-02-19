@@ -955,7 +955,8 @@ describe("Page Components", () => {
       });
       const ReposPage = (await import("../src/pages/repos")).default;
       renderPage(<ReposPage />);
-      expect(screen.getByText("Repositories")).toBeDefined();
+      // "Repositories" appears in both the page header and the tab button
+      expect(screen.getAllByText("Repositories").length).toBeGreaterThanOrEqual(1);
     });
 
     test("shows loading state", async () => {
@@ -964,7 +965,7 @@ describe("Page Components", () => {
       ) as unknown as typeof fetch;
       const ReposPage = (await import("../src/pages/repos")).default;
       renderPage(<ReposPage />);
-      expect(screen.getByText("Repositories")).toBeDefined();
+      expect(screen.getAllByText("Repositories").length).toBeGreaterThanOrEqual(1);
     });
 
     test("shows data after fetch resolves", async () => {
@@ -976,15 +977,20 @@ describe("Page Components", () => {
       const ReposPage = (await import("../src/pages/repos")).default;
       renderPage(<ReposPage />);
 
+      // Wait for repos tab data
       await waitFor(
         () => {
-          expect(screen.getByText("core-lib")).toBeDefined();
+          expect(screen.getByText("my-app")).toBeDefined();
         },
         { timeout: 3000 },
       );
       expect(screen.getByText("3")).toBeDefined();
-      // "my-app" appears in both repos and deps tables
-      expect(screen.getAllByText("my-app").length).toBeGreaterThanOrEqual(1);
+
+      // Click Dependencies tab to see dependency data
+      fireEvent.click(screen.getByText("Dependencies"));
+      await waitFor(() => {
+        expect(screen.getByText("core-lib")).toBeDefined();
+      });
     });
 
     test("shows error state gracefully", async () => {
@@ -992,7 +998,7 @@ describe("Page Components", () => {
       const ReposPage = (await import("../src/pages/repos")).default;
       renderPage(<ReposPage />);
       // ReposPage doesn't have explicit error text; verify no crash
-      expect(screen.getByText("Repositories")).toBeDefined();
+      expect(screen.getAllByText("Repositories").length).toBeGreaterThanOrEqual(1);
     });
   });
 

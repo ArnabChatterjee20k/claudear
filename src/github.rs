@@ -2,57 +2,19 @@
 
 use crate::config::GitHubConfig;
 use crate::error::{Error, Result};
-use crate::http::HttpResponse;
-use crate::storage::{FixAttemptTracker, SqliteTracker};
-use crate::types::{FixAttempt, IssueType, PrReviewRecord, RegressionWatch};
+use crate::scm::{CodeReview, RemoteRepo, ReviewComment, ReviewUser, ScmProvider};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use serde::Deserialize;
 
-/// Trait for HTTP client operations to enable testing.
-#[async_trait]
-pub trait HttpClient: Send + Sync {
-    /// Perform a GET request with headers.
-    async fn get(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse>;
-}
+// Backward-compatibility re-exports (types moved to scm module)
+pub use crate::scm::{
+    CodeReview as PrReview, PrInfo, PrMonitor, PrReviewState, PrStatus, PrStatusUpdate,
+    RemoteRepo as OrgRepo, ReviewComment as PrReviewComment, ReviewEvent, ReviewUser as GitHubUser,
+    ReviewWatcher,
+};
 
-/// Default HTTP client using reqwest.
-pub struct ReqwestHttpClient {
-    client: reqwest::Client,
-}
-
-impl ReqwestHttpClient {
-    /// Create a new reqwest-based HTTP client.
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
-        }
-    }
-}
-
-impl Default for ReqwestHttpClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl HttpClient for ReqwestHttpClient {
-    async fn get(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
-        let mut request = self.client.get(url);
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        let response = request.send().await?;
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-        Ok(HttpResponse { status, body })
-    }
-}
+// Backward-compatibility re-exports (types moved to http module)
+pub use crate::http::{HttpClient, ReqwestHttpClient};
 
 /// GitHub API client for PR monitoring.
 pub struct GitHubClient<H: HttpClient = ReqwestHttpClient> {
@@ -67,106 +29,13 @@ struct PullRequest {
     head: Option<PullRequestRef>,
     base: Option<PullRequestRef>,
     title: Option<String>,
-    user: Option<GitHubUser>,
+    user: Option<ReviewUser>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PullRequestRef {
     #[serde(rename = "ref")]
     ref_name: String,
-}
-
-/// Lightweight PR info returned by `get_pr_info`.
-#[derive(Debug, Clone)]
-pub struct PrInfo {
-    pub head_branch: Option<String>,
-    pub base_branch: Option<String>,
-    pub title: Option<String>,
-    pub author: Option<String>,
-}
-
-/// A GitHub PR review.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrReview {
-    /// Review ID.
-    pub id: i64,
-    /// Review state (APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING).
-    pub state: String,
-    /// Review body/comment.
-    pub body: Option<String>,
-    /// Reviewer user.
-    pub user: GitHubUser,
-    /// When the review was submitted.
-    pub submitted_at: Option<String>,
-    /// HTML URL to the review.
-    pub html_url: Option<String>,
-}
-
-/// A GitHub user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitHubUser {
-    /// User ID.
-    pub id: i64,
-    /// Username/login.
-    pub login: String,
-    /// User type (User, Bot, etc.).
-    #[serde(rename = "type")]
-    pub user_type: Option<String>,
-}
-
-/// A repository from the GitHub API (organization repos endpoint).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrgRepo {
-    /// Repository ID.
-    pub id: i64,
-    /// Full name (org/repo).
-    pub full_name: String,
-    /// Repository name (without org).
-    pub name: String,
-    /// Default branch name.
-    pub default_branch: String,
-    /// Clone URL (HTTPS).
-    pub clone_url: String,
-    /// SSH URL for cloning.
-    #[serde(default)]
-    pub ssh_url: String,
-    /// HTML URL.
-    pub html_url: String,
-    /// Whether the repo is private.
-    pub private: bool,
-    /// Whether the repo is archived.
-    pub archived: bool,
-}
-
-/// A GitHub PR review comment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrReviewComment {
-    /// Comment ID.
-    pub id: i64,
-    /// File path the comment is on.
-    pub path: String,
-    /// Line position in the diff.
-    pub position: Option<i64>,
-    /// Original line position.
-    pub original_position: Option<i64>,
-    /// Comment body.
-    pub body: String,
-    /// User who wrote the comment.
-    pub user: GitHubUser,
-    /// When the comment was created.
-    pub created_at: String,
-    /// When the comment was last updated.
-    pub updated_at: String,
-    /// HTML URL to the comment.
-    pub html_url: String,
-    /// Associated review ID if part of a review.
-    pub pull_request_review_id: Option<i64>,
-    /// Start line (for multi-line comments).
-    pub start_line: Option<i64>,
-    /// Line number.
-    pub line: Option<i64>,
-    /// Side of the diff (LEFT or RIGHT).
-    pub side: Option<String>,
 }
 
 impl GitHubClient<ReqwestHttpClient> {
@@ -180,20 +49,6 @@ impl GitHubClient<ReqwestHttpClient> {
 }
 
 impl<H: HttpClient> GitHubClient<H> {
-    /// Returns true when `candidate` is at or after `since`.
-    ///
-    /// GitHub timestamps are RFC3339. We parse for timezone-safe ordering and
-    /// fall back to string comparison if parsing fails.
-    fn timestamp_at_or_after(candidate: &str, since: &str) -> bool {
-        match (
-            chrono::DateTime::parse_from_rfc3339(candidate),
-            chrono::DateTime::parse_from_rfc3339(since),
-        ) {
-            (Ok(candidate_dt), Ok(since_dt)) => candidate_dt >= since_dt,
-            _ => candidate >= since,
-        }
-    }
-
     /// Create a new GitHub client with a custom HTTP client.
     pub fn with_http_client(config: GitHubConfig, http: H) -> Self {
         Self { config, http }
@@ -282,7 +137,7 @@ impl<H: HttpClient> GitHubClient<H> {
     }
 
     /// Get reviews for a PR.
-    pub async fn get_pr_reviews(&self, repo: &str, pr_number: i64) -> Result<Vec<PrReview>> {
+    pub async fn get_pr_reviews(&self, repo: &str, pr_number: i64) -> Result<Vec<CodeReview>> {
         let token = self
             .config
             .token
@@ -315,7 +170,7 @@ impl<H: HttpClient> GitHubClient<H> {
                 )));
             }
 
-            let reviews: Vec<PrReview> = response.json()?;
+            let reviews: Vec<CodeReview> = response.json()?;
             let count = reviews.len();
             all_reviews.extend(reviews);
 
@@ -338,7 +193,7 @@ impl<H: HttpClient> GitHubClient<H> {
         &self,
         repo: &str,
         pr_number: i64,
-    ) -> Result<Vec<PrReviewComment>> {
+    ) -> Result<Vec<ReviewComment>> {
         let token = self
             .config
             .token
@@ -371,7 +226,7 @@ impl<H: HttpClient> GitHubClient<H> {
                 )));
             }
 
-            let comments: Vec<PrReviewComment> = response.json()?;
+            let comments: Vec<ReviewComment> = response.json()?;
             let count = comments.len();
             all_comments.extend(comments);
 
@@ -387,49 +242,6 @@ impl<H: HttpClient> GitHubClient<H> {
         }
 
         Ok(all_comments)
-    }
-
-    /// Get reviews for a PR that haven't been processed yet.
-    pub async fn get_new_reviews(
-        &self,
-        repo: &str,
-        pr_number: i64,
-        since: Option<&str>,
-    ) -> Result<Vec<PrReview>> {
-        let reviews = self.get_pr_reviews(repo, pr_number).await?;
-
-        if let Some(since_time) = since {
-            Ok(reviews
-                .into_iter()
-                .filter(|r| {
-                    r.submitted_at
-                        .as_ref()
-                        .map(|t| Self::timestamp_at_or_after(t, since_time))
-                        .unwrap_or(false)
-                })
-                .collect())
-        } else {
-            Ok(reviews)
-        }
-    }
-
-    /// Get review comments since a given time.
-    pub async fn get_new_review_comments(
-        &self,
-        repo: &str,
-        pr_number: i64,
-        since: Option<&str>,
-    ) -> Result<Vec<PrReviewComment>> {
-        let comments = self.get_pr_review_comments(repo, pr_number).await?;
-
-        if let Some(since_time) = since {
-            Ok(comments
-                .into_iter()
-                .filter(|c| Self::timestamp_at_or_after(&c.updated_at, since_time))
-                .collect())
-        } else {
-            Ok(comments)
-        }
     }
 
     /// Get the GitHub token (if configured).
@@ -469,7 +281,7 @@ impl<H: HttpClient> GitHubClient<H> {
     ///
     /// Paginates through all results (100 per page) and returns all repos.
     /// Excludes archived repositories.
-    pub async fn list_org_repos(&self, org: &str) -> Result<Vec<OrgRepo>> {
+    pub async fn list_org_repos(&self, org: &str) -> Result<Vec<RemoteRepo>> {
         let token = self
             .config
             .token
@@ -500,11 +312,11 @@ impl<H: HttpClient> GitHubClient<H> {
                 )));
             }
 
-            let repos: Vec<OrgRepo> = response.json()?;
+            let repos: Vec<RemoteRepo> = response.json()?;
             let count = repos.len();
 
             // Filter out archived repos
-            let active_repos: Vec<OrgRepo> = repos.into_iter().filter(|r| !r.archived).collect();
+            let active_repos: Vec<RemoteRepo> = repos.into_iter().filter(|r| !r.archived).collect();
             all_repos.extend(active_repos);
 
             // If we got fewer than per_page, we've reached the end
@@ -526,1008 +338,51 @@ impl<H: HttpClient> GitHubClient<H> {
     }
 }
 
-/// Status of a GitHub PR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrStatus {
-    Open,
-    Merged,
-    Closed,
-}
-
-/// PR Monitor that watches for merged PRs and updates issue status.
-pub struct PrMonitor<H: HttpClient = ReqwestHttpClient> {
-    github: GitHubClient<H>,
-    tracker: Arc<dyn FixAttemptTracker>,
-    auto_resolve: bool,
-    /// Optional SQLite tracker for regression watching.
-    /// When set, merged PRs for bug issues will create regression watches
-    /// instead of auto-resolving.
-    regression_tracker: Option<Arc<SqliteTracker>>,
-}
-
-impl PrMonitor<ReqwestHttpClient> {
-    /// Create a new PR monitor with the default HTTP client.
-    pub fn new(
-        github: GitHubClient,
-        tracker: Arc<dyn FixAttemptTracker>,
-        auto_resolve: bool,
-    ) -> Self {
-        Self {
-            github,
-            tracker,
-            auto_resolve,
-            regression_tracker: None,
-        }
+#[async_trait]
+impl<H: HttpClient> ScmProvider for GitHubClient<H> {
+    fn name(&self) -> &str {
+        "github"
     }
 
-    /// Create a new PR monitor with regression tracking enabled.
-    pub fn with_regression_tracking(
-        github: GitHubClient,
-        tracker: Arc<dyn FixAttemptTracker>,
-        auto_resolve: bool,
-        regression_tracker: Arc<SqliteTracker>,
-    ) -> Self {
-        Self {
-            github,
-            tracker,
-            auto_resolve,
-            regression_tracker: Some(regression_tracker),
-        }
-    }
-}
-
-impl<H: HttpClient> PrMonitor<H> {
-    /// Create a new PR monitor with a custom HTTP client.
-    pub fn with_http_client(
-        github: GitHubClient<H>,
-        tracker: Arc<dyn FixAttemptTracker>,
-        auto_resolve: bool,
-    ) -> Self {
-        Self {
-            github,
-            tracker,
-            auto_resolve,
-            regression_tracker: None,
-        }
+    fn is_enabled(&self) -> bool {
+        self.is_enabled()
     }
 
-    /// Determine if a fix attempt is for a bug-type issue.
-    ///
-    /// Bug-type issues are:
-    /// - All Sentry issues (always bugs)
-    /// - Linear issues with a "bug" label (check metadata if available)
-    fn is_bug_type(&self, attempt: &FixAttempt) -> bool {
-        attempt.is_bug()
+    fn review_trigger(&self) -> &str {
+        self.review_trigger()
     }
 
-    /// Get the issue type for a fix attempt.
-    fn get_issue_type(&self, attempt: &FixAttempt) -> IssueType {
-        match attempt.source.as_str() {
-            "sentry" => IssueType::SentryIssue,
-            "linear" => IssueType::LinearBug,
-            _ => IssueType::SentryIssue, // Default fallback
-        }
+    async fn get_pr_status(&self, project: &str, number: i64) -> Result<PrStatus> {
+        GitHubClient::get_pr_status(self, project, number).await
     }
 
-    /// Check all pending PRs and update their status.
-    pub async fn check_pending_prs(&self) -> Result<Vec<PrStatusUpdate>> {
-        if !self.github.is_enabled() {
-            return Ok(vec![]);
-        }
-
-        let pending_prs = self.tracker.get_pending_prs()?;
-        let mut updates = Vec::new();
-
-        for attempt in pending_prs {
-            if let Some(update) = self.check_pr(&attempt).await? {
-                updates.push(update);
-            }
-        }
-
-        Ok(updates)
+    async fn get_pr_info(&self, project: &str, number: i64) -> Result<PrInfo> {
+        GitHubClient::get_pr_info(self, project, number).await
     }
 
-    /// Check a single PR and update its status if needed.
-    async fn check_pr(&self, attempt: &FixAttempt) -> Result<Option<PrStatusUpdate>> {
-        let repo = match &attempt.github_repo {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-
-        let pr_number = match attempt.github_pr_number {
-            Some(n) => n,
-            None => return Ok(None),
-        };
-
-        let status = match self.github.get_pr_status(repo, pr_number).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    source = "github",
-                    repo = %repo,
-                    pr_number = pr_number,
-                    error = %e,
-                    "Failed to check PR"
-                );
-                return Ok(None);
-            }
-        };
-
-        match status {
-            PrStatus::Merged => {
-                tracing::info!(source = "github", repo = %repo, pr_number = pr_number, "PR has been merged!");
-                self.tracker
-                    .mark_merged(&attempt.source, &attempt.issue_id)?;
-
-                // Log activity event
-                let pr_url = attempt.pr_url.clone().unwrap_or_default();
-                let activity = crate::types::ActivityLogEntry::new(
-                    "pr_merged",
-                    format!("PR merged: {}", pr_url),
-                )
-                .with_source(attempt.source.clone())
-                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
-                .with_metadata(serde_json::json!({
-                    "pr_url": pr_url,
-                    "repo": repo,
-                    "pr_number": pr_number
-                }));
-                let _ = self.tracker.record_activity(&activity);
-
-                // Determine if we should start regression tracking instead of auto-resolving
-                let is_bug = self.is_bug_type(attempt);
-                let regression_watch_id = if is_bug {
-                    if let Some(ref regression_tracker) = self.regression_tracker {
-                        // Create a regression watch for bug-type issues
-                        let issue_type = self.get_issue_type(attempt);
-                        let mut watch =
-                            RegressionWatch::new(issue_type, &attempt.issue_id, attempt.id);
-                        watch.pr_merged_at = Some(chrono::Utc::now());
-
-                        match regression_tracker.create_regression_watch(&watch) {
-                            Ok(watch_id) => {
-                                tracing::info!(
-                                    source = "github",
-                                    issue_id = %attempt.issue_id,
-                                    watch_id = watch_id,
-                                    "Created regression watch for bug fix"
-                                );
-
-                                // Log activity for regression watch creation
-                                let watch_activity = crate::types::ActivityLogEntry::new(
-                                    "regression_watch_created",
-                                    format!(
-                                        "Started regression monitoring for {} after PR merge",
-                                        attempt.short_id
-                                    ),
-                                )
-                                .with_source(attempt.source.clone())
-                                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
-                                .with_metadata(serde_json::json!({
-                                    "watch_id": watch_id,
-                                    "issue_type": issue_type.to_string(),
-                                    "pr_url": pr_url
-                                }));
-                                let _ = self.tracker.record_activity(&watch_activity);
-
-                                Some(watch_id)
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    source = "github",
-                                    issue_id = %attempt.issue_id,
-                                    error = %e,
-                                    "Failed to create regression watch"
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // For bugs with regression tracking, don't auto-resolve yet
-                // The issue will be resolved after 24 hours of no regressions
-                let should_resolve = if regression_watch_id.is_some() {
-                    false // Don't auto-resolve, regression monitoring will handle it
-                } else {
-                    self.auto_resolve
-                };
-
-                Ok(Some(PrStatusUpdate {
-                    source: attempt.source.clone(),
-                    issue_id: attempt.issue_id.clone(),
-                    short_id: attempt.short_id.clone(),
-                    pr_url,
-                    new_status: PrStatus::Merged,
-                    should_resolve,
-                    regression_watch_id,
-                }))
-            }
-            PrStatus::Closed => {
-                tracing::info!(
-                    source = "github",
-                    repo = %repo,
-                    pr_number = pr_number,
-                    "PR was closed without merging"
-                );
-                self.tracker
-                    .mark_closed(&attempt.source, &attempt.issue_id)?;
-
-                // Log activity event
-                let pr_url = attempt.pr_url.clone().unwrap_or_default();
-                let activity = crate::types::ActivityLogEntry::new(
-                    "pr_closed",
-                    format!("PR closed without merge: {}", pr_url),
-                )
-                .with_source(attempt.source.clone())
-                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
-                .with_metadata(serde_json::json!({
-                    "pr_url": pr_url,
-                    "repo": repo,
-                    "pr_number": pr_number
-                }));
-                let _ = self.tracker.record_activity(&activity);
-
-                Ok(Some(PrStatusUpdate {
-                    source: attempt.source.clone(),
-                    issue_id: attempt.issue_id.clone(),
-                    short_id: attempt.short_id.clone(),
-                    pr_url,
-                    new_status: PrStatus::Closed,
-                    should_resolve: false,
-                    regression_watch_id: None,
-                }))
-            }
-            PrStatus::Open => Ok(None),
-        }
-    }
-}
-
-/// Update information for a PR status change.
-#[derive(Debug, Clone)]
-pub struct PrStatusUpdate {
-    pub source: String,
-    pub issue_id: String,
-    pub short_id: String,
-    pub pr_url: String,
-    pub new_status: PrStatus,
-    /// Whether the issue should be resolved on the source.
-    pub should_resolve: bool,
-    /// If set, a regression watch was created for this bug fix.
-    /// The issue won't be auto-resolved until regression monitoring completes.
-    pub regression_watch_id: Option<i64>,
-}
-
-/// State for tracking PR reviews.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrReviewState {
-    /// PR URL.
-    pub pr_url: String,
-    /// Repository (owner/repo).
-    pub repo: String,
-    /// PR number.
-    pub pr_number: i64,
-    /// Source issue ID.
-    pub issue_id: String,
-    /// Source (linear, sentry, etc.).
-    pub source: String,
-    /// Last review ID processed.
-    pub last_review_id: Option<i64>,
-    /// Last review timestamp processed.
-    pub last_review_time: Option<String>,
-    /// Last comment ID processed.
-    pub last_comment_id: Option<i64>,
-    /// Last comment timestamp processed.
-    pub last_comment_time: Option<String>,
-    /// Whether this PR is still being watched.
-    pub is_active: bool,
-}
-
-impl PrReviewState {
-    /// Create a new review state.
-    pub fn new(
-        pr_url: impl Into<String>,
-        repo: impl Into<String>,
-        pr_number: i64,
-        issue_id: impl Into<String>,
-        source: impl Into<String>,
-    ) -> Self {
-        Self {
-            pr_url: pr_url.into(),
-            repo: repo.into(),
-            pr_number,
-            issue_id: issue_id.into(),
-            source: source.into(),
-            last_review_id: None,
-            last_review_time: None,
-            last_comment_id: None,
-            last_comment_time: None,
-            is_active: true,
-        }
-    }
-}
-
-/// An event from a PR review watcher.
-#[derive(Debug, Clone)]
-pub enum ReviewEvent {
-    /// A new review was submitted.
-    ReviewSubmitted {
-        pr_url: String,
-        repo: String,
-        pr_number: i64,
-        review: PrReview,
-        /// Inline comments submitted as part of this review.
-        inline_comments: Vec<PrReviewComment>,
-    },
-    /// New review comments were added.
-    CommentsAdded {
-        pr_url: String,
-        repo: String,
-        pr_number: i64,
-        comments: Vec<PrReviewComment>,
-    },
-}
-
-impl ReviewEvent {
-    /// Get the PR URL for this event.
-    pub fn pr_url(&self) -> &str {
-        match self {
-            ReviewEvent::ReviewSubmitted { pr_url, .. } => pr_url,
-            ReviewEvent::CommentsAdded { pr_url, .. } => pr_url,
-        }
+    async fn get_pr_diff(&self, project: &str, number: i64) -> Result<String> {
+        GitHubClient::get_pr_diff(self, project, number).await
     }
 
-    /// Check if this event requires agent action.
-    pub fn requires_action(&self) -> bool {
-        match self {
-            ReviewEvent::ReviewSubmitted { review, .. } => {
-                // Only process reviews that request changes or have comments
-                matches!(
-                    review.state.to_uppercase().as_str(),
-                    "CHANGES_REQUESTED" | "COMMENTED"
-                )
-            }
-            ReviewEvent::CommentsAdded { comments, .. } => !comments.is_empty(),
-        }
+    async fn get_reviews(&self, project: &str, number: i64) -> Result<Vec<CodeReview>> {
+        self.get_pr_reviews(project, number).await
     }
 
-    /// Get a summary of feedback for the agent.
-    pub fn get_feedback_summary(&self) -> String {
-        match self {
-            ReviewEvent::ReviewSubmitted {
-                review,
-                inline_comments,
-                ..
-            } => {
-                let mut summary = format!(
-                    "Review from @{} ({})\n",
-                    review.user.login,
-                    review.state.to_uppercase()
-                );
-                if let Some(body) = &review.body {
-                    if !body.is_empty() {
-                        summary.push_str(&format!("\nReview comment:\n{}\n", body));
-                    }
-                }
-                if !inline_comments.is_empty() {
-                    summary.push_str(&format!("\nInline comments ({}):\n", inline_comments.len()));
-                    for comment in inline_comments {
-                        summary.push_str(&format!("- `{}`", comment.path));
-                        if let Some(line) = comment.line {
-                            summary.push_str(&format!(" (line {})", line));
-                        }
-                        summary.push_str(&format!(": {}\n", comment.body));
-                    }
-                }
-                summary
-            }
-            ReviewEvent::CommentsAdded { comments, .. } => {
-                let mut summary = String::new();
-                for comment in comments {
-                    summary.push_str(&format!(
-                        "Comment from @{} on `{}`",
-                        comment.user.login, comment.path
-                    ));
-                    if let Some(line) = comment.line {
-                        summary.push_str(&format!(" (line {})", line));
-                    }
-                    summary.push_str(&format!(":\n{}\n\n", comment.body));
-                }
-                summary
-            }
-        }
-    }
-}
-
-/// Watches PRs for review activity.
-pub struct ReviewWatcher<H: HttpClient = ReqwestHttpClient> {
-    github: GitHubClient<H>,
-    /// Map of PR URL -> review state
-    states: std::sync::RwLock<std::collections::HashMap<String, PrReviewState>>,
-    /// Optional tracker for recording reviews to the database
-    tracker: Option<Arc<dyn FixAttemptTracker>>,
-    /// Optional sqlite tracker for persisting review states
-    sqlite_tracker: Option<Arc<SqliteTracker>>,
-}
-
-impl ReviewWatcher<ReqwestHttpClient> {
-    /// Create a new review watcher with the default HTTP client.
-    pub fn new(github: GitHubClient) -> Self {
-        Self {
-            github,
-            states: std::sync::RwLock::new(std::collections::HashMap::new()),
-            tracker: None,
-            sqlite_tracker: None,
-        }
+    async fn get_review_comments(&self, project: &str, number: i64) -> Result<Vec<ReviewComment>> {
+        self.get_pr_review_comments(project, number).await
     }
 
-    /// Create a new review watcher with a tracker for analytics.
-    pub fn with_tracker(github: GitHubClient, tracker: Arc<dyn FixAttemptTracker>) -> Self {
-        Self {
-            github,
-            states: std::sync::RwLock::new(std::collections::HashMap::new()),
-            tracker: Some(tracker),
-            sqlite_tracker: None,
-        }
-    }
-
-    /// Create a new review watcher with a sqlite tracker for state persistence.
-    pub fn with_sqlite_tracker(
-        github: GitHubClient,
-        tracker: Arc<dyn FixAttemptTracker>,
-        sqlite_tracker: Option<Arc<SqliteTracker>>,
-    ) -> Self {
-        Self {
-            github,
-            states: std::sync::RwLock::new(std::collections::HashMap::new()),
-            tracker: Some(tracker),
-            sqlite_tracker,
-        }
-    }
-}
-
-impl<H: HttpClient> ReviewWatcher<H> {
-    /// Create a new review watcher with a custom HTTP client.
-    pub fn with_http_client(github: GitHubClient<H>) -> Self {
-        Self {
-            github,
-            states: std::sync::RwLock::new(std::collections::HashMap::new()),
-            tracker: None,
-            sqlite_tracker: None,
-        }
-    }
-
-    /// Create a new review watcher with a custom HTTP client and tracker.
-    pub fn with_http_client_and_tracker(
-        github: GitHubClient<H>,
-        tracker: Arc<dyn FixAttemptTracker>,
-    ) -> Self {
-        Self {
-            github,
-            states: std::sync::RwLock::new(std::collections::HashMap::new()),
-            tracker: Some(tracker),
-            sqlite_tracker: None,
-        }
-    }
-
-    /// Check if the watcher is enabled.
-    pub fn is_enabled(&self) -> bool {
-        self.github.is_enabled()
-    }
-
-    /// Start watching a PR for reviews.
-    pub fn watch_pr(&self, state: PrReviewState) {
-        let mut merged_state = state;
-        let mut states = self.states.write().unwrap_or_else(|poisoned| {
-            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        // Preserve existing review/comment cursors when a PR is re-registered.
-        // This prevents replaying the full review history on subsequent poll cycles.
-        if let Some(existing) = states.get(&merged_state.pr_url) {
-            merged_state.last_review_id = merged_state.last_review_id.or(existing.last_review_id);
-            if merged_state.last_review_time.is_none() {
-                merged_state.last_review_time = existing.last_review_time.clone();
-            }
-            merged_state.last_comment_id =
-                merged_state.last_comment_id.or(existing.last_comment_id);
-            if merged_state.last_comment_time.is_none() {
-                merged_state.last_comment_time = existing.last_comment_time.clone();
-            }
-        }
-        merged_state.is_active = true;
-        states.insert(merged_state.pr_url.clone(), merged_state.clone());
-        drop(states);
-
-        // Persist merged state if sqlite_tracker is available
-        if let Some(ref sqlite) = self.sqlite_tracker {
-            if let Err(e) = sqlite.save_pr_review_state(&merged_state) {
-                tracing::warn!(
-                    component = "review_watcher",
-                    pr_url = %merged_state.pr_url,
-                    error = %e,
-                    "Failed to persist PR review state to database"
-                );
-            }
-        }
-    }
-
-    /// Stop watching a PR.
-    pub fn unwatch_pr(&self, pr_url: &str) {
-        // Deactivate in database first if sqlite_tracker is available
-        if let Some(ref sqlite) = self.sqlite_tracker {
-            if let Err(e) = sqlite.deactivate_pr_review_state(pr_url) {
-                tracing::warn!(
-                    component = "review_watcher",
-                    pr_url = %pr_url,
-                    error = %e,
-                    "Failed to deactivate PR review state in database"
-                );
-            }
-        }
-
-        let mut states = self.states.write().unwrap_or_else(|poisoned| {
-            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-            poisoned.into_inner()
-        });
-        if let Some(state) = states.get_mut(pr_url) {
-            state.is_active = false;
-        }
-    }
-
-    /// Get the state for a PR.
-    pub fn get_state(&self, pr_url: &str) -> Option<PrReviewState> {
-        let states = self.states.read().unwrap_or_else(|poisoned| {
-            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-            poisoned.into_inner()
-        });
-        states.get(pr_url).cloned()
-    }
-
-    /// Get all active states.
-    pub fn get_active_states(&self) -> Vec<PrReviewState> {
-        let states = self.states.read().unwrap_or_else(|poisoned| {
-            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-            poisoned.into_inner()
-        });
-        states.values().filter(|s| s.is_active).cloned().collect()
-    }
-
-    /// Load states from storage.
-    pub fn load_states(&self, states_vec: Vec<PrReviewState>) {
-        let mut states = self.states.write().unwrap_or_else(|poisoned| {
-            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-            poisoned.into_inner()
-        });
-        for state in states_vec {
-            if state.is_active {
-                states.insert(state.pr_url.clone(), state);
-            }
-        }
-    }
-
-    /// Get all states for persistence.
-    pub fn get_all_states(&self) -> Vec<PrReviewState> {
-        let states = self.states.read().unwrap_or_else(|poisoned| {
-            tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-            poisoned.into_inner()
-        });
-        states.values().cloned().collect()
-    }
-
-    fn compare_timestamps(candidate: &str, baseline: &str) -> std::cmp::Ordering {
-        match (
-            chrono::DateTime::parse_from_rfc3339(candidate),
-            chrono::DateTime::parse_from_rfc3339(baseline),
-        ) {
-            (Ok(candidate_dt), Ok(baseline_dt)) => candidate_dt.cmp(&baseline_dt),
-            _ => candidate.cmp(baseline),
-        }
-    }
-
-    fn comment_is_after_cursor(
-        comment: &PrReviewComment,
-        last_comment_time: Option<&str>,
-        last_comment_id: Option<i64>,
-    ) -> bool {
-        let Some(last_time) = last_comment_time else {
-            return true;
-        };
-
-        match Self::compare_timestamps(&comment.updated_at, last_time) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => last_comment_id.map(|id| comment.id > id).unwrap_or(true),
-        }
-    }
-
-    /// Check all watched PRs for new reviews.
-    pub async fn check_for_reviews(&self) -> Result<Vec<ReviewEvent>> {
-        if !self.github.is_enabled() {
-            return Ok(vec![]);
-        }
-
-        let states_to_check: Vec<PrReviewState> = {
-            let states = self.states.read().unwrap_or_else(|poisoned| {
-                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-                poisoned.into_inner()
-            });
-            states.values().filter(|s| s.is_active).cloned().collect()
-        };
-
-        let mut events = Vec::new();
-
-        for state in states_to_check {
-            match self.check_pr_reviews(&state).await {
-                Ok(pr_events) => events.extend(pr_events),
-                Err(e) => {
-                    tracing::warn!(
-                        component = "review_watcher",
-                        pr_url = %state.pr_url,
-                        error = %e,
-                        "Failed to check reviews"
-                    );
-                }
-            }
-        }
-
-        Ok(events)
-    }
-
-    /// Check reviews for a single watched PR.
-    ///
-    /// This is used by webhook handlers to trigger immediate processing for the
-    /// PR that emitted an event, instead of waiting for the next poll cycle.
-    pub async fn check_for_pr(&self, pr_url: &str) -> Result<Vec<ReviewEvent>> {
-        if !self.github.is_enabled() {
-            return Ok(vec![]);
-        }
-
-        let state = {
-            let states = self.states.read().unwrap_or_else(|poisoned| {
-                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-                poisoned.into_inner()
-            });
-            states.get(pr_url).filter(|s| s.is_active).cloned()
-        };
-
-        match state {
-            Some(state) => self.check_pr_reviews(&state).await,
-            None => Ok(vec![]),
-        }
-    }
-
-    /// Record a review to the database for analytics.
-    fn record_review_to_db(&self, state: &PrReviewState, review: &PrReview) {
-        if let Some(ref tracker) = self.tracker {
-            let mut record = PrReviewRecord::new(&state.pr_url);
-            record.reviewer = Some(review.user.login.clone());
-            record.review_state = Some(review.state.clone());
-            record.body = review.body.clone();
-
-            // Parse the submitted_at timestamp from GitHub's ISO 8601 format
-            if let Some(ref ts) = review.submitted_at {
-                if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
-                    record.submitted_at = Some(parsed.with_timezone(&chrono::Utc));
-                }
-            }
-
-            if let Err(e) = tracker.record_pr_review(&record) {
-                tracing::warn!(
-                    component = "review_watcher",
-                    pr_url = %state.pr_url,
-                    error = %e,
-                    "Failed to record review to database"
-                );
-            }
-
-            // Log activity event for the review
-            let message = format!("PR review from {}: {}", review.user.login, review.state);
-            let activity = crate::types::ActivityLogEntry::new("pr_review_received", &message)
-                .with_source("github".to_string())
-                .with_metadata(serde_json::json!({
-                    "pr_url": state.pr_url,
-                    "reviewer": review.user.login,
-                    "review_state": review.state,
-                    "repo": state.repo,
-                    "pr_number": state.pr_number
-                }));
-
-            if let Err(e) = tracker.record_activity(&activity) {
-                tracing::warn!(
-                    component = "review_watcher",
-                    error = %e,
-                    "Failed to record review activity"
-                );
-            }
-        }
-    }
-
-    /// Check a single PR for new reviews.
-    async fn check_pr_reviews(&self, state: &PrReviewState) -> Result<Vec<ReviewEvent>> {
-        let mut events = Vec::new();
-
-        // Check for new reviews
-        let mut reviews = self
-            .github
-            .get_new_reviews(
-                &state.repo,
-                state.pr_number,
-                state.last_review_time.as_deref(),
-            )
-            .await?;
-        reviews.sort_by_key(|r| r.id);
-
-        // Collect review IDs we're processing this cycle so we can
-        // attach their inline comments directly to the review event.
-        let mut processed_review_ids: Vec<i64> = Vec::new();
-        let mut latest_review_id = state.last_review_id;
-        let mut latest_review_time = state.last_review_time.clone();
-
-        for review in reviews {
-            // Skip reviews we've already processed
-            if let Some(last_id) = state.last_review_id {
-                if review.id <= last_id {
-                    continue;
-                }
-            }
-
-            // Skip bot reviews
-            if review.user.user_type.as_deref() == Some("Bot") {
-                continue;
-            }
-
-            // Skip pending reviews (not yet submitted)
-            if review.state.to_uppercase() == "PENDING" {
-                continue;
-            }
-
-            // Record the review to the database for analytics
-            self.record_review_to_db(state, &review);
-
-            processed_review_ids.push(review.id);
-
-            events.push(ReviewEvent::ReviewSubmitted {
-                pr_url: state.pr_url.clone(),
-                repo: state.repo.clone(),
-                pr_number: state.pr_number,
-                review: review.clone(),
-                inline_comments: Vec::new(), // populated below
-            });
-
-            latest_review_id = Some(latest_review_id.map_or(review.id, |id| id.max(review.id)));
-            if let Some(submitted_at) = review.submitted_at.clone() {
-                let should_update_time = latest_review_time
-                    .as_deref()
-                    .map(|existing| {
-                        GitHubClient::<H>::timestamp_at_or_after(&submitted_at, existing)
-                    })
-                    .unwrap_or(true);
-                if should_update_time {
-                    latest_review_time = Some(submitted_at);
-                }
-            }
-        }
-
-        if latest_review_id != state.last_review_id || latest_review_time != state.last_review_time
-        {
-            let mut states = self.states.write().unwrap_or_else(|poisoned| {
-                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-                poisoned.into_inner()
-            });
-            if let Some(s) = states.get_mut(&state.pr_url) {
-                s.last_review_id = latest_review_id;
-                s.last_review_time = latest_review_time.clone();
-
-                // Persist state update to database
-                if let Some(ref sqlite) = self.sqlite_tracker {
-                    if let Err(e) = sqlite.save_pr_review_state(s) {
-                        tracing::warn!(
-                            component = "review_watcher",
-                            pr_url = %s.pr_url,
-                            error = %e,
-                            "Failed to persist PR review state update"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Check for new comments
-        let comments = match self
-            .github
-            .get_new_review_comments(
-                &state.repo,
-                state.pr_number,
-                state.last_comment_time.as_deref(),
-            )
-            .await
-        {
-            Ok(comments) => comments,
-            Err(e) => {
-                // Don't drop already-collected review events for this poll cycle
-                // when comment retrieval fails transiently.
-                tracing::warn!(
-                    component = "review_watcher",
-                    pr_url = %state.pr_url,
-                    error = %e,
-                    "Failed to fetch review comments; continuing with review events only"
-                );
-                return Ok(events);
-            }
-        };
-
-        // Get the review trigger (e.g., "/claudear")
-        let trigger = self.github.review_trigger();
-
-        // Cursor comments are all non-bot comments after the current cursor.
-        let cursor_comments: Vec<_> = comments
-            .into_iter()
-            .filter(|c| c.user.user_type.as_deref() != Some("Bot"))
-            .filter(|c| {
-                Self::comment_is_after_cursor(
-                    c,
-                    state.last_comment_time.as_deref(),
-                    state.last_comment_id,
-                )
-            })
-            .collect();
-
-        // Attach inline comments to their parent review events (these bypass
-        // the trigger filter since they were submitted as part of the review).
-        // Standalone comments (not part of a review we just processed) still
-        // require the trigger.
-        let mut attached_comment_ids: std::collections::HashSet<i64> =
-            std::collections::HashSet::new();
-
-        for comment in &cursor_comments {
-            if let Some(review_id) = comment.pull_request_review_id {
-                if processed_review_ids.contains(&review_id) {
-                    // Find the matching review event and attach this comment
-                    for event in &mut events {
-                        if let ReviewEvent::ReviewSubmitted {
-                            review,
-                            inline_comments,
-                            ..
-                        } = event
-                        {
-                            if review.id == review_id {
-                                inline_comments.push(comment.clone());
-                                attached_comment_ids.insert(comment.id);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Standalone comments: not attached to a review we just processed,
-        // must match the trigger filter
-        let standalone_comments: Vec<_> = cursor_comments
-            .iter()
-            .filter(|c| !attached_comment_ids.contains(&c.id))
-            .filter(|c| {
-                if c.pull_request_review_id.is_some() {
-                    // Inline comments are review feedback and should remain actionable
-                    // even when they arrive in a later poll cycle.
-                    true
-                } else if trigger.is_empty() {
-                    true
-                } else {
-                    c.body.to_lowercase().contains(&trigger.to_lowercase())
-                }
-            })
-            .cloned()
-            .collect();
-
-        if !attached_comment_ids.is_empty() || !standalone_comments.is_empty() {
-            // Record all new comments to database
-            if let Some(ref sqlite) = self.sqlite_tracker {
-                // Re-collect for recording: attached comments are already in events,
-                // standalone comments are in standalone_comments
-                for event in &events {
-                    if let ReviewEvent::ReviewSubmitted {
-                        inline_comments, ..
-                    } = event
-                    {
-                        for comment in inline_comments {
-                            if let Err(e) = sqlite.record_pr_review_comment(&state.pr_url, comment)
-                            {
-                                tracing::warn!(
-                                    component = "review_watcher",
-                                    pr_url = %state.pr_url,
-                                    comment_id = comment.id,
-                                    error = %e,
-                                    "Failed to record PR review comment"
-                                );
-                            }
-                        }
-                    }
-                }
-                for comment in &standalone_comments {
-                    if let Err(e) = sqlite.record_pr_review_comment(&state.pr_url, comment) {
-                        tracing::warn!(
-                            component = "review_watcher",
-                            pr_url = %state.pr_url,
-                            comment_id = comment.id,
-                            error = %e,
-                            "Failed to record PR review comment"
-                        );
-                    }
-                }
-            }
-        }
-
-        if !cursor_comments.is_empty() {
-            // Update state cursor using all processed comments (including non-trigger comments)
-            // to prevent repeatedly scanning unchanged comments every poll cycle.
-            let mut latest_comment_id = state.last_comment_id;
-            let mut latest_comment_time = state.last_comment_time.clone();
-            for comment in &cursor_comments {
-                let replace = latest_comment_time
-                    .as_deref()
-                    .map(|existing_time| {
-                        let cmp = Self::compare_timestamps(&comment.updated_at, existing_time);
-                        cmp == std::cmp::Ordering::Greater
-                            || (cmp == std::cmp::Ordering::Equal
-                                && comment.id > latest_comment_id.unwrap_or(i64::MIN))
-                    })
-                    .unwrap_or(true);
-
-                if replace {
-                    latest_comment_id = Some(comment.id);
-                    latest_comment_time = Some(comment.updated_at.clone());
-                }
-            }
-
-            let mut states = self.states.write().unwrap_or_else(|poisoned| {
-                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
-                poisoned.into_inner()
-            });
-            if let Some(s) = states.get_mut(&state.pr_url) {
-                s.last_comment_id = latest_comment_id;
-                if let Some(t) = latest_comment_time {
-                    s.last_comment_time = Some(t);
-                }
-
-                // Persist state update to database
-                if let Some(ref sqlite) = self.sqlite_tracker {
-                    if let Err(e) = sqlite.save_pr_review_state(s) {
-                        tracing::warn!(
-                            component = "review_watcher",
-                            pr_url = %s.pr_url,
-                            error = %e,
-                            "Failed to persist PR review state update"
-                        );
-                    }
-                }
-            }
-        }
-
-        if !standalone_comments.is_empty() {
-            events.push(ReviewEvent::CommentsAdded {
-                pr_url: state.pr_url.clone(),
-                repo: state.repo.clone(),
-                pr_number: state.pr_number,
-                comments: standalone_comments,
-            });
-        }
-
-        Ok(events)
+    async fn list_repos(&self, org_or_group: &str) -> Result<Vec<RemoteRepo>> {
+        self.list_org_repos(org_or_group).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::HttpResponse;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// Mock HTTP client for testing.
     #[allow(clippy::type_complexity)]
@@ -2229,7 +1084,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let state = PrReviewState::new("url", "owner/repo", 1, "issue", "linear");
         watcher.watch_pr(state);
@@ -2269,7 +1125,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         watcher.watch_pr(PrReviewState::new(
             "url",
@@ -2290,90 +1147,6 @@ mod tests {
 
         let updated_state = watcher.get_state("url").unwrap();
         assert_eq!(updated_state.last_review_id, Some(1));
-    }
-
-    #[tokio::test]
-    async fn test_review_watcher_check_for_single_pr() {
-        let mock = MockHttpClient::new();
-        mock.mock_response(
-            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
-            200,
-            r#"[
-                {"id": 1, "state": "CHANGES_REQUESTED", "body": "Fix this", "user": {"id": 123, "login": "reviewer", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
-            ]"#,
-        );
-        mock.mock_response(
-            "https://api.github.com/repos/owner/repo/pulls/1/comments",
-            200,
-            "[]",
-        );
-        mock.mock_response(
-            "https://api.github.com/repos/owner/other/pulls/2/reviews",
-            200,
-            r#"[
-                {"id": 2, "state": "APPROVED", "body": null, "user": {"id": 124, "login": "other", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
-            ]"#,
-        );
-        mock.mock_response(
-            "https://api.github.com/repos/owner/other/pulls/2/comments",
-            200,
-            "[]",
-        );
-
-        let config = GitHubConfig {
-            token: Some("test_token".to_string()),
-            poll_interval_ms: 60000,
-            auto_resolve_on_merge: true,
-            webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
-            use_ssh: false,
-        };
-        let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
-
-        watcher.watch_pr(PrReviewState::new(
-            "url-1",
-            "owner/repo",
-            1,
-            "issue-1",
-            "linear",
-        ));
-        watcher.watch_pr(PrReviewState::new(
-            "url-2",
-            "owner/other",
-            2,
-            "issue-2",
-            "linear",
-        ));
-
-        let events = watcher.check_for_pr("url-1").await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].pr_url(), "url-1");
-
-        let requests = watcher.github.http.get_requests();
-        assert_eq!(requests.len(), 2);
-        assert!(requests
-            .iter()
-            .all(|(url, _)| url.contains("/repos/owner/repo/pulls/1/")));
-    }
-
-    #[tokio::test]
-    async fn test_review_watcher_check_for_single_pr_unknown_returns_empty() {
-        let mock = MockHttpClient::new();
-        let config = GitHubConfig {
-            token: Some("test_token".to_string()),
-            poll_interval_ms: 60000,
-            auto_resolve_on_merge: true,
-            webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
-            use_ssh: false,
-        };
-        let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
-
-        let events = watcher.check_for_pr("missing-url").await.unwrap();
-        assert!(events.is_empty());
-        assert!(watcher.github.http.get_requests().is_empty());
     }
 
     #[tokio::test]
@@ -2401,7 +1174,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let state = PrReviewState::new("url", "owner/repo", 1, "issue", "linear");
         watcher.watch_pr(state);
@@ -2435,7 +1209,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let state = PrReviewState::new("url", "owner/repo", 1, "issue", "linear");
         watcher.watch_pr(state);
@@ -2469,7 +1244,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let state = PrReviewState::new("url", "owner/repo", 1, "issue", "linear");
         watcher.watch_pr(state);
@@ -2507,7 +1283,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         watcher.watch_pr(PrReviewState::new(
             "url",
@@ -2554,7 +1331,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         watcher.watch_pr(PrReviewState::new(
             "url",
@@ -2599,7 +1377,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let state = PrReviewState::new("url", "owner/repo", 1, "issue", "linear");
         watcher.watch_pr(state);
@@ -2640,7 +1419,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         watcher.watch_pr(PrReviewState::new(
             "url",
@@ -2659,129 +1439,6 @@ mod tests {
             updated_state.last_comment_time.as_deref(),
             Some("2024-01-01T00:00:00Z")
         );
-    }
-
-    #[tokio::test]
-    async fn test_review_watcher_processes_comment_edit_after_cursor_advance() {
-        let mock = MockHttpClient::new();
-        let reviews_url = "https://api.github.com/repos/owner/repo/pulls/1/reviews";
-        let comments_url = "https://api.github.com/repos/owner/repo/pulls/1/comments";
-
-        mock.mock_response(reviews_url, 200, "[]");
-        mock.mock_response(
-            comments_url,
-            200,
-            r#"[
-                {"id": 1, "path": "file.rs", "body": "plain comment", "user": {"id": 123, "login": "user", "type": "User"}, "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z", "html_url": "url"}
-            ]"#,
-        );
-
-        let config = GitHubConfig {
-            token: Some("test_token".to_string()),
-            poll_interval_ms: 60000,
-            auto_resolve_on_merge: true,
-            webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
-            use_ssh: false,
-        };
-        let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
-
-        watcher.watch_pr(PrReviewState::new(
-            "url",
-            "owner/repo",
-            1,
-            "issue",
-            "linear",
-        ));
-
-        let first = watcher.check_for_reviews().await.unwrap();
-        assert!(first.is_empty());
-
-        // Same comment ID, newer timestamp, now containing trigger.
-        watcher.github.http.mock_response(
-            comments_url,
-            200,
-            r#"[
-                {"id": 1, "path": "file.rs", "body": "/claudear please re-run", "user": {"id": 123, "login": "user", "type": "User"}, "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:01:00Z", "html_url": "url"}
-            ]"#,
-        );
-
-        let second = watcher.check_for_reviews().await.unwrap();
-        assert_eq!(second.len(), 1);
-        match &second[0] {
-            ReviewEvent::CommentsAdded { comments, .. } => {
-                assert_eq!(comments.len(), 1);
-                assert_eq!(comments[0].body, "/claudear please re-run");
-            }
-            _ => panic!("Expected CommentsAdded event"),
-        }
-
-        let updated_state = watcher.get_state("url").unwrap();
-        assert_eq!(updated_state.last_comment_id, Some(1));
-        assert_eq!(
-            updated_state.last_comment_time.as_deref(),
-            Some("2024-01-01T00:01:00Z")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_review_watcher_processes_delayed_inline_comment_without_trigger() {
-        let mock = MockHttpClient::new();
-        let reviews_url = "https://api.github.com/repos/owner/repo/pulls/1/reviews";
-        let comments_url = "https://api.github.com/repos/owner/repo/pulls/1/comments";
-
-        mock.mock_response(
-            reviews_url,
-            200,
-            r#"[
-                {"id": 10, "state": "CHANGES_REQUESTED", "body": "needs fixes", "user": {"id": 123, "login": "reviewer", "type": "User"}, "submitted_at": "2024-01-01T00:00:00Z"}
-            ]"#,
-        );
-        mock.mock_response(comments_url, 200, "[]");
-
-        let config = GitHubConfig {
-            token: Some("test_token".to_string()),
-            poll_interval_ms: 60000,
-            auto_resolve_on_merge: true,
-            webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
-            use_ssh: false,
-        };
-        let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
-
-        watcher.watch_pr(PrReviewState::new(
-            "url",
-            "owner/repo",
-            1,
-            "issue",
-            "linear",
-        ));
-
-        let first = watcher.check_for_reviews().await.unwrap();
-        assert_eq!(first.len(), 1);
-
-        // Next poll: review feed is empty, but an inline comment for the prior review arrives.
-        watcher.github.http.mock_response(reviews_url, 200, "[]");
-        watcher.github.http.mock_response(
-            comments_url,
-            200,
-            r#"[
-                {"id": 1, "path": "file.rs", "body": "inline feedback", "user": {"id": 123, "login": "reviewer", "type": "User"}, "created_at": "2024-01-01T00:01:00Z", "updated_at": "2024-01-01T00:01:00Z", "html_url": "url", "pull_request_review_id": 10}
-            ]"#,
-        );
-
-        let second = watcher.check_for_reviews().await.unwrap();
-        assert_eq!(second.len(), 1);
-        match &second[0] {
-            ReviewEvent::CommentsAdded { comments, .. } => {
-                assert_eq!(comments.len(), 1);
-                assert_eq!(comments[0].body, "inline feedback");
-                assert_eq!(comments[0].pull_request_review_id, Some(10));
-            }
-            _ => panic!("Expected CommentsAdded event"),
-        }
     }
 
     #[tokio::test]
@@ -2809,7 +1466,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         // Pre-set the last_review_id to 1, so the review should be skipped
         let mut state = PrReviewState::new("url", "owner/repo", 1, "issue", "linear");
@@ -3010,7 +1668,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
-        let watcher = ReviewWatcher::new(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let state = PrReviewState::new("url", "repo", 1, "issue", "linear");
         watcher.watch_pr(state);
@@ -3036,7 +1695,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
-        let watcher = ReviewWatcher::new(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let mut existing = PrReviewState::new("url", "repo", 1, "issue", "linear");
         existing.last_review_id = Some(42);
@@ -3087,7 +1747,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
-        let watcher = ReviewWatcher::with_http_client(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         watcher.watch_pr(PrReviewState::new(
             "url",
@@ -3126,7 +1787,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
-        let watcher = ReviewWatcher::new(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let state1 = PrReviewState::new("url1", "repo", 1, "issue1", "linear");
         let state2 = PrReviewState::new("url2", "repo", 2, "issue2", "linear");
@@ -3151,7 +1813,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
-        let watcher = ReviewWatcher::new(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let mut inactive_state = PrReviewState::new("url1", "repo", 1, "issue1", "linear");
         inactive_state.is_active = false;
@@ -3371,12 +2034,14 @@ mod tests {
             use_ssh: false,
         };
         let client_enabled = GitHubClient::new(config_enabled);
-        let watcher_enabled = ReviewWatcher::new(client_enabled);
+        let provider_enabled: Arc<dyn ScmProvider> = Arc::new(client_enabled);
+        let watcher_enabled = crate::scm::ReviewWatcher::new(provider_enabled);
         assert!(watcher_enabled.is_enabled());
 
         let config_disabled = GitHubConfig::default();
         let client_disabled = GitHubClient::new(config_disabled);
-        let watcher_disabled = ReviewWatcher::new(client_disabled);
+        let provider_disabled: Arc<dyn ScmProvider> = Arc::new(client_disabled);
+        let watcher_disabled = crate::scm::ReviewWatcher::new(provider_disabled);
         assert!(!watcher_disabled.is_enabled());
     }
 
@@ -3556,7 +2221,8 @@ mod tests {
     fn test_review_watcher_get_all_states_empty() {
         let config = GitHubConfig::default();
         let client = GitHubClient::new(config);
-        let watcher = ReviewWatcher::new(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let all_states = watcher.get_all_states();
         assert!(all_states.is_empty());
@@ -3573,7 +2239,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
-        let watcher = ReviewWatcher::new(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         let state1 = PrReviewState::new("url", "repo", 1, "issue1", "linear");
         let state2 = PrReviewState::new("url", "repo", 1, "issue2", "sentry");
@@ -3675,7 +2342,8 @@ mod tests {
     async fn test_review_watcher_check_for_reviews_disabled() {
         let config = GitHubConfig::default(); // No token = disabled
         let client = GitHubClient::new(config);
-        let watcher = ReviewWatcher::new(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         // Should return empty when disabled
         let events = watcher.check_for_reviews().await.unwrap();
@@ -3693,7 +2361,8 @@ mod tests {
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
-        let watcher = ReviewWatcher::new(client);
+        let provider: Arc<dyn ScmProvider> = Arc::new(client);
+        let watcher = crate::scm::ReviewWatcher::new(provider);
 
         // Should not panic when unwatching a PR that doesn't exist
         watcher.unwatch_pr("nonexistent");
@@ -3803,124 +2472,6 @@ mod tests {
 
         assert!(!update.should_resolve);
         assert_eq!(update.regression_watch_id, Some(123));
-    }
-
-    #[test]
-    fn test_is_bug_type_sentry() {
-        let mock = MockHttpClient::new();
-        let config = GitHubConfig::default();
-        let github_client = GitHubClient::with_http_client(config, mock);
-        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
-        let monitor = PrMonitor::with_http_client(
-            github_client,
-            tracker.clone() as Arc<dyn FixAttemptTracker>,
-            true,
-        );
-
-        // Sentry issues should always be bugs
-        let sentry_attempt = FixAttempt {
-            id: 1,
-            issue_id: "sentry-issue-1".to_string(),
-            short_id: "SENTRY-1".to_string(),
-            source: "sentry".to_string(),
-            attempted_at: chrono::Utc::now(),
-            pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
-            status: crate::types::FixAttemptStatus::Pending,
-            error_message: None,
-            merged_at: None,
-            resolved_at: None,
-            retry_count: 0,
-            last_retry_at: None,
-            issue_labels: vec![],
-            parent_attempt_id: None,
-            cascade_repo: None,
-        };
-        assert!(monitor.is_bug_type(&sentry_attempt));
-
-        // Linear issues are not bugs by default (would need label check)
-        let linear_attempt = FixAttempt {
-            id: 2,
-            issue_id: "linear-issue-1".to_string(),
-            short_id: "LIN-1".to_string(),
-            source: "linear".to_string(),
-            attempted_at: chrono::Utc::now(),
-            pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
-            status: crate::types::FixAttemptStatus::Pending,
-            error_message: None,
-            merged_at: None,
-            resolved_at: None,
-            retry_count: 0,
-            last_retry_at: None,
-            issue_labels: vec![],
-            parent_attempt_id: None,
-            cascade_repo: None,
-        };
-        assert!(!monitor.is_bug_type(&linear_attempt));
-    }
-
-    #[test]
-    fn test_get_issue_type() {
-        let mock = MockHttpClient::new();
-        let config = GitHubConfig::default();
-        let github_client = GitHubClient::with_http_client(config, mock);
-        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
-        let monitor = PrMonitor::with_http_client(
-            github_client,
-            tracker.clone() as Arc<dyn FixAttemptTracker>,
-            true,
-        );
-
-        let sentry_attempt = FixAttempt {
-            id: 1,
-            issue_id: "sentry-issue-1".to_string(),
-            short_id: "SENTRY-1".to_string(),
-            source: "sentry".to_string(),
-            attempted_at: chrono::Utc::now(),
-            pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
-            status: crate::types::FixAttemptStatus::Pending,
-            error_message: None,
-            merged_at: None,
-            resolved_at: None,
-            retry_count: 0,
-            last_retry_at: None,
-            issue_labels: vec![],
-            parent_attempt_id: None,
-            cascade_repo: None,
-        };
-        assert_eq!(
-            monitor.get_issue_type(&sentry_attempt),
-            crate::types::IssueType::SentryIssue
-        );
-
-        let linear_attempt = FixAttempt {
-            id: 2,
-            issue_id: "linear-issue-1".to_string(),
-            short_id: "LIN-1".to_string(),
-            source: "linear".to_string(),
-            attempted_at: chrono::Utc::now(),
-            pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
-            status: crate::types::FixAttemptStatus::Pending,
-            error_message: None,
-            merged_at: None,
-            resolved_at: None,
-            retry_count: 0,
-            last_retry_at: None,
-            issue_labels: vec![],
-            parent_attempt_id: None,
-            cascade_repo: None,
-        };
-        assert_eq!(
-            monitor.get_issue_type(&linear_attempt),
-            crate::types::IssueType::LinearBug
-        );
     }
 
     #[test]

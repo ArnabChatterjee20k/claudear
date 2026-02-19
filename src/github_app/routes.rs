@@ -558,4 +558,858 @@ mod tests {
         assert!(html.contains("Test message"));
         assert!(html.contains("Setup Error"));
     }
+
+    // ── html_escape tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_html_escape_ampersand() {
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn test_html_escape_less_than() {
+        assert_eq!(html_escape("<script>"), "&lt;script&gt;");
+    }
+
+    #[test]
+    fn test_html_escape_greater_than() {
+        assert_eq!(html_escape("x > y"), "x &gt; y");
+    }
+
+    #[test]
+    fn test_html_escape_double_quote() {
+        assert_eq!(html_escape(r#"say "hello""#), "say &quot;hello&quot;");
+    }
+
+    #[test]
+    fn test_html_escape_single_quote() {
+        assert_eq!(html_escape("it's"), "it&#x27;s");
+    }
+
+    #[test]
+    fn test_html_escape_all_special_chars() {
+        let input = r#"<script>alert("XSS");</script> & it's done"#;
+        let escaped = html_escape(input);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(!escaped.contains('"'));
+        assert!(!escaped.contains('\''));
+        // Ampersand in the original becomes &amp; but the escaped string
+        // will contain & as part of entities
+        assert!(escaped.contains("&amp;"));
+        assert!(escaped.contains("&lt;"));
+        assert!(escaped.contains("&gt;"));
+        assert!(escaped.contains("&quot;"));
+        assert!(escaped.contains("&#x27;"));
+    }
+
+    #[test]
+    fn test_html_escape_empty_string() {
+        assert_eq!(html_escape(""), "");
+    }
+
+    #[test]
+    fn test_html_escape_no_special_chars() {
+        assert_eq!(html_escape("Hello World 123"), "Hello World 123");
+    }
+
+    #[test]
+    fn test_html_escape_unicode() {
+        assert_eq!(html_escape("日本語"), "日本語");
+    }
+
+    #[test]
+    fn test_html_escape_nested_entities() {
+        // Ensure & in already-escaped content gets re-escaped
+        assert_eq!(html_escape("&amp;"), "&amp;amp;");
+    }
+
+    // ── SetupState tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_setup_state_csrf_token_is_hex() {
+        let state = SetupState::new("https://example.com".to_string());
+        // CSRF token should be 64 hex characters (32 bytes)
+        assert_eq!(state.csrf_token.len(), 64);
+        assert!(
+            state.csrf_token.chars().all(|c| c.is_ascii_hexdigit()),
+            "CSRF token must be hex: {}",
+            state.csrf_token
+        );
+    }
+
+    #[test]
+    fn test_setup_state_uniqueness() {
+        let state1 = SetupState::new("https://example.com".to_string());
+        let state2 = SetupState::new("https://example.com".to_string());
+        assert_ne!(
+            state1.csrf_token, state2.csrf_token,
+            "CSRF tokens must be unique"
+        );
+    }
+
+    #[test]
+    fn test_setup_state_is_valid_fresh() {
+        let state = SetupState::new("https://example.com".to_string());
+        assert!(state.is_valid(), "Fresh state should be valid");
+    }
+
+    #[test]
+    fn test_setup_state_is_invalid_when_expired() {
+        let state = SetupState {
+            csrf_token: "test".to_string(),
+            base_url: "https://example.com".to_string(),
+            created_at: chrono::Utc::now() - chrono::Duration::minutes(16),
+        };
+        assert!(
+            !state.is_valid(),
+            "State older than 15 minutes should be expired"
+        );
+    }
+
+    #[test]
+    fn test_setup_state_is_valid_at_boundary() {
+        let state = SetupState {
+            csrf_token: "test".to_string(),
+            base_url: "https://example.com".to_string(),
+            created_at: chrono::Utc::now() - chrono::Duration::minutes(14),
+        };
+        assert!(
+            state.is_valid(),
+            "State younger than 15 minutes should still be valid"
+        );
+    }
+
+    // ── SetupStateManager tests ────────────────────────────────────
+
+    #[test]
+    fn test_state_manager_create_returns_valid_state() {
+        let manager = SetupStateManager::new();
+        let state = manager.create_state("https://my-app.com".to_string());
+
+        assert!(!state.csrf_token.is_empty());
+        assert_eq!(state.base_url, "https://my-app.com");
+        assert!(state.is_valid());
+    }
+
+    #[test]
+    fn test_state_manager_validate_consumes_token() {
+        let manager = SetupStateManager::new();
+        let state = manager.create_state("https://example.com".to_string());
+        let token = state.csrf_token.clone();
+
+        // First consumption should succeed
+        let result = manager.validate_and_consume(&token);
+        assert!(result.is_some());
+
+        // Second consumption should fail (token already consumed)
+        let result2 = manager.validate_and_consume(&token);
+        assert!(
+            result2.is_none(),
+            "Token should be consumed after first use"
+        );
+    }
+
+    #[test]
+    fn test_state_manager_rejects_unknown_token() {
+        let manager = SetupStateManager::new();
+        let result = manager.validate_and_consume("nonexistent_token");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_state_manager_rejects_expired_token() {
+        let manager = SetupStateManager::new();
+
+        // Manually insert an expired state
+        {
+            let mut states = manager.states.write().unwrap();
+            states.insert(
+                "expired_token".to_string(),
+                SetupState {
+                    csrf_token: "expired_token".to_string(),
+                    base_url: "https://example.com".to_string(),
+                    created_at: chrono::Utc::now() - chrono::Duration::minutes(20),
+                },
+            );
+        }
+
+        let result = manager.validate_and_consume("expired_token");
+        assert!(result.is_none(), "Expired token should be rejected");
+    }
+
+    #[test]
+    fn test_state_manager_cleans_expired_states_on_create() {
+        let manager = SetupStateManager::new();
+
+        // Insert an expired state manually
+        {
+            let mut states = manager.states.write().unwrap();
+            states.insert(
+                "old_token".to_string(),
+                SetupState {
+                    csrf_token: "old_token".to_string(),
+                    base_url: "https://example.com".to_string(),
+                    created_at: chrono::Utc::now() - chrono::Duration::minutes(20),
+                },
+            );
+        }
+
+        // Creating a new state should clean up expired ones
+        let _new_state = manager.create_state("https://new.com".to_string());
+
+        // The expired token should have been cleaned
+        let states = manager.states.read().unwrap();
+        assert!(
+            !states.contains_key("old_token"),
+            "Expired states should be cleaned up on create"
+        );
+    }
+
+    #[test]
+    fn test_state_manager_multiple_concurrent_states() {
+        let manager = SetupStateManager::new();
+
+        let state1 = manager.create_state("https://app1.com".to_string());
+        let state2 = manager.create_state("https://app2.com".to_string());
+        let state3 = manager.create_state("https://app3.com".to_string());
+
+        // All three should be independently consumable
+        let r1 = manager.validate_and_consume(&state1.csrf_token);
+        assert!(r1.is_some());
+        assert_eq!(r1.unwrap().base_url, "https://app1.com");
+
+        let r3 = manager.validate_and_consume(&state3.csrf_token);
+        assert!(r3.is_some());
+        assert_eq!(r3.unwrap().base_url, "https://app3.com");
+
+        let r2 = manager.validate_and_consume(&state2.csrf_token);
+        assert!(r2.is_some());
+        assert_eq!(r2.unwrap().base_url, "https://app2.com");
+    }
+
+    #[test]
+    fn test_state_manager_default() {
+        // SetupStateManager implements Default
+        let manager = SetupStateManager::default();
+        let state = manager.create_state("https://example.com".to_string());
+        assert!(!state.csrf_token.is_empty());
+    }
+
+    // ── generate_csrf_token tests ──────────────────────────────────
+
+    #[test]
+    fn test_generate_csrf_token_length() {
+        let token = generate_csrf_token();
+        // 32 bytes -> 64 hex chars
+        assert_eq!(token.len(), 64);
+    }
+
+    #[test]
+    fn test_generate_csrf_token_is_hex() {
+        let token = generate_csrf_token();
+        assert!(
+            token.chars().all(|c| c.is_ascii_hexdigit()),
+            "Token should be hex-encoded: {}",
+            token
+        );
+    }
+
+    #[test]
+    fn test_generate_csrf_token_uniqueness_batch() {
+        let mut tokens = std::collections::HashSet::new();
+        for _ in 0..100 {
+            tokens.insert(generate_csrf_token());
+        }
+        assert_eq!(
+            tokens.len(),
+            100,
+            "100 generated tokens should all be unique"
+        );
+    }
+
+    // ── SetupQuery deserialization tests ────────────────────────────
+
+    #[test]
+    fn test_setup_query_all_fields() {
+        let query: SetupQuery = serde_json::from_str(
+            r#"{
+            "base_url": "https://example.com",
+            "org": "my-org",
+            "name": "my-app"
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(query.base_url.unwrap(), "https://example.com");
+        assert_eq!(query.org.unwrap(), "my-org");
+        assert_eq!(query.name.unwrap(), "my-app");
+    }
+
+    #[test]
+    fn test_setup_query_minimal() {
+        let query: SetupQuery = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(query.base_url.is_none());
+        assert!(query.org.is_none());
+        assert!(query.name.is_none());
+    }
+
+    #[test]
+    fn test_setup_query_only_base_url() {
+        let query: SetupQuery =
+            serde_json::from_str(r#"{"base_url": "https://test.com"}"#).unwrap();
+        assert_eq!(query.base_url.unwrap(), "https://test.com");
+        assert!(query.org.is_none());
+        assert!(query.name.is_none());
+    }
+
+    // ── CallbackQuery deserialization tests ─────────────────────────
+
+    #[test]
+    fn test_callback_query_deserialization() {
+        let query: CallbackQuery = serde_json::from_str(
+            r#"{
+            "code": "abc123",
+            "state": "csrf_token_here"
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(query.code, "abc123");
+        assert_eq!(query.state, "csrf_token_here");
+    }
+
+    #[test]
+    fn test_callback_query_missing_code_fails() {
+        let result = serde_json::from_str::<CallbackQuery>(r#"{"state": "token"}"#);
+        assert!(
+            result.is_err(),
+            "Missing 'code' should fail deserialization"
+        );
+    }
+
+    #[test]
+    fn test_callback_query_missing_state_fails() {
+        let result = serde_json::from_str::<CallbackQuery>(r#"{"code": "abc"}"#);
+        assert!(
+            result.is_err(),
+            "Missing 'state' should fail deserialization"
+        );
+    }
+
+    // ── ManifestConversionResponse deserialization tests ────────────
+
+    #[test]
+    fn test_manifest_conversion_response_deserialization() {
+        let json = r#"{
+            "id": 12345,
+            "slug": "my-app",
+            "name": "My App",
+            "client_id": "Iv1.abc123",
+            "client_secret": "secret_value",
+            "webhook_secret": "whsec_test",
+            "pem": "-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----",
+            "html_url": "https://github.com/apps/my-app"
+        }"#;
+
+        let response: ManifestConversionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, 12345);
+        assert_eq!(response.slug, "my-app");
+        assert_eq!(response.name, "My App");
+        assert_eq!(response.client_id, "Iv1.abc123");
+        assert_eq!(response.client_secret, "secret_value");
+        assert_eq!(response.webhook_secret, "whsec_test");
+        assert!(response.pem.contains("BEGIN RSA PRIVATE KEY"));
+        assert_eq!(response.html_url, "https://github.com/apps/my-app");
+    }
+
+    #[test]
+    fn test_manifest_conversion_response_missing_field_fails() {
+        let json = r#"{
+            "id": 12345,
+            "slug": "my-app",
+            "name": "My App"
+        }"#;
+
+        let result = serde_json::from_str::<ManifestConversionResponse>(json);
+        assert!(result.is_err(), "Missing required fields should fail");
+    }
+
+    // ── HTML generation tests ──────────────────────────────────────
+
+    #[test]
+    fn test_setup_form_html_contains_form() {
+        let html = setup_form_html(None);
+        assert!(html.contains("<form"));
+        assert!(html.contains("</form>"));
+        assert!(html.contains("method=\"GET\""));
+        assert!(html.contains("action=\"/github/setup\""));
+    }
+
+    #[test]
+    fn test_setup_form_html_contains_required_inputs() {
+        let html = setup_form_html(None);
+        assert!(html.contains("name=\"base_url\""));
+        assert!(html.contains("name=\"org\""));
+        assert!(html.contains("name=\"name\""));
+        assert!(html.contains("type=\"submit\"") || html.contains("button"));
+    }
+
+    #[test]
+    fn test_setup_form_html_error_is_escaped() {
+        let html = setup_form_html(Some("<script>alert('xss')</script>"));
+        assert!(
+            !html.contains("<script>alert"),
+            "Error message should be escaped"
+        );
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_error_html_escapes_title_and_message() {
+        let html = error_html("<b>bad</b>", "evil <script> tag");
+        assert!(!html.contains("<b>bad</b>"));
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;b&gt;bad&lt;/b&gt;"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_error_html_contains_retry_link() {
+        let html = error_html("Error", "Something went wrong");
+        assert!(
+            html.contains("/github/setup"),
+            "Error page should contain a link to try again"
+        );
+    }
+
+    #[test]
+    fn test_success_html_contains_app_info() {
+        let creds = ManifestConversionResponse {
+            id: 42,
+            slug: "test-app".to_string(),
+            name: "Test App".to_string(),
+            client_id: "Iv1.test".to_string(),
+            client_secret: "secret".to_string(),
+            webhook_secret: "whsec".to_string(),
+            pem: "pem-content".to_string(),
+            html_url: "https://github.com/apps/test-app".to_string(),
+        };
+
+        let html = success_html(&creds, "https://my-server.com");
+        assert!(html.contains("Test App"));
+        assert!(html.contains("42")); // App ID
+        assert!(html.contains("https://github.com/apps/test-app"));
+        assert!(html.contains("https://my-server.com/webhook/github"));
+        assert!(html.contains(".env"));
+        assert!(html.contains("github-app-key.pem"));
+    }
+
+    #[test]
+    fn test_success_html_escapes_xss_in_app_name() {
+        let creds = ManifestConversionResponse {
+            id: 1,
+            slug: "xss".to_string(),
+            name: "<script>alert('xss')</script>".to_string(),
+            client_id: "test".to_string(),
+            client_secret: "test".to_string(),
+            webhook_secret: "test".to_string(),
+            pem: "test".to_string(),
+            html_url: "https://example.com".to_string(),
+        };
+
+        let html = success_html(&creds, "https://example.com");
+        assert!(
+            !html.contains("<script>alert"),
+            "App name should be escaped"
+        );
+    }
+
+    #[test]
+    fn test_partial_success_html_contains_manual_instructions() {
+        let creds = ManifestConversionResponse {
+            id: 99,
+            slug: "my-app".to_string(),
+            name: "My App".to_string(),
+            client_id: "Iv1.client".to_string(),
+            client_secret: "client_secret_value".to_string(),
+            webhook_secret: "webhook_secret_value".to_string(),
+            pem: "-----BEGIN RSA PRIVATE KEY-----\nkey\n-----END RSA PRIVATE KEY-----".to_string(),
+            html_url: "https://github.com/apps/my-app".to_string(),
+        };
+
+        let html = partial_success_html(&creds, "Permission denied");
+
+        // Should contain the error message
+        assert!(html.contains("Permission denied"));
+
+        // Should contain manual setup instructions
+        assert!(html.contains("GITHUB_APP_ID=99"));
+        assert!(html.contains("GITHUB_APP_PRIVATE_KEY_PATH=github-app-key.pem"));
+        assert!(html.contains("GITHUB_APP_WEBHOOK_SECRET=webhook_secret_value"));
+        assert!(html.contains("GITHUB_APP_CLIENT_ID=Iv1.client"));
+        assert!(html.contains("GITHUB_APP_CLIENT_SECRET=client_secret_value"));
+
+        // Should contain the private key for manual saving
+        assert!(html.contains("BEGIN RSA PRIVATE KEY"));
+    }
+
+    #[test]
+    fn test_partial_success_html_escapes_error_message() {
+        let creds = ManifestConversionResponse {
+            id: 1,
+            slug: "test".to_string(),
+            name: "Test".to_string(),
+            client_id: "test".to_string(),
+            client_secret: "test".to_string(),
+            webhook_secret: "test".to_string(),
+            pem: "test".to_string(),
+            html_url: "https://example.com".to_string(),
+        };
+
+        let html = partial_success_html(&creds, "<script>evil</script>");
+        assert!(!html.contains("<script>evil"), "Error should be escaped");
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    // ── github_setup_handler tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_setup_handler_no_base_url_returns_form() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let query = SetupQuery {
+            base_url: None,
+            org: None,
+            name: None,
+        };
+
+        let result = github_setup_handler(Query(query), state_manager).await;
+        assert!(
+            result.is_err(),
+            "No base_url should return Err(Html) with form"
+        );
+        let html = result.unwrap_err().0;
+        assert!(html.contains("GitHub App Setup"));
+        assert!(html.contains("<form"));
+    }
+
+    #[tokio::test]
+    async fn test_setup_handler_empty_base_url_returns_form() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let query = SetupQuery {
+            base_url: Some("".to_string()),
+            org: None,
+            name: None,
+        };
+
+        let result = github_setup_handler(Query(query), state_manager).await;
+        assert!(result.is_err());
+        let html = result.unwrap_err().0;
+        assert!(html.contains("<form"));
+    }
+
+    #[tokio::test]
+    async fn test_setup_handler_invalid_url_scheme_returns_error() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let query = SetupQuery {
+            base_url: Some("ftp://example.com".to_string()),
+            org: None,
+            name: None,
+        };
+
+        let result = github_setup_handler(Query(query), state_manager).await;
+        assert!(result.is_err());
+        let html = result.unwrap_err().0;
+        assert!(
+            html.contains("http://") || html.contains("https://"),
+            "Error should mention valid URL schemes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_setup_handler_valid_https_url_redirects() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let query = SetupQuery {
+            base_url: Some("https://my-server.com:3100".to_string()),
+            org: None,
+            name: None,
+        };
+
+        let result = github_setup_handler(Query(query), state_manager).await;
+        assert!(result.is_ok(), "Valid HTTPS URL should produce a redirect");
+    }
+
+    #[tokio::test]
+    async fn test_setup_handler_valid_http_url_redirects() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let query = SetupQuery {
+            base_url: Some("http://localhost:3100".to_string()),
+            org: None,
+            name: None,
+        };
+
+        let result = github_setup_handler(Query(query), state_manager).await;
+        assert!(result.is_ok(), "Valid HTTP URL should produce a redirect");
+    }
+
+    #[tokio::test]
+    async fn test_setup_handler_with_org_redirects() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let query = SetupQuery {
+            base_url: Some("https://example.com".to_string()),
+            org: Some("my-org".to_string()),
+            name: None,
+        };
+
+        let result = github_setup_handler(Query(query), state_manager).await;
+        assert!(result.is_ok(), "Should redirect with org parameter");
+    }
+
+    #[tokio::test]
+    async fn test_setup_handler_creates_csrf_state() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let query = SetupQuery {
+            base_url: Some("https://example.com".to_string()),
+            org: None,
+            name: None,
+        };
+
+        let _ = github_setup_handler(Query(query), state_manager.clone()).await;
+
+        // The state manager should have stored a state entry
+        let states = state_manager.states.read().unwrap();
+        assert_eq!(states.len(), 1, "One CSRF state should have been created");
+    }
+
+    // ── github_callback_handler tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_callback_handler_invalid_state_returns_error() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let query = CallbackQuery {
+            code: "test_code".to_string(),
+            state: "invalid_csrf_token".to_string(),
+        };
+
+        let result = github_callback_handler(Query(query), state_manager).await;
+        let html = result.0;
+        assert!(
+            html.contains("Invalid or expired state"),
+            "Should show expired state error"
+        );
+        assert!(html.contains("start over") || html.contains("Try again"));
+    }
+
+    #[tokio::test]
+    async fn test_callback_handler_expired_state_returns_error() {
+        let state_manager = Arc::new(SetupStateManager::new());
+
+        // Insert an expired state manually
+        {
+            let mut states = state_manager.states.write().unwrap();
+            states.insert(
+                "expired_csrf".to_string(),
+                SetupState {
+                    csrf_token: "expired_csrf".to_string(),
+                    base_url: "https://example.com".to_string(),
+                    created_at: chrono::Utc::now() - chrono::Duration::minutes(20),
+                },
+            );
+        }
+
+        let query = CallbackQuery {
+            code: "test_code".to_string(),
+            state: "expired_csrf".to_string(),
+        };
+
+        let result = github_callback_handler(Query(query), state_manager).await;
+        let html = result.0;
+        assert!(
+            html.contains("Invalid or expired state"),
+            "Expired CSRF should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_callback_handler_valid_state_but_invalid_code_returns_error() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let state = state_manager.create_state("https://example.com".to_string());
+
+        let query = CallbackQuery {
+            code: "invalid_code_that_wont_work".to_string(),
+            state: state.csrf_token.clone(),
+        };
+
+        let result = github_callback_handler(Query(query), state_manager).await;
+        let html = result.0;
+
+        // The code exchange will fail because we're not hitting real GitHub
+        assert!(
+            html.contains("Failed") || html.contains("error") || html.contains("Error"),
+            "Invalid code should produce an error page, got: {}",
+            &html[..html.len().min(500)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_callback_handler_consumes_state_token() {
+        let state_manager = Arc::new(SetupStateManager::new());
+        let state = state_manager.create_state("https://example.com".to_string());
+        let token = state.csrf_token.clone();
+
+        let query = CallbackQuery {
+            code: "some_code".to_string(),
+            state: token.clone(),
+        };
+
+        // First callback attempt (will fail on code exchange, but state is consumed)
+        let _ = github_callback_handler(Query(query), state_manager.clone()).await;
+
+        // State should be consumed
+        let states = state_manager.states.read().unwrap();
+        assert!(
+            !states.contains_key(&token),
+            "CSRF token should be consumed after callback"
+        );
+    }
+
+    // ── State manager concurrent access tests ──────────────────────
+
+    #[test]
+    fn test_state_manager_concurrent_create_and_validate() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let manager = Arc::new(SetupStateManager::new());
+        let mut handles = vec![];
+
+        // Spawn threads that create states
+        let created_tokens: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for i in 0..20 {
+            let mgr = Arc::clone(&manager);
+            let tokens = Arc::clone(&created_tokens);
+            handles.push(thread::spawn(move || {
+                let state = mgr.create_state(format!("https://app-{}.com", i));
+                tokens.lock().unwrap().push(state.csrf_token);
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        // All tokens should be valid
+        let tokens = created_tokens.lock().unwrap();
+        assert_eq!(tokens.len(), 20);
+
+        for token in tokens.iter() {
+            let result = manager.validate_and_consume(token);
+            assert!(result.is_some(), "All created tokens should be consumable");
+        }
+    }
+
+    // ── SETUP_STATE_EXPIRY_MINUTES constant tests ──────────────────
+
+    #[test]
+    fn test_setup_state_expiry_is_15_minutes() {
+        assert_eq!(SETUP_STATE_EXPIRY_MINUTES, 15);
+    }
+
+    // ── Edge case HTML tests ───────────────────────────────────────
+
+    #[test]
+    fn test_error_html_empty_strings() {
+        let html = error_html("", "");
+        assert!(html.contains("Setup Error"));
+        // Should still render valid HTML
+        assert!(html.contains("<html>"));
+        assert!(html.contains("</html>"));
+    }
+
+    #[test]
+    fn test_setup_form_html_is_valid_html_structure() {
+        let html = setup_form_html(None);
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("<html>"));
+        assert!(html.contains("</html>"));
+        assert!(html.contains("<head>"));
+        assert!(html.contains("</head>"));
+        assert!(html.contains("<body>"));
+        assert!(html.contains("</body>"));
+    }
+
+    #[test]
+    fn test_success_html_is_valid_html_structure() {
+        let creds = ManifestConversionResponse {
+            id: 1,
+            slug: "test".to_string(),
+            name: "Test".to_string(),
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            webhook_secret: "whsec".to_string(),
+            pem: "pem".to_string(),
+            html_url: "https://example.com".to_string(),
+        };
+
+        let html = success_html(&creds, "https://example.com");
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("<html>"));
+        assert!(html.contains("</html>"));
+    }
+
+    #[test]
+    fn test_partial_success_html_is_valid_html_structure() {
+        let creds = ManifestConversionResponse {
+            id: 1,
+            slug: "test".to_string(),
+            name: "Test".to_string(),
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            webhook_secret: "whsec".to_string(),
+            pem: "pem".to_string(),
+            html_url: "https://example.com".to_string(),
+        };
+
+        let html = partial_success_html(&creds, "Error");
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("Manual Configuration Required"));
+    }
+
+    #[test]
+    fn test_success_html_escapes_base_url() {
+        let creds = ManifestConversionResponse {
+            id: 1,
+            slug: "test".to_string(),
+            name: "Test".to_string(),
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            webhook_secret: "whsec".to_string(),
+            pem: "pem".to_string(),
+            html_url: "https://example.com".to_string(),
+        };
+
+        let html = success_html(&creds, "https://evil.com/<script>");
+        assert!(!html.contains("<script>"), "base_url should be escaped");
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_partial_success_html_escapes_credentials() {
+        let creds = ManifestConversionResponse {
+            id: 1,
+            slug: "test".to_string(),
+            name: "<b>Evil</b>".to_string(),
+            client_id: "<script>".to_string(),
+            client_secret: "secret&more".to_string(),
+            webhook_secret: "whsec".to_string(),
+            pem: "pem".to_string(),
+            html_url: "https://evil.com/\"onclick=\"alert(1)".to_string(),
+        };
+
+        let html = partial_success_html(&creds, "error");
+        assert!(!html.contains("<b>Evil</b>"), "Name should be escaped");
+        assert!(!html.contains("<script>"), "Client ID should be escaped");
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&amp;more"));
+    }
 }

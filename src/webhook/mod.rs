@@ -2,6 +2,7 @@
 
 mod configurator;
 mod github;
+mod gitlab;
 mod linear;
 mod linear_api;
 mod sentry;
@@ -10,6 +11,7 @@ mod server;
 
 pub use configurator::{print_setup_result, WebhookConfigurator, WebhookSetupResult};
 pub use github::GitHubWebhookHandler;
+pub use gitlab::{GitLabIssueWebhookHandler, GitLabMrWebhookHandler};
 pub use linear::LinearWebhookHandler;
 pub use linear_api::{LinearApiClient, WebhookRegistration};
 pub use sentry::SentryWebhookHandler;

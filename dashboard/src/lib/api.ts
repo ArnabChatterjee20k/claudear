@@ -754,6 +754,21 @@ export async function fetchTelemetryLatency(params?: {
   return fetchJson(`${API_BASE}/telemetry/latency?${searchParams}`);
 }
 
+// ─── Config API ──────────────────────────────────
+
+export interface ConfigResponse {
+  content: string
+  path: string
+}
+
+export async function fetchConfig(): Promise<ConfigResponse> {
+  return fetchJson(`${API_BASE}/config`)
+}
+
+export async function saveConfig(content: string): Promise<{ ok: boolean; message: string }> {
+  return putJson(`${API_BASE}/config`, { content })
+}
+
 // ─── Auth API ────────────────────────────────────
 
 export async function login(email: string, password: string): Promise<LoginResponse> {

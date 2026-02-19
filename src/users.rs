@@ -10,6 +10,8 @@ pub struct ResolvedUser {
     pub slug: String,
     /// Discord user ID for mentions.
     pub discord_id: Option<String>,
+    /// Slack user ID for mentions.
+    pub slack_id: Option<String>,
     /// Email address.
     pub email: Option<String>,
     /// Pushover user key.
@@ -41,12 +43,14 @@ impl UserRegistry {
                 "linear" => user.linear_name.as_deref() == Some(assignee_value),
                 "github" => user.github_username.as_deref() == Some(assignee_value),
                 "sentry" => user.sentry_username.as_deref() == Some(assignee_value),
+                "jira" => user.jira_username.as_deref() == Some(assignee_value),
                 _ => false,
             };
             if matched {
                 return Some(ResolvedUser {
                     slug: slug.clone(),
                     discord_id: user.discord_id.clone(),
+                    slack_id: user.slack_id.clone(),
                     email: user.email.clone(),
                     push_user_key: user.push_user_key.clone(),
                     sms_number: user.sms_number.clone(),
@@ -80,7 +84,10 @@ mod tests {
                 linear_name: Some("Jake Barnwell".to_string()),
                 github_username: Some("jakebarnby".to_string()),
                 sentry_username: Some("jake".to_string()),
+                jira_username: Some("jake.barnby".to_string()),
+                gitlab_username: Some("jakebarnby".to_string()),
                 discord_id: Some("123456789".to_string()),
+                slack_id: Some("U_JAKE_SLACK".to_string()),
                 email: Some("jake@example.com".to_string()),
                 push_user_key: Some("push_key_jake".to_string()),
                 sms_number: Some("+1234567890".to_string()),
@@ -92,7 +99,10 @@ mod tests {
                 linear_name: Some("Alice Smith".to_string()),
                 github_username: Some("alicesmith".to_string()),
                 sentry_username: None,
+                jira_username: None,
+                gitlab_username: None,
                 discord_id: Some("987654321".to_string()),
+                slack_id: None,
                 email: Some("alice@example.com".to_string()),
                 push_user_key: None,
                 sms_number: None,
@@ -138,9 +148,17 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_jira_username() {
+        let registry = UserRegistry::new(test_users());
+        let resolved = registry.resolve("jira", "jake.barnby").unwrap();
+        assert_eq!(resolved.slug, "jake");
+        assert_eq!(resolved.discord_id.as_deref(), Some("123456789"));
+    }
+
+    #[test]
     fn test_resolve_unknown_source() {
         let registry = UserRegistry::new(test_users());
-        assert!(registry.resolve("jira", "Jake Barnwell").is_none());
+        assert!(registry.resolve("pagerduty", "Jake Barnwell").is_none());
     }
 
     #[test]

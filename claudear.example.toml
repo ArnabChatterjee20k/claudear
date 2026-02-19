@@ -5,33 +5,11 @@
 # Environment variables can override any setting (useful for secrets in containers).
 
 # ============================================
-# Core Configuration (REQUIRED)
+# Core
 # ============================================
 
 # Working directory where repositories are cloned
 work_dir = "~/.claudear/repos"
-
-# ============================================
-# Repository Discovery (REQUIRED)
-# ============================================
-# Claudear auto-discovers repositories from known organizations.
-# Issues are automatically routed to the correct repository by
-# inferring the target repo from file paths in stack traces and issue content.
-
-# GitHub organizations to track
-# Repositories from these orgs will be indexed for issue-to-repo inference
-known_orgs = ["utopia-php", "appwrite", "appwrite-labs", "open-runtimes"]
-
-# Paths to scan for local repository clones
-# These directories are scanned to find repos matching known_orgs
-auto_discover_paths = ["~/Local"]
-
-# ============================================
-# Processing Configuration
-# ============================================
-
-# Polling interval in milliseconds (default: 300000 = 5 minutes)
-poll_interval_ms = 300000
 
 # SQLite database path (default: ./claudear.db)
 db_path = "./claudear.db"
@@ -39,9 +17,8 @@ db_path = "./claudear.db"
 # Webhook server port (default: 3100)
 webhook_port = 3100
 
-# ============================================
-# Rate Limiting
-# ============================================
+# Polling interval in milliseconds (default: 300000 = 5 minutes)
+poll_interval_ms = 300000
 
 # Max issues to process per poll cycle (default: 5)
 max_issues_per_cycle = 5
@@ -61,13 +38,18 @@ ipc_timeout_secs = 30
 # Claude process execution timeout in seconds (default: 21600 = 6 hours)
 claude_timeout_secs = 21600
 
-# Embedding model/cache are configured via environment variables:
-# - EMBEDDING_MODEL (default: nomic)
-# - EMBEDDING_CACHE_DIR (optional)
+# GitHub organizations to track
+# Repositories from these orgs will be indexed for issue-to-repo inference
+known_orgs = [
+    "utopia-php",
+    "appwrite",
+    "appwrite-labs",
+    "open-runtimes"
+]
 
-# ============================================
-# Retry Configuration
-# ============================================
+# Paths to scan for local repository clones
+# These directories are scanned to find repos matching known_orgs
+auto_discover_paths = ["~/Local"]
 
 [retry]
 # Maximum retry attempts for failed fixes (default: 2)
@@ -81,74 +63,54 @@ base_delay_ms = 60000
 max_delay_ms = 3600000
 
 # ============================================
-# Claude Configuration
+# Claude
 # ============================================
 
 [claude]
 # Model to use (default: Claude CLI default)
 # Options: sonnet, opus, haiku, or full model ID (e.g., claude-sonnet-4-5-20250929)
-# model = "sonnet"
+model = "sonnet"
 
 # Custom instructions appended to Claude's system prompt
-# instructions = "Always write tests. Follow existing code style."
+instructions = "Always write tests. Follow existing code style."
 
 # Path to a file containing custom instructions (relative to this config file)
 # If both instructions and instructions_file are set, file content comes first
-# instructions_file = "./claude-instructions.md"
+instructions_file = "./claude-instructions.md"
 
 # Tool permissions granted without prompting (--allowedTools)
 # See: https://docs.anthropic.com/en/docs/claude-code/settings
-# permissions = ["Bash(git *)", "Read", "Edit"]
+permissions = ["Bash(git *)", "Read", "Edit"]
 
 # Skip all permission prompts (default: true)
 skip_permissions = true
 
 # ============================================
-# User Registry (Optional)
+# Users
 # ============================================
 # Map team members to their identifiers across services.
 # When an issue is assigned to a user, notifications are routed to them specifically.
 # Global config fields (e.g. discord.user_id) can reference user slugs instead of raw IDs.
 
-# [users.jake]
-# # Source identifiers (matched against issue assignees)
-# linear_name = "Jake Barnwell"
-# github_username = "jakebarnby"
-# sentry_username = "jake"
-# # Notification channel IDs
-# discord_id = "123456789012345678"
-# email = "jake@example.com"
-# push_user_key = "pushover_user_key"
-# sms_number = "+1234567890"
-#
-# [users.alice]
-# linear_name = "Alice Smith"
-# github_username = "alicesmith"
-# discord_id = "987654321098765432"
-# email = "alice@example.com"
+[users.jake]
+# Source identifiers
+linear_name = "Jake Barnby"
+github_username = "jakebarnby"
+sentry_username = "jake"
+jira_username = "jake.barnby"
+gitlab_username = "jakebarnby"
+# Notification channel IDs
+discord_id = "123456789012345678"
+slack_id = "U0123456789"
+email = "jake@example.com"
+push_user_key = "pushover_user_key"
+sms_number = "+1234567890"
 
 # ============================================
-# Discord Notifications (Optional)
-# ============================================
-
-[discord]
-# Discord webhook URL for notifications
-webhook_url = "https://discord.com/api/webhooks/..."
-
-# Discord user ID to mention in notifications
-user_id = ""
-
-# Bot token for reply polling (required for Discord replies)
-bot_token = ""
-
-# Channel ID to poll for replies (required for Discord replies)
-channel_id = ""
-
-# ============================================
-# Human Q&A Ask Loop (Optional)
+# Human Q&A Ask Loop
 # ============================================
 # Claude can ask blocking questions through all enabled notifiers.
-# v1 reply-capable channels: Discord + Email.
+# Reply-capable channels: Discord, Slack, and Email.
 # Delivery is fan-out to all enabled channels; first reply wins.
 
 [ask]
@@ -177,7 +139,105 @@ max_reuse_candidates = 3
 best_effort_on_timeout = true
 
 # ============================================
-# Linear Configuration
+# SCM
+# ============================================
+
+[github]
+# GitHub personal access token (for checking PR status)
+token = "ghp_xxxxxxxxxxxx"
+
+# PR status check interval in milliseconds (default: 60000 = 1 minute)
+poll_interval_ms = 60000
+
+# Auto-resolve issues on Linear/Sentry when PRs merge (default: false)
+auto_resolve_on_merge = false
+
+# Optional: Webhook secret for verifying GitHub webhook signatures
+# Set via GITHUB_WEBHOOK_SECRET env var for security
+webhook_secret = ""
+
+# Trigger tag for GitHub review comments (default: /claudear)
+# Comments must include this tag to trigger Claude.
+# Set to empty string to respond to all comments.
+review_trigger = "/claudear"
+
+# Use SSH URLs for cloning instead of HTTPS (default: false)
+# Set to true if SSH keys are configured for GitHub.
+use_ssh = false
+
+# GitHub App Authentication (Optional)
+# Configure this section to use GitHub App authentication instead of PAT.
+
+[github.app]
+# GitHub App ID
+app_id = ""
+
+# Path to private key PEM file (alternative to private_key)
+private_key_path = ""
+
+# Inline private key PEM content (alternative to private_key_path)
+private_key = ""
+
+# Optional: Webhook secret for GitHub App webhook verification
+# Set via GITHUB_APP_WEBHOOK_SECRET env var for security
+webhook_secret = ""
+
+# Optional: Installation ID (auto-detected if empty)
+installation_id = ""
+
+# Optional: OAuth Client ID for manifest/user auth flows
+client_id = ""
+
+# Optional: OAuth Client Secret
+client_secret = ""
+
+# Optional: Public base URL for GitHub App manifest flow
+base_url = ""
+
+[gitlab]
+
+# Enable/disable GitLab source (default: false)
+enabled = true
+
+# GitLab personal access token
+# Set via GITLAB_TOKEN env var for security
+token = "glpat-xxxxxxxxxxxx"
+
+# GitLab base URL (default: "https://gitlab.com")
+# For self-hosted instances, change to your GitLab URL
+base_url = "https://gitlab.com"
+
+# GitLab groups to monitor for issues
+groups = ["my-group", "my-group/subgroup"]
+
+# Labels that trigger automation (default: ["auto-implement", "claude"])
+trigger_labels = ["auto-implement", "claude"]
+
+# States that trigger automation (default: ["opened"])
+trigger_states = ["opened"]
+
+# MR status check interval in milliseconds (default: 60000 = 1 minute)
+poll_interval_ms = 60000
+
+# Auto-resolve issues when MRs merge (default: false)
+auto_resolve_on_merge = false
+
+# Webhook secret for verifying GitLab webhook requests
+# Set via GITLAB_WEBHOOK_SECRET env var for security
+webhook_secret = ""
+
+# Trigger tag for MR review comments (default: /claudear)
+review_trigger = "/claudear"
+
+# Use SSH URLs for cloning instead of HTTPS (default: false)
+use_ssh = false
+
+# Per-source rate limiting (overrides global values if set)
+max_issues_per_cycle = 3
+max_concurrent = 2
+
+# ============================================
+# Sources
 # ============================================
 # To use Linear, provide an API key from Linear Settings > API
 
@@ -194,7 +254,7 @@ trigger_labels = ["auto-implement", "claude"]
 # Optional: Only process issues assigned to this user (display name, case-insensitive).
 # When set, trigger_labels becomes optional — issues matching the assignee are
 # processed regardless of labels if trigger_labels is empty.
-# trigger_assignee = "Jane Smith"
+trigger_assignee = "Jane Smith"
 
 # States that trigger automation
 trigger_states = ["backlog", "todo"]
@@ -210,12 +270,12 @@ project_id = ""
 webhook_secret = ""
 
 # Per-source rate limiting (overrides global values if set)
-# max_issues_per_cycle = 3
-# max_concurrent = 2
+max_issues_per_cycle = 3
+max_concurrent = 2
 
-# ============================================
-# Sentry Configuration
-# ============================================
+# Polling interval in milliseconds for Linear source (overrides global)
+# poll_interval_ms = 300000
+
 # To use Sentry, provide an auth token from https://sentry.io/settings/account/api/auth-tokens/
 
 [sentry]
@@ -249,70 +309,115 @@ escalation_threshold_percent = 50
 client_secret = ""
 
 # Per-source rate limiting (overrides global values if set)
-# max_issues_per_cycle = 2
-# max_concurrent = 4
+max_issues_per_cycle = 2
+max_concurrent = 4
 
-# ============================================
-# GitHub PR Monitoring (Optional)
-# ============================================
+# Polling interval in milliseconds for Sentry source (overrides global)
+# poll_interval_ms = 300000
 
-[github]
-# GitHub personal access token (for checking PR status)
-token = "ghp_xxxxxxxxxxxx"
+# To use Jira Cloud, provide an API token from https://id.atlassian.com/manage-profile/security/api-tokens
+# To use Jira Server/DC, provide a personal access token (PAT).
 
-# PR status check interval in milliseconds (default: 60000 = 1 minute)
-poll_interval_ms = 60000
+[jira]
+# Enable/disable Jira source (default: true if api_token provided)
+enabled = true
 
-# Auto-resolve issues on Linear/Sentry when PRs merge (default: false)
-auto_resolve_on_merge = false
-
-# Optional: Webhook secret for verifying GitHub webhook signatures
-# Set via GITHUB_WEBHOOK_SECRET env var for security
-webhook_secret = ""
-
-# Trigger tag for GitHub review comments (default: /claudear)
-# Comments must include this tag to trigger Claude.
-# Set to empty string to respond to all comments.
-review_trigger = "/claudear"
-
-# Use SSH URLs for cloning instead of HTTPS (default: false)
-# Set to true if SSH keys are configured for GitHub.
-use_ssh = false
-
-# ============================================
-# GitHub App Authentication (Optional)
-# ============================================
-# Configure this section to use GitHub App authentication instead of PAT.
-
-[github_app]
-# GitHub App ID
-# app_id =
-
-# Path to private key PEM file (alternative to private_key)
-private_key_path = ""
-
-# Inline private key PEM content (alternative to private_key_path)
-private_key = ""
-
-# Optional: Webhook secret for GitHub App webhook verification
-# Set via GITHUB_APP_WEBHOOK_SECRET env var for security
-webhook_secret = ""
-
-# Optional: Installation ID (auto-detected if empty)
-# installation_id =
-
-# Optional: OAuth Client ID for manifest/user auth flows
-client_id = ""
-
-# Optional: OAuth Client Secret
-client_secret = ""
-
-# Optional: Public base URL for GitHub App manifest flow
+# Jira base URL (REQUIRED for Jira)
+# Cloud: "https://your-domain.atlassian.net"
+# Server/DC: "https://jira.your-company.com"
 base_url = ""
 
+# Email address for Basic auth (REQUIRED for Jira Cloud)
+email = ""
+
+# API token (Cloud) or personal access token (Server/DC)
+# Set via JIRA_API_TOKEN env var for security
+api_token = ""
+
+# Authentication mode: "basic" (email:token, Jira Cloud) or "bearer" (PAT, Server/DC)
+auth_mode = "basic"
+
+# Jira project keys to monitor (e.g., ["PROJ", "BACKEND"])
+project_keys = []
+
+# Labels that trigger automation (default: ["auto-implement", "claude"])
+trigger_labels = ["auto-implement", "claude"]
+
+# Statuses that trigger automation (default: ["To Do", "Backlog"])
+trigger_statuses = ["To Do", "Backlog"]
+
+# Optional: Only process issues assigned to this user (display name).
+# When set, trigger_labels becomes optional — issues matching the assignee are
+# processed regardless of labels if trigger_labels is empty.
+trigger_assignee = "Jane Smith"
+
+# Optional: Filter by issue types (e.g., ["Bug", "Task", "Story"])
+issue_types = ["Bug", "Task"]
+
+# Optional: Custom JQL appended to the generated query
+custom_jql = "priority = High"
+
+# Maximum results per search request (default: 50, max: 100)
+max_results = 50
+
+# Per-source rate limiting (overrides global values if set)
+max_issues_per_cycle = 3
+max_concurrent = 2
+poll_interval_ms = 300000
+
 # ============================================
-# Email Notifications (Optional)
+# Notifiers
 # ============================================
+
+[discord]
+# Discord webhook URL for notifications
+webhook_url = "https://discord.com/api/webhooks/..."
+
+# Discord user ID to mention in notifications
+user_id = ""
+
+# Bot token for reply polling (required for Discord replies)
+bot_token = ""
+
+# Channel ID to poll for replies (required for Discord replies)
+channel_id = ""
+
+# Enable Discord as an issue source (messages become issues) (default: false)
+source_enabled = false
+
+# Channel to listen for issue messages (falls back to channel_id)
+listen_channel_id = ""
+
+# Guild (server) ID for constructing message URLs
+guild_id = ""
+
+# Polling interval in milliseconds for Discord source (overrides global)
+# poll_interval_ms = 300000
+
+[slack]
+# Slack Bot Token (xoxb-) for API calls
+bot_token = ""
+
+# Slack channel ID for notifications
+channel_id = ""
+
+# Incoming Webhook URL (optional, notification-only alternative to bot token)
+# webhook_url = "https://hooks.slack.com/services/..."
+
+# Slack user ID to mention in notifications
+user_id = ""
+
+# Workspace name for constructing message URLs
+# workspace = "mycompany"
+
+# Enable Slack as an issue source (default: false)
+# source_enabled = false
+
+# Channel to listen for issue messages (falls back to channel_id)
+# listen_channel_id = ""
+
+# Polling interval in milliseconds for Slack source (overrides global)
+# poll_interval_ms = 300000
 
 [email]
 # SMTP server host
@@ -354,10 +459,6 @@ imap_use_tls = true
 # IMAP folder to scan for replies (default: INBOX)
 imap_folder = "INBOX"
 
-# ============================================
-# SMS Notifications via Twilio (Optional)
-# ============================================
-
 [sms]
 # Twilio Account SID
 account_sid = ""
@@ -370,10 +471,6 @@ from_number = ""
 
 # Recipient phone numbers
 to_numbers = []
-
-# ============================================
-# Push Notifications via Pushover (Optional)
-# ============================================
 
 [push]
 # Pushover API token
@@ -389,7 +486,7 @@ device = ""
 priority = 0
 
 # ============================================
-# Regression Monitoring (Optional)
+# Monitoring
 # ============================================
 # Tracks post-fix regressions after releases.
 
@@ -423,9 +520,6 @@ github_search_repos = []
 # [regression.package_names]
 # "utopia-php/database" = "utopia-php/database"
 
-# ============================================
-# Cascade Chaining (Optional)
-# ============================================
 # Enables chained follow-up fixes across repositories.
 
 [cascade]
@@ -434,3 +528,90 @@ enabled = false
 
 # Maximum cascade depth (default: 0 = unlimited)
 max_depth = 0
+
+# ============================================
+# Continuous Learning
+# ============================================
+# Accumulates knowledge from Claude's execution logs, PR diffs, Q&A answers,
+# and review feedback to improve future fix quality.
+
+[learning]
+# Auto-extract learnings from Claude execution logs (default: true)
+auto_extract_learnings = true
+
+# Analyze PR diffs on merge (default: true)
+diff_analysis = true
+
+# Promote repeated Q&A answers to standing instructions (default: true)
+qa_promotion = true
+
+# Minimum occurrences before Q&A answer is promoted (default: 2)
+qa_promotion_threshold = 2
+
+# Accumulate per-repo knowledge from successful fixes (default: true)
+repo_knowledge = true
+
+# Classify review feedback patterns (default: true)
+review_classification = true
+
+# Minimum occurrences before review pattern is promoted (default: 3)
+review_promotion_threshold = 3
+
+# Track how Claude approaches fixes (default: true)
+strategy_fingerprinting = true
+
+# Score fix quality based on merge velocity (default: true)
+quality_scoring = true
+
+# Detect clusters of correlated issues (default: true)
+cluster_detection = true
+
+# Time window for cluster detection in minutes (default: 30)
+cluster_window_minutes = 30
+
+# Minimum issues to form a cluster (default: 3)
+min_cluster_size = 3
+
+# Auto-generate AGENT.md from accumulated knowledge (default: false)
+auto_agent_md = false
+
+# ============================================
+# Prioritisation Engine
+# ============================================
+# Computes composite severity scores from multiple signals, classifies blast
+# radius, clusters content-similar issues, and evaluates suppression rules.
+
+[prioritisation]
+# Enable/disable the prioritisation engine (default: true).
+# When false, the legacy two-level sort (MatchPriority then IssuePriority) is used.
+enabled = true
+
+# Component weights (must sum to ~1.0 for intuitive scores)
+severity_weight = 0.30
+frequency_weight = 0.25
+regression_weight = 0.20
+blast_radius_weight = 0.15
+cluster_weight = 0.10
+
+# Path patterns for blast radius classification.
+# Issues touching these paths are classified at the corresponding tier.
+# Case-insensitive segment matching (split on /, \, ., _, -) against filename, function, and culprit metadata.
+critical_paths = ["auth", "payment", "billing", "security", "login", "oauth"]
+core_paths = ["api", "core", "middleware", "router", "handler"]
+infra_paths = ["deploy", "infra", "ci", "docker", "terraform", "k8s", "database", "migration"]
+test_paths = ["test", "spec", "fixture", "mock"]
+cosmetic_paths = ["readme", "changelog", "license", "docs", "md"]
+
+# Content clustering (groups similar issues by error type + culprit + title similarity)
+content_clustering = true
+cluster_similarity_threshold = 0.60
+min_content_cluster_size = 2
+
+# Suppression rules: skip known-noisy issues before they consume processing slots.
+# Each rule matches a field against a pattern. First matching rule wins.
+# suppression_rules = [
+#     { name = "flaky-ci", field = "title", pattern = "flaky", match_mode = "contains", reason = "Known flaky test" },
+#     { name = "rate-limits", field = "error_type", pattern = "RateLimitError", match_mode = "contains", sources = ["sentry"], reason = "Transient rate limit errors" },
+#     { name = "docs-typos", field = "filename", pattern = "readme", match_mode = "contains", reason = "Cosmetic documentation issues" },
+#     { name = "bot-noise", field = "title", pattern = "^\\[bot\\]", match_mode = "regex", reason = "Automated bot issues" },
+# ]

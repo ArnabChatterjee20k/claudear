@@ -5,11 +5,11 @@ use claudear::{
     api::ApiServer,
     config::Config,
     feedback::{EmbeddingClient, EmbeddingConfig, IssueEmbeddingService},
-    github::{GitHubClient, PrMonitor, PrStatus, ReviewWatcher},
+    github::GitHubClient,
     ipc::{default_socket_path, is_daemon_running, print_response, IpcClient, IpcServer},
     notifier::{
         CompositeNotifier, ConsoleNotifier, DiscordNotifier, EmailNotifier, Notifier, PushNotifier,
-        SmsNotifier,
+        SlackNotifier, SmsNotifier,
     },
     regression::{
         CompositeChecker, LinearRegressionChecker, LinearRegressionConfig, NoOpChecker,
@@ -20,7 +20,8 @@ use claudear::{
     repo::{DependencyType, RepoIndex, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
-    source::{DiscordSource, IssueSource, LinearSource, SentrySource},
+    scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
+    source::{DiscordSource, IssueSource, JiraSource, LinearSource, SentrySource, SlackSource},
     storage::{FixAttemptTracker, SqliteTracker},
     types::{ActivityLogEntry, FixAttemptStatus},
     users::UserRegistry,
@@ -502,8 +503,9 @@ fn create_review_watcher(
         return None;
     }
 
+    let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
     let review_watcher =
-        ReviewWatcher::with_sqlite_tracker(github_client, tracker, Some(sqlite_tracker.clone()));
+        ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite_tracker.clone()));
 
     // Restore states from database
     match sqlite_tracker.get_active_pr_review_states() {
@@ -552,6 +554,13 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
         }
     }
 
+    if let Some(ref jira_config) = config.jira {
+        if jira_config.enabled {
+            sources.push(Arc::new(JiraSource::new(jira_config.clone())));
+            tracing::info!("Jira source initialized");
+        }
+    }
+
     if config.discord.source_enabled {
         if config.discord.bot_token.is_some()
             && (config.discord.listen_channel_id.is_some() || config.discord.channel_id.is_some())
@@ -560,6 +569,17 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
             tracing::info!("Discord source initialized");
         } else {
             tracing::warn!("Discord source_enabled but missing bot_token or channel_id; skipping");
+        }
+    }
+
+    if config.slack.source_enabled {
+        if config.slack.bot_token.is_some()
+            && (config.slack.listen_channel_id.is_some() || config.slack.channel_id.is_some())
+        {
+            sources.push(Arc::new(SlackSource::new(config.slack.clone())));
+            tracing::info!("Slack source initialized");
+        } else {
+            tracing::warn!("Slack source_enabled but missing bot_token or channel_id; skipping");
         }
     }
 
@@ -610,6 +630,13 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
     if discord_notifier.is_enabled() {
         composite.add(Arc::new(discord_notifier));
         tracing::info!("Discord notifier enabled");
+    }
+
+    // Add Slack if configured
+    let slack_notifier = SlackNotifier::new(config.slack.clone(), user_registry.clone());
+    if slack_notifier.is_enabled() {
+        composite.add(Arc::new(slack_notifier));
+        tracing::info!("Slack notifier enabled");
     }
 
     // Add Email if configured
@@ -2016,7 +2043,12 @@ async fn main() -> anyhow::Result<()> {
                 server.start().await?;
             } else if enable_dashboard {
                 // Dashboard only (no webhooks)
-                let server = ApiServer::with_port(config.clone(), tracker.clone(), *port);
+                let server = ApiServer::with_port(
+                    config.clone(),
+                    tracker.clone(),
+                    *port,
+                    std::path::PathBuf::from(config_path.clone()),
+                );
                 server.start().await?;
             }
             Ok::<(), anyhow::Error>(())
@@ -2065,17 +2097,18 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let github_client = GitHubClient::new(config.github.clone());
+        let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
         let sources = create_sources(&config);
         let pr_monitor = if config.regression.enabled {
             PrMonitor::with_regression_tracking(
-                github_client,
+                provider,
                 tracker.clone(),
                 config.github.auto_resolve_on_merge,
                 sqlite_tracker.clone(),
             )
         } else {
             PrMonitor::new(
-                github_client,
+                provider,
                 tracker.clone(),
                 config.github.auto_resolve_on_merge,
             )
@@ -2378,9 +2411,20 @@ async fn main() -> anyhow::Result<()> {
     {
         // --dashboard-dir overrides the embedded dashboard (useful for development)
         let server = if let Some(dir) = dashboard_dir {
-            ApiServer::with_dashboard(config, tracker, port, dir)
+            ApiServer::with_dashboard(
+                config,
+                tracker,
+                port,
+                dir,
+                std::path::PathBuf::from(config_path.clone()),
+            )
         } else {
-            ApiServer::with_port(config, tracker, port)
+            ApiServer::with_port(
+                config,
+                tracker,
+                port,
+                std::path::PathBuf::from(config_path.clone()),
+            )
         };
 
         // Handle shutdown signals
@@ -2676,8 +2720,12 @@ async fn main() -> anyhow::Result<()> {
                         }
                     } else {
                         tracing::info!("Dashboard API available at http://localhost:{}", port);
-                        let api_server =
-                            ApiServer::with_port(config.clone(), tracker_for_api.clone(), port);
+                        let api_server = ApiServer::with_port(
+                            config.clone(),
+                            tracker_for_api.clone(),
+                            port,
+                            std::path::PathBuf::from(config_path.clone()),
+                        );
                         tokio::select! {
                             result = watcher.start(Some(interval)) => result?,
                             result = api_server.start() => result?,

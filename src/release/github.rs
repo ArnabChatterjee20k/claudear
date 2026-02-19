@@ -1,7 +1,7 @@
 //! GitHub Release API client.
 
 use crate::error::{Error, Result};
-use crate::github::{HttpClient, ReqwestHttpClient};
+use crate::http::{HttpClient, ReqwestHttpClient};
 use serde::Deserialize;
 use std::cmp::Ordering;
 
@@ -1334,5 +1334,731 @@ version = "1.32.0"
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Unsupported"));
+    }
+
+    // ---------------------------------------------------------------
+    // 1. npm_package_path_matches (tested indirectly via check_npm_lock)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_npm_scoped_package_matches() {
+        let lock = r#"{
+            "packages": {
+                "node_modules/@scope/pkg": {"version": "2.0.0"}
+            }
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "package-lock.json",
+            "@scope/pkg",
+            "2.0.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_npm_root_empty_path_does_not_match() {
+        // The root entry "" should NOT match any package name
+        let lock = r#"{
+            "packages": {
+                "": {"version": "1.0.0"}
+            }
+        }"#;
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "package-lock.json",
+            "my-app",
+            "1.0.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_npm_deeply_nested_package_matches() {
+        let lock = r#"{
+            "packages": {
+                "node_modules/a/node_modules/b/node_modules/pkg": {"version": "3.0.0"}
+            }
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "package-lock.json",
+            "pkg",
+            "3.0.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_npm_similar_name_does_not_match() {
+        // "lodash-es" should NOT match when searching for "lodash"
+        let lock = r#"{
+            "packages": {
+                "node_modules/lodash-es": {"version": "4.17.21"}
+            }
+        }"#;
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "package-lock.json",
+            "lodash",
+            "4.17.21"
+        )
+        .unwrap());
+    }
+
+    // ---------------------------------------------------------------
+    // 2. yarn_header_matches_package (tested via check_yarn_lock)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_yarn_scoped_package_matches() {
+        let lock = r#"
+"@types/node@^18.0.0":
+  version "18.15.0"
+  resolved "https://registry.yarnpkg.com/@types/node/-/node-18.15.0.tgz"
+"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "yarn.lock",
+            "@types/node",
+            "18.15.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_yarn_single_quoted_header_matches() {
+        let lock = "
+'lodash@^4.0.0':
+  version \"4.17.21\"
+  resolved \"https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz\"
+";
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "yarn.lock",
+            "lodash",
+            "4.17.21"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_yarn_package_not_found_returns_false() {
+        let lock = r#"
+"express@^4.18.0":
+  version "4.18.2"
+  resolved "https://registry.yarnpkg.com/express/-/express-4.18.2.tgz"
+"#;
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "yarn.lock",
+            "nonexistent-package",
+            "1.0.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_yarn_similar_name_prefix_no_false_positive() {
+        // "lodash" should NOT match a header for "lodash-es"
+        let lock = r#"
+"lodash-es@^4.17.0":
+  version "4.17.21"
+  resolved "https://registry.yarnpkg.com/lodash-es/-/lodash-es-4.17.21.tgz"
+"#;
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "yarn.lock",
+            "lodash",
+            "4.17.21"
+        )
+        .unwrap());
+    }
+
+    // ---------------------------------------------------------------
+    // 3. split_version_parts / compare_relaxed_versions
+    //    (tested via compare_versions / check_lock_file_version
+    //     with non-semver versions)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_version_with_prerelease_text() {
+        // "1.0.0-alpha" vs "1.0.0-beta": alpha < beta lexicographically
+        let lock = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "1.0.0-alpha"}
+            ]
+        }"#;
+
+        // alpha < beta, so 1.0.0-alpha is NOT >= 1.0.0-beta
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "1.0.0-beta"
+        )
+        .unwrap());
+
+        // But 1.0.0-alpha >= 1.0.0-alpha
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "1.0.0-alpha"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_version_with_leading_zeros_equal() {
+        // "01.02.03" vs "1.2.3" should be equal (leading zeros stripped)
+        let lock = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "01.02.03"}
+            ]
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "1.2.3"
+        )
+        .unwrap());
+
+        // And the reverse: "1.2.3" in lock, min "01.02.03"
+        let lock2 = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "1.2.3"}
+            ]
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock2,
+            "composer.lock",
+            "vendor/pkg",
+            "01.02.03"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_all_text_version_comparison() {
+        // "alpha" vs "beta": alpha < beta
+        let lock = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "alpha"}
+            ]
+        }"#;
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "beta"
+        )
+        .unwrap());
+
+        // "beta" >= "alpha"
+        let lock2 = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "beta"}
+            ]
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock2,
+            "composer.lock",
+            "vendor/pkg",
+            "alpha"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_mixed_version_comparison() {
+        // "1a2" vs "1b1": numeric 1 == 1, then text "a" < "b"
+        let lock = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "1a2"}
+            ]
+        }"#;
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "1b1"
+        )
+        .unwrap());
+
+        // "1b1" >= "1a2"
+        let lock2 = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "1b1"}
+            ]
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock2,
+            "composer.lock",
+            "vendor/pkg",
+            "1a2"
+        )
+        .unwrap());
+    }
+
+    // ---------------------------------------------------------------
+    // 4. compare_numeric_strings (tested indirectly)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_large_numbers_no_overflow() {
+        // Numbers larger than u64::MAX (18446744073709551615)
+        let lock = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "99999999999999999999.0.0"}
+            ]
+        }"#;
+
+        // Should not panic/overflow; the large number is >= a smaller one
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "88888888888888888888.0.0"
+        )
+        .unwrap());
+
+        // And vice versa
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "99999999999999999999.0.1"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_all_zeros_equal() {
+        // "000" vs "0" should be equal
+        let lock = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "000"}
+            ]
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "0"
+        )
+        .unwrap());
+
+        // And the reverse
+        let lock2 = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "0"}
+            ]
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock2,
+            "composer.lock",
+            "vendor/pkg",
+            "000"
+        )
+        .unwrap());
+    }
+
+    // ---------------------------------------------------------------
+    // 5. API error paths
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_releases_non_200_returns_error() {
+        let mock = MockHttpClient::new(403, r#"{"message": "Forbidden"}"#);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client.get_releases("org/repo", 10).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("403"));
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_release_500_returns_error() {
+        let mock = MockHttpClient::new(500, r#"{"message": "Internal Server Error"}"#);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client.get_latest_release("org/repo").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn test_is_commit_in_release_identical_returns_true() {
+        let mock = MockHttpClient::new(
+            200,
+            r#"{"status": "identical", "ahead_by": 0, "behind_by": 0}"#,
+        );
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client
+            .is_commit_in_release("org/repo", "abc123", "v1.0.0")
+            .await
+            .unwrap();
+
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_is_commit_in_release_404_returns_false() {
+        let mock = MockHttpClient::new(404, r#"{"message": "Not Found"}"#);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client
+            .is_commit_in_release("org/repo", "nonexistent", "v1.0.0")
+            .await
+            .unwrap();
+
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_merge_commit_404_returns_none() {
+        let mock = MockHttpClient::new(404, r#"{"message": "Not Found"}"#);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client.get_pr_merge_commit("org/repo", 999).await.unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_details_success() {
+        let mock = MockHttpClient::new(
+            200,
+            r#"{
+                "number": 42,
+                "merged": true,
+                "merge_commit_sha": "abc123def456",
+                "merged_at": "2024-03-15T12:00:00Z"
+            }"#,
+        );
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client.get_pr_details("org/repo", 42).await.unwrap();
+
+        assert!(result.is_some());
+        let pr = result.unwrap();
+        assert_eq!(pr.number, 42);
+        assert!(pr.merged);
+        assert_eq!(pr.merge_commit_sha, Some("abc123def456".to_string()));
+        assert_eq!(pr.merged_at, Some("2024-03-15T12:00:00Z".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_details_not_found() {
+        let mock = MockHttpClient::new(404, r#"{"message": "Not Found"}"#);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client.get_pr_details("org/repo", 999).await.unwrap();
+
+        assert!(result.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // 6. get_file_at_ref
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_file_at_ref_success_base64() {
+        // "Hello, World!" base64-encoded is "SGVsbG8sIFdvcmxkIQ=="
+        let mock = MockHttpClient::new(
+            200,
+            r#"{"content": "SGVsbG8sIFdvcmxkIQ==\n", "encoding": "base64"}"#,
+        );
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client
+            .get_file_at_ref("org/repo", "README.md", "v1.0.0")
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some("Hello, World!".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_file_at_ref_not_found() {
+        let mock = MockHttpClient::new(404, r#"{"message": "Not Found"}"#);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client
+            .get_file_at_ref("org/repo", "nonexistent.txt", "v1.0.0")
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_file_at_ref_non_base64_encoding_returns_error() {
+        let mock = MockHttpClient::new(
+            200,
+            r#"{"content": "raw content here", "encoding": "utf-8"}"#,
+        );
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client
+            .get_file_at_ref("org/repo", "file.txt", "v1.0.0")
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unexpected encoding"));
+    }
+
+    #[tokio::test]
+    async fn test_get_file_at_ref_api_error() {
+        let mock = MockHttpClient::new(500, r#"{"message": "Internal Server Error"}"#);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let result = client
+            .get_file_at_ref("org/repo", "file.txt", "v1.0.0")
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("500"));
+    }
+
+    // ---------------------------------------------------------------
+    // 7. Lock file edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_composer_lock_empty_packages_array() {
+        let lock = r#"{
+            "packages": [],
+            "packages-dev": []
+        }"#;
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "any/package",
+            "1.0.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_npm_lock_packages_take_precedence_over_dependencies() {
+        // When both "packages" and "dependencies" are present, packages
+        // is checked first. Here the packages section has a newer version
+        // while dependencies has an older one.
+        let lock = r#"{
+            "packages": {
+                "node_modules/lodash": {"version": "4.18.0"}
+            },
+            "dependencies": {
+                "lodash": {"version": "4.17.0"}
+            }
+        }"#;
+
+        // Should find the 4.18.0 from packages and return true
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "package-lock.json",
+            "lodash",
+            "4.18.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_poetry_lock_package_as_last_entry() {
+        // The target package is the last entry with no trailing [[package]] header
+        let lock = r#"
+[[package]]
+name = "other"
+version = "1.0.0"
+
+[[package]]
+name = "target-pkg"
+version = "2.5.0"
+"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "poetry.lock",
+            "target-pkg",
+            "2.5.0"
+        )
+        .unwrap());
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "poetry.lock",
+            "target-pkg",
+            "2.4.0"
+        )
+        .unwrap());
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "poetry.lock",
+            "target-pkg",
+            "2.6.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_cargo_lock_multiple_versions_first_match_wins() {
+        // When there are multiple versions of the same package,
+        // the first one found is used.
+        let lock = r#"
+[[package]]
+name = "serde"
+version = "1.0.100"
+
+[[package]]
+name = "serde"
+version = "1.0.200"
+"#;
+
+        // First match is 1.0.100, so >= 1.0.150 should be false
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "Cargo.lock",
+            "serde",
+            "1.0.150"
+        )
+        .unwrap());
+
+        // First match is 1.0.100, so >= 1.0.100 should be true
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "Cargo.lock",
+            "serde",
+            "1.0.100"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_pipfile_lock_no_version_field() {
+        // A package entry that has no "version" field
+        let lock = r#"{
+            "default": {
+                "some-pkg": {"hashes": ["sha256:abc123"]}
+            }
+        }"#;
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "Pipfile.lock",
+            "some-pkg",
+            "1.0.0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_pipfile_lock_develop_dependencies() {
+        let lock = r#"{
+            "default": {},
+            "develop": {
+                "pytest": {"version": "==8.0.0"}
+            }
+        }"#;
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "Pipfile.lock",
+            "pytest",
+            "8.0.0"
+        )
+        .unwrap());
+
+        assert!(ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "Pipfile.lock",
+            "pytest",
+            "7.0.0"
+        )
+        .unwrap());
+
+        assert!(!ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "Pipfile.lock",
+            "pytest",
+            "9.0.0"
+        )
+        .unwrap());
+    }
+
+    // ---------------------------------------------------------------
+    // 8. check_composer_lock_version legacy method
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_check_composer_lock_version_legacy_delegates() {
+        let lock = r#"{
+            "packages": [
+                {"name": "vendor/pkg", "version": "v2.0.0"}
+            ]
+        }"#;
+
+        // The legacy method should produce the same result as check_lock_file_version
+        let legacy_result = ReleaseClient::<MockHttpClient>::check_composer_lock_version(
+            lock,
+            "vendor/pkg",
+            "v2.0.0",
+        )
+        .unwrap();
+        let new_result = ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "v2.0.0",
+        )
+        .unwrap();
+
+        assert_eq!(legacy_result, new_result);
+        assert!(legacy_result);
+
+        // Also check with a version that's too high
+        let legacy_false = ReleaseClient::<MockHttpClient>::check_composer_lock_version(
+            lock,
+            "vendor/pkg",
+            "v3.0.0",
+        )
+        .unwrap();
+        let new_false = ReleaseClient::<MockHttpClient>::check_lock_file_version(
+            lock,
+            "composer.lock",
+            "vendor/pkg",
+            "v3.0.0",
+        )
+        .unwrap();
+
+        assert_eq!(legacy_false, new_false);
+        assert!(!legacy_false);
     }
 }

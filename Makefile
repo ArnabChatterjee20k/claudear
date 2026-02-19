@@ -68,6 +68,10 @@ test-all: test dashboard-test
 test-prod-e2e:
 	./scripts/prod-e2e-smoke.sh
 
+## test-prod-e2e-docker: Run production smoke test using Docker (avoids nested claude issues)
+test-prod-e2e-docker:
+	CLAUDEAR_E2E_USE_DOCKER=true ./scripts/prod-e2e-smoke.sh
+
 ## lint: Run clippy linter
 lint:
 	$(CARGO) clippy -- -D warnings

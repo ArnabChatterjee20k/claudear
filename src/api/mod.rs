@@ -23,27 +23,35 @@ pub struct ApiServer {
     tracker: Arc<dyn FixAttemptTracker>,
     port: u16,
     dashboard_dir: Option<PathBuf>,
+    config_path: PathBuf,
 }
 
 impl ApiServer {
     /// Create a new API server.
-    pub fn new(config: Config, tracker: Arc<dyn FixAttemptTracker>) -> Self {
+    pub fn new(config: Config, tracker: Arc<dyn FixAttemptTracker>, config_path: PathBuf) -> Self {
         let port = config.webhook_port; // Reuse webhook port for now
         Self {
             config,
             tracker,
             port,
             dashboard_dir: None,
+            config_path,
         }
     }
 
     /// Create a new API server with custom port.
-    pub fn with_port(config: Config, tracker: Arc<dyn FixAttemptTracker>, port: u16) -> Self {
+    pub fn with_port(
+        config: Config,
+        tracker: Arc<dyn FixAttemptTracker>,
+        port: u16,
+        config_path: PathBuf,
+    ) -> Self {
         Self {
             config,
             tracker,
             port,
             dashboard_dir: None,
+            config_path,
         }
     }
 
@@ -53,12 +61,14 @@ impl ApiServer {
         tracker: Arc<dyn FixAttemptTracker>,
         port: u16,
         dashboard_dir: PathBuf,
+        config_path: PathBuf,
     ) -> Self {
         Self {
             config,
             tracker,
             port,
             dashboard_dir: Some(dashboard_dir),
+            config_path,
         }
     }
 
@@ -95,6 +105,7 @@ impl ApiServer {
         let app = create_api_router_with_dashboard(
             self.config.clone(),
             self.tracker.clone(),
+            self.config_path,
             self.dashboard_dir.clone(),
         )
         .layer(cors)

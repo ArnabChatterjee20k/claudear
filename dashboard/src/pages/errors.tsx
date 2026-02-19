@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import useSWR from 'swr'
 import { fetchErrors, type ErrorPattern } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
@@ -6,6 +7,8 @@ import { Card, CardContent } from '../components/ui/card'
 import { Skeleton } from '../components/ui/skeleton'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { TimeAgo } from '../components/shared/time-ago'
+import { Modal } from '../components/shared/modal'
+import { formatDate } from '../lib/formatters'
 
 function truncate(text: string | null, maxLen: number): string {
   if (!text) return '--'
@@ -13,6 +16,8 @@ function truncate(text: string | null, maxLen: number): string {
 }
 
 export default function ErrorsPage() {
+  const [selectedError, setSelectedError] = useState<ErrorPattern | null>(null)
+
   const { data, error, isLoading } = useSWR<ErrorPattern[]>(
     'errors',
     () => fetchErrors(50),
@@ -68,15 +73,6 @@ export default function ErrorsPage() {
         </span>
       ),
     },
-    {
-      key: 'resolution_hints',
-      header: 'Resolution Hints',
-      render: row => (
-        <span className="text-sm text-muted-foreground">
-          {truncate(row.resolution_hints, 60)}
-        </span>
-      ),
-    },
   ]
 
   return (
@@ -103,10 +99,64 @@ export default function ErrorsPage() {
               data={sorted}
               keyFn={row => row.id}
               emptyMessage="No error patterns detected"
+              onRowClick={row => setSelectedError(row)}
             />
           </CardContent>
         </Card>
       )}
+
+      <Modal
+        open={!!selectedError}
+        onClose={() => setSelectedError(null)}
+        title={selectedError?.error_type || 'Error Detail'}
+      >
+        {selectedError && (
+          <div className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <p className="text-sm text-muted-foreground">Error Type</p>
+                <Badge variant="destructive">{selectedError.error_type || 'unknown'}</Badge>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Occurrences</p>
+                <p className="text-sm font-medium">{selectedError.occurrence_count}</p>
+              </div>
+              <div className="sm:col-span-2">
+                <p className="text-sm text-muted-foreground">Error Message</p>
+                <p className="text-sm whitespace-pre-wrap">{selectedError.error_message || '--'}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">First Seen</p>
+                <p className="text-sm">{formatDate(selectedError.first_seen)}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Last Seen</p>
+                <p className="text-sm">{formatDate(selectedError.last_seen)}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Sources</p>
+                <p className="text-sm capitalize">{selectedError.sources?.join(', ') || '--'}</p>
+              </div>
+              {selectedError.example_issue_ids && selectedError.example_issue_ids.length > 0 && (
+                <div>
+                  <p className="text-sm text-muted-foreground">Example Issue IDs</p>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {selectedError.example_issue_ids.map(id => (
+                      <Badge key={id} variant="secondary">{id}</Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {selectedError.resolution_hints && (
+                <div className="sm:col-span-2">
+                  <p className="text-sm text-muted-foreground">Resolution Hints</p>
+                  <p className="text-sm whitespace-pre-wrap">{selectedError.resolution_hints}</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }

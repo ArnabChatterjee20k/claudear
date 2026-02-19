@@ -1,12 +1,19 @@
 //! Issue source implementations.
 
 mod discord;
+mod gitlab;
+mod jira;
 mod linear;
 pub mod sentry;
+mod slack;
 
 pub use discord::DiscordSource;
+pub use gitlab::GitLabSource;
+pub(crate) use gitlab::{format_gitlab_context, gitlab_matches_criteria};
+pub use jira::JiraSource;
 pub use linear::LinearSource;
 pub use sentry::SentrySource;
+pub use slack::SlackSource;
 
 use crate::error::Result;
 use crate::types::{Issue, MatchResult};

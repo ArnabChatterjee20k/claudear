@@ -364,4 +364,209 @@ mod tests {
         // and the event count is below threshold
         assert!(!result.regression_detected);
     }
+
+    #[tokio::test]
+    async fn test_api_error_non_404_non_200() {
+        // A non-404, non-200 status should return an Error
+        let mock = MockSentryClient::new(500, r#"{"detail": "Internal Server Error"}"#);
+
+        let checker = SentryRegressionChecker::new(create_config(), mock);
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "err-issue", 1);
+
+        let result = checker.check_regression(&watch).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn test_unparseable_event_count() {
+        // An unparseable count should default to 0, and with threshold=1
+        // and status=unresolved, 0 < 1 so no regression from count path.
+        // lastSeen is in the past, so no regression from timing path either.
+        let mock = MockSentryClient::new(
+            200,
+            r#"{
+                "id": "bad-count",
+                "shortId": "TEST-BAD",
+                "title": "Bad Count Error",
+                "count": "not_a_number",
+                "status": "unresolved",
+                "lastSeen": "2024-01-01T00:00:00Z"
+            }"#,
+        );
+
+        let config = SentryRegressionConfig {
+            auth_token: "test-token".to_string(),
+            org_slug: "test-org".to_string(),
+            event_threshold: 1, // threshold is 1, unparseable defaults to 0 which is below
+        };
+
+        let checker = SentryRegressionChecker::new(config, mock);
+        let mut watch = RegressionWatch::new(IssueType::SentryIssue, "bad-count", 1);
+        watch.monitoring_started_at = Some(Utc::now() - Duration::hours(1));
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        assert!(!result.regression_detected);
+    }
+
+    #[tokio::test]
+    async fn test_status_ignored_no_regression() {
+        // Status "ignored" should not be considered active, so no regression
+        // even with a high event count above threshold
+        let mock = MockSentryClient::new(
+            200,
+            r#"{
+                "id": "ign-1",
+                "shortId": "TEST-IGN",
+                "title": "Ignored Error",
+                "count": "500",
+                "status": "ignored",
+                "lastSeen": "2099-01-01T00:00:00Z"
+            }"#,
+        );
+
+        let checker = SentryRegressionChecker::new(create_config(), mock);
+        let mut watch = RegressionWatch::new(IssueType::SentryIssue, "ign-1", 1);
+        watch.monitoring_started_at = Some(Utc::now() - Duration::hours(1));
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        assert!(!result.regression_detected);
+    }
+
+    #[tokio::test]
+    async fn test_zero_event_count_below_threshold() {
+        // Zero events with threshold of 1 -> no regression from event count path
+        let mock = MockSentryClient::new(
+            200,
+            r#"{
+                "id": "zero-1",
+                "shortId": "TEST-ZERO",
+                "title": "Zero Events Error",
+                "count": "0",
+                "status": "unresolved",
+                "lastSeen": "2024-01-01T00:00:00Z"
+            }"#,
+        );
+
+        let checker = SentryRegressionChecker::new(create_config(), mock);
+        let mut watch = RegressionWatch::new(IssueType::SentryIssue, "zero-1", 1);
+        watch.monitoring_started_at = Some(Utc::now() - Duration::hours(1));
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        // lastSeen is in 2024, well before monitoring_started_at, so no regression
+        assert!(!result.regression_detected);
+    }
+
+    #[tokio::test]
+    async fn test_no_monitoring_started_at() {
+        // When monitoring_started_at is None, the lastSeen timing check is skipped.
+        // Only the event count path is evaluated.
+        // With count "0" and threshold 1, no regression should be detected.
+        let mock = MockSentryClient::new(
+            200,
+            r#"{
+                "id": "no-mon",
+                "shortId": "TEST-NOMON",
+                "title": "No Monitoring Start",
+                "count": "0",
+                "status": "unresolved",
+                "lastSeen": "2099-12-31T23:59:59Z"
+            }"#,
+        );
+
+        let checker = SentryRegressionChecker::new(create_config(), mock);
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "no-mon", 1);
+        // monitoring_started_at is None by default
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        // count is 0 which is below threshold=1, so no regression from count path
+        // monitoring_started_at is None so the lastSeen timing check is skipped
+        assert!(!result.regression_detected);
+    }
+
+    #[tokio::test]
+    async fn test_last_seen_before_monitoring_started() {
+        // lastSeen is before monitoring_started_at -> no regression from timing path
+        // even if the issue is unresolved
+        let past_time = Utc::now() - Duration::hours(10);
+        let body = format!(
+            r#"{{
+                "id": "before-mon",
+                "shortId": "TEST-BEFORE",
+                "title": "Old Activity",
+                "count": "0",
+                "status": "unresolved",
+                "lastSeen": "{}"
+            }}"#,
+            past_time.to_rfc3339()
+        );
+
+        let mock = MockSentryClient::new(200, &body);
+
+        let checker = SentryRegressionChecker::new(create_config(), mock);
+        let mut watch = RegressionWatch::new(IssueType::SentryIssue, "before-mon", 1);
+        // monitoring started 5 hours ago, lastSeen is 10 hours ago (before monitoring)
+        watch.monitoring_started_at = Some(Utc::now() - Duration::hours(5));
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        assert!(!result.regression_detected);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_last_seen_timestamp() {
+        // Invalid lastSeen format should be handled gracefully: warning logged, no crash,
+        // falls through to no-regression result
+        let mock = MockSentryClient::new(
+            200,
+            r#"{
+                "id": "bad-ts",
+                "shortId": "TEST-BADTS",
+                "title": "Bad Timestamp Error",
+                "count": "0",
+                "status": "unresolved",
+                "lastSeen": "not-a-valid-timestamp"
+            }"#,
+        );
+
+        let checker = SentryRegressionChecker::new(create_config(), mock);
+        let mut watch = RegressionWatch::new(IssueType::SentryIssue, "bad-ts", 1);
+        watch.monitoring_started_at = Some(Utc::now() - Duration::hours(1));
+
+        // Should not panic or error - handles gracefully
+        let result = checker.check_regression(&watch).await.unwrap();
+        // count is 0 < threshold 1, invalid lastSeen is skipped, so no regression
+        assert!(!result.regression_detected);
+    }
+
+    #[tokio::test]
+    async fn test_exact_threshold_boundary() {
+        // Event count exactly equals threshold -> regression detected
+        let config = SentryRegressionConfig {
+            auth_token: "test-token".to_string(),
+            org_slug: "test-org".to_string(),
+            event_threshold: 5,
+        };
+
+        let mock = MockSentryClient::new(
+            200,
+            r#"{
+                "id": "exact-th",
+                "shortId": "TEST-EXACT",
+                "title": "Exact Threshold Error",
+                "count": "5",
+                "status": "unresolved",
+                "lastSeen": "2024-01-01T00:00:00Z"
+            }"#,
+        );
+
+        let checker = SentryRegressionChecker::new(config, mock);
+        let mut watch = RegressionWatch::new(IssueType::SentryIssue, "exact-th", 1);
+        watch.monitoring_started_at = Some(Utc::now() - Duration::hours(1));
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        // count (5) >= threshold (5) and status is unresolved -> regression
+        assert!(result.regression_detected);
+        assert!(result.details.unwrap().contains("5 events"));
+    }
 }

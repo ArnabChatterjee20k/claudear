@@ -279,6 +279,9 @@ pub struct AskRequest {
     /// Optional desired email responder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_email: Option<String>,
+    /// Optional desired Slack responder ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_slack_id: Option<String>,
 }
 
 /// Delivery metadata for an ask message.
@@ -943,6 +946,156 @@ impl ErrorPattern {
             resolution_hints: None,
         }
     }
+}
+
+// ============================================================
+// Prioritisation types
+// ============================================================
+
+/// Composite severity score produced by the prioritisation engine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SeverityScore {
+    /// Final weighted score (higher = more urgent).
+    pub score: f64,
+    /// Contribution from issue/match priority (0.0-1.0).
+    pub severity_component: f64,
+    /// Contribution from event frequency signals (0.0-1.0).
+    pub frequency_component: f64,
+    /// Contribution from regression risk signals (0.0-1.0).
+    pub regression_component: f64,
+    /// Contribution from blast radius classification (0.0-1.0).
+    pub blast_radius_component: f64,
+    /// Boost from belonging to a content cluster (0.0 or 1.0).
+    pub cluster_boost: f64,
+}
+
+/// Blast radius classification for an issue.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BlastRadius {
+    Cosmetic,
+    Test,
+    Peripheral,
+    #[default]
+    Core,
+    Infrastructure,
+    Critical,
+}
+
+impl std::fmt::Display for BlastRadius {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cosmetic => write!(f, "cosmetic"),
+            Self::Test => write!(f, "test"),
+            Self::Peripheral => write!(f, "peripheral"),
+            Self::Core => write!(f, "core"),
+            Self::Infrastructure => write!(f, "infrastructure"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+/// A cluster of content-similar issues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentCluster {
+    /// Database ID (0 before storage).
+    pub id: i64,
+    /// Key identifying the cluster (e.g. "TypeError::app.main").
+    pub cluster_key: String,
+    /// Source service name.
+    pub source: String,
+    /// Issue ID of the representative (highest-scored) issue.
+    pub representative_issue_id: String,
+    /// All issue IDs in the cluster.
+    pub issue_ids: Vec<String>,
+    /// Shared error type (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    /// Shared culprit (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub culprit: Option<String>,
+    /// Average pairwise similarity within the cluster.
+    pub avg_similarity: f64,
+    /// Status: "active" or "resolved".
+    pub status: String,
+    /// When the cluster was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// A user-configured suppression rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuppressionRule {
+    /// Human-readable rule name.
+    pub name: String,
+    /// Which issue field to match against.
+    pub field: SuppressionField,
+    /// Pattern to match.
+    pub pattern: String,
+    /// How to match the pattern.
+    #[serde(default)]
+    pub match_mode: SuppressionMatchMode,
+    /// Restrict this rule to specific sources (empty = all sources).
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Human-readable reason for suppression.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Which issue field a suppression rule matches against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SuppressionField {
+    Title,
+    Description,
+    Source,
+    Culprit,
+    Filename,
+    ErrorType,
+    Project,
+    Labels,
+    Metadata(String),
+}
+
+/// How a suppression pattern is matched.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SuppressionMatchMode {
+    #[default]
+    Contains,
+    Exact,
+    Regex,
+}
+
+/// Result of evaluating suppression rules against an issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuppressionResult {
+    /// Whether the issue was suppressed.
+    pub suppressed: bool,
+    /// Name of the matched rule (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_rule: Option<String>,
+    /// Reason from the matched rule (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// An issue after scoring and classification by the prioritisation engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrioritisedIssue {
+    /// The original issue.
+    pub issue: Issue,
+    /// Criteria match result.
+    pub match_result: MatchResult,
+    /// Composite severity score.
+    pub severity_score: SeverityScore,
+    /// Blast radius classification.
+    pub blast_radius: BlastRadius,
+    /// Cluster key if the issue belongs to a content cluster.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_key: Option<String>,
 }
 
 /// Processing metric for time-series data.

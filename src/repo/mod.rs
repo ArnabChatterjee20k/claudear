@@ -2,6 +2,7 @@
 //!
 //! Provides git operations, dependency tracking, cascading changes, and repository indexing.
 
+pub mod code_index;
 mod discovery;
 mod git;
 mod index;

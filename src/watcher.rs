@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::feedback::{
     format_similar_issues_context, FeedbackAnalyzer, FixOutcome, IssueEmbeddingService, Outcome,
 };
-use crate::github::{GitHubClient, PrReviewState, PrStatus, ReviewEvent, ReviewWatcher};
+use crate::github::GitHubClient;
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
 use crate::notifier::send_to_all_and_wait_first_reply;
 use crate::notifier::Notifier;
@@ -16,6 +16,7 @@ use crate::qa::{
 use crate::repo::{worktree_path, GitOps, RepoIndex, RepoRelationships};
 use crate::retry::RetryManager;
 use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
+use crate::scm::{PrReviewState, PrStatus, ReviewEvent, ReviewWatcher};
 use crate::source::IssueSource;
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
 use crate::types::{
@@ -143,6 +144,8 @@ impl Watcher {
             &config.known_orgs,
             &config.auto_discover_paths,
             github_client,
+            None, // gitlab_provider
+            &[],  // gitlab_groups
             &config.work_dir,
             config.github.use_ssh,
         )
@@ -197,6 +200,8 @@ impl Watcher {
             &config.known_orgs,
             &config.auto_discover_paths,
             github_client,
+            None, // gitlab_provider
+            &[],  // gitlab_groups
             &config.work_dir,
             config.github.use_ssh,
         )
@@ -697,13 +702,13 @@ impl Watcher {
         if self.config.learning.review_classification {
             if let Some(repo) = &attempt.github_repo {
                 // Parse feedback as review comments for classification
-                let mock_comment = crate::github::PrReviewComment {
+                let mock_comment = crate::scm::ReviewComment {
                     id: 0,
                     path: String::new(),
                     position: None,
                     original_position: None,
                     body: feedback.to_string(),
-                    user: crate::github::GitHubUser {
+                    user: crate::scm::ReviewUser {
                         login: "reviewer".to_string(),
                         id: 0,
                         user_type: None,
@@ -1790,6 +1795,11 @@ Create a PR with your changes."#,
         let mut inflight_skipped = 0usize;
         let mut unmatched_skipped = 0usize;
 
+        // Pre-build regex cache for suppression rules (avoids re-compilation per issue)
+        let suppression_cache = crate::prioritisation::suppression::RegexCache::new(
+            &self.config.prioritisation.suppression_rules,
+        );
+
         let processing = self.processing.read().await;
         for issue in issues {
             if !seen_issue_ids.insert(issue.id.clone()) {
@@ -1813,6 +1823,27 @@ Create a PR with your changes."#,
             if processing.contains(&processing_key) {
                 inflight_skipped = inflight_skipped.saturating_add(1);
                 continue;
+            }
+
+            // Early suppression check: only runs as fallback when the prioritisation
+            // engine is disabled. When enabled, suppression is handled inside prioritise().
+            if !self.config.prioritisation.enabled
+                && !self.config.prioritisation.suppression_rules.is_empty()
+            {
+                let suppression = crate::prioritisation::suppression::check_issue_with_cache(
+                    &self.config.prioritisation.suppression_rules,
+                    &issue,
+                    &suppression_cache,
+                );
+                if suppression.suppressed {
+                    tracing::debug!(
+                        source = source.name(),
+                        issue_id = %issue.short_id,
+                        rule = suppression.matched_rule.as_deref().unwrap_or("?"),
+                        "Issue suppressed early in poll loop"
+                    );
+                    continue;
+                }
             }
 
             let match_result = source.matches_criteria(&issue);
@@ -1865,9 +1896,54 @@ Create a PR with your changes."#,
         // Apply per-source max issues per cycle limit (falls back to global)
         let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
 
-        // Sort by priority before selecting the subset that will be processed.
-        self.sort_by_priority(&mut candidates);
-        let to_process: Vec<_> = candidates.into_iter().take(source_max_issues).collect();
+        // Sort and select: use prioritisation engine when enabled, else legacy sort.
+        let to_process: Vec<(Issue, MatchResult)> = if self.config.prioritisation.enabled {
+            let (prioritised, suppressed) = crate::prioritisation::prioritise(
+                &self.config.prioritisation,
+                candidates,
+                self.tracker.as_ref(),
+            );
+
+            // Log and record suppressions
+            for (issue, result) in &suppressed {
+                let rule = result.matched_rule.as_deref().unwrap_or("unknown");
+                let reason = result.reason.as_deref().unwrap_or("");
+                tracing::info!(
+                    source = source.name(),
+                    issue_id = %issue.short_id,
+                    rule = rule,
+                    "Issue suppressed during poll"
+                );
+                if let Err(e) =
+                    self.tracker
+                        .record_suppression(source.name(), &issue.id, rule, reason)
+                {
+                    tracing::debug!(error = %e, "Failed to record suppression");
+                }
+            }
+
+            // Store severity scores
+            for pi in &prioritised {
+                if let Err(e) = self.tracker.store_severity_score(
+                    source.name(),
+                    &pi.issue.id,
+                    &pi.severity_score,
+                    pi.blast_radius,
+                ) {
+                    tracing::debug!(error = %e, "Failed to store severity score");
+                }
+            }
+
+            // Convert back and take top N
+            prioritised
+                .into_iter()
+                .take(source_max_issues)
+                .map(|pi| (pi.issue, pi.match_result))
+                .collect()
+        } else {
+            self.sort_by_priority(&mut candidates);
+            candidates.into_iter().take(source_max_issues).collect()
+        };
 
         let to_process_count = to_process.len();
         let queued_short_ids: Vec<String> = to_process
@@ -2260,9 +2336,17 @@ Create a PR with your changes."#,
                 format!("origin/{}", default_branch)
             };
 
-            // Create per-issue worktree
+            // Create per-issue worktree.
+            // For review reruns, check out the actual PR branch so Claude can push
+            // to it.  For initial runs, use detached HEAD (Claude creates a new branch).
             let wt_path = worktree_path(&self.config.work_dir, repo_name, &issue.short_id);
-            if let Err(e) = GitOps::create_worktree(&project_dir, &wt_path, &checkout_ref).await {
+            let wt_result = if let Some(ref branch) = existing_pr_branch {
+                GitOps::create_worktree_on_branch(&project_dir, &wt_path, branch, &checkout_ref)
+                    .await
+            } else {
+                GitOps::create_worktree(&project_dir, &wt_path, &checkout_ref).await
+            };
+            if let Err(e) = wt_result {
                 let wt_error = format!("Failed to create worktree: {}", e);
                 self.record_issue_decision(
                     &issue,
@@ -2644,6 +2728,10 @@ Create a PR with your changes."#,
                     asked_at: Utc::now(),
                     target_discord_id,
                     target_email,
+                    target_slack_id: resolved_user
+                        .as_deref()
+                        .and_then(|slug| self.user_registry.get_by_slug(slug))
+                        .and_then(|u| u.slack_id.clone()),
                 };
 
                 let asked_activity = ActivityLogEntry::new(
@@ -2773,7 +2861,42 @@ Create a PR with your changes."#,
             }
 
             if claude_result.success {
-                if let Some(ref pr_url) = claude_result.pr_url {
+                // For review reruns, resolve the effective PR URL:
+                // 1. If Claude returned a PR URL, prefer the existing one (Claude
+                //    should not create new PRs during review reruns).
+                // 2. If Claude did NOT return a PR URL (common when it just pushes
+                //    to the existing branch), fall back to the attempt's stored URL.
+                let effective_pr_url = if existing_pr_branch.is_some() {
+                    let stored_url = self
+                        .tracker
+                        .get_attempt(source.name(), &issue.id)
+                        .ok()
+                        .flatten()
+                        .and_then(|a| a.pr_url);
+                    match (&claude_result.pr_url, &stored_url) {
+                        (Some(new_url), Some(existing_url)) if new_url != existing_url => {
+                            tracing::warn!(
+                                short_id = %issue.short_id,
+                                existing_pr = %existing_url,
+                                claude_pr = %new_url,
+                                "Review rerun produced a different PR URL; keeping original"
+                            );
+                            stored_url
+                        }
+                        (None, Some(_)) => {
+                            tracing::info!(
+                                short_id = %issue.short_id,
+                                "Review rerun pushed to existing branch (no new PR URL)"
+                            );
+                            stored_url
+                        }
+                        _ => claude_result.pr_url.clone(),
+                    }
+                } else {
+                    claude_result.pr_url.clone()
+                };
+
+                if let Some(ref pr_url) = effective_pr_url {
                     self.record_issue_decision(
                         &issue,
                         "claude_run_succeeded_with_pr",
@@ -3886,6 +4009,7 @@ mod tests {
             claude_timeout_secs: 21600,
             claude: crate::config::ClaudeConfig::default(),
             discord: crate::config::DiscordConfig::default(),
+            slack: crate::config::SlackConfig::default(),
             email: crate::config::EmailConfig::default(),
             sms: crate::config::SmsConfig::default(),
             push: crate::config::PushConfig::default(),
@@ -3895,10 +4019,14 @@ mod tests {
             retry: crate::config::RetryConfig::default(),
             linear: None,
             sentry: None,
+            jira: None,
+            gitlab: None,
             regression: crate::config::RegressionConfig::default(),
             cascade: crate::config::CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: crate::config::LearningConfig::default(),
+            prioritisation: crate::config::PrioritisationConfig::default(),
+            code_index: crate::config::CodeIndexConfig::default(),
         }
     }
 
@@ -5051,11 +5179,11 @@ mod tests {
 
     #[test]
     fn test_group_review_feedback_by_pr_batches_same_pr() {
-        let review1 = crate::github::PrReview {
+        let review1 = crate::scm::CodeReview {
             id: 1,
             state: "CHANGES_REQUESTED".to_string(),
             body: Some("first".to_string()),
-            user: crate::github::GitHubUser {
+            user: crate::scm::ReviewUser {
                 id: 1,
                 login: "r1".to_string(),
                 user_type: Some("User".to_string()),
@@ -5063,11 +5191,11 @@ mod tests {
             submitted_at: Some("2024-01-01T00:00:00Z".to_string()),
             html_url: None,
         };
-        let review2 = crate::github::PrReview {
+        let review2 = crate::scm::CodeReview {
             id: 2,
             state: "COMMENTED".to_string(),
             body: Some("second".to_string()),
-            user: crate::github::GitHubUser {
+            user: crate::scm::ReviewUser {
                 id: 2,
                 login: "r2".to_string(),
                 user_type: Some("User".to_string()),
@@ -5077,21 +5205,21 @@ mod tests {
         };
 
         let events = vec![
-            crate::github::ReviewEvent::ReviewSubmitted {
+            crate::scm::ReviewEvent::ReviewSubmitted {
                 pr_url: "https://github.com/org/repo/pull/1".to_string(),
                 repo: "org/repo".to_string(),
                 pr_number: 1,
                 review: review1,
                 inline_comments: vec![],
             },
-            crate::github::ReviewEvent::ReviewSubmitted {
+            crate::scm::ReviewEvent::ReviewSubmitted {
                 pr_url: "https://github.com/org/repo/pull/1".to_string(),
                 repo: "org/repo".to_string(),
                 pr_number: 1,
                 review: review2,
                 inline_comments: vec![],
             },
-            crate::github::ReviewEvent::CommentsAdded {
+            crate::scm::ReviewEvent::CommentsAdded {
                 pr_url: "https://github.com/org/repo/pull/2".to_string(),
                 repo: "org/repo".to_string(),
                 pr_number: 2,

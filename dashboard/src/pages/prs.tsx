@@ -10,9 +10,11 @@ import { PageHeader } from '../components/layout/page-header'
 import { StatsCard } from '../components/shared/stats-card'
 import { StatusBadge } from '../components/shared/status-badge'
 import { DataTable, type Column } from '../components/shared/data-table'
+import { Modal } from '../components/shared/modal'
 import { Select } from '../components/ui/select'
 import { Card, CardContent } from '../components/ui/card'
 import { Skeleton } from '../components/ui/skeleton'
+import { formatMins, formatDate } from '../lib/formatters'
 import {
   GitPullRequest,
   GitMerge,
@@ -22,13 +24,6 @@ import {
   ExternalLink,
 } from 'lucide-react'
 
-function formatMins(mins: number | null): string {
-  if (mins == null) return '--'
-  if (mins < 60) return `${mins.toFixed(0)}m`
-  if (mins < 1440) return `${(mins / 60).toFixed(1)}h`
-  return `${(mins / 1440).toFixed(1)}d`
-}
-
 const statusOptions = [
   { value: 'open', label: 'Open' },
   { value: 'merged', label: 'Merged' },
@@ -37,6 +32,7 @@ const statusOptions = [
 
 export default function PrsPage() {
   const [statusFilter, setStatusFilter] = useState('')
+  const [selectedPr, setSelectedPr] = useState<PrRecord | null>(null)
 
   const { data: analytics, isLoading: analyticsLoading } = useSWR<PrAnalytics>(
     'pr-analytics',
@@ -65,6 +61,7 @@ export default function PrsPage() {
           target="_blank"
           rel="noopener noreferrer"
           className="text-primary hover:underline inline-flex items-center gap-1"
+          onClick={e => e.stopPropagation()}
         >
           #{row.pr_number}
           <ExternalLink className="h-3 w-3" />
@@ -201,10 +198,111 @@ export default function PrsPage() {
               data={prs}
               keyFn={row => row.id}
               emptyMessage="No pull requests found"
+              onRowClick={row => setSelectedPr(row)}
             />
           </CardContent>
         </Card>
       )}
+
+      <Modal
+        open={!!selectedPr}
+        onClose={() => setSelectedPr(null)}
+        title={selectedPr ? `PR #${selectedPr.pr_number}` : undefined}
+      >
+        {selectedPr && (
+          <div className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <p className="text-sm text-muted-foreground">Status</p>
+                <StatusBadge status={selectedPr.status} />
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Repository</p>
+                <p className="text-sm">{selectedPr.github_repo}</p>
+              </div>
+              <div className="sm:col-span-2">
+                <p className="text-sm text-muted-foreground">Title</p>
+                <p className="text-sm">{selectedPr.title || '--'}</p>
+              </div>
+              {selectedPr.description && (
+                <div className="sm:col-span-2">
+                  <p className="text-sm text-muted-foreground">Description</p>
+                  <p className="text-sm whitespace-pre-wrap">{selectedPr.description}</p>
+                </div>
+              )}
+              <div>
+                <p className="text-sm text-muted-foreground">Author</p>
+                <p className="text-sm">{selectedPr.author || '--'}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Branch</p>
+                <p className="text-sm font-mono">
+                  {selectedPr.head_branch || '--'} → {selectedPr.base_branch || '--'}
+                </p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Files Changed</p>
+                <p className="text-sm">{selectedPr.files_changed ?? '--'}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Lines</p>
+                <p className="text-sm">
+                  <span className="text-green-600">+{selectedPr.lines_added ?? 0}</span>
+                  {' / '}
+                  <span className="text-red-600">-{selectedPr.lines_removed ?? 0}</span>
+                </p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Approvals / Changes Requested</p>
+                <p className="text-sm">
+                  <span className="text-green-600">{selectedPr.approvals_count}</span>
+                  {' / '}
+                  <span className="text-red-600">{selectedPr.changes_requested_count}</span>
+                </p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Review Cycles</p>
+                <p className="text-sm">{selectedPr.review_cycles}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Time to First Review</p>
+                <p className="text-sm">{formatMins(selectedPr.time_to_first_review_mins)}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Time to Merge</p>
+                <p className="text-sm">{formatMins(selectedPr.time_to_merge_mins)}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Created</p>
+                <p className="text-sm">{formatDate(selectedPr.created_at)}</p>
+              </div>
+              {selectedPr.merged_at && (
+                <div>
+                  <p className="text-sm text-muted-foreground">Merged</p>
+                  <p className="text-sm">{formatDate(selectedPr.merged_at)}</p>
+                </div>
+              )}
+              {selectedPr.closed_at && (
+                <div>
+                  <p className="text-sm text-muted-foreground">Closed</p>
+                  <p className="text-sm">{formatDate(selectedPr.closed_at)}</p>
+                </div>
+              )}
+            </div>
+            <div>
+              <a
+                href={selectedPr.pr_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm text-primary hover:underline inline-flex items-center gap-1"
+              >
+                <ExternalLink className="h-3 w-3" />
+                View on GitHub
+              </a>
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }

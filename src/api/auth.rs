@@ -501,9 +501,9 @@ mod tests {
     use super::*;
     use crate::api::routes::create_api_router;
     use crate::config::{
-        AskConfig, CascadeConfig, ClaudeConfig, Config, DiscordConfig, EmailConfig,
-        GitHubAppConfig, GitHubConfig, LearningConfig, PushConfig, RegressionConfig, RetryConfig,
-        SmsConfig,
+        AskConfig, CascadeConfig, ClaudeConfig, CodeIndexConfig, Config, DiscordConfig,
+        EmailConfig, GitHubAppConfig, GitHubConfig, LearningConfig, PrioritisationConfig,
+        PushConfig, RegressionConfig, RetryConfig, SlackConfig, SmsConfig,
     };
     use crate::storage::SqliteTracker;
     use axum::body::Body;
@@ -528,6 +528,7 @@ mod tests {
             claude_timeout_secs: 21600,
             claude: ClaudeConfig::default(),
             discord: DiscordConfig::default(),
+            slack: SlackConfig::default(),
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
             push: PushConfig::default(),
@@ -537,10 +538,14 @@ mod tests {
             retry: RetryConfig::default(),
             linear: None,
             sentry: None,
+            jira: None,
+            gitlab: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
+            prioritisation: PrioritisationConfig::default(),
+            code_index: CodeIndexConfig::default(),
         }
     }
 
@@ -551,8 +556,12 @@ mod tests {
     ) {
         let tracker: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
             std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
-        let router =
-            create_api_router(test_config(), tracker.clone()).layer(CookieManagerLayer::new());
+        let router = create_api_router(
+            test_config(),
+            tracker.clone(),
+            std::path::PathBuf::from("claudear.toml"),
+        )
+        .layer(CookieManagerLayer::new());
         (router, tracker)
     }
 
@@ -783,5 +792,450 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ─── Parameterized seed helpers for test isolation ─────────────────
+
+    /// Seed an admin user with a custom email and return (user_id, session_token).
+    fn seed_admin_with_email(
+        tracker: &std::sync::Arc<dyn crate::storage::FixAttemptTracker>,
+        email: &str,
+    ) -> (i64, String) {
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("password", 4).unwrap();
+        let user_id = db
+            .create_user(email, &password_hash, "Admin User", "admin")
+            .unwrap();
+        let token = db.create_session(user_id, "2099-12-31 23:59:59").unwrap();
+        (user_id, token)
+    }
+
+    // ─── Rate limiting tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_rate_limit_rejects_11th_attempt() {
+        // Use a unique email to avoid interference with other tests
+        let key = "ratelimit-11th@unique-test.com";
+        // First 10 attempts should succeed
+        for i in 0..LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
+            assert!(
+                check_login_rate_limit(key),
+                "Attempt {} should be allowed",
+                i + 1
+            );
+        }
+        // 11th attempt should be rejected
+        assert!(
+            !check_login_rate_limit(key),
+            "11th attempt should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_independent_keys() {
+        let key_a = "ratelimit-indep-a@unique-test.com";
+        let key_b = "ratelimit-indep-b@unique-test.com";
+
+        // Exhaust rate limit for key_a
+        for _ in 0..LOGIN_RATE_LIMIT_MAX_ATTEMPTS {
+            check_login_rate_limit(key_a);
+        }
+        assert!(
+            !check_login_rate_limit(key_a),
+            "key_a should be rate-limited"
+        );
+
+        // key_b should still be allowed
+        assert!(
+            check_login_rate_limit(key_b),
+            "key_b should NOT be rate-limited"
+        );
+    }
+
+    // ─── create_user_handler validation tests ─────────────────────────
+
+    #[tokio::test]
+    async fn test_create_user_invalid_role() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-role@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"email":"x@test.com","password":"longpassword","name":"X","role":"superuser"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_empty_email() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-email@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"email":"","password":"longpassword","name":"X","role":"viewer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_email_without_at() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-noat@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"email":"bademail","password":"longpassword","name":"X","role":"viewer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_password_too_short() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-pw@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"email":"x@test.com","password":"short","name":"X","role":"viewer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_empty_name() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-name@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"email":"x@test.com","password":"longpassword","name":"","role":"viewer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_duplicate_email() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-dup@test.com");
+
+        // Create a user first
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        db.create_user("dup@test.com", &hash, "Dup User", "viewer")
+            .unwrap();
+
+        // Try to create another user with the same email
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"email":"dup@test.com","password":"longpassword","name":"Another","role":"viewer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    // ─── update_user_handler validation tests ─────────────────────────
+
+    #[tokio::test]
+    async fn test_update_user_invalid_role() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-role@test.com");
+
+        // Create a target user to update
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        let target_id = db
+            .create_user("target-update@test.com", &hash, "Target", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{}", target_id))
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"role":"superuser"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_not_found() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-nf@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/users/99999")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"name":"Updated"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── delete_user_handler tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_delete_user_success() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-del-ok@test.com");
+
+        // Create a target user to delete
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        let target_id = db
+            .create_user("target-del@test.com", &hash, "Target", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/users/{}", target_id))
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("User deleted"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_not_found() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-del-nf@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/users/99999")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── list_users_handler tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_users_as_admin() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-list@test.com");
+
+        // Create an additional user
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        db.create_user("extra-list@test.com", &hash, "Extra User", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/users")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        // Should contain both users
+        assert!(body_str.contains("admin-list@test.com"));
+        assert!(body_str.contains("extra-list@test.com"));
+
+        // Verify the response parses as a JSON array
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+
+    // ─── get_user_handler tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_user_by_id() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-getuser@test.com");
+
+        // Create a target user
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        let target_id = db
+            .create_user("target-get@test.com", &hash, "Target Get", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/users/{}", target_id))
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("target-get@test.com"));
+        assert!(body_str.contains("Target Get"));
+        assert!(body_str.contains("viewer"));
+    }
+
+    #[tokio::test]
+    async fn test_get_user_not_found() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-getuser-nf@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/users/99999")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── logout_handler tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_logout_clears_session_cookie() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-logout@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/logout")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify response body
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(body_str.contains("Logged out"));
+    }
+
+    // ─── AuthUserResponse conversion test ─────────────────────────────
+
+    #[test]
+    fn test_auth_user_response_from_auth_user() {
+        let user = AuthUser {
+            id: 42,
+            email: "convert@test.com".to_string(),
+            name: "Convert User".to_string(),
+            role: "admin".to_string(),
+        };
+
+        let response = AuthUserResponse::from(&user);
+
+        assert_eq!(response.id, 42);
+        assert_eq!(response.email, "convert@test.com");
+        assert_eq!(response.name, "Convert User");
+        assert_eq!(response.role, "admin");
     }
 }

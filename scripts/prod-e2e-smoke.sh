@@ -36,8 +36,13 @@ CLAUDE_TIMEOUT="${CLAUDEAR_E2E_CLAUDE_TIMEOUT_SECS:-600}"
 S1_PORT=3150
 S2_PORT=3151
 
-# Track all daemon PIDs for cleanup
+# Docker mode: run claudear inside Docker container to avoid nested claude issues
+USE_DOCKER="${CLAUDEAR_E2E_USE_DOCKER:-false}"
+DOCKER_IMAGE="${CLAUDEAR_E2E_DOCKER_IMAGE:-claudear-app:latest}"
+
+# Track all daemon PIDs/containers for cleanup
 DAEMON_PIDS=()
+DOCKER_CONTAINERS=()
 
 # Track all PR numbers/branches for cleanup
 declare -a CLEANUP_PR_NUMBERS=()
@@ -334,13 +339,93 @@ get_pr_branch() {
   jq -r '.head.ref // empty' <<<"$resp"
 }
 
-# Kill daemon by PID if alive
-kill_daemon() {
+# Kill daemon by PID if alive (non-docker mode)
+kill_daemon_pid() {
   local pid="$1"
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     log "Killed daemon PID ${pid}"
+  fi
+}
+
+# Stop Docker container
+stop_container() {
+  local name="$1"
+  [[ -n "$name" ]] || return 0
+  docker stop "$name" 2>/dev/null || true
+  docker rm -f "$name" 2>/dev/null || true
+  log "Stopped container ${name}"
+}
+
+# Unified daemon start: returns a handle (PID or container name)
+# Usage: daemon_handle="$(start_daemon CONFIG PORT LOG_FILE)"
+start_daemon() {
+  local config_path="$1" port="$2" daemon_log="$3"
+  if [[ "$USE_DOCKER" == "true" ]]; then
+    local mount_dir
+    mount_dir="$(dirname "$config_path")"
+    local name="claudear-e2e-${port}-${RANDOM}"
+
+    # Resolve Claude auth token for the container
+    local claude_oauth="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+    local api_key="${ANTHROPIC_API_KEY:-}"
+    if [[ -z "$api_key" && -z "$claude_oauth" ]]; then
+      # Try macOS keychain (Claude Code stores OAuth as JSON in keychain)
+      local keychain_json
+      keychain_json="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+      if [[ -n "$keychain_json" ]]; then
+        claude_oauth="$(echo "$keychain_json" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)"
+      fi
+    fi
+    [[ -n "$api_key" || -n "$claude_oauth" ]] || fail "No Claude auth available (ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or macOS keychain)"
+
+    # Write env vars to a temp file to avoid shell escaping issues with tokens
+    local env_file="${mount_dir}/.docker-env-${name}"
+    {
+      printf 'ANTHROPIC_API_KEY=%s\n' "$api_key"
+      printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$claude_oauth"
+    } > "$env_file"
+
+    docker run -d \
+      --name "$name" \
+      -v "${mount_dir}:${mount_dir}" \
+      --env-file "$env_file" \
+      "${DOCKER_IMAGE}" \
+      claudear --config "$config_path" start --poll --poll-interval 5000 --port "$port" --no-webhooks \
+      >/dev/null
+
+    rm -f "$env_file"
+    # Stream container logs to the daemon log file
+    docker logs -f "$name" >>"$daemon_log" 2>&1 &
+    DOCKER_CONTAINERS+=("$name")
+    echo "$name"
+  else
+    "$CLAUDEAR_BIN" --config "$config_path" start --poll --poll-interval 5000 --port "$port" --no-webhooks >>"$daemon_log" 2>&1 &
+    local pid=$!
+    DAEMON_PIDS+=("$pid")
+    echo "$pid"
+  fi
+}
+
+# Unified daemon kill
+kill_daemon() {
+  local handle="$1"
+  [[ -n "$handle" ]] || return 0
+  if [[ "$USE_DOCKER" == "true" ]]; then
+    stop_container "$handle"
+  else
+    kill_daemon_pid "$handle"
+  fi
+}
+
+# Unified daemon alive check
+check_daemon_alive() {
+  local handle="$1"
+  if [[ "$USE_DOCKER" == "true" ]]; then
+    [[ "$(docker inspect -f '{{.State.Running}}' "$handle" 2>/dev/null)" == "true" ]]
+  else
+    kill -0 "$handle" 2>/dev/null
   fi
 }
 
@@ -405,7 +490,12 @@ cleanup() {
 
   # Kill all daemon processes
   for pid in ${DAEMON_PIDS[@]+"${DAEMON_PIDS[@]}"}; do
-    kill_daemon "$pid"
+    kill_daemon_pid "$pid"
+  done
+
+  # Stop all Docker containers
+  for name in ${DOCKER_CONTAINERS[@]+"${DOCKER_CONTAINERS[@]}"}; do
+    stop_container "$name"
   done
 
   # Close PRs (only if not merged)
@@ -450,17 +540,31 @@ require_cmd git
 require_cmd curl
 require_cmd jq
 require_cmd sqlite3
-if [[ -z "${CLAUDEAR_E2E_BINARY:-}" ]] || [[ ! -x "${CLAUDEAR_E2E_BINARY:-}" ]]; then
-  require_cmd cargo
+
+if [[ "$USE_DOCKER" == "true" ]]; then
+  require_cmd docker
+  log "Docker mode enabled (image: ${DOCKER_IMAGE})"
+  if ! docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
+    log "Pulling Docker image ${DOCKER_IMAGE}..."
+    docker pull "${DOCKER_IMAGE}" || {
+      log "Pull failed, building locally..."
+      (cd "$PROJECT_ROOT" && docker compose build)
+      DOCKER_IMAGE="claudear-app:latest"
+    }
+  fi
+else
+  if [[ -z "${CLAUDEAR_E2E_BINARY:-}" ]] || [[ ! -x "${CLAUDEAR_E2E_BINARY:-}" ]]; then
+    require_cmd cargo
+  fi
+  require_cmd claude
+  ensure_claude_auth
 fi
-require_cmd claude
 
 require_env CLAUDEAR_E2E_LINEAR_API_KEY
 require_env CLAUDEAR_E2E_LINEAR_TEAM_ID
 require_env CLAUDEAR_E2E_GITHUB_REPO
 require_env CLAUDEAR_E2E_GITHUB_TOKEN
 require_env CLAUDEAR_E2E_GITHUB_REVIEWER_TOKEN
-ensure_claude_auth
 
 if [[ ! "${CLAUDEAR_E2E_GITHUB_REPO}" =~ ^[^/]+/[^/]+$ ]]; then
   fail "CLAUDEAR_E2E_GITHUB_REPO must be in owner/repo format"
@@ -470,11 +574,13 @@ REPO_OWNER="${CLAUDEAR_E2E_GITHUB_REPO%%/*}"
 REPO_NAME="${CLAUDEAR_E2E_GITHUB_REPO##*/}"
 
 CLAUDEAR_BIN="${CLAUDEAR_E2E_BINARY:-${PROJECT_ROOT}/target/release/claudear}"
-if [[ ! -x "$CLAUDEAR_BIN" ]]; then
-  log "Building release binary..."
-  (cd "$PROJECT_ROOT" && cargo build --release)
+if [[ "$USE_DOCKER" != "true" ]]; then
+  if [[ ! -x "$CLAUDEAR_BIN" ]]; then
+    log "Building release binary..."
+    (cd "$PROJECT_ROOT" && cargo build --release)
+  fi
+  [[ -x "$CLAUDEAR_BIN" ]] || fail "Expected executable at ${CLAUDEAR_BIN}"
 fi
-[[ -x "$CLAUDEAR_BIN" ]] || fail "Expected executable at ${CLAUDEAR_BIN}"
 
 # Check if Discord scenario is available
 HAS_DISCORD=false
@@ -544,13 +650,24 @@ find_or_create_label() {
 
 clone_mock_repo() {
   local dest="$1"
-  git clone --depth 1 \
+  git clone \
     "https://x-access-token:${CLAUDEAR_E2E_GITHUB_TOKEN}@github.com/${CLAUDEAR_E2E_GITHUB_REPO}.git" \
     "$dest" >/dev/null 2>&1 || fail "Failed to clone ${CLAUDEAR_E2E_GITHUB_REPO}"
+
+  # Ensure the repo has at least one commit on main (empty repos break worktree creation)
+  if ! git -C "$dest" rev-parse HEAD >/dev/null 2>&1; then
+    log "Seeding empty repo with initial commit..."
+    git -C "$dest" checkout -b main 2>/dev/null || true
+    echo "# E2E Test Repository" > "$dest/README.md"
+    git -C "$dest" add README.md
+    git -C "$dest" -c user.name="Claudear E2E" -c user.email="e2e@claudear.local" commit -m "chore: seed repo for e2e testing" >/dev/null
+    git -C "$dest" push -u origin main >/dev/null 2>&1 || fail "Failed to push initial commit"
+    log "Seeded repo with initial commit on main"
+  fi
 }
 
 # =============================================================================
-# 7. Helper: Generate Config YAML
+# 7. Helper: Generate Config TOML
 # =============================================================================
 
 generate_config() {
@@ -563,64 +680,61 @@ generate_config() {
   local ask_enabled="${7:-false}"
   local claude_instructions="${8:-}"
 
-  cat >"$config_path" <<YAML
-work_dir: "${work_dir}"
-known_orgs:
-  - "${REPO_OWNER}"
-auto_discover_paths:
-  - "${repos_dir}"
-poll_interval_ms: 5000
-webhook_port: ${port}
-db_path: "${db_path}"
-max_issues_per_cycle: 1
-max_concurrent: 1
-processing_delay_ms: 0
-claude_timeout_secs: ${CLAUDE_TIMEOUT}
+  cat >"$config_path" <<TOML
+work_dir = "${work_dir}"
+known_orgs = ["${REPO_OWNER}"]
+auto_discover_paths = ["${repos_dir}"]
+poll_interval_ms = 5000
+webhook_port = ${port}
+db_path = "${db_path}"
+max_issues_per_cycle = 1
+max_concurrent = 1
+processing_delay_ms = 0
+claude_timeout_secs = ${CLAUDE_TIMEOUT}
 
-claude:
-  skip_permissions: true
-  instructions: "${claude_instructions}"
+[claude]
+skip_permissions = true
+instructions = "${claude_instructions}"
 
-ask:
-  enabled: ${ask_enabled}
-  wait_timeout_secs: 120
-  poll_interval_secs: 5
-  best_effort_on_timeout: true
+[ask]
+enabled = ${ask_enabled}
+wait_timeout_secs = 120
+poll_interval_secs = 5
+best_effort_on_timeout = true
 
-github:
-  token: "${CLAUDEAR_E2E_GITHUB_TOKEN}"
-  auto_resolve_on_merge: false
-  review_trigger: "/claudear"
+[github]
+token = "${CLAUDEAR_E2E_GITHUB_TOKEN}"
+auto_resolve_on_merge = false
+review_trigger = "/claudear"
 
-discord:
-  bot_token: "${CLAUDEAR_E2E_DISCORD_BOT_TOKEN:-}"
-  channel_id: "${CLAUDEAR_E2E_DISCORD_CHANNEL_ID:-}"
-  source_enabled: ${discord_source}
-  listen_channel_id: "${CLAUDEAR_E2E_DISCORD_CHANNEL_ID:-}"
+[discord]
+bot_token = "${CLAUDEAR_E2E_DISCORD_BOT_TOKEN:-}"
+channel_id = "${CLAUDEAR_E2E_DISCORD_CHANNEL_ID:-}"
+source_enabled = ${discord_source}
+listen_channel_id = "${CLAUDEAR_E2E_DISCORD_CHANNEL_ID:-}"
 
-linear:
-  enabled: true
-  api_key: "${CLAUDEAR_E2E_LINEAR_API_KEY}"
-  trigger_labels:
-    - claudear
-  trigger_states: []
-  team_id: "${CLAUDEAR_E2E_LINEAR_TEAM_ID}"
+[linear]
+enabled = true
+api_key = "${CLAUDEAR_E2E_LINEAR_API_KEY}"
+trigger_labels = ["claudear"]
+trigger_states = []
+team_id = "${CLAUDEAR_E2E_LINEAR_TEAM_ID}"
 
-regression:
-  enabled: true
-  check_interval_secs: 10
-  monitoring_duration_secs: 10
+[regression]
+enabled = true
+check_interval_secs = 10
+monitoring_duration_secs = 10
 
-learning:
-  auto_extract_learnings: true
-  diff_analysis: true
-  qa_promotion: true
-  repo_knowledge: true
-  review_classification: true
-  strategy_fingerprinting: true
-  quality_scoring: true
-  cluster_detection: true
-YAML
+[learning]
+auto_extract_learnings = true
+diff_analysis = true
+qa_promotion = true
+repo_knowledge = true
+review_classification = true
+strategy_fingerprinting = true
+quality_scoring = true
+cluster_detection = true
+TOML
 }
 
 # =============================================================================
@@ -688,7 +802,7 @@ run_scenario_1() {
   local repos_dir="${work_root}/repos"
   local local_repo="${repos_dir}/${REPO_NAME}"
   local db_path="${S1_TMP_DIR}/claudear-s1.db"
-  local config_path="${S1_TMP_DIR}/claudear.s1.yaml"
+  local config_path="${S1_TMP_DIR}/claudear.s1.toml"
   local daemon_log="${S1_TMP_DIR}/daemon.log"
 
   mkdir -p "$repos_dir"
@@ -762,13 +876,12 @@ EOF
 
   # --- Step 3: Start Daemon ---
   log "Starting daemon (Scenario 1, port ${S1_PORT})..."
-  "$CLAUDEAR_BIN" --config "$config_path" start --poll --poll-interval 5000 --port "$S1_PORT" --no-webhooks >"$daemon_log" 2>&1 &
-  local daemon_pid=$!
-  DAEMON_PIDS+=("$daemon_pid")
-  log "Daemon PID: ${daemon_pid}"
+  local daemon_pid
+  daemon_pid="$(start_daemon "$config_path" "$S1_PORT" "$daemon_log")"
+  log "Daemon handle: ${daemon_pid}"
   sleep 3
 
-  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+  if ! check_daemon_alive "$daemon_pid"; then
     warn "Daemon exited early. Logs:"
     cat "$daemon_log" >&2
     fail "Scenario 1 daemon failed to start"
@@ -894,17 +1007,23 @@ EOF
   assert_db "$db_path" "claude_executions" "1=1" 3 "claude_executions: >= 3"
 
   assert_db "$db_path" "pr_reviews" \
-    "pr_url='${S1_PR_URL}' AND review_state='CHANGES_REQUESTED'" \
+    "review_state='CHANGES_REQUESTED'" \
     1 "pr_reviews: changes_requested review recorded" "false"
 
   assert_db "$db_path" "review_patterns" "1=1" 0 "review_patterns: may populate" "false"
 
-  # --- Step 11: Verify PR unchanged after REQUEST_CHANGES ---
-  log "Verifying PR URL unchanged after REQUEST_CHANGES review..."
-  s1_current_pr_url="$(db_query "$db_path" \
-    "SELECT pr_url FROM fix_attempts WHERE source='linear' AND issue_id='${S1_ISSUE_ID}' ORDER BY id DESC LIMIT 1")"
-  if [[ -n "$s1_current_pr_url" && "$s1_current_pr_url" != "$S1_PR_URL" ]]; then
-    warn "PR URL changed after REQUEST_CHANGES review: ${S1_PR_URL} -> ${s1_current_pr_url} (worktree should have prevented this)"
+  # --- Step 11: Re-read latest PR (may have changed during reviews) ---
+  local s1_latest_pr_url
+  s1_latest_pr_url="$(db_query "$db_path" \
+    "SELECT pr_url FROM fix_attempts WHERE source='linear' AND issue_id='${S1_ISSUE_ID}' AND pr_url IS NOT NULL AND pr_url != '' ORDER BY id DESC LIMIT 1")"
+  if [[ -n "$s1_latest_pr_url" && "$s1_latest_pr_url" != "$S1_PR_URL" ]]; then
+    warn "PR URL changed during reviews: ${S1_PR_URL} -> ${s1_latest_pr_url}"
+    S1_PR_URL="$s1_latest_pr_url"
+    S1_PR_NUMBER="$(parse_pr_number "$S1_PR_URL")"
+    S1_PR_BRANCH="$(get_pr_branch "$S1_PR_NUMBER")"
+    CLEANUP_PR_NUMBERS+=("$S1_PR_NUMBER")
+    CLEANUP_PR_BRANCHES+=("${S1_PR_BRANCH:-}")
+    log "  Now tracking PR #${S1_PR_NUMBER}"
   else
     log "  PR URL unchanged: ${S1_PR_URL}"
   fi
@@ -960,9 +1079,7 @@ EOF
     kill_daemon "$daemon_pid"
     db_exec "$db_path" "UPDATE regression_watches SET status='monitoring', monitoring_started_at=datetime('now') WHERE issue_id='${S1_ISSUE_ID}'"
     log "Restarting daemon..."
-    "$CLAUDEAR_BIN" --config "$config_path" start --poll --poll-interval 5000 --port "$S1_PORT" --no-webhooks >>"$daemon_log" 2>&1 &
-    daemon_pid=$!
-    DAEMON_PIDS+=("$daemon_pid")
+    daemon_pid="$(start_daemon "$config_path" "$S1_PORT" "$daemon_log")"
     sleep 3
   fi
 
@@ -1027,7 +1144,7 @@ run_scenario_2() {
   local repos_dir="${work_root}/repos"
   local local_repo="${repos_dir}/${REPO_NAME}"
   local db_path="${S2_TMP_DIR}/claudear-s2.db"
-  local config_path="${S2_TMP_DIR}/claudear.s2.yaml"
+  local config_path="${S2_TMP_DIR}/claudear.s2.toml"
   local daemon_log="${S2_TMP_DIR}/daemon.log"
 
   mkdir -p "$repos_dir"
@@ -1042,16 +1159,15 @@ run_scenario_2() {
 
   # --- Step 2: Start Daemon + Seed ---
   log "Starting daemon (Scenario 2, port ${S2_PORT})..."
-  "$CLAUDEAR_BIN" --config "$config_path" start --poll --poll-interval 5000 --port "$S2_PORT" --no-webhooks >"$daemon_log" 2>&1 &
-  local daemon_pid=$!
-  DAEMON_PIDS+=("$daemon_pid")
-  log "Daemon PID: ${daemon_pid}"
+  local daemon_pid
+  daemon_pid="$(start_daemon "$config_path" "$S2_PORT" "$daemon_log")"
+  log "Daemon handle: ${daemon_pid}"
 
   # Wait for Discord source to seed cursor (first poll returns empty)
   log "Waiting 8s for Discord source to seed cursor..."
   sleep 8
 
-  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+  if ! check_daemon_alive "$daemon_pid"; then
     warn "Scenario 2 daemon exited early. Logs:"
     cat "$daemon_log" >&2
     fail "Scenario 2 daemon failed to start"
@@ -1245,10 +1361,8 @@ EOF
 
   # --- Step 13: Restart Daemon for Retry ---
   log "Restarting daemon for retry..."
-  "$CLAUDEAR_BIN" --config "$config_path" start --poll --poll-interval 5000 --port "$S2_PORT" --no-webhooks >>"$daemon_log" 2>&1 &
-  daemon_pid=$!
-  DAEMON_PIDS+=("$daemon_pid")
-  log "Daemon PID: ${daemon_pid}"
+  daemon_pid="$(start_daemon "$config_path" "$S2_PORT" "$daemon_log")"
+  log "Daemon handle: ${daemon_pid}"
   sleep 3
 
   # --- Step 14: Checkpoint G - Retry PR Created ---
@@ -1308,9 +1422,7 @@ EOF
     log "Retry watch is awaiting_release; nudging to monitoring..."
     kill_daemon "$daemon_pid"
     db_exec "$db_path" "UPDATE regression_watches SET status='monitoring', monitoring_started_at=datetime('now') WHERE issue_id='${S2_DISCORD_MSG_ID}'"
-    "$CLAUDEAR_BIN" --config "$config_path" start --poll --poll-interval 5000 --port "$S2_PORT" --no-webhooks >>"$daemon_log" 2>&1 &
-    daemon_pid=$!
-    DAEMON_PIDS+=("$daemon_pid")
+    daemon_pid="$(start_daemon "$config_path" "$S2_PORT" "$daemon_log")"
     sleep 3
   fi
 

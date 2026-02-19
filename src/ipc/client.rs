@@ -287,4 +287,115 @@ mod tests {
         let client = IpcClient::with_socket_path(path.clone());
         assert_eq!(client.socket_path, path);
     }
+
+    // === Constructor tests ===
+
+    #[test]
+    fn test_new_uses_default_path() {
+        let client = IpcClient::new();
+        let expected = super::super::default_socket_path();
+        assert_eq!(client.socket_path, expected);
+    }
+
+    #[test]
+    fn test_with_socket_path_uses_custom_path() {
+        let custom = PathBuf::from("/var/run/custom-claudear.sock");
+        let client = IpcClient::with_socket_path(custom.clone());
+        assert_eq!(client.socket_path, custom);
+    }
+
+    #[test]
+    fn test_new_uses_default_timeout() {
+        let client = IpcClient::new();
+        assert_eq!(client.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_with_socket_path_uses_default_timeout() {
+        let client = IpcClient::with_socket_path(PathBuf::from("/tmp/x.sock"));
+        assert_eq!(client.timeout, Duration::from_secs(30));
+    }
+
+    // === with_timeout tests ===
+
+    #[test]
+    fn test_with_timeout_sets_custom_timeout() {
+        let client = IpcClient::new().with_timeout(Duration::from_secs(120));
+        assert_eq!(client.timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_with_timeout_chained_with_socket_path() {
+        let path = PathBuf::from("/tmp/chained.sock");
+        let client =
+            IpcClient::with_socket_path(path.clone()).with_timeout(Duration::from_millis(500));
+        assert_eq!(client.socket_path, path);
+        assert_eq!(client.timeout, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_with_timeout_zero() {
+        let client = IpcClient::new().with_timeout(Duration::from_secs(0));
+        assert_eq!(client.timeout, Duration::from_secs(0));
+    }
+
+    // === is_daemon_running tests ===
+
+    #[test]
+    fn test_is_daemon_running_nonexistent_socket() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/nonexistent-claudear-test.sock"));
+        assert!(!client.is_daemon_running());
+    }
+
+    #[test]
+    fn test_is_daemon_running_path_is_regular_file() {
+        // Create a temp file that is NOT a socket
+        let tmp = std::env::temp_dir().join("claudear-test-not-a-socket.tmp");
+        std::fs::write(&tmp, "not a socket").unwrap();
+        let client = IpcClient::with_socket_path(tmp.clone());
+        assert!(!client.is_daemon_running());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // === send to non-existent socket tests ===
+
+    #[tokio::test]
+    async fn test_send_to_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.send(IpcCommand::Ping).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to connect to daemon"),
+            "Unexpected error message: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ping_nonexistent_socket_returns_false() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.ping().await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_status_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.status().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_trigger_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.trigger("linear", "LIN-1").await;
+        assert!(result.is_err());
+    }
 }

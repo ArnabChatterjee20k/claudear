@@ -1,15 +1,15 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { render, screen, cleanup, act } from "@testing-library/react";
-import { Router, useHash, useRouter } from "../src/router";
+import { Router, RouterProvider, useRouter } from "../src/router";
 
 afterEach(() => {
   cleanup();
   window.location.hash = "";
 });
 
-// Helper to test hooks via a component
-function UseHashHarness() {
-  const { path, navigate } = useHash();
+// Helper to test the router hook via a component
+function UseRouterHarness() {
+  const { path, navigate } = useRouter();
   return (
     <div>
       <span data-testid="path">{path}</span>
@@ -18,16 +18,24 @@ function UseHashHarness() {
   );
 }
 
-describe("useHash", () => {
+describe("RouterProvider", () => {
   test("defaults to '/' when no hash is set", () => {
     window.location.hash = "";
-    render(<UseHashHarness />);
+    render(
+      <RouterProvider>
+        <UseRouterHarness />
+      </RouterProvider>
+    );
     expect(screen.getByTestId("path").textContent).toBe("/");
   });
 
   test("reads hash from URL", () => {
     window.location.hash = "#/settings";
-    render(<UseHashHarness />);
+    render(
+      <RouterProvider>
+        <UseRouterHarness />
+      </RouterProvider>
+    );
     expect(screen.getByTestId("path").textContent).toBe("/settings");
   });
 });
@@ -39,7 +47,11 @@ describe("Router", () => {
       "/": () => <div>Home</div>,
       "/about": () => <div>About</div>,
     };
-    render(<Router routes={routes} />);
+    render(
+      <RouterProvider>
+        <Router routes={routes} />
+      </RouterProvider>
+    );
     expect(screen.getByText("About")).toBeTruthy();
   });
 
@@ -49,7 +61,11 @@ describe("Router", () => {
       "/": () => <div>Home</div>,
       "/about": () => <div>About</div>,
     };
-    render(<Router routes={routes} />);
+    render(
+      <RouterProvider>
+        <Router routes={routes} />
+      </RouterProvider>
+    );
     expect(screen.getByText("Home")).toBeTruthy();
   });
 
@@ -58,8 +74,11 @@ describe("Router", () => {
     const routes: Record<string, () => JSX.Element> = {
       "/about": () => <div>About</div>,
     };
-    const { container } = render(<Router routes={routes} />);
-    // The Provider is rendered but has no children content
+    const { container } = render(
+      <RouterProvider>
+        <Router routes={routes} />
+      </RouterProvider>
+    );
     expect(container.textContent).toBe("");
   });
 });
@@ -81,7 +100,11 @@ describe("useRouter", () => {
     const routes: Record<string, () => JSX.Element> = {
       "/dashboard": () => <Child />,
     };
-    render(<Router routes={routes} />);
+    render(
+      <RouterProvider>
+        <Router routes={routes} />
+      </RouterProvider>
+    );
     expect(screen.getByTestId("router-path").textContent).toBe("/dashboard");
   });
 });
@@ -89,7 +112,11 @@ describe("useRouter", () => {
 describe("Navigation", () => {
   test("calling navigate updates the hash", () => {
     window.location.hash = "#/";
-    render(<UseHashHarness />);
+    render(
+      <RouterProvider>
+        <UseRouterHarness />
+      </RouterProvider>
+    );
     act(() => {
       screen.getByText("go").click();
     });

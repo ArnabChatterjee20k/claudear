@@ -436,4 +436,170 @@ mod tests {
         assert_eq!(hooks[0].id, "1");
         assert_eq!(hooks[1].url, "https://example.com/hook2");
     }
+
+    // ── validate_slug tests ──
+
+    #[test]
+    fn test_validate_slug_valid_alphanumeric() {
+        assert!(validate_slug("my-project", "test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_slug_valid_with_dots() {
+        assert!(validate_slug("my.project.v2", "test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_slug_valid_with_underscores() {
+        assert!(validate_slug("my_project", "test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_slug_empty() {
+        let err = validate_slug("", "test").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("empty"), "expected 'empty' in error: {}", msg);
+    }
+
+    #[test]
+    fn test_validate_slug_with_slashes() {
+        let err = validate_slug("my/project", "test").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("invalid"),
+            "expected 'invalid' in error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_validate_slug_with_spaces() {
+        let err = validate_slug("my project", "test").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("invalid"),
+            "expected 'invalid' in error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_validate_slug_with_special_chars() {
+        let err = validate_slug("my@project!", "test").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("invalid"),
+            "expected 'invalid' in error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_validate_slug_unicode() {
+        // Note: Rust's is_alphanumeric() considers CJK characters as alphanumeric,
+        // so "日本語" passes validation. Use a non-alphanumeric Unicode symbol instead.
+        let err = validate_slug("project-\u{2603}", "test").unwrap_err(); // ☃ snowman
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("invalid"),
+            "expected 'invalid' in error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_validate_slug_single_char() {
+        assert!(validate_slug("a", "test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_slug_with_numbers_only() {
+        assert!(validate_slug("123", "test").is_ok());
+    }
+
+    // ── Deserialization tests ──
+
+    #[test]
+    fn test_sentry_error_response_deserialization() {
+        let json = r#"{"detail": "Project not found"}"#;
+        let resp: SentryErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.detail, Some("Project not found".to_string()));
+    }
+
+    #[test]
+    fn test_sentry_error_response_no_detail() {
+        let json = r#"{"detail": null}"#;
+        let resp: SentryErrorResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.detail.is_none());
+    }
+
+    #[test]
+    fn test_project_response_deserialization() {
+        let json = r#"{"slug": "my-project"}"#;
+        let resp: ProjectResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.slug, "my-project");
+    }
+
+    #[test]
+    fn test_hook_response_extra_fields_ignored() {
+        let json = r#"{
+            "id": "456",
+            "url": "https://example.com/hook",
+            "secret": "s3cret",
+            "events": ["event.alert"],
+            "status": "active",
+            "dateCreated": "2024-06-15T12:00:00Z",
+            "unknownField": true,
+            "nested": {"key": "value"}
+        }"#;
+        let resp: HookResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.id, "456");
+        assert_eq!(resp.url, "https://example.com/hook");
+        assert_eq!(resp.secret, "s3cret");
+        assert_eq!(resp.events, vec!["event.alert"]);
+    }
+
+    #[test]
+    fn test_hook_list_item_empty_events() {
+        let json = r#"{"id": "99", "url": "https://example.com/hook", "events": []}"#;
+        let item: HookListItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.id, "99");
+        assert!(item.events.is_empty());
+    }
+
+    // ── Struct field tests ──
+
+    #[test]
+    fn test_sentry_webhook_registration_clone() {
+        let original = SentryWebhookRegistration {
+            id: "hook_1".to_string(),
+            url: "https://example.com/wh".to_string(),
+            secret: "secret_val".to_string(),
+            events: vec!["event.created".to_string(), "event.alert".to_string()],
+            project_slug: "proj-a".to_string(),
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned.id, original.id);
+        assert_eq!(cloned.url, original.url);
+        assert_eq!(cloned.secret, original.secret);
+        assert_eq!(cloned.events, original.events);
+        assert_eq!(cloned.project_slug, original.project_slug);
+    }
+
+    #[test]
+    fn test_create_hook_request_events_order() {
+        let request = CreateHookRequest {
+            url: "https://example.com/hook".to_string(),
+            events: vec![
+                "event.created".to_string(),
+                "event.alert".to_string(),
+                "issue.assigned".to_string(),
+            ],
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(events[0], "event.created");
+        assert_eq!(events[1], "event.alert");
+        assert_eq!(events[2], "issue.assigned");
+    }
 }

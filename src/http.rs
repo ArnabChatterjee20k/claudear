@@ -1,6 +1,7 @@
-//! Shared HTTP response type used by source and client HTTP abstractions.
+//! Shared HTTP types used by source and client HTTP abstractions.
 
 use crate::error::{Error, Result};
+use async_trait::async_trait;
 
 /// HTTP response abstraction for testability.
 ///
@@ -27,6 +28,51 @@ impl HttpResponse {
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_str(&self.body)
             .map_err(|e| Error::Other(format!("JSON parse error: {}", e)))
+    }
+}
+
+/// Trait for HTTP client operations to enable testing.
+#[async_trait]
+pub trait HttpClient: Send + Sync {
+    /// Perform a GET request with headers.
+    async fn get(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse>;
+}
+
+/// Default HTTP client using reqwest.
+pub struct ReqwestHttpClient {
+    client: reqwest::Client,
+}
+
+impl ReqwestHttpClient {
+    /// Create a new reqwest-based HTTP client.
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        }
+    }
+}
+
+impl Default for ReqwestHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl HttpClient for ReqwestHttpClient {
+    async fn get(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+        let mut request = self.client.get(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(HttpResponse { status, body })
     }
 }
 

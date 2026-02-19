@@ -153,6 +153,70 @@ impl GitOps {
         Ok(())
     }
 
+    /// Create a git worktree checked out on a local branch.
+    ///
+    /// Unlike [`create_worktree`] (detached HEAD), this creates/resets a local
+    /// branch at `start_point` so that subsequent pushes target the correct
+    /// remote branch.  Used for review-driven reruns where Claude must push to
+    /// an existing PR branch.
+    pub async fn create_worktree_on_branch(
+        repo_path: &Path,
+        worktree_path: &Path,
+        branch: &str,
+        start_point: &str,
+    ) -> Result<()> {
+        validate_ref(branch, "branch")?;
+        validate_ref(start_point, "start point")?;
+
+        // Crash recovery: remove stale worktree
+        if worktree_path.exists() {
+            tracing::warn!(worktree = ?worktree_path, "Stale worktree found, removing");
+            Self::remove_worktree(repo_path, worktree_path).await?;
+        }
+
+        // Create parent directory
+        if let Some(parent) = worktree_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                Error::io(format!(
+                    "Failed to create worktree parent directory {:?}: {}",
+                    parent, e
+                ))
+            })?;
+        }
+
+        tracing::info!(
+            repo = ?repo_path,
+            worktree = ?worktree_path,
+            branch = %branch,
+            start_point = %start_point,
+            "Creating worktree on branch"
+        );
+
+        // -B creates (or resets) the local branch at start_point.
+        let output = Command::new("git")
+            .args(["worktree", "add", "-B"])
+            .arg(branch)
+            .arg(worktree_path)
+            .arg(start_point)
+            .current_dir(repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| Error::io(format!("Failed to execute git worktree add: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::git(format!(
+                "git worktree add -B {} failed: {}",
+                branch, stderr
+            )));
+        }
+
+        tracing::info!(worktree = ?worktree_path, branch = %branch, "Worktree created on branch");
+        Ok(())
+    }
+
     /// Remove a git worktree and clean up.
     pub async fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
         tracing::debug!(
@@ -355,7 +419,196 @@ pub fn worktree_path(work_dir: &Path, repo_name: &str, issue_short_id: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as StdCommand;
     use tempfile::TempDir;
+
+    // ── Helper: create a real git repo with an initial commit ──
+
+    /// Create a bare-minimum git repo in `path` with one commit on "main".
+    fn init_git_repo(path: &Path) {
+        StdCommand::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(path)
+            .output()
+            .expect("git init failed");
+
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(path)
+            .output()
+            .expect("git config email failed");
+
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(path)
+            .output()
+            .expect("git config name failed");
+
+        std::fs::write(path.join("README.md"), "# test\n").unwrap();
+
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .expect("git add failed");
+
+        StdCommand::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(path)
+            .output()
+            .expect("git commit failed");
+    }
+
+    /// Create a second commit so the repo has some history.
+    fn add_second_commit(path: &Path) {
+        std::fs::write(path.join("file2.txt"), "second file\n").unwrap();
+
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .expect("git add failed");
+
+        StdCommand::new("git")
+            .args(["commit", "-m", "second commit"])
+            .current_dir(path)
+            .output()
+            .expect("git commit failed");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  validate_ref
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_validate_ref_accepts_simple_branch() {
+        assert!(validate_ref("main", "branch").is_ok());
+        assert!(validate_ref("develop", "branch").is_ok());
+        assert!(validate_ref("feature/my-thing", "branch").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_accepts_slashes_dots_underscores() {
+        assert!(validate_ref("release/v1.2.3", "tag").is_ok());
+        assert!(validate_ref("feature_branch", "branch").is_ok());
+        assert!(validate_ref("user/feature.name", "branch").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_accepts_at_in_middle() {
+        // '@' is allowed in the middle but bare "@" is rejected
+        assert!(validate_ref("user@feature", "branch").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_empty() {
+        let result = validate_ref("", "branch");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("disallowed"));
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_bare_at() {
+        let result = validate_ref("@", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_leading_dash() {
+        let result = validate_ref("-evil", "branch");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("disallowed"));
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_double_dot() {
+        let result = validate_ref("main..evil", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_semicolon() {
+        let result = validate_ref("main;evil", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_space() {
+        let result = validate_ref("main evil", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_backtick() {
+        let result = validate_ref("main`evil`", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_pipe() {
+        let result = validate_ref("main|evil", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_dollar() {
+        let result = validate_ref("$HOME", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_tilde() {
+        let result = validate_ref("HEAD~1", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_caret() {
+        let result = validate_ref("HEAD^", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_colon() {
+        let result = validate_ref("refs:heads", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_question_mark() {
+        let result = validate_ref("branch?", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_asterisk() {
+        let result = validate_ref("branch*", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_bracket() {
+        let result = validate_ref("branch[0]", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_error_message_includes_label() {
+        let result = validate_ref("--evil", "checkout ref");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("checkout ref"), "error was: {}", err);
+    }
+
+    #[test]
+    fn test_validate_ref_error_message_includes_value() {
+        let result = validate_ref("--evil", "branch");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("--evil"), "error was: {}", err);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  is_git_repo
+    // ════════════════════════════════════════════════════════════
 
     #[test]
     fn test_is_git_repo_true() {
@@ -385,6 +638,36 @@ mod tests {
     }
 
     #[test]
+    fn test_is_git_repo_real_repo() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        assert!(GitOps::is_git_repo(temp.path()));
+    }
+
+    #[test]
+    fn test_is_git_repo_empty_git_dir() {
+        // .git directory exists but is empty - still counts as a git repo
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        assert!(GitOps::is_git_repo(temp.path()));
+    }
+
+    #[test]
+    fn test_is_git_repo_nested_dir_is_not_repo() {
+        // A subdirectory inside a git repo is not itself detected as a git repo
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        let sub = temp.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        // subdir does not have its own .git
+        assert!(!GitOps::is_git_repo(&sub));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  worktree_path (the free function)
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
     fn test_worktree_path_simple() {
         let p = worktree_path(Path::new("/work"), "owner/repo", "ABC-123");
         assert_eq!(p, PathBuf::from("/work/repo-worktrees/ABC-123"));
@@ -396,12 +679,179 @@ mod tests {
         assert_eq!(p, PathBuf::from("/work/repo-worktrees/XYZ-1"));
     }
 
+    #[test]
+    fn test_worktree_path_deep_owner() {
+        // Only the last path component is used
+        let p = worktree_path(Path::new("/work"), "org/team/repo", "ISSUE-1");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/ISSUE-1"));
+    }
+
+    #[test]
+    fn test_worktree_path_sanitizes_slashes_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "feat/issue");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/feat_issue"));
+    }
+
+    #[test]
+    fn test_worktree_path_sanitizes_backslash_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "feat\\issue");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/feat_issue"));
+    }
+
+    #[test]
+    fn test_worktree_path_sanitizes_dot_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "v1.2.3");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/v1_2_3"));
+    }
+
+    #[test]
+    fn test_worktree_path_sanitizes_null_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "issue\0evil");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/issue_evil"));
+    }
+
+    #[test]
+    fn test_worktree_path_sanitizes_repo_name_with_slashes() {
+        // The repo_name short extraction uses split('/').next_back()
+        // then sanitizes slashes/backslashes/nulls in the short name
+        let p = worktree_path(Path::new("/tmp"), "owner/my-repo", "ID-1");
+        assert_eq!(p, PathBuf::from("/tmp/my-repo-worktrees/ID-1"));
+    }
+
+    #[test]
+    fn test_worktree_path_sanitizes_null_in_repo_name() {
+        let p = worktree_path(Path::new("/tmp"), "evil\0repo", "ID-1");
+        assert_eq!(p, PathBuf::from("/tmp/evil_repo-worktrees/ID-1"));
+    }
+
+    #[test]
+    fn test_worktree_path_empty_repo_name() {
+        // edge case: empty string - split('/').next_back() returns Some("")
+        let p = worktree_path(Path::new("/work"), "", "ID-1");
+        assert_eq!(p, PathBuf::from("/work/-worktrees/ID-1"));
+    }
+
+    #[test]
+    fn test_worktree_path_empty_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/"));
+    }
+
+    #[test]
+    fn test_worktree_path_complex_work_dir() {
+        let p = worktree_path(
+            Path::new("/var/lib/claudear/workspaces"),
+            "myorg/backend",
+            "JIRA-4567",
+        );
+        assert_eq!(
+            p,
+            PathBuf::from("/var/lib/claudear/workspaces/backend-worktrees/JIRA-4567")
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  current_branch (async, real git repo)
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_current_branch_on_main() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let branch = GitOps::current_branch(temp.path()).await.unwrap();
+        assert_eq!(branch, "main");
+    }
+
+    #[tokio::test]
+    async fn test_current_branch_after_checkout() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        StdCommand::new("git")
+            .args(["checkout", "-b", "feature/test-branch"])
+            .current_dir(temp.path())
+            .output()
+            .expect("checkout -b failed");
+
+        let branch = GitOps::current_branch(temp.path()).await.unwrap();
+        assert_eq!(branch, "feature/test-branch");
+    }
+
+    #[tokio::test]
+    async fn test_current_branch_detached_head() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        add_second_commit(temp.path());
+
+        // Detach HEAD at the first commit
+        StdCommand::new("git")
+            .args(["checkout", "HEAD~1"])
+            .current_dir(temp.path())
+            .output()
+            .expect("detach head failed");
+
+        let branch = GitOps::current_branch(temp.path()).await.unwrap();
+        // git rev-parse --abbrev-ref HEAD returns "HEAD" when detached
+        assert_eq!(branch, "HEAD");
+    }
+
+    #[tokio::test]
+    async fn test_current_branch_non_git_dir() {
+        let temp = TempDir::new().unwrap();
+        let result = GitOps::current_branch(temp.path()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("git rev-parse failed"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_current_branch_nonexistent_path() {
+        let result = GitOps::current_branch(Path::new("/nonexistent/path/xyz")).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_current_branch_multiple_branches() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        // Create several branches and switch back to main
+        for name in &["branch-a", "branch-b", "branch-c"] {
+            StdCommand::new("git")
+                .args(["branch", name])
+                .current_dir(temp.path())
+                .output()
+                .unwrap();
+        }
+
+        let branch = GitOps::current_branch(temp.path()).await.unwrap();
+        assert_eq!(branch, "main");
+
+        // Now switch
+        StdCommand::new("git")
+            .args(["checkout", "branch-b"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        let branch = GitOps::current_branch(temp.path()).await.unwrap();
+        assert_eq!(branch, "branch-b");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  ensure_repo_at_path - clone path (URL validation)
+    // ════════════════════════════════════════════════════════════
+
     #[tokio::test]
     async fn test_clone_rejects_option_injection() {
         let temp = TempDir::new().unwrap();
         let target = temp.path().join("repo");
 
-        // URL starting with '-' should be rejected (option injection)
         let result = GitOps::ensure_repo_at_path(&target, "--upload-pack=evil", "main").await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -444,9 +894,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clone_invalid_url_git_error() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("repo");
+
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://nonexistent.invalid/repo.git", "main")
+                .await;
+        assert!(result.is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  ensure_repo_at_path - pull path (branch validation)
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
     async fn test_pull_rejects_option_injection_in_branch() {
         let temp = TempDir::new().unwrap();
-        // Create a directory to trigger the pull path (repo_path.exists() = true)
         std::fs::create_dir_all(temp.path().join("repo")).unwrap();
         let target = temp.path().join("repo");
 
@@ -484,23 +948,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clone_invalid_url_git_error() {
+    async fn test_pull_rejects_empty_branch() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("repo")).unwrap();
+        let target = temp.path().join("repo");
+
+        let result = GitOps::ensure_repo_at_path(&target, "https://example.com/repo.git", "").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("disallowed"));
+    }
+
+    #[tokio::test]
+    async fn test_pull_rejects_at_branch() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("repo")).unwrap();
+        let target = temp.path().join("repo");
+
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://example.com/repo.git", "@").await;
+        assert!(result.is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  ensure_repo_at_path - local clone from file:// URL
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_ensure_repo_at_path_clones_local_repo() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+
+        let url = format!("file://{}", origin.path().display());
+        let result = GitOps::ensure_repo_at_path(&target, &url, "main").await;
+        assert!(result.is_ok(), "clone failed: {:?}", result.unwrap_err());
+        assert!(target.join(".git").exists());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_repo_at_path_pulls_when_exists() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        // Clone it first
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+
+        let url = format!("file://{}", origin.path().display());
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        // Add a second commit to origin
+        add_second_commit(origin.path());
+
+        // Pull again - should succeed (repo already exists)
+        let result = GitOps::ensure_repo_at_path(&target, &url, "main").await;
+        assert!(result.is_ok(), "pull failed: {:?}", result.unwrap_err());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  ensure_repo_fetched
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_ensure_repo_fetched_clones_when_missing() {
         let temp = TempDir::new().unwrap();
         let target = temp.path().join("repo");
 
-        // Valid URL format but nonexistent - git clone should fail
         let result =
-            GitOps::ensure_repo_at_path(&target, "https://nonexistent.invalid/repo.git", "main")
-                .await;
+            GitOps::ensure_repo_fetched(&target, "https://nonexistent.invalid/repo.git").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_current_branch_non_git_dir() {
-        let temp = TempDir::new().unwrap();
-        let result = GitOps::current_branch(temp.path()).await;
-        assert!(result.is_err());
+    async fn test_ensure_repo_fetched_fetches_when_exists() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+
+        let url = format!("file://{}", origin.path().display());
+        // Clone first
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        // Now ensure_repo_fetched should just fetch
+        let result = GitOps::ensure_repo_fetched(&target, &url).await;
+        assert!(result.is_ok(), "fetch failed: {:?}", result.unwrap_err());
     }
+
+    // ════════════════════════════════════════════════════════════
+    //  fetch_branch
+    // ════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_fetch_branch_rejects_injection() {
@@ -512,6 +1057,109 @@ mod tests {
             .to_string()
             .contains("disallowed characters"));
     }
+
+    #[tokio::test]
+    async fn test_fetch_branch_rejects_empty() {
+        let result = GitOps::fetch_branch(Path::new("/tmp"), "").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_branch_rejects_double_dot() {
+        let result = GitOps::fetch_branch(Path::new("/tmp"), "a..b").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_branch_on_real_repo() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        // Create a branch in origin
+        StdCommand::new("git")
+            .args(["branch", "feature-x"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+        let url = format!("file://{}", origin.path().display());
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        // Fetch the branch
+        let result = GitOps::fetch_branch(&target, "feature-x").await;
+        assert!(
+            result.is_ok(),
+            "fetch_branch failed: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_branch_nonexistent_branch() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+        let url = format!("file://{}", origin.path().display());
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        let result = GitOps::fetch_branch(&target, "nonexistent-branch").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("git fetch branch failed"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  fetch_all
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_fetch_all_on_cloned_repo() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+        let url = format!("file://{}", origin.path().display());
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        let result = GitOps::fetch_all(&target).await;
+        assert!(
+            result.is_ok(),
+            "fetch_all failed: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_non_git_dir() {
+        let temp = TempDir::new().unwrap();
+        let result = GitOps::fetch_all(temp.path()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("git fetch failed"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  create_worktree / remove_worktree (real git operations)
+    // ════════════════════════════════════════════════════════════
 
     #[tokio::test]
     async fn test_create_worktree_rejects_injection() {
@@ -526,13 +1174,748 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_repo_fetched_clones_when_missing() {
+    async fn test_create_worktree_rejects_empty_ref() {
+        let temp = TempDir::new().unwrap();
+        let wt = temp.path().join("wt");
+        let result = GitOps::create_worktree(temp.path(), &wt, "").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_and_remove_worktree() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_parent = temp.path().join("my-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("wt1");
+
+        // Create worktree at HEAD (detached)
+        let result = GitOps::create_worktree(temp.path(), &wt_path, "main").await;
+        assert!(
+            result.is_ok(),
+            "create_worktree failed: {:?}",
+            result.unwrap_err()
+        );
+        assert!(wt_path.exists());
+        assert!(wt_path.join("README.md").exists());
+
+        // The worktree should have .git as a file (not a directory)
+        let git_path = wt_path.join(".git");
+        assert!(git_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn test_create_worktree_non_git_dir_fails() {
+        let temp = TempDir::new().unwrap();
+        let wt_path = temp.path().join("wt");
+
+        let result = GitOps::create_worktree(temp.path(), &wt_path, "main").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_worktree_invalid_ref_fails() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_path = temp.path().join("wt");
+        // "nonexistent-branch" doesn't exist
+        let result = GitOps::create_worktree(temp.path(), &wt_path, "nonexistent-branch").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_worktree_stale_recovery() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_parent = temp.path().join("test-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("wt1");
+
+        // Create worktree once
+        GitOps::create_worktree(temp.path(), &wt_path, "main")
+            .await
+            .unwrap();
+        assert!(wt_path.exists());
+
+        // Creating the same worktree again should succeed (stale recovery)
+        let result = GitOps::create_worktree(temp.path(), &wt_path, "main").await;
+        assert!(
+            result.is_ok(),
+            "stale worktree recovery failed: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  create_worktree_on_branch
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_create_worktree_on_branch_rejects_invalid_branch() {
+        let temp = TempDir::new().unwrap();
+        let wt = temp.path().join("wt");
+        let result = GitOps::create_worktree_on_branch(temp.path(), &wt, "--evil", "main").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("disallowed characters"));
+    }
+
+    #[tokio::test]
+    async fn test_create_worktree_on_branch_rejects_invalid_start_point() {
+        let temp = TempDir::new().unwrap();
+        let wt = temp.path().join("wt");
+        let result =
+            GitOps::create_worktree_on_branch(temp.path(), &wt, "my-branch", "--evil").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("disallowed characters"));
+    }
+
+    #[tokio::test]
+    async fn test_create_worktree_on_branch_success() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_parent = temp.path().join("branch-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("wt1");
+
+        let result =
+            GitOps::create_worktree_on_branch(temp.path(), &wt_path, "feature-branch", "main")
+                .await;
+        assert!(
+            result.is_ok(),
+            "create_worktree_on_branch failed: {:?}",
+            result.unwrap_err()
+        );
+        assert!(wt_path.exists());
+
+        // The worktree should be on the named branch, not detached
+        let branch_output = StdCommand::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap();
+        let branch = String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string();
+        assert_eq!(branch, "feature-branch");
+    }
+
+    #[tokio::test]
+    async fn test_create_worktree_on_branch_stale_recovery() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_parent = temp.path().join("recover-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("wt1");
+
+        GitOps::create_worktree_on_branch(temp.path(), &wt_path, "branch-a", "main")
+            .await
+            .unwrap();
+
+        // Creating again with a different branch - should remove stale and recreate
+        let result =
+            GitOps::create_worktree_on_branch(temp.path(), &wt_path, "branch-b", "main").await;
+        assert!(
+            result.is_ok(),
+            "stale recovery failed: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  remove_worktree
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_remove_worktree_nonexistent_is_ok() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        // Removing a worktree that doesn't exist just logs a warning
+        let wt_parent = temp.path().join("foo-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("nope");
+
+        // Should not fail catastrophically
+        let result = GitOps::remove_worktree(temp.path(), &wt_path).await;
+        // The git command might fail but it should not propagate as error
+        // since the dir doesn't exist, the fallback rm is skipped
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_remove_worktree_refuses_outside_worktrees_area() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        // Simulate a worktree directory outside the *-worktrees naming convention.
+        // The remove function should refuse to rm -rf it.
+        let bad_dir = temp.path().join("unsafe-area").join("wt");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+
+        let result = GitOps::remove_worktree(temp.path(), &bad_dir).await;
+        // The git worktree remove command will fail (it's not a real worktree)
+        // but the safety check should catch that the parent doesn't end in "-worktrees"
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Refusing to remove"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  has_uncommitted_changes (via git status in a real repo)
+    //  Note: no has_uncommitted_changes method exists, but we
+    //  verify the detection pattern using current_branch + git status
+    // ════════════════════════════════════════════════════════════
+
+    // ════════════════════════════════════════════════════════════
+    //  ensure_repo_at_path - pull integration test
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_ensure_repo_at_path_pull_updates_branch() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+        let url = format!("file://{}", origin.path().display());
+
+        // Clone
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        // Verify initial commit
+        let log = StdCommand::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let initial_log = String::from_utf8_lossy(&log.stdout);
+        assert!(initial_log.contains("initial commit"));
+
+        // Add a commit to origin
+        add_second_commit(origin.path());
+
+        // Pull
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        // Verify second commit is now present
+        let log = StdCommand::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let updated_log = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            updated_log.contains("second commit"),
+            "pull did not bring second commit: {}",
+            updated_log
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Edge cases for URL validation in clone
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_clone_rejects_url_with_backtick() {
         let temp = TempDir::new().unwrap();
         let target = temp.path().join("repo");
 
-        // Nonexistent URL should fail at clone, not panic
+        // Backtick in URL - the clone function currently only checks for -, ;, |, $
+        // so backtick should be passed to git which may fail
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://example.com/`evil`", "main").await;
+        // This should fail at clone (invalid URL) even if our check doesn't catch it
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_clone_accepts_valid_https_url_format() {
+        // Verify that valid URL formats pass URL validation (they'll fail at git level
+        // because the host doesn't exist, but they shouldn't be blocked by our check)
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("repo");
+
+        let result = GitOps::ensure_repo_at_path(
+            &target,
+            "https://github.com/valid-org/valid-repo.git",
+            "main",
+        )
+        .await;
+        // Should fail because host is reachable but repo doesn't exist, or DNS fails
+        // The important thing is it's NOT blocked by our URL validation
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("git clone failed"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  validate_ref - boundary / allowed characters
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_validate_ref_allows_numeric_only() {
+        assert!(validate_ref("12345", "branch").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_allows_single_char() {
+        assert!(validate_ref("a", "branch").is_ok());
+        assert!(validate_ref("1", "branch").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_allows_mixed_case() {
+        assert!(validate_ref("Feature/MyBranch", "branch").is_ok());
+        assert!(validate_ref("UPPERCASE", "branch").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_allows_dots() {
+        assert!(validate_ref("v1.2.3", "tag").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_only_dots_dot_dot() {
+        // ".." is rejected because it contains ".."
+        let result = validate_ref("..", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_allows_single_dot() {
+        // A single dot is ok (no ".." substring)
+        assert!(validate_ref(".", "branch").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_newline() {
+        let result = validate_ref("main\nevil", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_null_byte() {
+        let result = validate_ref("main\0evil", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_hash() {
+        let result = validate_ref("branch#1", "branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_curly_braces() {
+        let result = validate_ref("stash@{0}", "ref");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_backslash() {
+        let result = validate_ref("path\\name", "ref");
+        assert!(result.is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Worktree path edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_worktree_path_trailing_slash_in_repo_name() {
+        // split('/').next_back() on "owner/repo/" returns ""
+        let p = worktree_path(Path::new("/work"), "owner/repo/", "ID-1");
+        assert_eq!(p, PathBuf::from("/work/-worktrees/ID-1"));
+    }
+
+    #[test]
+    fn test_worktree_path_preserves_dashes_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "ABC-123-DEF");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/ABC-123-DEF"));
+    }
+
+    #[test]
+    fn test_worktree_path_preserves_underscores_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "my_issue_123");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/my_issue_123"));
+    }
+
+    #[test]
+    fn test_worktree_path_multiple_dots_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "a.b.c.d");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/a_b_c_d"));
+    }
+
+    #[test]
+    fn test_worktree_path_mixed_special_chars_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "a/b\\c.d\0e");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/a_b_c_d_e"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Integration: clone, branch, current_branch round-trip
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_clone_and_verify_branch() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+        let url = format!("file://{}", origin.path().display());
+
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        let branch = GitOps::current_branch(&target).await.unwrap();
+        assert_eq!(branch, "main");
+    }
+
+    #[tokio::test]
+    async fn test_worktree_current_branch_is_detached() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_parent = temp.path().join("detach-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("wt");
+
+        GitOps::create_worktree(temp.path(), &wt_path, "main")
+            .await
+            .unwrap();
+
+        // Detached worktree should report HEAD
+        let branch = GitOps::current_branch(&wt_path).await.unwrap();
+        assert_eq!(branch, "HEAD");
+    }
+
+    #[tokio::test]
+    async fn test_worktree_on_branch_current_branch() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_parent = temp.path().join("named-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("wt");
+
+        GitOps::create_worktree_on_branch(temp.path(), &wt_path, "my-feature", "main")
+            .await
+            .unwrap();
+
+        let branch = GitOps::current_branch(&wt_path).await.unwrap();
+        assert_eq!(branch, "my-feature");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Integration: fetch_all picks up new branches
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_fetch_all_picks_up_new_branch() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+        let url = format!("file://{}", origin.path().display());
+
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        // Create a new branch in origin
+        StdCommand::new("git")
+            .args(["branch", "new-feature"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
+        // Fetch all
+        GitOps::fetch_all(&target).await.unwrap();
+
+        // Verify remote branch is available
+        let output = StdCommand::new("git")
+            .args(["branch", "-r"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let branches = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            branches.contains("origin/new-feature"),
+            "new-feature not found in remote branches: {}",
+            branches
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Integration: is_git_repo on worktree
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_is_git_repo_on_worktree() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_parent = temp.path().join("isgit-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("wt");
+
+        GitOps::create_worktree(temp.path(), &wt_path, "main")
+            .await
+            .unwrap();
+
+        // Worktree has .git as a file, is_git_repo should return true
+        assert!(GitOps::is_git_repo(&wt_path));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Error handling: various non-git-directory scenarios
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_fetch_all_on_empty_dir() {
+        let temp = TempDir::new().unwrap();
+        let result = GitOps::fetch_all(temp.path()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_branch_on_non_repo() {
+        let temp = TempDir::new().unwrap();
+        let result = GitOps::fetch_branch(temp.path(), "main").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_current_branch_on_empty_repo_no_commits() {
+        let temp = TempDir::new().unwrap();
+
+        // git init without any commits
+        StdCommand::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        // rev-parse --abbrev-ref HEAD on a repo with no commits should fail
+        let result = GitOps::current_branch(temp.path()).await;
+        assert!(result.is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Validate ref: comprehensive injection patterns
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_validate_ref_rejects_various_shell_metacharacters() {
+        let bad_refs = vec![
+            "$(whoami)",
+            "`id`",
+            "a;b",
+            "a|b",
+            "a&b",
+            "a>b",
+            "a<b",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a'b",
+            "a\"b",
+            "a!b",
+            "a#b",
+            "a%b",
+            "a(b)",
+            "a{b}",
+            "a=b",
+            "a+b",
+            "a,b",
+        ];
+        for bad in bad_refs {
+            let result = validate_ref(bad, "ref");
+            assert!(
+                result.is_err(),
+                "validate_ref should have rejected {:?}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_ref_accepts_all_allowed_characters() {
+        // Every character that should be individually allowed
+        let good = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./a@b";
+        assert!(validate_ref(good, "ref").is_ok());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  create_worktree_on_branch with double-dot rejection
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_create_worktree_on_branch_rejects_dotdot_in_branch() {
+        let temp = TempDir::new().unwrap();
+        let wt = temp.path().join("wt");
+        let result = GitOps::create_worktree_on_branch(temp.path(), &wt, "a..b", "main").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_worktree_on_branch_rejects_dotdot_in_start_point() {
+        let temp = TempDir::new().unwrap();
+        let wt = temp.path().join("wt");
+        let result = GitOps::create_worktree_on_branch(temp.path(), &wt, "branch", "a..b").await;
+        assert!(result.is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  ensure_repo_at_path: chooses clone vs pull correctly
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_ensure_repo_at_path_path_not_exist_triggers_clone() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("does_not_exist");
+
+        // With a nonexistent target, it should try to clone (which fails because
+        // the URL is fake)
+        let result =
+            GitOps::ensure_repo_at_path(&target, "https://nonexistent.invalid/repo.git", "main")
+                .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("git clone failed"), "unexpected: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_repo_at_path_path_exists_triggers_pull() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("exists");
+        std::fs::create_dir_all(&target).unwrap();
+
+        // With an existing target, it should try to pull (which fails because
+        // branch validation rejects "--evil")
+        let result = GitOps::ensure_repo_at_path(&target, "https://x.com/r.git", "--evil").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("disallowed characters"), "unexpected: {}", err);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  ensure_repo_fetched: chooses clone vs fetch correctly
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_ensure_repo_fetched_path_not_exist_triggers_clone() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("nope");
+
         let result =
             GitOps::ensure_repo_fetched(&target, "https://nonexistent.invalid/repo.git").await;
         assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("git clone failed"), "unexpected: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_repo_fetched_path_exists_triggers_fetch() {
+        let temp = TempDir::new().unwrap();
+        // Just an empty directory
+        let target = temp.path().join("exists");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let result =
+            GitOps::ensure_repo_fetched(&target, "https://nonexistent.invalid/repo.git").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // Should have tried fetch (not clone) since the path exists
+        assert!(err.contains("git fetch failed"), "unexpected: {}", err);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Worktree path with repo names that need sanitization
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_worktree_path_backslash_in_repo_name() {
+        let p = worktree_path(Path::new("/work"), "owner\\repo", "ID");
+        // split('/') won't split on backslash, so last component is "owner\\repo"
+        // then replace removes backslashes
+        assert_eq!(p, PathBuf::from("/work/owner_repo-worktrees/ID"));
+    }
+
+    #[test]
+    fn test_worktree_path_null_in_both() {
+        let p = worktree_path(Path::new("/work"), "re\0po", "is\0sue");
+        assert_eq!(p, PathBuf::from("/work/re_po-worktrees/is_sue"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Integration: full workflow - clone, fetch, worktree
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_full_workflow_clone_branch_worktree() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+        add_second_commit(origin.path());
+
+        let workspace = TempDir::new().unwrap();
+        let repo_path = workspace.path().join("repo");
+        let url = format!("file://{}", origin.path().display());
+
+        // 1) Clone
+        GitOps::ensure_repo_at_path(&repo_path, &url, "main")
+            .await
+            .unwrap();
+
+        // 2) Verify current branch
+        let branch = GitOps::current_branch(&repo_path).await.unwrap();
+        assert_eq!(branch, "main");
+
+        // 3) Create a worktree on a named branch
+        let wt_parent = workspace.path().join("test-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("fix-123");
+
+        GitOps::create_worktree_on_branch(&repo_path, &wt_path, "fix/issue-123", "main")
+            .await
+            .unwrap();
+
+        // 4) Verify worktree branch
+        let wt_branch = GitOps::current_branch(&wt_path).await.unwrap();
+        assert_eq!(wt_branch, "fix/issue-123");
+
+        // 5) Verify worktree is detected as a git repo
+        assert!(GitOps::is_git_repo(&wt_path));
+
+        // 6) Main repo is still on main
+        let main_branch = GitOps::current_branch(&repo_path).await.unwrap();
+        assert_eq!(main_branch, "main");
     }
 }

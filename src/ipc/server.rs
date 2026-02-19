@@ -623,4 +623,737 @@ mod tests {
         assert!(!state.paused.load(Ordering::SeqCst));
         assert_eq!(state.issues_processed.load(Ordering::SeqCst), 0);
     }
+
+    // ── Mocks and helpers ──────────────────────────────────────────
+
+    use crate::error::Result as CrateResult;
+    use crate::notifier::Notifier;
+    use crate::source::IssueSource;
+    use crate::storage::SqliteTracker;
+    use crate::types::{Issue, MatchPriority, MatchResult};
+    use async_trait::async_trait;
+
+    /// Minimal mock for `IssueSource`.
+    struct MockSource {
+        source_name: String,
+    }
+
+    impl MockSource {
+        fn new(name: &str) -> Self {
+            Self {
+                source_name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IssueSource for MockSource {
+        fn name(&self) -> &str {
+            &self.source_name
+        }
+        fn display_name(&self) -> &str {
+            &self.source_name
+        }
+        async fn fetch_issues(&self) -> CrateResult<Vec<Issue>> {
+            Ok(vec![])
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("test", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, _issue: &Issue) -> CrateResult<String> {
+            Ok(String::new())
+        }
+        async fn get_issue(&self, _id: &str) -> CrateResult<Issue> {
+            Err(crate::error::Error::issue_not_found(
+                &self.source_name,
+                "mock",
+            ))
+        }
+    }
+
+    /// Minimal mock for `Notifier`.
+    struct MockNotifier;
+
+    #[async_trait]
+    impl Notifier for MockNotifier {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        async fn notify_start(&self, _issue: &Issue) -> CrateResult<()> {
+            Ok(())
+        }
+        async fn notify_success(&self, _issue: &Issue, _pr_url: &str) -> CrateResult<()> {
+            Ok(())
+        }
+        async fn notify_completed(&self, _issue: &Issue) -> CrateResult<()> {
+            Ok(())
+        }
+        async fn notify_failed(&self, _issue: &Issue, _error: &str) -> CrateResult<()> {
+            Ok(())
+        }
+        async fn notify_status(&self, _message: &str) -> CrateResult<()> {
+            Ok(())
+        }
+        async fn notify_urgent_issues(&self, _issues: &[Issue]) -> CrateResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a `ServerState` for tests. The `mode` is set to "test"
+    /// and `max_activity_entries` is configurable.
+    fn test_state(max_activity: usize, max_retries: u32) -> Arc<ServerState> {
+        Arc::new(ServerState {
+            paused: AtomicBool::new(false),
+            start_time: Instant::now(),
+            issues_processed: AtomicUsize::new(0),
+            prs_created: AtomicUsize::new(0),
+            processing: RwLock::new(Vec::new()),
+            activity: Mutex::new(VecDeque::new()),
+            mode: RwLock::new("test".to_string()),
+            poll_interval_ms: AtomicU64::new(0),
+            source_names: vec!["linear".to_string()],
+            max_activity_entries: max_activity,
+            max_retries,
+        })
+    }
+
+    fn mock_tracker() -> Arc<dyn FixAttemptTracker> {
+        Arc::new(SqliteTracker::in_memory().expect("in-memory tracker"))
+    }
+
+    fn mock_sources() -> Vec<Arc<dyn IssueSource>> {
+        vec![Arc::new(MockSource::new("linear"))]
+    }
+
+    fn mock_notifier() -> Arc<dyn Notifier> {
+        Arc::new(MockNotifier)
+    }
+
+    // ── handle_command tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_handle_command_ping() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Ping,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        assert!(resp.is_ok());
+        match resp {
+            IpcResponse::Ok(IpcData::Pong) => {} // expected
+            other => panic!("Expected Pong, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_status() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        state.issues_processed.store(5, Ordering::SeqCst);
+        state.prs_created.store(3, Ordering::SeqCst);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Status,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::State(ws)) => {
+                assert!(ws.running);
+                assert!(!ws.paused);
+                assert_eq!(ws.mode, "test");
+                assert!(ws.uptime_secs < 5); // just created
+                assert_eq!(ws.issues_processed, 5);
+                assert_eq!(ws.prs_created, 3);
+                assert!(ws.processing.is_empty());
+                assert_eq!(ws.sources, vec!["linear".to_string()]);
+                assert_eq!(ws.poll_interval_ms, None); // 0 maps to None
+            }
+            other => panic!("Expected State, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_pause() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        // Initially not paused
+        assert!(!state.paused.load(Ordering::SeqCst));
+
+        let resp = handle_command(
+            IpcCommand::Pause,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        assert!(state.paused.load(Ordering::SeqCst));
+        match resp {
+            IpcResponse::Ok(IpcData::Message(msg)) => {
+                assert_eq!(msg, "Watcher paused");
+            }
+            other => panic!("Expected paused message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_resume() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        state.paused.store(true, Ordering::SeqCst);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Resume,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        assert!(!state.paused.load(Ordering::SeqCst));
+        match resp {
+            IpcResponse::Ok(IpcData::Message(msg)) => {
+                assert_eq!(msg, "Watcher resumed");
+            }
+            other => panic!("Expected resumed message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_activity_returns_reverse_chronological_with_limit() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        // Add 5 entries
+        {
+            let mut activity = state.activity.lock().await;
+            for i in 0..5 {
+                activity.push_back(ActivityEntry {
+                    timestamp: format!("2025-01-01T00:00:0{}Z", i),
+                    activity_type: ActivityType::IssueDetected,
+                    message: format!("entry-{}", i),
+                    issue_id: None,
+                    source: None,
+                });
+            }
+        }
+
+        // Request limit of 3
+        let resp = handle_command(
+            IpcCommand::Activity { limit: 3 },
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Activity(entries)) => {
+                assert_eq!(entries.len(), 3);
+                // Reversed: most recent first
+                assert_eq!(entries[0].message, "entry-4");
+                assert_eq!(entries[1].message, "entry-3");
+                assert_eq!(entries[2].message, "entry-2");
+            }
+            other => panic!("Expected Activity, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_activity_returns_all_when_limit_exceeds_count() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        {
+            let mut activity = state.activity.lock().await;
+            activity.push_back(ActivityEntry {
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                activity_type: ActivityType::WatcherStarted,
+                message: "only-one".to_string(),
+                issue_id: None,
+                source: None,
+            });
+        }
+
+        let resp = handle_command(
+            IpcCommand::Activity { limit: 100 },
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Activity(entries)) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].message, "only-one");
+            }
+            other => panic!("Expected Activity, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_shutdown_sends_signal() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Shutdown,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Message(msg)) => {
+                assert_eq!(msg, "Shutdown initiated");
+            }
+            other => panic!("Expected shutdown message, got {:?}", other),
+        }
+
+        // Verify the signal was actually sent
+        assert!(shutdown_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_stats() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Stats,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Stats(stats)) => {
+                // Fresh in-memory tracker should have all zeros
+                assert_eq!(stats.total, 0);
+                assert_eq!(stats.pending, 0);
+                assert_eq!(stats.success, 0);
+                assert_eq!(stats.failed, 0);
+            }
+            other => panic!("Expected Stats, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_list_prs() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::ListPrs,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Attempts(attempts)) => {
+                assert!(attempts.is_empty());
+            }
+            other => panic!("Expected Attempts, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_list_retries() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::ListRetries,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Attempts(attempts)) => {
+                assert!(attempts.is_empty());
+            }
+            other => panic!("Expected Attempts, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_trigger_without_watcher() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Trigger {
+                source: "linear".to_string(),
+                issue_id: "LIN-1".to_string(),
+            },
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Error { message } => {
+                assert_eq!(message, "Watcher not available");
+            }
+            other => panic!("Expected error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_reset_without_watcher_falls_through_to_tracker() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        // Record an attempt first so the reset has something to target
+        tracker.record_attempt("linear", "LIN-1", "LIN-1").unwrap();
+
+        let resp = handle_command(
+            IpcCommand::Reset {
+                source: "linear".to_string(),
+                issue_id: "LIN-1".to_string(),
+            },
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Reset { source, issue_id }) => {
+                assert_eq!(source, "linear");
+                assert_eq!(issue_id, "LIN-1");
+            }
+            other => panic!("Expected Reset, got {:?}", other),
+        }
+    }
+
+    // ── IpcServerBuilder tests ─────────────────────────────────────
+
+    #[test]
+    fn test_builder_default_max_activity_entries() {
+        let builder = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(builder.max_activity_entries, DEFAULT_MAX_ACTIVITY_ENTRIES);
+        assert_eq!(builder.max_activity_entries, 10_000);
+    }
+
+    #[test]
+    fn test_builder_default_max_retries() {
+        let builder = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(builder.max_retries, 2);
+    }
+
+    #[test]
+    fn test_builder_custom_max_activity_entries() {
+        let server = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier())
+            .max_activity_entries(500)
+            .build();
+
+        assert_eq!(server.state.max_activity_entries, 500);
+    }
+
+    #[test]
+    fn test_builder_custom_max_retries() {
+        let server = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier())
+            .max_retries(5)
+            .build();
+
+        assert_eq!(server.state.max_retries, 5);
+    }
+
+    #[test]
+    fn test_builder_collects_source_names() {
+        let sources: Vec<Arc<dyn IssueSource>> = vec![
+            Arc::new(MockSource::new("linear")),
+            Arc::new(MockSource::new("sentry")),
+            Arc::new(MockSource::new("jira")),
+        ];
+        let server = IpcServerBuilder::new(mock_tracker(), sources, mock_notifier()).build();
+
+        assert_eq!(server.state.source_names.len(), 3);
+        assert!(server.state.source_names.contains(&"linear".to_string()));
+        assert!(server.state.source_names.contains(&"sentry".to_string()));
+        assert!(server.state.source_names.contains(&"jira".to_string()));
+    }
+
+    // ── IpcServer method tests ─────────────────────────────────────
+
+    #[test]
+    fn test_is_paused_initially_false() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert!(!server.is_paused());
+    }
+
+    #[test]
+    fn test_set_poll_interval_stores_value() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        server.set_poll_interval(300_000);
+        assert_eq!(
+            server.state.poll_interval_ms.load(Ordering::SeqCst),
+            300_000
+        );
+    }
+
+    #[test]
+    fn test_inc_issues_processed() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(server.state.issues_processed.load(Ordering::SeqCst), 0);
+        server.inc_issues_processed();
+        assert_eq!(server.state.issues_processed.load(Ordering::SeqCst), 1);
+        server.inc_issues_processed();
+        server.inc_issues_processed();
+        assert_eq!(server.state.issues_processed.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_inc_prs_created() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(server.state.prs_created.load(Ordering::SeqCst), 0);
+        server.inc_prs_created();
+        assert_eq!(server.state.prs_created.load(Ordering::SeqCst), 1);
+        server.inc_prs_created();
+        assert_eq!(server.state.prs_created.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_add_and_remove_processing() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+
+        server.add_processing("LIN-1").await;
+        server.add_processing("LIN-2").await;
+        assert_eq!(server.state.processing.read().await.len(), 2);
+
+        server.remove_processing("LIN-1").await;
+        let processing = server.state.processing.read().await;
+        assert_eq!(processing.len(), 1);
+        assert_eq!(processing[0], "LIN-2");
+    }
+
+    #[tokio::test]
+    async fn test_remove_processing_nonexistent_is_noop() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        server.add_processing("LIN-1").await;
+        server.remove_processing("DOES-NOT-EXIST").await;
+        assert_eq!(server.state.processing.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_log_activity_adds_entries() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+
+        server
+            .log_activity(
+                ActivityType::IssueDetected,
+                "Found issue",
+                Some("LIN-1"),
+                Some("linear"),
+            )
+            .await;
+        server
+            .log_activity(ActivityType::PrCreated, "PR opened", None, None)
+            .await;
+
+        let activity = server.state.activity.lock().await;
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0].message, "Found issue");
+        assert_eq!(activity[0].issue_id, Some("LIN-1".to_string()));
+        assert_eq!(activity[0].source, Some("linear".to_string()));
+        assert_eq!(activity[1].message, "PR opened");
+    }
+
+    #[tokio::test]
+    async fn test_log_activity_caps_at_max_entries() {
+        let server = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier())
+            .max_activity_entries(3)
+            .build();
+
+        for i in 0..5 {
+            server
+                .log_activity(
+                    ActivityType::IssueDetected,
+                    &format!("entry-{}", i),
+                    None,
+                    None,
+                )
+                .await;
+        }
+
+        let activity = server.state.activity.lock().await;
+        assert_eq!(activity.len(), 3);
+        // Oldest entries should have been evicted; entries 2, 3, 4 remain
+        assert_eq!(activity[0].message, "entry-2");
+        assert_eq!(activity[1].message, "entry-3");
+        assert_eq!(activity[2].message, "entry-4");
+    }
+
+    #[tokio::test]
+    async fn test_set_mode() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        server.set_mode("poll").await;
+        assert_eq!(*server.state.mode.read().await, "poll");
+    }
+
+    #[test]
+    fn test_shutdown_receiver() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        let mut rx = server.shutdown_receiver();
+        // No signal yet
+        assert!(rx.try_recv().is_err());
+
+        server.shutdown();
+        assert!(rx.try_recv().is_ok());
+    }
+
+    // ── Status with poll interval set ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_handle_command_status_with_poll_interval() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        state.poll_interval_ms.store(60_000, Ordering::SeqCst);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Status,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::State(ws)) => {
+                assert_eq!(ws.poll_interval_ms, Some(60_000));
+            }
+            other => panic!("Expected State, got {:?}", other),
+        }
+    }
+
+    // ── Status with paused state ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_handle_command_status_reflects_paused() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        state.paused.store(true, Ordering::SeqCst);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Status,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::State(ws)) => {
+                assert!(ws.paused);
+            }
+            other => panic!("Expected State, got {:?}", other),
+        }
+    }
 }

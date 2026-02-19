@@ -80,6 +80,8 @@ pub struct Config {
     pub claude: ClaudeConfig,
     /// Discord configuration.
     pub discord: DiscordConfig,
+    /// Slack configuration.
+    pub slack: SlackConfig,
     /// Email configuration.
     pub email: EmailConfig,
     /// SMS configuration.
@@ -99,6 +101,10 @@ pub struct Config {
     pub linear: Option<LinearConfig>,
     /// Sentry source configuration.
     pub sentry: Option<SentryConfig>,
+    /// Jira source configuration.
+    pub jira: Option<JiraConfig>,
+    /// GitLab configuration for MR monitoring and issue management.
+    pub gitlab: Option<GitLabConfig>,
     /// Regression monitoring configuration.
     #[serde(default)]
     pub regression: RegressionConfig,
@@ -111,6 +117,12 @@ pub struct Config {
     /// Continuous learning configuration.
     #[serde(default)]
     pub learning: LearningConfig,
+    /// Prioritisation engine configuration.
+    #[serde(default)]
+    pub prioritisation: PrioritisationConfig,
+    /// Code indexing configuration.
+    #[serde(default)]
+    pub code_index: CodeIndexConfig,
 }
 
 impl Default for Config {
@@ -130,6 +142,7 @@ impl Default for Config {
             claude_timeout_secs: 21600, // 6 hours
             claude: ClaudeConfig::default(),
             discord: DiscordConfig::default(),
+            slack: SlackConfig::default(),
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
             push: PushConfig::default(),
@@ -139,10 +152,14 @@ impl Default for Config {
             retry: RetryConfig::default(),
             linear: None,
             sentry: None,
+            jira: None,
+            gitlab: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
+            prioritisation: PrioritisationConfig::default(),
+            code_index: CodeIndexConfig::default(),
         }
     }
 }
@@ -246,6 +263,171 @@ impl Default for LearningConfig {
     }
 }
 
+/// Code indexing configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeIndexConfig {
+    /// Enable tree-sitter code indexing.
+    pub enabled: bool,
+    /// Maximum file size to index in KB.
+    pub max_file_size_kb: u64,
+    /// Embedding batch size.
+    pub batch_size: usize,
+}
+
+impl Default for CodeIndexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_file_size_kb: 1024,
+            batch_size: 32,
+        }
+    }
+}
+
+/// Prioritisation engine configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrioritisationConfig {
+    /// Enable the prioritisation engine (when false, legacy sort is used).
+    pub enabled: bool,
+    /// Weight for severity component (issue + match priority).
+    pub severity_weight: f64,
+    /// Weight for frequency component (event counts, escalation).
+    pub frequency_weight: f64,
+    /// Weight for regression risk component.
+    pub regression_weight: f64,
+    /// Weight for blast radius component.
+    pub blast_radius_weight: f64,
+    /// Weight for content-cluster boost component.
+    pub cluster_weight: f64,
+    /// Path patterns classified as Critical blast radius.
+    pub critical_paths: Vec<String>,
+    /// Path patterns classified as Core blast radius.
+    pub core_paths: Vec<String>,
+    /// Path patterns classified as Infrastructure blast radius.
+    pub infra_paths: Vec<String>,
+    /// Path patterns classified as Test blast radius.
+    pub test_paths: Vec<String>,
+    /// Path patterns classified as Cosmetic blast radius.
+    pub cosmetic_paths: Vec<String>,
+    /// Enable content clustering for duplicate detection.
+    pub content_clustering: bool,
+    /// Minimum Jaccard similarity to keep a cluster.
+    pub cluster_similarity_threshold: f64,
+    /// Minimum number of issues to form a content cluster.
+    pub min_content_cluster_size: usize,
+    /// User-defined suppression rules.
+    pub suppression_rules: Vec<crate::types::SuppressionRule>,
+}
+
+impl Default for PrioritisationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            severity_weight: 0.30,
+            frequency_weight: 0.25,
+            regression_weight: 0.20,
+            blast_radius_weight: 0.15,
+            cluster_weight: 0.10,
+            critical_paths: vec![
+                "auth".into(),
+                "payment".into(),
+                "billing".into(),
+                "security".into(),
+                "login".into(),
+                "oauth".into(),
+            ],
+            core_paths: vec![
+                "api".into(),
+                "core".into(),
+                "middleware".into(),
+                "router".into(),
+                "handler".into(),
+            ],
+            infra_paths: vec![
+                "deploy".into(),
+                "infra".into(),
+                "ci".into(),
+                "docker".into(),
+                "terraform".into(),
+                "k8s".into(),
+                "database".into(),
+                "migration".into(),
+            ],
+            test_paths: vec![
+                "test".into(),
+                "spec".into(),
+                "fixture".into(),
+                "mock".into(),
+            ],
+            cosmetic_paths: vec![
+                "readme".into(),
+                "changelog".into(),
+                "license".into(),
+                "docs".into(),
+                "md".into(),
+            ],
+            content_clustering: true,
+            cluster_similarity_threshold: 0.60,
+            min_content_cluster_size: 2,
+            suppression_rules: Vec::new(),
+        }
+    }
+}
+
+impl PrioritisationConfig {
+    /// Validate prioritisation configuration values.
+    ///
+    /// Checks that weights are finite and non-negative, similarity threshold is
+    /// in 0.0-1.0, and min_cluster_size >= 2.
+    pub fn validate(&self) -> Result<()> {
+        let weights = [
+            ("severity_weight", self.severity_weight),
+            ("frequency_weight", self.frequency_weight),
+            ("regression_weight", self.regression_weight),
+            ("blast_radius_weight", self.blast_radius_weight),
+            ("cluster_weight", self.cluster_weight),
+        ];
+
+        for (name, value) in &weights {
+            if !value.is_finite() {
+                return Err(Error::config(format!(
+                    "prioritisation.{name} must be finite, got {value}"
+                )));
+            }
+            if *value < 0.0 {
+                return Err(Error::config(format!(
+                    "prioritisation.{name} must be non-negative, got {value}"
+                )));
+            }
+        }
+
+        let weight_sum: f64 = weights.iter().map(|(_, v)| v).sum();
+        if weight_sum == 0.0 {
+            return Err(Error::config("prioritisation weights must not all be zero"));
+        }
+
+        if !self.cluster_similarity_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.cluster_similarity_threshold)
+        {
+            return Err(Error::config(format!(
+                "prioritisation.cluster_similarity_threshold must be between 0.0 and 1.0, got {}",
+                self.cluster_similarity_threshold
+            )));
+        }
+
+        if self.min_content_cluster_size < 2 {
+            return Err(Error::config(format!(
+                "prioritisation.min_content_cluster_size must be >= 2, got {}",
+                self.min_content_cluster_size
+            )));
+        }
+
+        Ok(())
+    }
+}
+
 /// Retry configuration for failed fix attempts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -266,6 +448,28 @@ impl Default for RetryConfig {
             max_delay_ms: 3_600_000, // 1 hour
         }
     }
+}
+
+/// Slack notification configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlackConfig {
+    /// Slack Bot Token (xoxb-) for API calls.
+    pub bot_token: Option<String>,
+    /// Slack channel ID for notifications.
+    pub channel_id: Option<String>,
+    /// Slack Incoming Webhook URL (optional, notification-only alternative).
+    pub webhook_url: Option<String>,
+    /// Slack user ID to mention in notifications.
+    pub user_id: Option<String>,
+    /// Enable Slack as an issue source (messages become issues).
+    pub source_enabled: bool,
+    /// Channel to listen for issue messages (falls back to channel_id).
+    pub listen_channel_id: Option<String>,
+    /// Workspace name for constructing message URLs.
+    pub workspace: Option<String>,
+    /// Polling interval in milliseconds for Slack source (overrides global).
+    pub poll_interval_ms: Option<u64>,
 }
 
 /// Discord notification configuration.
@@ -380,14 +584,95 @@ pub struct UserConfig {
     pub github_username: Option<String>,
     /// User's Sentry username (matched against issue assignee).
     pub sentry_username: Option<String>,
+    /// User's Jira username/display name (matched against issue assignee).
+    pub jira_username: Option<String>,
+    /// User's GitLab username (matched against MR author / issue assignee).
+    pub gitlab_username: Option<String>,
     /// Discord user ID for mentions.
     pub discord_id: Option<String>,
+    /// Slack user ID for mentions.
+    pub slack_id: Option<String>,
     /// Email address for notifications.
     pub email: Option<String>,
     /// Pushover user key for push notifications.
     pub push_user_key: Option<String>,
     /// Phone number for SMS notifications.
     pub sms_number: Option<String>,
+}
+
+/// GitLab configuration for MR monitoring and issue management.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitLabConfig {
+    /// Whether this source is enabled.
+    pub enabled: bool,
+    /// GitLab personal access token.
+    pub token: Option<String>,
+    /// GitLab base URL (default: "https://gitlab.com").
+    pub base_url: String,
+    /// GitLab groups to monitor.
+    pub groups: Vec<String>,
+    /// Labels that trigger automation.
+    pub trigger_labels: Vec<String>,
+    /// States that trigger automation (e.g., "opened").
+    pub trigger_states: Vec<String>,
+    /// Poll interval for checking MR status (ms).
+    pub poll_interval_ms: u64,
+    /// Whether to auto-resolve issues when MRs merge.
+    pub auto_resolve_on_merge: bool,
+    /// Webhook secret for verifying GitLab webhook requests.
+    pub webhook_secret: Option<String>,
+    /// Trigger tag for review comments (e.g., "/claudear").
+    pub review_trigger: String,
+    /// Use SSH URLs for cloning instead of HTTPS.
+    #[serde(default)]
+    pub use_ssh: bool,
+    /// Maximum issues to process per poll cycle for this source (overrides global).
+    pub max_issues_per_cycle: Option<usize>,
+    /// Maximum concurrent issue processing for this source (overrides global).
+    pub max_concurrent: Option<usize>,
+}
+
+impl Default for GitLabConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token: None,
+            base_url: "https://gitlab.com".to_string(),
+            groups: Vec::new(),
+            trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
+            trigger_states: vec!["opened".to_string()],
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: false,
+            webhook_secret: None,
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+            max_issues_per_cycle: None,
+            max_concurrent: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl GitLabConfig {
+    /// Create a GitLabConfig suitable for testing.
+    pub fn test_default() -> Self {
+        Self {
+            enabled: true,
+            token: Some("test_token".to_string()),
+            base_url: "https://gitlab.com".to_string(),
+            groups: vec!["mygroup".to_string()],
+            trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
+            trigger_states: vec!["opened".to_string()],
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: Some("test_secret".to_string()),
+            review_trigger: "/claudear".to_string(),
+            use_ssh: false,
+            max_issues_per_cycle: None,
+            max_concurrent: None,
+        }
+    }
 }
 
 /// GitHub configuration for PR monitoring.
@@ -641,6 +926,64 @@ impl Default for SentryConfig {
             min_event_count: 10,
             escalation_threshold_percent: 50,
             client_secret: None,
+            max_issues_per_cycle: None,
+            max_concurrent: None,
+            poll_interval_ms: None,
+        }
+    }
+}
+
+/// Jira source configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JiraConfig {
+    /// Whether this source is enabled.
+    pub enabled: bool,
+    /// Jira base URL (e.g., "https://myco.atlassian.net").
+    pub base_url: String,
+    /// Email for Basic auth (Jira Cloud).
+    pub email: String,
+    /// API token (Cloud) or personal access token (Server/DC).
+    pub api_token: String,
+    /// Authentication mode: "basic" (email:token) or "bearer" (PAT).
+    pub auth_mode: String,
+    /// Jira project keys to monitor (e.g., ["PROJ", "BACKEND"]).
+    pub project_keys: Vec<String>,
+    /// Labels that trigger automation.
+    pub trigger_labels: Vec<String>,
+    /// Statuses that trigger automation.
+    pub trigger_statuses: Vec<String>,
+    /// Optional: Only process issues assigned to this user (display name).
+    pub trigger_assignee: Option<String>,
+    /// Issue types to include (e.g., ["Bug", "Task", "Story"]).
+    pub issue_types: Vec<String>,
+    /// Optional: Custom JQL appended to the generated query.
+    pub custom_jql: Option<String>,
+    /// Maximum results per search request (default: 50, max: 100).
+    pub max_results: usize,
+    /// Maximum issues to process per poll cycle for this source (overrides global).
+    pub max_issues_per_cycle: Option<usize>,
+    /// Maximum concurrent issue processing for this source (overrides global).
+    pub max_concurrent: Option<usize>,
+    /// Polling interval in milliseconds for Jira source (overrides global).
+    pub poll_interval_ms: Option<u64>,
+}
+
+impl Default for JiraConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: String::new(),
+            email: String::new(),
+            api_token: String::new(),
+            auth_mode: "basic".to_string(),
+            project_keys: Vec::new(),
+            trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
+            trigger_statuses: vec!["To Do".to_string(), "Backlog".to_string()],
+            trigger_assignee: None,
+            issue_types: Vec::new(),
+            custom_jql: None,
+            max_results: 50,
             max_issues_per_cycle: None,
             max_concurrent: None,
             poll_interval_ms: None,
@@ -1000,6 +1343,35 @@ impl Config {
             self.discord.poll_interval_ms = Some(v);
         }
 
+        // Slack
+        if let Ok(v) = env::var("SLACK_BOT_TOKEN") {
+            self.slack.bot_token = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("SLACK_CHANNEL_ID") {
+            self.slack.channel_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("SLACK_WEBHOOK_URL") {
+            self.slack.webhook_url = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("SLACK_USER_ID") {
+            self.slack.user_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("SLACK_SOURCE_ENABLED") {
+            self.slack.source_enabled = v == "true" || v == "1";
+        }
+        if let Ok(v) = env::var("SLACK_LISTEN_CHANNEL_ID") {
+            self.slack.listen_channel_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("SLACK_WORKSPACE") {
+            self.slack.workspace = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Some(v) = env::var("SLACK_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.slack.poll_interval_ms = Some(v);
+        }
+
         // Email
         if let Ok(v) = env::var("SMTP_HOST") {
             self.email.smtp_host = Some(v).filter(|s| !s.is_empty());
@@ -1190,6 +1562,12 @@ impl Config {
 
         // Sentry - apply overrides to existing config or create new one
         self.apply_sentry_env_overrides();
+
+        // Jira - apply overrides to existing config or create new one
+        self.apply_jira_env_overrides();
+
+        // GitLab - apply overrides to existing config or create new one
+        self.apply_gitlab_env_overrides();
     }
 
     /// Apply Linear environment variable overrides.
@@ -1323,6 +1701,158 @@ impl Config {
         }
     }
 
+    /// Apply Jira environment variable overrides.
+    fn apply_jira_env_overrides(&mut self) {
+        // If JIRA_API_TOKEN is set in env, ensure we have a JiraConfig
+        if let Ok(api_token) = env::var("JIRA_API_TOKEN") {
+            if !api_token.is_empty() {
+                let jira = self.jira.get_or_insert_with(JiraConfig::default);
+                jira.api_token = api_token;
+            }
+        }
+
+        // Apply other overrides if we have a JiraConfig
+        if let Some(ref mut jira) = self.jira {
+            if let Ok(v) = env::var("JIRA_ENABLED") {
+                jira.enabled = v.to_lowercase() == "true" || v == "1";
+            }
+            if let Ok(v) = env::var("JIRA_BASE_URL") {
+                if !v.is_empty() {
+                    jira.base_url = v;
+                }
+            }
+            if let Ok(v) = env::var("JIRA_EMAIL") {
+                if !v.is_empty() {
+                    jira.email = v;
+                }
+            }
+            if let Ok(v) = env::var("JIRA_AUTH_MODE") {
+                if !v.is_empty() {
+                    jira.auth_mode = v;
+                }
+            }
+            if let Ok(v) = env::var("JIRA_PROJECT_KEYS") {
+                if !v.is_empty() {
+                    jira.project_keys = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            if let Ok(v) = env::var("JIRA_TRIGGER_LABELS") {
+                if !v.is_empty() {
+                    jira.trigger_labels = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            if let Ok(v) = env::var("JIRA_TRIGGER_STATUSES") {
+                if !v.is_empty() {
+                    jira.trigger_statuses = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            if let Ok(v) = env::var("JIRA_TRIGGER_ASSIGNEE") {
+                jira.trigger_assignee = Some(v).filter(|s| !s.is_empty());
+            }
+            if let Ok(v) = env::var("JIRA_ISSUE_TYPES") {
+                if !v.is_empty() {
+                    jira.issue_types = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            if let Ok(v) = env::var("JIRA_CUSTOM_JQL") {
+                jira.custom_jql = Some(v).filter(|s| !s.is_empty());
+            }
+            if let Some(v) = env::var("JIRA_MAX_RESULTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                jira.max_results = v;
+            }
+            if let Some(v) = env::var("JIRA_MAX_ISSUES_PER_CYCLE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                jira.max_issues_per_cycle = Some(v);
+            }
+            if let Some(v) = env::var("JIRA_MAX_CONCURRENT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                jira.max_concurrent = Some(v);
+            }
+            if let Some(v) = env::var("JIRA_POLL_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                jira.poll_interval_ms = Some(v);
+            }
+        }
+    }
+
+    /// Apply GitLab environment variable overrides.
+    fn apply_gitlab_env_overrides(&mut self) {
+        // If GITLAB_TOKEN is set in env, ensure we have a GitLabConfig
+        if let Ok(token) = env::var("GITLAB_TOKEN") {
+            if !token.is_empty() {
+                let gitlab = self.gitlab.get_or_insert_with(GitLabConfig::default);
+                gitlab.token = Some(token);
+                gitlab.enabled = true;
+            }
+        }
+
+        // Apply other overrides if we have a GitLabConfig
+        if let Some(ref mut gitlab) = self.gitlab {
+            if let Ok(v) = env::var("GITLAB_ENABLED") {
+                gitlab.enabled = v.to_lowercase() == "true" || v == "1";
+            }
+            if let Ok(v) = env::var("GITLAB_BASE_URL") {
+                if !v.is_empty() {
+                    gitlab.base_url = v;
+                }
+            }
+            if let Ok(v) = env::var("GITLAB_GROUPS") {
+                if !v.is_empty() {
+                    gitlab.groups = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            if let Ok(v) = env::var("GITLAB_TRIGGER_LABELS") {
+                if !v.is_empty() {
+                    gitlab.trigger_labels = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            if let Ok(v) = env::var("GITLAB_TRIGGER_STATES") {
+                if !v.is_empty() {
+                    gitlab.trigger_states = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            if let Some(v) = env::var("GITLAB_POLL_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                gitlab.poll_interval_ms = v;
+            }
+            if let Ok(v) = env::var("GITLAB_AUTO_RESOLVE_ON_MERGE") {
+                gitlab.auto_resolve_on_merge = v.to_lowercase() == "true" || v == "1";
+            }
+            if let Ok(v) = env::var("GITLAB_WEBHOOK_SECRET") {
+                gitlab.webhook_secret = Some(v).filter(|s| !s.is_empty());
+            }
+            if let Ok(v) = env::var("GITLAB_REVIEW_TRIGGER") {
+                gitlab.review_trigger = v;
+            }
+            if let Ok(v) = env::var("GITLAB_USE_SSH") {
+                gitlab.use_ssh = v.to_lowercase() == "true" || v == "1";
+            }
+            if let Some(v) = env::var("GITLAB_MAX_ISSUES_PER_CYCLE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                gitlab.max_issues_per_cycle = Some(v);
+            }
+            if let Some(v) = env::var("GITLAB_MAX_CONCURRENT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                gitlab.max_concurrent = Some(v);
+            }
+        }
+    }
+
     /// Validate that at least one source is configured and enabled.
     pub fn validate(&self) -> Result<()> {
         let has_linear = self
@@ -1333,10 +1863,18 @@ impl Config {
             .sentry
             .as_ref()
             .is_some_and(|c| c.enabled && !c.auth_token.is_empty());
+        let has_jira = self
+            .jira
+            .as_ref()
+            .is_some_and(|c| c.enabled && !c.api_token.is_empty());
+        let has_gitlab = self
+            .gitlab
+            .as_ref()
+            .is_some_and(|c| c.enabled && c.token.is_some());
 
-        if !has_linear && !has_sentry {
+        if !has_linear && !has_sentry && !has_jira && !has_gitlab {
             return Err(Error::config(
-                "No sources configured. Configure linear or sentry in config file with valid API credentials.",
+                "No sources configured. Configure linear, sentry, jira, or gitlab in config file with valid API credentials.",
             ));
         }
 
@@ -1347,6 +1885,29 @@ impl Config {
                     "sentry.org_slug is required when Sentry is enabled",
                 ));
             }
+        }
+
+        // Validate Jira has base_url when enabled
+        if let Some(ref jira) = self.jira {
+            if jira.enabled && !jira.api_token.is_empty() && jira.base_url.is_empty() {
+                return Err(Error::config(
+                    "jira.base_url is required when Jira is enabled",
+                ));
+            }
+            if jira.enabled
+                && !jira.api_token.is_empty()
+                && jira.auth_mode == "basic"
+                && jira.email.is_empty()
+            {
+                return Err(Error::config(
+                    "jira.email is required when Jira auth_mode is 'basic'",
+                ));
+            }
+        }
+
+        // Validate prioritisation config only when engine is enabled
+        if self.prioritisation.enabled {
+            self.prioritisation.validate()?;
         }
 
         Ok(())
@@ -1362,9 +1923,21 @@ impl Config {
         self.sentry.as_ref().is_some_and(|c| c.enabled)
     }
 
+    /// Check if Jira source is enabled.
+    pub fn is_jira_enabled(&self) -> bool {
+        self.jira.as_ref().is_some_and(|c| c.enabled)
+    }
+
     /// Check if GitHub PR monitoring is enabled.
     pub fn is_github_enabled(&self) -> bool {
         self.github.token.is_some() || self.github_app.is_configured()
+    }
+
+    /// Check if GitLab is enabled.
+    pub fn is_gitlab_enabled(&self) -> bool {
+        self.gitlab
+            .as_ref()
+            .is_some_and(|c| c.enabled && c.token.is_some())
     }
 
     /// Determine the GitHub authentication mode to use.
@@ -1397,6 +1970,16 @@ impl Config {
                 .as_ref()
                 .and_then(|c| c.max_issues_per_cycle)
                 .unwrap_or(self.max_issues_per_cycle),
+            "jira" => self
+                .jira
+                .as_ref()
+                .and_then(|c| c.max_issues_per_cycle)
+                .unwrap_or(self.max_issues_per_cycle),
+            "gitlab" => self
+                .gitlab
+                .as_ref()
+                .and_then(|c| c.max_issues_per_cycle)
+                .unwrap_or(self.max_issues_per_cycle),
             _ => self.max_issues_per_cycle,
         }
     }
@@ -1412,6 +1995,16 @@ impl Config {
                 .unwrap_or(self.max_concurrent),
             "sentry" => self
                 .sentry
+                .as_ref()
+                .and_then(|c| c.max_concurrent)
+                .unwrap_or(self.max_concurrent),
+            "jira" => self
+                .jira
+                .as_ref()
+                .and_then(|c| c.max_concurrent)
+                .unwrap_or(self.max_concurrent),
+            "gitlab" => self
+                .gitlab
                 .as_ref()
                 .and_then(|c| c.max_concurrent)
                 .unwrap_or(self.max_concurrent),
@@ -1434,6 +2027,11 @@ impl Config {
                 .unwrap_or(self.poll_interval_ms),
             "sentry" => self
                 .sentry
+                .as_ref()
+                .and_then(|c| c.poll_interval_ms)
+                .unwrap_or(self.poll_interval_ms),
+            "jira" => self
+                .jira
                 .as_ref()
                 .and_then(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
@@ -1486,6 +2084,21 @@ mod tests {
         "SENTRY_MAX_ISSUES_PER_CYCLE",
         "SENTRY_MAX_CONCURRENT",
         "SENTRY_POLL_INTERVAL_MS",
+        "JIRA_API_TOKEN",
+        "JIRA_ENABLED",
+        "JIRA_BASE_URL",
+        "JIRA_EMAIL",
+        "JIRA_AUTH_MODE",
+        "JIRA_PROJECT_KEYS",
+        "JIRA_TRIGGER_LABELS",
+        "JIRA_TRIGGER_STATUSES",
+        "JIRA_TRIGGER_ASSIGNEE",
+        "JIRA_ISSUE_TYPES",
+        "JIRA_CUSTOM_JQL",
+        "JIRA_MAX_RESULTS",
+        "JIRA_MAX_ISSUES_PER_CYCLE",
+        "JIRA_MAX_CONCURRENT",
+        "JIRA_POLL_INTERVAL_MS",
         "DISCORD_WEBHOOK_URL",
         "DISCORD_USER_ID",
         "DISCORD_BOT_TOKEN",
@@ -4102,5 +4715,71 @@ another_unknown = 42
             restored.cluster_window_minutes
         );
         assert_eq!(config.auto_agent_md, restored.auto_agent_md);
+    }
+
+    #[test]
+    fn prioritisation_validate_rejects_negative_weight() {
+        let config = PrioritisationConfig {
+            severity_weight: -0.1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("severity_weight"),
+            "Expected error about severity_weight, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn prioritisation_validate_rejects_nan_weight() {
+        let config = PrioritisationConfig {
+            frequency_weight: f64::NAN,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("frequency_weight"),
+            "Expected error about frequency_weight, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn prioritisation_validate_rejects_all_zero_weights() {
+        let config = PrioritisationConfig {
+            severity_weight: 0.0,
+            frequency_weight: 0.0,
+            regression_weight: 0.0,
+            blast_radius_weight: 0.0,
+            cluster_weight: 0.0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("must not all be zero"),
+            "Expected all-zero error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn prioritisation_validate_rejects_cluster_size_one() {
+        let config = PrioritisationConfig {
+            min_content_cluster_size: 1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("min_content_cluster_size"),
+            "Expected cluster size error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn prioritisation_validate_accepts_defaults() {
+        let config = PrioritisationConfig::default();
+        assert!(config.validate().is_ok());
     }
 }

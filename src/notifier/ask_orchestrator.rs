@@ -182,6 +182,7 @@ mod tests {
             asked_at: Utc::now(),
             target_discord_id: None,
             target_email: None,
+            target_slack_id: None,
         }
     }
 

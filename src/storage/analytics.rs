@@ -64,11 +64,17 @@ pub struct TrendAnalysis {
 
 impl TrendAnalysis {
     /// Create a new trend analysis.
+    ///
+    /// Computes percentage change using the absolute value of `previous` as the
+    /// denominator so that negative-to-negative transitions (e.g. -100 → -50)
+    /// are reported correctly.
     pub fn new(current: f64, previous: f64) -> Self {
-        let change_percent = if previous > 0.0 {
-            ((current - previous) / previous) * 100.0
+        let change_percent = if previous != 0.0 {
+            ((current - previous) / previous.abs()) * 100.0
         } else if current > 0.0 {
             100.0
+        } else if current < 0.0 {
+            -100.0
         } else {
             0.0
         };
@@ -265,21 +271,32 @@ impl<'a> AnalyticsService<'a> {
 }
 
 /// Helper function to compute a hash for error message normalization.
+///
+/// Normalises by lowercasing, collapsing each run of digits to the
+/// placeholder `<N>` (so "port 8080" and "port 3000" both become
+/// "port <N>"), and collapsing whitespace.
 pub fn compute_error_hash(error_message: &str) -> String {
     use sha2::{Digest, Sha256};
 
-    // Normalize the error message by:
-    // 1. Converting to lowercase
-    // 2. Removing numbers (often variable)
-    // 3. Removing extra whitespace
-    let normalized: String = error_message
-        .to_lowercase()
-        .chars()
-        .filter(|c| !c.is_numeric())
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Normalize the error message:
+    // 1. Convert to lowercase
+    // 2. Replace each contiguous run of digits with `<N>` (preserves structure)
+    // 3. Collapse extra whitespace
+    let lower = error_message.to_lowercase();
+    let mut collapsed = String::with_capacity(lower.len());
+    let mut in_digits = false;
+    for ch in lower.chars() {
+        if ch.is_numeric() {
+            if !in_digits {
+                collapsed.push_str("<N>");
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            collapsed.push(ch);
+        }
+    }
+    let normalized: String = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
 
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
@@ -287,6 +304,9 @@ pub fn compute_error_hash(error_message: &str) -> String {
 }
 
 /// Classify an error message into an error type.
+///
+/// Categories are checked in priority order. More specific patterns (e.g.
+/// "timeout", "git") are checked before broader ones (e.g. "test", "api").
 pub fn classify_error(error_message: &str) -> &'static str {
     let lower = error_message.to_lowercase();
 
@@ -294,12 +314,15 @@ pub fn classify_error(error_message: &str) -> &'static str {
         "timeout"
     } else if lower.contains("build") || lower.contains("compile") || lower.contains("cargo") {
         "build_failure"
-    } else if lower.contains("test") || lower.contains("assertion") {
-        "test_failure"
-    } else if lower.contains("claude") || lower.contains("api") || lower.contains("rate limit") {
-        "claude_error"
     } else if lower.contains("git") || lower.contains("merge") || lower.contains("conflict") {
         "git_error"
+    } else if lower.contains("test") || lower.contains("assertion") {
+        "test_failure"
+    } else if lower.contains("claude")
+        || lower.contains("claude api")
+        || lower.contains("rate limit")
+    {
+        "claude_error"
     } else if lower.contains("permission") || lower.contains("access denied") {
         "permission_error"
     } else if lower.contains("network") || lower.contains("connection") {
@@ -397,5 +420,817 @@ mod tests {
         let summary = service.get_summary().unwrap();
         assert_eq!(summary.total_processed, 0);
         assert_eq!(summary.success_rate, 0.0);
+    }
+
+    // ================================================================
+    // classify_error: priority ordering and ambiguous keyword tests
+    // ================================================================
+
+    #[test]
+    fn test_classify_error_timeout_beats_test_failure() {
+        // "test timeout" contains both "test" and "timeout".
+        // timeout is checked first, so it wins.
+        assert_eq!(
+            classify_error("test timeout after 60s"),
+            "timeout",
+            "timeout should take priority over test_failure"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_build_beats_test() {
+        // "build test failed" contains both "build" and "test".
+        // build_failure is checked before test_failure.
+        assert_eq!(
+            classify_error("build test failed"),
+            "build_failure",
+            "build_failure should take priority over test_failure"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_compile_beats_test() {
+        // "compile test error" contains both "compile" and "test".
+        assert_eq!(
+            classify_error("compile test error"),
+            "build_failure",
+            "compile (build_failure) should take priority over test"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_git_beats_test() {
+        // "git merge conflict in test file" contains "git", "merge", "conflict", AND "test".
+        // git_error is now checked before test_failure in the priority order.
+        let result = classify_error("git merge conflict in test file");
+        assert_eq!(
+            result, "git_error",
+            "'git merge conflict in test file' should be classified as git_error"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_connection_timeout() {
+        // "connection timeout" contains both "timeout" and "connection".
+        // timeout is checked first, so it wins over network_error.
+        assert_eq!(
+            classify_error("connection timeout"),
+            "timeout",
+            "timeout should take priority over network_error (connection)"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_sentry_api_not_misclassified() {
+        // "Sentry API error" should not be classified as claude_error.
+        // The claude_error branch now matches "claude" or "claude api" or "rate limit",
+        // not the generic keyword "api".
+        let result = classify_error("Sentry API error");
+        assert_eq!(
+            result, "unknown",
+            "'Sentry API error' should be unknown — it is not a Claude error"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_rate_limit_without_api() {
+        // "rate limit exceeded" alone matches "rate limit" in the claude_error branch.
+        assert_eq!(classify_error("rate limit exceeded"), "claude_error");
+    }
+
+    #[test]
+    fn test_classify_error_empty_string() {
+        assert_eq!(classify_error(""), "unknown");
+    }
+
+    #[test]
+    fn test_classify_error_whitespace_only() {
+        assert_eq!(classify_error("   \t\n  "), "unknown");
+    }
+
+    #[test]
+    fn test_classify_error_case_insensitive() {
+        assert_eq!(classify_error("TIMEOUT"), "timeout");
+        assert_eq!(classify_error("BUILD FAILURE"), "build_failure");
+        assert_eq!(classify_error("Test Failed"), "test_failure");
+        assert_eq!(classify_error("GIT ERROR"), "git_error");
+    }
+
+    #[test]
+    fn test_classify_error_timed_out_variant() {
+        assert_eq!(classify_error("the process timed out"), "timeout");
+    }
+
+    #[test]
+    fn test_classify_error_cargo_is_build_failure() {
+        assert_eq!(
+            classify_error("cargo build returned exit code 1"),
+            "build_failure"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_assertion_is_test_failure() {
+        assert_eq!(
+            classify_error("assertion failed: expected 5 got 3"),
+            "test_failure"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_access_denied() {
+        assert_eq!(classify_error("access denied for user"), "permission_error");
+    }
+
+    #[test]
+    fn test_classify_error_merge_without_git() {
+        // "merge conflict" without "git" — still matches git_error via "merge" keyword.
+        // But "test" is checked before "merge". If the message is just "merge conflict",
+        // there's no "test" keyword, so it falls through to git_error.
+        assert_eq!(classify_error("merge conflict in file.rs"), "git_error");
+    }
+
+    #[test]
+    fn test_classify_error_conflict_without_git_or_merge() {
+        // "conflict" alone matches git_error.
+        assert_eq!(classify_error("conflict detected"), "git_error");
+    }
+
+    // ================================================================
+    // compute_error_hash: collision and edge case tests
+    // ================================================================
+
+    #[test]
+    fn test_compute_error_hash_http_status_codes_differ() {
+        // "HTTP 404 Not Found" vs "HTTP 500 Internal Error"
+        // After digit removal: "http  not found" vs "http  internal error"
+        // After whitespace normalization: "http not found" vs "http internal error"
+        // These SHOULD produce different hashes (and they do, because the text differs).
+        let hash_404 = compute_error_hash("HTTP 404 Not Found");
+        let hash_500 = compute_error_hash("HTTP 500 Internal Error");
+        assert_ne!(
+            hash_404, hash_500,
+            "HTTP 404 and HTTP 500 should produce different hashes \
+             because the textual parts differ after digit removal"
+        );
+    }
+
+    #[test]
+    fn test_compute_error_hash_port_numbers_collapse() {
+        // "Error at port 8080" and "Error at port 3000"
+        // Both become "error at port <N>" after normalization.
+        // This is intentional: the port number is variable and we want to
+        // group structurally identical errors together.
+        let hash1 = compute_error_hash("Error at port 8080");
+        let hash2 = compute_error_hash("Error at port 3000");
+        assert_eq!(
+            hash1, hash2,
+            "Different port numbers should hash the same (digit runs are collapsed to <N>)"
+        );
+    }
+
+    #[test]
+    fn test_compute_error_hash_version_numbers_cause_collision() {
+        // "version 1.2.3" and "version 4.5.6" both become "version ..."
+        let hash1 = compute_error_hash("version 1.2.3");
+        let hash2 = compute_error_hash("version 4.5.6");
+        assert_eq!(
+            hash1, hash2,
+            "Different version numbers collide because digits are stripped"
+        );
+    }
+
+    #[test]
+    fn test_compute_error_hash_empty_string() {
+        // Should produce a valid 32-char hex hash, not panic.
+        let hash = compute_error_hash("");
+        assert_eq!(
+            hash.len(),
+            32,
+            "Hash should be 32 hex characters (16 bytes)"
+        );
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash should contain only hex digits"
+        );
+    }
+
+    #[test]
+    fn test_compute_error_hash_only_numbers() {
+        // "42" -> digits collapsed to "<N>" -> hash of "<N>"
+        let hash_numbers = compute_error_hash("42");
+        let hash_empty = compute_error_hash("");
+        assert_ne!(
+            hash_numbers, hash_empty,
+            "A digits-only string becomes '<N>' which differs from the empty-string hash"
+        );
+        // All digit-only strings should hash the same (they all become "<N>")
+        let hash_99 = compute_error_hash("99");
+        assert_eq!(hash_numbers, hash_99);
+    }
+
+    #[test]
+    fn test_compute_error_hash_very_long_message() {
+        let long_message = "a]".repeat(10_000);
+        let hash = compute_error_hash(&long_message);
+        assert_eq!(hash.len(), 32, "Hash should always be 32 hex characters");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_compute_error_hash_unicode() {
+        let hash = compute_error_hash("错误: 连接失败 🔥");
+        assert_eq!(hash.len(), 32);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Different unicode messages should produce different hashes.
+        let hash2 = compute_error_hash("エラー: 接続に失敗しました");
+        assert_ne!(hash, hash2);
+    }
+
+    #[test]
+    fn test_compute_error_hash_whitespace_normalization() {
+        // Extra whitespace should be collapsed.
+        let hash1 = compute_error_hash("error   in    file");
+        let hash2 = compute_error_hash("error in file");
+        assert_eq!(
+            hash1, hash2,
+            "Extra whitespace should be normalized to single spaces"
+        );
+    }
+
+    #[test]
+    fn test_compute_error_hash_case_insensitive() {
+        let hash1 = compute_error_hash("Error Message");
+        let hash2 = compute_error_hash("error message");
+        assert_eq!(hash1, hash2, "Hashing should be case-insensitive");
+    }
+
+    #[test]
+    fn test_compute_error_hash_leading_trailing_whitespace() {
+        let hash1 = compute_error_hash("  error message  ");
+        let hash2 = compute_error_hash("error message");
+        assert_eq!(
+            hash1, hash2,
+            "Leading/trailing whitespace should be normalized away"
+        );
+    }
+
+    #[test]
+    fn test_compute_error_hash_only_whitespace() {
+        // Whitespace-only string normalizes to empty.
+        let hash = compute_error_hash("   \t\n   ");
+        let hash_empty = compute_error_hash("");
+        assert_eq!(
+            hash, hash_empty,
+            "Whitespace-only string should hash the same as empty string"
+        );
+    }
+
+    // ================================================================
+    // TrendAnalysis::new edge cases
+    // ================================================================
+
+    #[test]
+    fn test_trend_analysis_both_zero() {
+        let trend = TrendAnalysis::new(0.0, 0.0);
+        assert_eq!(trend.change_percent, 0.0);
+        assert_eq!(trend.direction, TrendDirection::Stable);
+    }
+
+    #[test]
+    fn test_trend_analysis_negative_current() {
+        // current=-10, previous=100
+        // change_percent = ((-10) - 100) / 100 * 100 = -110%
+        let trend = TrendAnalysis::new(-10.0, 100.0);
+        assert!(
+            (trend.change_percent - (-110.0)).abs() < 0.01,
+            "change_percent should be -110%, got {}",
+            trend.change_percent
+        );
+        assert_eq!(trend.direction, TrendDirection::Down);
+    }
+
+    #[test]
+    fn test_trend_analysis_both_negative_improvement() {
+        // current=-50, previous=-100
+        // The value improved from -100 to -50 (less negative).
+        // change = (-50 - (-100)) / |-100| * 100 = 50%  => Up
+        let trend = TrendAnalysis::new(-50.0, -100.0);
+        assert!(
+            (trend.change_percent - 50.0).abs() < 0.01,
+            "Both-negative improvement: change should be +50%, got {}",
+            trend.change_percent
+        );
+        assert_eq!(trend.direction, TrendDirection::Up);
+    }
+
+    #[test]
+    fn test_trend_analysis_current_zero_previous_positive() {
+        // current=0, previous=100 => change = -100%
+        let trend = TrendAnalysis::new(0.0, 100.0);
+        assert!((trend.change_percent - (-100.0)).abs() < 0.01);
+        assert_eq!(trend.direction, TrendDirection::Down);
+    }
+
+    #[test]
+    fn test_trend_analysis_current_zero_previous_negative() {
+        // current=0, previous=-100
+        // change = (0 - (-100)) / |-100| * 100 = 100% => Up
+        let trend = TrendAnalysis::new(0.0, -100.0);
+        assert!(
+            (trend.change_percent - 100.0).abs() < 0.01,
+            "Going from -100 to 0 should be +100%, got {}",
+            trend.change_percent
+        );
+        assert_eq!(trend.direction, TrendDirection::Up);
+    }
+
+    #[test]
+    fn test_trend_analysis_boundary_exactly_5_percent_up() {
+        // 5% change exactly: current=105, previous=100
+        // change = (105-100)/100 * 100 = 5.0
+        // direction: 5.0 > 5.0 is false, so Stable
+        let trend = TrendAnalysis::new(105.0, 100.0);
+        assert!((trend.change_percent - 5.0).abs() < 0.01);
+        assert_eq!(
+            trend.direction,
+            TrendDirection::Stable,
+            "Exactly 5.0% should be Stable (need > 5.0 for Up)"
+        );
+    }
+
+    #[test]
+    fn test_trend_analysis_boundary_just_over_5_percent_up() {
+        // 5.01% change: current=105.01, previous=100
+        let trend = TrendAnalysis::new(105.01, 100.0);
+        assert!(trend.change_percent > 5.0);
+        assert_eq!(
+            trend.direction,
+            TrendDirection::Up,
+            "Just over 5% should be Up"
+        );
+    }
+
+    #[test]
+    fn test_trend_analysis_boundary_exactly_minus_5_percent() {
+        // -5% change exactly: current=95, previous=100
+        // change = (95-100)/100 * 100 = -5.0
+        // direction: -5.0 < -5.0 is false, so Stable
+        let trend = TrendAnalysis::new(95.0, 100.0);
+        assert!((trend.change_percent - (-5.0)).abs() < 0.01);
+        assert_eq!(
+            trend.direction,
+            TrendDirection::Stable,
+            "Exactly -5.0% should be Stable (need < -5.0 for Down)"
+        );
+    }
+
+    #[test]
+    fn test_trend_analysis_boundary_just_under_minus_5_percent() {
+        // current=94.99, previous=100 => -5.01%
+        let trend = TrendAnalysis::new(94.99, 100.0);
+        assert!(trend.change_percent < -5.0);
+        assert_eq!(trend.direction, TrendDirection::Down);
+    }
+
+    #[test]
+    fn test_trend_analysis_very_large_values() {
+        let trend = TrendAnalysis::new(1e15, 1e14);
+        // change = (1e15 - 1e14) / 1e14 * 100 = 9e14 / 1e14 * 100 = 900%
+        assert!((trend.change_percent - 900.0).abs() < 0.01);
+        assert_eq!(trend.direction, TrendDirection::Up);
+        assert!(trend.change_percent.is_finite());
+    }
+
+    #[test]
+    fn test_trend_analysis_very_small_previous() {
+        // previous very close to zero but positive => huge percentage change
+        let trend = TrendAnalysis::new(100.0, 0.0001);
+        // change = (100 - 0.0001) / 0.0001 * 100 = ~99999900%
+        assert!(trend.change_percent > 1_000_000.0);
+        assert_eq!(trend.direction, TrendDirection::Up);
+        assert!(trend.change_percent.is_finite());
+    }
+
+    #[test]
+    fn test_trend_analysis_nan_propagation() {
+        // NaN inputs: NaN != 0.0 is true, so we enter the percentage formula.
+        // (NaN - NaN) / NaN.abs() = NaN. NaN comparisons (> 5, < -5) are false.
+        let trend = TrendAnalysis::new(f64::NAN, f64::NAN);
+        assert!(trend.change_percent.is_nan());
+        // NaN > 5.0 and NaN < -5.0 are both false, so direction = Stable
+        assert_eq!(trend.direction, TrendDirection::Stable);
+    }
+
+    #[test]
+    fn test_trend_analysis_infinity() {
+        let trend = TrendAnalysis::new(f64::INFINITY, 100.0);
+        // change = (INF - 100) / 100 * 100 = INF
+        assert!(trend.change_percent.is_infinite());
+        // INF > 5.0 is true
+        assert_eq!(trend.direction, TrendDirection::Up);
+    }
+
+    #[test]
+    fn test_trend_analysis_negative_infinity() {
+        let trend = TrendAnalysis::new(f64::NEG_INFINITY, 100.0);
+        assert!(trend.change_percent.is_infinite());
+        assert_eq!(trend.direction, TrendDirection::Down);
+    }
+
+    #[test]
+    fn test_trend_analysis_previous_zero_current_negative() {
+        // previous=0.0, current=-5.0
+        // previous is 0, current < 0 => change_percent = -100%
+        let trend = TrendAnalysis::new(-5.0, 0.0);
+        assert!(
+            (trend.change_percent - (-100.0)).abs() < 0.01,
+            "Going from 0 to -5 should be -100%, got {}",
+            trend.change_percent
+        );
+        assert_eq!(trend.direction, TrendDirection::Down);
+    }
+
+    // ================================================================
+    // TimePeriod methods
+    // ================================================================
+
+    #[test]
+    fn test_time_period_start_time_is_in_the_past() {
+        let now = Utc::now();
+        for period in &[
+            TimePeriod::Hour,
+            TimePeriod::Day,
+            TimePeriod::Week,
+            TimePeriod::Month,
+        ] {
+            let start = period.start_time();
+            assert!(
+                start < now,
+                "{:?}.start_time() should be in the past",
+                period
+            );
+        }
+    }
+
+    #[test]
+    fn test_time_period_start_time_approximately_correct() {
+        let now = Utc::now();
+
+        let hour_start = TimePeriod::Hour.start_time();
+        let diff = now - hour_start;
+        // Should be approximately 1 hour (within a few seconds of test execution)
+        assert!(
+            (diff.num_seconds() - 3600).abs() < 5,
+            "Hour start_time should be ~3600s ago, was {}s",
+            diff.num_seconds()
+        );
+
+        let day_start = TimePeriod::Day.start_time();
+        let diff = now - day_start;
+        assert!(
+            (diff.num_seconds() - 86400).abs() < 5,
+            "Day start_time should be ~86400s ago, was {}s",
+            diff.num_seconds()
+        );
+    }
+
+    #[test]
+    fn test_time_period_duration_values() {
+        assert_eq!(TimePeriod::Hour.duration().num_seconds(), 3600);
+        assert_eq!(TimePeriod::Day.duration().num_seconds(), 86400);
+        assert_eq!(TimePeriod::Week.duration().num_seconds(), 604800);
+        assert_eq!(TimePeriod::Month.duration().num_seconds(), 2592000); // 30 * 86400
+    }
+
+    // ================================================================
+    // AnalyticsService with seeded data
+    // ================================================================
+
+    #[test]
+    fn test_success_rate_with_mixed_attempts() {
+        use crate::storage::FixAttemptTracker;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Record 4 attempts: 2 success, 1 failed, 1 merged
+        tracker
+            .record_attempt("test_source", "issue-1", "TST-1")
+            .unwrap();
+        tracker
+            .mark_success("test_source", "issue-1", "https://github.com/pr/1")
+            .unwrap();
+
+        tracker
+            .record_attempt("test_source", "issue-2", "TST-2")
+            .unwrap();
+        tracker
+            .mark_failed("test_source", "issue-2", "build error")
+            .unwrap();
+
+        tracker
+            .record_attempt("test_source", "issue-3", "TST-3")
+            .unwrap();
+        tracker
+            .mark_success("test_source", "issue-3", "https://github.com/pr/3")
+            .unwrap();
+        tracker.mark_merged("test_source", "issue-3").unwrap();
+
+        tracker
+            .record_attempt("test_source", "issue-4", "TST-4")
+            .unwrap();
+        tracker
+            .mark_success("test_source", "issue-4", "https://github.com/pr/4")
+            .unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let rate = service.get_success_rate().unwrap();
+        // 3 successes (issue-1 success, issue-3 merged, issue-4 success) out of 4 total = 0.75
+        assert!(
+            (rate - 0.75).abs() < 0.01,
+            "Success rate should be 0.75 (3/4), got {}",
+            rate
+        );
+    }
+
+    #[test]
+    fn test_success_rate_all_failures() {
+        use crate::storage::FixAttemptTracker;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        for i in 0..5 {
+            let issue_id = format!("issue-{}", i);
+            let short_id = format!("TST-{}", i);
+            tracker.record_attempt("src", &issue_id, &short_id).unwrap();
+            tracker.mark_failed("src", &issue_id, "some error").unwrap();
+        }
+
+        let service = AnalyticsService::new(&tracker);
+        let rate = service.get_success_rate().unwrap();
+        assert!(
+            rate.abs() < 0.001,
+            "Success rate should be 0.0 when all attempts failed, got {}",
+            rate
+        );
+    }
+
+    #[test]
+    fn test_success_rate_empty_db() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let service = AnalyticsService::new(&tracker);
+        let rate = service.get_success_rate().unwrap();
+        assert_eq!(rate, 0.0, "Empty DB should have 0.0 success rate");
+    }
+
+    #[test]
+    fn test_top_errors_with_multiple_patterns() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Insert error patterns with different occurrence counts.
+        let mut pattern1 = ErrorPattern::new("hash-a");
+        pattern1.error_type = Some("build_failure".to_string());
+        pattern1.error_message = Some("cargo build failed".to_string());
+        pattern1.occurrence_count = 10;
+        tracker.record_error_pattern(&pattern1).unwrap();
+
+        let mut pattern2 = ErrorPattern::new("hash-b");
+        pattern2.error_type = Some("timeout".to_string());
+        pattern2.error_message = Some("process timed out".to_string());
+        pattern2.occurrence_count = 5;
+        tracker.record_error_pattern(&pattern2).unwrap();
+
+        let mut pattern3 = ErrorPattern::new("hash-c");
+        pattern3.error_type = Some("test_failure".to_string());
+        pattern3.error_message = Some("assertion failed".to_string());
+        pattern3.occurrence_count = 20;
+        tracker.record_error_pattern(&pattern3).unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let top = service.get_top_errors(2).unwrap();
+
+        assert_eq!(top.len(), 2, "Should return at most 2 error patterns");
+        // Ordered by occurrence_count DESC
+        assert_eq!(
+            top[0].error_type.as_deref(),
+            Some("test_failure"),
+            "Most frequent error should be first"
+        );
+        assert_eq!(top[0].occurrence_count, 20);
+        assert_eq!(top[1].error_type.as_deref(), Some("build_failure"));
+        assert_eq!(top[1].occurrence_count, 10);
+    }
+
+    #[test]
+    fn test_top_errors_empty_db() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let service = AnalyticsService::new(&tracker);
+        let top = service.get_top_errors(10).unwrap();
+        assert!(top.is_empty());
+    }
+
+    #[test]
+    fn test_average_metric_no_metrics() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let service = AnalyticsService::new(&tracker);
+        let avg = service
+            .average_metric("nonexistent_metric", TimePeriod::Day)
+            .unwrap();
+        assert_eq!(avg, None, "No metrics should return None");
+    }
+
+    #[test]
+    fn test_average_metric_with_data() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Record some metrics.
+        let m1 = ProcessingMetric::new("latency", 100.0);
+        let m2 = ProcessingMetric::new("latency", 200.0);
+        let m3 = ProcessingMetric::new("latency", 300.0);
+        tracker.record_metric(&m1).unwrap();
+        tracker.record_metric(&m2).unwrap();
+        tracker.record_metric(&m3).unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let avg = service.average_metric("latency", TimePeriod::Day).unwrap();
+        assert!(avg.is_some());
+        let avg_val = avg.unwrap();
+        assert!(
+            (avg_val - 200.0).abs() < 0.01,
+            "Average of 100, 200, 300 should be 200.0, got {}",
+            avg_val
+        );
+    }
+
+    #[test]
+    fn test_average_metric_wrong_name_returns_none() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let m = ProcessingMetric::new("latency", 100.0);
+        tracker.record_metric(&m).unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let avg = service
+            .average_metric("throughput", TimePeriod::Day)
+            .unwrap();
+        assert_eq!(
+            avg, None,
+            "Querying a different metric name should return None"
+        );
+    }
+
+    #[test]
+    fn test_calculate_throughput_empty_db() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let service = AnalyticsService::new(&tracker);
+        let throughput = service.calculate_throughput(TimePeriod::Hour).unwrap();
+        assert!(
+            throughput.abs() < 0.001,
+            "Empty DB should have 0.0 throughput, got {}",
+            throughput
+        );
+    }
+
+    #[test]
+    fn test_calculate_throughput_with_activities() {
+        use crate::types::ActivityLogEntry;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Record some processing_completed activities (timestamped now, within Hour).
+        for i in 0..6 {
+            let entry =
+                ActivityLogEntry::new("processing_completed", format!("Processed issue {}", i));
+            tracker.record_activity(&entry).unwrap();
+        }
+        // Also record a pr_created activity (also counts for throughput).
+        let pr_entry = ActivityLogEntry::new("pr_created", "PR created");
+        tracker.record_activity(&pr_entry).unwrap();
+
+        // Record an unrelated activity (should not count).
+        let other = ActivityLogEntry::new("error", "something went wrong");
+        tracker.record_activity(&other).unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let throughput = service.calculate_throughput(TimePeriod::Hour).unwrap();
+        // 7 relevant activities / 1 hour = 7.0
+        assert!(
+            (throughput - 7.0).abs() < 0.01,
+            "Throughput should be 7.0/hr, got {}",
+            throughput
+        );
+    }
+
+    #[test]
+    fn test_calculate_error_rate_empty_db() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let service = AnalyticsService::new(&tracker);
+        let rate = service.calculate_error_rate(TimePeriod::Hour).unwrap();
+        assert!(
+            rate.abs() < 0.001,
+            "Empty DB should have 0.0 error rate, got {}",
+            rate
+        );
+    }
+
+    #[test]
+    fn test_calculate_error_rate_with_mixed_activities() {
+        use crate::types::ActivityLogEntry;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // 3 processing_completed, 2 errors, 1 pr_created => total=6, errors=2 => rate=2/6
+        for _ in 0..3 {
+            let entry = ActivityLogEntry::new("processing_completed", "done");
+            tracker.record_activity(&entry).unwrap();
+        }
+        for _ in 0..2 {
+            let entry = ActivityLogEntry::new("error", "failed");
+            tracker.record_activity(&entry).unwrap();
+        }
+        let entry = ActivityLogEntry::new("pr_created", "PR opened");
+        tracker.record_activity(&entry).unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let rate = service.calculate_error_rate(TimePeriod::Hour).unwrap();
+        assert!(
+            (rate - (2.0 / 6.0)).abs() < 0.01,
+            "Error rate should be 2/6 = 0.333, got {}",
+            rate
+        );
+    }
+
+    #[test]
+    fn test_calculate_error_rate_all_errors() {
+        use crate::types::ActivityLogEntry;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        for _ in 0..5 {
+            let entry = ActivityLogEntry::new("error", "everything broke");
+            tracker.record_activity(&entry).unwrap();
+        }
+
+        let service = AnalyticsService::new(&tracker);
+        let rate = service.calculate_error_rate(TimePeriod::Day).unwrap();
+        assert!(
+            (rate - 1.0).abs() < 0.01,
+            "Error rate should be 1.0 when all activities are errors, got {}",
+            rate
+        );
+    }
+
+    #[test]
+    fn test_analytics_summary_with_data() {
+        use crate::storage::FixAttemptTracker;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/pr/1")
+            .unwrap();
+
+        tracker
+            .record_attempt("linear", "issue-2", "LIN-2")
+            .unwrap();
+        tracker
+            .mark_failed("linear", "issue-2", "build failed")
+            .unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let summary = service.get_summary().unwrap();
+        assert_eq!(summary.total_processed, 2);
+        assert!((summary.success_rate - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_error_pattern_deduplication_via_hash() {
+        // Recording the same pattern_hash twice should increment occurrence_count
+        // rather than creating a duplicate row.
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let hash = compute_error_hash("connection refused on port 443");
+        let mut pattern = ErrorPattern::new(hash.clone());
+        pattern.error_type = Some("network_error".to_string());
+        pattern.error_message = Some("connection refused on port 443".to_string());
+        pattern.occurrence_count = 1;
+        tracker.record_error_pattern(&pattern).unwrap();
+
+        // Record the same hash again (simulating a second occurrence).
+        let mut pattern2 = ErrorPattern::new(hash);
+        pattern2.error_type = Some("network_error".to_string());
+        pattern2.error_message = Some("connection refused on port 8080".to_string());
+        pattern2.occurrence_count = 1;
+        tracker.record_error_pattern(&pattern2).unwrap();
+
+        let service = AnalyticsService::new(&tracker);
+        let top = service.get_top_errors(10).unwrap();
+        // Should be 1 row (deduplicated), with occurrence_count incremented.
+        assert_eq!(
+            top.len(),
+            1,
+            "Same pattern_hash should be deduplicated into one row"
+        );
+        assert_eq!(
+            top[0].occurrence_count, 2,
+            "Occurrence count should be incremented on conflict"
+        );
     }
 }

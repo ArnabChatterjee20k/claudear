@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { render, screen, cleanup, fireEvent } from "@testing-library/react";
-import { Router } from "../src/router";
+import { Router, RouterProvider } from "../src/router";
 import { Sidebar } from "../src/components/layout/sidebar";
 
 describe("Sidebar", () => {
@@ -12,7 +12,10 @@ describe("Sidebar", () => {
   function renderSidebar(hash = "#/") {
     window.location.hash = hash;
     return render(
-      <Router routes={{ [hash.slice(1) || "/"]: () => <Sidebar /> }} />
+      <RouterProvider>
+        <Sidebar />
+        <Router routes={{ [hash.slice(1) || "/"]: () => <div /> }} />
+      </RouterProvider>
     );
   }
 
@@ -25,6 +28,7 @@ describe("Sidebar", () => {
     renderSidebar();
     const labels = [
       "Overview",
+      "Issues",
       "Attempts",
       "PRs",
       "Analytics",
@@ -60,5 +64,25 @@ describe("Sidebar", () => {
     const attemptsButton = screen.getByText("Attempts").closest("button");
     fireEvent.click(attemptsButton!);
     expect(window.location.hash).toBe("#/attempts");
+  });
+
+  test("dark mode toggle adds dark class to documentElement", () => {
+    document.documentElement.classList.remove("dark");
+    localStorage.removeItem("theme");
+    renderSidebar();
+    const toggleBtn = screen.getByTitle("Switch to dark mode");
+    fireEvent.click(toggleBtn);
+    expect(document.documentElement.classList.contains("dark")).toBe(true);
+    expect(localStorage.getItem("theme")).toBe("dark");
+  });
+
+  test("dark mode toggle removes dark class when already dark", () => {
+    document.documentElement.classList.add("dark");
+    localStorage.setItem("theme", "dark");
+    renderSidebar();
+    const toggleBtn = screen.getByTitle("Switch to light mode");
+    fireEvent.click(toggleBtn);
+    expect(document.documentElement.classList.contains("dark")).toBe(false);
+    expect(localStorage.getItem("theme")).toBe("light");
   });
 });
