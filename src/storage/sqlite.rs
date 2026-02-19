@@ -1084,7 +1084,7 @@ impl SqliteTracker {
             None => Ok(None),
             Some(b) if b.is_empty() => Ok(None),
             Some(b) => {
-                if !b.len().is_multiple_of(4) {
+                if b.len() % 4 != 0 {
                     return Err(rusqlite::Error::InvalidColumnType(
                         col,
                         "embedding".to_string(),
@@ -1102,6 +1102,37 @@ impl SqliteTracker {
                 Ok(Some(embedding))
             }
         }
+    }
+
+    /// Map a row to an `IssueEmbedding`.
+    ///
+    /// Expects columns 0-7 in standard order (id, source, issue_id, short_id,
+    /// title, embedding, embedding_model, created_at).  The remaining metadata
+    /// columns (description, url, priority, status, labels, updated_at) start
+    /// at `meta_offset`.
+    fn row_to_issue_embedding(
+        row: &rusqlite::Row<'_>,
+        meta_offset: usize,
+    ) -> rusqlite::Result<IssueEmbedding> {
+        let embedding = Self::parse_optional_embedding(row, 5)?;
+        let updated_at: Option<String> = row.get(meta_offset + 5)?;
+
+        Ok(IssueEmbedding {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            issue_id: row.get(2)?,
+            short_id: row.get(3)?,
+            title: row.get(4)?,
+            description: row.get(meta_offset)?,
+            url: row.get(meta_offset + 1)?,
+            priority: row.get(meta_offset + 2)?,
+            status: row.get(meta_offset + 3)?,
+            labels: row.get(meta_offset + 4)?,
+            embedding,
+            embedding_model: row.get(6)?,
+            created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
+            updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
+        })
     }
 
     fn parse_optional_datetime(s: Option<String>) -> Option<DateTime<Utc>> {
@@ -3546,26 +3577,7 @@ impl SqliteTracker {
 
         let result = stmt
             .query_row(params![source, issue_id], |row| {
-                let embedding = Self::parse_optional_embedding(row, 5)?;
-
-                let updated_at: Option<String> = row.get(13)?;
-
-                Ok(IssueEmbedding {
-                    id: row.get(0)?,
-                    source: row.get(1)?,
-                    issue_id: row.get(2)?,
-                    short_id: row.get(3)?,
-                    title: row.get(4)?,
-                    description: row.get(8)?,
-                    url: row.get(9)?,
-                    priority: row.get(10)?,
-                    status: row.get(11)?,
-                    labels: row.get(12)?,
-                    embedding,
-                    embedding_model: row.get(6)?,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-                    updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
-                })
+                Self::row_to_issue_embedding(row, 8)
             })
             .ok();
 
@@ -3619,27 +3631,7 @@ impl SqliteTracker {
 
         let mut stmt = conn.prepare(query)?;
 
-        let row_mapper = |row: &rusqlite::Row<'_>| {
-            let embedding = Self::parse_optional_embedding(row, 5)?;
-            let updated_at: Option<String> = row.get(13)?;
-
-            Ok(IssueEmbedding {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                issue_id: row.get(2)?,
-                short_id: row.get(3)?,
-                title: row.get(4)?,
-                description: row.get(8)?,
-                url: row.get(9)?,
-                priority: row.get(10)?,
-                status: row.get(11)?,
-                labels: row.get(12)?,
-                embedding,
-                embedding_model: row.get(6)?,
-                created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-                updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
-            })
-        };
+        let row_mapper = |row: &rusqlite::Row<'_>| Self::row_to_issue_embedding(row, 8);
 
         let rows = match source {
             Some(s) => stmt.query_map(params![s, limit as i64, offset as i64], row_mapper)?,
@@ -3689,27 +3681,7 @@ impl SqliteTracker {
 
         let mut stmt = conn.prepare(query)?;
 
-        let row_mapper = |row: &rusqlite::Row<'_>| {
-            let embedding = Self::parse_optional_embedding(row, 5)?;
-            let updated_at: Option<String> = row.get(13)?;
-
-            Ok(IssueEmbedding {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                issue_id: row.get(2)?,
-                short_id: row.get(3)?,
-                title: row.get(4)?,
-                description: row.get(8)?,
-                url: row.get(9)?,
-                priority: row.get(10)?,
-                status: row.get(11)?,
-                labels: row.get(12)?,
-                embedding,
-                embedding_model: row.get(6)?,
-                created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-                updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
-            })
-        };
+        let row_mapper = |row: &rusqlite::Row<'_>| Self::row_to_issue_embedding(row, 8);
 
         let rows = match source {
             Some(s) => stmt.query_map(params![s, limit as i64, offset as i64], row_mapper)?,
@@ -3803,25 +3775,7 @@ impl SqliteTracker {
                 limit as i64
             ],
             |row| {
-                let embedding = Self::parse_optional_embedding(row, 5)?;
-                let updated_at: Option<String> = row.get(14)?;
-
-                let ie = IssueEmbedding {
-                    id: row.get(0)?,
-                    source: row.get(1)?,
-                    issue_id: row.get(2)?,
-                    short_id: row.get(3)?,
-                    title: row.get(4)?,
-                    description: row.get(9)?,
-                    url: row.get(10)?,
-                    priority: row.get(11)?,
-                    status: row.get(12)?,
-                    labels: row.get(13)?,
-                    embedding,
-                    embedding_model: row.get(6)?,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-                    updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
-                };
+                let ie = Self::row_to_issue_embedding(row, 9)?;
                 let similarity: f64 = row.get(8)?;
                 Ok((ie, similarity))
             },
@@ -5667,18 +5621,20 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         // Read values from DB before the UPDATE (avoid borrowing the watch channel
         // while the conn lock is held).
-        let (db_total_repos, db_indexed_repos, db_total_files_indexed): (i64, i64, i64) =
-            conn.query_row(
-                "SELECT total_repos, indexed_repos, total_files_indexed FROM indexing_progress WHERE id = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
+        let db_total_repos: i64 = conn.query_row(
+            "SELECT total_repos FROM indexing_progress WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
         conn.execute(
             r#"
             UPDATE indexing_progress SET
                 status = 'idle',
                 current_repo = NULL,
                 started_at = NULL,
+                indexed_repos = 0,
+                total_files_indexed = 0,
+                current_repo_files = 0,
                 updated_at = ?1
             WHERE id = 1
             "#,
@@ -5688,8 +5644,8 @@ impl SqliteTracker {
         let new_value = IndexingProgress {
             status: "idle".to_string(),
             total_repos: db_total_repos as usize,
-            indexed_repos: db_indexed_repos as usize,
-            total_files_indexed: db_total_files_indexed as usize,
+            indexed_repos: 0,
+            total_files_indexed: 0,
             updated_at: Some(now),
             ..Default::default()
         };
@@ -7617,8 +7573,15 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let ids_json = serde_json::to_string(&cluster.issue_ids).unwrap_or_else(|_| "[]".into());
         conn.execute(
-            "INSERT OR REPLACE INTO content_clusters (cluster_key, source, representative_issue_id, issue_ids, error_type, culprit, avg_similarity, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO content_clusters (cluster_key, source, representative_issue_id, issue_ids, error_type, culprit, avg_similarity, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(cluster_key, source) DO UPDATE SET
+                representative_issue_id = excluded.representative_issue_id,
+                issue_ids = excluded.issue_ids,
+                error_type = excluded.error_type,
+                culprit = excluded.culprit,
+                avg_similarity = excluded.avg_similarity,
+                status = excluded.status",
             params![
                 cluster.cluster_key,
                 cluster.source,
@@ -7628,7 +7591,7 @@ impl SqliteTracker {
                 cluster.culprit,
                 cluster.avg_similarity,
                 cluster.status,
-                Utc::now().to_rfc3339(),
+                Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -8195,7 +8158,7 @@ fn parse_language(s: &str) -> crate::repo::code_index::Language {
         "Swift" => crate::repo::code_index::Language::Swift,
         "Kotlin" => crate::repo::code_index::Language::Kotlin,
         other => {
-            tracing::warn!(language = %other, "Unknown language in DB, falling back to Rust");
+            tracing::error!(language = %other, "Unknown language in DB — data integrity issue; falling back to Rust");
             crate::repo::code_index::Language::Rust
         }
     }

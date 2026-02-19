@@ -1388,7 +1388,10 @@ The PR title should include the issue ID: {}
         });
         // Also match self-hosted GitLab instances
         static GITLAB_MR_GENERIC_RE: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-            regex_lite::Regex::new(r"https://[^\s]+/-/merge_requests/\d+[^\s]*").unwrap()
+            regex_lite::Regex::new(
+                r"https://[a-zA-Z0-9._-]+(?:\.[a-zA-Z]{2,})/[^\s/]+/[^\s/]+/-/merge_requests/\d+",
+            )
+            .unwrap()
         });
 
         // Try explicit PR_URL format first

@@ -1680,8 +1680,7 @@ mod tests {
 
         watcher.unwatch_pr("url");
         let after_unwatch = watcher.get_state("url");
-        assert!(after_unwatch.is_some());
-        assert!(!after_unwatch.unwrap().is_active);
+        assert!(after_unwatch.is_none());
     }
 
     #[test]

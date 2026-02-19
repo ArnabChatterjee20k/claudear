@@ -59,6 +59,7 @@ struct AppState {
     user_registry: UserRegistry,
     claude: ClaudeRunner,
     github_handler: Option<GitHubWebhookHandler>,
+    suppression_regex_cache: Option<crate::prioritisation::suppression::RegexCache>,
     /// Tracks currently processing webhooks with timestamps for TTL-based cleanup.
     /// Key: processing key (source:issue_id), Value: timestamp when processing started.
     processing: RwLock<HashMap<String, Instant>>,
@@ -167,6 +168,14 @@ impl WebhookServer {
             }
         }
 
+        let suppression_regex_cache = if !self.config.prioritisation.suppression_rules.is_empty() {
+            Some(crate::prioritisation::suppression::RegexCache::new(
+                &self.config.prioritisation.suppression_rules,
+            ))
+        } else {
+            None
+        };
+
         let state = Arc::new(AppState {
             claude: ClaudeRunner::new(
                 ClaudeRunnerConfig {
@@ -190,6 +199,7 @@ impl WebhookServer {
             review_watcher: self.review_watcher,
             user_registry,
             github_handler: self.github_handler,
+            suppression_regex_cache,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -423,14 +433,11 @@ async fn webhook_handler(
     }
 
     // Check suppression rules before criteria matching
-    if !state.config.prioritisation.suppression_rules.is_empty() {
-        let cache = crate::prioritisation::suppression::RegexCache::new(
-            &state.config.prioritisation.suppression_rules,
-        );
+    if let Some(ref cache) = state.suppression_regex_cache {
         let result = crate::prioritisation::suppression::check_issue_with_cache(
             &state.config.prioritisation.suppression_rules,
             &issue,
-            &cache,
+            cache,
         );
         if result.suppressed {
             let rule_name = result.matched_rule.as_deref().unwrap_or("unknown");
@@ -1944,6 +1951,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let Json(response) = health_handler(State(state)).await;
@@ -1986,6 +1994,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(processing_set),
+            suppression_regex_cache: None,
         });
 
         let Json(response) = health_handler(State(state)).await;
@@ -2026,6 +2035,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -2100,6 +2110,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -2149,6 +2160,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -2220,6 +2232,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -2301,6 +2314,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -2354,6 +2368,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -2408,6 +2423,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(processing),
+            suppression_regex_cache: None,
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -2458,6 +2474,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -2530,6 +2547,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -2649,6 +2667,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let Json(response) = health_handler(State(state)).await;
@@ -2770,6 +2789,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         }
     }
 
@@ -2846,6 +2866,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         };
 
         // Should not panic
@@ -2876,6 +2897,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         };
 
         // Should not panic even with empty error
@@ -2913,6 +2935,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         })
     }
 
@@ -2943,6 +2966,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(processing),
+            suppression_regex_cache: None,
         })
     }
 
@@ -2972,6 +2996,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         })
     }
 
@@ -3214,6 +3239,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_handler_issue_suppressed_by_rule() {
+        use crate::prioritisation::suppression::RegexCache;
         use crate::types::{SuppressionField, SuppressionMatchMode, SuppressionRule};
 
         let mut handlers = WebhookHandlerRegistry::new();
@@ -3229,6 +3255,8 @@ mod tests {
             sources: vec![],
             reason: "Test issues are suppressed".to_string(),
         }];
+
+        let cache = RegexCache::new(&config.prioritisation.suppression_rules);
 
         let state = Arc::new(AppState {
             claude: ClaudeRunner::new(
@@ -3251,6 +3279,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: Some(cache),
         });
 
         let (status, Json(response)) = webhook_handler(
@@ -4035,6 +4064,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         };
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
@@ -4069,6 +4099,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         };
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
@@ -4105,6 +4136,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         };
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
@@ -4269,6 +4301,7 @@ mod tests {
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: Some(github_handler),
             processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
         });
 
         let app = build_router(state);

@@ -972,7 +972,7 @@ pub struct JiraConfig {
 impl Default for JiraConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             base_url: String::new(),
             email: String::new(),
             api_token: String::new(),
@@ -1871,10 +1871,12 @@ impl Config {
             .gitlab
             .as_ref()
             .is_some_and(|c| c.enabled && c.token.is_some());
+        let has_slack = self.slack.source_enabled && self.slack.bot_token.is_some();
+        let has_discord = self.discord.source_enabled && self.discord.bot_token.is_some();
 
-        if !has_linear && !has_sentry && !has_jira && !has_gitlab {
+        if !has_linear && !has_sentry && !has_jira && !has_gitlab && !has_slack && !has_discord {
             return Err(Error::config(
-                "No sources configured. Configure linear, sentry, jira, or gitlab in config file with valid API credentials.",
+                "No sources configured. Configure linear, sentry, jira, gitlab, slack, or discord in config file with valid API credentials.",
             ));
         }
 
@@ -1893,6 +1895,12 @@ impl Config {
                 return Err(Error::config(
                     "jira.base_url is required when Jira is enabled",
                 ));
+            }
+            if jira.enabled && jira.auth_mode != "basic" && jira.auth_mode != "bearer" {
+                return Err(Error::config(format!(
+                    "jira.auth_mode must be 'basic' or 'bearer', got '{}'",
+                    jira.auth_mode
+                )));
             }
             if jira.enabled
                 && !jira.api_token.is_empty()
@@ -2020,6 +2028,7 @@ impl Config {
                 .discord
                 .poll_interval_ms
                 .unwrap_or(self.poll_interval_ms),
+            "slack" => self.slack.poll_interval_ms.unwrap_or(self.poll_interval_ms),
             "linear" => self
                 .linear
                 .as_ref()
@@ -2034,6 +2043,11 @@ impl Config {
                 .jira
                 .as_ref()
                 .and_then(|c| c.poll_interval_ms)
+                .unwrap_or(self.poll_interval_ms),
+            "gitlab" => self
+                .gitlab
+                .as_ref()
+                .map(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
             _ => self.poll_interval_ms,
         }

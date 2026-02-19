@@ -104,12 +104,12 @@ pub struct GitLabIssue {
     pub assignees: Vec<GitLabUser>,
 }
 
-impl GitLabClient<crate::github::ReqwestHttpClient> {
+impl GitLabClient<crate::http::ReqwestHttpClient> {
     /// Create a new GitLab client with the default HTTP client.
     pub fn new(config: GitLabConfig) -> Self {
         Self {
             config,
-            http: crate::github::ReqwestHttpClient::new(),
+            http: crate::http::ReqwestHttpClient::new(),
         }
     }
 }
@@ -138,7 +138,7 @@ impl<H: HttpClient> GitLabClient<H> {
     /// URL-encode a project path for GitLab API calls.
     /// GitLab uses URL-encoded project paths like `group%2Fsubgroup%2Fproject`.
     fn encode_project_path(project: &str) -> String {
-        project.replace('/', "%2F")
+        urlencoding::encode(project).into_owned()
     }
 
     /// Build standard GitLab API headers.
@@ -181,10 +181,14 @@ impl<H: HttpClient> GitLabClient<H> {
         );
 
         if !labels.is_empty() {
-            url.push_str(&format!("&labels={}", labels.join(",")));
+            let encoded_labels: Vec<String> = labels
+                .iter()
+                .map(|l| urlencoding::encode(l).into_owned())
+                .collect();
+            url.push_str(&format!("&labels={}", encoded_labels.join(",")));
         }
         if let Some(s) = state {
-            url.push_str(&format!("&state={}", s));
+            url.push_str(&format!("&state={}", urlencoding::encode(s)));
         }
 
         let headers = self.build_headers(token);
@@ -221,10 +225,14 @@ impl<H: HttpClient> GitLabClient<H> {
         );
 
         if !labels.is_empty() {
-            url.push_str(&format!("&labels={}", labels.join(",")));
+            let encoded_labels: Vec<String> = labels
+                .iter()
+                .map(|l| urlencoding::encode(l).into_owned())
+                .collect();
+            url.push_str(&format!("&labels={}", encoded_labels.join(",")));
         }
         if let Some(s) = state {
-            url.push_str(&format!("&state={}", s));
+            url.push_str(&format!("&state={}", urlencoding::encode(s)));
         }
 
         let headers = self.build_headers(token);
@@ -549,10 +557,10 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
             reviews.push(Self::note_to_review(note));
         }
 
-        // Map approvals to reviews
+        // Map approvals to reviews (use negative user ID to avoid collision with note IDs)
         for approval in &approvals.approved_by {
             reviews.push(CodeReview {
-                id: approval.user.id,
+                id: -(approval.user.id),
                 state: "APPROVED".to_string(),
                 body: None,
                 user: ReviewUser {
@@ -796,11 +804,11 @@ mod tests {
     #[test]
     fn test_encode_project_path() {
         assert_eq!(
-            GitLabClient::<crate::github::ReqwestHttpClient>::encode_project_path("group/repo"),
+            GitLabClient::<crate::http::ReqwestHttpClient>::encode_project_path("group/repo"),
             "group%2Frepo"
         );
         assert_eq!(
-            GitLabClient::<crate::github::ReqwestHttpClient>::encode_project_path(
+            GitLabClient::<crate::http::ReqwestHttpClient>::encode_project_path(
                 "group/subgroup/repo"
             ),
             "group%2Fsubgroup%2Frepo"
@@ -1103,8 +1111,8 @@ mod tests {
             Some("2025-01-01T00:00:00Z")
         );
 
-        // Second review: the approval
-        assert_eq!(reviews[1].id, 30);
+        // Second review: the approval (negative user ID to avoid collision with note IDs)
+        assert_eq!(reviews[1].id, -30);
         assert_eq!(reviews[1].state, "APPROVED");
         assert!(reviews[1].body.is_none());
         assert_eq!(reviews[1].user.login, "approver_c");

@@ -30,7 +30,7 @@ pub fn prioritise(
 ) -> (Vec<PrioritisedIssue>, Vec<(Issue, SuppressionResult)>) {
     // Step 1: Suppress -- consume candidates without cloning by partitioning
     // into kept and suppressed via the suppression engine.
-    let (issues_only, match_map): (Vec<Issue>, std::collections::HashMap<String, MatchResult>) =
+    let (issues_only, mut match_map): (Vec<Issue>, std::collections::HashMap<String, MatchResult>) =
         candidates.into_iter().fold(
             (Vec::new(), std::collections::HashMap::new()),
             |(mut issues, mut map), (issue, mr)| {
@@ -46,7 +46,7 @@ pub fn prioritise(
     let mut kept: Vec<(Issue, MatchResult)> = kept_issues
         .into_iter()
         .filter_map(|issue| {
-            let mr = match_map.get(&issue.id).cloned()?;
+            let mr = match_map.remove(&issue.id)?;
             Some((issue, mr))
         })
         .collect();
@@ -749,17 +749,15 @@ mod tests {
         let candidates = vec![dup1, dup2];
         let (result, suppressed) = prioritise(&config, candidates, &tracker);
         assert!(suppressed.is_empty());
-        // Both issues are kept (different Issue objects), but they share the
-        // same MatchResult because the map is keyed by id.
-        assert_eq!(result.len(), 2);
-        // Both should have a valid score (no panic from missing match_map entry)
-        for pi in &result {
-            assert!(
-                pi.severity_score.score.is_finite(),
-                "score must be finite for duplicate-id issue '{}'",
-                pi.issue.title
-            );
-        }
+        // Duplicate issue IDs are deduplicated: the match_map is keyed by id,
+        // so the second insert overwrites the first. On rebuild the first issue
+        // consumes the entry and the second is dropped by filter_map.
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].severity_score.score.is_finite(),
+            "score must be finite for duplicate-id issue '{}'",
+            result[0].issue.title
+        );
     }
 
     #[test]

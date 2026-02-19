@@ -172,7 +172,7 @@ fn matches_pattern_cached(
             let pat = pattern.to_lowercase();
             lower.contains(&pat)
         }
-        SuppressionMatchMode::Exact => value.eq_ignore_ascii_case(pattern),
+        SuppressionMatchMode::Exact => value.to_lowercase() == pattern.to_lowercase(),
         SuppressionMatchMode::Regex => cache.is_match(pattern, value),
     }
 }

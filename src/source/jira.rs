@@ -225,6 +225,11 @@ impl<H: JiraHttpClient> JiraSource<H> {
         }
     }
 
+    /// Escape a value for embedding in a JQL quoted string.
+    fn escape_jql_value(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
     /// Build a JQL query from the configuration.
     fn build_jql(&self) -> String {
         let mut clauses = Vec::new();
@@ -235,7 +240,7 @@ impl<H: JiraHttpClient> JiraSource<H> {
                 .config
                 .project_keys
                 .iter()
-                .map(|k| format!("\"{}\"", k))
+                .map(|k| format!("\"{}\"", Self::escape_jql_value(k)))
                 .collect::<Vec<_>>()
                 .join(", ");
             clauses.push(format!("project in ({})", projects));
@@ -250,7 +255,7 @@ impl<H: JiraHttpClient> JiraSource<H> {
                 .config
                 .trigger_statuses
                 .iter()
-                .map(|s| format!("\"{}\"", s))
+                .map(|s| format!("\"{}\"", Self::escape_jql_value(s)))
                 .collect::<Vec<_>>()
                 .join(", ");
             clauses.push(format!("status in ({})", statuses));
@@ -262,7 +267,7 @@ impl<H: JiraHttpClient> JiraSource<H> {
                 .config
                 .trigger_labels
                 .iter()
-                .map(|l| format!("\"{}\"", l))
+                .map(|l| format!("\"{}\"", Self::escape_jql_value(l)))
                 .collect::<Vec<_>>()
                 .join(", ");
             clauses.push(format!("labels in ({})", labels));
@@ -270,7 +275,10 @@ impl<H: JiraHttpClient> JiraSource<H> {
 
         // Assignee filter
         if let Some(ref assignee) = self.config.trigger_assignee {
-            clauses.push(format!("assignee = \"{}\"", assignee));
+            clauses.push(format!(
+                "assignee = \"{}\"",
+                Self::escape_jql_value(assignee)
+            ));
         }
 
         // Issue type filter
@@ -279,7 +287,7 @@ impl<H: JiraHttpClient> JiraSource<H> {
                 .config
                 .issue_types
                 .iter()
-                .map(|t| format!("\"{}\"", t))
+                .map(|t| format!("\"{}\"", Self::escape_jql_value(t)))
                 .collect::<Vec<_>>()
                 .join(", ");
             clauses.push(format!("issuetype in ({})", types));

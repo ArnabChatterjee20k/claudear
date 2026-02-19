@@ -188,6 +188,9 @@ fn gather_leading_context(lines: &[&str], start_0idx: usize) -> usize {
     let mut ctx_start = start_0idx;
     while ctx_start > 0 {
         let prev = lines[ctx_start - 1].trim();
+        if prev.is_empty() {
+            break;
+        }
         if prev.starts_with("//")       // C-style line comments (includes ///)
             || prev.starts_with("#[")    // Rust attributes
             || prev.starts_with("#![")   // Rust inner attributes

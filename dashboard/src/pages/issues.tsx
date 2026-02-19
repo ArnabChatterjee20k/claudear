@@ -15,7 +15,7 @@ import { TimeAgo } from '../components/shared/time-ago'
 import { Modal } from '../components/shared/modal'
 import { Card, CardContent } from '../components/ui/card'
 import { Skeleton } from '../components/ui/skeleton'
-import { formatDate } from '../lib/formatters'
+import { formatDate, parseUTCDate } from '../lib/formatters'
 
 export default function IssuesPage() {
   const [selectedIssue, setSelectedIssue] = useState<IssueSummary | null>(null)
@@ -231,8 +231,8 @@ export default function IssuesPage() {
                   {issueAttempts
                     .sort(
                       (a, b) =>
-                        new Date(b.attempted_at).getTime() -
-                        new Date(a.attempted_at).getTime(),
+                        parseUTCDate(b.attempted_at).getTime() -
+                        parseUTCDate(a.attempted_at).getTime(),
                     )
                     .map(a => (
                       <div

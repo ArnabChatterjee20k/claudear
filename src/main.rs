@@ -423,7 +423,8 @@ enum UsersCommands {
 fn init_logging(
     log_dir: Option<&std::path::Path>,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,ort=warn"));
 
     // Console layer - always enabled
     let console_layer = fmt::layer().with_target(false).with_writer(std::io::stdout);

@@ -8,8 +8,9 @@ import { Badge } from '../components/ui/badge'
 import {
   Settings, Save, RotateCcw, FileText, AlertTriangle,
   CheckCircle2, Server, GitBranch, Bell, Shield,
-  Cpu, Bot, RefreshCw, Eye, X,
+  Cpu, Bot, RefreshCw, Eye, X, ShieldAlert,
 } from 'lucide-react'
+import { useAuth } from '../lib/auth'
 
 interface TomlSection {
   key: string
@@ -106,7 +107,7 @@ function parseArrayValue(value: string): string[] {
 }
 
 function serializeArrayValue(items: string[]): string {
-  return `[${items.map(i => `"${i}"`).join(', ')}]`
+  return `[${items.map(i => `"${i.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).join(', ')}]`
 }
 
 /** Build a map of sectionKey.fieldKey -> value from parsed TOML content. */
@@ -120,6 +121,73 @@ function buildFieldMap(content: string): Record<string, string> {
     }
   }
   return map
+}
+
+function ArrayFieldInput({
+  field,
+  onChange,
+  changed,
+}: {
+  field: ParsedField
+  onChange: (key: string, newValue: string) => void
+  changed?: boolean
+}) {
+  const [newItem, setNewItem] = useState('')
+  const items = parseArrayValue(field.value)
+
+  return (
+    <div className={`space-y-2 ${changed ? 'rounded-md ring-2 ring-amber-400/50 p-1.5 -m-1.5' : ''}`}>
+      <div className="flex flex-wrap gap-1">
+        {items.length === 0 && (
+          <span className="text-xs text-muted-foreground italic">Empty</span>
+        )}
+        {items.map((item, i) => (
+          <span
+            key={i}
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs bg-muted border"
+          >
+            {item}
+            <button
+              onClick={() => {
+                const next = items.filter((_, j) => j !== i)
+                onChange(field.key, serializeArrayValue(next))
+              }}
+              className="text-muted-foreground hover:text-foreground"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </span>
+        ))}
+      </div>
+      <div className="flex gap-1">
+        <input
+          type="text"
+          value={newItem}
+          onChange={e => setNewItem(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter' && newItem.trim()) {
+              e.preventDefault()
+              onChange(field.key, serializeArrayValue([...items, newItem.trim()]))
+              setNewItem('')
+            }
+          }}
+          placeholder="Add item..."
+          className="flex-1 px-2 py-1 text-xs border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
+        />
+        <button
+          onClick={() => {
+            if (newItem.trim()) {
+              onChange(field.key, serializeArrayValue([...items, newItem.trim()]))
+              setNewItem('')
+            }
+          }}
+          className="px-2 py-1 text-xs border rounded-md hover:bg-muted"
+        >
+          Add
+        </button>
+      </div>
+    </div>
+  )
 }
 
 function FieldInput({
@@ -164,62 +232,7 @@ function FieldInput({
   }
 
   if (field.type === 'array') {
-    const items = parseArrayValue(field.value)
-    const [newItem, setNewItem] = useState('')
-
-    return (
-      <div className={`space-y-2 ${changed ? 'rounded-md ring-2 ring-amber-400/50 p-1.5 -m-1.5' : ''}`}>
-        <div className="flex flex-wrap gap-1">
-          {items.length === 0 && (
-            <span className="text-xs text-muted-foreground italic">Empty</span>
-          )}
-          {items.map((item, i) => (
-            <span
-              key={i}
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs bg-muted border"
-            >
-              {item}
-              <button
-                onClick={() => {
-                  const next = items.filter((_, j) => j !== i)
-                  onChange(field.key, serializeArrayValue(next))
-                }}
-                className="text-muted-foreground hover:text-foreground"
-              >
-                <X className="h-3 w-3" />
-              </button>
-            </span>
-          ))}
-        </div>
-        <div className="flex gap-1">
-          <input
-            type="text"
-            value={newItem}
-            onChange={e => setNewItem(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter' && newItem.trim()) {
-                e.preventDefault()
-                onChange(field.key, serializeArrayValue([...items, newItem.trim()]))
-                setNewItem('')
-              }
-            }}
-            placeholder="Add item..."
-            className="flex-1 px-2 py-1 text-xs border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
-          />
-          <button
-            onClick={() => {
-              if (newItem.trim()) {
-                onChange(field.key, serializeArrayValue([...items, newItem.trim()]))
-                setNewItem('')
-              }
-            }}
-            className="px-2 py-1 text-xs border rounded-md hover:bg-muted"
-          >
-            Add
-          </button>
-        </div>
-      </div>
-    )
+    return <ArrayFieldInput field={field} onChange={onChange} changed={changed} />
   }
 
   // String / unknown
@@ -346,6 +359,7 @@ function SectionFormCard({
 }
 
 export default function ConfigPage() {
+  const { user: currentUser } = useAuth()
   const { data, isLoading, error, mutate } = useSWR<ConfigResponse>('config', fetchConfig)
   const [editContent, setEditContent] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -383,14 +397,7 @@ export default function ConfigPage() {
       setSaveResult(result)
       mutate()
     } catch (e: any) {
-      const msg = e?.message || 'Unknown error'
-      let detail = msg
-      try {
-        if (msg.includes('Failed to put')) {
-          detail = msg
-        }
-      } catch {}
-      setSaveResult({ ok: false, message: detail })
+      setSaveResult({ ok: false, message: e?.message || 'Unknown error' })
     } finally {
       setSaving(false)
     }
@@ -408,6 +415,15 @@ export default function ConfigPage() {
     const rebuilt = allSections.map(s => s.lines.join('\n')).join('\n')
     setEditContent(rebuilt)
   }, [editContent, savedContent])
+
+  if (currentUser?.role !== 'admin') {
+    return (
+      <div className="flex items-center gap-2 text-muted-foreground text-sm p-6">
+        <ShieldAlert className="h-5 w-5" />
+        <span>Access denied. You need administrator privileges to view configuration.</span>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-6">

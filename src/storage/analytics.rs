@@ -318,10 +318,7 @@ pub fn classify_error(error_message: &str) -> &'static str {
         "git_error"
     } else if lower.contains("test") || lower.contains("assertion") {
         "test_failure"
-    } else if lower.contains("claude")
-        || lower.contains("claude api")
-        || lower.contains("rate limit")
-    {
+    } else if lower.contains("claude") || lower.contains("rate limit") {
         "claude_error"
     } else if lower.contains("permission") || lower.contains("access denied") {
         "permission_error"

@@ -1381,6 +1381,10 @@ pub enum IssueType {
     SentryIssue,
     /// Issue from Linear marked as a bug.
     LinearBug,
+    /// Issue from GitLab.
+    GitLabIssue,
+    /// Issue from Jira.
+    JiraIssue,
 }
 
 impl IssueType {
@@ -1389,6 +1393,8 @@ impl IssueType {
         match self {
             Self::SentryIssue => "sentry",
             Self::LinearBug => "linear",
+            Self::GitLabIssue => "gitlab",
+            Self::JiraIssue => "jira",
         }
     }
 }
@@ -1398,6 +1404,8 @@ impl std::fmt::Display for IssueType {
         match self {
             Self::SentryIssue => write!(f, "sentry_issue"),
             Self::LinearBug => write!(f, "linear_bug"),
+            Self::GitLabIssue => write!(f, "gitlab_issue"),
+            Self::JiraIssue => write!(f, "jira_issue"),
         }
     }
 }
@@ -1409,6 +1417,8 @@ impl std::str::FromStr for IssueType {
         match s.to_lowercase().as_str() {
             "sentry_issue" => Ok(Self::SentryIssue),
             "linear_bug" => Ok(Self::LinearBug),
+            "gitlab_issue" => Ok(Self::GitLabIssue),
+            "jira_issue" => Ok(Self::JiraIssue),
             _ => Err(format!("Unknown issue type: {}", s)),
         }
     }

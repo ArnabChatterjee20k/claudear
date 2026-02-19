@@ -431,7 +431,9 @@ impl PrMonitor {
         match attempt.source.as_str() {
             "sentry" => IssueType::SentryIssue,
             "linear" => IssueType::LinearBug,
-            _ => IssueType::SentryIssue, // Default fallback
+            "gitlab" => IssueType::GitLabIssue,
+            "jira" => IssueType::JiraIssue,
+            _ => IssueType::SentryIssue,
         }
     }
 
@@ -729,9 +731,7 @@ impl ReviewWatcher {
             tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
             poisoned.into_inner()
         });
-        if let Some(state) = states.get_mut(pr_url) {
-            state.is_active = false;
-        }
+        states.remove(pr_url);
     }
 
     /// Get the state for a PR.
@@ -2596,6 +2596,28 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_get_issue_type_gitlab() {
+            let provider = Arc::new(MockPrScmProvider::new(true));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+            let monitor = PrMonitor::new(provider, tracker, true);
+
+            let attempt = make_fix_attempt("gitlab", "issue-1", "GL-1", None, None, None, vec![]);
+
+            assert_eq!(monitor.get_issue_type(&attempt), IssueType::GitLabIssue);
+        }
+
+        #[tokio::test]
+        async fn test_get_issue_type_jira() {
+            let provider = Arc::new(MockPrScmProvider::new(true));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+            let monitor = PrMonitor::new(provider, tracker, true);
+
+            let attempt = make_fix_attempt("jira", "issue-1", "JIRA-1", None, None, None, vec![]);
+
+            assert_eq!(monitor.get_issue_type(&attempt), IssueType::JiraIssue);
+        }
+
+        #[tokio::test]
         async fn test_get_issue_type_unknown() {
             let provider = Arc::new(MockPrScmProvider::new(true));
             let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
@@ -2792,7 +2814,7 @@ mod tests {
         }
 
         #[test]
-        fn test_unwatch_pr_deactivates() {
+        fn test_unwatch_pr_removes() {
             let provider: Arc<dyn ScmProvider> =
                 Arc::new(MockScmProvider::new("github", true, "/claudear"));
             let watcher = ReviewWatcher::new(provider);
@@ -2802,8 +2824,7 @@ mod tests {
             watcher.unwatch_pr("https://github.com/org/repo/pull/1");
 
             let retrieved = watcher.get_state("https://github.com/org/repo/pull/1");
-            assert!(retrieved.is_some());
-            assert!(!retrieved.unwrap().is_active);
+            assert!(retrieved.is_none());
         }
 
         #[test]
@@ -2830,7 +2851,7 @@ mod tests {
         }
 
         #[test]
-        fn test_get_all_states_includes_inactive() {
+        fn test_get_all_states_excludes_unwatched() {
             let provider: Arc<dyn ScmProvider> =
                 Arc::new(MockScmProvider::new("github", true, "/claudear"));
             let watcher = ReviewWatcher::new(provider);
@@ -2848,7 +2869,8 @@ mod tests {
             watcher.unwatch_pr("https://github.com/org/repo/pull/1");
 
             let all = watcher.get_all_states();
-            assert_eq!(all.len(), 2);
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].pr_url, "https://github.com/org/repo/pull/2");
         }
 
         #[test]

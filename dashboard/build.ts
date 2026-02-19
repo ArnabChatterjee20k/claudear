@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync, renameSync } from "fs";
 import { join } from "path";
 import { createHash } from "crypto";
 
@@ -61,7 +61,6 @@ if (tailwindResult.exitCode !== 0) {
 const cssContent = readFileSync(join(outdir, "assets/index.css"));
 const cssHash = createHash("md5").update(cssContent).digest("hex").slice(0, 8);
 const cssFilename = `index-${cssHash}.css`;
-const { renameSync } = await import("fs");
 renameSync(join(outdir, "assets/index.css"), join(outdir, "assets", cssFilename));
 
 // 5. Find generated JS entry file
@@ -92,7 +91,7 @@ writeFileSync(join(outdir, "index.html"), html);
 // 7. Copy static assets
 try {
   cpSync(join(srcdir, "public"), outdir, { recursive: true });
-} catch {}
+} catch (e) { console.warn('Warning: could not copy public directory:', e) }
 
 console.log(`Build complete: ${result.outputs.length} files`);
 for (const output of result.outputs) {

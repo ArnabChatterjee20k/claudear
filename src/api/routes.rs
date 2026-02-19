@@ -2144,7 +2144,6 @@ async fn telemetry_latency_handler(
 #[derive(Serialize)]
 struct ConfigResponse {
     content: String,
-    path: String,
 }
 
 #[derive(Deserialize)]
@@ -2152,21 +2151,31 @@ struct ConfigUpdateRequest {
     content: String,
 }
 
-/// GET /api/config — return the raw TOML config file content.
+/// Redact values of keys that look like secrets in raw TOML content.
+fn redact_secrets(content: &str) -> String {
+    let re = regex_lite::Regex::new(
+        r#"(?im)^(\s*(?:[a-z_]*(?:token|secret|password|api_key|auth)[a-z_]*)\s*=\s*)("[^"]*"|'[^']*'|[^\n]*)"#,
+    )
+    .expect("valid regex");
+    re.replace_all(content, r#"${1}"[REDACTED]""#).into_owned()
+}
+
+/// GET /api/config — return the raw TOML config file content with secrets redacted.
 async fn get_config_handler(
     _user: AdminUser,
     State(state): State<ApiState>,
 ) -> Result<Json<ConfigResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let content = std::fs::read_to_string(&state.config_path).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Failed to read config: {}", e) })),
-        )
-    })?;
+    let content = tokio::fs::read_to_string(&state.config_path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Failed to read config: {}", e) })),
+            )
+        })?;
 
     Ok(Json(ConfigResponse {
-        content,
-        path: state.config_path.display().to_string(),
+        content: redact_secrets(&content),
     }))
 }
 
@@ -2176,20 +2185,28 @@ async fn put_config_handler(
     State(state): State<ApiState>,
     Json(body): Json<ConfigUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // Validate the TOML parses as a valid Config before writing
-    toml::from_str::<Config>(&body.content).map_err(|e| {
+    let parsed = toml::from_str::<Config>(&body.content).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
         )
     })?;
 
-    std::fs::write(&state.config_path, &body.content).map_err(|e| {
+    parsed.validate().map_err(|e| {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Failed to write config: {}", e) })),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Config validation failed: {}", e) })),
         )
     })?;
+
+    tokio::fs::write(&state.config_path, &body.content)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Failed to write config: {}", e) })),
+            )
+        })?;
 
     Ok(Json(
         serde_json::json!({ "ok": true, "message": "Config saved. Restart to apply changes." }),
@@ -3214,7 +3231,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(resp["content"].as_str().unwrap().contains("work_dir"));
-        assert!(resp["path"].as_str().is_some());
+        assert!(resp["path"].is_null(), "path field should not be exposed");
 
         // Cleanup
         let _ = std::fs::remove_file(&config_path);

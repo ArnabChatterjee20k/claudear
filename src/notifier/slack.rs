@@ -203,7 +203,7 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 pub(crate) fn slack_ts_to_datetime(ts: &str) -> Option<DateTime<Utc>> {
     let secs_f64: f64 = ts.parse().ok()?;
     let secs = secs_f64.trunc() as i64;
-    let nanos = ((secs_f64.fract()) * 1_000_000_000.0) as u32;
+    let nanos = (secs_f64.fract().abs() * 1_000_000_000.0).min(999_999_999.0) as u32;
     DateTime::from_timestamp(secs, nanos)
 }
 
@@ -283,9 +283,11 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
         {
             if !token.is_empty() && !channel_id.is_empty() {
                 self.post_chat_message(token, channel_id, &message).await?;
+                return Ok(());
             }
         }
 
+        tracing::warn!("Slack send() called but no webhook_url or bot_token+channel_id configured, message dropped");
         Ok(())
     }
 
@@ -652,7 +654,7 @@ pub(crate) fn build_urgent_issues_message(
         return None;
     }
 
-    let mut fields: Vec<SlackText> = issues
+    let fields: Vec<SlackText> = issues
         .iter()
         .take(10)
         .map(|issue| {
@@ -663,9 +665,6 @@ pub(crate) fn build_urgent_issues_message(
             SlackText::mrkdwn(format!("{} <{}|{} - {}>", emoji, url, short_id, title))
         })
         .collect();
-
-    // Slack section fields are limited to 10
-    fields.truncate(10);
 
     let header_text = format!(
         "\u{1F6A8} {} Urgent Issue{} Detected",
@@ -932,7 +931,9 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
         let since_ts = format!("{}.000000", since.timestamp());
         let history_url = format!(
             "{}conversations.history?channel={}&oldest={}&limit=50",
-            SLACK_API_BASE, channel_id, since_ts
+            SLACK_API_BASE,
+            urlencoding::encode(channel_id),
+            urlencoding::encode(&since_ts)
         );
         let history_resp = self.http.get_json(&history_url, Some(token_str)).await?;
         let history: SlackApiResponse =
@@ -962,7 +963,10 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
         for qm in &question_messages {
             let replies_url = format!(
                 "{}conversations.replies?channel={}&ts={}&oldest={}",
-                SLACK_API_BASE, channel_id, qm.ts, since_ts
+                SLACK_API_BASE,
+                urlencoding::encode(channel_id),
+                urlencoding::encode(&qm.ts),
+                urlencoding::encode(&since_ts)
             );
             let replies_resp = self.http.get_json(&replies_url, Some(token_str)).await?;
             let thread: SlackApiResponse =

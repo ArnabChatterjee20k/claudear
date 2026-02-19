@@ -44,6 +44,7 @@ impl UserRegistry {
                 "github" => user.github_username.as_deref() == Some(assignee_value),
                 "sentry" => user.sentry_username.as_deref() == Some(assignee_value),
                 "jira" => user.jira_username.as_deref() == Some(assignee_value),
+                "gitlab" => user.gitlab_username.as_deref() == Some(assignee_value),
                 _ => false,
             };
             if matched {

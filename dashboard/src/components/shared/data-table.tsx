@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { EmptyState } from './empty-state'
 
@@ -30,6 +30,8 @@ export function DataTable<T>({
   const [sortKey, setSortKey] = useState<string | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
   const [page, setPage] = useState(1)
+
+  useEffect(() => { setPage(1) }, [data.length])
 
   const handleSort = (key: string) => {
     if (sortKey === key) {
