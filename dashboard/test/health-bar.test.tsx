@@ -33,7 +33,7 @@ describe("HealthBar", () => {
     expect(container.innerHTML).toBe("");
   });
 
-  test("shows Healthy and Connected for ok status", async () => {
+  test("shows Healthy for ok status", async () => {
     mockFetchHealth({
       status: "ok",
       version: "1.2.3",
@@ -46,7 +46,6 @@ describe("HealthBar", () => {
     await waitFor(() => {
       expect(screen.getByText("Healthy")).toBeTruthy();
     });
-    expect(screen.getByText("Connected")).toBeTruthy();
   });
 
   test("shows Degraded when status is not ok", async () => {
@@ -64,7 +63,7 @@ describe("HealthBar", () => {
     });
   });
 
-  test("shows Error when database status is not ok", async () => {
+  test("shows Healthy when database status is ok even with error field", async () => {
     mockFetchHealth({
       status: "ok",
       version: "1.2.3",
@@ -75,7 +74,7 @@ describe("HealthBar", () => {
     renderWithSWR(<HealthBar />);
 
     await waitFor(() => {
-      expect(screen.getByText("Error")).toBeTruthy();
+      expect(screen.getByText("Healthy")).toBeTruthy();
     });
   });
 

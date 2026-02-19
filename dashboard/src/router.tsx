@@ -5,17 +5,18 @@ const RouterContext = createContext<{ path: string; navigate: (path: string) => 
   navigate: () => {},
 })
 
-function useHash() {
-  const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
+function useHistory() {
+  const [path, setPath] = useState(() => window.location.pathname)
 
   useEffect(() => {
-    const onHashChange = () => setPath(window.location.hash.slice(1) || '/')
-    window.addEventListener('hashchange', onHashChange)
-    return () => window.removeEventListener('hashchange', onHashChange)
+    const onPopState = () => setPath(window.location.pathname)
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
   }, [])
 
   const navigate = useCallback((newPath: string) => {
-    window.location.hash = newPath
+    window.history.pushState(null, '', newPath)
+    setPath(newPath)
   }, [])
 
   return { path, navigate }
@@ -26,7 +27,7 @@ export function useRouter() {
 }
 
 export function RouterProvider({ children }: { children: React.ReactNode }) {
-  const value = useHash()
+  const value = useHistory()
   return <RouterContext.Provider value={value}>{children}</RouterContext.Provider>
 }
 

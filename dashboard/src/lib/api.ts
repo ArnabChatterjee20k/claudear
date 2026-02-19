@@ -119,6 +119,7 @@ export interface AuthUser {
   email: string
   name: string
   role: string
+  avatar_url: string | null
 }
 
 export interface LoginResponse {
@@ -130,6 +131,7 @@ export interface UserRecord {
   email: string
   name: string
   role: string
+  avatar_url: string | null
   created_at: string
   updated_at: string
 }
@@ -835,6 +837,24 @@ export async function logout(): Promise<void> {
 
 export async function getMe(): Promise<AuthUser> {
   return fetchJson(`${API_BASE}/auth/me`)
+}
+
+export async function updateProfile(data: {
+  name?: string; password?: string; current_password?: string
+}): Promise<UserRecord> {
+  return putJson(`${API_BASE}/auth/profile`, data)
+}
+
+export async function uploadAvatar(file: File): Promise<{ avatar_url: string }> {
+  const form = new FormData()
+  form.append('avatar', file)
+  const res = await fetch(`${API_BASE}/auth/avatar`, { method: 'POST', body: form })
+  if (res.status === 401) {
+    onUnauthorized?.()
+    throw new Error('Unauthorized')
+  }
+  if (!res.ok) throw new Error(`Failed to upload avatar: ${res.status}`)
+  return res.json()
 }
 
 // ─── User Management API ─────────────────────────

@@ -4,7 +4,7 @@ import { Router, RouterProvider, useRouter } from "../src/router";
 
 afterEach(() => {
   cleanup();
-  window.location.hash = "";
+  window.history.replaceState(null, "", "/");
 });
 
 // Helper to test the router hook via a component
@@ -19,8 +19,8 @@ function UseRouterHarness() {
 }
 
 describe("RouterProvider", () => {
-  test("defaults to '/' when no hash is set", () => {
-    window.location.hash = "";
+  test("defaults to '/' when at root", () => {
+    window.history.replaceState(null, "", "/");
     render(
       <RouterProvider>
         <UseRouterHarness />
@@ -29,8 +29,8 @@ describe("RouterProvider", () => {
     expect(screen.getByTestId("path").textContent).toBe("/");
   });
 
-  test("reads hash from URL", () => {
-    window.location.hash = "#/settings";
+  test("reads path from URL", () => {
+    window.history.replaceState(null, "", "/settings");
     render(
       <RouterProvider>
         <UseRouterHarness />
@@ -42,7 +42,7 @@ describe("RouterProvider", () => {
 
 describe("Router", () => {
   test("renders correct component for path", () => {
-    window.location.hash = "#/about";
+    window.history.replaceState(null, "", "/about");
     const routes: Record<string, () => JSX.Element> = {
       "/": () => <div>Home</div>,
       "/about": () => <div>About</div>,
@@ -56,7 +56,7 @@ describe("Router", () => {
   });
 
   test("falls back to '/' route for unknown paths", () => {
-    window.location.hash = "#/nonexistent";
+    window.history.replaceState(null, "", "/nonexistent");
     const routes: Record<string, () => JSX.Element> = {
       "/": () => <div>Home</div>,
       "/about": () => <div>About</div>,
@@ -70,7 +70,7 @@ describe("Router", () => {
   });
 
   test("renders nothing when no matching route and no '/' route", () => {
-    window.location.hash = "#/unknown";
+    window.history.replaceState(null, "", "/unknown");
     const routes: Record<string, () => JSX.Element> = {
       "/about": () => <div>About</div>,
     };
@@ -85,7 +85,7 @@ describe("Router", () => {
 
 describe("useRouter", () => {
   test("provides path and navigate from context", () => {
-    window.location.hash = "#/dashboard";
+    window.history.replaceState(null, "", "/dashboard");
 
     function Child() {
       const { path, navigate } = useRouter();
@@ -110,8 +110,8 @@ describe("useRouter", () => {
 });
 
 describe("Navigation", () => {
-  test("calling navigate updates the hash", () => {
-    window.location.hash = "#/";
+  test("calling navigate updates the path via pushState", () => {
+    window.history.replaceState(null, "", "/");
     render(
       <RouterProvider>
         <UseRouterHarness />
@@ -120,6 +120,7 @@ describe("Navigation", () => {
     act(() => {
       screen.getByText("go").click();
     });
-    expect(window.location.hash).toBe("#/next");
+    expect(window.location.pathname).toBe("/next");
+    expect(screen.getByTestId("path").textContent).toBe("/next");
   });
 });

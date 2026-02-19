@@ -57,6 +57,7 @@ pub struct UserRow {
     pub password_hash: String,
     pub name: String,
     pub role: String,
+    pub avatar_url: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -69,8 +70,9 @@ impl UserRow {
             password_hash: row.get(2)?,
             name: row.get(3)?,
             role: row.get(4)?,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
+            avatar_url: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
         })
     }
 }
@@ -184,8 +186,7 @@ impl SqliteTracker {
                 merged_at TEXT,
                 resolved_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
-                issue_labels TEXT,  -- JSON array of labels for bug detection
-                UNIQUE(source, issue_id)
+                issue_labels TEXT  -- JSON array of labels for bug detection
             );
 
             CREATE INDEX IF NOT EXISTS idx_fix_attempts_status ON fix_attempts(status);
@@ -755,6 +756,12 @@ impl SqliteTracker {
             "CREATE INDEX IF NOT EXISTS idx_fix_attempts_parent ON fix_attempts(parent_attempt_id);",
         )?;
 
+        // Partial unique index: uniqueness on (source, issue_id) only for non-cascade rows.
+        // Cascade rows (cascade_repo IS NOT NULL) share the parent's source+issue_id.
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fix_attempts_unique_original ON fix_attempts(source, issue_id) WHERE cascade_repo IS NULL;",
+        )?;
+
         // ============================================================
         // Continuous Learning Tables
         // ============================================================
@@ -887,6 +894,13 @@ impl SqliteTracker {
                         "Failed to run learning migration"
                     );
                 }
+            }
+        }
+
+        // User avatar migration
+        if let Err(e) = conn.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT", []) {
+            if !e.to_string().contains("duplicate column name") {
+                tracing::error!(error = %e, "Failed to run users.avatar_url migration");
             }
         }
 
@@ -1907,35 +1921,53 @@ impl FixAttemptTracker for SqliteTracker {
             Some(serde_json::to_string(labels).unwrap_or_default())
         };
 
-        // Conditional upsert: only update existing rows that have been soft-reset
-        // (reset_at IS NOT NULL). This prevents silently overwriting state for
-        // actively-processing or already-completed attempts.
-        let rows_affected = conn.execute(
-            r#"
-            INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, issue_labels)
-            VALUES (?, ?, ?, 'pending', datetime('now'), ?)
-            ON CONFLICT(source, issue_id) DO UPDATE SET
-                short_id = excluded.short_id,
-                attempted_at = datetime('now'),
-                issue_labels = COALESCE(excluded.issue_labels, fix_attempts.issue_labels),
-                reset_at = NULL
-            WHERE fix_attempts.reset_at IS NOT NULL
-            "#,
-            params![source, issue_id, short_id, labels_json],
-        )?;
-        if rows_affected == 0 {
-            tracing::warn!(
-                source = source,
-                issue_id = issue_id,
-                "Attempt already exists and is not in reset state, skipping"
-            );
-        } else {
-            tracing::info!(
-                source = source,
-                issue_id = issue_id,
-                rows_affected = rows_affected,
-                "Fix attempt recorded"
-            );
+        // Manual upsert: check for existing non-cascade row, then INSERT or UPDATE.
+        // We cannot use ON CONFLICT(source, issue_id) because the uniqueness constraint
+        // is a partial index (cascade rows share source+issue_id with the parent).
+        let existing: Option<(i64, Option<String>)> = conn
+            .prepare_cached(
+                "SELECT id, reset_at FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL",
+            )?
+            .query_row(params![source, issue_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+
+        match existing {
+            None => {
+                // No existing row — insert fresh
+                conn.execute(
+                    r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, issue_labels)
+                       VALUES (?, ?, ?, 'pending', datetime('now'), ?)"#,
+                    params![source, issue_id, short_id, labels_json],
+                )?;
+                tracing::info!(source = source, issue_id = issue_id, "Fix attempt recorded");
+            }
+            Some((_id, Some(_reset_at))) => {
+                // Existing row in reset state — update it
+                conn.execute(
+                    r#"UPDATE fix_attempts SET
+                         short_id = ?,
+                         attempted_at = datetime('now'),
+                         issue_labels = COALESCE(?, issue_labels),
+                         reset_at = NULL
+                       WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL"#,
+                    params![short_id, labels_json, source, issue_id],
+                )?;
+                tracing::info!(
+                    source = source,
+                    issue_id = issue_id,
+                    "Fix attempt updated (was in reset state)"
+                );
+            }
+            Some((_id, None)) => {
+                // Existing row NOT in reset state — skip
+                tracing::warn!(
+                    source = source,
+                    issue_id = issue_id,
+                    "Attempt already exists and is not in reset state, skipping"
+                );
+            }
         }
         Ok(())
     }
@@ -6761,7 +6793,7 @@ impl SqliteTracker {
     pub fn get_user_by_id(&self, id: i64) -> Result<Option<UserRow>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, created_at, updated_at FROM users WHERE id = ?1"
+            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE id = ?1"
         )?;
         let user = stmt.query_row(params![id], UserRow::from_row).optional()?;
         Ok(user)
@@ -6770,7 +6802,7 @@ impl SqliteTracker {
     pub fn get_user_by_email(&self, email: &str) -> Result<Option<UserRow>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, created_at, updated_at FROM users WHERE email = ?1"
+            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE email = ?1"
         )?;
         let user = stmt
             .query_row(params![email], UserRow::from_row)
@@ -6781,7 +6813,7 @@ impl SqliteTracker {
     pub fn list_users(&self) -> Result<Vec<UserRow>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, created_at, updated_at FROM users ORDER BY id"
+            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users ORDER BY id"
         )?;
         let users = stmt
             .query_map([], UserRow::from_row)?
@@ -6796,6 +6828,7 @@ impl SqliteTracker {
         password_hash: Option<&str>,
         name: Option<&str>,
         role: Option<&str>,
+        avatar_url: Option<&str>,
     ) -> Result<bool> {
         let conn = self.acquire_lock()?;
         let mut sets = Vec::new();
@@ -6816,6 +6849,10 @@ impl SqliteTracker {
         if let Some(r) = role {
             sets.push("role = ?");
             values.push(Box::new(r.to_string()));
+        }
+        if let Some(a) = avatar_url {
+            sets.push("avatar_url = ?");
+            values.push(Box::new(a.to_string()));
         }
 
         if sets.is_empty() {
@@ -6858,7 +6895,7 @@ impl SqliteTracker {
     pub fn get_session_user(&self, token: &str) -> Result<Option<UserRow>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
-            "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.created_at, u.updated_at
+            "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
              FROM sessions s
              JOIN users u ON s.user_id = u.id
              WHERE s.id = ?1 AND s.expires_at > datetime('now')",
@@ -9923,6 +9960,7 @@ mod tests {
                 None,
                 Some("New Name"),
                 Some("admin"),
+                None,
             )
             .unwrap();
         let user = tracker.get_user_by_id(id).unwrap().unwrap();

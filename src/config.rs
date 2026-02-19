@@ -123,6 +123,13 @@ pub struct Config {
     /// Code indexing configuration.
     #[serde(default)]
     pub code_index: CodeIndexConfig,
+    /// General-purpose storage directory for user uploads (avatars, etc.).
+    #[serde(default = "default_storage_dir")]
+    pub storage_dir: PathBuf,
+}
+
+fn default_storage_dir() -> PathBuf {
+    PathBuf::from("./storage")
 }
 
 impl Default for Config {
@@ -160,6 +167,7 @@ impl Default for Config {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            storage_dir: default_storage_dir(),
         }
     }
 }

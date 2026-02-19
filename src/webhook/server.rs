@@ -1692,6 +1692,7 @@ mod tests {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            storage_dir: "/tmp/claudear-storage".into(),
         }
     }
 

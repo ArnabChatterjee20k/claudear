@@ -34,6 +34,8 @@ pub struct ApiState {
     pub config_path: PathBuf,
     /// Watch channel for real-time indexing progress pushed from SQLite hooks.
     pub indexing_rx: tokio::sync::watch::Receiver<crate::storage::IndexingProgress>,
+    /// General-purpose storage directory for user uploads (avatars, etc.).
+    pub storage_dir: PathBuf,
 }
 
 /// Create the API router.
@@ -54,12 +56,21 @@ pub fn create_api_router_with_dashboard(
     indexing_rx: tokio::sync::watch::Receiver<crate::storage::IndexingProgress>,
     dashboard_dir: Option<PathBuf>,
 ) -> Router {
+    let storage_dir = config.storage_dir.clone();
+
+    // Ensure avatar upload directory exists
+    let avatars_dir = storage_dir.join("avatars");
+    if let Err(e) = std::fs::create_dir_all(&avatars_dir) {
+        tracing::warn!(error = %e, path = %avatars_dir.display(), "Failed to create avatars directory");
+    }
+
     let state = ApiState {
         config,
         tracker,
         start_time: Instant::now(),
         config_path,
         indexing_rx,
+        storage_dir: storage_dir.clone(),
     };
 
     let api_routes = Router::new()
@@ -112,6 +123,14 @@ pub fn create_api_router_with_dashboard(
         .route("/api/auth/login", axum::routing::post(login_handler))
         .route("/api/auth/logout", axum::routing::post(logout_handler))
         .route("/api/auth/me", axum::routing::get(me_handler))
+        .route(
+            "/api/auth/profile",
+            axum::routing::put(update_profile_handler),
+        )
+        .route(
+            "/api/auth/avatar",
+            axum::routing::post(upload_avatar_handler),
+        )
         // Config routes (admin only)
         .route(
             "/api/config",
@@ -128,7 +147,8 @@ pub fn create_api_router_with_dashboard(
                 .put(update_user_handler)
                 .delete(delete_user_handler),
         )
-        .with_state(state);
+        .with_state(state)
+        .nest_service("/avatars", ServeDir::new(avatars_dir));
 
     // If dashboard directory is provided, serve from filesystem (development override)
     if let Some(dashboard_path) = dashboard_dir {
@@ -2262,6 +2282,7 @@ mod tests {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            storage_dir: "/tmp/claudear-storage".into(),
         }
     }
 

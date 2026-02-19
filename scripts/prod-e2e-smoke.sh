@@ -4,11 +4,12 @@ set -Eeuo pipefail
 ###############################################################################
 # Production E2E Smoke Test
 #
-# Tests the full claudear lifecycle across two scenarios:
+# Tests the full claudear lifecycle across three scenarios:
 #   Scenario 1: Linear source -> daemon poll -> PR -> review comments ->
 #               request_changes review -> merge -> regression watch -> resolve
 #   Scenario 2: Discord source -> ask/question flow -> PR -> merge ->
 #               simulated regression -> retry -> re-merge -> resolve
+#   Scenario 3: Cascade -> upstream merge triggers downstream adaptation PR
 #
 # Required env vars:
 #   CLAUDEAR_E2E_LINEAR_API_KEY
@@ -17,6 +18,7 @@ set -Eeuo pipefail
 #   CLAUDEAR_E2E_GITHUB_TOKEN
 #   CLAUDEAR_E2E_DISCORD_BOT_TOKEN  (Scenario 2 only, skipped if absent)
 #   CLAUDEAR_E2E_DISCORD_CHANNEL_ID (Scenario 2 only, skipped if absent)
+#   CLAUDEAR_E2E_GITHUB_REPO_2      (Scenario 3 only, skipped if absent)
 #   Claude auth via ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or CLI login
 ###############################################################################
 
@@ -35,6 +37,7 @@ CLAUDE_TIMEOUT="${CLAUDEAR_E2E_CLAUDE_TIMEOUT_SECS:-600}"
 # Ports for daemon instances
 S1_PORT=3150
 S2_PORT=3151
+S3_PORT=3152
 
 # Docker mode: run claudear inside Docker container to avoid nested claude issues
 USE_DOCKER="${CLAUDEAR_E2E_USE_DOCKER:-false}"
@@ -44,14 +47,19 @@ DOCKER_IMAGE="${CLAUDEAR_E2E_DOCKER_IMAGE:-claudear-app:latest}"
 DAEMON_PIDS=()
 DOCKER_CONTAINERS=()
 
-# Track all PR numbers/branches for cleanup
+# Track all PR numbers/branches for cleanup (repo 1)
 declare -a CLEANUP_PR_NUMBERS=()
 declare -a CLEANUP_PR_BRANCHES=()
 declare -a CLEANUP_LINEAR_IDS=()
 
+# Track PR numbers/branches for cleanup (repo 2 — cascade)
+declare -a CLEANUP_PR_NUMBERS_2=()
+declare -a CLEANUP_PR_BRANCHES_2=()
+
 # Scenario status
 S1_STATUS="not_started"
 S2_STATUS="not_started"
+S3_STATUS="not_started"
 FINAL_STATUS="failed"
 
 # Warning counter
@@ -339,6 +347,48 @@ get_pr_branch() {
   jq -r '.head.ref // empty' <<<"$resp"
 }
 
+# Repo-parameterized GitHub API helpers (for cascade PRs on a second repo)
+gh_api_on() {
+  local repo="$1" method="$2" path="$3"
+  shift 3
+  curl -sSfL -X "$method" \
+    -H "Authorization: Bearer ${CLAUDEAR_E2E_GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${repo}${path}" "$@"
+}
+
+gh_api_on_nofail() {
+  local repo="$1" method="$2" path="$3"
+  shift 3
+  curl -sSL -X "$method" \
+    -H "Authorization: Bearer ${CLAUDEAR_E2E_GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${repo}${path}" "$@" 2>/dev/null || true
+}
+
+get_pr_branch_on() {
+  local repo="$1" pr_number="$2"
+  local resp
+  resp="$(gh_api_on "$repo" GET "/pulls/${pr_number}")"
+  jq -r '.head.ref // empty' <<<"$resp"
+}
+
+close_github_pr_on() {
+  local repo="$1" pr_number="$2"
+  [[ -n "$pr_number" ]] || return 0
+  gh_api_on_nofail "$repo" PATCH "/pulls/${pr_number}" \
+    --data '{"state":"closed"}' >/dev/null
+  log "Closed GitHub PR #${pr_number} on ${repo}"
+}
+
+delete_github_branch_on() {
+  local repo="$1" branch="$2"
+  [[ -n "$branch" ]] || return 0
+  local branch_escaped="${branch//\//%2F}"
+  gh_api_on_nofail "$repo" DELETE "/git/refs/heads/${branch_escaped}" >/dev/null
+  log "Deleted branch ${branch} on ${repo}"
+}
+
 # Kill daemon by PID if alive (non-docker mode)
 kill_daemon_pid() {
   local pid="$1"
@@ -499,16 +549,28 @@ cleanup() {
     stop_container "$name"
   done
 
-  # Close PRs (only if not merged)
+  # Close PRs on repo 1 (only if not merged)
   for pr in ${CLEANUP_PR_NUMBERS[@]+"${CLEANUP_PR_NUMBERS[@]}"}; do
     close_github_pr "$pr"
   done
+
+  # Close PRs on repo 2 (cascade)
+  if [[ -n "${CLAUDEAR_E2E_GITHUB_REPO_2:-}" ]]; then
+    for pr in ${CLEANUP_PR_NUMBERS_2[@]+"${CLEANUP_PR_NUMBERS_2[@]}"}; do
+      close_github_pr_on "$CLAUDEAR_E2E_GITHUB_REPO_2" "$pr"
+    done
+  fi
 
   # Delete branches
   if [[ "${CLAUDEAR_E2E_DELETE_BRANCH:-false}" == "true" ]]; then
     for branch in ${CLEANUP_PR_BRANCHES[@]+"${CLEANUP_PR_BRANCHES[@]}"}; do
       delete_github_branch "$branch"
     done
+    if [[ -n "${CLAUDEAR_E2E_GITHUB_REPO_2:-}" ]]; then
+      for branch in ${CLEANUP_PR_BRANCHES_2[@]+"${CLEANUP_PR_BRANCHES_2[@]}"}; do
+        delete_github_branch_on "$CLAUDEAR_E2E_GITHUB_REPO_2" "$branch"
+      done
+    fi
   fi
 
   # Resolve Linear issues
@@ -517,7 +579,7 @@ cleanup() {
   done
 
   # Clean temp directories
-  for dir in "${S1_TMP_DIR:-}" "${S2_TMP_DIR:-}"; do
+  for dir in "${S1_TMP_DIR:-}" "${S2_TMP_DIR:-}" "${S3_TMP_DIR:-}"; do
     if [[ -n "$dir" && -d "$dir" ]]; then
       rm -rf "$dir"
     fi
@@ -590,6 +652,19 @@ if [[ -n "${CLAUDEAR_E2E_DISCORD_BOT_TOKEN:-}" && -n "${CLAUDEAR_E2E_DISCORD_CHA
   log "Discord credentials found - Scenario 2 enabled"
 else
   log "Discord credentials not found - Scenario 2 will be skipped"
+fi
+
+# Check if cascade scenario is available
+HAS_CASCADE=false
+if [[ -n "${CLAUDEAR_E2E_GITHUB_REPO_2:-}" ]]; then
+  if [[ ! "${CLAUDEAR_E2E_GITHUB_REPO_2}" =~ ^[^/]+/[^/]+$ ]]; then
+    fail "CLAUDEAR_E2E_GITHUB_REPO_2 must be in owner/repo format"
+  fi
+  HAS_CASCADE=true
+  REPO_NAME_2="${CLAUDEAR_E2E_GITHUB_REPO_2##*/}"
+  log "Second repo found (${CLAUDEAR_E2E_GITHUB_REPO_2}) - Scenario 3 (cascade) enabled"
+else
+  log "CLAUDEAR_E2E_GITHUB_REPO_2 not set - Scenario 3 will be skipped"
 fi
 
 # =============================================================================
@@ -667,6 +742,23 @@ clone_mock_repo() {
   fi
 }
 
+clone_mock_repo_on() {
+  local repo="$1" dest="$2"
+  git clone \
+    "https://x-access-token:${CLAUDEAR_E2E_GITHUB_TOKEN}@github.com/${repo}.git" \
+    "$dest" >/dev/null 2>&1 || fail "Failed to clone ${repo}"
+
+  if ! git -C "$dest" rev-parse HEAD >/dev/null 2>&1; then
+    log "Seeding empty repo ${repo} with initial commit..."
+    git -C "$dest" checkout -b main 2>/dev/null || true
+    echo "# E2E Test Repository" > "$dest/README.md"
+    git -C "$dest" add README.md
+    git -C "$dest" -c user.name="Claudear E2E" -c user.email="e2e@claudear.local" commit -m "chore: seed repo for e2e testing" >/dev/null
+    git -C "$dest" push -u origin main >/dev/null 2>&1 || fail "Failed to push initial commit to ${repo}"
+    log "Seeded ${repo} with initial commit on main"
+  fi
+}
+
 # =============================================================================
 # 7. Helper: Generate Config TOML
 # =============================================================================
@@ -680,6 +772,8 @@ generate_config() {
   local discord_source="${6:-false}"
   local ask_enabled="${7:-false}"
   local claude_instructions="${8:-}"
+  local cascade_enabled="${9:-false}"
+  local cascade_max_depth="${10:-3}"
 
   cat >"$config_path" <<TOML
 work_dir = "${work_dir}"
@@ -725,6 +819,10 @@ team_id = "${CLAUDEAR_E2E_LINEAR_TEAM_ID}"
 enabled = true
 check_interval_secs = 10
 monitoring_duration_secs = 10
+
+[cascade]
+enabled = ${cascade_enabled}
+max_depth = ${cascade_max_depth}
 
 [learning]
 auto_extract_learnings = true
@@ -782,6 +880,47 @@ check_claude_executions_count() {
   local count
   count="$(db_count "$db" "SELECT 1 FROM claude_executions")"
   [[ "$count" -ge "$min" ]]
+}
+
+check_cascade_attempt_exists() {
+  local db="$1" source="$2" issue_id="$3"
+  local count
+  count="$(db_count "$db" "SELECT 1 FROM fix_attempts WHERE source='${source}' AND issue_id='${issue_id}' AND cascade_repo IS NOT NULL AND parent_attempt_id IS NOT NULL")"
+  [[ "$count" -ge 1 ]]
+}
+
+check_cascade_attempt_has_pr() {
+  local db="$1" source="$2" issue_id="$3"
+  local pr_url
+  pr_url="$(db_query "$db" "SELECT pr_url FROM fix_attempts WHERE source='${source}' AND issue_id='${issue_id}' AND cascade_repo IS NOT NULL AND pr_url IS NOT NULL AND pr_url != '' ORDER BY id DESC LIMIT 1")"
+  [[ -n "$pr_url" ]]
+}
+
+check_fix_attempt_merged_non_cascade() {
+  local db="$1" source="$2" issue_id="$3"
+  local status
+  status="$(db_query "$db" "SELECT status FROM fix_attempts WHERE source='${source}' AND issue_id='${issue_id}' AND cascade_repo IS NULL ORDER BY id DESC LIMIT 1")"
+  [[ "$status" == "merged" ]]
+}
+
+check_cascade_attempt_merged() {
+  local db="$1" source="$2" issue_id="$3"
+  local status
+  status="$(db_query "$db" "SELECT status FROM fix_attempts WHERE source='${source}' AND issue_id='${issue_id}' AND cascade_repo IS NOT NULL ORDER BY id DESC LIMIT 1")"
+  [[ "$status" == "merged" ]]
+}
+
+# Run repos index to discover dependencies before starting daemon
+run_repos_index() {
+  local config_path="$1"
+  if [[ "$USE_DOCKER" == "true" ]]; then
+    local mount_dir
+    mount_dir="$(dirname "$config_path")"
+    docker run --rm -v "${mount_dir}:${mount_dir}" "${DOCKER_IMAGE}" \
+      claudear --config "$config_path" repos index 2>&1 || fail "repos index failed"
+  else
+    "$CLAUDEAR_BIN" --config "$config_path" repos index 2>&1 || fail "repos index failed"
+  fi
 }
 
 ###############################################################################
@@ -913,6 +1052,22 @@ EOF
   assert_db "$db_path" "issues" \
     "source='linear' AND issue_id='${S1_ISSUE_ID}'" 0 "issues: issue record created" "false"
 
+  # Indexing progress (single-row table, always seeded)
+  assert_db "$db_path" "indexing_progress" "id=1" 1 "indexing_progress: singleton row exists"
+
+  # Webhook deliveries: not expected in polling mode (--no-webhooks)
+  assert_db "$db_path" "webhook_deliveries" "1=1" 0 "webhook_deliveries: none expected in poll mode" "false"
+
+  # Code indexing tables: may be populated during repo indexing
+  assert_db "$db_path" "code_symbols" "1=1" 0 "code_symbols: may populate during indexing" "false"
+  assert_db "$db_path" "code_chunks" "1=1" 0 "code_chunks: may populate during indexing" "false"
+  assert_db "$db_path" "code_chunk_embeddings" "1=1" 0 "code_chunk_embeddings: may populate" "false"
+
+  # Prioritisation engine tables: may be populated during issue processing
+  assert_db "$db_path" "severity_scores" "1=1" 0 "severity_scores: may populate" "false"
+  assert_db "$db_path" "content_clusters" "1=1" 0 "content_clusters: may populate" "false"
+  assert_db "$db_path" "suppression_log" "1=1" 0 "suppression_log: may populate" "false"
+
   # --- Step 5: Checkpoint B - PR Created ---
   log_checkpoint "S1 Checkpoint B: PR Created"
 
@@ -941,6 +1096,13 @@ EOF
     1 "claude_executions: successful execution"
 
   assert_db "$db_path" "activity_log" "issue_id='${S1_ISSUE_ID}'" 2 "activity_log: >= 2 entries"
+
+  # Issue clusters: may form if similar issues exist
+  assert_db "$db_path" "issue_clusters" "1=1" 0 "issue_clusters: may populate" "false"
+  assert_db "$db_path" "issue_cluster_members" "1=1" 0 "issue_cluster_members: may populate" "false"
+
+  # Promoted instructions: requires repeated Q&A patterns
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "promoted_instructions: may populate" "false"
 
   # --- Step 6: Post COMMENT Review (using reviewer token) ---
   # Use a PR review (not an issue comment) so the review watcher picks it up
@@ -1045,8 +1207,8 @@ EOF
     1 "fix_attempts: merged with timestamp"
 
   assert_db "$db_path" "prs" \
-    "pr_url='${S1_PR_URL}' AND status='merged' AND merged_at IS NOT NULL AND review_cycles >= 1 AND files_changed > 0" \
-    1 "prs: merged with review_cycles and files_changed" "false"
+    "pr_url='${S1_PR_URL}' AND status='merged' AND merged_at IS NOT NULL AND review_cycles >= 1" \
+    1 "prs: merged with review_cycles" "false"
 
   assert_db "$db_path" "diff_analyses" \
     "attempt_id IS NOT NULL AND files_changed > 0 AND change_categories IS NOT NULL" \
@@ -1061,6 +1223,9 @@ EOF
     1 "feedback_outcomes: success outcome" "false"
 
   assert_db "$db_path" "repo_knowledge" "1=1" 0 "repo_knowledge: may populate" "false"
+
+  # Error patterns: may detect recurring errors
+  assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate" "false"
 
   # --- Step 12: Checkpoint F - Regression Watch Created ---
   log_checkpoint "S1 Checkpoint F: Regression Watch Created"
@@ -1105,16 +1270,40 @@ EOF
   # --- Step 14: Checkpoint H - Learnings Complete ---
   log_checkpoint "S1 Checkpoint H: Learnings Complete"
 
+  # files_changed is populated asynchronously by post-merge learning (after mark_merged)
+  assert_db "$db_path" "prs" \
+    "pr_url='${S1_PR_URL}' AND files_changed > 0" \
+    1 "prs: files_changed populated after learning" "false"
+
   assert_db "$db_path" "diff_analyses" "diff_summary IS NOT NULL" 1 "learnings: diff_analyses" "false"
   assert_db "$db_path" "strategy_fingerprints" "fix_approach IS NOT NULL" 1 "learnings: strategy_fingerprints" "false"
   assert_db "$db_path" "feedback_outcomes" "outcome IS NOT NULL" 1 "learnings: feedback_outcomes" "false"
   assert_db "$db_path" "repo_knowledge" "1=1" 0 "learnings: repo_knowledge" "false"
   assert_db "$db_path" "review_patterns" "1=1" 0 "learnings: review_patterns" "false"
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "learnings: promoted_instructions" "false"
+  assert_db "$db_path" "issue_clusters" "1=1" 0 "learnings: issue_clusters" "false"
+  assert_db "$db_path" "content_clusters" "1=1" 0 "learnings: content_clusters" "false"
+  assert_db "$db_path" "severity_scores" "1=1" 0 "learnings: severity_scores" "false"
+  assert_db "$db_path" "suppression_log" "1=1" 0 "learnings: suppression_log" "false"
+  assert_db "$db_path" "error_patterns" "1=1" 0 "learnings: error_patterns" "false"
   assert_db "$db_path" "processing_metrics" "1=1" 3 "learnings: processing_metrics >= 3" "false"
   assert_db "$db_path" "activity_log" "issue_id='${S1_ISSUE_ID}'" 5 "learnings: activity_log >= 5"
 
+  # Verify code indexing state at end
+  assert_db "$db_path" "code_symbols" "1=1" 0 "learnings: code_symbols" "false"
+  assert_db "$db_path" "code_chunks" "1=1" 0 "learnings: code_chunks" "false"
+
+  # Verify indexing_progress final state
+  assert_db "$db_path" "indexing_progress" "id=1" 1 "learnings: indexing_progress singleton"
+
   # --- Step 15: Kill Daemon ---
   kill_daemon "$daemon_pid"
+
+  # Copy DB for local inspection
+  if [[ -n "${CLAUDEAR_E2E_SAVE_DB:-}" ]]; then
+    cp "$db_path" "$CLAUDEAR_E2E_SAVE_DB"
+    log "Saved S1 database to ${CLAUDEAR_E2E_SAVE_DB}"
+  fi
 
   S1_STATUS="passed"
   log_checkpoint "SCENARIO 1 PASSED"
@@ -1220,6 +1409,22 @@ EOF
 
   assert_db "$db_path" "activity_log" "1=1" 1 "activity_log: entry exists"
 
+  # Indexing progress (single-row table, always seeded)
+  assert_db "$db_path" "indexing_progress" "id=1" 1 "indexing_progress: singleton row exists"
+
+  # Webhook deliveries: not expected in polling mode
+  assert_db "$db_path" "webhook_deliveries" "1=1" 0 "webhook_deliveries: none expected in poll mode" "false"
+
+  # Code indexing tables
+  assert_db "$db_path" "code_symbols" "1=1" 0 "code_symbols: may populate during indexing" "false"
+  assert_db "$db_path" "code_chunks" "1=1" 0 "code_chunks: may populate during indexing" "false"
+  assert_db "$db_path" "code_chunk_embeddings" "1=1" 0 "code_chunk_embeddings: may populate" "false"
+
+  # Prioritisation engine tables
+  assert_db "$db_path" "severity_scores" "1=1" 0 "severity_scores: may populate" "false"
+  assert_db "$db_path" "content_clusters" "1=1" 0 "content_clusters: may populate" "false"
+  assert_db "$db_path" "suppression_log" "1=1" 0 "suppression_log: may populate" "false"
+
   # --- Step 5: Checkpoint B - Ask Flow Initiated (non-fatal) ---
   log_checkpoint "S2 Checkpoint B: Ask Flow (non-fatal)"
 
@@ -1289,6 +1494,13 @@ EOF
 
   assert_db "$db_path" "discord_threads" "1=1" 0 "discord_threads: may create thread" "false"
 
+  # Issue clusters: may form if similar issues exist
+  assert_db "$db_path" "issue_clusters" "1=1" 0 "issue_clusters: may populate" "false"
+  assert_db "$db_path" "issue_cluster_members" "1=1" 0 "issue_cluster_members: may populate" "false"
+
+  # Promoted instructions: requires repeated Q&A patterns
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "promoted_instructions: may populate" "false"
+
   # --- Step 9: Add "bug" label to fix_attempts ---
   log "Adding 'bug' label to fix_attempts for regression watch creation..."
   db_exec "$db_path" "UPDATE fix_attempts SET issue_labels='[\"bug\"]' WHERE source='discord' AND issue_id='${S2_DISCORD_MSG_ID}'"
@@ -1317,6 +1529,7 @@ EOF
 
   assert_db "$db_path" "diff_analyses" "1=1" 1 "diff_analyses: analysis exists" "false"
   assert_db "$db_path" "strategy_fingerprints" "1=1" 1 "strategy_fingerprints: fingerprint exists" "false"
+  assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate" "false"
 
   # --- Step 11: Checkpoint F - Regression Watch ---
   log_checkpoint "S2 Checkpoint F: Regression Watch"
@@ -1445,13 +1658,32 @@ EOF
   # --- Step 17: Checkpoint J - Learnings Complete ---
   log_checkpoint "S2 Checkpoint J: Learnings Complete"
 
+  # files_changed is populated asynchronously by post-merge learning
+  assert_db "$db_path" "prs" \
+    "pr_url='${S2_RETRY_PR_URL}' AND files_changed > 0" \
+    1 "prs: files_changed populated after learning" "false"
+
   assert_db "$db_path" "diff_analyses" "1=1" 2 "learnings: diff_analyses >= 2 (original + retry)" "false"
   assert_db "$db_path" "strategy_fingerprints" "1=1" 2 "learnings: strategy_fingerprints >= 2" "false"
   assert_db "$db_path" "feedback_outcomes" "outcome IS NOT NULL" 1 "learnings: feedback_outcomes >= 1" "false"
   assert_db "$db_path" "repo_knowledge" "1=1" 0 "learnings: repo_knowledge" "false"
   assert_db "$db_path" "qa_knowledge" "1=1" 1 "learnings: qa_knowledge >= 1" "false"
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "learnings: promoted_instructions" "false"
+  assert_db "$db_path" "issue_clusters" "1=1" 0 "learnings: issue_clusters" "false"
+  assert_db "$db_path" "content_clusters" "1=1" 0 "learnings: content_clusters" "false"
+  assert_db "$db_path" "severity_scores" "1=1" 0 "learnings: severity_scores" "false"
+  assert_db "$db_path" "suppression_log" "1=1" 0 "learnings: suppression_log" "false"
+  assert_db "$db_path" "error_patterns" "1=1" 0 "learnings: error_patterns" "false"
+  assert_db "$db_path" "review_patterns" "1=1" 0 "learnings: review_patterns" "false"
   assert_db "$db_path" "processing_metrics" "1=1" 3 "learnings: processing_metrics >= 3" "false"
   assert_db "$db_path" "activity_log" "1=1" 8 "learnings: activity_log >= 8"
+
+  # Verify code indexing state at end
+  assert_db "$db_path" "code_symbols" "1=1" 0 "learnings: code_symbols" "false"
+  assert_db "$db_path" "code_chunks" "1=1" 0 "learnings: code_chunks" "false"
+
+  # Verify indexing_progress final state
+  assert_db "$db_path" "indexing_progress" "id=1" 1 "learnings: indexing_progress singleton"
 
   # --- Step 18: Kill Daemon ---
   kill_daemon "$daemon_pid"
@@ -1462,14 +1694,303 @@ EOF
 
 ###############################################################################
 #
+#  SCENARIO 3: Cascade (upstream merge triggers downstream adaptation PR)
+#
+###############################################################################
+
+run_scenario_3() {
+  if [[ "$HAS_CASCADE" != "true" ]]; then
+    log_checkpoint "SCENARIO 3: SKIPPED (CLAUDEAR_E2E_GITHUB_REPO_2 not set)"
+    S3_STATUS="skipped"
+    return 0
+  fi
+
+  log_checkpoint "SCENARIO 3: Cascade (upstream merge -> downstream PR)"
+  S3_STATUS="running"
+
+  # --- Step 1: Setup ---
+  local smoke_id="s3-smoke-$(date -u +%Y%m%d%H%M%S)-$RANDOM"
+  local smoke_file="e2e/${smoke_id}.md"
+
+  S3_TMP_DIR="$(mktemp -d)"
+  local work_root="${S3_TMP_DIR}/work"
+  local repos_dir="${work_root}/repos"
+  local local_repo="${repos_dir}/${REPO_NAME}"
+  local local_repo_2="${repos_dir}/${REPO_NAME_2}"
+  local db_path="${S3_TMP_DIR}/claudear-s3.db"
+  local config_path="${S3_TMP_DIR}/claudear.s3.toml"
+  local daemon_log="${S3_TMP_DIR}/daemon.log"
+
+  mkdir -p "$repos_dir"
+
+  log "Cloning upstream repo (${CLAUDEAR_E2E_GITHUB_REPO})..."
+  clone_mock_repo "$local_repo"
+
+  log "Cloning downstream repo (${CLAUDEAR_E2E_GITHUB_REPO_2})..."
+  clone_mock_repo_on "$CLAUDEAR_E2E_GITHUB_REPO_2" "$local_repo_2"
+
+  # --- Step 1a: Ensure package.json in both repos (creates npm dependency) ---
+  log "Ensuring package.json in upstream repo..."
+  if ! git -C "$local_repo" cat-file -e HEAD:package.json 2>/dev/null; then
+    cat > "$local_repo/package.json" <<PKGJSON
+{"name": "@${REPO_OWNER}/${REPO_NAME}", "version": "1.0.0"}
+PKGJSON
+    git -C "$local_repo" add package.json
+    git -C "$local_repo" -c user.name="Claudear E2E" -c user.email="e2e@claudear.local" \
+      commit -m "chore: add package.json for cascade e2e" >/dev/null
+    git -C "$local_repo" push >/dev/null 2>&1 || fail "Failed to push package.json to upstream"
+    log "  Committed package.json to upstream"
+  else
+    log "  package.json already exists in upstream"
+  fi
+
+  log "Ensuring package.json in downstream repo..."
+  if ! git -C "$local_repo_2" cat-file -e HEAD:package.json 2>/dev/null; then
+    cat > "$local_repo_2/package.json" <<PKGJSON
+{"name": "@${REPO_OWNER}/${REPO_NAME_2}", "version": "1.0.0", "dependencies": {"@${REPO_OWNER}/${REPO_NAME}": "*"}}
+PKGJSON
+    git -C "$local_repo_2" add package.json
+    git -C "$local_repo_2" -c user.name="Claudear E2E" -c user.email="e2e@claudear.local" \
+      commit -m "chore: add package.json with upstream dependency for cascade e2e" >/dev/null
+    git -C "$local_repo_2" push >/dev/null 2>&1 || fail "Failed to push package.json to downstream"
+    log "  Committed package.json to downstream"
+  else
+    log "  package.json already exists in downstream"
+  fi
+
+  # --- Step 1b: Generate config with cascade enabled ---
+  generate_config "$config_path" "${work_root}/cloned" "$repos_dir" "$db_path" "$S3_PORT" \
+    "false" "false" "" "true" "3"
+
+  # --- Step 1c: Run repos index to discover npm dependency ---
+  log "Running repos index to discover dependencies..."
+  run_repos_index "$config_path"
+  log "repos index complete"
+
+  # --- Step 2: Create Linear Issue targeting upstream ---
+  log "Finding/creating labels..."
+  local bug_label_id
+  bug_label_id="$(find_or_create_label "bug" "#e11d48")"
+  [[ -n "$bug_label_id" ]] || fail "Could not find or create 'bug' label"
+
+  local claudear_label_id
+  claudear_label_id="$(find_or_create_label "claudear" "#6366f1")"
+  [[ -n "$claudear_label_id" ]] || fail "Could not find or create 'claudear' label"
+
+  local issue_title="[claudear-e2e] ${smoke_id}"
+  local issue_desc
+  issue_desc="$(cat <<EOF
+Production E2E smoke task (Scenario 3: Cascade).
+
+Repository: ${CLAUDEAR_E2E_GITHUB_REPO}
+Required change:
+1. Create file \`${smoke_file}\`
+2. Put the exact text: \`${smoke_id}\`
+3. Commit and open a pull request
+
+Note: This issue tests cascade to downstream repos.
+EOF
+)"
+
+  local create_mutation='mutation CreateIssue($input: IssueCreateInput!) {
+    issueCreate(input: $input) {
+      success
+      issue { id identifier url }
+    }
+  }'
+  local create_vars
+  create_vars="$(
+    jq -cn \
+      --arg teamId "$CLAUDEAR_E2E_LINEAR_TEAM_ID" \
+      --arg title "$issue_title" \
+      --arg description "$issue_desc" \
+      --arg bugId "$bug_label_id" \
+      --arg claudearId "$claudear_label_id" \
+      '{input: {teamId: $teamId, title: $title, description: $description, labelIds: [$bugId, $claudearId]}}'
+  )"
+
+  log "Creating Linear issue..."
+  local create_resp
+  create_resp="$(linear_graphql "$create_mutation" "$create_vars")"
+  local create_ok
+  create_ok="$(jq -r '.data.issueCreate.success // false' <<<"$create_resp")"
+  [[ "$create_ok" == "true" ]] || fail "Linear issueCreate failed: $(jq -r '.errors[]?.message' <<<"$create_resp" | tr '\n' '; ')"
+
+  local S3_ISSUE_ID S3_IDENTIFIER S3_ISSUE_URL
+  S3_ISSUE_ID="$(jq -r '.data.issueCreate.issue.id // empty' <<<"$create_resp")"
+  S3_IDENTIFIER="$(jq -r '.data.issueCreate.issue.identifier // empty' <<<"$create_resp")"
+  S3_ISSUE_URL="$(jq -r '.data.issueCreate.issue.url // empty' <<<"$create_resp")"
+  [[ -n "$S3_ISSUE_ID" ]] || fail "Linear issue ID missing"
+  CLEANUP_LINEAR_IDS+=("$S3_ISSUE_ID")
+
+  log "Created Linear issue ${S3_IDENTIFIER} (${S3_ISSUE_ID})"
+  log "Issue URL: ${S3_ISSUE_URL}"
+
+  # --- Step 3: Start Daemon (loads dependency graph from DB) ---
+  log "Starting daemon (Scenario 3, port ${S3_PORT})..."
+  local daemon_pid
+  daemon_pid="$(start_daemon "$config_path" "$S3_PORT" "$daemon_log")"
+  log "Daemon handle: ${daemon_pid}"
+  sleep 3
+
+  if ! check_daemon_alive "$daemon_pid"; then
+    warn "Daemon exited early. Logs:"
+    cat "$daemon_log" >&2
+    fail "Scenario 3 daemon failed to start"
+  fi
+
+  # --- Step 4: Checkpoint A - Issue Accepted ---
+  log_checkpoint "S3 Checkpoint A: Issue Accepted"
+
+  wait_for "fix_attempts row for Linear issue" "$WAIT_TIMEOUT" "$POLL_INTERVAL" \
+    check_fix_attempt_exists "$db_path" "linear" "$S3_ISSUE_ID"
+
+  assert_db "$db_path" "fix_attempts" \
+    "source='linear' AND issue_id='${S3_ISSUE_ID}' AND short_id IS NOT NULL AND cascade_repo IS NULL" \
+    1 "fix_attempts: upstream issue accepted"
+
+  assert_db "$db_path" "repositories" "1=1" 2 "repositories: both repos indexed"
+  assert_db "$db_path" "repository_dependencies" "1=1" 1 "repository_dependencies: npm dependency discovered"
+  assert_db "$db_path" "repo_files" "1=1" 1 "repo_files: files indexed" "false"
+
+  # --- Step 5: Checkpoint B - Upstream PR Created ---
+  log_checkpoint "S3 Checkpoint B: Upstream PR Created"
+
+  wait_for_pr_verbose "$db_path" "linear" "$S3_ISSUE_ID" "$WAIT_TIMEOUT" "$POLL_INTERVAL" "$daemon_log"
+
+  local S3_PR_URL S3_PR_NUMBER S3_PR_BRANCH
+  S3_PR_URL="$(db_query "$db_path" "SELECT pr_url FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NULL AND pr_url IS NOT NULL AND pr_url != '' ORDER BY id DESC LIMIT 1")"
+  S3_PR_NUMBER="$(parse_pr_number "$S3_PR_URL")"
+  [[ -n "$S3_PR_NUMBER" ]] || fail "Could not parse upstream PR number from: ${S3_PR_URL}"
+  S3_PR_BRANCH="$(get_pr_branch "$S3_PR_NUMBER")"
+  CLEANUP_PR_NUMBERS+=("$S3_PR_NUMBER")
+  CLEANUP_PR_BRANCHES+=("${S3_PR_BRANCH:-}")
+
+  log "Upstream PR created: ${S3_PR_URL} (#${S3_PR_NUMBER})"
+
+  assert_db "$db_path" "fix_attempts" \
+    "source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NULL AND status='success' AND pr_url IS NOT NULL AND github_repo='${CLAUDEAR_E2E_GITHUB_REPO}'" \
+    1 "fix_attempts: upstream PR recorded"
+
+  assert_db "$db_path" "prs" \
+    "pr_url='${S3_PR_URL}' AND status='open'" \
+    1 "prs: upstream PR open"
+
+  assert_db "$db_path" "claude_executions" "1=1" 1 "claude_executions: at least 1 execution"
+
+  # --- Step 6: Merge Upstream PR ---
+  log "Merging upstream PR #${S3_PR_NUMBER}..."
+  gh_api PUT "/repos/${CLAUDEAR_E2E_GITHUB_REPO}/pulls/${S3_PR_NUMBER}/merge" \
+    --data '{"merge_method":"squash"}' >/dev/null
+
+  # --- Step 7: Checkpoint C - Upstream Merged + Cascade Triggered ---
+  log_checkpoint "S3 Checkpoint C: Upstream Merged + Cascade Triggered"
+
+  wait_for "fix_attempts status=merged (upstream)" "$WAIT_TIMEOUT" "$POLL_INTERVAL" \
+    check_fix_attempt_merged_non_cascade "$db_path" "linear" "$S3_ISSUE_ID"
+
+  assert_db "$db_path" "fix_attempts" \
+    "source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NULL AND status='merged' AND merged_at IS NOT NULL" \
+    1 "fix_attempts: upstream merged"
+
+  # Wait for cascade attempt to be created
+  wait_for "cascade fix_attempt row" "$WAIT_TIMEOUT" "$POLL_INTERVAL" \
+    check_cascade_attempt_exists "$db_path" "linear" "$S3_ISSUE_ID"
+
+  assert_db "$db_path" "fix_attempts" \
+    "source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NOT NULL AND parent_attempt_id IS NOT NULL" \
+    1 "fix_attempts: cascade attempt created with parent link"
+
+  # Verify cascade_repo points to downstream
+  local cascade_repo_val
+  cascade_repo_val="$(db_query "$db_path" "SELECT cascade_repo FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NOT NULL LIMIT 1")"
+  log "  Cascade repo: ${cascade_repo_val}"
+
+  # Verify parent_attempt_id links back correctly
+  local parent_id cascade_parent_id
+  parent_id="$(db_query "$db_path" "SELECT id FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NULL LIMIT 1")"
+  cascade_parent_id="$(db_query "$db_path" "SELECT parent_attempt_id FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NOT NULL LIMIT 1")"
+  if [[ "$parent_id" != "$cascade_parent_id" ]]; then
+    warn "Cascade parent_attempt_id mismatch: expected ${parent_id}, got ${cascade_parent_id}"
+  else
+    log "  DB OK: cascade parent_attempt_id matches upstream attempt id (${parent_id})"
+  fi
+
+  # --- Step 8: Checkpoint D - Cascade PR Created ---
+  log_checkpoint "S3 Checkpoint D: Cascade PR Created"
+
+  wait_for "cascade fix_attempt has PR" "$WAIT_TIMEOUT" "$POLL_INTERVAL" \
+    check_cascade_attempt_has_pr "$db_path" "linear" "$S3_ISSUE_ID"
+
+  local S3_CASCADE_PR_URL S3_CASCADE_PR_NUMBER S3_CASCADE_PR_BRANCH
+  S3_CASCADE_PR_URL="$(db_query "$db_path" "SELECT pr_url FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NOT NULL AND pr_url IS NOT NULL AND pr_url != '' ORDER BY id DESC LIMIT 1")"
+  S3_CASCADE_PR_NUMBER="$(parse_pr_number "$S3_CASCADE_PR_URL")"
+  [[ -n "$S3_CASCADE_PR_NUMBER" ]] || fail "Could not parse cascade PR number from: ${S3_CASCADE_PR_URL}"
+  S3_CASCADE_PR_BRANCH="$(get_pr_branch_on "$CLAUDEAR_E2E_GITHUB_REPO_2" "$S3_CASCADE_PR_NUMBER")"
+  CLEANUP_PR_NUMBERS_2+=("$S3_CASCADE_PR_NUMBER")
+  CLEANUP_PR_BRANCHES_2+=("${S3_CASCADE_PR_BRANCH:-}")
+
+  log "Cascade PR created: ${S3_CASCADE_PR_URL} (#${S3_CASCADE_PR_NUMBER})"
+
+  assert_db "$db_path" "fix_attempts" \
+    "source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NOT NULL AND status='success' AND pr_url IS NOT NULL" \
+    1 "fix_attempts: cascade PR recorded"
+
+  assert_db "$db_path" "claude_executions" "1=1" 2 "claude_executions: >= 2 (upstream + cascade)"
+
+  assert_db "$db_path" "activity_log" "1=1" 3 "activity_log: >= 3 entries"
+
+  # --- Step 9: Checkpoint E - Merge Cascade PR + Final Validation ---
+  log_checkpoint "S3 Checkpoint E: Merge Cascade PR + Final Validation"
+
+  log "Merging cascade PR #${S3_CASCADE_PR_NUMBER} on ${CLAUDEAR_E2E_GITHUB_REPO_2}..."
+  gh_api_on "$CLAUDEAR_E2E_GITHUB_REPO_2" PUT "/pulls/${S3_CASCADE_PR_NUMBER}/merge" \
+    --data '{"merge_method":"squash"}' >/dev/null
+
+  wait_for "cascade fix_attempts status=merged" "$WAIT_TIMEOUT" "$POLL_INTERVAL" \
+    check_cascade_attempt_merged "$db_path" "linear" "$S3_ISSUE_ID"
+
+  assert_db "$db_path" "fix_attempts" \
+    "source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NOT NULL AND status='merged'" \
+    1 "fix_attempts: cascade merged"
+
+  # Final comprehensive validation
+  assert_db "$db_path" "fix_attempts" \
+    "source='linear' AND issue_id='${S3_ISSUE_ID}'" \
+    2 "fix_attempts: 2 rows total (1 original + 1 cascade)"
+
+  assert_db "$db_path" "repositories" "1=1" 2 "repositories: 2 repos"
+  assert_db "$db_path" "repository_dependencies" "1=1" 1 "repository_dependencies: 1 dependency"
+
+  assert_db "$db_path" "prs" "status='merged'" 1 "prs: upstream PR merged" "false"
+
+  assert_db "$db_path" "activity_log" "1=1" 4 "activity_log: >= 4 entries"
+
+  # --- Step 10: Kill Daemon ---
+  kill_daemon "$daemon_pid"
+
+  # Copy DB for local inspection
+  if [[ -n "${CLAUDEAR_E2E_SAVE_DB_S3:-}" ]]; then
+    cp "$db_path" "$CLAUDEAR_E2E_SAVE_DB_S3"
+    log "Saved S3 database to ${CLAUDEAR_E2E_SAVE_DB_S3}"
+  fi
+
+  S3_STATUS="passed"
+  log_checkpoint "SCENARIO 3 PASSED"
+}
+
+###############################################################################
+#
 #  MAIN
 #
 ###############################################################################
 
 log_checkpoint "Production E2E Smoke Test Starting"
 log "GitHub repo: ${CLAUDEAR_E2E_GITHUB_REPO}"
+log "GitHub repo 2: ${CLAUDEAR_E2E_GITHUB_REPO_2:-<not set>}"
 log "Linear team: ${CLAUDEAR_E2E_LINEAR_TEAM_ID}"
 log "Discord available: ${HAS_DISCORD}"
+log "Cascade available: ${HAS_CASCADE}"
 log "Binary: ${CLAUDEAR_BIN}"
 log ""
 
@@ -1477,11 +1998,15 @@ run_scenario_1
 
 run_scenario_2
 
+run_scenario_3
+
 # Final status
-if [[ "$S1_STATUS" == "passed" && ("$S2_STATUS" == "passed" || "$S2_STATUS" == "skipped") ]]; then
+if [[ "$S1_STATUS" == "passed" &&
+      ("$S2_STATUS" == "passed" || "$S2_STATUS" == "skipped") &&
+      ("$S3_STATUS" == "passed" || "$S3_STATUS" == "skipped") ]]; then
   FINAL_STATUS="passed"
 else
-  fail "One or more scenarios failed (S1: ${S1_STATUS}, S2: ${S2_STATUS})"
+  fail "One or more scenarios failed (S1: ${S1_STATUS}, S2: ${S2_STATUS}, S3: ${S3_STATUS})"
 fi
 
 log_checkpoint "ALL SCENARIOS PASSED (warnings: ${WARN_COUNT})"

@@ -6,15 +6,15 @@ import { Sidebar } from "../src/components/layout/sidebar";
 describe("Sidebar", () => {
   afterEach(() => {
     cleanup();
-    window.location.hash = "";
+    window.history.replaceState(null, "", "/");
   });
 
-  function renderSidebar(hash = "#/") {
-    window.location.hash = hash;
+  function renderSidebar(path = "/") {
+    window.history.replaceState(null, "", path);
     return render(
       <RouterProvider>
         <Sidebar />
-        <Router routes={{ [hash.slice(1) || "/"]: () => <div /> }} />
+        <Router routes={{ [path]: () => <div /> }} />
       </RouterProvider>
     );
   }
@@ -47,23 +47,23 @@ describe("Sidebar", () => {
   });
 
   test("active item has correct styling on root path", () => {
-    renderSidebar("#/");
+    renderSidebar("/");
     const overviewButton = screen.getByText("Overview").closest("button");
     expect(overviewButton?.className).toContain("bg-primary");
     expect(overviewButton?.className).toContain("font-medium");
   });
 
   test("non-active items have muted styling", () => {
-    renderSidebar("#/");
+    renderSidebar("/");
     const attemptsButton = screen.getByText("Attempts").closest("button");
     expect(attemptsButton?.className).toContain("text-muted-foreground");
   });
 
-  test("clicking a nav item updates the hash", () => {
-    renderSidebar("#/");
+  test("clicking a nav item updates the path", () => {
+    renderSidebar("/");
     const attemptsButton = screen.getByText("Attempts").closest("button");
     fireEvent.click(attemptsButton!);
-    expect(window.location.hash).toBe("#/attempts");
+    expect(window.location.pathname).toBe("/attempts");
   });
 
   test("dark mode toggle adds dark class to documentElement", () => {

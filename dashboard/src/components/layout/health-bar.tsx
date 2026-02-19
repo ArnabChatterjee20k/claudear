@@ -1,6 +1,6 @@
 import useSWR from 'swr'
 import { getHealth, type Health } from '../../lib/api'
-import { Server, Database, Loader2 } from 'lucide-react'
+import { Server, Loader2 } from 'lucide-react'
 
 export function HealthBar() {
   const { data: health, error, isValidating } = useSWR<Health>('health', getHealth, {
@@ -20,16 +20,6 @@ export function HealthBar() {
         ) : (
           <span className={health!.status === 'ok' ? 'text-green-500' : 'text-yellow-500'}>
             {health!.status === 'ok' ? 'Healthy' : 'Degraded'}
-          </span>
-        )}
-      </div>
-      <div className="flex items-center gap-2">
-        <Database className="h-4 w-4" />
-        {unreachable ? (
-          <span className="text-red-500">Unreachable</span>
-        ) : (
-          <span className={health!.database.status === 'ok' ? 'text-green-500' : 'text-red-500'}>
-            {health!.database.status === 'ok' ? 'Connected' : 'Error'}
           </span>
         )}
       </div>

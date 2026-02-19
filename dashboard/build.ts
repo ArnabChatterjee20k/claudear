@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync, renameSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync, renameSync, existsSync } from "fs";
 import { join } from "path";
 import { createHash } from "crypto";
 
@@ -89,9 +89,10 @@ html = html
 writeFileSync(join(outdir, "index.html"), html);
 
 // 7. Copy static assets
-try {
-  cpSync(join(srcdir, "public"), outdir, { recursive: true });
-} catch (e) { console.warn('Warning: could not copy public directory:', e) }
+const publicDir = join(srcdir, "public");
+if (existsSync(publicDir)) {
+  cpSync(publicDir, outdir, { recursive: true });
+}
 
 console.log(`Build complete: ${result.outputs.length} files`);
 for (const output of result.outputs) {

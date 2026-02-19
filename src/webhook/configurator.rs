@@ -299,6 +299,7 @@ mod tests {
             learning: crate::config::LearningConfig::default(),
             prioritisation: crate::config::PrioritisationConfig::default(),
             code_index: crate::config::CodeIndexConfig::default(),
+            storage_dir: "/tmp/claudear-storage".into(),
         }
     }
 

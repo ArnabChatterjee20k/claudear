@@ -17,6 +17,7 @@ import UsersPage from './pages/users'
 import TelemetryPage from './pages/telemetry'
 import ConfigPage from './pages/config'
 import IssuesPage from './pages/issues'
+import SettingsPage from './pages/settings'
 
 const routes: Record<string, () => JSX.Element> = {
   '/': OverviewPage,
@@ -34,6 +35,7 @@ const routes: Record<string, () => JSX.Element> = {
   '/telemetry': TelemetryPage,
   '/config': ConfigPage,
   '/users': UsersPage,
+  '/settings': SettingsPage,
 }
 
 function AuthenticatedApp() {

@@ -914,11 +914,26 @@ impl Watcher {
             }
         }
 
-        // Normalize repo name for dependency graph lookup
-        // github_repo is "owner/repo", graph uses short names like "appwrite"
+        // Try full owner/repo name first (used when dependencies are loaded from DB),
+        // fall back to short name for backwards compatibility with hardcoded defaults.
         let repo_short_name = github_repo.split('/').next_back().unwrap_or(&github_repo);
-
-        let dependants = relationships.get_dependants(repo_short_name);
+        let dependants = {
+            let full = relationships.get_dependants(&github_repo);
+            if !full.is_empty() {
+                full
+            } else {
+                relationships.get_dependants(repo_short_name)
+            }
+        };
+        // Which key actually matched in the graph
+        let graph_key = {
+            let full = relationships.get_dependants(&github_repo);
+            if !full.is_empty() {
+                github_repo.to_string()
+            } else {
+                repo_short_name.to_string()
+            }
+        };
         if dependants.is_empty() {
             tracing::debug!(
                 repo = %github_repo,
@@ -939,7 +954,7 @@ impl Watcher {
 
         for dependant in dependants {
             let dep_type = graph
-                .get_first_hop_dependency_type(repo_short_name)
+                .get_first_hop_dependency_type(&graph_key)
                 .map(|t| t.as_str())
                 .unwrap_or("unknown");
 
@@ -4037,6 +4052,7 @@ mod tests {
             learning: crate::config::LearningConfig::default(),
             prioritisation: crate::config::PrioritisationConfig::default(),
             code_index: crate::config::CodeIndexConfig::default(),
+            storage_dir: "/tmp/claudear-storage".into(),
         }
     }
 

@@ -63,7 +63,7 @@ export function Sidebar() {
   }, [dark])
 
   return (
-    <aside className="w-56 border-r bg-card flex flex-col">
+    <aside className="w-56 border-r bg-card flex flex-col h-screen sticky top-0">
       <div className="p-4 border-b">
         <h1 className="text-lg font-bold flex items-center gap-2">
           <Activity className="h-5 w-5 text-primary" />
@@ -133,10 +133,23 @@ export function Sidebar() {
       </nav>
       <div className="p-3 border-t">
         <div className="flex items-center justify-between">
-          <div className="min-w-0">
-            <div className="text-sm font-medium truncate">{user?.name}</div>
-            <div className="text-xs text-muted-foreground truncate">{user?.email}</div>
-          </div>
+          <button
+            onClick={() => navigate('/settings')}
+            className="flex items-center gap-2 min-w-0 hover:opacity-80 transition-opacity"
+            title="Account settings"
+          >
+            {user?.avatar_url ? (
+              <img src={user.avatar_url} alt={user.name} className="h-8 w-8 rounded-full object-cover shrink-0" />
+            ) : (
+              <div className="h-8 w-8 rounded-full bg-primary/10 text-primary flex items-center justify-center text-xs font-semibold shrink-0">
+                {user?.name?.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase()}
+              </div>
+            )}
+            <div className="min-w-0 text-left">
+              <div className="text-sm font-medium truncate">{user?.name}</div>
+              <div className="text-xs text-muted-foreground truncate">{user?.email}</div>
+            </div>
+          </button>
           <div className="flex items-center gap-0.5">
             <button
               onClick={() => setDark(d => !d)}

@@ -1913,6 +1913,7 @@ async fn main() -> anyhow::Result<()> {
                             Some(&hash),
                             Some(name.as_str()),
                             Some("admin"),
+                            None,
                         )?;
                         println!(
                             "Updated existing user '{}' (id={}) with new password and admin role",

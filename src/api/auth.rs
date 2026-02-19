@@ -65,6 +65,7 @@ pub struct AuthUser {
     pub email: String,
     pub name: String,
     pub role: String,
+    pub avatar_url: Option<String>,
 }
 
 impl FromRequestParts<ApiState> for AuthUser {
@@ -98,6 +99,7 @@ impl FromRequestParts<ApiState> for AuthUser {
             email: user.email,
             name: user.name,
             role: user.role,
+            avatar_url: user.avatar_url,
         })
     }
 }
@@ -140,6 +142,7 @@ pub struct AuthUserResponse {
     pub email: String,
     pub name: String,
     pub role: String,
+    pub avatar_url: Option<String>,
 }
 
 impl From<&AuthUser> for AuthUserResponse {
@@ -149,6 +152,7 @@ impl From<&AuthUser> for AuthUserResponse {
             email: u.email.clone(),
             name: u.name.clone(),
             role: u.role.clone(),
+            avatar_url: u.avatar_url.clone(),
         }
     }
 }
@@ -175,6 +179,7 @@ pub struct UserResponse {
     pub email: String,
     pub name: String,
     pub role: String,
+    pub avatar_url: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -242,6 +247,7 @@ pub async fn login_handler(
             email: user.email,
             name: user.name,
             role: user.role,
+            avatar_url: user.avatar_url,
         },
     }))
 }
@@ -279,6 +285,183 @@ pub async fn me_handler(user: AuthUser) -> Json<AuthUserResponse> {
     Json(AuthUserResponse::from(&user))
 }
 
+// ─── Profile update handlers (authenticated user) ──────────────────────────
+
+#[derive(Deserialize)]
+pub struct UpdateProfileRequest {
+    pub name: Option<String>,
+    pub password: Option<String>,
+    pub current_password: Option<String>,
+}
+
+/// PUT /api/auth/profile
+pub async fn update_profile_handler(
+    user: AuthUser,
+    State(state): State<ApiState>,
+    Json(body): Json<UpdateProfileRequest>,
+) -> Result<Json<UserResponse>, StatusCode> {
+    let db = state
+        .tracker
+        .as_any()
+        .downcast_ref::<SqliteTracker>()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Validate name if provided
+    if let Some(ref name) = body.name {
+        if name.trim().is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // If changing password, require current_password verification
+    let password_hash = match &body.password {
+        Some(new_pw) => {
+            if new_pw.len() < 8 {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            // Rate limit password change to prevent bcrypt CPU exhaustion
+            if !check_login_rate_limit(&user.email) {
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+            let current_pw = body
+                .current_password
+                .as_deref()
+                .ok_or(StatusCode::BAD_REQUEST)?;
+
+            // Fetch current user to verify password
+            let current_user = db
+                .get_user_by_id(user.id)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .ok_or(StatusCode::NOT_FOUND)?;
+
+            let valid = bcrypt::verify(current_pw, &current_user.password_hash)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if !valid {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+
+            Some(
+                bcrypt::hash(new_pw, bcrypt::DEFAULT_COST)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            )
+        }
+        None => None,
+    };
+
+    db.update_user(
+        user.id,
+        None,
+        password_hash.as_deref(),
+        body.name.as_deref(),
+        None,
+        None,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let updated = db
+        .get_user_by_id(user.id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(UserResponse {
+        id: updated.id,
+        email: updated.email,
+        name: updated.name,
+        role: updated.role,
+        avatar_url: updated.avatar_url,
+        created_at: updated.created_at,
+        updated_at: updated.updated_at,
+    }))
+}
+
+/// POST /api/auth/avatar
+pub async fn upload_avatar_handler(
+    user: AuthUser,
+    State(state): State<ApiState>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    const MAX_SIZE: usize = 5 * 1024 * 1024; // 5MB
+    const ALLOWED_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+    let avatars_dir = state.storage_dir.join("avatars");
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
+        let content_type = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        if !ALLOWED_TYPES.contains(&content_type.as_str()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        let ext = match content_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => return Err(StatusCode::BAD_REQUEST),
+        };
+
+        let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        if data.len() > MAX_SIZE {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        // Validate magic bytes match the claimed content type
+        let valid_magic = match ext {
+            "png" => data.starts_with(&[0x89, b'P', b'N', b'G']),
+            "jpg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
+            "gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
+            "webp" => data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP",
+            _ => false,
+        };
+        if !valid_magic {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        // Delete old avatar files for this user
+        let prefix = format!("{}.", user.id);
+        let avatars_dir_clone = avatars_dir.clone();
+        if let Ok(mut entries) = tokio::fs::read_dir(&avatars_dir_clone).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(&prefix) {
+                        let _ = tokio::fs::remove_file(entry.path()).await;
+                    }
+                }
+            }
+        }
+
+        let filename = format!("{}.{}", user.id, ext);
+        let file_path = avatars_dir.join(&filename);
+        tokio::fs::write(&file_path, &data)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let avatar_url = format!("/avatars/{}", filename);
+
+        // Update user's avatar_url in DB
+        let db = state
+            .tracker
+            .as_any()
+            .downcast_ref::<SqliteTracker>()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        db.update_user(user.id, None, None, None, None, Some(&avatar_url))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        return Ok(Json(serde_json::json!({ "avatar_url": avatar_url })));
+    }
+
+    Err(StatusCode::BAD_REQUEST)
+}
+
 // ─── User CRUD handlers (admin only) ──────────────────────────────────
 
 /// GET /api/users
@@ -303,6 +486,7 @@ pub async fn list_users_handler(
             email: u.email,
             name: u.name,
             role: u.role,
+            avatar_url: u.avatar_url,
             created_at: u.created_at,
             updated_at: u.updated_at,
         })
@@ -333,6 +517,7 @@ pub async fn get_user_handler(
         email: user.email,
         name: user.name,
         role: user.role,
+        avatar_url: user.avatar_url,
         created_at: user.created_at,
         updated_at: user.updated_at,
     }))
@@ -399,6 +584,7 @@ pub async fn create_user_handler(
             email: user.email,
             name: user.name,
             role: user.role,
+            avatar_url: user.avatar_url,
             created_at: user.created_at,
             updated_at: user.updated_at,
         }),
@@ -441,6 +627,7 @@ pub async fn update_user_handler(
             password_hash.as_deref(),
             body.name.as_deref(),
             body.role.as_deref(),
+            None,
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -458,6 +645,7 @@ pub async fn update_user_handler(
         email: user.email,
         name: user.name,
         role: user.role,
+        avatar_url: user.avatar_url,
         created_at: user.created_at,
         updated_at: user.updated_at,
     }))
@@ -546,6 +734,7 @@ mod tests {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            storage_dir: "/tmp/claudear-storage".into(),
         }
     }
 
@@ -1231,6 +1420,7 @@ mod tests {
             email: "convert@test.com".to_string(),
             name: "Convert User".to_string(),
             role: "admin".to_string(),
+            avatar_url: None,
         };
 
         let response = AuthUserResponse::from(&user);
