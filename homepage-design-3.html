@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>claudear - Your AI team mate</title>
+  <meta name="description" content="Autonomous issue-to-PR pipeline powered by Claude Code. Issues in. Pull requests out.">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Inter:wght@400;450;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            heading: ['Instrument Sans', 'Inter', 'system-ui', 'sans-serif'],
+            body: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['Berkeley Mono', 'JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            violet: { DEFAULT: '#8B5CF6' },
+            emerald: { DEFAULT: '#10B981' },
+            danger: { DEFAULT: '#EF4444' },
+          },
+          letterSpacing: {
+            tight: '-0.02em',
+            widest: '0.12em',
+          },
+        },
+      },
+    }
+  </script>
+  <style>
+    /* Antialiased rendering */
+    * {
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    html {
+      background: #000000;
+    }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: #000000;
+      color: rgba(255, 255, 255, 0.9);
+      overflow-x: hidden;
+    }
+
+    /* Noise grain overlay */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      pointer-events: none;
+      opacity: 0.02;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+      background-repeat: repeat;
+      background-size: 256px 256px;
+    }
+
+    /* Heading font */
+    h1, h2, h3, h4, h5, h6 {
+      font-family: 'Instrument Sans', 'Inter', system-ui, sans-serif;
+      letter-spacing: -0.02em;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.14); }
+
+    /* Navbar solid on scroll */
+    .navbar-scrolled {
+      background: rgba(0, 0, 0, 0.85) !important;
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+
+    /* Animated gradient line */
+    @keyframes gradient-shift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+
+    .gradient-line {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, #8B5CF6, transparent);
+      background-size: 200% 100%;
+      animation: gradient-shift 4s ease-in-out infinite;
+    }
+
+    /* Pipeline flow animation */
+    @keyframes flow-pulse {
+      0%, 100% { opacity: 0; transform: translateX(-100%); }
+      50% { opacity: 1; }
+      100% { opacity: 0; transform: translateX(400%); }
+    }
+
+    @keyframes node-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.4); }
+      50% { box-shadow: 0 0 12px 4px rgba(139, 92, 246, 0.15); }
+    }
+
+    .pipeline-glow {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 25%;
+      height: 100%;
+      background: linear-gradient(90deg, transparent, #8B5CF6, transparent);
+      animation: flow-pulse 3.5s ease-in-out infinite;
+    }
+
+    .node-active {
+      animation: node-pulse 2.5s ease-in-out infinite;
+    }
+
+    /* Dot grid pattern animation */
+    @keyframes dot-reveal {
+      0%, 100% { opacity: 0.06; }
+      50% { opacity: 1; }
+    }
+
+    .dot-bright {
+      animation: dot-reveal 3s ease-in-out infinite;
+    }
+
+    /* Heartbeat / seismograph line */
+    @keyframes heartbeat-draw {
+      0% { stroke-dashoffset: 1000; }
+      100% { stroke-dashoffset: 0; }
+    }
+
+    .heartbeat-line {
+      stroke-dasharray: 1000;
+      animation: heartbeat-draw 4s linear infinite;
+    }
+
+    @keyframes pulse-red {
+      0%, 70%, 100% { fill: #10B981; }
+      80% { fill: #EF4444; }
+      85% { fill: #EF4444; }
+      90% { fill: #EF4444; }
+    }
+
+    /* Hero spotlight */
+    .hero-spotlight {
+      position: absolute;
+      width: 700px;
+      height: 700px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(139, 92, 246, 0.05) 0%, transparent 70%);
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
+
+    /* Subtle hover transitions */
+    .card-ghost {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      transition: border-color 150ms ease;
+    }
+
+    .card-ghost:hover {
+      border-color: rgba(255, 255, 255, 0.12);
+    }
+
+    /* CTA hover */
+    .cta-link {
+      transition: opacity 150ms ease;
+    }
+    .cta-link:hover {
+      opacity: 0.8;
+    }
+
+    /* Nav link hover */
+    .nav-link {
+      transition: color 150ms ease;
+    }
+    .nav-link:hover {
+      color: rgba(255, 255, 255, 0.9);
+    }
+
+    /* prefers-reduced-motion: disable ALL animations */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+      .gradient-line {
+        background: linear-gradient(90deg, transparent, #8B5CF6, transparent);
+        background-size: 100% 100%;
+      }
+      .pipeline-glow {
+        display: none;
+      }
+    }
+
+    /* Pipeline responsive */
+    @media (max-width: 768px) {
+      .pipeline-container {
+        flex-direction: column;
+        align-items: center;
+        gap: 2rem;
+      }
+      .pipeline-line-h {
+        display: none;
+      }
+      .pipeline-line-v {
+        display: block !important;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ========== NAVBAR ========== -->
+  <nav id="navbar" class="fixed top-0 left-0 right-0 z-50 transition-all duration-300" style="background: transparent;">
+    <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+      <a href="#" class="font-heading text-white font-medium text-lg tracking-tight cursor-pointer" style="letter-spacing: -0.01em;">claudear</a>
+      <div class="flex items-center gap-6">
+        <a href="#" class="nav-link text-sm text-neutral-500 cursor-pointer hidden sm:inline">Docs</a>
+        <a href="#" class="nav-link text-sm text-neutral-500 cursor-pointer hidden sm:inline">GitHub</a>
+        <span class="hidden sm:inline text-neutral-700">|</span>
+        <a href="#" class="cta-link text-sm font-medium cursor-pointer" style="color: #8B5CF6;">Get Started
+          <span class="inline-block ml-0.5" aria-hidden="true">&rarr;</span>
+        </a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ========== HERO ========== -->
+  <section class="relative flex flex-col items-center justify-center text-center px-6" style="min-height: 90vh; padding-top: 80px; padding-bottom: 80px;">
+    <div class="hero-spotlight"></div>
+    <div class="relative z-10 flex flex-col items-center">
+      <span class="inline-block text-xs font-medium uppercase mb-8" style="color: #8B5CF6; letter-spacing: 0.12em; font-size: 11px;">Autonomous Engineering</span>
+      <h1 class="font-heading font-bold text-white leading-none" style="font-size: clamp(40px, 8vw, 72px); line-height: 1.05;">
+        Issues in.<br>Pull requests out.
+      </h1>
+      <div class="gradient-line w-48 mt-8 mb-8 mx-auto rounded-full"></div>
+      <p class="text-neutral-500 text-base max-w-xl mx-auto leading-relaxed" style="line-height: 1.6;">
+        Claudear watches your issue trackers, routes bugs to the right repo, spawns Claude Code to write the fix, and opens a PR. No templates. No workflows. Just code.
+      </p>
+      <a href="#" class="cta-link mt-10 text-sm font-medium cursor-pointer" style="color: #8B5CF6;">
+        Start building <span class="inline-block ml-0.5" aria-hidden="true">&rarr;</span>
+      </a>
+    </div>
+  </section>
+
+  <!-- ========== PIPELINE ========== -->
+  <section class="py-32 px-6">
+    <div class="max-w-4xl mx-auto">
+      <p class="text-neutral-600 text-xs uppercase tracking-widest text-center mb-16" style="letter-spacing: 0.12em;">The loop</p>
+
+      <!-- Desktop pipeline -->
+      <div class="hidden md:block">
+        <div class="relative flex items-start justify-between">
+          <!-- Connecting line -->
+          <div class="absolute top-3 left-[10%] right-[10%] h-px" style="background: rgba(255,255,255,0.07);">
+            <div class="pipeline-glow"></div>
+          </div>
+
+          <!-- Nodes -->
+          <div class="relative z-10 flex flex-col items-center w-1/5">
+            <div class="w-6 h-6 rounded-full border border-white/10 flex items-center justify-center" style="background: rgba(255,255,255,0.03);">
+              <div class="w-2 h-2 rounded-full bg-white/20"></div>
+            </div>
+            <span class="text-white/80 text-sm font-medium mt-4 mb-2">Issue</span>
+            <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[140px]">Linear, Sentry, Jira, GitHub, GitLab, Discord, Slack</span>
+          </div>
+
+          <div class="relative z-10 flex flex-col items-center w-1/5">
+            <div class="w-6 h-6 rounded-full border border-white/10 flex items-center justify-center" style="background: rgba(255,255,255,0.03);">
+              <div class="w-2 h-2 rounded-full bg-white/20"></div>
+            </div>
+            <span class="text-white/80 text-sm font-medium mt-4 mb-2">Route</span>
+            <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[140px]">Stack trace analysis. Confidence scoring.</span>
+          </div>
+
+          <div class="relative z-10 flex flex-col items-center w-1/5">
+            <div class="w-6 h-6 rounded-full border flex items-center justify-center node-active" style="background: rgba(139, 92, 246, 0.08); border-color: rgba(139, 92, 246, 0.3);">
+              <div class="w-2 h-2 rounded-full" style="background: #8B5CF6;"></div>
+            </div>
+            <span class="text-sm font-medium mt-4 mb-2" style="color: #8B5CF6;">Fix</span>
+            <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[140px]">Claude Code with full tool access.</span>
+          </div>
+
+          <div class="relative z-10 flex flex-col items-center w-1/5">
+            <div class="w-6 h-6 rounded-full border border-white/10 flex items-center justify-center" style="background: rgba(255,255,255,0.03);">
+              <div class="w-2 h-2 rounded-full bg-white/20"></div>
+            </div>
+            <span class="text-white/80 text-sm font-medium mt-4 mb-2">PR</span>
+            <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[140px]">Opened, reviewed, merged.</span>
+          </div>
+
+          <div class="relative z-10 flex flex-col items-center w-1/5">
+            <div class="w-6 h-6 rounded-full border border-white/10 flex items-center justify-center" style="background: rgba(255,255,255,0.03);">
+              <div class="w-2 h-2 rounded-full bg-white/20"></div>
+            </div>
+            <span class="text-white/80 text-sm font-medium mt-4 mb-2">Learn</span>
+            <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[140px]">Patterns extracted. Knowledge retained.</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mobile pipeline (vertical) -->
+      <div class="md:hidden flex flex-col items-center gap-0">
+        <!-- Issue -->
+        <div class="flex flex-col items-center">
+          <div class="w-6 h-6 rounded-full border border-white/10 flex items-center justify-center" style="background: rgba(255,255,255,0.03);">
+            <div class="w-2 h-2 rounded-full bg-white/20"></div>
+          </div>
+          <span class="text-white/80 text-sm font-medium mt-3 mb-1">Issue</span>
+          <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[200px]">Linear, Sentry, Jira, GitHub, GitLab, Discord, Slack</span>
+        </div>
+        <div class="w-px h-8" style="background: rgba(255,255,255,0.07);"></div>
+        <!-- Route -->
+        <div class="flex flex-col items-center">
+          <div class="w-6 h-6 rounded-full border border-white/10 flex items-center justify-center" style="background: rgba(255,255,255,0.03);">
+            <div class="w-2 h-2 rounded-full bg-white/20"></div>
+          </div>
+          <span class="text-white/80 text-sm font-medium mt-3 mb-1">Route</span>
+          <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[200px]">Stack trace analysis. Confidence scoring.</span>
+        </div>
+        <div class="w-px h-8" style="background: rgba(255,255,255,0.07);"></div>
+        <!-- Fix -->
+        <div class="flex flex-col items-center">
+          <div class="w-6 h-6 rounded-full border flex items-center justify-center node-active" style="background: rgba(139, 92, 246, 0.08); border-color: rgba(139, 92, 246, 0.3);">
+            <div class="w-2 h-2 rounded-full" style="background: #8B5CF6;"></div>
+          </div>
+          <span class="text-sm font-medium mt-3 mb-1" style="color: #8B5CF6;">Fix</span>
+          <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[200px]">Claude Code with full tool access.</span>
+        </div>
+        <div class="w-px h-8" style="background: rgba(255,255,255,0.07);"></div>
+        <!-- PR -->
+        <div class="flex flex-col items-center">
+          <div class="w-6 h-6 rounded-full border border-white/10 flex items-center justify-center" style="background: rgba(255,255,255,0.03);">
+            <div class="w-2 h-2 rounded-full bg-white/20"></div>
+          </div>
+          <span class="text-white/80 text-sm font-medium mt-3 mb-1">PR</span>
+          <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[200px]">Opened, reviewed, merged.</span>
+        </div>
+        <div class="w-px h-8" style="background: rgba(255,255,255,0.07);"></div>
+        <!-- Learn -->
+        <div class="flex flex-col items-center">
+          <div class="w-6 h-6 rounded-full border border-white/10 flex items-center justify-center" style="background: rgba(255,255,255,0.03);">
+            <div class="w-2 h-2 rounded-full bg-white/20"></div>
+          </div>
+          <span class="text-white/80 text-sm font-medium mt-3 mb-1">Learn</span>
+          <span class="text-neutral-600 text-xs text-center leading-relaxed max-w-[200px]">Patterns extracted. Knowledge retained.</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== FEATURES ========== -->
+
+  <!-- Feature 1: Intelligence (text left, visual right) -->
+  <section class="py-32 px-6">
+    <div class="max-w-5xl mx-auto grid md:grid-cols-2 gap-16 md:gap-24 items-center">
+      <div>
+        <span class="inline-block text-xs font-medium uppercase mb-5" style="color: #8B5CF6; letter-spacing: 0.12em; font-size: 11px;">Intelligence</span>
+        <h2 class="font-heading text-white font-semibold text-3xl md:text-4xl mb-5" style="line-height: 1.15;">It learns what works</h2>
+        <p class="text-neutral-500 text-base leading-relaxed" style="line-height: 1.6;">
+          Every merged PR teaches Claudear something. Local vector embeddings capture patterns. Review feedback gets internalized. Fix strategies that work get reinforced. No external APIs &mdash; all learning stays on your machine.
+        </p>
+      </div>
+      <div class="flex items-center justify-center">
+        <!-- Dot grid visualization -->
+        <div class="grid gap-3" style="grid-template-columns: repeat(8, 1fr);" aria-hidden="true">
+          <!-- Row 1 -->
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 0.2s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <!-- Row 2 -->
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 0.8s;"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 0.4s;"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 1.0s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <!-- Row 3 -->
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 1.2s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 0.6s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 1.4s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <!-- Row 4 -->
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 1.6s;"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 0.3s;"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 0.9s;"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 1.8s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <!-- Row 5 -->
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 2.0s;"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 1.1s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <!-- Row 6 -->
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 2.2s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 0.7s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <!-- Row 7 -->
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full dot-bright" style="background: #8B5CF6; animation-delay: 1.5s;"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <!-- Row 8 -->
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+          <div class="w-2 h-2 rounded-full" style="background: rgba(255,255,255,0.06);"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 2: Collaboration (visual left, text right) -->
+  <section class="py-32 px-6">
+    <div class="max-w-5xl mx-auto grid md:grid-cols-2 gap-16 md:gap-24 items-center">
+      <!-- Chat mockup -->
+      <div class="order-2 md:order-1">
+        <div class="card-ghost rounded-xl p-6 max-w-md mx-auto md:mx-0" aria-hidden="true">
+          <!-- Message 1: Claude -->
+          <div class="mb-5">
+            <div class="flex items-center gap-2 mb-2">
+              <div class="w-5 h-5 rounded-full flex items-center justify-center" style="background: rgba(139, 92, 246, 0.15);">
+                <div class="w-2 h-2 rounded-full" style="background: #8B5CF6;"></div>
+              </div>
+              <span class="text-xs font-medium" style="color: #8B5CF6;">Claude</span>
+            </div>
+            <p class="text-sm text-neutral-400 leading-relaxed pl-7">Should the retry limit apply to webhook failures or only polling failures?</p>
+          </div>
+          <!-- Message 2: You -->
+          <div>
+            <div class="flex items-center gap-2 mb-2">
+              <div class="w-5 h-5 rounded-full flex items-center justify-center" style="background: rgba(255,255,255,0.06);">
+                <div class="w-2 h-2 rounded-full bg-white/30"></div>
+              </div>
+              <span class="text-xs font-medium text-white/70">You</span>
+            </div>
+            <p class="text-sm text-neutral-300 leading-relaxed pl-7">Just polling failures, webhooks should always retry</p>
+          </div>
+        </div>
+      </div>
+      <!-- Text -->
+      <div class="order-1 md:order-2">
+        <span class="inline-block text-xs font-medium uppercase mb-5" style="color: #8B5CF6; letter-spacing: 0.12em; font-size: 11px;">Collaboration</span>
+        <h2 class="font-heading text-white font-semibold text-3xl md:text-4xl mb-5" style="line-height: 1.15;">Asks when it's stuck</h2>
+        <p class="text-neutral-500 text-base leading-relaxed" style="line-height: 1.6;">
+          When Claude encounters ambiguity, it doesn't guess. It asks your team a question via Discord, Slack, or Email. The first reply wins. Claude picks up where it left off. No context lost.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature 3: Vigilance (text left, visual right) -->
+  <section class="py-32 px-6">
+    <div class="max-w-5xl mx-auto grid md:grid-cols-2 gap-16 md:gap-24 items-center">
+      <div>
+        <span class="inline-block text-xs font-medium uppercase mb-5" style="color: #8B5CF6; letter-spacing: 0.12em; font-size: 11px;">Vigilance</span>
+        <h2 class="font-heading text-white font-semibold text-3xl md:text-4xl mb-5" style="line-height: 1.15;">Watches after it ships</h2>
+        <p class="text-neutral-500 text-base leading-relaxed" style="line-height: 1.6;">
+          For 24 hours after a fix deploys, Claudear monitors for regressions. Re-opened issues, error rate spikes, similar stack traces &mdash; it catches problems before your users do.
+        </p>
+      </div>
+      <!-- Heartbeat / seismograph visualization -->
+      <div class="flex items-center justify-center" aria-hidden="true">
+        <svg width="320" height="80" viewBox="0 0 320 80" fill="none" xmlns="http://www.w3.org/2000/svg" class="w-full max-w-xs md:max-w-sm">
+          <!-- Baseline -->
+          <line x1="0" y1="40" x2="320" y2="40" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>
+          <!-- Heartbeat line -->
+          <polyline
+            class="heartbeat-line"
+            points="0,40 20,40 35,40 40,38 45,40 60,40 75,40 80,35 85,25 90,40 95,45 100,40 115,40 130,40 135,38 140,40 155,40 170,40 175,32 180,20 185,40 190,48 195,40 210,40 225,40 230,38 235,40 250,40 260,40 265,15 268,55 272,8 276,50 280,40 295,40 310,40 320,40"
+            stroke="#10B981"
+            stroke-width="1.5"
+            fill="none"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+          <!-- Red spike overlay for the regression detection area -->
+          <polyline
+            points="260,40 265,15 268,55 272,8 276,50 280,40"
+            stroke="#EF4444"
+            stroke-width="1.5"
+            fill="none"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+          <!-- Small label -->
+          <text x="262" y="72" fill="#EF4444" font-size="9" font-family="Inter, system-ui, sans-serif" opacity="0.7">regression</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== NUMBERS ========== -->
+  <section class="py-32 px-6">
+    <div class="max-w-4xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-12 md:gap-8 text-center">
+      <div>
+        <span class="block font-heading text-white font-bold text-5xl md:text-6xl" style="letter-spacing: -0.02em;">7</span>
+        <span class="block text-neutral-600 text-sm mt-3">Issue sources</span>
+      </div>
+      <div>
+        <span class="block font-heading text-white font-bold text-5xl md:text-6xl" style="letter-spacing: -0.02em;">11</span>
+        <span class="block text-neutral-600 text-sm mt-3">Languages parsed</span>
+      </div>
+      <div>
+        <span class="block font-heading text-white font-bold text-5xl md:text-6xl" style="letter-spacing: -0.02em;">18</span>
+        <span class="block text-neutral-600 text-sm mt-3">Dashboard pages</span>
+      </div>
+      <div>
+        <span class="block font-heading text-white font-bold text-5xl md:text-6xl" style="letter-spacing: -0.02em;">24h</span>
+        <span class="block text-neutral-600 text-sm mt-3">Regression monitoring</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== INTEGRATION STRIP ========== -->
+  <section class="py-24 px-6">
+    <div class="max-w-3xl mx-auto text-center">
+      <p class="font-mono text-neutral-600 text-sm tracking-wide">
+        Linear &middot; Sentry &middot; GitHub &middot; GitLab &middot; Jira &middot; Discord &middot; Slack &middot; Email
+      </p>
+      <p class="text-neutral-600 text-sm mt-6">One TOML config. One command. Every source.</p>
+    </div>
+  </section>
+
+  <!-- ========== FINAL CTA ========== -->
+  <section class="py-40 px-6">
+    <div class="max-w-2xl mx-auto text-center">
+      <h2 class="font-heading text-white font-semibold text-2xl md:text-3xl mb-8" style="line-height: 1.2;">Your next PR is already being written.</h2>
+      <a href="#" class="cta-link text-sm font-medium cursor-pointer" style="color: #8B5CF6;">
+        Get Started <span class="inline-block ml-0.5" aria-hidden="true">&rarr;</span>
+      </a>
+    </div>
+  </section>
+
+  <!-- ========== FOOTER ========== -->
+  <footer class="px-6 pb-12" style="border-top: 1px solid rgba(255,255,255,0.05);">
+    <div class="max-w-6xl mx-auto pt-8">
+      <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
+        <span class="font-heading text-white/60 text-sm font-medium tracking-tight">claudear</span>
+        <div class="flex items-center gap-4">
+          <a href="#" class="nav-link text-xs text-neutral-600 cursor-pointer">Docs</a>
+          <span class="text-neutral-800">&middot;</span>
+          <a href="#" class="nav-link text-xs text-neutral-600 cursor-pointer">GitHub</a>
+          <span class="text-neutral-800">&middot;</span>
+          <a href="#" class="nav-link text-xs text-neutral-600 cursor-pointer">Dashboard</a>
+        </div>
+      </div>
+      <p class="text-center sm:text-left text-neutral-800 text-xs mt-6">Built with Rust &amp; Claude Code</p>
+    </div>
+  </footer>
+
+  <!-- ========== SCRIPTS ========== -->
+  <script>
+    // Navbar scroll effect
+    const navbar = document.getElementById('navbar');
+    let lastScroll = 0;
+    const onScroll = () => {
+      const y = window.scrollY;
+      if (y > 40) {
+        navbar.classList.add('navbar-scrolled');
+      } else {
+        navbar.classList.remove('navbar-scrolled');
+      }
+      lastScroll = y;
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+  </script>
+</body>
+</html>

@@ -290,7 +290,11 @@ async fn stats_handler(
         .tracker
         .get_stats()
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn overview_handler(
@@ -300,7 +304,11 @@ async fn overview_handler(
     let stats = state
         .tracker
         .get_stats()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Calculate rates
     let completed = stats.merged + stats.closed + stats.failed + stats.cannot_fix;
@@ -324,7 +332,11 @@ async fn overview_handler(
                     .map(|attempt| attempt_to_summary(&attempt))
                     .collect()
             })
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
     } else {
         get_attempts(&state.tracker, Some(10))
     };
@@ -400,10 +412,18 @@ async fn attempts_handler(
         let offset = (page - 1) * per_page;
         let rows = db
             .list_attempts(status_filter, source_filter, per_page, offset)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         let total = db
             .count_attempts(status_filter, source_filter)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         let attempts = rows
             .into_iter()
             .map(|attempt| attempt_to_summary(&attempt))
@@ -442,7 +462,11 @@ async fn attempt_detail_handler(
     state
         .tracker
         .get_attempt_by_id(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -489,7 +513,11 @@ async fn retries_handler(
     let retryable = state
         .tracker
         .get_retryable_issues(max_retries)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Create RetryManager to compute which attempts are ready for retry
     let retry_manager = RetryManager::new(state.config.retry.clone(), state.tracker.clone());
@@ -1047,7 +1075,11 @@ async fn attempt_full_detail_handler(
     let attempt = state
         .tracker
         .get_attempt_by_id(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
     let executions = state
@@ -1085,7 +1117,11 @@ async fn attempt_execution_log_handler(
     let attempt_exists = state
         .tracker
         .get_attempt_by_id(attempt_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .is_some();
     if !attempt_exists {
         return Err(StatusCode::NOT_FOUND);
@@ -1093,13 +1129,21 @@ async fn attempt_execution_log_handler(
 
     let execution = if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
         db.get_execution_for_attempt(attempt_id, execution_id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
             .ok_or(StatusCode::NOT_FOUND)?
     } else {
         state
             .tracker
             .get_executions_for_attempt(attempt_id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
             .into_iter()
             .find(|e| e.id == execution_id)
             .ok_or(StatusCode::NOT_FOUND)?
@@ -1204,7 +1248,11 @@ async fn activity_handler(
         .tracker
         .get_recent_activities_filtered(limit, source_filter)
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn analytics_summary_handler(
@@ -1214,7 +1262,11 @@ async fn analytics_summary_handler(
     let mut summary = state
         .tracker
         .get_analytics_summary()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     summary.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr().unwrap_or(None);
 
@@ -1258,7 +1310,11 @@ async fn metrics_handler(
         .tracker
         .get_metrics(metric_name, since, limit)
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn errors_handler(
@@ -1272,7 +1328,11 @@ async fn errors_handler(
         .tracker
         .get_error_patterns(limit)
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn issues_handler(
@@ -1292,11 +1352,19 @@ async fn issues_handler(
 
     let total = db
         .count_issues(query.source.as_deref())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let rows = db
         .list_issues(query.source.as_deref(), per_page, offset)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let issues: Vec<IssueSummary> = rows
         .into_iter()
@@ -1344,7 +1412,11 @@ async fn prs_handler(
         .tracker
         .list_prs(query.status.as_deref(), limit)
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn pr_analytics_handler(
@@ -1354,7 +1426,11 @@ async fn pr_analytics_handler(
     let mut analytics = state
         .tracker
         .get_pr_analytics()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     analytics.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr().unwrap_or(None);
     analytics.rejection_reasons = state.tracker.get_rejection_reasons(10).unwrap_or_default();
@@ -1373,7 +1449,11 @@ async fn feedback_handler(
         .tracker
         .get_feedback_outcomes(query.source.as_deref(), limit)
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn regressions_handler(
@@ -1389,13 +1469,21 @@ async fn regressions_handler(
                 .tracker
                 .get_regression_watches_by_status(status)
                 .map(Json)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
         }
         None => state
             .tracker
             .get_all_regression_watches()
             .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR),
+            .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }),
     }
 }
 
@@ -1408,7 +1496,11 @@ async fn regression_checks_handler(
         .tracker
         .get_regression_checks(id)
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn experiments_handler(
@@ -1419,7 +1511,11 @@ async fn experiments_handler(
         .tracker
         .get_active_experiments()
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn repos_handler(
@@ -1430,7 +1526,11 @@ async fn repos_handler(
         .tracker
         .list_indexed_repos()
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn repo_stats_handler(
@@ -1441,7 +1541,11 @@ async fn repo_stats_handler(
         .tracker
         .get_index_stats()
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn dependencies_handler(
@@ -1452,7 +1556,11 @@ async fn dependencies_handler(
         .tracker
         .list_all_dependencies()
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 #[derive(Serialize)]
@@ -1513,7 +1621,11 @@ async fn repo_learning_handler(
 
     let raw_knowledge = tracker
         .get_repo_knowledge(&repo)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let mut groups_map: BTreeMap<String, Vec<KnowledgeEntry>> = BTreeMap::new();
     for rk in &raw_knowledge {
@@ -1541,11 +1653,19 @@ async fn repo_learning_handler(
 
     let instructions = tracker
         .get_promoted_instructions(&repo)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let review_patterns = tracker
         .get_review_patterns(&repo, 200)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let mut by_category: HashMap<String, usize> = HashMap::new();
     let mut promoted_count: usize = 0;
@@ -1563,15 +1683,27 @@ async fn repo_learning_handler(
 
     let strategies = tracker
         .get_successful_strategies(&repo, 100)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let diff_analyses = tracker
         .get_diff_analyses_for_repo(&repo, 100)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let all_correlations = tracker
         .get_cross_repo_correlations(1, 168)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let correlations: Vec<_> = all_correlations
         .into_iter()
         .filter(|c| c.repo_a == repo || c.repo_b == repo)
@@ -1664,7 +1796,11 @@ async fn inference_stats_handler(
         .tracker
         .get_inference_stats()
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn inference_history_handler(
@@ -1678,7 +1814,11 @@ async fn inference_history_handler(
         .tracker
         .get_inference_history(limit)
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn telemetry_overview_handler(
@@ -1689,7 +1829,11 @@ async fn telemetry_overview_handler(
     let stats = state
         .tracker
         .get_stats()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let recent_attempts = get_attempt_records_since(&state.tracker, now - Duration::days(7));
 
     let windows = vec![
@@ -1701,7 +1845,11 @@ async fn telemetry_overview_handler(
     let retryable = state
         .tracker
         .get_retryable_issues(state.config.retry.max_retries)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let retry_manager = RetryManager::new(state.config.retry.clone(), state.tracker.clone());
     let ready_retries = retryable
         .iter()
@@ -1711,12 +1859,20 @@ async fn telemetry_overview_handler(
     let pr_analytics = state
         .tracker
         .get_pr_analytics()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let watches = state
         .tracker
         .get_all_regression_watches()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let mut queue = TelemetryQueueMetrics {
         pending_attempts: stats.pending as i64,
         retryable_attempts: retryable.len() as i64,

@@ -150,9 +150,40 @@ pub trait ScmProvider: Send + Sync {
     fn parse_pr_number(&self, _url: &str) -> Option<i64> {
         None
     }
+
+    /// Get the latest release for a repository.
+    async fn get_latest_release(&self, _project: &str) -> Result<Option<ScmRelease>> {
+        Ok(None)
+    }
+
+    /// Create a release for a repository.
+    async fn create_release(
+        &self,
+        _project: &str,
+        _tag: &str,
+        _name: &str,
+        _body: &str,
+    ) -> Result<ScmRelease> {
+        Err(crate::error::Error::Other(
+            "create_release not supported by this SCM provider".into(),
+        ))
+    }
 }
 
 // Shared types
+
+/// A release on the SCM provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScmRelease {
+    /// Tag name (e.g., "v1.2.3").
+    pub tag: String,
+    /// Release name/title.
+    pub name: Option<String>,
+    /// HTML URL to the release page.
+    pub url: String,
+    /// When the release was published (RFC 3339).
+    pub published_at: Option<String>,
+}
 
 /// Status of a PR / merge request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

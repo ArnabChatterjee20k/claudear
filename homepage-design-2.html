@@ -1,0 +1,1101 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claudear - Your AI Team Mate</title>
+  <meta name="description" content="Autonomous issue-to-PR pipeline powered by Claude Code. Monitor issues, spawn agents, ship fixes.">
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=DM+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+
+  <!-- Tailwind CSS v3 CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwindcss.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            heading: ['"Space Grotesk"', 'system-ui', 'sans-serif'],
+            body: ['"DM Sans"', 'system-ui', 'sans-serif'],
+            mono: ['"Fira Code"', 'monospace'],
+          },
+          colors: {
+            navy: { 900: '#0B1120', 950: '#030712' },
+          },
+        },
+      },
+    };
+  </script>
+
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+  <style>
+    /* ── Base ─────────────────────────────────────────── */
+    html { color-scheme: dark; }
+    body {
+      font-family: 'DM Sans', system-ui, sans-serif;
+      background: linear-gradient(180deg, #0B1120 0%, #030712 100%);
+      color: #F8FAFC;
+      overflow-x: hidden;
+    }
+    h1, h2, h3, h4, h5, h6, .font-heading { font-family: 'Space Grotesk', system-ui, sans-serif; }
+    code, .font-mono { font-family: 'Fira Code', monospace; }
+
+    /* ── Glass card ──────────────────────────────────── */
+    .glass {
+      background: rgba(255, 255, 255, 0.05);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .glass-hover {
+      transition: border-color 200ms ease, box-shadow 200ms ease, transform 200ms ease;
+    }
+    .glass-hover:hover {
+      border-color: rgba(59, 130, 246, 0.4);
+      box-shadow: 0 0 30px rgba(59, 130, 246, 0.08);
+      transform: translateY(-2px);
+    }
+
+    /* ── Ambient glow helper ─────────────────────────── */
+    .glow-blue {
+      position: absolute;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(59,130,246,0.20) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .glow-amber {
+      position: absolute;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(245,158,11,0.12) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    /* ── Shimmer pill ────────────────────────────────── */
+    @keyframes shimmer {
+      0% { background-position: -200% 0; }
+      100% { background-position: 200% 0; }
+    }
+    .shimmer {
+      background: linear-gradient(90deg, transparent 0%, rgba(59,130,246,0.15) 50%, transparent 100%);
+      background-size: 200% 100%;
+      animation: shimmer 3s ease-in-out infinite;
+    }
+
+    /* ── Pipeline animation ──────────────────────────── */
+    @keyframes flowDot {
+      0% { offset-distance: 0%; opacity: 0; }
+      5% { opacity: 1; }
+      95% { opacity: 1; }
+      100% { offset-distance: 100%; opacity: 0; }
+    }
+    .flow-dot {
+      offset-distance: 0%;
+      animation: flowDot var(--duration, 3s) linear infinite;
+      animation-delay: var(--delay, 0s);
+    }
+
+    @keyframes pulse-ring {
+      0% { transform: scale(1); opacity: 0.5; }
+      50% { transform: scale(1.15); opacity: 0.2; }
+      100% { transform: scale(1); opacity: 0.5; }
+    }
+    .pulse-ring {
+      animation: pulse-ring 2.5s ease-in-out infinite;
+    }
+
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(24px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .animate-fade-in-up {
+      animation: fadeInUp 0.6s ease-out forwards;
+      opacity: 0;
+    }
+
+    /* ── Learning chart animation ─────────────────────── */
+    @keyframes drawLine {
+      from { stroke-dashoffset: 400; }
+      to { stroke-dashoffset: 0; }
+    }
+    .draw-line {
+      stroke-dasharray: 400;
+      stroke-dashoffset: 400;
+      animation: drawLine 2s ease-out forwards;
+    }
+
+    /* ── Reduced motion ──────────────────────────────── */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+
+    /* ── Scrollbar ───────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0B1120; }
+    ::-webkit-scrollbar-thumb { background: #1E293B; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #334155; }
+
+    /* ── Mobile nav ──────────────────────────────────── */
+    .mobile-menu {
+      transform: translateY(-100%);
+      transition: transform 300ms ease;
+    }
+    .mobile-menu.open {
+      transform: translateY(0);
+    }
+  </style>
+</head>
+
+<body class="min-h-screen antialiased">
+
+  <!-- ════════════════════════════════════════════════════
+       NAVBAR
+       ════════════════════════════════════════════════════ -->
+  <nav id="navbar" class="fixed top-0 left-0 right-0 z-50 transition-all duration-300" style="background:rgba(15,23,42,0.80);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border-bottom:1px solid rgba(255,255,255,0.06);">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="flex items-center justify-between h-16">
+        <!-- Logo -->
+        <a href="#" class="flex items-center gap-2.5 cursor-pointer group">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none" class="transition-transform duration-200 group-hover:scale-110">
+            <rect width="28" height="28" rx="7" fill="url(#logoGrad)"/>
+            <path d="M7 14h3l2-5 3 10 2-7 2 4h2" stroke="#F8FAFC" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            <defs>
+              <linearGradient id="logoGrad" x1="0" y1="0" x2="28" y2="28">
+                <stop stop-color="#3B82F6"/>
+                <stop offset="1" stop-color="#2563EB"/>
+              </linearGradient>
+            </defs>
+          </svg>
+          <span class="font-heading font-semibold text-lg tracking-tight">claudear</span>
+        </a>
+
+        <!-- Desktop links -->
+        <div class="hidden md:flex items-center gap-8">
+          <a href="#features" class="text-sm text-slate-400 hover:text-white transition-colors duration-200 cursor-pointer">Product</a>
+          <a href="#integrations" class="text-sm text-slate-400 hover:text-white transition-colors duration-200 cursor-pointer">Integrations</a>
+          <a href="#architecture" class="text-sm text-slate-400 hover:text-white transition-colors duration-200 cursor-pointer">Docs</a>
+          <a href="#" class="text-sm text-slate-400 hover:text-white transition-colors duration-200 cursor-pointer">Pricing</a>
+        </div>
+
+        <!-- Desktop CTA -->
+        <div class="hidden md:flex items-center gap-4">
+          <a href="#" class="text-sm text-slate-400 hover:text-white transition-colors duration-200 cursor-pointer">Sign In</a>
+          <a href="#cta" class="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg cursor-pointer transition-all duration-200 hover:shadow-lg hover:shadow-blue-500/20" style="background:linear-gradient(135deg,#3B82F6,#2563EB);">
+            Start Free
+          </a>
+        </div>
+
+        <!-- Mobile hamburger -->
+        <button id="mobileMenuBtn" class="md:hidden p-2 text-slate-400 hover:text-white cursor-pointer" aria-label="Toggle menu">
+          <i data-lucide="menu" class="w-5 h-5"></i>
+        </button>
+      </div>
+    </div>
+
+    <!-- Mobile menu -->
+    <div id="mobileMenu" class="mobile-menu md:hidden absolute top-16 left-0 right-0" style="background:rgba(15,23,42,0.95);backdrop-filter:blur(24px);border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div class="px-4 py-6 space-y-4">
+        <a href="#features" class="block text-sm text-slate-400 hover:text-white cursor-pointer">Product</a>
+        <a href="#integrations" class="block text-sm text-slate-400 hover:text-white cursor-pointer">Integrations</a>
+        <a href="#architecture" class="block text-sm text-slate-400 hover:text-white cursor-pointer">Docs</a>
+        <a href="#" class="block text-sm text-slate-400 hover:text-white cursor-pointer">Pricing</a>
+        <hr class="border-white/10">
+        <a href="#" class="block text-sm text-slate-400 hover:text-white cursor-pointer">Sign In</a>
+        <a href="#cta" class="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white rounded-lg cursor-pointer" style="background:linear-gradient(135deg,#3B82F6,#2563EB);">Start Free</a>
+      </div>
+    </div>
+  </nav>
+
+
+  <!-- ════════════════════════════════════════════════════
+       HERO SECTION
+       ════════════════════════════════════════════════════ -->
+  <section class="relative min-h-screen flex flex-col items-center justify-center pt-16 overflow-hidden">
+    <!-- Ambient glows -->
+    <div class="glow-blue" style="width:800px;height:800px;top:-200px;left:50%;transform:translateX(-50%);"></div>
+    <div class="glow-blue" style="width:500px;height:500px;bottom:10%;right:-10%;opacity:0.15;"></div>
+
+    <div class="relative z-10 max-w-5xl mx-auto px-4 sm:px-6 text-center pt-12 sm:pt-20">
+      <!-- Pill badge -->
+      <div class="animate-fade-in-up inline-flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-medium text-blue-300 border border-blue-500/30 mb-8 shimmer" style="animation-delay:0.1s;">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="3" fill="#3B82F6"/><circle cx="7" cy="7" r="5.5" stroke="#3B82F6" stroke-opacity="0.4"/></svg>
+        Powered by Claude Code
+      </div>
+
+      <!-- Headline -->
+      <h1 class="animate-fade-in-up font-heading font-bold text-4xl sm:text-5xl md:text-6xl lg:text-7xl leading-[1.08] tracking-tight mb-6" style="animation-delay:0.2s;">
+        Your codebase<br class="hidden sm:block"> fixes itself
+      </h1>
+
+      <!-- Subheadline -->
+      <p class="animate-fade-in-up max-w-2xl mx-auto text-base sm:text-lg text-slate-400 leading-relaxed mb-10" style="animation-delay:0.35s;">
+        Claudear monitors your issues, routes them to the right repo, spawns AI agents to write the fix, and opens a pull request. Regressions get caught. Patterns get learned. Your team ships faster.
+      </p>
+
+      <!-- CTAs -->
+      <div class="animate-fade-in-up flex flex-col sm:flex-row items-center justify-center gap-4 mb-12" style="animation-delay:0.5s;">
+        <a href="#cta" class="inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold text-white rounded-xl cursor-pointer transition-all duration-200 hover:shadow-xl hover:shadow-blue-500/25 hover:-translate-y-0.5" style="background:linear-gradient(135deg,#3B82F6,#2563EB);">
+          Get Started
+          <i data-lucide="arrow-right" class="w-4 h-4"></i>
+        </a>
+        <a href="#" class="inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold text-slate-300 rounded-xl border border-white/10 hover:border-white/25 hover:text-white cursor-pointer transition-all duration-200">
+          <i data-lucide="play" class="w-4 h-4"></i>
+          Watch Demo
+        </a>
+      </div>
+
+      <!-- Integration icons row -->
+      <div class="animate-fade-in-up flex flex-wrap items-center justify-center gap-6 text-xs text-slate-500 mb-16" style="animation-delay:0.6s;" id="integrations">
+        <span class="flex items-center gap-1.5"><i data-lucide="layout-grid" class="w-3.5 h-3.5"></i> Linear</span>
+        <span class="text-slate-700">|</span>
+        <span class="flex items-center gap-1.5"><i data-lucide="bug" class="w-3.5 h-3.5"></i> Sentry</span>
+        <span class="text-slate-700">|</span>
+        <span class="flex items-center gap-1.5"><i data-lucide="github" class="w-3.5 h-3.5"></i> GitHub</span>
+        <span class="text-slate-700">|</span>
+        <span class="flex items-center gap-1.5"><i data-lucide="ticket" class="w-3.5 h-3.5"></i> Jira</span>
+        <span class="text-slate-700">|</span>
+        <span class="flex items-center gap-1.5"><i data-lucide="message-square" class="w-3.5 h-3.5"></i> Slack</span>
+        <span class="text-slate-700">|</span>
+        <span class="flex items-center gap-1.5"><i data-lucide="hash" class="w-3.5 h-3.5"></i> Discord</span>
+        <span class="text-slate-700">|</span>
+        <span class="flex items-center gap-1.5"><i data-lucide="gitlab" class="w-3.5 h-3.5"></i> GitLab</span>
+      </div>
+    </div>
+
+    <!-- ── Hero Pipeline Visualization ────────────────── -->
+    <div class="animate-fade-in-up relative z-10 w-full max-w-4xl mx-auto px-4 pb-20" style="animation-delay:0.7s;">
+      <svg viewBox="0 0 900 320" fill="none" class="w-full h-auto" aria-label="Animated pipeline visualization showing issues flowing through Claudear to produce PRs, notifications, and learning">
+        <defs>
+          <!-- Flow paths -->
+          <path id="pathLinear" d="M130,80 C250,80 250,160 380,160"/>
+          <path id="pathSentry" d="M130,160 C250,160 300,160 380,160"/>
+          <path id="pathJira" d="M130,240 C250,240 250,160 380,160"/>
+          <path id="pathToPR" d="M520,160 C600,160 650,80 770,80"/>
+          <path id="pathToNotif" d="M520,160 C600,160 650,160 770,160"/>
+          <path id="pathToLearn" d="M520,160 C600,160 650,240 770,240"/>
+
+          <filter id="glowFilter">
+            <feGaussianBlur stdDeviation="6" result="blur"/>
+            <feMerge>
+              <feMergeNode in="blur"/>
+              <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+          </filter>
+
+          <radialGradient id="nodeGlow" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#3B82F6" stop-opacity="0.15"/>
+            <stop offset="100%" stop-color="#3B82F6" stop-opacity="0"/>
+          </radialGradient>
+
+          <linearGradient id="centerGrad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#3B82F6"/>
+            <stop offset="100%" stop-color="#2563EB"/>
+          </linearGradient>
+        </defs>
+
+        <!-- Ambient glow behind center -->
+        <circle cx="450" cy="160" r="100" fill="url(#nodeGlow)"/>
+
+        <!-- Draw the paths (static lines) -->
+        <use href="#pathLinear" stroke="#1E3A5F" stroke-width="1.5" opacity="0.5"/>
+        <use href="#pathSentry" stroke="#1E3A5F" stroke-width="1.5" opacity="0.5"/>
+        <use href="#pathJira" stroke="#1E3A5F" stroke-width="1.5" opacity="0.5"/>
+        <use href="#pathToPR" stroke="#1E3A5F" stroke-width="1.5" opacity="0.5"/>
+        <use href="#pathToNotif" stroke="#1E3A5F" stroke-width="1.5" opacity="0.5"/>
+        <use href="#pathToLearn" stroke="#1E3A5F" stroke-width="1.5" opacity="0.5"/>
+
+        <!-- Animated dots flowing along paths -->
+        <!-- Left → Center -->
+        <circle r="3" fill="#3B82F6" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M130,80 C250,80 250,160 380,160');--duration:2.8s;--delay:0s;"/>
+        <circle r="3" fill="#3B82F6" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M130,80 C250,80 250,160 380,160');--duration:2.8s;--delay:1.4s;"/>
+        <circle r="3" fill="#3B82F6" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M130,160 C250,160 300,160 380,160');--duration:2.4s;--delay:0.3s;"/>
+        <circle r="3" fill="#3B82F6" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M130,160 C250,160 300,160 380,160');--duration:2.4s;--delay:1.5s;"/>
+        <circle r="3" fill="#3B82F6" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M130,240 C250,240 250,160 380,160');--duration:3s;--delay:0.6s;"/>
+        <circle r="3" fill="#3B82F6" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M130,240 C250,240 250,160 380,160');--duration:3s;--delay:2s;"/>
+
+        <!-- Center → Right -->
+        <circle r="3" fill="#10B981" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M520,160 C600,160 650,80 770,80');--duration:2.5s;--delay:0.5s;"/>
+        <circle r="3" fill="#10B981" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M520,160 C600,160 650,80 770,80');--duration:2.5s;--delay:1.8s;"/>
+        <circle r="3" fill="#F59E0B" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M520,160 C600,160 650,160 770,160');--duration:2.6s;--delay:0.8s;"/>
+        <circle r="3" fill="#F59E0B" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M520,160 C600,160 650,160 770,160');--duration:2.6s;--delay:2.1s;"/>
+        <circle r="3" fill="#8B5CF6" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M520,160 C600,160 650,240 770,240');--duration:2.9s;--delay:0.2s;"/>
+        <circle r="3" fill="#8B5CF6" filter="url(#glowFilter)" class="flow-dot" style="offset-path:path('M520,160 C600,160 650,240 770,240');--duration:2.9s;--delay:1.6s;"/>
+
+        <!-- ── Source Nodes (Left) ───────────────────── -->
+        <!-- Linear -->
+        <g>
+          <rect x="60" y="52" width="80" height="56" rx="12" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>
+          <text x="100" y="72" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9" font-weight="500">LINEAR</text>
+          <rect x="82" y="80" width="36" height="4" rx="2" fill="#3B82F6" opacity="0.6"/>
+          <rect x="82" y="88" width="24" height="4" rx="2" fill="#3B82F6" opacity="0.3"/>
+          <rect x="82" y="96" width="30" height="4" rx="2" fill="#3B82F6" opacity="0.3"/>
+        </g>
+
+        <!-- Sentry -->
+        <g>
+          <rect x="60" y="132" width="80" height="56" rx="12" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>
+          <text x="100" y="152" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9" font-weight="500">SENTRY</text>
+          <rect x="82" y="160" width="36" height="4" rx="2" fill="#F59E0B" opacity="0.6"/>
+          <rect x="82" y="168" width="28" height="4" rx="2" fill="#F59E0B" opacity="0.3"/>
+          <rect x="82" y="176" width="32" height="4" rx="2" fill="#F59E0B" opacity="0.3"/>
+        </g>
+
+        <!-- Jira -->
+        <g>
+          <rect x="60" y="212" width="80" height="56" rx="12" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>
+          <text x="100" y="232" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9" font-weight="500">JIRA</text>
+          <rect x="82" y="240" width="36" height="4" rx="2" fill="#10B981" opacity="0.6"/>
+          <rect x="82" y="248" width="20" height="4" rx="2" fill="#10B981" opacity="0.3"/>
+          <rect x="82" y="256" width="28" height="4" rx="2" fill="#10B981" opacity="0.3"/>
+        </g>
+
+        <!-- ── Center Hub ────────────────────────────── -->
+        <g>
+          <!-- Pulsing rings -->
+          <circle cx="450" cy="160" r="58" stroke="#3B82F6" stroke-width="1" fill="none" opacity="0.3" class="pulse-ring"/>
+          <circle cx="450" cy="160" r="68" stroke="#3B82F6" stroke-width="0.5" fill="none" opacity="0.15" class="pulse-ring" style="animation-delay:0.8s;"/>
+
+          <!-- Main circle -->
+          <rect x="395" y="120" width="110" height="80" rx="16" fill="rgba(59,130,246,0.1)" stroke="#3B82F6" stroke-width="1.5"/>
+          <text x="450" y="154" text-anchor="middle" fill="#F8FAFC" font-family="Space Grotesk" font-size="12" font-weight="700" letter-spacing="2">CLAUDEAR</text>
+          <text x="450" y="172" text-anchor="middle" fill="#3B82F6" font-family="DM Sans" font-size="8" font-weight="500">PROCESSING</text>
+
+          <!-- Activity dots inside -->
+          <circle cx="430" cy="183" r="2" fill="#3B82F6" opacity="0.6">
+            <animate attributeName="opacity" values="0.6;1;0.6" dur="1.5s" repeatCount="indefinite"/>
+          </circle>
+          <circle cx="440" cy="183" r="2" fill="#3B82F6" opacity="0.8">
+            <animate attributeName="opacity" values="0.8;0.4;0.8" dur="1.5s" repeatCount="indefinite" begin="0.3s"/>
+          </circle>
+          <circle cx="450" cy="183" r="2" fill="#3B82F6" opacity="0.5">
+            <animate attributeName="opacity" values="0.5;1;0.5" dur="1.5s" repeatCount="indefinite" begin="0.6s"/>
+          </circle>
+          <circle cx="460" cy="183" r="2" fill="#3B82F6" opacity="0.7">
+            <animate attributeName="opacity" values="0.7;0.3;0.7" dur="1.5s" repeatCount="indefinite" begin="0.9s"/>
+          </circle>
+          <circle cx="470" cy="183" r="2" fill="#3B82F6" opacity="0.4">
+            <animate attributeName="opacity" values="0.4;0.9;0.4" dur="1.5s" repeatCount="indefinite" begin="1.2s"/>
+          </circle>
+        </g>
+
+        <!-- ── Output Nodes (Right) ──────────────────── -->
+        <!-- PR -->
+        <g>
+          <rect x="750" y="52" width="100" height="56" rx="12" fill="rgba(16,185,129,0.08)" stroke="rgba(16,185,129,0.3)" stroke-width="1"/>
+          <text x="800" y="72" text-anchor="middle" fill="#10B981" font-family="DM Sans" font-size="9" font-weight="600">PULL REQUEST</text>
+          <text x="800" y="92" text-anchor="middle" fill="#10B981" font-family="Fira Code" font-size="18" font-weight="500">PR</text>
+        </g>
+
+        <!-- Notification -->
+        <g>
+          <rect x="750" y="132" width="100" height="56" rx="12" fill="rgba(245,158,11,0.08)" stroke="rgba(245,158,11,0.3)" stroke-width="1"/>
+          <text x="800" y="152" text-anchor="middle" fill="#F59E0B" font-family="DM Sans" font-size="9" font-weight="600">NOTIFICATION</text>
+          <!-- Bell shape -->
+          <path d="M795,170 Q795,164 800,164 Q805,164 805,170 L806,174 L794,174 Z" fill="none" stroke="#F59E0B" stroke-width="1" opacity="0.7"/>
+          <circle cx="800" cy="176" r="1.5" fill="#F59E0B" opacity="0.7"/>
+        </g>
+
+        <!-- Learning -->
+        <g>
+          <rect x="750" y="212" width="100" height="56" rx="12" fill="rgba(139,92,246,0.08)" stroke="rgba(139,92,246,0.3)" stroke-width="1"/>
+          <text x="800" y="232" text-anchor="middle" fill="#A78BFA" font-family="DM Sans" font-size="9" font-weight="600">LEARNING</text>
+          <!-- Brain-ish icon -->
+          <path d="M792,252 Q792,244 800,244 Q808,244 808,252" fill="none" stroke="#A78BFA" stroke-width="1" opacity="0.7"/>
+          <path d="M796,248 Q800,256 804,248" fill="none" stroke="#A78BFA" stroke-width="0.8" opacity="0.5"/>
+        </g>
+
+        <!-- Labels -->
+        <text x="100" y="38" text-anchor="middle" fill="#475569" font-family="DM Sans" font-size="10" font-weight="500" text-transform="uppercase" letter-spacing="1.5">SOURCES</text>
+        <text x="800" y="38" text-anchor="middle" fill="#475569" font-family="DM Sans" font-size="10" font-weight="500" text-transform="uppercase" letter-spacing="1.5">OUTPUTS</text>
+      </svg>
+    </div>
+  </section>
+
+
+  <!-- ════════════════════════════════════════════════════
+       BENTO GRID SECTION
+       ════════════════════════════════════════════════════ -->
+  <section id="features" class="relative py-24 sm:py-32">
+    <div class="glow-blue" style="width:600px;height:600px;top:0;left:-15%;"></div>
+
+    <div class="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <!-- Section heading -->
+      <div class="text-center mb-16">
+        <h2 class="font-heading font-bold text-3xl sm:text-4xl lg:text-5xl tracking-tight mb-4">Everything, automated</h2>
+        <p class="text-slate-400 max-w-xl mx-auto text-base sm:text-lg">From issue detection to merged PR. One daemon handles the entire pipeline.</p>
+      </div>
+
+      <!-- Grid -->
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4 lg:gap-5">
+
+        <!-- Card 1: Issue to PR (large, spans 2) -->
+        <div class="md:col-span-2 glass glass-hover rounded-2xl p-6 lg:p-8 relative overflow-hidden">
+          <div class="glow-blue" style="width:300px;height:300px;top:-100px;right:-80px;opacity:0.1;"></div>
+          <h3 class="font-heading font-semibold text-lg sm:text-xl mb-2">Issue to PR in minutes</h3>
+          <p class="text-slate-400 text-sm mb-8">Watch the full lifecycle from issue detection to merged pull request.</p>
+
+          <!-- Timeline -->
+          <div class="relative">
+            <div class="absolute top-4 left-0 right-0 h-px bg-gradient-to-r from-blue-500/50 via-blue-500/30 to-emerald-500/50"></div>
+            <div class="flex justify-between relative">
+              <div class="flex flex-col items-center">
+                <div class="w-8 h-8 rounded-full bg-blue-500/20 border border-blue-500/40 flex items-center justify-center mb-2">
+                  <i data-lucide="alert-circle" class="w-3.5 h-3.5 text-blue-400"></i>
+                </div>
+                <span class="text-xs text-slate-500">Issue created</span>
+                <span class="font-mono text-xs text-blue-400 mt-1">0s</span>
+              </div>
+              <div class="flex flex-col items-center">
+                <div class="w-8 h-8 rounded-full bg-blue-500/20 border border-blue-500/40 flex items-center justify-center mb-2">
+                  <i data-lucide="cpu" class="w-3.5 h-3.5 text-blue-400"></i>
+                </div>
+                <span class="text-xs text-slate-500">Agent spawned</span>
+                <span class="font-mono text-xs text-blue-400 mt-1">12s</span>
+              </div>
+              <div class="flex flex-col items-center">
+                <div class="w-8 h-8 rounded-full bg-amber-500/20 border border-amber-500/40 flex items-center justify-center mb-2">
+                  <i data-lucide="code" class="w-3.5 h-3.5 text-amber-400"></i>
+                </div>
+                <span class="text-xs text-slate-500">Code written</span>
+                <span class="font-mono text-xs text-amber-400 mt-1">2m</span>
+              </div>
+              <div class="flex flex-col items-center">
+                <div class="w-8 h-8 rounded-full bg-amber-500/20 border border-amber-500/40 flex items-center justify-center mb-2">
+                  <i data-lucide="git-pull-request" class="w-3.5 h-3.5 text-amber-400"></i>
+                </div>
+                <span class="text-xs text-slate-500">PR opened</span>
+                <span class="font-mono text-xs text-amber-400 mt-1">2m 34s</span>
+              </div>
+              <div class="flex flex-col items-center">
+                <div class="w-8 h-8 rounded-full bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center mb-2">
+                  <i data-lucide="check-circle" class="w-3.5 h-3.5 text-emerald-400"></i>
+                </div>
+                <span class="text-xs text-slate-500">Merged</span>
+                <span class="font-mono text-xs text-emerald-400 mt-1">merged</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 2: 7 Sources -->
+        <div class="glass glass-hover rounded-2xl p-6 lg:p-8 relative overflow-hidden">
+          <h3 class="font-heading font-semibold text-lg mb-2">7 Sources, One Pipeline</h3>
+          <p class="text-slate-400 text-sm mb-6">Every issue tracker. One daemon.</p>
+          <div class="space-y-2.5">
+            <div class="flex items-center gap-3 text-sm text-slate-300"><i data-lucide="layout-grid" class="w-4 h-4 text-blue-400"></i> Linear</div>
+            <div class="flex items-center gap-3 text-sm text-slate-300"><i data-lucide="bug" class="w-4 h-4 text-amber-400"></i> Sentry</div>
+            <div class="flex items-center gap-3 text-sm text-slate-300"><i data-lucide="ticket" class="w-4 h-4 text-blue-400"></i> Jira</div>
+            <div class="flex items-center gap-3 text-sm text-slate-300"><i data-lucide="github" class="w-4 h-4 text-slate-300"></i> GitHub</div>
+            <div class="flex items-center gap-3 text-sm text-slate-300"><i data-lucide="gitlab" class="w-4 h-4 text-orange-400"></i> GitLab</div>
+            <div class="flex items-center gap-3 text-sm text-slate-300"><i data-lucide="hash" class="w-4 h-4 text-indigo-400"></i> Discord</div>
+            <div class="flex items-center gap-3 text-sm text-slate-300"><i data-lucide="message-square" class="w-4 h-4 text-green-400"></i> Slack</div>
+          </div>
+        </div>
+
+        <!-- Card 3: Intelligent Routing -->
+        <div class="glass glass-hover rounded-2xl p-6 lg:p-8 relative overflow-hidden">
+          <h3 class="font-heading font-semibold text-lg mb-2">Intelligent Routing</h3>
+          <p class="text-slate-400 text-sm mb-6">Confidence-scored repo inference from stack traces and content.</p>
+
+          <!-- Mini routing visualization -->
+          <div class="flex items-center justify-between">
+            <div class="flex flex-col items-center">
+              <div class="w-10 h-10 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center">
+                <i data-lucide="file-text" class="w-4 h-4 text-amber-400"></i>
+              </div>
+              <span class="text-xs text-slate-500 mt-1.5">Issue</span>
+            </div>
+            <div class="flex-1 mx-3">
+              <div class="h-px bg-gradient-to-r from-amber-500/40 to-blue-500/40"></div>
+            </div>
+            <div class="flex flex-col items-center">
+              <div class="w-10 h-10 rounded-lg bg-blue-500/10 border border-blue-500/30 flex items-center justify-center">
+                <i data-lucide="brain" class="w-4 h-4 text-blue-400"></i>
+              </div>
+              <span class="text-xs text-slate-500 mt-1.5">Analyze</span>
+            </div>
+            <div class="flex-1 mx-3">
+              <div class="h-px bg-gradient-to-r from-blue-500/40 to-emerald-500/40"></div>
+            </div>
+            <div class="flex flex-col items-center">
+              <div class="w-10 h-10 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
+                <i data-lucide="folder-git-2" class="w-4 h-4 text-emerald-400"></i>
+              </div>
+              <span class="text-xs text-slate-500 mt-1.5">Repo</span>
+            </div>
+          </div>
+
+          <div class="mt-4 flex items-center gap-2">
+            <div class="h-1.5 flex-1 rounded-full bg-emerald-500/20 overflow-hidden">
+              <div class="h-full w-[94%] rounded-full bg-gradient-to-r from-emerald-500/60 to-emerald-400/80"></div>
+            </div>
+            <span class="font-mono text-xs text-emerald-400">94%</span>
+          </div>
+        </div>
+
+        <!-- Card 4: Learns from outcomes (large, spans 2) -->
+        <div class="md:col-span-2 glass glass-hover rounded-2xl p-6 lg:p-8 relative overflow-hidden">
+          <div class="glow-amber" style="width:300px;height:300px;bottom:-100px;left:-80px;"></div>
+          <h3 class="font-heading font-semibold text-lg sm:text-xl mb-2">Learns from every outcome</h3>
+          <p class="text-slate-400 text-sm mb-6">Vector embeddings. Pattern matching. Review analysis. Claudear gets smarter with every fix.</p>
+
+          <!-- Learning curve chart -->
+          <div class="relative">
+            <svg viewBox="0 0 400 120" fill="none" class="w-full h-auto">
+              <!-- Grid lines -->
+              <line x1="40" y1="10" x2="40" y2="100" stroke="#1E293B" stroke-width="0.5"/>
+              <line x1="40" y1="100" x2="390" y2="100" stroke="#1E293B" stroke-width="0.5"/>
+              <line x1="40" y1="70" x2="390" y2="70" stroke="#1E293B" stroke-width="0.5" stroke-dasharray="3"/>
+              <line x1="40" y1="40" x2="390" y2="40" stroke="#1E293B" stroke-width="0.5" stroke-dasharray="3"/>
+
+              <!-- Y labels -->
+              <text x="35" y="103" text-anchor="end" fill="#475569" font-family="DM Sans" font-size="8">0%</text>
+              <text x="35" y="73" text-anchor="end" fill="#475569" font-family="DM Sans" font-size="8">50%</text>
+              <text x="35" y="43" text-anchor="end" fill="#475569" font-family="DM Sans" font-size="8">100%</text>
+
+              <!-- X labels -->
+              <text x="40" y="113" text-anchor="start" fill="#475569" font-family="DM Sans" font-size="8">Week 1</text>
+              <text x="215" y="113" text-anchor="middle" fill="#475569" font-family="DM Sans" font-size="8">Week 4</text>
+              <text x="390" y="113" text-anchor="end" fill="#475569" font-family="DM Sans" font-size="8">Week 8</text>
+
+              <!-- Area fill -->
+              <path d="M40,95 C80,92 120,85 160,75 C200,65 240,50 280,38 C320,28 360,22 390,18 L390,100 L40,100 Z"
+                    fill="url(#chartFill)" opacity="0.3"/>
+              <defs>
+                <linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#3B82F6"/>
+                  <stop offset="100%" stop-color="#3B82F6" stop-opacity="0"/>
+                </linearGradient>
+              </defs>
+
+              <!-- Line -->
+              <path d="M40,95 C80,92 120,85 160,75 C200,65 240,50 280,38 C320,28 360,22 390,18"
+                    stroke="#3B82F6" stroke-width="2" fill="none" stroke-linecap="round" class="draw-line"/>
+
+              <!-- Data points -->
+              <circle cx="40" cy="95" r="3" fill="#0B1120" stroke="#3B82F6" stroke-width="1.5"/>
+              <circle cx="160" cy="75" r="3" fill="#0B1120" stroke="#3B82F6" stroke-width="1.5"/>
+              <circle cx="280" cy="38" r="3" fill="#0B1120" stroke="#3B82F6" stroke-width="1.5"/>
+              <circle cx="390" cy="18" r="3" fill="#0B1120" stroke="#3B82F6" stroke-width="1.5"/>
+
+              <!-- Label on last point -->
+              <text x="380" y="12" text-anchor="end" fill="#3B82F6" font-family="Fira Code" font-size="8" font-weight="500">94% success</text>
+            </svg>
+          </div>
+        </div>
+
+        <!-- Card 5: Human in the Loop -->
+        <div class="glass glass-hover rounded-2xl p-6 lg:p-8 relative overflow-hidden">
+          <h3 class="font-heading font-semibold text-lg mb-2">Human in the Loop</h3>
+          <p class="text-slate-400 text-sm mb-6">When blocked, asks your team. First reply wins.</p>
+
+          <!-- Chat mockup -->
+          <div class="space-y-3">
+            <!-- Claude message -->
+            <div class="flex items-start gap-2">
+              <div class="w-6 h-6 rounded-full bg-blue-500/20 border border-blue-500/40 flex-shrink-0 flex items-center justify-center mt-0.5">
+                <svg width="10" height="10" viewBox="0 0 28 28"><path d="M7 14h3l2-5 3 10 2-7 2 4h2" stroke="#3B82F6" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
+              </div>
+              <div class="glass rounded-lg px-3 py-2 text-xs text-slate-300 max-w-[85%]">
+                The error references <code class="text-blue-300 font-mono text-[10px]">auth_middleware</code> -- should I fix the token validation or the session handler?
+              </div>
+            </div>
+            <!-- Human reply -->
+            <div class="flex items-start gap-2 justify-end">
+              <div class="bg-blue-500/15 border border-blue-500/25 rounded-lg px-3 py-2 text-xs text-slate-200 max-w-[85%]">
+                Fix the session handler. Token validation is fine.
+              </div>
+              <div class="w-6 h-6 rounded-full bg-emerald-500/20 border border-emerald-500/40 flex-shrink-0 flex items-center justify-center mt-0.5">
+                <i data-lucide="user" class="w-3 h-3 text-emerald-400"></i>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 6: Regression Guard -->
+        <div class="glass glass-hover rounded-2xl p-6 lg:p-8 relative overflow-hidden">
+          <h3 class="font-heading font-semibold text-lg mb-2">Regression Guard</h3>
+          <p class="text-slate-400 text-sm mb-6">24-hour post-deploy monitoring. Catches regressions before users do.</p>
+
+          <!-- Shield + clock -->
+          <div class="flex items-center justify-center">
+            <div class="relative">
+              <div class="w-20 h-20 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center">
+                <i data-lucide="shield-check" class="w-8 h-8 text-emerald-400"></i>
+              </div>
+              <div class="absolute -top-2 -right-2 w-8 h-8 rounded-full bg-slate-900 border border-emerald-500/30 flex items-center justify-center">
+                <span class="font-mono text-[10px] text-emerald-400">24h</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="mt-5 flex items-center gap-2 text-xs text-emerald-400">
+            <i data-lucide="check" class="w-3 h-3"></i>
+            <span>All clear -- 0 regressions in 24h</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ════════════════════════════════════════════════════
+       ARCHITECTURE SECTION
+       ════════════════════════════════════════════════════ -->
+  <section id="architecture" class="relative py-24 sm:py-32">
+    <div class="glow-blue" style="width:700px;height:700px;bottom:-200px;right:-15%;"></div>
+
+    <div class="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="text-center mb-16">
+        <h2 class="font-heading font-bold text-3xl sm:text-4xl lg:text-5xl tracking-tight mb-4">Built to watch. Built to fix.</h2>
+        <p class="text-slate-400 max-w-xl mx-auto text-base sm:text-lg">A Rust-powered daemon designed for reliability, speed, and zero overhead.</p>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-12 lg:gap-16 items-start">
+        <!-- Left: Architecture details -->
+        <div class="space-y-6">
+          <div class="flex items-start gap-4">
+            <div class="w-10 h-10 rounded-lg bg-amber-500/10 border border-amber-500/25 flex items-center justify-center flex-shrink-0 mt-0.5">
+              <i data-lucide="zap" class="w-5 h-5 text-amber-400"></i>
+            </div>
+            <div>
+              <h4 class="font-heading font-semibold text-white mb-1">Rust-powered daemon</h4>
+              <p class="text-sm text-slate-400 leading-relaxed">Async Tokio runtime for non-blocking I/O across all sources. Zero garbage collection pauses. Sub-millisecond event processing.</p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-4">
+            <div class="w-10 h-10 rounded-lg bg-blue-500/10 border border-blue-500/25 flex items-center justify-center flex-shrink-0 mt-0.5">
+              <i data-lucide="database" class="w-5 h-5 text-blue-400"></i>
+            </div>
+            <div>
+              <h4 class="font-heading font-semibold text-white mb-1">SQLite for lightweight persistence</h4>
+              <p class="text-sm text-slate-400 leading-relaxed">No external database required. WAL mode for concurrent reads. Embedded storage that travels with your deployment.</p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-4">
+            <div class="w-10 h-10 rounded-lg bg-purple-500/10 border border-purple-500/25 flex items-center justify-center flex-shrink-0 mt-0.5">
+              <i data-lucide="brain" class="w-5 h-5 text-purple-400"></i>
+            </div>
+            <div>
+              <h4 class="font-heading font-semibold text-white mb-1">Local vector embeddings</h4>
+              <p class="text-sm text-slate-400 leading-relaxed">No external AI APIs for learning. On-device pattern recognition that improves with every resolved issue.</p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-4">
+            <div class="w-10 h-10 rounded-lg bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-center flex-shrink-0 mt-0.5">
+              <i data-lucide="radio" class="w-5 h-5 text-emerald-400"></i>
+            </div>
+            <div>
+              <h4 class="font-heading font-semibold text-white mb-1">WebSocket-driven dashboard</h4>
+              <p class="text-sm text-slate-400 leading-relaxed">Real-time updates pushed to the React dashboard. No polling. Instant visibility into every operation.</p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-4">
+            <div class="w-10 h-10 rounded-lg bg-sky-500/10 border border-sky-500/25 flex items-center justify-center flex-shrink-0 mt-0.5">
+              <i data-lucide="webhook" class="w-5 h-5 text-sky-400"></i>
+            </div>
+            <div>
+              <h4 class="font-heading font-semibold text-white mb-1">Webhook + polling hybrid</h4>
+              <p class="text-sm text-slate-400 leading-relaxed">Maximum coverage with minimal latency. Webhooks for instant alerts, polling as a safety net. Nothing slips through.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: Architecture diagram -->
+        <div class="glass rounded-2xl p-6 lg:p-8 border border-white/10 relative overflow-hidden">
+          <div class="glow-blue" style="width:300px;height:300px;top:30%;left:50%;transform:translate(-50%,-50%);opacity:0.08;"></div>
+
+          <svg viewBox="0 0 400 480" fill="none" class="w-full h-auto">
+            <!-- SOURCES LAYER -->
+            <text x="200" y="24" text-anchor="middle" fill="#64748B" font-family="DM Sans" font-size="11" font-weight="600" letter-spacing="1.5">SOURCES</text>
+
+            <rect x="10" y="38" width="72" height="36" rx="8" fill="rgba(59,130,246,0.08)" stroke="rgba(59,130,246,0.25)" stroke-width="1"/>
+            <text x="46" y="60" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9">Linear</text>
+
+            <rect x="92" y="38" width="72" height="36" rx="8" fill="rgba(245,158,11,0.08)" stroke="rgba(245,158,11,0.25)" stroke-width="1"/>
+            <text x="128" y="60" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9">Sentry</text>
+
+            <rect x="174" y="38" width="52" height="36" rx="8" fill="rgba(16,185,129,0.08)" stroke="rgba(16,185,129,0.25)" stroke-width="1"/>
+            <text x="200" y="60" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9">Jira</text>
+
+            <rect x="236" y="38" width="52" height="36" rx="8" fill="rgba(148,163,184,0.08)" stroke="rgba(148,163,184,0.25)" stroke-width="1"/>
+            <text x="262" y="60" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9">GitHub</text>
+
+            <rect x="298" y="38" width="52" height="36" rx="8" fill="rgba(251,146,60,0.08)" stroke="rgba(251,146,60,0.25)" stroke-width="1"/>
+            <text x="324" y="60" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9">GitLab</text>
+
+            <rect x="360" y="38" width="30" height="36" rx="8" fill="rgba(99,102,241,0.08)" stroke="rgba(99,102,241,0.25)" stroke-width="1"/>
+            <text x="375" y="60" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="7">+2</text>
+
+            <!-- Connecting lines down -->
+            <line x1="46" y1="74" x2="200" y2="140" stroke="#1E3A5F" stroke-width="1" opacity="0.4"/>
+            <line x1="128" y1="74" x2="200" y2="140" stroke="#1E3A5F" stroke-width="1" opacity="0.4"/>
+            <line x1="200" y1="74" x2="200" y2="140" stroke="#1E3A5F" stroke-width="1" opacity="0.5"/>
+            <line x1="262" y1="74" x2="200" y2="140" stroke="#1E3A5F" stroke-width="1" opacity="0.4"/>
+            <line x1="324" y1="74" x2="200" y2="140" stroke="#1E3A5F" stroke-width="1" opacity="0.4"/>
+
+            <!-- CLAUDEAR CORE -->
+            <text x="200" y="130" text-anchor="middle" fill="#64748B" font-family="DM Sans" font-size="11" font-weight="600" letter-spacing="1.5">CORE</text>
+
+            <!-- Core box -->
+            <rect x="60" y="140" width="280" height="200" rx="16" fill="rgba(59,130,246,0.04)" stroke="#3B82F6" stroke-width="1" stroke-opacity="0.3"/>
+
+            <!-- Internal modules -->
+            <rect x="85" y="162" width="110" height="40" rx="8" fill="rgba(59,130,246,0.08)" stroke="rgba(59,130,246,0.2)" stroke-width="1"/>
+            <text x="140" y="178" text-anchor="middle" fill="#60A5FA" font-family="DM Sans" font-size="9" font-weight="500">Issue Router</text>
+            <text x="140" y="192" text-anchor="middle" fill="#475569" font-family="DM Sans" font-size="7">confidence scoring</text>
+
+            <rect x="205" y="162" width="110" height="40" rx="8" fill="rgba(245,158,11,0.08)" stroke="rgba(245,158,11,0.2)" stroke-width="1"/>
+            <text x="260" y="178" text-anchor="middle" fill="#FBBF24" font-family="DM Sans" font-size="9" font-weight="500">Agent Spawner</text>
+            <text x="260" y="192" text-anchor="middle" fill="#475569" font-family="DM Sans" font-size="7">Claude Code</text>
+
+            <rect x="85" y="218" width="110" height="40" rx="8" fill="rgba(16,185,129,0.08)" stroke="rgba(16,185,129,0.2)" stroke-width="1"/>
+            <text x="140" y="234" text-anchor="middle" fill="#34D399" font-family="DM Sans" font-size="9" font-weight="500">PR Manager</text>
+            <text x="140" y="248" text-anchor="middle" fill="#475569" font-family="DM Sans" font-size="7">lifecycle tracking</text>
+
+            <rect x="205" y="218" width="110" height="40" rx="8" fill="rgba(139,92,246,0.08)" stroke="rgba(139,92,246,0.2)" stroke-width="1"/>
+            <text x="260" y="234" text-anchor="middle" fill="#A78BFA" font-family="DM Sans" font-size="9" font-weight="500">Learning Engine</text>
+            <text x="260" y="248" text-anchor="middle" fill="#475569" font-family="DM Sans" font-size="7">vector embeddings</text>
+
+            <rect x="85" y="274" width="110" height="40" rx="8" fill="rgba(236,72,153,0.08)" stroke="rgba(236,72,153,0.2)" stroke-width="1"/>
+            <text x="140" y="290" text-anchor="middle" fill="#F472B6" font-family="DM Sans" font-size="9" font-weight="500">Retry Manager</text>
+            <text x="140" y="304" text-anchor="middle" fill="#475569" font-family="DM Sans" font-size="7">exponential backoff</text>
+
+            <rect x="205" y="274" width="110" height="40" rx="8" fill="rgba(14,165,233,0.08)" stroke="rgba(14,165,233,0.2)" stroke-width="1"/>
+            <text x="260" y="290" text-anchor="middle" fill="#38BDF8" font-family="DM Sans" font-size="9" font-weight="500">Notifier</text>
+            <text x="260" y="304" text-anchor="middle" fill="#475569" font-family="DM Sans" font-size="7">Slack / Discord</text>
+
+            <!-- Internal connections -->
+            <path d="M140,202 L140,218" stroke="#1E3A5F" stroke-width="0.8" opacity="0.4"/>
+            <path d="M260,202 L260,218" stroke="#1E3A5F" stroke-width="0.8" opacity="0.4"/>
+            <path d="M195,182 L205,182" stroke="#1E3A5F" stroke-width="0.8" opacity="0.4"/>
+            <path d="M195,238 L205,238" stroke="#1E3A5F" stroke-width="0.8" opacity="0.4"/>
+
+            <!-- Core label -->
+            <text x="200" y="358" text-anchor="middle" fill="#3B82F6" font-family="Space Grotesk" font-size="10" font-weight="600" letter-spacing="2" opacity="0.5">CLAUDEAR DAEMON</text>
+
+            <!-- Connecting lines down from core -->
+            <line x1="120" y1="340" x2="80" y2="410" stroke="#1E3A5F" stroke-width="1" opacity="0.4"/>
+            <line x1="200" y1="340" x2="200" y2="410" stroke="#1E3A5F" stroke-width="1" opacity="0.5"/>
+            <line x1="280" y1="340" x2="320" y2="410" stroke="#1E3A5F" stroke-width="1" opacity="0.4"/>
+
+            <!-- OUTPUTS LAYER -->
+            <text x="200" y="400" text-anchor="middle" fill="#64748B" font-family="DM Sans" font-size="11" font-weight="600" letter-spacing="1.5">OUTPUTS</text>
+
+            <rect x="25" y="410" width="110" height="40" rx="8" fill="rgba(16,185,129,0.08)" stroke="rgba(16,185,129,0.25)" stroke-width="1"/>
+            <text x="80" y="434" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9">Pull Requests</text>
+
+            <rect x="145" y="410" width="110" height="40" rx="8" fill="rgba(245,158,11,0.08)" stroke="rgba(245,158,11,0.25)" stroke-width="1"/>
+            <text x="200" y="434" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9">Notifications</text>
+
+            <rect x="265" y="410" width="110" height="40" rx="8" fill="rgba(139,92,246,0.08)" stroke="rgba(139,92,246,0.25)" stroke-width="1"/>
+            <text x="320" y="434" text-anchor="middle" fill="#94A3B8" font-family="DM Sans" font-size="9">Learning DB</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ════════════════════════════════════════════════════
+       DASHBOARD PREVIEW SECTION
+       ════════════════════════════════════════════════════ -->
+  <section class="relative py-24 sm:py-32">
+    <div class="glow-blue" style="width:500px;height:500px;top:50%;left:50%;transform:translate(-50%,-50%);opacity:0.1;"></div>
+
+    <div class="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="text-center mb-16">
+        <h2 class="font-heading font-bold text-3xl sm:text-4xl lg:text-5xl tracking-tight mb-4">Full observability. Zero guesswork.</h2>
+        <p class="text-slate-400 max-w-2xl mx-auto text-base sm:text-lg">18 pages of real-time insight into every fix, every PR, every learning.</p>
+      </div>
+
+      <!-- Browser frame mockup -->
+      <div class="max-w-5xl mx-auto">
+        <div class="glass rounded-2xl overflow-hidden border border-white/10">
+          <!-- Title bar -->
+          <div class="flex items-center gap-2 px-4 py-3 border-b border-white/5">
+            <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
+            <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
+            <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
+            <div class="flex-1 mx-8">
+              <div class="bg-white/5 rounded-md px-3 py-1 flex items-center gap-2 max-w-sm mx-auto">
+                <i data-lucide="lock" class="w-3 h-3 text-slate-500"></i>
+                <span class="text-xs text-slate-500 font-mono">localhost:3000/dashboard</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Dashboard preview content -->
+          <div class="relative h-72 sm:h-96 lg:h-[28rem] flex items-center justify-center" style="background:linear-gradient(180deg,#0F172A,#0B1120);">
+            <!-- Stylized dashboard mockup -->
+            <div class="absolute inset-4 sm:inset-6 lg:inset-8 grid grid-cols-12 grid-rows-6 gap-2 opacity-40">
+              <!-- Sidebar -->
+              <div class="col-span-2 row-span-6 rounded-lg bg-white/[0.03] border border-white/[0.04]"></div>
+              <!-- Top bar -->
+              <div class="col-span-10 row-span-1 rounded-lg bg-white/[0.03] border border-white/[0.04]"></div>
+              <!-- Main cards -->
+              <div class="col-span-3 row-span-2 rounded-lg bg-blue-500/[0.05] border border-blue-500/[0.08]"></div>
+              <div class="col-span-3 row-span-2 rounded-lg bg-emerald-500/[0.05] border border-emerald-500/[0.08]"></div>
+              <div class="col-span-4 row-span-2 rounded-lg bg-amber-500/[0.05] border border-amber-500/[0.08]"></div>
+              <!-- Table area -->
+              <div class="col-span-6 row-span-3 rounded-lg bg-white/[0.03] border border-white/[0.04]"></div>
+              <!-- Chart area -->
+              <div class="col-span-4 row-span-3 rounded-lg bg-white/[0.03] border border-white/[0.04]"></div>
+            </div>
+
+            <!-- Center overlay text -->
+            <div class="relative z-10 text-center">
+              <div class="w-16 h-16 rounded-2xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center mx-auto mb-4">
+                <i data-lucide="layout-dashboard" class="w-7 h-7 text-blue-400"></i>
+              </div>
+              <p class="text-slate-400 text-sm font-medium">React Dashboard</p>
+              <p class="text-slate-600 text-xs mt-1">Real-time WebSocket updates</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Stat cards -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mt-8 max-w-5xl mx-auto">
+        <div class="glass rounded-xl p-4 text-center glass-hover">
+          <div class="flex items-center justify-center mb-2">
+            <i data-lucide="wrench" class="w-5 h-5 text-blue-400"></i>
+          </div>
+          <p class="text-2xl font-heading font-bold text-white">Fix attempts</p>
+          <p class="text-xs text-slate-500 mt-1">tracked</p>
+        </div>
+        <div class="glass rounded-xl p-4 text-center glass-hover">
+          <div class="flex items-center justify-center mb-2">
+            <i data-lucide="git-pull-request" class="w-5 h-5 text-emerald-400"></i>
+          </div>
+          <p class="text-2xl font-heading font-bold text-white">PR lifecycle</p>
+          <p class="text-xs text-slate-500 mt-1">monitored</p>
+        </div>
+        <div class="glass rounded-xl p-4 text-center glass-hover">
+          <div class="flex items-center justify-center mb-2">
+            <i data-lucide="shield-alert" class="w-5 h-5 text-amber-400"></i>
+          </div>
+          <p class="text-2xl font-heading font-bold text-white">Regressions</p>
+          <p class="text-xs text-slate-500 mt-1">caught</p>
+        </div>
+        <div class="glass rounded-xl p-4 text-center glass-hover">
+          <div class="flex items-center justify-center mb-2">
+            <i data-lucide="sparkles" class="w-5 h-5 text-purple-400"></i>
+          </div>
+          <p class="text-2xl font-heading font-bold text-white">Patterns</p>
+          <p class="text-xs text-slate-500 mt-1">learned</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ════════════════════════════════════════════════════
+       CTA SECTION
+       ════════════════════════════════════════════════════ -->
+  <section id="cta" class="relative py-24 sm:py-32">
+    <div class="relative z-10 max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="relative rounded-2xl p-8 sm:p-12 lg:p-16 text-center overflow-hidden" style="background:linear-gradient(135deg,rgba(59,130,246,0.08),rgba(30,64,175,0.08));border:1px solid rgba(59,130,246,0.2);">
+        <div class="glow-blue" style="width:400px;height:400px;top:-150px;left:50%;transform:translateX(-50%);opacity:0.15;"></div>
+
+        <div class="relative z-10">
+          <h2 class="font-heading font-bold text-3xl sm:text-4xl lg:text-5xl tracking-tight mb-4">Stop triaging. Start shipping.</h2>
+          <p class="text-slate-400 text-base sm:text-lg max-w-lg mx-auto mb-8">Get Claudear watching your issues in under 5 minutes.</p>
+
+          <div class="flex flex-col sm:flex-row items-center justify-center gap-4">
+            <a href="#" class="inline-flex items-center gap-2 px-8 py-3.5 text-sm font-semibold text-white rounded-xl cursor-pointer transition-all duration-200 hover:shadow-xl hover:shadow-blue-500/25 hover:-translate-y-0.5" style="background:linear-gradient(135deg,#3B82F6,#2563EB);">
+              Get Started
+              <i data-lucide="arrow-right" class="w-4 h-4"></i>
+            </a>
+            <a href="#" class="inline-flex items-center gap-2 px-8 py-3.5 text-sm font-semibold text-slate-300 rounded-xl border border-white/10 hover:border-white/25 hover:text-white cursor-pointer transition-all duration-200">
+              <i data-lucide="book-open" class="w-4 h-4"></i>
+              Read the Docs
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ════════════════════════════════════════════════════
+       FOOTER
+       ════════════════════════════════════════════════════ -->
+  <footer class="relative border-t border-white/5 py-16">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-8 mb-12">
+        <!-- Brand col -->
+        <div class="col-span-2 md:col-span-1">
+          <a href="#" class="flex items-center gap-2 mb-4 cursor-pointer">
+            <svg width="24" height="24" viewBox="0 0 28 28" fill="none">
+              <rect width="28" height="28" rx="7" fill="url(#logoGrad2)"/>
+              <path d="M7 14h3l2-5 3 10 2-7 2 4h2" stroke="#F8FAFC" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <defs>
+                <linearGradient id="logoGrad2" x1="0" y1="0" x2="28" y2="28">
+                  <stop stop-color="#3B82F6"/>
+                  <stop offset="1" stop-color="#2563EB"/>
+                </linearGradient>
+              </defs>
+            </svg>
+            <span class="font-heading font-semibold text-base">claudear</span>
+          </a>
+          <p class="text-xs text-slate-500 leading-relaxed">Your AI team mate.<br>Autonomous issue-to-PR pipeline.</p>
+        </div>
+
+        <!-- Product -->
+        <div>
+          <h4 class="font-heading font-semibold text-sm text-white mb-4">Product</h4>
+          <ul class="space-y-2.5">
+            <li><a href="#features" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer">Features</a></li>
+            <li><a href="#integrations" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer">Integrations</a></li>
+            <li><a href="#" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer">Dashboard</a></li>
+          </ul>
+        </div>
+
+        <!-- Resources -->
+        <div>
+          <h4 class="font-heading font-semibold text-sm text-white mb-4">Resources</h4>
+          <ul class="space-y-2.5">
+            <li><a href="#" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer">Docs</a></li>
+            <li><a href="#" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer">API</a></li>
+            <li><a href="#" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer">Changelog</a></li>
+          </ul>
+        </div>
+
+        <!-- Community -->
+        <div>
+          <h4 class="font-heading font-semibold text-sm text-white mb-4">Community</h4>
+          <ul class="space-y-2.5">
+            <li><a href="#" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer flex items-center gap-1.5"><i data-lucide="github" class="w-3.5 h-3.5"></i> GitHub</a></li>
+            <li><a href="#" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer flex items-center gap-1.5"><i data-lucide="hash" class="w-3.5 h-3.5"></i> Discord</a></li>
+          </ul>
+        </div>
+
+        <!-- Company -->
+        <div>
+          <h4 class="font-heading font-semibold text-sm text-white mb-4">Company</h4>
+          <ul class="space-y-2.5">
+            <li><a href="#" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer">About</a></li>
+            <li><a href="#" class="text-sm text-slate-500 hover:text-slate-300 transition-colors duration-200 cursor-pointer">Blog</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Bottom bar -->
+      <div class="flex flex-col sm:flex-row items-center justify-between gap-4 pt-8 border-t border-white/5">
+        <p class="text-xs text-slate-600 flex items-center gap-1.5">
+          Built with
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#F59E0B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="inline"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+          Rust &amp; Claude Code
+        </p>
+        <p class="text-xs text-slate-600">&copy; 2026 Claudear. All rights reserved.</p>
+      </div>
+    </div>
+  </footer>
+
+
+  <!-- ════════════════════════════════════════════════════
+       SCRIPTS
+       ════════════════════════════════════════════════════ -->
+  <script>
+    // Initialize Lucide icons
+    lucide.createIcons();
+
+    // Mobile menu toggle
+    const mobileMenuBtn = document.getElementById('mobileMenuBtn');
+    const mobileMenu = document.getElementById('mobileMenu');
+    let menuOpen = false;
+
+    mobileMenuBtn.addEventListener('click', () => {
+      menuOpen = !menuOpen;
+      mobileMenu.classList.toggle('open', menuOpen);
+    });
+
+    // Close mobile menu on link click
+    mobileMenu.querySelectorAll('a').forEach(link => {
+      link.addEventListener('click', () => {
+        menuOpen = false;
+        mobileMenu.classList.remove('open');
+      });
+    });
+
+    // Intersection Observer for scroll animations
+    const observerOptions = {
+      threshold: 0.1,
+      rootMargin: '0px 0px -50px 0px'
+    };
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.style.animationPlayState = 'running';
+          observer.unobserve(entry.target);
+        }
+      });
+    }, observerOptions);
+
+    // Observe elements that should animate on scroll (bento cards, architecture items)
+    document.querySelectorAll('.glass-hover').forEach(el => {
+      el.style.opacity = '0';
+      el.style.transform = 'translateY(16px)';
+      el.style.transition = 'opacity 0.5s ease, transform 0.5s ease';
+    });
+
+    const cardObserver = new IntersectionObserver((entries) => {
+      entries.forEach((entry, index) => {
+        if (entry.isIntersecting) {
+          setTimeout(() => {
+            entry.target.style.opacity = '1';
+            entry.target.style.transform = 'translateY(0)';
+          }, index * 80);
+          cardObserver.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.05, rootMargin: '0px 0px -30px 0px' });
+
+    document.querySelectorAll('.glass-hover').forEach(el => {
+      cardObserver.observe(el);
+    });
+
+    // Smooth scroll for anchor links
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+      anchor.addEventListener('click', function(e) {
+        const href = this.getAttribute('href');
+        if (href === '#') return;
+        e.preventDefault();
+        const target = document.querySelector(href);
+        if (target) {
+          target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      });
+    });
+
+    // Navbar background on scroll
+    const navbar = document.getElementById('navbar');
+    let lastScroll = 0;
+    window.addEventListener('scroll', () => {
+      const scrollY = window.scrollY;
+      if (scrollY > 100) {
+        navbar.style.borderBottomColor = 'rgba(255,255,255,0.08)';
+        navbar.style.background = 'rgba(15,23,42,0.92)';
+      } else {
+        navbar.style.borderBottomColor = 'rgba(255,255,255,0.06)';
+        navbar.style.background = 'rgba(15,23,42,0.80)';
+      }
+      lastScroll = scrollY;
+    }, { passive: true });
+  </script>
+</body>
+</html>

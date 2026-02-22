@@ -6633,6 +6633,30 @@ impl SqliteTracker {
         Ok(result)
     }
 
+    /// Get the most recently merged fix attempt for a given SCM repo.
+    pub fn get_most_recent_merged_attempt_for_repo(
+        &self,
+        scm_repo: &str,
+    ) -> Result<Option<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE scm_repo = ? AND status = 'merged'
+            ORDER BY merged_at DESC
+            LIMIT 1
+            "#,
+        )?;
+
+        let result = stmt
+            .query_row(params![scm_repo], Self::row_to_fix_attempt)
+            .ok();
+        Ok(result)
+    }
+
     /// List fix attempts with optional status/source filters and pagination.
     pub fn list_attempts(
         &self,

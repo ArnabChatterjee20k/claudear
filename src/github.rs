@@ -4,6 +4,7 @@ use crate::config::GitHubConfig;
 use crate::error::{Error, Result};
 use crate::scm::{
     CodeReview, PostReviewAction, PrSummary, RemoteRepo, ReviewComment, ReviewUser, ScmProvider,
+    ScmRelease,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -488,6 +489,103 @@ impl<H: HttpClient> GitHubClient<H> {
             .collect())
     }
 
+    /// Get the latest release for a repository.
+    pub async fn get_latest_release(&self, repo: &str) -> Result<Option<ScmRelease>> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+        let headers = self.build_headers(token);
+        let response = self.http.get(&url, headers).await?;
+
+        if response.status == 404 {
+            return Ok(None);
+        }
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to get latest release for {}: {}",
+                repo, response.body
+            )));
+        }
+
+        let val: serde_json::Value = response.json()?;
+        Ok(Some(ScmRelease {
+            tag: val
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            name: val.get("name").and_then(|v| v.as_str()).map(String::from),
+            url: val
+                .get("html_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            published_at: val
+                .get("published_at")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        }))
+    }
+
+    /// Create a release for a repository.
+    pub async fn create_release(
+        &self,
+        repo: &str,
+        tag: &str,
+        name: &str,
+        body: &str,
+    ) -> Result<ScmRelease> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let url = format!("https://api.github.com/repos/{}/releases", repo);
+        let headers = self.build_headers(token);
+        let payload = serde_json::json!({
+            "tag_name": tag,
+            "name": name,
+            "body": body,
+        });
+
+        let response = self
+            .http
+            .post(&url, headers, &payload.to_string())
+            .await?;
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to create release for {}: {}",
+                repo, response.body
+            )));
+        }
+
+        let val: serde_json::Value = response.json()?;
+        Ok(ScmRelease {
+            tag: val
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            name: val.get("name").and_then(|v| v.as_str()).map(String::from),
+            url: val
+                .get("html_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            published_at: val
+                .get("published_at")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        })
+    }
+
     /// Parse a PR number from a GitHub PR URL.
     pub fn parse_pr_number(url: &str) -> Option<i64> {
         // Match /pull/123 or /pulls/123
@@ -577,6 +675,20 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
 
     fn parse_pr_number(&self, url: &str) -> Option<i64> {
         GitHubClient::<H>::parse_pr_number(url)
+    }
+
+    async fn get_latest_release(&self, project: &str) -> Result<Option<ScmRelease>> {
+        GitHubClient::get_latest_release(self, project).await
+    }
+
+    async fn create_release(
+        &self,
+        project: &str,
+        tag: &str,
+        name: &str,
+        body: &str,
+    ) -> Result<ScmRelease> {
+        GitHubClient::create_release(self, project, tag, name, body).await
     }
 }
 

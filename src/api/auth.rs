@@ -198,13 +198,25 @@ impl FromRequestParts<ApiState> for AuthUser {
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .ok_or(StatusCode::UNAUTHORIZED)?;
 
-        Ok(AuthUser {
+        let auth_user = AuthUser {
             id: user.id,
             email: user.email,
             name: user.name,
             role: user.role,
             avatar_url: user.avatar_url,
-        })
+        };
+
+        sentry::configure_scope(|scope| {
+            scope.set_user(Some(sentry::User {
+                id: Some(auth_user.id.to_string()),
+                email: Some(auth_user.email.clone()),
+                username: Some(auth_user.name.clone()),
+                ..Default::default()
+            }));
+            scope.set_tag("user.role", &auth_user.role);
+        });
+
+        Ok(auth_user)
     }
 }
 
@@ -369,6 +381,16 @@ pub async fn login_handler(
         SESSION_MAX_AGE_DAYS,
     ));
     cookies.add(cookie);
+
+    sentry::configure_scope(|scope| {
+        scope.set_user(Some(sentry::User {
+            id: Some(user.id.to_string()),
+            email: Some(user.email.clone()),
+            username: Some(user.name.clone()),
+            ..Default::default()
+        }));
+        scope.set_tag("user.role", &user.role);
+    });
 
     Ok(Json(LoginResponse {
         user: AuthUserResponse {

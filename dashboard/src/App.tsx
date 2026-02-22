@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { Router, RouterProvider } from './router'
 import { AppShell } from './components/layout/app-shell'
 import { AuthProvider, useAuth } from './lib/auth'
@@ -62,6 +63,10 @@ const routes: Record<string, () => JSX.Element> = {
 
 function AuthenticatedApp() {
   const { user, loading } = useAuth()
+
+  useEffect(() => {
+    if (user) Sentry.setTag('user.role', user.role)
+  }, [user])
 
   return (
     <Sentry.ErrorBoundary fallback={<SentryFallback />}>

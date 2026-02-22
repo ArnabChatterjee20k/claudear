@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claudear - Your AI Team Mate</title>
+  <meta name="description" content="Autonomous issue-to-PR pipeline powered by Claude Code. Issues go in. Pull requests come out.">
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+
+  <!-- Tailwind CSS v3 CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090B',
+            card: '#111113',
+            border: '#27272A',
+            accent: '#22C55E',
+            'accent-dim': '#16a34a',
+            link: '#3B82F6',
+            heading: '#FAFAFA',
+            body: '#A1A1AA',
+            muted: '#71717A',
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+          borderRadius: {
+            card: '8px',
+            btn: '6px',
+          },
+        },
+      },
+    }
+  </script>
+
+  <style>
+    html { background: #09090B; }
+    body { font-family: 'Inter', system-ui, sans-serif; background: #09090B; color: #FAFAFA; }
+
+    /* Dot grid background */
+    .dot-grid {
+      background-image: radial-gradient(circle, #FAFAFA 0.5px, transparent 0.5px);
+      background-size: 24px 24px;
+      opacity: 0.03;
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    /* Blinking cursor */
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+    .cursor-blink {
+      animation: blink 1s step-end infinite;
+    }
+
+    /* Terminal typing cursor */
+    @keyframes termBlink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+    .term-cursor {
+      display: inline-block;
+      width: 8px;
+      height: 18px;
+      background: #22C55E;
+      animation: termBlink 0.7s step-end infinite;
+      vertical-align: text-bottom;
+      margin-left: 2px;
+    }
+
+    /* Pipeline flow animation */
+    @keyframes dashFlow {
+      0% { stroke-dashoffset: 20; }
+      100% { stroke-dashoffset: 0; }
+    }
+    .dash-animate {
+      stroke-dasharray: 6 4;
+      animation: dashFlow 0.8s linear infinite;
+    }
+
+    /* Pulse dot along pipeline */
+    @keyframes pulseDot {
+      0%, 100% { opacity: 0.3; transform: scale(0.8); }
+      50% { opacity: 1; transform: scale(1.2); }
+    }
+    .pulse-dot {
+      animation: pulseDot 2s ease-in-out infinite;
+    }
+
+    /* Feature card hover */
+    .feature-card {
+      transition: border-color 200ms ease, transform 200ms ease, box-shadow 200ms ease;
+    }
+    .feature-card:hover {
+      border-color: #22C55E;
+      transform: translateY(-2px);
+      box-shadow: 0 4px 24px rgba(34, 197, 94, 0.06);
+    }
+
+    /* Integration icon hover */
+    .integration-icon {
+      transition: color 200ms ease, opacity 200ms ease;
+      opacity: 0.5;
+    }
+    .integration-icon:hover {
+      opacity: 1;
+      color: #FAFAFA;
+    }
+
+    /* Navbar scroll state */
+    .nav-solid {
+      background: rgba(9, 9, 11, 0.95);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid #27272A;
+    }
+
+    /* Smooth transitions on buttons */
+    .btn-transition {
+      transition: background-color 200ms ease, border-color 200ms ease, color 200ms ease, transform 200ms ease;
+    }
+    .btn-transition:hover {
+      transform: translateY(-1px);
+    }
+
+    /* Terminal window glow */
+    .terminal-glow {
+      box-shadow: 0 0 60px rgba(34, 197, 94, 0.05), 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+
+    /* Scrollbar styling */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #09090B; }
+    ::-webkit-scrollbar-thumb { background: #27272A; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+    /* Syntax highlighting colors */
+    .syn-key { color: #22C55E; }
+    .syn-str { color: #F59E0B; }
+    .syn-comment { color: #71717A; }
+    .syn-bracket { color: #A1A1AA; }
+    .syn-flag { color: #3B82F6; }
+    .syn-cmd { color: #FAFAFA; }
+    .syn-num { color: #C084FC; }
+
+    /* Pipeline responsive */
+    @media (max-width: 1023px) {
+      .pipeline-desktop { display: none; }
+      .pipeline-mobile { display: block; }
+    }
+    @media (min-width: 1024px) {
+      .pipeline-desktop { display: block; }
+      .pipeline-mobile { display: none; }
+    }
+
+    /* Respect reduced motion */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+      .cursor-blink, .term-cursor, .dash-animate, .pulse-dot {
+        animation: none !important;
+      }
+      .term-cursor { opacity: 1; }
+    }
+  </style>
+</head>
+<body class="overflow-x-hidden">
+
+  <!-- Dot grid bg -->
+  <div class="dot-grid"></div>
+
+  <!-- ==================== NAVBAR ==================== -->
+  <nav id="navbar" class="fixed top-0 left-0 right-0 z-50 transition-all duration-300">
+    <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+      <a href="#" class="flex items-center gap-0 cursor-pointer">
+        <span class="font-mono font-bold text-xl text-heading tracking-tight">claudear</span>
+        <span class="cursor-blink inline-block w-[10px] h-[20px] bg-accent ml-0.5 rounded-[1px]"></span>
+      </a>
+      <div class="hidden md:flex items-center gap-8">
+        <a href="#pipeline" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">How it works</a>
+        <a href="#features" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Features</a>
+        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
+        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
+        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
+        <a href="#" class="bg-accent text-bg font-sans text-sm font-medium px-4 py-2 rounded-btn btn-transition cursor-pointer hover:bg-accent-dim">
+          Get Started
+        </a>
+      </div>
+      <button id="mobile-menu-btn" class="md:hidden text-heading cursor-pointer" aria-label="Toggle menu">
+        <i data-lucide="menu" class="w-6 h-6"></i>
+      </button>
+    </div>
+    <div id="mobile-menu" class="hidden md:hidden bg-bg border-t border-border px-6 pb-4">
+      <div class="flex flex-col gap-4 pt-4">
+        <a href="#pipeline" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">How it works</a>
+        <a href="#features" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Features</a>
+        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
+        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
+        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
+        <a href="#" class="bg-accent text-bg font-sans text-sm font-medium px-4 py-2 rounded-btn btn-transition cursor-pointer text-center hover:bg-accent-dim">Get Started</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ==================== HERO ==================== -->
+  <section class="relative z-10 pt-32 pb-20 md:pt-40 md:pb-28">
+    <div class="max-w-6xl mx-auto px-6">
+      <div class="grid lg:grid-cols-2 gap-12 lg:gap-16 items-center">
+        <!-- Left: copy -->
+        <div>
+          <h1 class="font-mono font-bold text-4xl md:text-5xl lg:text-[3.4rem] leading-tight text-heading mb-6">
+            Issues go in.<br>Pull requests come out.
+          </h1>
+          <p class="font-sans text-lg md:text-xl text-body leading-relaxed mb-8 max-w-lg">
+            Claudear watches your issue trackers, spawns Claude Code agents to fix bugs and ship features, and opens PRs — autonomously. Your AI team mate that actually writes code.
+          </p>
+          <div class="flex flex-wrap gap-4 mb-8">
+            <a href="#" class="bg-accent text-bg font-sans font-medium px-6 py-3 rounded-btn btn-transition cursor-pointer inline-flex items-center gap-2 hover:bg-accent-dim">
+              <i data-lucide="arrow-right" class="w-4 h-4"></i>
+              Get Started
+            </a>
+            <a href="#" class="border border-border text-heading font-sans font-medium px-6 py-3 rounded-btn btn-transition cursor-pointer inline-flex items-center gap-2 hover:border-body">
+              <i data-lucide="github" class="w-4 h-4"></i>
+              View on GitHub
+            </a>
+          </div>
+          <!-- Mini terminal prompt -->
+          <div class="inline-flex items-center bg-card border border-border rounded-btn px-4 py-2.5">
+            <span class="font-mono text-sm text-muted mr-2">$</span>
+            <span class="font-mono text-sm text-accent">claudear start --poll</span>
+            <span class="term-cursor ml-1" style="height: 14px; width: 7px;"></span>
+          </div>
+        </div>
+
+        <!-- Right: animated terminal -->
+        <div class="terminal-glow rounded-card overflow-hidden border border-border">
+          <div class="bg-[#1a1a1d] border-b border-border px-4 py-3 flex items-center gap-3">
+            <div class="flex items-center gap-2">
+              <span class="w-3 h-3 rounded-full bg-[#FF5F57]"></span>
+              <span class="w-3 h-3 rounded-full bg-[#FEBC2E]"></span>
+              <span class="w-3 h-3 rounded-full bg-[#28C840]"></span>
+            </div>
+            <span class="font-mono text-xs text-muted ml-2">claudear</span>
+          </div>
+          <div class="bg-card p-5 min-h-[340px]">
+            <div id="terminal-output" class="font-mono text-sm leading-7"></div>
+            <span id="terminal-cursor" class="term-cursor" style="display:none;"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== PIPELINE ==================== -->
+  <section id="pipeline" class="relative z-10 py-20 md:py-28">
+    <div class="max-w-6xl mx-auto px-6">
+      <h2 class="font-mono font-bold text-2xl md:text-3xl text-heading mb-4">The pipeline</h2>
+      <p class="font-sans text-body mb-16 max-w-2xl">From issue filed to pull request merged, fully autonomous.</p>
+
+      <!-- Desktop pipeline -->
+      <div class="pipeline-desktop">
+        <div class="relative">
+          <svg class="absolute inset-0 w-full h-full pointer-events-none" style="z-index: 0;" preserveAspectRatio="none">
+            <line x1="16.5%" y1="50%" x2="20.5%" y2="50%" class="dash-animate" stroke="#27272A" stroke-width="2" />
+            <line x1="33%" y1="50%" x2="37%" y2="50%" class="dash-animate" stroke="#27272A" stroke-width="2" />
+            <line x1="49.5%" y1="50%" x2="53.5%" y2="50%" class="dash-animate" stroke="#27272A" stroke-width="2" />
+            <line x1="66%" y1="50%" x2="70%" y2="50%" class="dash-animate" stroke="#27272A" stroke-width="2" />
+            <line x1="82.5%" y1="50%" x2="86.5%" y2="50%" class="dash-animate" stroke="#27272A" stroke-width="2" />
+            <circle r="3" fill="#22C55E" class="pulse-dot" cx="18.5%" cy="50%" style="animation-delay: 0s;" />
+            <circle r="3" fill="#22C55E" class="pulse-dot" cx="35%" cy="50%" style="animation-delay: 0.4s;" />
+            <circle r="3" fill="#22C55E" class="pulse-dot" cx="51.5%" cy="50%" style="animation-delay: 0.8s;" />
+            <circle r="3" fill="#22C55E" class="pulse-dot" cx="68%" cy="50%" style="animation-delay: 1.2s;" />
+            <circle r="3" fill="#22C55E" class="pulse-dot" cx="84.5%" cy="50%" style="animation-delay: 1.6s;" />
+          </svg>
+          <div class="grid grid-cols-6 gap-5 relative z-10">
+            <div class="bg-card border border-border rounded-card p-5 text-center">
+              <div class="w-10 h-10 mx-auto mb-3 flex items-center justify-center rounded-full bg-accent/10">
+                <i data-lucide="alert-circle" class="w-5 h-5 text-accent"></i>
+              </div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Issue Filed</h3>
+              <p class="font-sans text-xs text-muted">Bug report or feature request created in any tracker</p>
+            </div>
+            <div class="bg-card border border-border rounded-card p-5 text-center">
+              <div class="w-10 h-10 mx-auto mb-3 flex items-center justify-center rounded-full bg-accent/10">
+                <i data-lucide="radar" class="w-5 h-5 text-accent"></i>
+              </div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Detected</h3>
+              <p class="font-sans text-xs text-muted">Claudear picks it up via polling or webhook</p>
+            </div>
+            <div class="bg-card border border-border rounded-card p-5 text-center">
+              <div class="w-10 h-10 mx-auto mb-3 flex items-center justify-center rounded-full bg-accent/10">
+                <i data-lucide="git-fork" class="w-5 h-5 text-accent"></i>
+              </div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Routed</h3>
+              <p class="font-sans text-xs text-muted">Matched to the right repo using content analysis</p>
+            </div>
+            <div class="bg-card border border-border rounded-card p-5 text-center">
+              <div class="w-10 h-10 mx-auto mb-3 flex items-center justify-center rounded-full bg-accent/10">
+                <i data-lucide="cpu" class="w-5 h-5 text-accent"></i>
+              </div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Fixed</h3>
+              <p class="font-sans text-xs text-muted">Claude Code agent reads, edits, and tests the fix</p>
+            </div>
+            <div class="bg-card border border-border rounded-card p-5 text-center">
+              <div class="w-10 h-10 mx-auto mb-3 flex items-center justify-center rounded-full bg-accent/10">
+                <i data-lucide="git-pull-request" class="w-5 h-5 text-accent"></i>
+              </div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">PR Opened</h3>
+              <p class="font-sans text-xs text-muted">Pull request created with full context and tests</p>
+            </div>
+            <div class="bg-card border border-border rounded-card p-5 text-center">
+              <div class="w-10 h-10 mx-auto mb-3 flex items-center justify-center rounded-full bg-accent/10">
+                <i data-lucide="check-circle-2" class="w-5 h-5 text-accent"></i>
+              </div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Resolved</h3>
+              <p class="font-sans text-xs text-muted">Merged, deployed, and monitored for regressions</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mobile pipeline (vertical) -->
+      <div class="pipeline-mobile">
+        <div class="flex flex-col gap-4">
+          <div class="bg-card border border-border rounded-card p-5 flex items-start gap-4">
+            <div class="w-10 h-10 shrink-0 flex items-center justify-center rounded-full bg-accent/10">
+              <i data-lucide="alert-circle" class="w-5 h-5 text-accent"></i>
+            </div>
+            <div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Issue Filed</h3>
+              <p class="font-sans text-xs text-muted">Bug report or feature request created in any tracker</p>
+            </div>
+          </div>
+          <div class="flex justify-center"><i data-lucide="arrow-down" class="w-4 h-4 text-border"></i></div>
+          <div class="bg-card border border-border rounded-card p-5 flex items-start gap-4">
+            <div class="w-10 h-10 shrink-0 flex items-center justify-center rounded-full bg-accent/10">
+              <i data-lucide="radar" class="w-5 h-5 text-accent"></i>
+            </div>
+            <div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Claudear Detects</h3>
+              <p class="font-sans text-xs text-muted">Picks it up via polling or webhook</p>
+            </div>
+          </div>
+          <div class="flex justify-center"><i data-lucide="arrow-down" class="w-4 h-4 text-border"></i></div>
+          <div class="bg-card border border-border rounded-card p-5 flex items-start gap-4">
+            <div class="w-10 h-10 shrink-0 flex items-center justify-center rounded-full bg-accent/10">
+              <i data-lucide="git-fork" class="w-5 h-5 text-accent"></i>
+            </div>
+            <div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Routes to Repo</h3>
+              <p class="font-sans text-xs text-muted">Matched to the right repo using content analysis</p>
+            </div>
+          </div>
+          <div class="flex justify-center"><i data-lucide="arrow-down" class="w-4 h-4 text-border"></i></div>
+          <div class="bg-card border border-border rounded-card p-5 flex items-start gap-4">
+            <div class="w-10 h-10 shrink-0 flex items-center justify-center rounded-full bg-accent/10">
+              <i data-lucide="cpu" class="w-5 h-5 text-accent"></i>
+            </div>
+            <div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Claude Code Fixes</h3>
+              <p class="font-sans text-xs text-muted">Agent reads, edits, and tests the fix</p>
+            </div>
+          </div>
+          <div class="flex justify-center"><i data-lucide="arrow-down" class="w-4 h-4 text-border"></i></div>
+          <div class="bg-card border border-border rounded-card p-5 flex items-start gap-4">
+            <div class="w-10 h-10 shrink-0 flex items-center justify-center rounded-full bg-accent/10">
+              <i data-lucide="git-pull-request" class="w-5 h-5 text-accent"></i>
+            </div>
+            <div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">PR Opened</h3>
+              <p class="font-sans text-xs text-muted">Pull request created with full context and tests</p>
+            </div>
+          </div>
+          <div class="flex justify-center"><i data-lucide="arrow-down" class="w-4 h-4 text-border"></i></div>
+          <div class="bg-card border border-border rounded-card p-5 flex items-start gap-4">
+            <div class="w-10 h-10 shrink-0 flex items-center justify-center rounded-full bg-accent/10">
+              <i data-lucide="check-circle-2" class="w-5 h-5 text-accent"></i>
+            </div>
+            <div>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Merged & Resolved</h3>
+              <p class="font-sans text-xs text-muted">Deployed and monitored for regressions</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <p class="font-sans text-sm text-muted mt-12 text-center flex items-center justify-center gap-2">
+        <i data-lucide="message-circle" class="w-4 h-4 text-muted"></i>
+        If Claude gets stuck, it asks your team a question via Discord, Slack, or Email -- then keeps going.
+      </p>
+    </div>
+  </section>
+
+  <!-- ==================== FEATURES ==================== -->
+  <section id="features" class="relative z-10 py-20 md:py-28">
+    <div class="max-w-6xl mx-auto px-6">
+      <h2 class="font-mono font-bold text-2xl md:text-3xl text-heading mb-4">Built for real work</h2>
+      <p class="font-sans text-body mb-16 max-w-2xl">Not a toy. Not a demo. A production-grade autonomous engineering pipeline.</p>
+
+      <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-5">
+        <!-- Row 1 -->
+        <div class="feature-card bg-card border border-border rounded-card p-6">
+          <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
+            <i data-lucide="radio-tower" class="w-5 h-5 text-accent"></i>
+          </div>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Multi-Source Intake</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">Monitors Linear, Sentry, Jira, GitHub, GitLab, Discord, and Slack. One daemon, every issue tracker.</p>
+        </div>
+        <div class="feature-card bg-card border border-border rounded-card p-6">
+          <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
+            <i data-lucide="route" class="w-5 h-5 text-accent"></i>
+          </div>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Intelligent Routing</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">Automatically determines which repository an issue belongs to using stack traces, file paths, and content analysis.</p>
+        </div>
+        <div class="feature-card bg-card border border-border rounded-card p-6">
+          <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
+            <i data-lucide="terminal" class="w-5 h-5 text-accent"></i>
+          </div>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Full Claude Code</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">Not a wrapper. Spawns real Claude Code processes with read, edit, bash, and full tool access.</p>
+        </div>
+
+        <!-- Row 2 -->
+        <div class="feature-card bg-card border border-border rounded-card p-6">
+          <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
+            <i data-lucide="brain" class="w-5 h-5 text-accent"></i>
+          </div>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Learns Over Time</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">Tracks fix outcomes. Builds local vector embeddings. Finds patterns. Gets smarter with every merge.</p>
+        </div>
+        <div class="feature-card bg-card border border-border rounded-card p-6">
+          <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
+            <i data-lucide="message-square" class="w-5 h-5 text-accent"></i>
+          </div>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Human Q&A Loop</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">When blocked, Claude asks your team via Discord, Slack, or Email. First reply wins. Work resumes instantly.</p>
+        </div>
+        <div class="feature-card bg-card border border-border rounded-card p-6">
+          <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
+            <i data-lucide="shield-check" class="w-5 h-5 text-accent"></i>
+          </div>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Regression Watch</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">Monitors for 24 hours post-deploy. Detects re-opened issues and error rate spikes automatically.</p>
+        </div>
+
+        <!-- Row 3 -->
+        <div class="feature-card bg-card border border-border rounded-card p-6">
+          <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
+            <i data-lucide="network" class="w-5 h-5 text-accent"></i>
+          </div>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Dependency Cascading</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">Understands your repo dependency graph. Propagates fixes through downstream packages automatically.</p>
+        </div>
+        <div class="feature-card bg-card border border-border rounded-card p-6">
+          <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
+            <i data-lucide="activity" class="w-5 h-5 text-accent"></i>
+          </div>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Observable</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">Real-time dashboard with 18 pages. Telemetry, analytics, activity logs. Nothing is a black box.</p>
+        </div>
+        <div class="feature-card bg-card border border-border rounded-card p-6">
+          <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
+            <i data-lucide="container" class="w-5 h-5 text-accent"></i>
+          </div>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Deploy Anywhere</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">Single binary. Docker, Homebrew, APT. Dashboard embedded. Self-contained.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== INTEGRATIONS ==================== -->
+  <section id="integrations" class="relative z-10 py-20 md:py-28">
+    <div class="max-w-6xl mx-auto px-6">
+      <h2 class="font-mono font-bold text-2xl md:text-3xl text-heading mb-4 text-center">Plugs into your stack</h2>
+      <p class="font-sans text-body mb-16 text-center max-w-lg mx-auto">One daemon connects to everything you already use.</p>
+
+      <div class="flex flex-wrap justify-center items-center gap-0">
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3.51 11.37a9 9 0 0 1 9.12-9.12l-9.12 9.12Z"/>
+            <path d="M2.27 15.98A9 9 0 0 0 8.02 21.73l-5.75-5.75Z"/>
+            <path d="M2.06 13.53a9 9 0 0 0 .85 3.46l10.58-10.58a9 9 0 0 0-3.46-.85L2.06 13.53Z"/>
+            <path d="M5.49 19.91a9 9 0 0 0 2.48 1.52L19.91 9.49a9 9 0 0 0-2.48-1.52L5.49 19.91Z" fill="currentColor" opacity="0.15"/>
+            <path d="M9.97 22.17a9 9 0 0 0 11.2-11.2L9.97 22.17Z"/>
+          </svg>
+          <span class="font-mono text-xs">Linear</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <i data-lucide="bug" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">Sentry</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <i data-lucide="github" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">GitHub</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <i data-lucide="gitlab" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">GitLab</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <i data-lucide="ticket" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">Jira</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <i data-lucide="headphones" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">Discord</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <i data-lucide="hash" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">Slack</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default">
+          <i data-lucide="mail" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">Email</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== CLI PREVIEW ==================== -->
+  <section id="cli" class="relative z-10 py-20 md:py-28">
+    <div class="max-w-6xl mx-auto px-6">
+      <h2 class="font-mono font-bold text-2xl md:text-3xl text-heading mb-4">One config. One command.</h2>
+      <p class="font-sans text-body mb-16 max-w-2xl">Define your sources, set your preferences, and let Claudear handle the rest.</p>
+
+      <div class="grid lg:grid-cols-2 gap-6">
+        <!-- Config file -->
+        <div class="rounded-card overflow-hidden border border-border terminal-glow">
+          <div class="bg-[#1a1a1d] border-b border-border px-4 py-3 flex items-center gap-3">
+            <div class="flex items-center gap-2">
+              <span class="w-3 h-3 rounded-full bg-[#FF5F57]"></span>
+              <span class="w-3 h-3 rounded-full bg-[#FEBC2E]"></span>
+              <span class="w-3 h-3 rounded-full bg-[#28C840]"></span>
+            </div>
+            <span class="font-mono text-xs text-muted ml-2">claudear.toml</span>
+          </div>
+          <div class="bg-card p-5 overflow-x-auto">
+            <pre class="font-mono text-sm leading-7"><span class="syn-comment"># Issue sources</span>
+<span class="syn-bracket">[[</span><span class="syn-key">sources</span><span class="syn-bracket">]]</span>
+<span class="syn-key">type</span> = <span class="syn-str">"linear"</span>
+<span class="syn-key">team</span> = <span class="syn-str">"ENG"</span>
+<span class="syn-key">labels</span> = <span class="syn-bracket">[</span><span class="syn-str">"bug"</span>, <span class="syn-str">"claudear"</span><span class="syn-bracket">]</span>
+
+<span class="syn-bracket">[[</span><span class="syn-key">sources</span><span class="syn-bracket">]]</span>
+<span class="syn-key">type</span> = <span class="syn-str">"sentry"</span>
+<span class="syn-key">project</span> = <span class="syn-str">"api-server"</span>
+<span class="syn-key">min_events</span> = <span class="syn-num">5</span>
+
+<span class="syn-bracket">[[</span><span class="syn-key">sources</span><span class="syn-bracket">]]</span>
+<span class="syn-key">type</span> = <span class="syn-str">"github"</span>
+<span class="syn-key">repo</span> = <span class="syn-str">"acme/api-server"</span>
+<span class="syn-key">labels</span> = <span class="syn-bracket">[</span><span class="syn-str">"claudear"</span><span class="syn-bracket">]</span>
+
+<span class="syn-comment"># Notifications</span>
+<span class="syn-bracket">[</span><span class="syn-key">notifications.discord</span><span class="syn-bracket">]</span>
+<span class="syn-key">channel_id</span> = <span class="syn-str">"1234567890"</span>
+
+<span class="syn-bracket">[</span><span class="syn-key">notifications.slack</span><span class="syn-bracket">]</span>
+<span class="syn-key">channel</span> = <span class="syn-str">"#claudear-alerts"</span></pre>
+          </div>
+        </div>
+
+        <!-- Terminal command -->
+        <div class="rounded-card overflow-hidden border border-border terminal-glow">
+          <div class="bg-[#1a1a1d] border-b border-border px-4 py-3 flex items-center gap-3">
+            <div class="flex items-center gap-2">
+              <span class="w-3 h-3 rounded-full bg-[#FF5F57]"></span>
+              <span class="w-3 h-3 rounded-full bg-[#FEBC2E]"></span>
+              <span class="w-3 h-3 rounded-full bg-[#28C840]"></span>
+            </div>
+            <span class="font-mono text-xs text-muted ml-2">terminal</span>
+          </div>
+          <div class="bg-card p-5 overflow-x-auto">
+            <pre class="font-mono text-sm leading-7"><span class="text-muted">$</span> <span class="syn-cmd">claudear start</span> <span class="syn-flag">--poll</span> <span class="syn-flag">--port</span> <span class="syn-num">3100</span>
+
+<span class="text-accent">    &#9556;&#9552;&#9559;&#9556;&#9552;&#9552;  &#9556;&#9552;&#9559;&#9556;&#9552;&#9559; &#9556;&#9552;&#9559;&#9556;&#9552;&#9559;&#9556;&#9552;&#9559;&#9556;&#9552;&#9559;
+    &#9553;  &#9553;  &#9554;&#9552;&#9565;&#9553; &#9553; &#9553;&#9553;&#9553;&#9553;  &#9554;&#9552;&#9565;&#9554;&#9574;&#9557;
+    &#9562;&#9552;&#9565;&#9562;&#9552;&#9565;&#9562; &#9562;&#9562;&#9552;&#9565;&#9552;&#9562;&#9565;&#9562;&#9552;&#9565;&#9562; &#9562;&#9562;&#9577;&#9552;</span>
+
+<span class="text-muted">    v0.14.2 | Rust + Claude Code</span>
+<span class="text-muted">    Dashboard: http://localhost:3100</span>
+
+<span class="text-accent">  [ok]</span> Config loaded from ./claudear.toml
+<span class="text-accent">  [ok]</span> Database initialized (SQLite WAL)
+<span class="text-accent">  [ok]</span> Connected: Linear (ENG)
+<span class="text-accent">  [ok]</span> Connected: Sentry (api-server)
+<span class="text-accent">  [ok]</span> Connected: GitHub (acme/api-server)
+<span class="text-accent">  [ok]</span> Discord notifier ready
+<span class="text-accent">  [ok]</span> Slack notifier ready
+<span class="text-accent">  [ok]</span> Vector store loaded (847 embeddings)
+<span class="text-accent">  [ok]</span> Polling started (interval: 30s)
+
+<span class="text-muted">  Watching for issues...</span><span class="term-cursor"></span></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== FOOTER ==================== -->
+  <footer class="relative z-10 border-t border-border py-12">
+    <div class="max-w-6xl mx-auto px-6">
+      <div class="flex flex-col md:flex-row items-center justify-between gap-6">
+        <div class="flex items-center gap-0">
+          <span class="font-mono font-bold text-lg text-heading tracking-tight">claudear</span>
+          <span class="cursor-blink inline-block w-[8px] h-[16px] bg-accent ml-0.5 rounded-[1px]"></span>
+        </div>
+        <div class="flex items-center gap-6">
+          <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
+          <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
+          <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
+        </div>
+        <p class="font-sans text-sm text-muted">
+          Built with <span class="text-body">Rust</span> &amp; <span class="text-body">Claude Code</span>
+        </p>
+      </div>
+    </div>
+  </footer>
+
+  <!-- ==================== SCRIPTS ==================== -->
+  <script>
+    // Initialize Lucide icons
+    lucide.createIcons();
+
+    // Navbar scroll behavior
+    (function() {
+      var navbar = document.getElementById('navbar');
+      window.addEventListener('scroll', function() {
+        if (window.scrollY > 40) {
+          navbar.classList.add('nav-solid');
+        } else {
+          navbar.classList.remove('nav-solid');
+        }
+      }, { passive: true });
+    })();
+
+    // Mobile menu toggle
+    (function() {
+      var btn = document.getElementById('mobile-menu-btn');
+      var menu = document.getElementById('mobile-menu');
+      btn.addEventListener('click', function() {
+        menu.classList.toggle('hidden');
+      });
+      var links = menu.querySelectorAll('a');
+      for (var i = 0; i < links.length; i++) {
+        links[i].addEventListener('click', function() {
+          menu.classList.add('hidden');
+        });
+      }
+    })();
+
+    // Terminal typing animation
+    (function() {
+      var prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      var output = document.getElementById('terminal-output');
+      var cursor = document.getElementById('terminal-cursor');
+
+      // Each line: { html: string, delay: ms before showing this line }
+      var lines = [
+        { html: '<span class="text-muted">$</span> <span class="syn-cmd">claudear start</span> <span class="syn-flag">--poll</span>', delay: 0, typed: true },
+        { html: '', delay: 400 },
+        { html: '<span class="text-accent">  &#10003;</span> <span class="text-body">Connected to Linear, Sentry, GitHub</span>', delay: 600 },
+        { html: '<span class="text-accent">  &#10003;</span> <span class="text-body">Indexed 12 repositories</span>', delay: 400 },
+        { html: '<span class="text-accent">  &#10003;</span> <span class="text-body">Watching for issues...</span>', delay: 400 },
+        { html: '', delay: 800 },
+        { html: '  <span class="text-link">&#9656;</span> <span class="text-body">New issue: <span class="text-heading">LIN-4521</span> &quot;Fix auth token refresh race condition&quot;</span>', delay: 600 },
+        { html: '  <span class="text-link">&#9656;</span> <span class="text-body">Inferred repo: <span class="text-heading">api-server</span> (confidence: 0.94)</span>', delay: 500 },
+        { html: '  <span class="text-link">&#9656;</span> <span class="text-body">Spawning Claude Code agent...</span>', delay: 400 },
+        { html: '  <span class="text-link">&#9656;</span> <span class="text-muted">Agent working... (2m 34s)</span>', delay: 2000 },
+        { html: '  <span class="text-accent">&#9656;</span> <span class="text-accent">PR #847 opened:</span> <span class="text-heading">&quot;fix: resolve auth token refresh race condition&quot;</span>', delay: 600 },
+        { html: '  <span class="text-accent">&#9656;</span> <span class="text-accent">Issue LIN-4521</span> <span class="text-muted">&#8594;</span> <span class="text-accent">resolved</span>', delay: 500 }
+      ];
+
+      if (prefersReducedMotion) {
+        // Show all lines immediately
+        for (var i = 0; i < lines.length; i++) {
+          var div = document.createElement('div');
+          div.className = 'min-h-[1.75rem]';
+          div.textContent = ''; // safe baseline
+          // Using a template for the static content
+          var tpl = document.createElement('template');
+          tpl.innerHTML = '<div class="min-h-[1.75rem]">' + lines[i].html + '</div>';
+          output.appendChild(tpl.content.firstChild);
+        }
+        return;
+      }
+
+      cursor.style.display = 'inline-block';
+
+      var lineIndex = 0;
+
+      function typeLine(div, text, callback) {
+        // Extract plain text characters and HTML tags
+        var segments = [];
+        var j = 0;
+        while (j < text.length) {
+          if (text[j] === '<') {
+            var end = text.indexOf('>', j);
+            if (end !== -1) {
+              segments.push({ value: text.substring(j, end + 1), isTag: true });
+              j = end + 1;
+              continue;
+            }
+          }
+          if (text[j] === '&') {
+            var semiPos = text.indexOf(';', j);
+            if (semiPos !== -1 && semiPos - j < 10) {
+              segments.push({ value: text.substring(j, semiPos + 1), isTag: false });
+              j = semiPos + 1;
+              continue;
+            }
+          }
+          segments.push({ value: text[j], isTag: false });
+          j++;
+        }
+
+        var built = '';
+        var segIdx = 0;
+
+        function nextChar() {
+          // Accumulate all tags, then show next visible char
+          while (segIdx < segments.length && segments[segIdx].isTag) {
+            built += segments[segIdx].value;
+            segIdx++;
+          }
+          if (segIdx < segments.length) {
+            built += segments[segIdx].value;
+            segIdx++;
+          }
+
+          var tpl = document.createElement('template');
+          tpl.innerHTML = built;
+          div.textContent = '';
+          while (div.firstChild) div.removeChild(div.firstChild);
+          while (tpl.content.firstChild) div.appendChild(tpl.content.firstChild);
+
+          if (segIdx >= segments.length) {
+            callback();
+            return;
+          }
+          setTimeout(nextChar, 30);
+        }
+        nextChar();
+      }
+
+      function showNextLine() {
+        if (lineIndex >= lines.length) {
+          // Done - just leave cursor blinking
+          return;
+        }
+
+        var line = lines[lineIndex];
+        var div = document.createElement('div');
+        div.className = 'min-h-[1.75rem]';
+        output.appendChild(div);
+
+        if (line.typed && line.html) {
+          typeLine(div, line.html, function() {
+            lineIndex++;
+            if (lineIndex < lines.length) {
+              setTimeout(showNextLine, lines[lineIndex].delay);
+            }
+          });
+        } else {
+          var tpl = document.createElement('template');
+          tpl.innerHTML = line.html;
+          while (tpl.content.firstChild) div.appendChild(tpl.content.firstChild);
+          lineIndex++;
+          if (lineIndex < lines.length) {
+            setTimeout(showNextLine, lines[lineIndex].delay);
+          }
+        }
+      }
+
+      setTimeout(showNextLine, 800);
+    })();
+  </script>
+
+</body>
+</html>

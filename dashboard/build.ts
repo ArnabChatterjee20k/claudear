@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync, renameSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync, renameSync, existsSync, globSync } from "fs";
 import { join } from "path";
 import { createHash } from "crypto";
 
@@ -15,6 +15,7 @@ const result = await Bun.build({
   outdir,
   minify: true,
   splitting: true,
+  sourcemap: "external",
   target: "browser",
   format: "esm",
   naming: "assets/[name]-[hash].[ext]",
@@ -108,3 +109,40 @@ for (const output of result.outputs) {
   console.log(`  ${output.path.replace(outdir, "dist")} (${size} KB)`);
 }
 console.log(`  dist/assets/${cssFilename} (${(cssContent.length / 1024).toFixed(1)} KB)`);
+
+// 8. Upload source maps to Sentry (if configured), then strip them from dist
+const sentryToken = process.env.SENTRY_AUTH_TOKEN;
+const sentryOrg = process.env.SENTRY_ORG;
+const sentryProject = process.env.SENTRY_PROJECT;
+const sentryRelease = process.env.SENTRY_RELEASE;
+
+if (sentryToken && sentryOrg && sentryProject && sentryRelease) {
+  console.log(`Uploading source maps to Sentry (org=${sentryOrg}, project=${sentryProject}, release=${sentryRelease})...`);
+  const uploadResult = Bun.spawnSync({
+    cmd: [
+      "npx", "@sentry/cli", "sourcemaps", "upload",
+      "--org", sentryOrg,
+      "--project", sentryProject,
+      "--release", sentryRelease,
+      join(outdir, "assets"),
+    ],
+    cwd: srcdir,
+    env: { ...process.env, SENTRY_AUTH_TOKEN: sentryToken },
+    stderr: "inherit",
+    stdout: "inherit",
+  });
+  if (uploadResult.exitCode !== 0) {
+    console.warn("Source map upload to Sentry failed (non-fatal)");
+  } else {
+    console.log("Source maps uploaded to Sentry successfully");
+  }
+} else {
+  console.log("Skipping Sentry source map upload (SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT, or SENTRY_RELEASE not set)");
+}
+
+// Remove .map files from dist to avoid serving them publicly
+for (const file of readdirSync(assetsDir)) {
+  if (file.endsWith(".map")) {
+    unlinkSync(join(assetsDir, file));
+  }
+}

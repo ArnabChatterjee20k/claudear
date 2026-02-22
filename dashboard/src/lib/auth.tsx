@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { getMe, login as apiLogin, logout as apiLogout, updateProfile as apiUpdateProfile, setOnUnauthorized, type AuthUser } from './api'
+import { Sentry } from './sentry'
 
 interface AuthState {
   user: AuthUser | null
@@ -34,19 +35,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     setOnUnauthorized(handleUnauthorized)
     getMe()
-      .then(setUser)
-      .catch(() => setUser(null))
+      .then((u) => {
+        setUser(u)
+        Sentry.setUser({ id: String(u.id), email: u.email, username: u.name })
+      })
+      .catch(() => {
+        setUser(null)
+        Sentry.setUser(null)
+      })
       .finally(() => setLoading(false))
   }, [handleUnauthorized])
 
   const login = useCallback(async (email: string, password: string) => {
     const res = await apiLogin(email, password)
     setUser(res.user)
+    Sentry.setUser({ id: String(res.user.id), email: res.user.email, username: res.user.name })
   }, [])
 
   const logout = useCallback(async () => {
     await apiLogout()
     setUser(null)
+    Sentry.setUser(null)
   }, [])
 
   const refreshUser = useCallback(async () => {

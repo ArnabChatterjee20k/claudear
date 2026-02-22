@@ -4,6 +4,7 @@
 //! Environment variables can override any TOML values.
 
 use crate::error::{Error, Result};
+use crate::secret::SecretValue;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -253,6 +254,30 @@ impl CascadeConfig {
         self.rules
             .iter()
             .find(|r| r.upstream == upstream && r.downstream == downstream)
+    }
+
+    /// Find a rule matching a specific upstream->downstream pair and trigger type.
+    pub fn find_rule_for_trigger(
+        &self,
+        upstream: &str,
+        downstream: &str,
+        trigger: &CascadeTrigger,
+    ) -> Option<&CascadeRule> {
+        self.rules.iter().find(|r| {
+            r.upstream == upstream && r.downstream == downstream && &r.trigger == trigger
+        })
+    }
+
+    /// Get all upstream repos that have release-triggered rules.
+    pub fn release_trigger_upstreams(&self) -> Vec<&str> {
+        let mut upstreams: Vec<&str> = self
+            .rules
+            .iter()
+            .filter(|r| r.trigger == CascadeTrigger::Release)
+            .map(|r| r.upstream.as_str())
+            .collect();
+        upstreams.dedup();
+        upstreams
     }
 }
 
@@ -595,11 +620,11 @@ impl Default for RetryConfig {
 #[serde(default)]
 pub struct SlackConfig {
     /// Slack Bot Token (xoxb-) for API calls.
-    pub bot_token: Option<String>,
+    pub bot_token: Option<SecretValue>,
     /// Slack channel ID for notifications.
     pub channel_id: Option<String>,
     /// Slack Incoming Webhook URL (optional, notification-only alternative).
-    pub webhook_url: Option<String>,
+    pub webhook_url: Option<SecretValue>,
     /// Slack user ID to mention in notifications.
     pub user_id: Option<String>,
     /// Enable Slack as an issue source (messages become issues).
@@ -617,11 +642,11 @@ pub struct SlackConfig {
 #[serde(default)]
 pub struct DiscordConfig {
     /// Discord webhook URL for notifications.
-    pub webhook_url: Option<String>,
+    pub webhook_url: Option<SecretValue>,
     /// Discord user ID to mention in notifications.
     pub user_id: Option<String>,
     /// Discord bot token used for inbound reply polling.
-    pub bot_token: Option<String>,
+    pub bot_token: Option<SecretValue>,
     /// Discord channel ID used for inbound reply polling.
     pub channel_id: Option<String>,
     /// Enable Discord as an issue source (messages become issues).
@@ -645,7 +670,7 @@ pub struct EmailConfig {
     /// SMTP username.
     pub smtp_username: Option<String>,
     /// SMTP password.
-    pub smtp_password: Option<String>,
+    pub smtp_password: Option<SecretValue>,
     /// Sender email address.
     pub from_address: Option<String>,
     /// Recipient email addresses.
@@ -659,7 +684,7 @@ pub struct EmailConfig {
     /// IMAP username.
     pub imap_username: Option<String>,
     /// IMAP password.
-    pub imap_password: Option<String>,
+    pub imap_password: Option<SecretValue>,
     /// Use TLS for IMAP.
     pub imap_use_tls: bool,
     /// IMAP folder to poll.
@@ -693,7 +718,7 @@ pub struct SmsConfig {
     /// Twilio Account SID.
     pub account_sid: Option<String>,
     /// Twilio Auth Token.
-    pub auth_token: Option<String>,
+    pub auth_token: Option<SecretValue>,
     /// Twilio phone number (sender).
     pub from_number: Option<String>,
     /// Recipient phone numbers.
@@ -705,7 +730,7 @@ pub struct SmsConfig {
 #[serde(default)]
 pub struct PushConfig {
     /// Pushover API token.
-    pub api_token: Option<String>,
+    pub api_token: Option<SecretValue>,
     /// Pushover user key.
     pub user_key: Option<String>,
     /// Device name (optional, sends to all devices if empty).
@@ -747,7 +772,7 @@ pub struct GitLabConfig {
     /// Whether this source is enabled.
     pub enabled: bool,
     /// GitLab personal access token.
-    pub token: Option<String>,
+    pub token: Option<SecretValue>,
     /// GitLab base URL (default: "https://gitlab.com").
     pub base_url: String,
     /// GitLab groups to monitor.
@@ -762,7 +787,7 @@ pub struct GitLabConfig {
     /// Whether to auto-resolve issues when MRs merge.
     pub auto_resolve_on_merge: bool,
     /// Webhook secret for verifying GitLab webhook requests.
-    pub webhook_secret: Option<String>,
+    pub webhook_secret: Option<SecretValue>,
     /// Trigger tag for review comments (e.g., "@claudear").
     pub review_trigger: String,
     /// Use SSH URLs for cloning instead of HTTPS.
@@ -800,14 +825,14 @@ impl GitLabConfig {
     pub fn test_default() -> Self {
         Self {
             enabled: true,
-            token: Some("test_token".to_string()),
+            token: Some(SecretValue::new("test_token")),
             base_url: "https://gitlab.com".to_string(),
             groups: vec!["mygroup".to_string()],
             trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
             trigger_states: vec!["opened".to_string()],
             poll_interval_ms: Some(60000),
             auto_resolve_on_merge: true,
-            webhook_secret: Some("test_secret".to_string()),
+            webhook_secret: Some(SecretValue::new("test_secret")),
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
             max_issues_per_cycle: None,
@@ -821,13 +846,13 @@ impl GitLabConfig {
 #[serde(default)]
 pub struct GitHubConfig {
     /// GitHub personal access token.
-    pub token: Option<String>,
+    pub token: Option<SecretValue>,
     /// Poll interval for checking PR status (ms).
     pub poll_interval_ms: u64,
     /// Whether to auto-resolve issues when PRs merge.
     pub auto_resolve_on_merge: bool,
     /// Webhook secret for verifying GitHub webhook signatures.
-    pub webhook_secret: Option<String>,
+    pub webhook_secret: Option<SecretValue>,
     /// Trigger tag for review comments (e.g., "@claudear" or "@mybot").
     /// Comments must contain this tag to trigger Claude.
     /// Set to empty string to respond to all comments.
@@ -873,15 +898,15 @@ pub struct GitHubAppConfig {
     /// Path to the private key PEM file.
     pub private_key_path: Option<PathBuf>,
     /// Inline private key PEM content (alternative to file).
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretValue>,
     /// Webhook secret for verifying GitHub webhook signatures.
-    pub webhook_secret: Option<String>,
+    pub webhook_secret: Option<SecretValue>,
     /// Installation ID (auto-detected if not set).
     pub installation_id: Option<i64>,
     /// OAuth Client ID (for user authorization flows).
     pub client_id: Option<String>,
     /// OAuth Client Secret.
-    pub client_secret: Option<String>,
+    pub client_secret: Option<SecretValue>,
     /// Public base URL for the manifest flow.
     pub base_url: Option<String>,
 }
@@ -895,7 +920,7 @@ impl GitHubAppConfig {
     /// Load the private key from file or inline content.
     pub fn load_private_key(&self) -> Result<String> {
         if let Some(key) = &self.private_key {
-            return Ok(key.clone());
+            return Ok(key.expose().to_string());
         }
 
         if let Some(path) = &self.private_key_path {
@@ -922,7 +947,7 @@ pub struct LinearConfig {
     /// Whether this source is enabled.
     pub enabled: bool,
     /// Linear API key.
-    pub api_key: String,
+    pub api_key: SecretValue,
     /// Labels that trigger automation.
     pub trigger_labels: Vec<String>,
     /// Optional assignee display name filter. When set, only issues assigned to
@@ -936,7 +961,7 @@ pub struct LinearConfig {
     /// Optional project filter.
     pub project_id: Option<String>,
     /// Webhook signature verification secret.
-    pub webhook_secret: Option<String>,
+    pub webhook_secret: Option<SecretValue>,
     /// Maximum issues to process per poll cycle for this source (overrides global).
     pub max_issues_per_cycle: Option<usize>,
     /// Maximum concurrent issue processing for this source (overrides global).
@@ -949,7 +974,7 @@ impl Default for LinearConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            api_key: String::new(),
+            api_key: SecretValue::new(""),
             trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
             trigger_assignee: None,
             trigger_states: vec!["backlog".to_string(), "todo".to_string()],
@@ -1032,7 +1057,7 @@ pub struct SentryConfig {
     /// Whether this source is enabled.
     pub enabled: bool,
     /// Sentry auth token.
-    pub auth_token: String,
+    pub auth_token: SecretValue,
     /// Sentry organization slug.
     pub org_slug: String,
     /// Project slugs to filter.
@@ -1046,7 +1071,7 @@ pub struct SentryConfig {
     /// Percentage increase to consider issue escalating.
     pub escalation_threshold_percent: u32,
     /// Webhook client secret for signature verification.
-    pub client_secret: Option<String>,
+    pub client_secret: Option<SecretValue>,
     /// Maximum issues to process per poll cycle for this source (overrides global).
     pub max_issues_per_cycle: Option<usize>,
     /// Maximum concurrent issue processing for this source (overrides global).
@@ -1059,7 +1084,7 @@ impl Default for SentryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            auth_token: String::new(),
+            auth_token: SecretValue::new(""),
             org_slug: String::new(),
             project_slugs: Vec::new(),
             top_issues_count: 100,
@@ -1085,7 +1110,7 @@ pub struct JiraConfig {
     /// Email for Basic auth (Jira Cloud).
     pub email: String,
     /// API token (Cloud) or personal access token (Server/DC).
-    pub api_token: String,
+    pub api_token: SecretValue,
     /// Authentication mode: "basic" (email:token) or "bearer" (PAT).
     pub auth_mode: String,
     /// Jira project keys to monitor (e.g., ["PROJ", "BACKEND"]).

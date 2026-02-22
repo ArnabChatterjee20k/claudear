@@ -28,7 +28,7 @@ use crate::users::UserRegistry;
 use chrono::Utc;
 use futures::future::join_all;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -76,6 +76,8 @@ pub struct Watcher {
     active_processing: AtomicUsize,
     /// Feedback analyzer for learning from past outcomes
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
+    /// Last seen release tag per upstream repo (for release-triggered cascades).
+    last_seen_releases: RwLock<HashMap<String, String>>,
 }
 
 impl Watcher {
@@ -118,7 +120,83 @@ impl Watcher {
             processing: RwLock::new(HashSet::new()),
             active_processing: AtomicUsize::new(0),
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
+            last_seen_releases: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Send a cron check-in to Sentry's HTTP API (fire-and-forget).
+    ///
+    /// Parses the DSN from SENTRY_DSN env var and sends a check-in for the
+    /// "claudear-watcher-poll" monitor. Does nothing if SENTRY_DSN is not set.
+    fn send_cron_check_in(
+        &self,
+        status: &str,
+        check_in_id: &str,
+        duration: Option<f64>,
+        poll_interval_ms: u64,
+    ) {
+        let dsn = match std::env::var("SENTRY_DSN") {
+            Ok(d) if !d.is_empty() => d,
+            _ => return,
+        };
+
+        // Parse DSN: https://<public_key>@<host>/<project_id>
+        let parsed = match url::Url::parse(&dsn) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let public_key = parsed.username();
+        if public_key.is_empty() {
+            return;
+        }
+        let project_id = parsed.path().trim_start_matches('/');
+        if project_id.is_empty() {
+            return;
+        }
+        let ingest = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
+
+        let environment = std::env::var("SENTRY_ENVIRONMENT").unwrap_or_default();
+        let interval_minutes = (poll_interval_ms / 60_000).max(1);
+
+        let mut url = format!(
+            "{}/api/{}/cron/claudear-watcher-poll/{}/?status={}&check_in_id={}",
+            ingest, project_id, public_key, status, check_in_id,
+        );
+        if !environment.is_empty() {
+            url.push_str(&format!("&environment={}", environment));
+        }
+        if let Some(d) = duration {
+            url.push_str(&format!("&duration={:.1}", d));
+        }
+
+        // Include monitor_config for upsert on in_progress check-ins
+        let body = if status == "in_progress" {
+            Some(serde_json::json!({
+                "monitor_config": {
+                    "schedule": {
+                        "type": "interval",
+                        "value": interval_minutes,
+                        "unit": "minute"
+                    },
+                    "checkin_margin": 5,
+                    "max_runtime": 30
+                }
+            }))
+        } else {
+            None
+        };
+
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let req = if let Some(body) = body {
+                client.post(&url).json(&body)
+            } else {
+                client.get(&url)
+            };
+            if let Err(e) = req.send().await {
+                tracing::debug!(error = %e, "Failed to send Sentry cron check-in");
+            }
+        });
     }
 
     /// Build a repository inferrer from config.
@@ -493,6 +571,11 @@ impl Watcher {
                 last_global = std::time::Instant::now();
                 global_cycle_count = global_cycle_count.wrapping_add(1);
 
+                let cron_id = uuid::Uuid::new_v4().to_string();
+                let cron_start = std::time::Instant::now();
+                self.send_cron_check_in("in_progress", &cron_id, None, poll_interval);
+                let mut housekeeping_ok = true;
+
                 // Periodically refresh repo index to detect new repositories
                 if global_cycle_count.is_multiple_of(REFRESH_INTERVAL) {
                     match self.refresh_repos().await {
@@ -517,12 +600,17 @@ impl Watcher {
                 // Run housekeeping (retries, cascades, metrics)
                 if let Err(e) = self.poll_housekeeping().await {
                     tracing::error!(component = "watcher", error = %e, "Housekeeping error");
+                    housekeeping_ok = false;
                 }
 
                 // Periodic learning subsystem tasks
                 if !self.dry_run && global_cycle_count.is_multiple_of(LEARNING_INTERVAL) {
                     self.run_periodic_learning().await;
                 }
+
+                let duration_secs = cron_start.elapsed().as_secs_f64();
+                let cron_status = if housekeeping_ok { "ok" } else { "error" };
+                self.send_cron_check_in(cron_status, &cron_id, Some(duration_secs), poll_interval);
             }
         }
 
@@ -877,14 +965,17 @@ impl Watcher {
         Ok(())
     }
 
-    /// Trigger cascade processing for downstream repos after a PR is merged.
+    /// Trigger cascade processing for downstream repos after a PR is merged
+    /// or a release is published.
     ///
     /// Looks up the merged repo in the dependency graph and spawns Claude
     /// in each direct dependent repo with context about the upstream changes.
+    /// The `trigger_type` controls which cascade rules are matched.
     pub async fn trigger_cascade(
         &self,
         attempt: &crate::types::FixAttempt,
         pr_url: &str,
+        trigger_type: crate::config::CascadeTrigger,
     ) -> Result<()> {
         let relationships = match &self.relationships {
             Some(r) => r,
@@ -937,6 +1028,7 @@ impl Watcher {
 
         // Also collect downstream repos from explicit cascade rules (config-driven).
         // This allows cascades to work even without detected code-level dependencies.
+        // Only include rules that match the current trigger type.
         let rule_only_downstreams: Vec<&str> = self
             .config
             .cascade
@@ -944,7 +1036,7 @@ impl Watcher {
             .iter()
             .filter(|r| {
                 (r.upstream == scm_repo || r.upstream == repo_short_name)
-                    && r.trigger != crate::config::CascadeTrigger::Release
+                    && r.trigger == trigger_type
                     && !graph_names.contains(r.downstream.as_str())
             })
             .map(|r| r.downstream.as_str())
@@ -954,6 +1046,7 @@ impl Watcher {
             tracing::debug!(
                 repo = %scm_repo,
                 short_name = %repo_short_name,
+                trigger = ?trigger_type,
                 "No downstream dependants found for cascade"
             );
             return Ok(());
@@ -961,6 +1054,7 @@ impl Watcher {
 
         tracing::info!(
             repo = %scm_repo,
+            trigger = ?trigger_type,
             graph_dependants = dependants.len(),
             rule_dependants = rule_only_downstreams.len(),
             "Triggering cascade for downstream repos"
@@ -976,17 +1070,36 @@ impl Watcher {
                 .map(|t| t.as_str())
                 .unwrap_or("unknown");
 
-            // Look up per-dependency cascade rule
-            let rule = self.config.cascade.find_rule(&scm_repo, &dependant.name);
+            // Look up per-dependency cascade rule for this trigger type
+            let rule = self
+                .config
+                .cascade
+                .find_rule_for_trigger(&scm_repo, &dependant.name, &trigger_type)
+                .or_else(|| {
+                    self.config
+                        .cascade
+                        .find_rule_for_trigger(repo_short_name, &dependant.name, &trigger_type)
+                });
 
-            // If a rule exists with trigger=release, skip for merge-triggered cascades
-            if let Some(r) = rule {
-                if r.trigger == crate::config::CascadeTrigger::Release {
-                    tracing::info!(
-                        upstream = %scm_repo,
-                        downstream = %dependant.name,
-                        "Skipping cascade — rule requires release trigger"
-                    );
+            // If no rule matches this trigger type, check if there's a rule with a
+            // different trigger — if so, skip (the other trigger path will handle it).
+            // If no rule exists at all, graph dependants cascade on merge by default.
+            if rule.is_none() {
+                let any_rule = self.config.cascade.find_rule(&scm_repo, &dependant.name);
+                if let Some(r) = any_rule {
+                    if r.trigger != trigger_type {
+                        tracing::info!(
+                            upstream = %scm_repo,
+                            downstream = %dependant.name,
+                            rule_trigger = ?r.trigger,
+                            current_trigger = ?trigger_type,
+                            "Skipping cascade — rule requires different trigger"
+                        );
+                        continue;
+                    }
+                } else if trigger_type != crate::config::CascadeTrigger::Merge {
+                    // No explicit rule and this isn't a merge trigger —
+                    // graph dependants only auto-cascade on merge.
                     continue;
                 }
             }
@@ -1013,7 +1126,10 @@ impl Watcher {
 
         // Process cascade-rule-only downstreams (explicitly configured, no code dependency detected)
         for downstream in rule_only_downstreams {
-            let rule = self.config.cascade.find_rule(&scm_repo, downstream);
+            let rule = self
+                .config
+                .cascade
+                .find_rule_for_trigger(&scm_repo, downstream, &trigger_type);
 
             if let Err(e) = self
                 .cascade_to_repo(
@@ -1032,6 +1148,110 @@ impl Watcher {
                     error = %e,
                     "Failed to cascade to downstream repo"
                 );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check for new releases on upstream repos with release-triggered cascade rules.
+    /// When a new release is detected, finds the most recently merged attempt for that
+    /// repo and triggers cascade with `CascadeTrigger::Release`.
+    pub async fn check_releases_and_cascade(&self) -> Result<()> {
+        if !self.config.cascade.enabled {
+            return Ok(());
+        }
+
+        let upstreams = self.config.cascade.release_trigger_upstreams();
+        if upstreams.is_empty() {
+            return Ok(());
+        }
+
+        // Need an SCM provider for release polling
+        let scm = match &self.scm_provider {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+
+        for upstream in upstreams {
+            let release = match scm.get_latest_release(upstream).await {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::debug!(
+                        upstream = %upstream,
+                        error = %e,
+                        "Failed to check latest release for cascade"
+                    );
+                    continue;
+                }
+            };
+
+            // Check if we've already processed this release
+            {
+                let seen = self.last_seen_releases.read().await;
+                if seen.get(upstream).map(|t| t.as_str()) == Some(&release.tag) {
+                    continue;
+                }
+            }
+
+            tracing::info!(
+                upstream = %upstream,
+                tag = %release.tag,
+                "New release detected, checking for release-triggered cascades"
+            );
+
+            // Mark as seen before processing (avoid duplicate cascades)
+            {
+                let mut seen = self.last_seen_releases.write().await;
+                seen.insert(upstream.to_string(), release.tag.clone());
+            }
+
+            // Find the most recently merged attempt for this upstream repo
+            let merged_attempt = self
+                .sqlite_tracker
+                .as_ref()
+                .and_then(|t| {
+                    t.get_most_recent_merged_attempt_for_repo(upstream)
+                        .ok()
+                        .flatten()
+                });
+
+            let attempt = match merged_attempt {
+                Some(a) => a,
+                None => {
+                    tracing::debug!(
+                        upstream = %upstream,
+                        "No merged attempt found for release-triggered cascade"
+                    );
+                    continue;
+                }
+            };
+
+            let pr_url = attempt.pr_url.clone().unwrap_or_default();
+            match self
+                .trigger_cascade(
+                    &attempt,
+                    &pr_url,
+                    crate::config::CascadeTrigger::Release,
+                )
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        upstream = %upstream,
+                        tag = %release.tag,
+                        "Release-triggered cascade completed"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        upstream = %upstream,
+                        tag = %release.tag,
+                        error = %e,
+                        "Failed to trigger release cascade"
+                    );
+                }
             }
         }
 
@@ -1441,6 +1661,13 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
+        // Check for new releases and trigger release-based cascades
+        if !self.dry_run {
+            if let Err(e) = self.check_releases_and_cascade().await {
+                tracing::error!(component = "watcher", error = %e, "Error checking releases for cascade");
+            }
+        }
+
         // Record lightweight operational telemetry for dashboard analytics.
         if !self.dry_run {
             let poll_duration_metric = ProcessingMetric::new(
@@ -1501,6 +1728,13 @@ Create a PR with your changes.{custom_instructions}"#,
         if !self.dry_run {
             if let Err(e) = self.check_pr_merges_and_cascade().await {
                 tracing::error!(component = "watcher", error = %e, "Error checking PR merges for cascade");
+            }
+        }
+
+        // Check for new releases and trigger release-based cascades
+        if !self.dry_run {
+            if let Err(e) = self.check_releases_and_cascade().await {
+                tracing::error!(component = "watcher", error = %e, "Error checking releases for cascade");
             }
         }
 
@@ -1891,7 +2125,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
                     let pr_url = attempt.pr_url.as_deref().unwrap_or("");
                     if self.config.cascade.enabled {
-                        match self.trigger_cascade(attempt, pr_url).await {
+                        match self.trigger_cascade(attempt, pr_url, crate::config::CascadeTrigger::Merge).await {
                             Ok(()) => {
                                 cascade_triggered += 1;
                             }
@@ -7062,7 +7296,7 @@ mod tests {
         };
 
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1")
+            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1", crate::config::CascadeTrigger::Merge)
             .await;
         assert!(result.is_ok());
     }
@@ -7127,7 +7361,7 @@ mod tests {
 
         // Even with relationships, cascade disabled returns Ok
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/upstream/pull/1")
+            .trigger_cascade(&attempt, "https://github.com/org/upstream/pull/1", crate::config::CascadeTrigger::Merge)
             .await;
         assert!(result.is_ok());
     }
@@ -7180,7 +7414,7 @@ mod tests {
             cascade_repo: None,
         };
 
-        let result = watcher.trigger_cascade(&attempt, "").await;
+        let result = watcher.trigger_cascade(&attempt, "", crate::config::CascadeTrigger::Merge).await;
         assert!(result.is_ok());
     }
 
@@ -7233,7 +7467,7 @@ mod tests {
         };
 
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1")
+            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1", crate::config::CascadeTrigger::Merge)
             .await;
         assert!(result.is_ok());
     }
@@ -7288,7 +7522,7 @@ mod tests {
         };
 
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/my-lib/pull/1")
+            .trigger_cascade(&attempt, "https://github.com/org/my-lib/pull/1", crate::config::CascadeTrigger::Merge)
             .await;
         assert!(result.is_ok());
     }
@@ -7781,7 +8015,7 @@ mod tests {
         // The child is at depth 1 already, and max_depth is 1
         // So trigger_cascade should bail out early
         let result = watcher
-            .trigger_cascade(&child, "https://github.com/org/upstream/pull/1")
+            .trigger_cascade(&child, "https://github.com/org/upstream/pull/1", crate::config::CascadeTrigger::Merge)
             .await;
         assert!(result.is_ok());
     }
@@ -8649,7 +8883,7 @@ mod tests {
         // With max_depth=0, cascade should NOT be blocked by depth
         // It will still return Ok because there are no dependants
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1")
+            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1", crate::config::CascadeTrigger::Merge)
             .await;
         assert!(result.is_ok());
     }
@@ -9266,7 +9500,7 @@ mod tests {
         // It will find dependants via the short name "upstream-lib"
         // but cascade_to_repo will fail because no inferrer is configured
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/upstream-lib/pull/1")
+            .trigger_cascade(&attempt, "https://github.com/org/upstream-lib/pull/1", crate::config::CascadeTrigger::Merge)
             .await;
         // Should still return Ok even if individual cascade_to_repo fails
         assert!(result.is_ok());
@@ -9530,7 +9764,7 @@ mod tests {
 
         // This exercises the full_name match path (not the short_name fallback)
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/upstream-lib/pull/1")
+            .trigger_cascade(&attempt, "https://github.com/org/upstream-lib/pull/1", crate::config::CascadeTrigger::Merge)
             .await;
         assert!(result.is_ok());
     }

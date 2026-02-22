@@ -414,6 +414,122 @@ impl<H: HttpClient> GitLabClient<H> {
             side: None,
         }
     }
+    /// Get the latest release for a project.
+    pub async fn get_latest_release(
+        &self,
+        project: &str,
+    ) -> Result<Option<crate::scm::ScmRelease>> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitLab token not configured"))?;
+
+        let encoded = Self::encode_project_path(project);
+        let url = format!(
+            "{}/api/v4/projects/{}/releases?per_page=1&order_by=released_at&sort=desc",
+            self.api_base(),
+            encoded
+        );
+        let headers = self.build_headers(token);
+        let response = self.http.get(&url, headers).await?;
+
+        if response.status == 404 {
+            return Ok(None);
+        }
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to get releases for {}: {}",
+                project, response.body
+            )));
+        }
+
+        let releases: Vec<serde_json::Value> = response.json()?;
+        let val = match releases.into_iter().next() {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        Ok(Some(crate::scm::ScmRelease {
+            tag: val
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            name: val.get("name").and_then(|v| v.as_str()).map(String::from),
+            url: val
+                .get("_links")
+                .and_then(|l| l.get("self"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            published_at: val
+                .get("released_at")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        }))
+    }
+
+    /// Create a release for a project.
+    pub async fn create_release(
+        &self,
+        project: &str,
+        tag: &str,
+        name: &str,
+        body: &str,
+    ) -> Result<crate::scm::ScmRelease> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitLab token not configured"))?;
+
+        let encoded = Self::encode_project_path(project);
+        let url = format!(
+            "{}/api/v4/projects/{}/releases",
+            self.api_base(),
+            encoded
+        );
+        let headers = self.build_headers(token);
+        let payload = serde_json::json!({
+            "tag_name": tag,
+            "name": name,
+            "description": body,
+        });
+
+        let response = self
+            .http
+            .post(&url, headers, &payload.to_string())
+            .await?;
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to create release for {}: {}",
+                project, response.body
+            )));
+        }
+
+        let val: serde_json::Value = response.json()?;
+        Ok(crate::scm::ScmRelease {
+            tag: val
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            name: val.get("name").and_then(|v| v.as_str()).map(String::from),
+            url: val
+                .get("_links")
+                .and_then(|l| l.get("self"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            published_at: val
+                .get("released_at")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        })
+    }
 }
 
 #[async_trait]
@@ -885,6 +1001,23 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
         let re = regex_lite::Regex::new(r"/merge_requests/(\d+)").ok()?;
         let caps = re.captures(url)?;
         caps.get(1)?.as_str().parse().ok()
+    }
+
+    async fn get_latest_release(
+        &self,
+        project: &str,
+    ) -> Result<Option<crate::scm::ScmRelease>> {
+        GitLabClient::get_latest_release(self, project).await
+    }
+
+    async fn create_release(
+        &self,
+        project: &str,
+        tag: &str,
+        name: &str,
+        body: &str,
+    ) -> Result<crate::scm::ScmRelease> {
+        GitLabClient::create_release(self, project, tag, name, body).await
     }
 }
 

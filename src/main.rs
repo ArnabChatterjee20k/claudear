@@ -963,6 +963,10 @@ fn main() -> anyhow::Result<()> {
         },
     ));
 
+    sentry::configure_scope(|scope| {
+        scope.set_tag("app.component", "claudear-backend");
+    });
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

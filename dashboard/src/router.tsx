@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, createContext, useContext } from 'react'
+import { Sentry } from './lib/sentry'
 
 const RouterContext = createContext<{ path: string; navigate: (path: string) => void }>({
   path: '/',
@@ -9,12 +10,17 @@ function useHistory() {
   const [path, setPath] = useState(() => window.location.pathname.split('?')[0])
 
   useEffect(() => {
-    const onPopState = () => setPath(window.location.pathname.split('?')[0])
+    const onPopState = () => {
+      const newPath = window.location.pathname.split('?')[0]
+      Sentry.addBreadcrumb({ category: 'navigation', message: newPath, level: 'info' })
+      setPath(newPath)
+    }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
   }, [])
 
   const navigate = useCallback((newPath: string) => {
+    Sentry.addBreadcrumb({ category: 'navigation', message: newPath, level: 'info' })
     window.history.pushState(null, '', newPath)
     setPath(newPath.split('?')[0])
   }, [])

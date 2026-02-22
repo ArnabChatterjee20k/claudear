@@ -535,12 +535,12 @@ max_depth = 0
 
 # Per-dependency cascade rules (optional).
 # Each rule controls how a specific upstream->downstream pair is cascaded.
-# If no rule matches, default behavior applies (trigger on merge, update version).
+# If no rule matches, default behavior applies (trigger on release, update version).
 
 # [[cascade.rules]]
 # upstream = "org/library"
 # downstream = "org/application"
-# trigger = "merge"           # "merge" (default) or "release"
+# trigger = "release"         # "merge" or "release" (default)
 # target_branch = "develop"   # Override downstream branch (default: repo default)
 # version_update = true       # Update dependency version in downstream (default: true)
 # instructions = "Run composer install after updating the dependency"

@@ -1,3 +1,5 @@
+import { Sentry } from './sentry'
+
 const API_BASE = '/api';
 
 export function getWsBase(): string {
@@ -623,11 +625,16 @@ async function fetchJson<T>(url: string): Promise<T> {
     onUnauthorized?.()
     throw new Error('Unauthorized')
   }
-  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`)
+  if (!res.ok) {
+    const err = new Error(`Failed to fetch ${url}: ${res.status}`)
+    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'GET', 'api.status': String(res.status) } })
+    throw err
+  }
   return res.json()
 }
 
 async function postJson<T>(url: string, body?: unknown): Promise<T> {
+  Sentry.addBreadcrumb({ category: 'api', message: `POST ${url}`, level: 'info' })
   const res = await fetch(url, {
     method: 'POST',
     headers: body ? { 'Content-Type': 'application/json' } : {},
@@ -637,12 +644,17 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
     onUnauthorized?.()
     throw new Error('Unauthorized')
   }
-  if (!res.ok) throw new Error(`Failed to post ${url}: ${res.status}`)
+  if (!res.ok) {
+    const err = new Error(`Failed to post ${url}: ${res.status}`)
+    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'POST', 'api.status': String(res.status) } })
+    throw err
+  }
   if (res.status === 204) return undefined as T
   return res.json()
 }
 
 async function putJson<T>(url: string, body: unknown): Promise<T> {
+  Sentry.addBreadcrumb({ category: 'api', message: `PUT ${url}`, level: 'info' })
   const res = await fetch(url, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -652,17 +664,26 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
     onUnauthorized?.()
     throw new Error('Unauthorized')
   }
-  if (!res.ok) throw new Error(`Failed to put ${url}: ${res.status}`)
+  if (!res.ok) {
+    const err = new Error(`Failed to put ${url}: ${res.status}`)
+    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'PUT', 'api.status': String(res.status) } })
+    throw err
+  }
   return res.json()
 }
 
 async function deleteRequest(url: string): Promise<void> {
+  Sentry.addBreadcrumb({ category: 'api', message: `DELETE ${url}`, level: 'info' })
   const res = await fetch(url, { method: 'DELETE' })
   if (res.status === 401) {
     onUnauthorized?.()
     throw new Error('Unauthorized')
   }
-  if (!res.ok) throw new Error(`Failed to delete ${url}: ${res.status}`)
+  if (!res.ok) {
+    const err = new Error(`Failed to delete ${url}: ${res.status}`)
+    Sentry.captureException(err, { tags: { 'api.url': url, 'api.method': 'DELETE', 'api.status': String(res.status) } })
+    throw err
+  }
 }
 
 // Existing

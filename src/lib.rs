@@ -50,6 +50,7 @@ pub mod reports;
 pub mod retry;
 pub mod runner;
 pub mod scm;
+pub mod secret;
 pub mod source;
 pub mod storage;
 pub mod templates;
@@ -59,6 +60,7 @@ pub mod watcher;
 pub mod webhook;
 
 pub use config::{CascadeConfig, CodeIndexConfig, Config, EvaluationConfig, RetryConfig};
+pub use secret::SecretValue;
 pub use discord::{DiscordClient, ThreadManager, ThreadState};
 pub use error::{Error, Result};
 pub use evaluation::{
@@ -75,7 +77,7 @@ pub use gitlab::GitLabClient;
 pub use scm::{
     CodeReview, OrgRepo, PostReviewAction, PrInfo, PrMonitor, PrReview, PrReviewComment,
     PrReviewState, PrStatus, PrStatusUpdate, PrSummary, RemoteRepo, ReviewComment, ReviewEvent,
-    ReviewUser, ReviewWatcher, ScmProvider,
+    ReviewUser, ReviewWatcher, ScmProvider, ScmRelease,
 };
 // Backward-compat alias
 pub use github_app::{

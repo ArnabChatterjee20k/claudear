@@ -29,6 +29,7 @@
   },
   "devDependencies": {
     "@happy-dom/global-registrator": "^14.0.0",
+    "@sentry/cli": "^2.40.0",
     "@testing-library/react": "^14.2.0",
     "@types/bun": "latest",
     "@types/react": "^18.2.48",
