@@ -1334,4 +1334,259 @@ mod tests {
         assert_eq!(response.status, 201);
         assert_eq!(response.body, "Created");
     }
+
+    // --- Additional coverage tests ---
+
+    #[tokio::test]
+    async fn test_notify_merged_disabled() {
+        let notifier = WhatsAppNotifier::new(disabled_config(), empty_registry());
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        let result = notifier.notify_merged(&issue, "https://github.com/pr/1").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_closed_disabled() {
+        let notifier = WhatsAppNotifier::new(disabled_config(), empty_registry());
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        let result = notifier.notify_closed(&issue, "https://github.com/pr/1").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ask_question_disabled() {
+        let notifier = WhatsAppNotifier::new(disabled_config(), empty_registry());
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-wa-disabled".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let result = notifier.ask_question(&issue, &request).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ask_question_api_error_propagates() {
+        let mock = MockWhatsAppClient::error(400, "Bad request");
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-wa-err".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which branch?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let result = notifier.ask_question(&issue, &request).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_recipients_unknown_user_slug_falls_back() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "alice".to_string(),
+            crate::config::UserConfig {
+                whatsapp_number: Some("+15550001111".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let notifier = WhatsAppNotifier::with_http_client_and_registry(
+            enabled_config(),
+            MockWhatsAppClient::success(),
+            registry,
+        );
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "unknown_user");
+        let recipients = notifier.resolve_recipients(Some(&issue));
+        assert_eq!(recipients, vec!["+15559876543".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_exactly_4096_not_truncated() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+
+        let msg = "x".repeat(4085);
+        notifier.notify_status(&msg).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert_eq!(body.len(), 4096);
+        assert!(!body.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_cascade_takes_precedence_over_pr_update() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+        issue.set_metadata("is_pr_update", true);
+
+        notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("Cascade PR"));
+        assert!(!body.contains("PR Updated"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_recipient_each_gets_correct_to_number() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(multi_recipient_config(), mock);
+
+        notifier.notify_status("broadcast").await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].2["to"], "+15551111111");
+        assert_eq!(calls[1].2["to"], "+15552222222");
+        assert_eq!(calls[2].2["to"], "+15553333333");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_empty_recipients_no_api_calls() {
+        let mock = MockWhatsAppClient::success();
+        let config = WhatsAppConfig {
+            phone_number_id: Some("pid".to_string()),
+            access_token: Some("token".into()),
+            to_numbers: vec![],
+            source_enabled: false,
+            listen_phone_number_id: None,
+            poll_interval_ms: None,
+        };
+        let notifier = WhatsAppNotifier::with_http_client(config, mock);
+
+        let result = notifier.notify_status("hello").await;
+        assert!(result.is_ok());
+        assert_eq!(notifier.http.get_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_notify_status_unicode_passthrough() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+
+        notifier
+            .notify_status("Status: OK \u{2705} \u{1F680}")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("\u{2705}"));
+        assert!(body.contains("\u{1F680}"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_error_101_chars_gets_truncated() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+
+        let error_101 = "x".repeat(101);
+        notifier.notify_failed(&issue, &error_101).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("..."));
+        assert!(!body.contains(&error_101));
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_normal_pr_created() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+
+        notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("PR Created"));
+        assert!(!body.contains("Cascade"));
+        assert!(!body.contains("Updated"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_completed_normal_no_regression() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+
+        notifier.notify_completed(&issue).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("Completed"));
+        assert!(body.contains("no PR URL"));
+        assert!(!body.contains("Regression"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_normal_no_regression_no_cascade() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+
+        notifier
+            .notify_failed(&issue, "compile error")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("FAILED"));
+        assert!(body.contains("compile error"));
+        assert!(!body.contains("REGRESSION"));
+        assert!(!body.contains("CASCADE"));
+    }
+
+    #[tokio::test]
+    async fn test_send_message_error_response_299() {
+        let mock = MockWhatsAppClient::new(299, "OK");
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.notify_status("test").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_message_error_response_300() {
+        let mock = MockWhatsAppClient::new(300, "Redirect");
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.notify_status("test").await;
+        assert!(result.is_err());
+    }
 }

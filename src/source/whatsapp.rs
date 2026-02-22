@@ -654,4 +654,189 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("to_numbers"));
     }
+
+    // --- Additional coverage tests ---
+
+    #[tokio::test]
+    async fn test_build_issue_context_with_url() {
+        let source = WhatsAppSource::new(make_config());
+        let mut issue = Issue::new("1", "WA-1", "Fix login", "https://wa.me/msg/123", "whatsapp");
+        issue.description = Some("Details here".to_string());
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+        assert!(context.contains("Fix login"));
+        assert!(context.contains("Details here"));
+        assert!(context.contains("URL: https://wa.me/msg/123"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_accumulates_across_fetches() {
+        let source = WhatsAppSource::new(make_config());
+
+        source.push_message(make_message("msg-a", "+1", "first"));
+        let _ = source.fetch_issues().await.unwrap();
+
+        source.push_message(make_message("msg-b", "+2", "second"));
+        let _ = source.fetch_issues().await.unwrap();
+
+        let cache = source.cache.read().unwrap();
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key("msg-a"));
+        assert!(cache.contains_key("msg-b"));
+    }
+
+    #[test]
+    fn test_message_to_issue_empty_text() {
+        let msg = make_message("id1", "+1", "");
+        let issue = WhatsAppSource::message_to_issue(&msg);
+        assert_eq!(issue.title, "");
+        assert_eq!(issue.description.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_preserves_order() {
+        let source = WhatsAppSource::new(make_config());
+
+        source.push_message(make_message("1", "+1", "alpha"));
+        source.push_message(make_message("2", "+2", "beta"));
+        source.push_message(make_message("3", "+3", "gamma"));
+
+        let issues = source.fetch_issues().await.unwrap();
+        assert_eq!(issues.len(), 3);
+        assert_eq!(issues[0].id, "1");
+        assert_eq!(issues[1].id, "2");
+        assert_eq!(issues[2].id, "3");
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_after_multiple_fetches() {
+        let source = WhatsAppSource::new(make_config());
+
+        source.push_message(make_message("first", "+1", "First message"));
+        let _ = source.fetch_issues().await.unwrap();
+
+        source.push_message(make_message("second", "+2", "Second message"));
+        let _ = source.fetch_issues().await.unwrap();
+
+        let first = source.get_issue("first").await.unwrap();
+        assert_eq!(first.title, "First message");
+        let second = source.get_issue("second").await.unwrap();
+        assert_eq!(second.title, "Second message");
+    }
+
+    #[test]
+    fn test_matches_criteria_priority_is_normal() {
+        let source = WhatsAppSource::new(make_config());
+        let issue = Issue::new("1", "WA-1", "Test", "", "whatsapp");
+        let result = source.matches_criteria(&issue);
+        assert_eq!(result.priority, MatchPriority::Normal);
+    }
+
+    #[tokio::test]
+    async fn test_default_resolve_issue() {
+        let source = WhatsAppSource::new(make_config());
+        let result = source.resolve_issue("any-id").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_default_add_comment() {
+        let source = WhatsAppSource::new(make_config());
+        let result = source.add_comment("any-id", "test comment").await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_default_is_terminal_status() {
+        let source = WhatsAppSource::new(make_config());
+        assert!(source.is_terminal_status("completed"));
+        assert!(source.is_terminal_status("resolved"));
+        assert!(source.is_terminal_status("cancelled"));
+        assert!(source.is_terminal_status("canceled"));
+        assert!(source.is_terminal_status("ignored"));
+        assert!(source.is_terminal_status("closed"));
+        assert!(source.is_terminal_status("done"));
+        assert!(!source.is_terminal_status("open"));
+        assert!(!source.is_terminal_status("in_progress"));
+    }
+
+    #[tokio::test]
+    async fn test_default_list_open_issues() {
+        let source = WhatsAppSource::new(make_config());
+        let result = source.list_open_issues("filter").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_default_find_or_create_label() {
+        let source = WhatsAppSource::new(make_config());
+        let result = source.find_or_create_label("bug").await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_title_101_chars() {
+        let s = "a".repeat(101);
+        let title = WhatsAppSource::extract_title(&s);
+        assert_eq!(title.len(), 100);
+        assert!(title.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_whitespace_only_filtered() {
+        let source = WhatsAppSource::new(make_config());
+
+        source.push_message(make_message("1", "+1", "\t\n  "));
+        source.push_message(make_message("2", "+2", "valid"));
+
+        let issues = source.fetch_issues().await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "2");
+    }
+
+    #[test]
+    fn test_message_to_issue_long_id() {
+        let msg = make_message(
+            "wamid.HBgLMTIzNDU2Nzg5MBUCABI3MTIzNDU2Nzg5MA==",
+            "+1",
+            "text",
+        );
+        let issue = WhatsAppSource::message_to_issue(&msg);
+        assert_eq!(issue.short_id, "WA-wamid.HB");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_empty_text_not_cached() {
+        let source = WhatsAppSource::new(make_config());
+
+        source.push_message(make_message("empty-1", "+1", "   "));
+
+        let issues = source.fetch_issues().await.unwrap();
+        assert!(issues.is_empty());
+
+        let cache = source.cache.read().unwrap();
+        assert!(!cache.contains_key("empty-1"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_empty_url() {
+        let source = WhatsAppSource::new(make_config());
+        let issue = Issue::new("1", "WA-1", "Title", "", "whatsapp");
+        let context = source.build_issue_context(&issue).await.unwrap();
+        assert!(!context.contains("URL:"));
+    }
+
+    #[test]
+    fn test_message_to_issue_sets_source() {
+        let msg = make_message("1", "+1", "text");
+        let issue = WhatsAppSource::message_to_issue(&msg);
+        assert_eq!(issue.source, "whatsapp");
+    }
+
+    #[test]
+    fn test_push_message_recovery() {
+        let source = WhatsAppSource::new(make_config());
+        source.push_message(make_message("1", "+1", "test"));
+        assert_eq!(source.buffer.read().unwrap().len(), 1);
+    }
 }

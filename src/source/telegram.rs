@@ -941,4 +941,310 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("bot_token"));
     }
+
+    // --- Additional coverage tests ---
+
+    #[tokio::test]
+    async fn test_build_issue_context_no_description() {
+        let source = TelegramSource::new(make_config());
+        let issue =
+            Issue::new("1", "TG-1", "Fix login", "https://t.me/c/1234567890/1", "telegram");
+        let context = source.build_issue_context(&issue).await.unwrap();
+        assert!(context.contains("Fix login"));
+        assert!(!context.contains("Message:"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_no_author() {
+        let source = TelegramSource::new(make_config());
+        let mut issue = Issue::new("1", "TG-1", "Test", "", "telegram");
+        issue.description = Some("body text".to_string());
+        let context = source.build_issue_context(&issue).await.unwrap();
+        assert!(context.contains("body text"));
+        assert!(!context.contains("Author:"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_no_chat_id_metadata() {
+        let source = TelegramSource::new(make_config());
+        let issue = Issue::new("1", "TG-1", "Test", "", "telegram");
+        let context = source.build_issue_context(&issue).await.unwrap();
+        assert!(!context.contains("Chat ID:"));
+    }
+
+    #[test]
+    fn test_message_to_issue_user_without_username() {
+        let msg = TelegramMessage {
+            message_id: 10,
+            from: Some(TelegramUser {
+                id: 99,
+                is_bot: false,
+                username: None,
+                first_name: Some("NoUsername".to_string()),
+            }),
+            chat: TelegramChat {
+                id: -1001234567890,
+                title: None,
+            },
+            text: Some("hello".to_string()),
+            date: 1700000000,
+        };
+        let issue = TelegramSource::message_to_issue(&msg);
+        assert!(issue.get_metadata::<String>("author_username").is_none());
+        assert_eq!(
+            issue.get_metadata::<String>("author_id"),
+            Some("99".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_title_exactly_100_chars() {
+        let s = "b".repeat(100);
+        let title = TelegramSource::extract_title(&s);
+        assert_eq!(title.len(), 100);
+        assert!(!title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_title_101_chars() {
+        let s = "b".repeat(101);
+        let title = TelegramSource::extract_title(&s);
+        assert_eq!(title.len(), 100);
+        assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_message_url_boundary_value() {
+        // Exactly -1_000_000_000_000 is NOT a supergroup (boundary)
+        let url = TelegramSource::message_url(-1_000_000_000_000, 1);
+        assert_eq!(url, "");
+
+        // One below is a supergroup
+        let url = TelegramSource::message_url(-1_000_000_000_001, 1);
+        assert_eq!(url, "https://t.me/c/1/1");
+    }
+
+    #[test]
+    fn test_message_url_positive_chat_id() {
+        let url = TelegramSource::message_url(12345, 1);
+        assert_eq!(url, "");
+    }
+
+    #[test]
+    fn test_message_url_zero_chat_id() {
+        let url = TelegramSource::message_url(0, 1);
+        assert_eq!(url, "");
+    }
+
+    #[test]
+    fn test_matches_criteria_priority_is_normal() {
+        let source = TelegramSource::new(make_config());
+        let issue = Issue::new("1", "TG-1", "Test", "http://test.com", "telegram");
+        let result = source.matches_criteria(&issue);
+        assert_eq!(result.priority, MatchPriority::Normal);
+    }
+
+    #[tokio::test]
+    async fn test_default_resolve_issue() {
+        let source = TelegramSource::new(make_config());
+        let result = source.resolve_issue("any-id").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_default_add_comment() {
+        let source = TelegramSource::new(make_config());
+        let result = source.add_comment("any-id", "test comment").await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_default_is_terminal_status() {
+        let source = TelegramSource::new(make_config());
+        assert!(source.is_terminal_status("completed"));
+        assert!(source.is_terminal_status("resolved"));
+        assert!(source.is_terminal_status("cancelled"));
+        assert!(source.is_terminal_status("canceled"));
+        assert!(source.is_terminal_status("ignored"));
+        assert!(source.is_terminal_status("closed"));
+        assert!(source.is_terminal_status("done"));
+        assert!(!source.is_terminal_status("open"));
+        assert!(!source.is_terminal_status("in_progress"));
+    }
+
+    #[tokio::test]
+    async fn test_default_list_open_issues() {
+        let source = TelegramSource::new(make_config());
+        let result = source.list_open_issues("filter").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_default_find_or_create_label() {
+        let source = TelegramSource::new(make_config());
+        let result = source.find_or_create_label("bug").await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_telegram_update_clone() {
+        let msg = make_message(1, "hello", false);
+        let update = make_update(100, msg);
+        let cloned = update.clone();
+        assert_eq!(cloned.update_id, 100);
+        assert!(cloned.message.is_some());
+    }
+
+    #[test]
+    fn test_deserialize_telegram_response_ok_false() {
+        let json = r#"{"ok": false, "result": []}"#;
+        let resp: TelegramResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.ok);
+    }
+
+    #[test]
+    fn test_deserialize_send_message_response_no_result() {
+        let json = r#"{"ok": false}"#;
+        let resp: SendMessageResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.ok);
+        assert!(resp.result.is_none());
+    }
+
+    #[test]
+    fn test_cache_multiple_messages() {
+        let source = TelegramSource::new(make_config());
+        let msg1 = make_message(1, "first", false);
+        let msg2 = make_message(2, "second", false);
+        let msg3 = make_message(3, "third", false);
+        source.cache_message(&msg1);
+        source.cache_message(&msg2);
+        source.cache_message(&msg3);
+
+        let cache = source.cache.read().unwrap();
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_returns_correct_fields() {
+        let source = TelegramSource::new(make_config());
+        let msg = make_message(42, "Test message body", false);
+        source.cache_message(&msg);
+
+        let issue = source.get_issue("42").await.unwrap();
+        assert_eq!(issue.id, "42");
+        assert_eq!(issue.short_id, "TG-42");
+        assert_eq!(issue.source, "telegram");
+        assert_eq!(issue.description.as_deref(), Some("Test message body"));
+        assert_eq!(
+            issue.get_metadata::<String>("author_username"),
+            Some("testuser".to_string())
+        );
+    }
+
+    #[test]
+    fn test_api_url_send_message() {
+        let source = TelegramSource::new(make_config());
+        let url = source.api_url("sendMessage").unwrap();
+        assert!(url.contains("/sendMessage"));
+        assert!(url.contains("api.telegram.org/bot"));
+    }
+
+    #[test]
+    fn test_matches_criteria_other_source_issue() {
+        let source = TelegramSource::new(make_config());
+        let issue = Issue::new("1", "LIN-1", "Linear Issue", "http://linear.app", "linear");
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+    }
+
+    #[test]
+    fn test_message_to_issue_private_chat_empty_url() {
+        let msg = TelegramMessage {
+            message_id: 5,
+            from: Some(TelegramUser {
+                id: 42,
+                is_bot: false,
+                username: Some("alice".to_string()),
+                first_name: None,
+            }),
+            chat: TelegramChat {
+                id: 12345,
+                title: None,
+            },
+            text: Some("DM message".to_string()),
+            date: 1700000000,
+        };
+        let issue = TelegramSource::message_to_issue(&msg);
+        assert_eq!(issue.url, "");
+    }
+
+    #[test]
+    fn test_initial_state_empty_cache() {
+        let source = TelegramSource::new(make_config());
+        let cache = source.cache.read().unwrap();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_deserialize_message_with_all_fields() {
+        let json = r#"{
+            "message_id": 42,
+            "from": {
+                "id": 100,
+                "is_bot": false,
+                "username": "alice",
+                "first_name": "Alice"
+            },
+            "chat": {
+                "id": -1001234567890,
+                "title": "Dev Chat"
+            },
+            "text": "Hello world",
+            "date": 1700000000
+        }"#;
+        let msg: TelegramMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.message_id, 42);
+        assert_eq!(
+            msg.from.as_ref().unwrap().username.as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            msg.from.as_ref().unwrap().first_name.as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(msg.chat.title.as_deref(), Some("Dev Chat"));
+        assert_eq!(msg.text.as_deref(), Some("Hello world"));
+        assert_eq!(msg.date, 1700000000);
+    }
+
+    #[test]
+    fn test_deserialize_multiple_updates() {
+        let json = r#"{
+            "ok": true,
+            "result": [
+                {
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 10,
+                        "chat": {"id": 100},
+                        "date": 1700000000,
+                        "text": "first"
+                    }
+                },
+                {
+                    "update_id": 2,
+                    "message": {
+                        "message_id": 11,
+                        "chat": {"id": 100},
+                        "date": 1700000001,
+                        "text": "second"
+                    }
+                }
+            ]
+        }"#;
+        let resp: TelegramResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.result.len(), 2);
+        assert_eq!(resp.result[0].update_id, 1);
+        assert_eq!(resp.result[1].update_id, 2);
+    }
 }
