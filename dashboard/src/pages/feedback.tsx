@@ -10,9 +10,9 @@ import { DataTable, type Column } from '../components/shared/data-table'
 import { Modal } from '../components/shared/modal'
 
 const outcomeColors: Record<string, string> = {
-  success: 'bg-green-100 text-green-800',
-  failure: 'bg-red-100 text-red-800',
-  partial: 'bg-yellow-100 text-yellow-800',
+  success: 'bg-green-500/10 text-green-700 dark:text-green-400',
+  failure: 'bg-red-500/10 text-red-700 dark:text-red-400',
+  partial: 'bg-yellow-500/10 text-yellow-700 dark:text-yellow-400',
 }
 
 const sourceOptions = [
@@ -49,7 +49,7 @@ export default function FeedbackPage() {
       render: row => (
         <span
           className={`px-2 py-0.5 rounded text-xs font-medium ${
-            outcomeColors[row.outcome] || 'bg-gray-100 text-gray-800'
+            outcomeColors[row.outcome] || 'bg-zinc-500/10 text-zinc-700 dark:text-zinc-400'
           }`}
         >
           {row.outcome}
@@ -149,7 +149,7 @@ export default function FeedbackPage() {
                 <p className="text-sm text-muted-foreground">Outcome</p>
                 <span
                   className={`px-2 py-0.5 rounded text-xs font-medium ${
-                    outcomeColors[selectedFeedback.outcome] || 'bg-gray-100 text-gray-800'
+                    outcomeColors[selectedFeedback.outcome] || 'bg-zinc-500/10 text-zinc-700 dark:text-zinc-400'
                   }`}
                 >
                   {selectedFeedback.outcome}

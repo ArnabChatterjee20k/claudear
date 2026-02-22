@@ -26,10 +26,10 @@ import {
 } from 'lucide-react'
 
 const confidenceColors: Record<string, string> = {
-  high: 'bg-green-100 text-green-800',
-  medium: 'bg-yellow-100 text-yellow-800',
-  low: 'bg-orange-100 text-orange-800',
-  none: 'bg-gray-100 text-gray-800',
+  high: 'bg-green-500/10 text-green-700 dark:text-green-400',
+  medium: 'bg-yellow-500/10 text-yellow-700 dark:text-yellow-400',
+  low: 'bg-orange-500/10 text-orange-700 dark:text-orange-400',
+  none: 'bg-zinc-500/10 text-zinc-700 dark:text-zinc-400',
 }
 
 export default function InferencePage() {
@@ -74,7 +74,7 @@ export default function InferencePage() {
         row.confidence ? (
           <span
             className={`px-2 py-0.5 rounded text-xs font-medium ${
-              confidenceColors[row.confidence] || 'bg-gray-100 text-gray-800'
+              confidenceColors[row.confidence] || 'bg-zinc-500/10 text-zinc-700 dark:text-zinc-400'
             }`}
           >
             {row.confidence}
@@ -136,7 +136,7 @@ export default function InferencePage() {
           <StatsCard
             title="Total Attempts"
             value={stats.total_attempts}
-            icon={<Brain className="h-4 w-4 text-blue-500" />}
+            icon={<Brain className="h-4 w-4 text-primary" />}
             description="All inference runs"
           />
           <StatsCard
@@ -214,7 +214,7 @@ export default function InferencePage() {
                 {selectedEntry.confidence ? (
                   <span
                     className={`px-2 py-0.5 rounded text-xs font-medium ${
-                      confidenceColors[selectedEntry.confidence] || 'bg-gray-100 text-gray-800'
+                      confidenceColors[selectedEntry.confidence] || 'bg-zinc-500/10 text-zinc-700 dark:text-zinc-400'
                     }`}
                   >
                     {selectedEntry.confidence}

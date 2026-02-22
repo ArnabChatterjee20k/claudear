@@ -3,10 +3,11 @@ import { useRouter } from '../../router'
 import { useAuth } from '../../lib/auth'
 import { getInitials } from '../../lib/formatters'
 import {
-  Activity, BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
+  BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
   Users, LogOut, Gauge, Settings, Sun, Moon, Ticket, GraduationCap,
 } from 'lucide-react'
+import { setSentryColorScheme } from '../../lib/sentry'
 
 type NavGroup = {
   label?: string
@@ -62,14 +63,15 @@ export function Sidebar() {
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
     localStorage.setItem('theme', dark ? 'dark' : 'light')
+    setSentryColorScheme(dark)
   }, [dark])
 
   return (
     <aside className="w-56 border-r bg-card flex flex-col h-screen sticky top-0">
       <div className="p-4 border-b">
-        <h1 className="text-lg font-bold flex items-center gap-2">
-          <Activity className="h-5 w-5 text-primary" />
-          Claudear
+        <h1 className="text-lg font-bold flex items-center gap-1 font-mono">
+          claudear
+          <span className="inline-block w-[10px] h-[20px] bg-primary ml-0.5 rounded-[1px]" />
         </h1>
       </div>
       <nav className="flex-1 p-2 overflow-y-auto">

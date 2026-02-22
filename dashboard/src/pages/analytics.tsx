@@ -68,7 +68,7 @@ export default function AnalyticsPage() {
             <StatsCard
               title="Total Processed"
               value={summary.total_processed}
-              icon={<BarChart3 className="h-4 w-4 text-blue-500" />}
+              icon={<BarChart3 className="h-4 w-4 text-primary" />}
               description={`${summary.total_merged} merged`}
             />
             <StatsCard

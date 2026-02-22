@@ -35,19 +35,19 @@ function IndexingProgressBar({ progress }: { progress: IndexingProgress }) {
       : 0
 
   return (
-    <Card className="border-blue-200 bg-blue-50/50 dark:border-blue-900 dark:bg-blue-950/30">
+    <Card className="border-primary/20 bg-primary/5">
       <CardContent className="p-4 space-y-3">
         <div className="flex items-center gap-2">
-          <Loader2 className="h-4 w-4 text-blue-500 animate-spin" />
+          <Loader2 className="h-4 w-4 text-primary animate-spin" />
           <span className="text-sm font-medium">Indexing in progress</span>
           <span className="text-sm text-muted-foreground ml-auto">
             {progress.indexed_repos} / {progress.total_repos} repos ({pct}%)
           </span>
         </div>
 
-        <div className="h-2 bg-blue-100 dark:bg-blue-900/50 rounded-full overflow-hidden">
+        <div className="h-2 bg-primary/10 rounded-full overflow-hidden">
           <div
-            className="h-full bg-blue-500 rounded-full transition-all duration-500 ease-out"
+            className="h-full bg-primary rounded-full transition-all duration-500 ease-out"
             style={{ width: `${pct}%` }}
           />
         </div>
@@ -228,7 +228,7 @@ export default function ReposPage() {
           <StatsCard
             title="Total Repos"
             value={stats.repo_count}
-            icon={<Database className="h-4 w-4 text-blue-500" />}
+            icon={<Database className="h-4 w-4 text-primary" />}
             description="Indexed repositories"
           />
           <StatsCard

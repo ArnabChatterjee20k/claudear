@@ -73,16 +73,16 @@ export default function OverviewPage() {
       <PageHeader title="Overview" description="Monitor automated issue fixing" />
 
       {overview.time_savings && overview.time_savings.merged_count > 0 && (
-        <Card className="border-green-200 bg-green-50 dark:bg-green-950/20 dark:border-green-900">
+        <Card className="border-primary/20 bg-primary/5">
           <CardContent className="pt-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium text-green-700 dark:text-green-400">Engineering Hours Saved This Week</p>
-                <p className="text-3xl font-bold text-green-800 dark:text-green-300">{overview.time_savings.hours_saved.toFixed(1)}h</p>
-                <p className="text-lg font-semibold text-green-700 dark:text-green-400">
+                <p className="text-sm font-medium text-primary/80">Engineering Hours Saved This Week</p>
+                <p className="text-3xl font-bold text-primary">{overview.time_savings.hours_saved.toFixed(1)}h</p>
+                <p className="text-lg font-semibold text-primary/80">
                   ${overview.time_savings.cost_saved.toLocaleString()} saved
                 </p>
-                <p className="text-sm text-green-600 dark:text-green-500">
+                <p className="text-sm text-primary/60">
                   {overview.time_savings.merged_count} merged fixes
                 </p>
               </div>
@@ -96,7 +96,7 @@ export default function OverviewPage() {
         <StatsCard title="Success Rate" value={`${success_rate.toFixed(1)}%`} icon={<CheckCircle2 className="h-4 w-4 text-green-500" />} description={`${stats.success + stats.merged} successful`} />
         <StatsCard title="Merge Rate" value={`${merge_rate.toFixed(1)}%`} icon={<GitMerge className="h-4 w-4 text-purple-500" />} description={`${stats.merged} merged PRs`} />
         <StatsCard title="Pending" value={stats.pending} icon={<Clock className="h-4 w-4 text-yellow-500" />} description="In progress" />
-        <StatsCard title="Agent Spawns Today" value={formatNumber(overview.agent_spawns_today ?? 0)} icon={<Bot className="h-4 w-4 text-blue-500" />} description="Claude invocations (24h)" />
+        <StatsCard title="Agent Spawns Today" value={formatNumber(overview.agent_spawns_today ?? 0)} icon={<Bot className="h-4 w-4 text-primary" />} description="Claude invocations (24h)" />
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-6">
@@ -122,7 +122,7 @@ export default function OverviewPage() {
           <CardContent>
             {retries.ready.length > 0 && (
               <div className="mb-4">
-                <h4 className="text-sm font-medium mb-2 text-green-600">Ready for Retry</h4>
+                <h4 className="text-sm font-medium mb-2 text-primary">Ready for Retry</h4>
                 <div className="space-y-2">
                   {retries.ready.map(attempt => (
                     <AttemptRow key={attempt.id} attempt={attempt} />

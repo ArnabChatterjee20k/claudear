@@ -19,9 +19,9 @@ describe("Sidebar", () => {
     );
   }
 
-  test('renders "Claudear" title', () => {
+  test('renders "claudear" title', () => {
     renderSidebar();
-    expect(screen.getByText("Claudear")).toBeDefined();
+    expect(screen.getByText("claudear")).toBeDefined();
   });
 
   test("renders all nav item labels", () => {

@@ -129,7 +129,7 @@ export default function PrsPage() {
           <StatsCard
             title="Total PRs"
             value={analytics.total}
-            icon={<GitPullRequest className="h-4 w-4 text-blue-500" />}
+            icon={<GitPullRequest className="h-4 w-4 text-primary" />}
             description="All tracked PRs"
           />
           <StatsCard

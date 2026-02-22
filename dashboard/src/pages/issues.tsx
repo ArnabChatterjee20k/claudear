@@ -54,7 +54,7 @@ export default function IssuesPage() {
       key: 'source',
       header: 'Source',
       render: row => (
-        <span className="px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 capitalize">
+        <span className="px-2 py-0.5 rounded text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 capitalize">
           {row.source}
         </span>
       ),

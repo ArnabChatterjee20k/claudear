@@ -11,20 +11,20 @@ import { TimeAgo } from '../components/shared/time-ago'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 const activityTypeColors: Record<string, string> = {
-  issue_received: 'bg-blue-100 text-blue-800',
-  attempt_started: 'bg-yellow-100 text-yellow-800',
-  attempt_completed: 'bg-green-100 text-green-800',
-  attempt_failed: 'bg-red-100 text-red-800',
-  decision: 'bg-slate-100 text-slate-800',
-  claude_started: 'bg-indigo-100 text-indigo-800',
-  claude_completed: 'bg-emerald-100 text-emerald-800',
-  claude_failed: 'bg-rose-100 text-rose-800',
-  claude_timed_out: 'bg-orange-100 text-orange-800',
-  pr_created: 'bg-purple-100 text-purple-800',
-  pr_merged: 'bg-purple-200 text-purple-900',
-  pr_closed: 'bg-orange-100 text-orange-800',
-  review_received: 'bg-cyan-100 text-cyan-800',
-  retry_scheduled: 'bg-amber-100 text-amber-800',
+  issue_received: 'bg-blue-500/10 text-blue-700 dark:text-blue-400',
+  attempt_started: 'bg-yellow-500/10 text-yellow-700 dark:text-yellow-400',
+  attempt_completed: 'bg-green-500/10 text-green-700 dark:text-green-400',
+  attempt_failed: 'bg-red-500/10 text-red-700 dark:text-red-400',
+  decision: 'bg-slate-500/10 text-slate-700 dark:text-slate-400',
+  claude_started: 'bg-indigo-500/10 text-indigo-700 dark:text-indigo-400',
+  claude_completed: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
+  claude_failed: 'bg-rose-500/10 text-rose-700 dark:text-rose-400',
+  claude_timed_out: 'bg-orange-500/10 text-orange-700 dark:text-orange-400',
+  pr_created: 'bg-purple-500/10 text-purple-700 dark:text-purple-400',
+  pr_merged: 'bg-purple-500/15 text-purple-700 dark:text-purple-300',
+  pr_closed: 'bg-orange-500/10 text-orange-700 dark:text-orange-400',
+  review_received: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-400',
+  retry_scheduled: 'bg-amber-500/10 text-amber-700 dark:text-amber-400',
 }
 
 const sourceOptions = [
@@ -116,7 +116,7 @@ export default function ActivityPage() {
                         <TimeAgo date={entry.timestamp} />
                         <span
                           className={`px-2 py-0.5 rounded text-xs font-medium ${
-                            activityTypeColors[entry.activity_type] || 'bg-gray-100 text-gray-800'
+                            activityTypeColors[entry.activity_type] || 'bg-zinc-500/10 text-zinc-700 dark:text-zinc-400'
                           }`}
                         >
                           {entry.activity_type.replace(/_/g, ' ')}

@@ -31,7 +31,7 @@ interface ParsedField {
 }
 
 const SECTION_META: Record<string, { label: string; icon: React.ReactNode; description: string }> = {
-  _top: { label: 'Core', icon: <Server className="h-4 w-4 text-blue-500" />, description: 'Working directory, orgs, and discovery paths' },
+  _top: { label: 'Core', icon: <Server className="h-4 w-4 text-primary" />, description: 'Working directory, orgs, and discovery paths' },
   retry: { label: 'Retry Strategy', icon: <RefreshCw className="h-4 w-4 text-orange-500" />, description: 'Retry timing and limits for failed fixes' },
   claude: { label: 'Claude', icon: <Bot className="h-4 w-4 text-violet-500" />, description: 'Model, instructions, and permissions' },
   discord: { label: 'Discord', icon: <Bell className="h-4 w-4 text-indigo-500" />, description: 'Webhook and bot notification settings' },
@@ -43,6 +43,8 @@ const SECTION_META: Record<string, { label: string; icon: React.ReactNode; descr
   email: { label: 'Email', icon: <Bell className="h-4 w-4 text-green-500" />, description: 'SMTP and IMAP notification settings' },
   sms: { label: 'SMS', icon: <Bell className="h-4 w-4 text-yellow-500" />, description: 'Twilio SMS notification settings' },
   push: { label: 'Push', icon: <Bell className="h-4 w-4 text-pink-500" />, description: 'Pushover notification settings' },
+  whatsapp: { label: 'WhatsApp', icon: <Bell className="h-4 w-4 text-green-600" />, description: 'WhatsApp Business Cloud API settings' },
+  telegram: { label: 'Telegram', icon: <Bell className="h-4 w-4 text-blue-500" />, description: 'Telegram Bot API settings' },
   regression: { label: 'Regression', icon: <Shield className="h-4 w-4 text-red-400" />, description: 'Post-fix regression monitoring' },
   cascade: { label: 'Cascade', icon: <RefreshCw className="h-4 w-4 text-teal-500" />, description: 'Multi-repo cascade chaining' },
   learning: { label: 'Learning', icon: <Cpu className="h-4 w-4 text-emerald-500" />, description: 'Continuous learning and knowledge extraction' },

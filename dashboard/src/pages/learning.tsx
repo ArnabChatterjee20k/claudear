@@ -30,10 +30,10 @@ function ConfidenceBadge({ value }: { value: number }) {
   const pct = Math.round(value * 100)
   const color =
     pct >= 80
-      ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300'
+      ? 'bg-green-500/10 text-green-700 dark:text-green-400'
       : pct >= 50
-        ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300'
-        : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300'
+        ? 'bg-yellow-500/10 text-yellow-700 dark:text-yellow-400'
+        : 'bg-red-500/10 text-red-700 dark:text-red-400'
   return (
     <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${color}`}>
       {pct}%
@@ -43,15 +43,15 @@ function ConfidenceBadge({ value }: { value: number }) {
 
 function CategoryBadge({ category }: { category: string }) {
   const colors: Record<string, string> = {
-    missing_tests: 'bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300',
-    style_issue: 'bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300',
-    wrong_approach: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
-    incomplete: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300',
-    security: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
-    performance: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
-    documentation: 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300',
+    missing_tests: 'bg-orange-500/10 text-orange-700 dark:text-orange-400',
+    style_issue: 'bg-purple-500/10 text-purple-700 dark:text-purple-400',
+    wrong_approach: 'bg-red-500/10 text-red-700 dark:text-red-400',
+    incomplete: 'bg-yellow-500/10 text-yellow-700 dark:text-yellow-400',
+    security: 'bg-red-500/10 text-red-700 dark:text-red-400',
+    performance: 'bg-blue-500/10 text-blue-700 dark:text-blue-400',
+    documentation: 'bg-zinc-500/10 text-zinc-700 dark:text-zinc-400',
   }
-  const c = colors[category] || 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300'
+  const c = colors[category] || 'bg-zinc-500/10 text-zinc-700 dark:text-zinc-400'
   return (
     <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${c}`}>
       {category.replace(/_/g, ' ')}
@@ -142,7 +142,7 @@ export default function LearningPage() {
             <StatsCard
               title="Knowledge Items"
               value={learning.knowledge_total}
-              icon={<BookOpen className="h-4 w-4 text-blue-500" />}
+              icon={<BookOpen className="h-4 w-4 text-primary" />}
               description={`${learning.knowledge.length} categories`}
             />
             <StatsCard
@@ -217,7 +217,7 @@ export default function LearningPage() {
                     header: 'Active',
                     render: row =>
                       row.is_active ? (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-500/10 text-green-700 dark:text-green-400">
                           active
                         </span>
                       ) : (
@@ -265,7 +265,7 @@ export default function LearningPage() {
                     header: 'Promoted',
                     render: row =>
                       row.promoted_to_instruction ? (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400">
                           promoted
                         </span>
                       ) : (

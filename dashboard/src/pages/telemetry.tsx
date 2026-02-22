@@ -173,7 +173,7 @@ export default function TelemetryPage() {
             <StatsCard
               title="Uptime"
               value={formatUptime(overview.uptime_secs)}
-              icon={<Clock3 className="h-4 w-4 text-blue-500" />}
+              icon={<Clock3 className="h-4 w-4 text-primary" />}
               description="API process uptime"
             />
             <StatsCard
@@ -225,7 +225,7 @@ export default function TelemetryPage() {
             <StatsCard
               title="Agent Spawns Today"
               value={formatCount(overview.agent_spawns_today)}
-              icon={<Bot className="h-4 w-4 text-blue-500" />}
+              icon={<Bot className="h-4 w-4 text-primary" />}
               description="Claude invocations (24h)"
             />
             <StatsCard
