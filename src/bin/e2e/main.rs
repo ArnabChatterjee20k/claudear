@@ -78,7 +78,7 @@ fn build_scm(cli: &Cli) -> Result<Arc<dyn ScmProvider>> {
             let token = std::env::var("CLAUDEAR_E2E_GITHUB_TOKEN")
                 .context("CLAUDEAR_E2E_GITHUB_TOKEN required")?;
             let config = claudear::config::GitHubConfig {
-                token: Some(token),
+                token: Some(token.into()),
                 auto_resolve_on_merge: true,
                 review_trigger: "@claudear".to_string(),
                 ..Default::default()
@@ -92,7 +92,7 @@ fn build_scm(cli: &Cli) -> Result<Arc<dyn ScmProvider>> {
                 .unwrap_or_else(|_| "https://gitlab.com".to_string());
             let config = claudear::config::GitLabConfig {
                 enabled: true,
-                token: Some(token),
+                token: Some(token.into()),
                 base_url,
                 review_trigger: "@claudear".to_string(),
                 ..Default::default()
@@ -112,7 +112,7 @@ fn build_source(cli: &Cli) -> Result<Arc<dyn IssueSource>> {
                 .context("CLAUDEAR_E2E_LINEAR_TEAM_ID required")?;
             let config = claudear::config::LinearConfig {
                 enabled: true,
-                api_key,
+                api_key: api_key.into(),
                 team_id: Some(team_id),
                 trigger_labels: vec!["claudear-e2e".to_string()],
                 trigger_states: vec!["backlog".to_string(), "todo".to_string()],
@@ -133,7 +133,7 @@ fn build_source(cli: &Cli) -> Result<Arc<dyn IssueSource>> {
                 enabled: true,
                 base_url,
                 email,
-                api_token,
+                api_token: api_token.into(),
                 auth_mode: "basic".to_string(),
                 project_keys: vec![project_key],
                 trigger_labels: vec!["claudear-e2e".to_string()],
@@ -150,9 +150,10 @@ fn build_source(cli: &Cli) -> Result<Arc<dyn IssueSource>> {
             // Webhook URL lets create_issue post as a non-bot (bypasses is_bot_message filter)
             let webhook_url = std::env::var("CLAUDEAR_E2E_DISCORD_WEBHOOK_URL")
                 .ok()
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+                .map(|s| claudear::secret::SecretValue::new(s));
             let config = claudear::config::DiscordConfig {
-                bot_token: Some(bot_token),
+                bot_token: Some(bot_token.into()),
                 channel_id: Some(channel_id.clone()),
                 source_enabled: true,
                 listen_channel_id: Some(channel_id),
@@ -169,9 +170,10 @@ fn build_source(cli: &Cli) -> Result<Arc<dyn IssueSource>> {
             // Webhook URL lets create_issue post as a non-bot (bypasses is_bot_message filter)
             let webhook_url = std::env::var("CLAUDEAR_E2E_SLACK_WEBHOOK_URL")
                 .ok()
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+                .map(|s| claudear::secret::SecretValue::new(s));
             let config = claudear::config::SlackConfig {
-                bot_token: Some(bot_token),
+                bot_token: Some(bot_token.into()),
                 channel_id: Some(channel_id.clone()),
                 source_enabled: true,
                 listen_channel_id: Some(channel_id),

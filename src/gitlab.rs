@@ -154,12 +154,12 @@ impl<H: HttpClient> GitLabClient<H> {
 
     /// Get the configured token.
     pub fn token(&self) -> Option<&str> {
-        self.config.token.as_deref()
+        self.config.token.as_ref().map(|s| s.expose())
     }
 
     /// Get the webhook secret.
     pub fn webhook_secret(&self) -> Option<&str> {
-        self.config.webhook_secret.as_deref()
+        self.config.webhook_secret.as_ref().map(|s| s.expose())
     }
 
     /// Fetch project issues from a specific project.
@@ -193,7 +193,7 @@ impl<H: HttpClient> GitLabClient<H> {
             url.push_str(&format!("&state={}", urlencoding::encode(s)));
         }
 
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let response = self.http.get(&url, headers).await?;
 
         if !response.is_success() {
@@ -237,7 +237,7 @@ impl<H: HttpClient> GitLabClient<H> {
             url.push_str(&format!("&state={}", urlencoding::encode(s)));
         }
 
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let response = self.http.get(&url, headers).await?;
 
         if !response.is_success() {
@@ -266,7 +266,7 @@ impl<H: HttpClient> GitLabClient<H> {
             issue_iid
         );
 
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let response = self.http.get(&url, headers).await?;
 
         if !response.is_success() {
@@ -302,7 +302,7 @@ impl<H: HttpClient> GitLabClient<H> {
                 page
             );
 
-            let headers = self.build_headers(token);
+            let headers = self.build_headers(token.expose());
             let response = self.http.get(&url, headers).await?;
 
             if !response.is_success() {
@@ -350,7 +350,7 @@ impl<H: HttpClient> GitLabClient<H> {
             mr_iid
         );
 
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let response = self.http.get(&url, headers).await?;
 
         if !response.is_success() {
@@ -431,7 +431,7 @@ impl<H: HttpClient> GitLabClient<H> {
             self.api_base(),
             encoded
         );
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let response = self.http.get(&url, headers).await?;
 
         if response.status == 404 {
@@ -491,7 +491,7 @@ impl<H: HttpClient> GitLabClient<H> {
             self.api_base(),
             encoded
         );
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let payload = serde_json::json!({
             "tag_name": tag,
             "name": name,
@@ -560,7 +560,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
             encoded,
             number
         );
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let response = self.http.get(&url, headers).await?;
 
         if response.is_not_found() {
@@ -597,7 +597,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
             encoded,
             number
         );
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let response = self.http.get(&url, headers).await?;
 
         if !response.is_success() {
@@ -628,7 +628,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
             encoded,
             number
         );
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let response = self.http.get(&url, headers).await?;
 
         if !response.is_success() {
@@ -732,7 +732,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
                 PER_PAGE,
                 page
             );
-            let headers = self.build_headers(token);
+            let headers = self.build_headers(token.expose());
             let response = self.http.get(&url, headers).await?;
 
             if response.is_not_found() {
@@ -795,7 +795,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
             encoded,
             number
         );
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let body = serde_json::json!({"squash": true}).to_string();
 
         let response = self.http.put(&url, headers, &body).await?;
@@ -822,7 +822,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
             encoded,
             number
         );
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let body = serde_json::json!({"state_event": "close"}).to_string();
 
         let response = self.http.put(&url, headers, &body).await?;
@@ -850,7 +850,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
             encoded,
             branch_encoded
         );
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
 
         let response = self.http.delete(&url, headers).await?;
         if !response.is_success() && !response.is_not_found() {
@@ -885,7 +885,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
                     encoded,
                     number
                 );
-                let headers = self.build_headers(token);
+                let headers = self.build_headers(token.expose());
                 let body = serde_json::json!({"body": body_text}).to_string();
 
                 let response = self.http.post(&url, headers, &body).await?;
@@ -903,7 +903,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
                     encoded,
                     number
                 );
-                let headers = self.build_headers(token);
+                let headers = self.build_headers(token.expose());
 
                 let response = self.http.post(&url, headers, "{}").await?;
                 if !response.is_success() {
@@ -922,7 +922,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
                     encoded,
                     number
                 );
-                let headers = self.build_headers(token);
+                let headers = self.build_headers(token.expose());
                 // Unapprove may fail if not previously approved -- ignore errors
                 let _ = self.http.post(&unapprove_url, headers.clone(), "{}").await;
 
@@ -958,7 +958,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
             self.api_base(),
             encoded
         );
-        let headers = self.build_headers(token);
+        let headers = self.build_headers(token.expose());
         let response = self.http.get(&url, headers).await?;
 
         if !response.is_success() {
@@ -2762,7 +2762,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_headers_custom_token() {
         let mut config = test_config();
-        config.token = Some("my-custom-gl-token".to_string());
+        config.token = Some("my-custom-gl-token".into());
 
         let mock = MockHttpClient::new();
         mock.mock_response(
@@ -4698,7 +4698,7 @@ mod tests {
         // enabled=false, token=Some => false
         let mut config = test_config();
         config.enabled = false;
-        config.token = Some("tk".to_string());
+        config.token = Some("tk".into());
         let client = GitLabClient::new(config);
         assert!(!client.is_enabled());
 

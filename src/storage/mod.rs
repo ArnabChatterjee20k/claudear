@@ -1,28 +1,35 @@
 //! Storage implementations for tracking fix attempts, embeddings, and analytics.
 
 pub mod analytics;
-mod sqlite;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+pub mod types;
+#[cfg(feature = "sqlite")]
 pub mod vectorlite;
 
 pub use analytics::{
     classify_error, compute_error_hash, AnalyticsService, TimePeriod, TrendAnalysis, TrendDirection,
 };
-pub use sqlite::{
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteTracker;
+pub use types::{
     ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
-    InferenceStats, SqliteTracker, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
+    InferenceStats, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
 };
+#[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 
 use crate::error::Result;
 use crate::feedback::FixOutcome;
 use crate::learning::cross_repo_correlator::CrossRepoCorrelation;
 use crate::types::{
-    ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
-    FixAttemptStatus, PrAnalytics, PrReviewRecord, ProcessingMetric, PromptExperiment,
-    QaKnowledgeEntry, QaMatch, RegressionCheck, RegressionWatch, RegressionWatchStatus,
+    ActivityLogEntry, AnalyticsSummary, AgentExecution, ErrorPattern, FixAttempt, FixAttemptStats,
+    FixAttemptStatus, IssueEmbedding, PrAnalytics, PrRecord, PrReviewRecord, ProcessingMetric,
+    PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck, RegressionWatch,
+    RegressionWatchStatus, SimilarIssue,
 };
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Trait for tracking fix attempts.
 pub trait FixAttemptTracker: Send + Sync {
@@ -102,8 +109,8 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(Vec::new()) // Default no-op
     }
 
-    /// Record a Claude execution.
-    fn record_execution(&self, _execution: &ClaudeExecution) -> Result<i64> {
+    /// Record an agent execution.
+    fn record_execution(&self, _execution: &AgentExecution) -> Result<i64> {
         Ok(0) // Default no-op
     }
 
@@ -225,8 +232,8 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(None)
     }
 
-    /// Get Claude executions for a given attempt ID.
-    fn get_executions_for_attempt(&self, _attempt_id: i64) -> Result<Vec<ClaudeExecution>> {
+    /// Get agent executions for a given attempt ID.
+    fn get_executions_for_attempt(&self, _attempt_id: i64) -> Result<Vec<AgentExecution>> {
         Ok(Vec::new())
     }
 
@@ -601,6 +608,504 @@ pub trait FixAttemptTracker: Send + Sync {
     ) -> Result<Vec<CrossRepoCorrelation>> {
         Ok(Vec::new())
     }
+
+    // --- Auth: User Management ---
+
+    /// Create a new user.
+    fn create_user(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+        _name: &str,
+        _role: &str,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Get a user by email.
+    fn get_user_by_email(&self, _email: &str) -> Result<Option<UserRow>> {
+        Ok(None)
+    }
+
+    /// Get a user by ID.
+    fn get_user_by_id(&self, _id: i64) -> Result<Option<UserRow>> {
+        Ok(None)
+    }
+
+    /// List all users.
+    fn list_users(&self) -> Result<Vec<UserRow>> {
+        Ok(Vec::new())
+    }
+
+    /// Update user fields. Returns true if a row was modified.
+    fn update_user(
+        &self,
+        _id: i64,
+        _email: Option<&str>,
+        _password_hash: Option<&str>,
+        _name: Option<&str>,
+        _role: Option<&str>,
+        _avatar_url: Option<&str>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Delete a user by ID. Returns true if a row was deleted.
+    fn delete_user(&self, _id: i64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Count total users.
+    fn count_users(&self) -> Result<i64> {
+        Ok(0)
+    }
+
+    // --- Auth: Session Management ---
+
+    /// Create a session for a user, returning the session token.
+    fn create_session(&self, _user_id: i64, _expires_at: &str) -> Result<String> {
+        Ok(String::new())
+    }
+
+    /// Get the user associated with a session token.
+    fn get_session_user(&self, _token: &str) -> Result<Option<UserRow>> {
+        Ok(None)
+    }
+
+    /// Delete a session by token.
+    fn delete_session(&self, _token: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Cleanup expired sessions, returning how many were removed.
+    fn cleanup_expired_sessions(&self) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Delete all sessions for a user.
+    fn delete_user_sessions(&self, _user_id: i64) -> Result<()> {
+        Ok(())
+    }
+
+    // --- Fix Attempts: Listing & Counting ---
+
+    /// List fix attempts with optional filters and pagination.
+    fn list_attempts(
+        &self,
+        _status: Option<&str>,
+        _source: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<FixAttempt>> {
+        Ok(Vec::new())
+    }
+
+    /// Count fix attempts with optional filters.
+    fn count_attempts(&self, _status: Option<&str>, _source: Option<&str>) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// List the most recent fix attempts.
+    fn list_recent_attempts(&self, _limit: usize) -> Result<Vec<FixAttempt>> {
+        Ok(Vec::new())
+    }
+
+    /// List fix attempts created since a timestamp.
+    fn list_attempts_since(&self, _since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+        Ok(Vec::new())
+    }
+
+    /// Get the most recent merged attempt for a given SCM repo.
+    fn get_most_recent_merged_attempt_for_repo(
+        &self,
+        _scm_repo: &str,
+    ) -> Result<Option<FixAttempt>> {
+        Ok(None)
+    }
+
+    // --- PR Lifecycle ---
+
+    /// Upsert a PR record. Returns the row ID.
+    fn upsert_pr(&self, _pr: &PrRecord) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Get a PR record by URL.
+    fn get_pr(&self, _pr_url: &str) -> Result<Option<PrRecord>> {
+        Ok(None)
+    }
+
+    /// Update a PR's status.
+    fn update_pr_status(&self, _pr_url: &str, _status: &str) -> Result<()> {
+        Ok(())
+    }
+
+    // --- Issue Management ---
+
+    /// List issues with optional source filter and pagination.
+    fn list_issues(
+        &self,
+        _source: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<IssueEmbedding>> {
+        Ok(Vec::new())
+    }
+
+    /// Count issues with optional source filter.
+    fn count_issues(&self, _source: Option<&str>) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Store an issue embedding record. Returns the row ID.
+    fn store_issue(&self, _issue: &IssueEmbedding) -> Result<i64> {
+        Ok(0)
+    }
+
+    // --- Executions ---
+
+    /// Get a specific execution for an attempt by execution ID.
+    fn get_execution_for_attempt(
+        &self,
+        _attempt_id: i64,
+        _execution_id: i64,
+    ) -> Result<Option<AgentExecution>> {
+        Ok(None)
+    }
+
+    // --- Webhook Deduplication ---
+
+    /// Check if a delivery has been seen and record it. Returns true if already seen.
+    fn check_and_record_delivery(&self, _delivery_id: &str, _source: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Cleanup old deliveries older than max_age_hours. Returns count removed.
+    fn cleanup_old_deliveries(&self, _max_age_hours: u64) -> Result<usize> {
+        Ok(0)
+    }
+
+    // --- Repository Sync ---
+
+    /// Sync repositories from a RepoIndex into storage. Returns count synced.
+    fn sync_from_index(
+        &self,
+        _index: &crate::repo::RepoIndex,
+        _sync_files: bool,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Sync a single repository's files into storage.
+    fn sync_repo_files(&self, _repo: &crate::repo::IndexedRepo) -> Result<()> {
+        Ok(())
+    }
+
+    // --- Cascade Attempts ---
+
+    /// Record a cascade fix attempt. Returns the new attempt ID.
+    fn record_cascade_attempt(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+        _short_id: &str,
+        _parent_attempt_id: i64,
+        _cascade_repo: &str,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Update a fix attempt with its PR details.
+    fn update_attempt_pr(
+        &self,
+        _attempt_id: i64,
+        _pr_url: &str,
+        _scm_repo: &str,
+        _pr_number: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Mark a cascade attempt as failed.
+    fn mark_cascade_failed(&self, _attempt_id: i64, _error: &str) -> Result<()> {
+        Ok(())
+    }
+
+    // --- Regression Watching ---
+
+    /// Create a regression watch. Returns the watch ID.
+    fn create_regression_watch(&self, _watch: &RegressionWatch) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Update a regression watch's status.
+    fn update_regression_watch_status(
+        &self,
+        _id: i64,
+        _status: RegressionWatchStatus,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // --- PR Review State ---
+
+    /// Save a PR review state.
+    fn save_pr_review_state(&self, _state: &crate::scm::PrReviewState) -> Result<()> {
+        Ok(())
+    }
+
+    /// Get all active PR review states.
+    fn get_active_pr_review_states(&self) -> Result<Vec<crate::scm::PrReviewState>> {
+        Ok(Vec::new())
+    }
+
+    /// Deactivate a PR review state.
+    fn deactivate_pr_review_state(&self, _pr_url: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Record a PR review comment. Returns the row ID.
+    fn record_pr_review_comment(
+        &self,
+        _pr_url: &str,
+        _comment: &crate::scm::ReviewComment,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Get all stored review comments for a PR.
+    fn get_comments_for_pr(
+        &self,
+        _pr_url: &str,
+    ) -> Result<Vec<types::StoredPrReviewComment>> {
+        Ok(Vec::new())
+    }
+
+    // --- Evaluation ---
+
+    /// Store an evaluation snapshot. Returns the row ID.
+    fn store_eval_snapshot(
+        &self,
+        _attempt_id: Option<i64>,
+        _phase: &str,
+        _snapshot: &crate::evaluation::EvalSnapshot,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Store an evaluation delta. Returns the row ID.
+    fn store_eval_delta(
+        &self,
+        _attempt_id: Option<i64>,
+        _repo: &str,
+        _delta: &crate::evaluation::EvalDelta,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    // --- Batch Activity & Pruning ---
+
+    /// Record a batch of activity log entries. Returns count recorded.
+    fn record_activities_batch(&self, _entries: &[ActivityLogEntry]) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Prune old activity log entries. Returns count pruned.
+    fn prune_old_activities(&self, _days_to_keep: i64) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Prune old processing metrics. Returns count pruned.
+    fn prune_old_metrics(&self, _days_to_keep: i64) -> Result<usize> {
+        Ok(0)
+    }
+
+    // --- Metrics & Diagnostics ---
+
+    /// Get activity type counts since a timestamp.
+    fn get_activity_type_counts_since(
+        &self,
+        _since: DateTime<Utc>,
+    ) -> Result<HashMap<String, i64>> {
+        Ok(HashMap::new())
+    }
+
+    /// Get metric counts for named metrics since a timestamp.
+    fn get_metric_counts_since(
+        &self,
+        _metric_names: &[&str],
+        _since: DateTime<Utc>,
+    ) -> Result<HashMap<String, i64>> {
+        Ok(HashMap::new())
+    }
+
+    /// Get metric sums for named metrics since a timestamp.
+    fn get_metric_sums_since(
+        &self,
+        _metric_names: &[&str],
+        _since: DateTime<Utc>,
+    ) -> Result<HashMap<String, f64>> {
+        Ok(HashMap::new())
+    }
+
+    /// Get metric sums grouped by source for named metrics since a timestamp.
+    fn get_metric_sums_by_source_since(
+        &self,
+        _metric_names: &[&str],
+        _since: DateTime<Utc>,
+    ) -> Result<HashMap<(String, String), f64>> {
+        Ok(HashMap::new())
+    }
+
+    /// Get diagnostic row counts for all major tables.
+    fn get_diagnostic_counts(&self) -> Result<DiagnosticCounts> {
+        Ok(DiagnosticCounts {
+            fix_attempts: 0,
+            fix_attempts_by_status: HashMap::new(),
+            activity_log: 0,
+            claude_executions: 0,
+            pr_reviews: 0,
+            pr_review_states: 0,
+            issues: 0,
+            similar_issues: 0,
+            repositories: 0,
+            repo_files: 0,
+            inference_attempts: 0,
+            error_patterns: 0,
+            processing_metrics: 0,
+            feedback_outcomes: 0,
+            prs: 0,
+            recent_fix_attempts: Vec::new(),
+        })
+    }
+
+    // --- Inference ---
+
+    /// Record an inference attempt. Returns the row ID.
+    fn record_inference_attempt(
+        &self,
+        _issue_id: &str,
+        _issue_source: &str,
+        _extracted_filenames: &[String],
+        _extracted_functions: &[String],
+        _extracted_keywords: &[String],
+        _inferred_repo_id: Option<i64>,
+        _confidence: &str,
+        _inference_reason: &str,
+        _duration_ms: Option<u64>,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Record feedback on an inference attempt.
+    fn record_inference_feedback(
+        &self,
+        _inference_id: i64,
+        _was_correct: bool,
+        _actual_repo_id: Option<i64>,
+        _feedback_source: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // --- Embeddings ---
+
+    /// Store a single issue embedding. Returns the row ID.
+    fn store_embedding(&self, _embedding: &IssueEmbedding) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Store a batch of issue embeddings.
+    fn store_embeddings_batch(&self, _embeddings: &[IssueEmbedding]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Get an embedding by source and issue ID.
+    fn get_embedding(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+    ) -> Result<Option<IssueEmbedding>> {
+        Ok(None)
+    }
+
+    /// Get all embeddings with optional source filter and pagination.
+    fn get_all_embeddings(
+        &self,
+        _source: Option<&str>,
+        _limit: Option<usize>,
+        _offset: Option<usize>,
+    ) -> Result<Vec<IssueEmbedding>> {
+        Ok(Vec::new())
+    }
+
+    /// Find similar issues by vector similarity. Returns None if vector search is unavailable.
+    fn find_similar_issues_vector(
+        &self,
+        _query_embedding: &[f32],
+        _source: &str,
+        _exclude_issue_id: Option<&str>,
+        _min_similarity: f64,
+        _limit: usize,
+    ) -> Result<Option<Vec<(IssueEmbedding, f64)>>> {
+        Ok(None)
+    }
+
+    /// Find similar outcomes by vector similarity. Returns None if vector search is unavailable.
+    fn find_similar_outcomes_vector(
+        &self,
+        _query_embedding: &[f32],
+        _min_similarity: f64,
+        _limit: usize,
+    ) -> Result<Option<Vec<(FixOutcome, f64)>>> {
+        Ok(None)
+    }
+
+    // --- Experiments ---
+
+    /// Save a prompt experiment. Returns the row ID.
+    fn save_experiment(&self, _experiment: &PromptExperiment) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Update experiment stats after a result.
+    fn update_experiment_stats(
+        &self,
+        _experiment_id: i64,
+        _success: bool,
+        _time_to_merge: Option<f64>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // --- Batch Operations ---
+
+    /// Get fix attempts for a batch of (source, issue_id) keys.
+    fn get_attempts_batch(&self, _keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
+        Ok(Vec::new())
+    }
+
+    /// Store a batch of similar issue records.
+    fn store_similar_issues_batch(&self, _similar_issues: &[SimilarIssue]) -> Result<()> {
+        Ok(())
+    }
+
+    // --- Release Tracking ---
+
+    /// Record a release tracking entry. Returns the row ID.
+    fn record_release_tracking(
+        &self,
+        _tracking: &crate::types::ReleaseTracking,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    // --- Repository Lookup ---
+
+    /// Get an indexed repository by name.
+    fn get_indexed_repo(&self, _name: &str) -> Result<Option<StoredIndexedRepo>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -705,7 +1210,7 @@ mod tests {
     #[test]
     fn test_default_record_execution_returns_zero() {
         let t = NoOpTracker;
-        let exec = ClaudeExecution::new();
+        let exec = AgentExecution::new();
         assert_eq!(t.record_execution(&exec).unwrap(), 0);
     }
 

@@ -193,7 +193,7 @@ mod tests {
 
     fn create_config() -> SentryRegressionConfig {
         SentryRegressionConfig {
-            auth_token: "test-token".to_string(),
+            auth_token: "test".to_string(),
             org_slug: "test-org".to_string(),
             event_threshold: 1,
         }
@@ -338,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn test_no_regression_below_threshold() {
         let config = SentryRegressionConfig {
-            auth_token: "test-token".to_string(),
+            auth_token: "test".to_string(),
             org_slug: "test-org".to_string(),
             event_threshold: 100, // High threshold
         };
@@ -397,7 +397,7 @@ mod tests {
         );
 
         let config = SentryRegressionConfig {
-            auth_token: "test-token".to_string(),
+            auth_token: "test".to_string(),
             org_slug: "test-org".to_string(),
             event_threshold: 1, // threshold is 1, unparseable defaults to 0 which is below
         };
@@ -543,7 +543,7 @@ mod tests {
     async fn test_exact_threshold_boundary() {
         // Event count exactly equals threshold -> regression detected
         let config = SentryRegressionConfig {
-            auth_token: "test-token".to_string(),
+            auth_token: "test".to_string(),
             org_slug: "test-org".to_string(),
             event_threshold: 5,
         };

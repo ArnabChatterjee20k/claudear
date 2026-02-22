@@ -220,7 +220,7 @@ impl MatchResult {
 
 /// Result of a Claude fix attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeResult {
+pub struct AgentResult {
     /// Whether the fix was successful.
     pub success: bool,
     /// Raw output from Claude.
@@ -538,7 +538,7 @@ impl ActivityLogEntry {
 
 /// Claude execution record with detailed metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeExecution {
+pub struct AgentExecution {
     /// Database ID.
     pub id: i64,
     /// Reference to fix_attempts table.
@@ -626,9 +626,29 @@ pub struct ClaudeExecution {
     /// Tokens written to prompt cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<i64>,
+    /// Provider name (e.g. "claude", "codex").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// A/B experiment name, if running under an experiment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experiment_name: Option<String>,
+    /// Which experiment arm/variant was selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experiment_variant: Option<String>,
 }
 
-impl ClaudeExecution {
+/// Per-provider statistics from an A/B experiment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentProviderStats {
+    pub provider: String,
+    pub total_attempts: i64,
+    pub success_count: i64,
+    pub avg_cost: Option<f64>,
+    pub avg_duration: Option<f64>,
+    pub success_rate: f64,
+}
+
+impl AgentExecution {
     /// Create a new execution record with the start time set to now.
     pub fn new() -> Self {
         Self {
@@ -662,6 +682,9 @@ impl ClaudeExecution {
             output_tokens: None,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            provider: None,
+            experiment_name: None,
+            experiment_variant: None,
         }
     }
 
@@ -681,7 +704,7 @@ impl ClaudeExecution {
     }
 }
 
-impl Default for ClaudeExecution {
+impl Default for AgentExecution {
     fn default() -> Self {
         Self::new()
     }
@@ -2037,7 +2060,7 @@ mod tests {
 
     #[test]
     fn test_claude_result_success() {
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: true,
             output: "PR created".to_string(),
             pr_url: Some("https://github.com/test/pr/1".to_string()),
@@ -2053,7 +2076,7 @@ mod tests {
 
     #[test]
     fn test_claude_result_failure() {
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: false,
             output: "".to_string(),
             pr_url: None,
@@ -2388,7 +2411,7 @@ mod tests {
 
     #[test]
     fn test_claude_result_empty_output() {
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: false,
             output: "".to_string(),
             pr_url: None,
@@ -3221,7 +3244,7 @@ mod tests {
 
     #[test]
     fn test_claude_execution_complete() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         assert!(exec.completed_at.is_none());
         assert!(exec.duration_secs.is_none());
         exec.complete(Some(0), false);
@@ -3233,7 +3256,7 @@ mod tests {
 
     #[test]
     fn test_claude_execution_complete_timeout() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.complete(None, true);
         assert!(exec.timed_out);
         assert!(exec.exit_code.is_none());
@@ -3242,7 +3265,7 @@ mod tests {
 
     #[test]
     fn test_claude_execution_complete_nonzero_exit() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.complete(Some(1), false);
         assert_eq!(exec.exit_code, Some(1));
         assert!(!exec.timed_out);
@@ -3250,13 +3273,13 @@ mod tests {
 
     #[test]
     fn test_claude_execution_with_attempt_id() {
-        let exec = ClaudeExecution::new().with_attempt_id(42);
+        let exec = AgentExecution::new().with_attempt_id(42);
         assert_eq!(exec.attempt_id, Some(42));
     }
 
     #[test]
     fn test_claude_execution_default() {
-        let exec = ClaudeExecution::default();
+        let exec = AgentExecution::default();
         assert_eq!(exec.id, 0);
         assert!(exec.attempt_id.is_none());
         assert!(!exec.timed_out);
@@ -3264,7 +3287,7 @@ mod tests {
 
     #[test]
     fn test_claude_execution_duration_non_negative() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.complete(Some(0), false);
         assert!(exec.duration_secs.unwrap() >= 0.0);
     }
@@ -4302,14 +4325,14 @@ mod tests {
 
     #[test]
     fn test_claude_execution_serde_roundtrip() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.attempt_id = Some(42);
         exec.model_version = Some("claude-3".to_string());
         exec.total_cost_usd = Some(0.05);
         exec.input_tokens = Some(1000);
         exec.output_tokens = Some(500);
         let json = serde_json::to_string(&exec).unwrap();
-        let parsed: ClaudeExecution = serde_json::from_str(&json).unwrap();
+        let parsed: AgentExecution = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.attempt_id, Some(42));
         assert_eq!(parsed.model_version, Some("claude-3".to_string()));
         assert!((parsed.total_cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
@@ -4317,7 +4340,7 @@ mod tests {
 
     #[test]
     fn test_claude_execution_new_defaults() {
-        let exec = ClaudeExecution::new();
+        let exec = AgentExecution::new();
         assert_eq!(exec.id, 0);
         assert!(exec.attempt_id.is_none());
         assert!(exec.completed_at.is_none());
@@ -4382,7 +4405,7 @@ mod tests {
 
     #[test]
     fn test_claude_result_with_blocking_question() {
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: false,
             output: "Blocked".to_string(),
             pr_url: None,
@@ -4397,7 +4420,7 @@ mod tests {
             used_qa_ids: vec![1, 2, 3],
         };
         let json = serde_json::to_string(&result).unwrap();
-        let parsed: ClaudeResult = serde_json::from_str(&json).unwrap();
+        let parsed: AgentResult = serde_json::from_str(&json).unwrap();
         assert!(parsed.blocking_question.is_some());
         let bq = parsed.blocking_question.unwrap();
         assert_eq!(bq.question, "Which database?");
@@ -4407,7 +4430,7 @@ mod tests {
 
     #[test]
     fn test_claude_result_serde_skip_none_fields() {
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: true,
             output: "ok".to_string(),
             pr_url: None,
@@ -4751,7 +4774,7 @@ mod tests {
             "success": true,
             "output": "done"
         });
-        let result: ClaudeResult = serde_json::from_value(json).unwrap();
+        let result: AgentResult = serde_json::from_value(json).unwrap();
         assert!(result.success);
         assert!(result.used_qa_ids.is_empty());
         assert!(result.blocking_question.is_none());

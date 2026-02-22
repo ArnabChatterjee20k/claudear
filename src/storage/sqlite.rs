@@ -1,19 +1,23 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
+use super::types::{
+    ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
+    InferenceStats, StoredDependency, StoredIndexedRepo, StoredPrReviewComment, StoredRepository,
+    UserRow,
+};
 use super::{is_vectorlite_available, try_load_vectorlite, FixAttemptTracker};
 use crate::error::Result;
 use crate::feedback::{FixOutcome, Outcome};
 use crate::learning::cross_repo_correlator::CrossRepoCorrelation;
 use crate::types::{
-    ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, FixAttempt, FixAttemptStats,
-    FixAttemptStatus, IssueEmbedding, PrReviewRecord, ProcessingMetric, PromptExperiment,
-    QaKnowledgeEntry, QaMatch, SimilarIssue, SourceStats,
+    ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, ExperimentProviderStats,
+    FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, PrReviewRecord,
+    ProcessingMetric, PromptExperiment, QaKnowledgeEntry, QaMatch, SimilarIssue, SourceStats,
 };
 use chrono::{DateTime, Utc};
 use rand::RngExt;
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
-use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -48,20 +52,6 @@ const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
 const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
-
-/// A user row from the database.
-#[derive(Debug, Clone, Serialize)]
-pub struct UserRow {
-    pub id: i64,
-    pub email: String,
-    #[serde(skip_serializing)]
-    pub password_hash: String,
-    pub name: String,
-    pub role: String,
-    pub avatar_url: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
 
 impl UserRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -983,6 +973,26 @@ impl SqliteTracker {
                 [],
             );
         }
+
+        // Idempotent migration: add provider + experiment columns to claude_executions.
+        for col_def in [
+            "provider TEXT DEFAULT 'claude'",
+            "experiment_name TEXT",
+            "experiment_variant TEXT",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE claude_executions ADD COLUMN {}", col_def),
+                [],
+            );
+        }
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_executions_provider ON claude_executions(provider)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_executions_experiment ON claude_executions(experiment_name)",
+            [],
+        );
 
         // Update query planner statistics after schema creation
         // This helps SQLite make better query planning decisions
@@ -2732,12 +2742,10 @@ impl FixAttemptTracker for SqliteTracker {
     ) -> Result<Vec<CrossRepoCorrelation>> {
         SqliteTracker::get_cross_repo_correlations(self, min_count, max_age_hours)
     }
-}
 
-impl SqliteTracker {
     /// Check if a webhook delivery ID has been seen, and record it if not.
     /// Returns true if this is a new delivery, false if it's a duplicate.
-    pub fn check_and_record_delivery(&self, delivery_id: &str, source: &str) -> Result<bool> {
+    fn check_and_record_delivery(&self, delivery_id: &str, source: &str) -> Result<bool> {
         let conn = self.acquire_lock()?;
         let rows_affected = conn.execute(
             "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, source) VALUES (?, ?)",
@@ -2747,7 +2755,7 @@ impl SqliteTracker {
     }
 
     /// Remove webhook delivery records older than the specified number of hours.
-    pub fn cleanup_old_deliveries(&self, max_age_hours: u64) -> Result<usize> {
+    fn cleanup_old_deliveries(&self, max_age_hours: u64) -> Result<usize> {
         let conn = self.acquire_lock()?;
         let rows = conn.execute(
             "DELETE FROM webhook_deliveries WHERE received_at < datetime('now', ?)",
@@ -2758,53 +2766,13 @@ impl SqliteTracker {
         }
         Ok(rows)
     }
-}
-
-impl SqliteTracker {
-    /// Record an activity to the activity log.
-    pub fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        let metadata_json = entry.metadata.as_ref().map(|m| m.to_string());
-
-        conn.execute(
-            r#"
-            INSERT INTO activity_log (timestamp, activity_type, source, issue_id, short_id, message, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-                entry.activity_type,
-                entry.source,
-                entry.issue_id,
-                entry.short_id,
-                entry.message,
-                metadata_json,
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        drop(conn);
-        Self::append_audit_json_line(
-            "activity",
-            &serde_json::json!({
-                "id": id,
-                "timestamp": entry.timestamp.to_rfc3339(),
-                "activity_type": entry.activity_type,
-                "source": entry.source,
-                "issue_id": entry.issue_id,
-                "short_id": entry.short_id,
-                "message": entry.message,
-                "metadata": entry.metadata,
-            }),
-        );
-        Ok(id)
-    }
 
     /// Record multiple activities in a single transaction for better performance.
     ///
     /// This is more efficient than calling `record_activity` in a loop because:
     /// - Single transaction reduces fsync overhead
     /// - Prepared statement is reused across all inserts
-    pub fn record_activities_batch(&self, entries: &[ActivityLogEntry]) -> Result<usize> {
+    fn record_activities_batch(&self, entries: &[ActivityLogEntry]) -> Result<usize> {
         if entries.is_empty() {
             return Ok(0);
         }
@@ -2854,50 +2822,8 @@ impl SqliteTracker {
         Ok(entries.len())
     }
 
-    /// Get recent activities, optionally filtered by source.
-    pub fn get_recent_activities(
-        &self,
-        limit: usize,
-        source_filter: Option<&str>,
-    ) -> Result<Vec<ActivityLogEntry>> {
-        let conn = self.acquire_lock()?;
-
-        // Build query dynamically based on whether source filter is provided
-        let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match source_filter {
-            Some(source) => (
-                r#"
-                SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
-                FROM activity_log
-                WHERE source = ?1
-                ORDER BY timestamp DESC
-                LIMIT ?2
-                "#
-                .to_string(),
-                vec![Box::new(source.to_string()), Box::new(limit as i64)],
-            ),
-            None => (
-                r#"
-                SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
-                FROM activity_log
-                ORDER BY timestamp DESC
-                LIMIT ?1
-                "#
-                .to_string(),
-                vec![Box::new(limit as i64)],
-            ),
-        };
-
-        let mut stmt = conn.prepare(&query)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            Ok(Self::row_to_activity_entry(row))
-        })?;
-
-        Ok(rows.flatten().collect())
-    }
-
     /// Count activity events grouped by type since a timestamp.
-    pub fn get_activity_type_counts_since(
+    fn get_activity_type_counts_since(
         &self,
         since: DateTime<Utc>,
     ) -> Result<HashMap<String, i64>> {
@@ -2923,367 +2849,10 @@ impl SqliteTracker {
         Ok(counts)
     }
 
-    /// Get activities for a specific issue.
-    pub fn get_activities_for_issue(
-        &self,
-        source: &str,
-        issue_id: &str,
-    ) -> Result<Vec<ActivityLogEntry>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
-            FROM activity_log
-            WHERE source = ? AND issue_id = ?
-            ORDER BY timestamp DESC
-            "#,
-        )?;
-
-        let mut entries = Vec::new();
-        let rows = stmt.query_map(params![source, issue_id], |row| {
-            Ok(Self::row_to_activity_entry(row))
-        })?;
-
-        for row in rows.flatten() {
-            entries.push(row);
-        }
-
-        Ok(entries)
-    }
-
-    fn row_to_activity_entry(row: &rusqlite::Row<'_>) -> ActivityLogEntry {
-        let metadata_str: Option<String> = row.get(7).ok();
-        let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
-
-        ActivityLogEntry {
-            id: row.get(0).unwrap_or(0),
-            timestamp: Self::parse_datetime(&row.get::<_, String>(1).unwrap_or_default()),
-            activity_type: row.get(2).unwrap_or_default(),
-            source: row.get(3).ok(),
-            issue_id: row.get(4).ok(),
-            short_id: row.get(5).ok(),
-            message: row.get(6).unwrap_or_default(),
-            metadata,
-        }
-    }
-
-    /// Convert a database row to a FixAttempt.
-    /// Expects columns in order: id, source, issue_id, short_id, attempted_at, pr_url,
-    /// scm_repo, scm_pr_number, status, error_message, merged_at, resolved_at,
-    /// retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-    fn row_to_fix_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<FixAttempt> {
-        // Parse issue_labels from JSON string
-        let issue_labels: Vec<String> = row
-            .get::<_, Option<String>>(14)?
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-
-        Ok(FixAttempt {
-            id: row.get(0)?,
-            source: row.get(1)?,
-            issue_id: row.get(2)?,
-            short_id: row.get(3)?,
-            attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
-            pr_url: row.get(5)?,
-            scm_repo: row.get(6)?,
-            scm_pr_number: row.get(7)?,
-            status: row
-                .get::<_, String>(8)?
-                .parse()
-                .unwrap_or(FixAttemptStatus::Pending),
-            error_message: row.get(9)?,
-            merged_at: Self::parse_optional_datetime(row.get(10)?),
-            resolved_at: Self::parse_optional_datetime(row.get(11)?),
-            retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
-            last_retry_at: Self::parse_optional_datetime(row.get(13)?),
-            issue_labels,
-            parent_attempt_id: row.get::<_, Option<i64>>(15).ok().flatten(),
-            cascade_repo: row.get::<_, Option<String>>(16).ok().flatten(),
-        })
-    }
-
-    /// Convert a database row to a StoredDependency.
-    /// Expects columns: rd.id, u.name, d.name, rd.dependency_type, rd.created_at
-    fn row_to_dependency(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDependency> {
-        Ok(StoredDependency {
-            id: row.get(0)?,
-            upstream: row.get(1)?,
-            downstream: row.get(2)?,
-            dep_type: row.get(3)?,
-            created_at: row.get(4)?,
-        })
-    }
-
-    /// Record a Claude execution.
-    pub fn record_execution(&self, execution: &ClaudeExecution) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO claude_executions (
-                attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
-                stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
-                prompt_used, prompt_hash, model_version, working_directory, git_branch,
-                git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
-                total_cost_usd, num_turns, session_id, duration_api_ms,
-                input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                execution.attempt_id,
-                execution.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                execution
-                    .completed_at
-                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                execution.duration_secs,
-                execution.exit_code,
-                execution.timed_out as i32,
-                execution.stdout_preview,
-                execution.stderr_preview,
-                execution.stdout_log_path,
-                execution.stderr_log_path,
-                execution.event_log_path,
-                execution.prompt_used,
-                execution.prompt_hash,
-                execution.model_version,
-                execution.working_directory,
-                execution.git_branch,
-                execution.git_commit_before,
-                execution.git_commit_after,
-                execution.files_changed,
-                execution.lines_added,
-                execution.lines_removed,
-                execution.total_cost_usd,
-                execution.num_turns,
-                execution.session_id,
-                execution.duration_api_ms,
-                execution.input_tokens,
-                execution.output_tokens,
-                execution.cache_read_input_tokens,
-                execution.cache_creation_input_tokens,
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        drop(conn);
-        Self::append_audit_json_line(
-            "execution",
-            &serde_json::json!({
-                "id": id,
-                "attempt_id": execution.attempt_id,
-                "started_at": execution.started_at.to_rfc3339(),
-                "completed_at": execution.completed_at.map(|v| v.to_rfc3339()),
-                "duration_secs": execution.duration_secs,
-                "exit_code": execution.exit_code,
-                "timed_out": execution.timed_out,
-                "stdout_preview": execution.stdout_preview,
-                "stderr_preview": execution.stderr_preview,
-                "stdout_log_path": execution.stdout_log_path,
-                "stderr_log_path": execution.stderr_log_path,
-                "event_log_path": execution.event_log_path,
-                "prompt_hash": execution.prompt_hash,
-                "model_version": execution.model_version,
-                "working_directory": execution.working_directory,
-                "git_branch": execution.git_branch,
-                "git_commit_before": execution.git_commit_before,
-                "git_commit_after": execution.git_commit_after,
-                "files_changed": execution.files_changed,
-                "lines_added": execution.lines_added,
-                "lines_removed": execution.lines_removed,
-                "total_cost_usd": execution.total_cost_usd,
-                "num_turns": execution.num_turns,
-                "session_id": execution.session_id,
-                "duration_api_ms": execution.duration_api_ms,
-                "input_tokens": execution.input_tokens,
-                "output_tokens": execution.output_tokens,
-                "cache_read_input_tokens": execution.cache_read_input_tokens,
-                "cache_creation_input_tokens": execution.cache_creation_input_tokens,
-            }),
-        );
-        Ok(id)
-    }
-
-    /// Get executions for a specific attempt.
-    pub fn get_executions_for_attempt(&self, attempt_id: i64) -> Result<Vec<ClaudeExecution>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
-                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
-                   prompt_used, prompt_hash, model_version, working_directory, git_branch,
-                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
-                   total_cost_usd, num_turns, session_id, duration_api_ms,
-                   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens
-            FROM claude_executions
-            WHERE attempt_id = ?
-            ORDER BY started_at DESC
-            "#,
-        )?;
-
-        let mut executions = Vec::new();
-        let rows = stmt.query_map(params![attempt_id], |row| {
-            Ok(ClaudeExecution {
-                id: row.get(0)?,
-                attempt_id: row.get(1)?,
-                started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
-                completed_at: Self::parse_optional_datetime(row.get(3)?),
-                duration_secs: row.get(4)?,
-                exit_code: row.get(5)?,
-                timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
-                stdout_preview: row.get(7)?,
-                stderr_preview: row.get(8)?,
-                stdout_log_path: row.get(9)?,
-                stderr_log_path: row.get(10)?,
-                event_log_path: row.get(11)?,
-                prompt_used: row.get(12)?,
-                prompt_hash: row.get(13)?,
-                model_version: row.get(14)?,
-                working_directory: row.get(15)?,
-                git_branch: row.get(16)?,
-                git_commit_before: row.get(17)?,
-                git_commit_after: row.get(18)?,
-                files_changed: row.get(19)?,
-                lines_added: row.get(20)?,
-                lines_removed: row.get(21)?,
-                total_cost_usd: row.get(22)?,
-                num_turns: row.get(23)?,
-                session_id: row.get(24)?,
-                duration_api_ms: row.get(25)?,
-                input_tokens: row.get(26)?,
-                output_tokens: row.get(27)?,
-                cache_read_input_tokens: row.get(28)?,
-                cache_creation_input_tokens: row.get(29)?,
-            })
-        })?;
-
-        for row in rows.flatten() {
-            executions.push(row);
-        }
-
-        Ok(executions)
-    }
-
-    /// Get a specific execution for an attempt.
-    pub fn get_execution_for_attempt(
-        &self,
-        attempt_id: i64,
-        execution_id: i64,
-    ) -> Result<Option<ClaudeExecution>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
-                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
-                   prompt_used, prompt_hash, model_version, working_directory, git_branch,
-                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
-                   total_cost_usd, num_turns, session_id, duration_api_ms,
-                   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens
-            FROM claude_executions
-            WHERE attempt_id = ?1 AND id = ?2
-            LIMIT 1
-            "#,
-        )?;
-
-        let execution = stmt
-            .query_row(params![attempt_id, execution_id], |row| {
-                Ok(ClaudeExecution {
-                    id: row.get(0)?,
-                    attempt_id: row.get(1)?,
-                    started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
-                    completed_at: Self::parse_optional_datetime(row.get(3)?),
-                    duration_secs: row.get(4)?,
-                    exit_code: row.get(5)?,
-                    timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
-                    stdout_preview: row.get(7)?,
-                    stderr_preview: row.get(8)?,
-                    stdout_log_path: row.get(9)?,
-                    stderr_log_path: row.get(10)?,
-                    event_log_path: row.get(11)?,
-                    prompt_used: row.get(12)?,
-                    prompt_hash: row.get(13)?,
-                    model_version: row.get(14)?,
-                    working_directory: row.get(15)?,
-                    git_branch: row.get(16)?,
-                    git_commit_before: row.get(17)?,
-                    git_commit_after: row.get(18)?,
-                    files_changed: row.get(19)?,
-                    lines_added: row.get(20)?,
-                    lines_removed: row.get(21)?,
-                    total_cost_usd: row.get(22)?,
-                    num_turns: row.get(23)?,
-                    session_id: row.get(24)?,
-                    duration_api_ms: row.get(25)?,
-                    input_tokens: row.get(26)?,
-                    output_tokens: row.get(27)?,
-                    cache_read_input_tokens: row.get(28)?,
-                    cache_creation_input_tokens: row.get(29)?,
-                })
-            })
-            .optional()?;
-
-        Ok(execution)
-    }
-
-    /// Record a PR review.
-    pub fn record_pr_review(&self, review: &PrReviewRecord) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO pr_reviews (attempt_id, pr_url, reviewer, review_state, submitted_at, body, sentiment, actionable_feedback)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                review.attempt_id,
-                review.pr_url,
-                review.reviewer,
-                review.review_state,
-                review.submitted_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                review.body,
-                review.sentiment,
-                review.actionable_feedback,
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// Get reviews for a specific attempt.
-    pub fn get_reviews_for_attempt(&self, attempt_id: i64) -> Result<Vec<PrReviewRecord>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, attempt_id, pr_url, reviewer, review_state, submitted_at, body, sentiment, actionable_feedback
-            FROM pr_reviews
-            WHERE attempt_id = ?
-            ORDER BY submitted_at DESC
-            "#,
-        )?;
-
-        let mut reviews = Vec::new();
-        let rows = stmt.query_map(params![attempt_id], |row| {
-            Ok(PrReviewRecord {
-                id: row.get(0)?,
-                attempt_id: row.get(1)?,
-                pr_url: row.get(2)?,
-                reviewer: row.get(3)?,
-                review_state: row.get(4)?,
-                submitted_at: Self::parse_optional_datetime(row.get(5)?),
-                body: row.get(6)?,
-                sentiment: row.get(7)?,
-                actionable_feedback: row.get(8)?,
-            })
-        })?;
-
-        for row in rows.flatten() {
-            reviews.push(row);
-        }
-
-        Ok(reviews)
-    }
-
     /// Save or update a PR review state for persistence.
     ///
     /// Uses upsert semantics - creates new record or updates existing based on pr_url.
-    pub fn save_pr_review_state(&self, state: &crate::scm::PrReviewState) -> Result<()> {
+    fn save_pr_review_state(&self, state: &crate::scm::PrReviewState) -> Result<()> {
         let conn = self.acquire_lock()?;
         conn.execute(
             r#"
@@ -3328,7 +2897,7 @@ impl SqliteTracker {
     }
 
     /// Get all active PR review states for restoration on startup.
-    pub fn get_active_pr_review_states(&self) -> Result<Vec<crate::scm::PrReviewState>> {
+    fn get_active_pr_review_states(&self) -> Result<Vec<crate::scm::PrReviewState>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
@@ -3354,7 +2923,7 @@ impl SqliteTracker {
     }
 
     /// Deactivate a PR review state (mark as no longer being watched).
-    pub fn deactivate_pr_review_state(&self, pr_url: &str) -> Result<()> {
+    fn deactivate_pr_review_state(&self, pr_url: &str) -> Result<()> {
         let conn = self.acquire_lock()?;
         let rows_affected = conn.execute(
             "UPDATE pr_review_states SET is_active = 0 WHERE pr_url = ?",
@@ -3371,7 +2940,7 @@ impl SqliteTracker {
     }
 
     /// Record a PR review comment for persistence.
-    pub fn record_pr_review_comment(
+    fn record_pr_review_comment(
         &self,
         pr_url: &str,
         comment: &crate::scm::ReviewComment,
@@ -3408,7 +2977,7 @@ impl SqliteTracker {
     }
 
     /// Get all comments for a specific PR.
-    pub fn get_comments_for_pr(&self, pr_url: &str) -> Result<Vec<StoredPrReviewComment>> {
+    fn get_comments_for_pr(&self, pr_url: &str) -> Result<Vec<StoredPrReviewComment>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
@@ -3430,50 +2999,8 @@ impl SqliteTracker {
         Ok(results)
     }
 
-    /// Convert a database row to a StoredPrReviewComment.
-    /// Expects columns: id, scm_comment_id, pr_url, review_id, path, position, line,
-    /// body, author, created_at, updated_at, html_url
-    fn row_to_stored_pr_review_comment(
-        row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<StoredPrReviewComment> {
-        Ok(StoredPrReviewComment {
-            id: row.get(0)?,
-            scm_comment_id: row.get(1)?,
-            pr_url: row.get(2)?,
-            review_id: row.get(3)?,
-            path: row.get(4)?,
-            position: row.get(5)?,
-            line: row.get(6)?,
-            body: row.get(7)?,
-            author: row.get(8)?,
-            created_at: row.get(9)?,
-            updated_at: row.get(10)?,
-            html_url: row.get(11)?,
-        })
-    }
-
-    /// Convert a database row to a PrReviewState.
-    /// Expects columns: pr_url, repo, pr_number, issue_id, source,
-    /// last_review_id, last_review_time, last_comment_id, last_comment_time, is_active
-    fn row_to_pr_review_state(
-        row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<crate::scm::PrReviewState> {
-        Ok(crate::scm::PrReviewState {
-            pr_url: row.get(0)?,
-            repo: row.get(1)?,
-            pr_number: row.get(2)?,
-            issue_id: row.get(3)?,
-            source: row.get(4)?,
-            last_review_id: row.get(5)?,
-            last_review_time: row.get(6)?,
-            last_comment_id: row.get(7)?,
-            last_comment_time: row.get(8)?,
-            is_active: row.get::<_, i32>(9)? != 0,
-        })
-    }
-
     /// Store an issue embedding.
-    pub fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
+    fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
         // Serialize the embedding vector to bytes if present
@@ -3541,7 +3068,7 @@ impl SqliteTracker {
     ///
     /// Much more efficient than calling `store_embedding` in a loop because
     /// the mutex is acquired once and all inserts share one transaction.
-    pub fn store_embeddings_batch(&self, embeddings: &[IssueEmbedding]) -> Result<()> {
+    fn store_embeddings_batch(&self, embeddings: &[IssueEmbedding]) -> Result<()> {
         if embeddings.is_empty() {
             return Ok(());
         }
@@ -3615,7 +3142,7 @@ impl SqliteTracker {
     }
 
     /// Get an embedding by source and issue ID.
-    pub fn get_embedding(&self, source: &str, issue_id: &str) -> Result<Option<IssueEmbedding>> {
+    fn get_embedding(&self, source: &str, issue_id: &str) -> Result<Option<IssueEmbedding>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
@@ -3644,7 +3171,7 @@ impl SqliteTracker {
     ///
     /// # Returns
     /// A vector of embeddings, limited to prevent unbounded memory usage.
-    pub fn get_all_embeddings(
+    fn get_all_embeddings(
         &self,
         source: Option<&str>,
         limit: Option<usize>,
@@ -3695,73 +3222,15 @@ impl SqliteTracker {
     }
 
     /// Store an issue (convenience wrapper around store_embedding).
-    pub fn store_issue(&self, issue: &IssueEmbedding) -> Result<i64> {
+    fn store_issue(&self, issue: &IssueEmbedding) -> Result<i64> {
         self.store_embedding(issue)
-    }
-
-    /// List issues with pagination, sorted by updated_at DESC, then created_at DESC.
-    pub fn list_issues(
-        &self,
-        source: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<IssueEmbedding>> {
-        let conn = self.acquire_lock()?;
-
-        let query = match source {
-            Some(_) => {
-                r#"
-                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
-                       description, url, priority, status, labels, updated_at
-                FROM issues
-                WHERE source = ?
-                ORDER BY COALESCE(updated_at, created_at) DESC
-                LIMIT ? OFFSET ?
-                "#
-            }
-            None => {
-                r#"
-                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
-                       description, url, priority, status, labels, updated_at
-                FROM issues
-                ORDER BY COALESCE(updated_at, created_at) DESC
-                LIMIT ? OFFSET ?
-                "#
-            }
-        };
-
-        let mut stmt = conn.prepare(query)?;
-
-        let row_mapper = |row: &rusqlite::Row<'_>| Self::row_to_issue_embedding(row, 8);
-
-        let rows = match source {
-            Some(s) => stmt.query_map(params![s, limit as i64, offset as i64], row_mapper)?,
-            None => stmt.query_map(params![limit as i64, offset as i64], row_mapper)?,
-        };
-
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| crate::error::Error::Storage(format!("Failed to list issues: {}", e)))
-    }
-
-    /// Count issues, optionally filtered by source.
-    pub fn count_issues(&self, source: Option<&str>) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-        let count: i64 = match source {
-            Some(s) => conn.query_row(
-                "SELECT COUNT(*) FROM issues WHERE source = ?",
-                params![s],
-                |row| row.get(0),
-            )?,
-            None => conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?,
-        };
-        Ok(count as usize)
     }
 
     /// Find similar issue embeddings using the HNSW vector index.
     ///
     /// Returns `None` if vectorlite is unavailable.
     /// Returns `Some(vec)` with matching embeddings and similarity scores.
-    pub fn find_similar_issues_vector(
+    fn find_similar_issues_vector(
         &self,
         query_embedding: &[f32],
         source: &str,
@@ -3853,7 +3322,7 @@ impl SqliteTracker {
     ///
     /// Returns `None` if vectorlite is unavailable (caller should fall back).
     /// Returns `Some(vec)` with matching outcomes and similarity scores.
-    pub fn find_similar_outcomes_vector(
+    fn find_similar_outcomes_vector(
         &self,
         query_embedding: &[f32],
         min_similarity: f64,
@@ -3969,6 +3438,1845 @@ impl SqliteTracker {
         }
 
         Ok(Some(results))
+    }
+
+    /// Get metric row counts grouped by name since a timestamp.
+    fn get_metric_counts_since(
+        &self,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<String, i64>> {
+        if metric_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.acquire_lock()?;
+
+        let placeholders = (0..metric_names.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT metric_name, COUNT(*)
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND metric_name IN ({})
+            GROUP BY metric_name
+            "#,
+            placeholders
+        );
+
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(metric_names.len() + 1);
+        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
+        for metric_name in metric_names {
+            bind_params.push(Box::new((*metric_name).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut counts = HashMap::new();
+        for row in rows.flatten() {
+            counts.insert(row.0, row.1);
+        }
+        Ok(counts)
+    }
+
+    /// Get metric sums grouped by name since a timestamp.
+    fn get_metric_sums_since(
+        &self,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<String, f64>> {
+        if metric_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.acquire_lock()?;
+
+        let placeholders = (0..metric_names.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT metric_name, SUM(metric_value)
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND metric_name IN ({})
+            GROUP BY metric_name
+            "#,
+            placeholders
+        );
+
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(metric_names.len() + 1);
+        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
+        for metric_name in metric_names {
+            bind_params.push(Box::new((*metric_name).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+            ))
+        })?;
+
+        let mut sums = HashMap::new();
+        for row in rows.flatten() {
+            sums.insert(row.0, row.1);
+        }
+        Ok(sums)
+    }
+
+    fn get_metric_sums_by_source_since(
+        &self,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<(String, String), f64>> {
+        if metric_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.acquire_lock()?;
+
+        let placeholders = (0..metric_names.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT metric_name, source, SUM(metric_value)
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND metric_name IN ({})
+            GROUP BY metric_name, source
+            "#,
+            placeholders
+        );
+
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(metric_names.len() + 1);
+        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
+        for metric_name in metric_names {
+            bind_params.push(Box::new((*metric_name).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+            ))
+        })?;
+
+        let mut sums = HashMap::new();
+        for row in rows.flatten() {
+            if let Some(source) = row.1 {
+                sums.insert((row.0, source), row.2);
+            }
+        }
+        Ok(sums)
+    }
+
+    /// Create or update a prompt experiment.
+    fn save_experiment(&self, experiment: &PromptExperiment) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO prompt_experiments (experiment_name, variant, prompt_template, prompt_hash, created_at, active, success_count, failure_count, avg_time_to_merge, avg_review_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                experiment.experiment_name,
+                experiment.variant,
+                experiment.prompt_template,
+                experiment.prompt_hash,
+                experiment.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                experiment.active as i32,
+                experiment.success_count,
+                experiment.failure_count,
+                experiment.avg_time_to_merge,
+                experiment.avg_review_score,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Update experiment statistics.
+    fn update_experiment_stats(
+        &self,
+        experiment_id: i64,
+        success: bool,
+        time_to_merge: Option<f64>,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+
+        if success {
+            conn.execute(
+                r#"
+                UPDATE prompt_experiments
+                SET success_count = success_count + 1
+                WHERE id = ?
+                "#,
+                params![experiment_id],
+            )?;
+        } else {
+            conn.execute(
+                r#"
+                UPDATE prompt_experiments
+                SET failure_count = failure_count + 1
+                WHERE id = ?
+                "#,
+                params![experiment_id],
+            )?;
+        }
+
+        if let Some(ttm) = time_to_merge {
+            // Update rolling average of time to merge
+            // Note: success_count was already incremented above, so we use
+            // (success_count - 1) for the old count and success_count for the new total
+            conn.execute(
+                r#"
+                UPDATE prompt_experiments
+                SET avg_time_to_merge = CASE
+                    WHEN avg_time_to_merge IS NULL THEN ?
+                    ELSE (avg_time_to_merge * (success_count - 1) + ?) / success_count
+                END
+                WHERE id = ?
+                "#,
+                params![ttm, ttm, experiment_id],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Prune old activity logs to prevent unbounded growth.
+    fn prune_old_activities(&self, days_to_keep: i64) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+
+        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
+        // This is safer than building strings in SQL even though days_to_keep is already i64
+        let modifier = format!("-{} days", days_to_keep.abs());
+
+        let deleted = conn.execute(
+            r#"
+            DELETE FROM activity_log
+            WHERE timestamp < datetime('now', ?)
+            "#,
+            params![modifier],
+        )?;
+
+        Ok(deleted)
+    }
+
+    /// Prune old metrics to prevent unbounded growth.
+    fn prune_old_metrics(&self, days_to_keep: i64) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+
+        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
+        let modifier = format!("-{} days", days_to_keep.abs());
+
+        let deleted = conn.execute(
+            r#"
+            DELETE FROM processing_metrics
+            WHERE timestamp < datetime('now', ?)
+            "#,
+            params![modifier],
+        )?;
+
+        Ok(deleted)
+    }
+
+    /// Sync repositories from a RepoIndex to the database.
+    ///
+    /// Updates paths for all repos in the index and optionally syncs files.
+    fn sync_from_index(
+        &self,
+        index: &crate::repo::RepoIndex,
+        sync_files: bool,
+    ) -> Result<usize> {
+        let repos = index.list();
+        let mut synced = 0;
+
+        for repo in repos {
+            let path_str = repo.path.to_string_lossy();
+
+            if sync_files {
+                // Use save_indexed_repo which also updates file_count and last_indexed_at
+                let repo_id = self.save_indexed_repo(
+                    &repo.name,
+                    &path_str,
+                    Some(&repo.scm_url),
+                    &repo.default_branch,
+                    repo.files.len(),
+                )?;
+
+                if !repo.files.is_empty() {
+                    let files_with_types: Vec<(String, Option<String>)> = repo
+                        .files
+                        .iter()
+                        .map(|f| {
+                            let file_type = std::path::Path::new(f)
+                                .extension()
+                                .map(|e| e.to_string_lossy().to_string());
+                            (f.clone(), file_type)
+                        })
+                        .collect();
+
+                    self.save_repo_files(repo_id, &files_with_types)?;
+                }
+            } else {
+                // Just update paths in repositories table
+                self.upsert_repository(&repo.name, Some(&path_str), None)?;
+            }
+            synced += 1;
+        }
+
+        Ok(synced)
+    }
+
+    fn sync_repo_files(&self, repo: &crate::repo::IndexedRepo) -> Result<()> {
+        self.sync_repo_files(repo)
+    }
+
+    /// Record an inference attempt.
+    #[allow(clippy::too_many_arguments)]
+    fn record_inference_attempt(
+        &self,
+        issue_id: &str,
+        issue_source: &str,
+        extracted_filenames: &[String],
+        extracted_functions: &[String],
+        extracted_keywords: &[String],
+        inferred_repo_id: Option<i64>,
+        confidence: &str,
+        inference_reason: &str,
+        duration_ms: Option<u64>,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        let filenames_json = serde_json::to_string(extracted_filenames).unwrap_or_default();
+        let functions_json = serde_json::to_string(extracted_functions).unwrap_or_default();
+        let keywords_json = serde_json::to_string(extracted_keywords).unwrap_or_default();
+
+        conn.execute(
+            r#"
+            INSERT INTO inference_attempts (
+                issue_id, issue_source, extracted_filenames, extracted_functions,
+                extracted_keywords, inferred_repo_id, confidence, inference_reason,
+                inference_duration_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                issue_id,
+                issue_source,
+                filenames_json,
+                functions_json,
+                keywords_json,
+                inferred_repo_id,
+                confidence,
+                inference_reason,
+                duration_ms.map(|d| d as i64),
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Record feedback on an inference attempt (was it correct?).
+    fn record_inference_feedback(
+        &self,
+        inference_id: i64,
+        was_correct: bool,
+        actual_repo_id: Option<i64>,
+        feedback_source: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE inference_attempts
+            SET was_correct = ?1, actual_repo_id = ?2, feedback_source = ?3, feedback_at = datetime('now')
+            WHERE id = ?4
+            "#,
+            params![was_correct, actual_repo_id, feedback_source, inference_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get diagnostic counts for all major tables.
+    ///
+    /// This is useful for debugging and verifying that data is being written correctly.
+    fn get_diagnostic_counts(&self) -> Result<DiagnosticCounts> {
+        let conn = self.acquire_lock()?;
+
+        let fix_attempts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?;
+        let fix_attempts_by_status: HashMap<String, i64> = {
+            let mut map = HashMap::new();
+            let mut stmt =
+                conn.prepare("SELECT status, COUNT(*) FROM fix_attempts GROUP BY status")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows.flatten() {
+                map.insert(row.0, row.1);
+            }
+            map
+        };
+
+        let activity_log: i64 =
+            conn.query_row("SELECT COUNT(*) FROM activity_log", [], |row| row.get(0))?;
+
+        let claude_executions: i64 =
+            conn.query_row("SELECT COUNT(*) FROM claude_executions", [], |row| {
+                row.get(0)
+            })?;
+
+        let pr_reviews: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pr_reviews", [], |row| row.get(0))?;
+
+        let pr_review_states: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pr_review_states", [], |row| {
+                row.get(0)
+            })?;
+
+        let issues: i64 = conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?;
+
+        let similar_issues: i64 =
+            conn.query_row("SELECT COUNT(*) FROM similar_issues", [], |row| row.get(0))?;
+
+        let repositories: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+
+        let repo_files: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repo_files", [], |row| row.get(0))?;
+
+        let inference_attempts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM inference_attempts", [], |row| {
+                row.get(0)
+            })?;
+
+        let error_patterns: i64 =
+            conn.query_row("SELECT COUNT(*) FROM error_patterns", [], |row| row.get(0))?;
+
+        let processing_metrics: i64 =
+            conn.query_row("SELECT COUNT(*) FROM processing_metrics", [], |row| {
+                row.get(0)
+            })?;
+
+        let feedback_outcomes: i64 =
+            conn.query_row("SELECT COUNT(*) FROM feedback_outcomes", [], |row| {
+                row.get(0)
+            })?;
+
+        let prs: i64 = conn.query_row("SELECT COUNT(*) FROM prs", [], |row| row.get(0))?;
+
+        // Get recent fix attempts for debugging
+        let recent_fix_attempts: Vec<(String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT source, issue_id, short_id, status FROM fix_attempts ORDER BY attempted_at DESC LIMIT 5"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.flatten().collect()
+        };
+
+        Ok(DiagnosticCounts {
+            fix_attempts,
+            fix_attempts_by_status,
+            activity_log,
+            claude_executions,
+            pr_reviews,
+            pr_review_states,
+            issues,
+            similar_issues,
+            repositories,
+            repo_files,
+            inference_attempts,
+            error_patterns,
+            processing_metrics,
+            feedback_outcomes,
+            prs,
+            recent_fix_attempts,
+        })
+    }
+
+    /// Upsert a PR record.
+    ///
+    /// Creates a new record or updates an existing one based on pr_url.
+    fn upsert_pr(&self, pr: &crate::types::PrRecord) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO prs (
+                pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
+                title, description, author, head_branch, base_branch, status,
+                created_at, updated_at, merged_at, closed_at,
+                approvals_count, changes_requested_count, comments_count, last_review_at,
+                time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                files_changed, lines_added, lines_removed
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+            )
+            ON CONFLICT(pr_url) DO UPDATE SET
+                scm_repo = excluded.scm_repo,
+                pr_number = excluded.pr_number,
+                attempt_id = COALESCE(excluded.attempt_id, prs.attempt_id),
+                issue_id = COALESCE(excluded.issue_id, prs.issue_id),
+                issue_source = COALESCE(excluded.issue_source, prs.issue_source),
+                title = COALESCE(excluded.title, prs.title),
+                description = COALESCE(excluded.description, prs.description),
+                author = COALESCE(excluded.author, prs.author),
+                head_branch = COALESCE(excluded.head_branch, prs.head_branch),
+                base_branch = COALESCE(excluded.base_branch, prs.base_branch),
+                status = excluded.status,
+                updated_at = datetime('now'),
+                merged_at = COALESCE(excluded.merged_at, prs.merged_at),
+                closed_at = COALESCE(excluded.closed_at, prs.closed_at),
+                approvals_count = excluded.approvals_count,
+                changes_requested_count = excluded.changes_requested_count,
+                comments_count = excluded.comments_count,
+                last_review_at = COALESCE(excluded.last_review_at, prs.last_review_at),
+                time_to_first_review_mins = COALESCE(excluded.time_to_first_review_mins, prs.time_to_first_review_mins),
+                time_to_merge_mins = COALESCE(excluded.time_to_merge_mins, prs.time_to_merge_mins),
+                review_cycles = excluded.review_cycles,
+                files_changed = COALESCE(excluded.files_changed, prs.files_changed),
+                lines_added = COALESCE(excluded.lines_added, prs.lines_added),
+                lines_removed = COALESCE(excluded.lines_removed, prs.lines_removed)
+            "#,
+            params![
+                pr.pr_url,
+                pr.scm_repo,
+                pr.pr_number,
+                pr.attempt_id,
+                pr.issue_id,
+                pr.issue_source,
+                pr.title,
+                pr.description,
+                pr.author,
+                pr.head_branch,
+                pr.base_branch,
+                pr.status,
+                pr.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                pr.updated_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.merged_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.closed_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.approvals_count,
+                pr.changes_requested_count,
+                pr.comments_count,
+                pr.last_review_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.time_to_first_review_mins,
+                pr.time_to_merge_mins,
+                pr.review_cycles,
+                pr.files_changed,
+                pr.lines_added,
+                pr.lines_removed,
+            ],
+        )?;
+
+        // Get the id (either inserted or existing)
+        let id: i64 = conn.query_row(
+            "SELECT id FROM prs WHERE pr_url = ?",
+            params![pr.pr_url],
+            |row| row.get(0),
+        )?;
+
+        tracing::info!(
+            pr_url = %pr.pr_url,
+            status = %pr.status,
+            id = id,
+            "PR record upserted"
+        );
+
+        Ok(id)
+    }
+
+    /// Get a PR record by URL.
+    fn get_pr(&self, pr_url: &str) -> Result<Option<crate::types::PrRecord>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
+                   title, description, author, head_branch, base_branch, status,
+                   created_at, updated_at, merged_at, closed_at,
+                   approvals_count, changes_requested_count, comments_count, last_review_at,
+                   time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                   files_changed, lines_added, lines_removed
+            FROM prs WHERE pr_url = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![pr_url], Self::row_to_pr_record).ok();
+        Ok(result)
+    }
+
+    /// Update PR status.
+    fn update_pr_status(&self, pr_url: &str, status: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let (merged_at, closed_at) = match status {
+            "merged" => (Some(now.clone()), None),
+            "closed" => (None, Some(now.clone())),
+            _ => (None, None),
+        };
+
+        conn.execute(
+            r#"
+            UPDATE prs SET
+                status = ?1,
+                updated_at = ?2,
+                merged_at = COALESCE(?3, merged_at),
+                closed_at = COALESCE(?4, closed_at)
+            WHERE pr_url = ?5
+            "#,
+            params![status, now, merged_at, closed_at, pr_url],
+        )?;
+
+        tracing::info!(
+            pr_url = %pr_url,
+            status = status,
+            "PR status updated"
+        );
+
+        Ok(())
+    }
+
+    /// Record a cascade fix attempt linked to a parent attempt.
+    fn record_cascade_attempt(
+        &self,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+        parent_attempt_id: i64,
+        cascade_repo: &str,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        // Check if this cascade already exists
+        let exists: bool = conn
+            .prepare_cached(
+                "SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ?",
+            )?
+            .exists(params![source, issue_id, cascade_repo])?;
+
+        if exists {
+            tracing::info!(
+                source = source,
+                issue_id = issue_id,
+                cascade_repo = cascade_repo,
+                "Cascade attempt already exists, skipping"
+            );
+            let id: i64 = conn.query_row(
+                "SELECT id FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ?",
+                params![source, issue_id, cascade_repo],
+                |row| row.get(0),
+            )?;
+            return Ok(id);
+        }
+
+        conn.execute(
+            r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, parent_attempt_id, cascade_repo)
+               VALUES (?, ?, ?, 'pending', datetime('now'), ?, ?)"#,
+            params![source, issue_id, short_id, parent_attempt_id, cascade_repo],
+        )?;
+
+        let id = conn.last_insert_rowid();
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            cascade_repo = cascade_repo,
+            parent_attempt_id = parent_attempt_id,
+            attempt_id = id,
+            "Recorded cascade fix attempt"
+        );
+        Ok(id)
+    }
+
+    /// Update a cascade attempt's PR info.
+    fn update_attempt_pr(
+        &self,
+        attempt_id: i64,
+        pr_url: &str,
+        scm_repo: &str,
+        pr_number: i64,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE fix_attempts SET pr_url = ?, scm_repo = ?, scm_pr_number = ?, status = 'success' WHERE id = ?",
+            params![pr_url, scm_repo, pr_number, attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a cascade attempt as failed.
+    fn mark_cascade_failed(&self, attempt_id: i64, error: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE fix_attempts SET status = 'failed', error_message = ? WHERE id = ?",
+            params![error, attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// Create a new regression watch.
+    fn create_regression_watch(&self, watch: &crate::types::RegressionWatch) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO regression_watches (
+                issue_type, issue_id, fix_attempt_id, status,
+                pr_merged_at, monitoring_started_at, resolved_at, regressed_at, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                watch.issue_type.to_string(),
+                watch.issue_id,
+                watch.fix_attempt_id,
+                watch.status.to_string(),
+                watch
+                    .pr_merged_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch
+                    .monitoring_started_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch
+                    .resolved_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch
+                    .regressed_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Update regression watch status.
+    fn update_regression_watch_status(
+        &self,
+        id: i64,
+        status: crate::types::RegressionWatchStatus,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+        // Update specific timestamp based on status
+        let (monitoring_started, resolved, regressed) = match status {
+            crate::types::RegressionWatchStatus::Monitoring => (Some(now.clone()), None, None),
+            crate::types::RegressionWatchStatus::Resolved => (None, Some(now.clone()), None),
+            crate::types::RegressionWatchStatus::Regressed => (None, None, Some(now.clone())),
+            _ => (None, None, None),
+        };
+
+        conn.execute(
+            r#"
+            UPDATE regression_watches SET
+                status = ?1,
+                monitoring_started_at = COALESCE(?2, monitoring_started_at),
+                resolved_at = COALESCE(?3, resolved_at),
+                regressed_at = COALESCE(?4, regressed_at)
+            WHERE id = ?5
+            "#,
+            params![
+                status.to_string(),
+                monitoring_started,
+                resolved,
+                regressed,
+                id
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    fn store_eval_snapshot(
+        &self,
+        attempt_id: Option<i64>,
+        phase: &str,
+        snapshot: &crate::evaluation::EvalSnapshot,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let diagnostics_json =
+            serde_json::to_string(&snapshot.diagnostics).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "INSERT INTO eval_snapshots (attempt_id, phase, category, tool_name, exit_code, passed, failed, skipped, warnings, errors, diagnostics_json, raw_output, duration_secs, line_coverage_pct, branch_coverage_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                attempt_id,
+                phase,
+                snapshot.category.to_string(),
+                snapshot.tool_name,
+                snapshot.exit_code,
+                snapshot.passed,
+                snapshot.failed,
+                snapshot.skipped,
+                snapshot.warnings,
+                snapshot.errors,
+                diagnostics_json,
+                snapshot.raw_output,
+                snapshot.duration_secs,
+                snapshot.line_coverage_pct,
+                snapshot.branch_coverage_pct,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn store_eval_delta(
+        &self,
+        attempt_id: Option<i64>,
+        repo: &str,
+        delta: &crate::evaluation::EvalDelta,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let regressions_json =
+            serde_json::to_string(&delta.regressions).unwrap_or_else(|_| "[]".into());
+        let fixed_json = serde_json::to_string(&delta.fixed).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "INSERT INTO eval_deltas (attempt_id, repo, tool_name, category, new_passes, new_failures, regressions_json, fixed_json, coverage_delta_pct, overall_improved)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                attempt_id,
+                repo,
+                delta.after.tool_name,
+                delta.after.category.to_string(),
+                delta.new_passes,
+                delta.new_failures,
+                regressions_json,
+                fixed_json,
+                delta.coverage_delta_pct,
+                delta.is_improvement() as i32,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn create_user(
+        &self,
+        email: &str,
+        password_hash: &str,
+        name: &str,
+        role: &str,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO users (email, password_hash, name, role) VALUES (?1, ?2, ?3, ?4)",
+            params![email, password_hash, name, role],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn get_user_by_email(&self, email: &str) -> Result<Option<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE email = ?1"
+        )?;
+        let user = stmt
+            .query_row(params![email], UserRow::from_row)
+            .optional()?;
+        Ok(user)
+    }
+
+    fn get_user_by_id(&self, id: i64) -> Result<Option<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE id = ?1"
+        )?;
+        let user = stmt.query_row(params![id], UserRow::from_row).optional()?;
+        Ok(user)
+    }
+
+    fn list_users(&self) -> Result<Vec<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users ORDER BY id"
+        )?;
+        let users = stmt
+            .query_map([], UserRow::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(users)
+    }
+
+    fn update_user(
+        &self,
+        id: i64,
+        email: Option<&str>,
+        password_hash: Option<&str>,
+        name: Option<&str>,
+        role: Option<&str>,
+        avatar_url: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let mut sets = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(e) = email {
+            sets.push("email = ?");
+            values.push(Box::new(e.to_string()));
+        }
+        if let Some(p) = password_hash {
+            sets.push("password_hash = ?");
+            values.push(Box::new(p.to_string()));
+        }
+        if let Some(n) = name {
+            sets.push("name = ?");
+            values.push(Box::new(n.to_string()));
+        }
+        if let Some(r) = role {
+            sets.push("role = ?");
+            values.push(Box::new(r.to_string()));
+        }
+        if let Some(a) = avatar_url {
+            sets.push("avatar_url = ?");
+            values.push(Box::new(a.to_string()));
+        }
+
+        if sets.is_empty() {
+            return Ok(false);
+        }
+
+        sets.push("updated_at = datetime('now')");
+        values.push(Box::new(id));
+
+        let sql = format!("UPDATE users SET {} WHERE id = ?", sets.join(", "));
+        let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        let rows = conn.execute(&sql, params.as_slice())?;
+        Ok(rows > 0)
+    }
+
+    fn delete_user(&self, id: i64) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let rows = conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        Ok(rows > 0)
+    }
+
+    fn count_users(&self) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    fn create_session(&self, user_id: i64, expires_at: &str) -> Result<String> {
+        let token = generate_session_token();
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO sessions (id, user_id, expires_at) VALUES (?1, ?2, ?3)",
+            params![token, user_id, expires_at],
+        )?;
+        Ok(token)
+    }
+
+    fn get_session_user(&self, token: &str) -> Result<Option<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
+             FROM sessions s
+             JOIN users u ON s.user_id = u.id
+             WHERE s.id = ?1 AND s.expires_at > datetime('now')",
+        )?;
+        let user = stmt
+            .query_row(params![token], UserRow::from_row)
+            .optional()?;
+        Ok(user)
+    }
+
+    fn delete_session(&self, token: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![token])?;
+        Ok(())
+    }
+
+    fn cleanup_expired_sessions(&self) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let deleted = conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= datetime('now')",
+            [],
+        )?;
+        Ok(deleted)
+    }
+
+    fn delete_user_sessions(&self, user_id: i64) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
+        Ok(())
+    }
+
+    /// List fix attempts with optional status/source filters and pagination.
+    fn list_attempts(
+        &self,
+        status: Option<&str>,
+        source: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut attempts = Vec::new();
+
+        let query_all = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            ORDER BY attempted_at DESC
+            LIMIT ?1 OFFSET ?2
+        "#;
+        let query_status = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE status = ?1
+            ORDER BY attempted_at DESC
+            LIMIT ?2 OFFSET ?3
+        "#;
+        let query_source = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE source = ?1
+            ORDER BY attempted_at DESC
+            LIMIT ?2 OFFSET ?3
+        "#;
+        let query_status_source = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE status = ?1 AND source = ?2
+            ORDER BY attempted_at DESC
+            LIMIT ?3 OFFSET ?4
+        "#;
+
+        match (status, source) {
+            (Some(status), Some(source)) => {
+                let mut stmt = conn.prepare_cached(query_status_source)?;
+                let rows = stmt.query_map(
+                    params![status, source, limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+            (Some(status), None) => {
+                let mut stmt = conn.prepare_cached(query_status)?;
+                let rows = stmt.query_map(
+                    params![status, limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+            (None, Some(source)) => {
+                let mut stmt = conn.prepare_cached(query_source)?;
+                let rows = stmt.query_map(
+                    params![source, limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare_cached(query_all)?;
+                let rows = stmt.query_map(
+                    params![limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+        }
+
+        Ok(attempts)
+    }
+
+    /// Count fix attempts with optional status/source filters.
+    fn count_attempts(&self, status: Option<&str>, source: Option<&str>) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = match (status, source) {
+            (Some(status), Some(source)) => conn.query_row(
+                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1 AND source = ?2",
+                params![status, source],
+                |row| row.get(0),
+            )?,
+            (Some(status), None) => conn.query_row(
+                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1",
+                params![status],
+                |row| row.get(0),
+            )?,
+            (None, Some(source)) => conn.query_row(
+                "SELECT COUNT(*) FROM fix_attempts WHERE source = ?1",
+                params![source],
+                |row| row.get(0),
+            )?,
+            (None, None) => {
+                conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?
+            }
+        };
+        Ok(count as usize)
+    }
+
+    /// List recent attempts ordered by attempted time descending.
+    fn list_recent_attempts(&self, limit: usize) -> Result<Vec<FixAttempt>> {
+        self.list_attempts(None, None, limit, 0)
+    }
+
+    /// List attempts since a timestamp, ordered by attempted time descending.
+    fn list_attempts_since(&self, since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE attempted_at >= ?1
+            ORDER BY attempted_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![since_str], Self::row_to_fix_attempt)?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Get the most recently merged fix attempt for a given SCM repo.
+    fn get_most_recent_merged_attempt_for_repo(
+        &self,
+        scm_repo: &str,
+    ) -> Result<Option<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE scm_repo = ? AND status = 'merged'
+            ORDER BY merged_at DESC
+            LIMIT 1
+            "#,
+        )?;
+
+        let result = stmt
+            .query_row(params![scm_repo], Self::row_to_fix_attempt)
+            .ok();
+        Ok(result)
+    }
+
+    /// List issues with pagination, sorted by updated_at DESC, then created_at DESC.
+    fn list_issues(
+        &self,
+        source: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IssueEmbedding>> {
+        let conn = self.acquire_lock()?;
+
+        let query = match source {
+            Some(_) => {
+                r#"
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                       description, url, priority, status, labels, updated_at
+                FROM issues
+                WHERE source = ?
+                ORDER BY COALESCE(updated_at, created_at) DESC
+                LIMIT ? OFFSET ?
+                "#
+            }
+            None => {
+                r#"
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                       description, url, priority, status, labels, updated_at
+                FROM issues
+                ORDER BY COALESCE(updated_at, created_at) DESC
+                LIMIT ? OFFSET ?
+                "#
+            }
+        };
+
+        let mut stmt = conn.prepare(query)?;
+
+        let row_mapper = |row: &rusqlite::Row<'_>| Self::row_to_issue_embedding(row, 8);
+
+        let rows = match source {
+            Some(s) => stmt.query_map(params![s, limit as i64, offset as i64], row_mapper)?,
+            None => stmt.query_map(params![limit as i64, offset as i64], row_mapper)?,
+        };
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::error::Error::Storage(format!("Failed to list issues: {}", e)))
+    }
+
+    /// Count issues, optionally filtered by source.
+    fn count_issues(&self, source: Option<&str>) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = match source {
+            Some(s) => conn.query_row(
+                "SELECT COUNT(*) FROM issues WHERE source = ?",
+                params![s],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?,
+        };
+        Ok(count as usize)
+    }
+
+    /// Get a specific execution for an attempt.
+    fn get_execution_for_attempt(
+        &self,
+        attempt_id: i64,
+        execution_id: i64,
+    ) -> Result<Option<ClaudeExecution>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
+                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
+                   prompt_used, prompt_hash, model_version, working_directory, git_branch,
+                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
+                   total_cost_usd, num_turns, session_id, duration_api_ms,
+                   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+                   provider, experiment_name, experiment_variant
+            FROM claude_executions
+            WHERE attempt_id = ?1 AND id = ?2
+            LIMIT 1
+            "#,
+        )?;
+
+        let execution = stmt
+            .query_row(params![attempt_id, execution_id], |row| {
+                Ok(ClaudeExecution {
+                    id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
+                    completed_at: Self::parse_optional_datetime(row.get(3)?),
+                    duration_secs: row.get(4)?,
+                    exit_code: row.get(5)?,
+                    timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
+                    stdout_preview: row.get(7)?,
+                    stderr_preview: row.get(8)?,
+                    stdout_log_path: row.get(9)?,
+                    stderr_log_path: row.get(10)?,
+                    event_log_path: row.get(11)?,
+                    prompt_used: row.get(12)?,
+                    prompt_hash: row.get(13)?,
+                    model_version: row.get(14)?,
+                    working_directory: row.get(15)?,
+                    git_branch: row.get(16)?,
+                    git_commit_before: row.get(17)?,
+                    git_commit_after: row.get(18)?,
+                    files_changed: row.get(19)?,
+                    lines_added: row.get(20)?,
+                    lines_removed: row.get(21)?,
+                    total_cost_usd: row.get(22)?,
+                    num_turns: row.get(23)?,
+                    session_id: row.get(24)?,
+                    duration_api_ms: row.get(25)?,
+                    input_tokens: row.get(26)?,
+                    output_tokens: row.get(27)?,
+                    cache_read_input_tokens: row.get(28)?,
+                    cache_creation_input_tokens: row.get(29)?,
+                    provider: row.get(30)?,
+                    experiment_name: row.get(31)?,
+                    experiment_variant: row.get(32)?,
+                })
+            })
+            .optional()?;
+
+        Ok(execution)
+    }
+
+    fn get_attempts_batch(&self, keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.acquire_lock()?;
+        let mut results = Vec::with_capacity(keys.len());
+        // Use a prepared statement to amortize compilation cost across the batch.
+        let mut stmt = conn.prepare_cached(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE source = ? AND issue_id = ?
+            "#,
+        )?;
+        for (source, issue_id) in keys {
+            let attempt = stmt
+                .query_row(params![source, issue_id], Self::row_to_fix_attempt)
+                .ok();
+            results.push(attempt);
+        }
+        Ok(results)
+    }
+
+    fn store_similar_issues_batch(&self, similar_issues: &[SimilarIssue]) -> Result<()> {
+        if similar_issues.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare_cached(
+                r#"
+                INSERT INTO similar_issues (source_issue_id, similar_issue_id, similarity_score, computed_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_issue_id, similar_issue_id) DO UPDATE SET
+                    similarity_score = excluded.similarity_score,
+                    computed_at = excluded.computed_at
+                "#,
+            )?;
+            for similar in similar_issues {
+                stmt.execute(params![
+                    similar.source_issue_id,
+                    similar.similar_issue_id,
+                    similar.similarity_score,
+                    similar.computed_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn record_release_tracking(&self, tracking: &crate::types::ReleaseTracking) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO release_tracking (
+                regression_watch_id, release_version, release_commit, released_at, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                tracking.regression_watch_id,
+                tracking.release_version,
+                tracking.release_commit,
+                tracking
+                    .released_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                tracking.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn get_indexed_repo(&self, name: &str) -> Result<Option<StoredIndexedRepo>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, path, scm_url, default_branch, file_count, last_indexed_at, created_at
+            FROM repositories WHERE name = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![name], |row| {
+            Ok(StoredIndexedRepo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                scm_url: row.get(3)?,
+                default_branch: row.get(4)?,
+                file_count: row.get(5)?,
+                last_indexed_at: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        });
+
+        match result {
+            Ok(repo) => Ok(Some(repo)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl SqliteTracker {
+    /// Record an activity to the activity log.
+    pub fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let metadata_json = entry.metadata.as_ref().map(|m| m.to_string());
+
+        conn.execute(
+            r#"
+            INSERT INTO activity_log (timestamp, activity_type, source, issue_id, short_id, message, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                entry.activity_type,
+                entry.source,
+                entry.issue_id,
+                entry.short_id,
+                entry.message,
+                metadata_json,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        Self::append_audit_json_line(
+            "activity",
+            &serde_json::json!({
+                "id": id,
+                "timestamp": entry.timestamp.to_rfc3339(),
+                "activity_type": entry.activity_type,
+                "source": entry.source,
+                "issue_id": entry.issue_id,
+                "short_id": entry.short_id,
+                "message": entry.message,
+                "metadata": entry.metadata,
+            }),
+        );
+        Ok(id)
+    }
+
+    /// Get recent activities, optionally filtered by source.
+    pub fn get_recent_activities(
+        &self,
+        limit: usize,
+        source_filter: Option<&str>,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        let conn = self.acquire_lock()?;
+
+        // Build query dynamically based on whether source filter is provided
+        let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match source_filter {
+            Some(source) => (
+                r#"
+                SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
+                FROM activity_log
+                WHERE source = ?1
+                ORDER BY timestamp DESC
+                LIMIT ?2
+                "#
+                .to_string(),
+                vec![Box::new(source.to_string()), Box::new(limit as i64)],
+            ),
+            None => (
+                r#"
+                SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
+                FROM activity_log
+                ORDER BY timestamp DESC
+                LIMIT ?1
+                "#
+                .to_string(),
+                vec![Box::new(limit as i64)],
+            ),
+        };
+
+        let mut stmt = conn.prepare(&query)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok(Self::row_to_activity_entry(row))
+        })?;
+
+        Ok(rows.flatten().collect())
+    }
+
+    /// Get activities for a specific issue.
+    pub fn get_activities_for_issue(
+        &self,
+        source: &str,
+        issue_id: &str,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, timestamp, activity_type, source, issue_id, short_id, message, metadata
+            FROM activity_log
+            WHERE source = ? AND issue_id = ?
+            ORDER BY timestamp DESC
+            "#,
+        )?;
+
+        let mut entries = Vec::new();
+        let rows = stmt.query_map(params![source, issue_id], |row| {
+            Ok(Self::row_to_activity_entry(row))
+        })?;
+
+        for row in rows.flatten() {
+            entries.push(row);
+        }
+
+        Ok(entries)
+    }
+
+    fn row_to_activity_entry(row: &rusqlite::Row<'_>) -> ActivityLogEntry {
+        let metadata_str: Option<String> = row.get(7).ok();
+        let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+
+        ActivityLogEntry {
+            id: row.get(0).unwrap_or(0),
+            timestamp: Self::parse_datetime(&row.get::<_, String>(1).unwrap_or_default()),
+            activity_type: row.get(2).unwrap_or_default(),
+            source: row.get(3).ok(),
+            issue_id: row.get(4).ok(),
+            short_id: row.get(5).ok(),
+            message: row.get(6).unwrap_or_default(),
+            metadata,
+        }
+    }
+
+    /// Convert a database row to a FixAttempt.
+    /// Expects columns in order: id, source, issue_id, short_id, attempted_at, pr_url,
+    /// scm_repo, scm_pr_number, status, error_message, merged_at, resolved_at,
+    /// retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+    fn row_to_fix_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<FixAttempt> {
+        // Parse issue_labels from JSON string
+        let issue_labels: Vec<String> = row
+            .get::<_, Option<String>>(14)?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        Ok(FixAttempt {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            issue_id: row.get(2)?,
+            short_id: row.get(3)?,
+            attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+            pr_url: row.get(5)?,
+            scm_repo: row.get(6)?,
+            scm_pr_number: row.get(7)?,
+            status: row
+                .get::<_, String>(8)?
+                .parse()
+                .unwrap_or(FixAttemptStatus::Pending),
+            error_message: row.get(9)?,
+            merged_at: Self::parse_optional_datetime(row.get(10)?),
+            resolved_at: Self::parse_optional_datetime(row.get(11)?),
+            retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
+            last_retry_at: Self::parse_optional_datetime(row.get(13)?),
+            issue_labels,
+            parent_attempt_id: row.get::<_, Option<i64>>(15).ok().flatten(),
+            cascade_repo: row.get::<_, Option<String>>(16).ok().flatten(),
+        })
+    }
+
+    /// Convert a database row to a StoredDependency.
+    /// Expects columns: rd.id, u.name, d.name, rd.dependency_type, rd.created_at
+    fn row_to_dependency(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDependency> {
+        Ok(StoredDependency {
+            id: row.get(0)?,
+            upstream: row.get(1)?,
+            downstream: row.get(2)?,
+            dep_type: row.get(3)?,
+            created_at: row.get(4)?,
+        })
+    }
+
+    /// Record a Claude execution.
+    pub fn record_execution(&self, execution: &ClaudeExecution) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO claude_executions (
+                attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
+                stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
+                prompt_used, prompt_hash, model_version, working_directory, git_branch,
+                git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
+                total_cost_usd, num_turns, session_id, duration_api_ms,
+                input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+                provider, experiment_name, experiment_variant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                execution.attempt_id,
+                execution.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                execution
+                    .completed_at
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                execution.duration_secs,
+                execution.exit_code,
+                execution.timed_out as i32,
+                execution.stdout_preview,
+                execution.stderr_preview,
+                execution.stdout_log_path,
+                execution.stderr_log_path,
+                execution.event_log_path,
+                execution.prompt_used,
+                execution.prompt_hash,
+                execution.model_version,
+                execution.working_directory,
+                execution.git_branch,
+                execution.git_commit_before,
+                execution.git_commit_after,
+                execution.files_changed,
+                execution.lines_added,
+                execution.lines_removed,
+                execution.total_cost_usd,
+                execution.num_turns,
+                execution.session_id,
+                execution.duration_api_ms,
+                execution.input_tokens,
+                execution.output_tokens,
+                execution.cache_read_input_tokens,
+                execution.cache_creation_input_tokens,
+                execution.provider,
+                execution.experiment_name,
+                execution.experiment_variant,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        Self::append_audit_json_line(
+            "execution",
+            &serde_json::json!({
+                "id": id,
+                "attempt_id": execution.attempt_id,
+                "started_at": execution.started_at.to_rfc3339(),
+                "completed_at": execution.completed_at.map(|v| v.to_rfc3339()),
+                "duration_secs": execution.duration_secs,
+                "exit_code": execution.exit_code,
+                "timed_out": execution.timed_out,
+                "stdout_preview": execution.stdout_preview,
+                "stderr_preview": execution.stderr_preview,
+                "stdout_log_path": execution.stdout_log_path,
+                "stderr_log_path": execution.stderr_log_path,
+                "event_log_path": execution.event_log_path,
+                "prompt_hash": execution.prompt_hash,
+                "model_version": execution.model_version,
+                "working_directory": execution.working_directory,
+                "git_branch": execution.git_branch,
+                "git_commit_before": execution.git_commit_before,
+                "git_commit_after": execution.git_commit_after,
+                "files_changed": execution.files_changed,
+                "lines_added": execution.lines_added,
+                "lines_removed": execution.lines_removed,
+                "total_cost_usd": execution.total_cost_usd,
+                "num_turns": execution.num_turns,
+                "session_id": execution.session_id,
+                "duration_api_ms": execution.duration_api_ms,
+                "input_tokens": execution.input_tokens,
+                "output_tokens": execution.output_tokens,
+                "cache_read_input_tokens": execution.cache_read_input_tokens,
+                "cache_creation_input_tokens": execution.cache_creation_input_tokens,
+            }),
+        );
+        Ok(id)
+    }
+
+    /// Get executions for a specific attempt.
+    pub fn get_executions_for_attempt(&self, attempt_id: i64) -> Result<Vec<ClaudeExecution>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
+                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
+                   prompt_used, prompt_hash, model_version, working_directory, git_branch,
+                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
+                   total_cost_usd, num_turns, session_id, duration_api_ms,
+                   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+                   provider, experiment_name, experiment_variant
+            FROM claude_executions
+            WHERE attempt_id = ?
+            ORDER BY started_at DESC
+            "#,
+        )?;
+
+        let mut executions = Vec::new();
+        let rows = stmt.query_map(params![attempt_id], |row| {
+            Ok(ClaudeExecution {
+                id: row.get(0)?,
+                attempt_id: row.get(1)?,
+                started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
+                completed_at: Self::parse_optional_datetime(row.get(3)?),
+                duration_secs: row.get(4)?,
+                exit_code: row.get(5)?,
+                timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
+                stdout_preview: row.get(7)?,
+                stderr_preview: row.get(8)?,
+                stdout_log_path: row.get(9)?,
+                stderr_log_path: row.get(10)?,
+                event_log_path: row.get(11)?,
+                prompt_used: row.get(12)?,
+                prompt_hash: row.get(13)?,
+                model_version: row.get(14)?,
+                working_directory: row.get(15)?,
+                git_branch: row.get(16)?,
+                git_commit_before: row.get(17)?,
+                git_commit_after: row.get(18)?,
+                files_changed: row.get(19)?,
+                lines_added: row.get(20)?,
+                lines_removed: row.get(21)?,
+                total_cost_usd: row.get(22)?,
+                num_turns: row.get(23)?,
+                session_id: row.get(24)?,
+                duration_api_ms: row.get(25)?,
+                input_tokens: row.get(26)?,
+                output_tokens: row.get(27)?,
+                cache_read_input_tokens: row.get(28)?,
+                cache_creation_input_tokens: row.get(29)?,
+                provider: row.get(30)?,
+                experiment_name: row.get(31)?,
+                experiment_variant: row.get(32)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            executions.push(row);
+        }
+
+        Ok(executions)
+    }
+
+    /// Get experiment comparison results.
+    pub fn get_experiment_results(
+        &self,
+        experiment_name: &str,
+    ) -> Result<Vec<ExperimentProviderStats>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                provider,
+                COUNT(*) as total_attempts,
+                SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) as success_count,
+                AVG(total_cost_usd) as avg_cost,
+                AVG(duration_secs) as avg_duration,
+                CAST(SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS REAL) / COUNT(*) as success_rate
+            FROM claude_executions
+            WHERE experiment_name = ?
+            GROUP BY provider
+            ORDER BY success_rate DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![experiment_name], |row| {
+            Ok(ExperimentProviderStats {
+                provider: row.get::<_, String>(0)?,
+                total_attempts: row.get(1)?,
+                success_count: row.get(2)?,
+                avg_cost: row.get(3)?,
+                avg_duration: row.get(4)?,
+                success_rate: row.get(5)?,
+            })
+        })?;
+
+        Ok(rows.flatten().collect())
+    }
+
+    /// Record a PR review.
+    pub fn record_pr_review(&self, review: &PrReviewRecord) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO pr_reviews (attempt_id, pr_url, reviewer, review_state, submitted_at, body, sentiment, actionable_feedback)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                review.attempt_id,
+                review.pr_url,
+                review.reviewer,
+                review.review_state,
+                review.submitted_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                review.body,
+                review.sentiment,
+                review.actionable_feedback,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get reviews for a specific attempt.
+    pub fn get_reviews_for_attempt(&self, attempt_id: i64) -> Result<Vec<PrReviewRecord>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, pr_url, reviewer, review_state, submitted_at, body, sentiment, actionable_feedback
+            FROM pr_reviews
+            WHERE attempt_id = ?
+            ORDER BY submitted_at DESC
+            "#,
+        )?;
+
+        let mut reviews = Vec::new();
+        let rows = stmt.query_map(params![attempt_id], |row| {
+            Ok(PrReviewRecord {
+                id: row.get(0)?,
+                attempt_id: row.get(1)?,
+                pr_url: row.get(2)?,
+                reviewer: row.get(3)?,
+                review_state: row.get(4)?,
+                submitted_at: Self::parse_optional_datetime(row.get(5)?),
+                body: row.get(6)?,
+                sentiment: row.get(7)?,
+                actionable_feedback: row.get(8)?,
+            })
+        })?;
+
+        for row in rows.flatten() {
+            reviews.push(row);
+        }
+
+        Ok(reviews)
+    }
+
+    /// Convert a database row to a StoredPrReviewComment.
+    /// Expects columns: id, scm_comment_id, pr_url, review_id, path, position, line,
+    /// body, author, created_at, updated_at, html_url
+    fn row_to_stored_pr_review_comment(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<StoredPrReviewComment> {
+        Ok(StoredPrReviewComment {
+            id: row.get(0)?,
+            scm_comment_id: row.get(1)?,
+            pr_url: row.get(2)?,
+            review_id: row.get(3)?,
+            path: row.get(4)?,
+            position: row.get(5)?,
+            line: row.get(6)?,
+            body: row.get(7)?,
+            author: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+            html_url: row.get(11)?,
+        })
+    }
+
+    /// Convert a database row to a PrReviewState.
+    /// Expects columns: pr_url, repo, pr_number, issue_id, source,
+    /// last_review_id, last_review_time, last_comment_id, last_comment_time, is_active
+    fn row_to_pr_review_state(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<crate::scm::PrReviewState> {
+        Ok(crate::scm::PrReviewState {
+            pr_url: row.get(0)?,
+            repo: row.get(1)?,
+            pr_number: row.get(2)?,
+            issue_id: row.get(3)?,
+            source: row.get(4)?,
+            last_review_id: row.get(5)?,
+            last_review_time: row.get(6)?,
+            last_comment_id: row.get(7)?,
+            last_comment_time: row.get(8)?,
+            is_active: row.get::<_, i32>(9)? != 0,
+        })
     }
 
     /// Record or update an error pattern.
@@ -4575,156 +5883,6 @@ impl SqliteTracker {
         Ok(rows.flatten().collect())
     }
 
-    /// Get metric row counts grouped by name since a timestamp.
-    pub fn get_metric_counts_since(
-        &self,
-        metric_names: &[&str],
-        since: DateTime<Utc>,
-    ) -> Result<HashMap<String, i64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, COUNT(*)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-
-        let mut counts = HashMap::new();
-        for row in rows.flatten() {
-            counts.insert(row.0, row.1);
-        }
-        Ok(counts)
-    }
-
-    /// Get metric sums grouped by name since a timestamp.
-    pub fn get_metric_sums_since(
-        &self,
-        metric_names: &[&str],
-        since: DateTime<Utc>,
-    ) -> Result<HashMap<String, f64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, SUM(metric_value)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-            ))
-        })?;
-
-        let mut sums = HashMap::new();
-        for row in rows.flatten() {
-            sums.insert(row.0, row.1);
-        }
-        Ok(sums)
-    }
-
-    /// Get metric sums grouped by (metric_name, source) since a timestamp.
-    pub fn get_metric_sums_by_source_since(
-        &self,
-        metric_names: &[&str],
-        since: DateTime<Utc>,
-    ) -> Result<HashMap<(String, String), f64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, source, SUM(metric_value)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name, source
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-            ))
-        })?;
-
-        let mut sums = HashMap::new();
-        for row in rows.flatten() {
-            if let Some(source) = row.1 {
-                sums.insert((row.0, source), row.2);
-            }
-        }
-        Ok(sums)
-    }
-
     fn row_to_metric(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessingMetric> {
         let tags_str: Option<String> = row.get(5)?;
         let tags = tags_str.and_then(|s| serde_json::from_str(&s).ok());
@@ -4737,31 +5895,6 @@ impl SqliteTracker {
             source: row.get(4)?,
             tags,
         })
-    }
-
-    /// Create or update a prompt experiment.
-    pub fn save_experiment(&self, experiment: &PromptExperiment) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO prompt_experiments (experiment_name, variant, prompt_template, prompt_hash, created_at, active, success_count, failure_count, avg_time_to_merge, avg_review_score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                experiment.experiment_name,
-                experiment.variant,
-                experiment.prompt_template,
-                experiment.prompt_hash,
-                experiment.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                experiment.active as i32,
-                experiment.success_count,
-                experiment.failure_count,
-                experiment.avg_time_to_merge,
-                experiment.avg_review_score,
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
     }
 
     /// Get active experiments.
@@ -4800,55 +5933,6 @@ impl SqliteTracker {
         Ok(experiments)
     }
 
-    /// Update experiment statistics.
-    pub fn update_experiment_stats(
-        &self,
-        experiment_id: i64,
-        success: bool,
-        time_to_merge: Option<f64>,
-    ) -> Result<()> {
-        let conn = self.acquire_lock()?;
-
-        if success {
-            conn.execute(
-                r#"
-                UPDATE prompt_experiments
-                SET success_count = success_count + 1
-                WHERE id = ?
-                "#,
-                params![experiment_id],
-            )?;
-        } else {
-            conn.execute(
-                r#"
-                UPDATE prompt_experiments
-                SET failure_count = failure_count + 1
-                WHERE id = ?
-                "#,
-                params![experiment_id],
-            )?;
-        }
-
-        if let Some(ttm) = time_to_merge {
-            // Update rolling average of time to merge
-            // Note: success_count was already incremented above, so we use
-            // (success_count - 1) for the old count and success_count for the new total
-            conn.execute(
-                r#"
-                UPDATE prompt_experiments
-                SET avg_time_to_merge = CASE
-                    WHEN avg_time_to_merge IS NULL THEN ?
-                    ELSE (avg_time_to_merge * (success_count - 1) + ?) / success_count
-                END
-                WHERE id = ?
-                "#,
-                params![ttm, ttm, experiment_id],
-            )?;
-        }
-
-        Ok(())
-    }
-
     /// Store a similar issue relationship.
     pub fn store_similar_issue(&self, similar: &SimilarIssue) -> Result<i64> {
         let conn = self.acquire_lock()?;
@@ -4869,62 +5953,6 @@ impl SqliteTracker {
             ],
         )?;
         Ok(conn.last_insert_rowid())
-    }
-
-    /// Store multiple similar issue relationships in a single transaction.
-    pub fn store_similar_issues_batch(&self, similar_issues: &[SimilarIssue]) -> Result<()> {
-        if similar_issues.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.acquire_lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                r#"
-                INSERT INTO similar_issues (source_issue_id, similar_issue_id, similarity_score, computed_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(source_issue_id, similar_issue_id) DO UPDATE SET
-                    similarity_score = excluded.similarity_score,
-                    computed_at = excluded.computed_at
-                "#,
-            )?;
-            for similar in similar_issues {
-                stmt.execute(params![
-                    similar.source_issue_id,
-                    similar.similar_issue_id,
-                    similar.similarity_score,
-                    similar.computed_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Get fix attempts for multiple (source, issue_id) pairs in a single query.
-    pub fn get_attempts_batch(&self, keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.acquire_lock()?;
-        let mut results = Vec::with_capacity(keys.len());
-        // Use a prepared statement to amortize compilation cost across the batch.
-        let mut stmt = conn.prepare_cached(
-            r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE source = ? AND issue_id = ?
-            "#,
-        )?;
-        for (source, issue_id) in keys {
-            let attempt = stmt
-                .query_row(params![source, issue_id], Self::row_to_fix_attempt)
-                .ok();
-            results.push(attempt);
-        }
-        Ok(results)
     }
 
     /// Find similar issues for a given issue.
@@ -5056,43 +6084,6 @@ impl SqliteTracker {
         })
     }
 
-    /// Prune old activity logs to prevent unbounded growth.
-    pub fn prune_old_activities(&self, days_to_keep: i64) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-
-        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
-        // This is safer than building strings in SQL even though days_to_keep is already i64
-        let modifier = format!("-{} days", days_to_keep.abs());
-
-        let deleted = conn.execute(
-            r#"
-            DELETE FROM activity_log
-            WHERE timestamp < datetime('now', ?)
-            "#,
-            params![modifier],
-        )?;
-
-        Ok(deleted)
-    }
-
-    /// Prune old metrics to prevent unbounded growth.
-    pub fn prune_old_metrics(&self, days_to_keep: i64) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-
-        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
-        let modifier = format!("-{} days", days_to_keep.abs());
-
-        let deleted = conn.execute(
-            r#"
-            DELETE FROM processing_metrics
-            WHERE timestamp < datetime('now', ?)
-            "#,
-            params![modifier],
-        )?;
-
-        Ok(deleted)
-    }
-
     /// Add or update a repository in the database.
     pub fn upsert_repository(
         &self,
@@ -5125,54 +6116,6 @@ impl SqliteTracker {
         )?;
 
         Ok(id)
-    }
-
-    /// Sync repositories from a RepoIndex to the database.
-    ///
-    /// Updates paths for all repos in the index and optionally syncs files.
-    pub fn sync_from_index(
-        &self,
-        index: &crate::repo::RepoIndex,
-        sync_files: bool,
-    ) -> Result<usize> {
-        let repos = index.list();
-        let mut synced = 0;
-
-        for repo in repos {
-            let path_str = repo.path.to_string_lossy();
-
-            if sync_files {
-                // Use save_indexed_repo which also updates file_count and last_indexed_at
-                let repo_id = self.save_indexed_repo(
-                    &repo.name,
-                    &path_str,
-                    Some(&repo.scm_url),
-                    &repo.default_branch,
-                    repo.files.len(),
-                )?;
-
-                if !repo.files.is_empty() {
-                    let files_with_types: Vec<(String, Option<String>)> = repo
-                        .files
-                        .iter()
-                        .map(|f| {
-                            let file_type = std::path::Path::new(f)
-                                .extension()
-                                .map(|e| e.to_string_lossy().to_string());
-                            (f.clone(), file_type)
-                        })
-                        .collect();
-
-                    self.save_repo_files(repo_id, &files_with_types)?;
-                }
-            } else {
-                // Just update paths in repositories table
-                self.upsert_repository(&repo.name, Some(&path_str), None)?;
-            }
-            synced += 1;
-        }
-
-        Ok(synced)
     }
 
     /// Get a repository by name.
@@ -5493,36 +6436,6 @@ impl SqliteTracker {
         Ok(())
     }
 
-    /// Get an indexed repository by name.
-    pub fn get_indexed_repo(&self, name: &str) -> Result<Option<StoredIndexedRepo>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, name, path, scm_url, default_branch, file_count, last_indexed_at, created_at
-            FROM repositories WHERE name = ?
-            "#,
-        )?;
-
-        let result = stmt.query_row(params![name], |row| {
-            Ok(StoredIndexedRepo {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                path: row.get(2)?,
-                scm_url: row.get(3)?,
-                default_branch: row.get(4)?,
-                file_count: row.get(5)?,
-                last_indexed_at: row.get(6)?,
-                created_at: row.get(7)?,
-            })
-        });
-
-        match result {
-            Ok(repo) => Ok(Some(repo)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// List all indexed repositories.
     pub fn list_indexed_repos(&self) -> Result<Vec<StoredIndexedRepo>> {
         let conn = self.acquire_lock()?;
@@ -5741,71 +6654,6 @@ impl SqliteTracker {
         Ok(row)
     }
 
-    /// Record an inference attempt.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_inference_attempt(
-        &self,
-        issue_id: &str,
-        issue_source: &str,
-        extracted_filenames: &[String],
-        extracted_functions: &[String],
-        extracted_keywords: &[String],
-        inferred_repo_id: Option<i64>,
-        confidence: &str,
-        inference_reason: &str,
-        duration_ms: Option<u64>,
-    ) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        let filenames_json = serde_json::to_string(extracted_filenames).unwrap_or_default();
-        let functions_json = serde_json::to_string(extracted_functions).unwrap_or_default();
-        let keywords_json = serde_json::to_string(extracted_keywords).unwrap_or_default();
-
-        conn.execute(
-            r#"
-            INSERT INTO inference_attempts (
-                issue_id, issue_source, extracted_filenames, extracted_functions,
-                extracted_keywords, inferred_repo_id, confidence, inference_reason,
-                inference_duration_ms
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            "#,
-            params![
-                issue_id,
-                issue_source,
-                filenames_json,
-                functions_json,
-                keywords_json,
-                inferred_repo_id,
-                confidence,
-                inference_reason,
-                duration_ms.map(|d| d as i64),
-            ],
-        )?;
-
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// Record feedback on an inference attempt (was it correct?).
-    pub fn record_inference_feedback(
-        &self,
-        inference_id: i64,
-        was_correct: bool,
-        actual_repo_id: Option<i64>,
-        feedback_source: &str,
-    ) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
-            r#"
-            UPDATE inference_attempts
-            SET was_correct = ?1, actual_repo_id = ?2, feedback_source = ?3, feedback_at = datetime('now')
-            WHERE id = ?4
-            "#,
-            params![was_correct, actual_repo_id, feedback_source, inference_id],
-        )?;
-        Ok(())
-    }
-
     /// Get inference statistics.
     pub fn get_inference_stats(&self) -> Result<InferenceStats> {
         let conn = self.acquire_lock()?;
@@ -5908,221 +6756,6 @@ impl SqliteTracker {
         }
 
         Ok(entries)
-    }
-
-    /// Get diagnostic counts for all major tables.
-    ///
-    /// This is useful for debugging and verifying that data is being written correctly.
-    pub fn get_diagnostic_counts(&self) -> Result<DiagnosticCounts> {
-        let conn = self.acquire_lock()?;
-
-        let fix_attempts: i64 =
-            conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?;
-        let fix_attempts_by_status: HashMap<String, i64> = {
-            let mut map = HashMap::new();
-            let mut stmt =
-                conn.prepare("SELECT status, COUNT(*) FROM fix_attempts GROUP BY status")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            for row in rows.flatten() {
-                map.insert(row.0, row.1);
-            }
-            map
-        };
-
-        let activity_log: i64 =
-            conn.query_row("SELECT COUNT(*) FROM activity_log", [], |row| row.get(0))?;
-
-        let claude_executions: i64 =
-            conn.query_row("SELECT COUNT(*) FROM claude_executions", [], |row| {
-                row.get(0)
-            })?;
-
-        let pr_reviews: i64 =
-            conn.query_row("SELECT COUNT(*) FROM pr_reviews", [], |row| row.get(0))?;
-
-        let pr_review_states: i64 =
-            conn.query_row("SELECT COUNT(*) FROM pr_review_states", [], |row| {
-                row.get(0)
-            })?;
-
-        let issues: i64 = conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?;
-
-        let similar_issues: i64 =
-            conn.query_row("SELECT COUNT(*) FROM similar_issues", [], |row| row.get(0))?;
-
-        let repositories: i64 =
-            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
-
-        let repo_files: i64 =
-            conn.query_row("SELECT COUNT(*) FROM repo_files", [], |row| row.get(0))?;
-
-        let inference_attempts: i64 =
-            conn.query_row("SELECT COUNT(*) FROM inference_attempts", [], |row| {
-                row.get(0)
-            })?;
-
-        let error_patterns: i64 =
-            conn.query_row("SELECT COUNT(*) FROM error_patterns", [], |row| row.get(0))?;
-
-        let processing_metrics: i64 =
-            conn.query_row("SELECT COUNT(*) FROM processing_metrics", [], |row| {
-                row.get(0)
-            })?;
-
-        let feedback_outcomes: i64 =
-            conn.query_row("SELECT COUNT(*) FROM feedback_outcomes", [], |row| {
-                row.get(0)
-            })?;
-
-        let prs: i64 = conn.query_row("SELECT COUNT(*) FROM prs", [], |row| row.get(0))?;
-
-        // Get recent fix attempts for debugging
-        let recent_fix_attempts: Vec<(String, String, String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT source, issue_id, short_id, status FROM fix_attempts ORDER BY attempted_at DESC LIMIT 5"
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            rows.flatten().collect()
-        };
-
-        Ok(DiagnosticCounts {
-            fix_attempts,
-            fix_attempts_by_status,
-            activity_log,
-            claude_executions,
-            pr_reviews,
-            pr_review_states,
-            issues,
-            similar_issues,
-            repositories,
-            repo_files,
-            inference_attempts,
-            error_patterns,
-            processing_metrics,
-            feedback_outcomes,
-            prs,
-            recent_fix_attempts,
-        })
-    }
-
-    /// Upsert a PR record.
-    ///
-    /// Creates a new record or updates an existing one based on pr_url.
-    pub fn upsert_pr(&self, pr: &crate::types::PrRecord) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO prs (
-                pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
-                title, description, author, head_branch, base_branch, status,
-                created_at, updated_at, merged_at, closed_at,
-                approvals_count, changes_requested_count, comments_count, last_review_at,
-                time_to_first_review_mins, time_to_merge_mins, review_cycles,
-                files_changed, lines_added, lines_removed
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
-            )
-            ON CONFLICT(pr_url) DO UPDATE SET
-                scm_repo = excluded.scm_repo,
-                pr_number = excluded.pr_number,
-                attempt_id = COALESCE(excluded.attempt_id, prs.attempt_id),
-                issue_id = COALESCE(excluded.issue_id, prs.issue_id),
-                issue_source = COALESCE(excluded.issue_source, prs.issue_source),
-                title = COALESCE(excluded.title, prs.title),
-                description = COALESCE(excluded.description, prs.description),
-                author = COALESCE(excluded.author, prs.author),
-                head_branch = COALESCE(excluded.head_branch, prs.head_branch),
-                base_branch = COALESCE(excluded.base_branch, prs.base_branch),
-                status = excluded.status,
-                updated_at = datetime('now'),
-                merged_at = COALESCE(excluded.merged_at, prs.merged_at),
-                closed_at = COALESCE(excluded.closed_at, prs.closed_at),
-                approvals_count = excluded.approvals_count,
-                changes_requested_count = excluded.changes_requested_count,
-                comments_count = excluded.comments_count,
-                last_review_at = COALESCE(excluded.last_review_at, prs.last_review_at),
-                time_to_first_review_mins = COALESCE(excluded.time_to_first_review_mins, prs.time_to_first_review_mins),
-                time_to_merge_mins = COALESCE(excluded.time_to_merge_mins, prs.time_to_merge_mins),
-                review_cycles = excluded.review_cycles,
-                files_changed = COALESCE(excluded.files_changed, prs.files_changed),
-                lines_added = COALESCE(excluded.lines_added, prs.lines_added),
-                lines_removed = COALESCE(excluded.lines_removed, prs.lines_removed)
-            "#,
-            params![
-                pr.pr_url,
-                pr.scm_repo,
-                pr.pr_number,
-                pr.attempt_id,
-                pr.issue_id,
-                pr.issue_source,
-                pr.title,
-                pr.description,
-                pr.author,
-                pr.head_branch,
-                pr.base_branch,
-                pr.status,
-                pr.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                pr.updated_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                pr.merged_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                pr.closed_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                pr.approvals_count,
-                pr.changes_requested_count,
-                pr.comments_count,
-                pr.last_review_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                pr.time_to_first_review_mins,
-                pr.time_to_merge_mins,
-                pr.review_cycles,
-                pr.files_changed,
-                pr.lines_added,
-                pr.lines_removed,
-            ],
-        )?;
-
-        // Get the id (either inserted or existing)
-        let id: i64 = conn.query_row(
-            "SELECT id FROM prs WHERE pr_url = ?",
-            params![pr.pr_url],
-            |row| row.get(0),
-        )?;
-
-        tracing::info!(
-            pr_url = %pr.pr_url,
-            status = %pr.status,
-            id = id,
-            "PR record upserted"
-        );
-
-        Ok(id)
-    }
-
-    /// Get a PR record by URL.
-    pub fn get_pr(&self, pr_url: &str) -> Result<Option<crate::types::PrRecord>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
-                   title, description, author, head_branch, base_branch, status,
-                   created_at, updated_at, merged_at, closed_at,
-                   approvals_count, changes_requested_count, comments_count, last_review_at,
-                   time_to_first_review_mins, time_to_merge_mins, review_cycles,
-                   files_changed, lines_added, lines_removed
-            FROM prs WHERE pr_url = ?
-            "#,
-        )?;
-
-        let result = stmt.query_row(params![pr_url], Self::row_to_pr_record).ok();
-        Ok(result)
     }
 
     /// Get all open PRs.
@@ -6552,38 +7185,6 @@ impl SqliteTracker {
         Ok(rows.flatten().collect())
     }
 
-    /// Update PR status.
-    pub fn update_pr_status(&self, pr_url: &str, status: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let (merged_at, closed_at) = match status {
-            "merged" => (Some(now.clone()), None),
-            "closed" => (None, Some(now.clone())),
-            _ => (None, None),
-        };
-
-        conn.execute(
-            r#"
-            UPDATE prs SET
-                status = ?1,
-                updated_at = ?2,
-                merged_at = COALESCE(?3, merged_at),
-                closed_at = COALESCE(?4, closed_at)
-            WHERE pr_url = ?5
-            "#,
-            params![status, now, merged_at, closed_at, pr_url],
-        )?;
-
-        tracing::info!(
-            pr_url = %pr_url,
-            status = status,
-            "PR status updated"
-        );
-
-        Ok(())
-    }
-
     fn row_to_pr_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::PrRecord> {
         Ok(crate::types::PrRecord {
             id: row.get(0)?,
@@ -6631,277 +7232,6 @@ impl SqliteTracker {
 
         let result = stmt.query_row(params![id], Self::row_to_fix_attempt).ok();
         Ok(result)
-    }
-
-    /// Get the most recently merged fix attempt for a given SCM repo.
-    pub fn get_most_recent_merged_attempt_for_repo(
-        &self,
-        scm_repo: &str,
-    ) -> Result<Option<FixAttempt>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE scm_repo = ? AND status = 'merged'
-            ORDER BY merged_at DESC
-            LIMIT 1
-            "#,
-        )?;
-
-        let result = stmt
-            .query_row(params![scm_repo], Self::row_to_fix_attempt)
-            .ok();
-        Ok(result)
-    }
-
-    /// List fix attempts with optional status/source filters and pagination.
-    pub fn list_attempts(
-        &self,
-        status: Option<&str>,
-        source: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<FixAttempt>> {
-        let conn = self.acquire_lock()?;
-        let mut attempts = Vec::new();
-
-        let query_all = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            ORDER BY attempted_at DESC
-            LIMIT ?1 OFFSET ?2
-        "#;
-        let query_status = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE status = ?1
-            ORDER BY attempted_at DESC
-            LIMIT ?2 OFFSET ?3
-        "#;
-        let query_source = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE source = ?1
-            ORDER BY attempted_at DESC
-            LIMIT ?2 OFFSET ?3
-        "#;
-        let query_status_source = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE status = ?1 AND source = ?2
-            ORDER BY attempted_at DESC
-            LIMIT ?3 OFFSET ?4
-        "#;
-
-        match (status, source) {
-            (Some(status), Some(source)) => {
-                let mut stmt = conn.prepare_cached(query_status_source)?;
-                let rows = stmt.query_map(
-                    params![status, source, limit as i64, offset as i64],
-                    Self::row_to_fix_attempt,
-                )?;
-                attempts.extend(rows.flatten());
-            }
-            (Some(status), None) => {
-                let mut stmt = conn.prepare_cached(query_status)?;
-                let rows = stmt.query_map(
-                    params![status, limit as i64, offset as i64],
-                    Self::row_to_fix_attempt,
-                )?;
-                attempts.extend(rows.flatten());
-            }
-            (None, Some(source)) => {
-                let mut stmt = conn.prepare_cached(query_source)?;
-                let rows = stmt.query_map(
-                    params![source, limit as i64, offset as i64],
-                    Self::row_to_fix_attempt,
-                )?;
-                attempts.extend(rows.flatten());
-            }
-            (None, None) => {
-                let mut stmt = conn.prepare_cached(query_all)?;
-                let rows = stmt.query_map(
-                    params![limit as i64, offset as i64],
-                    Self::row_to_fix_attempt,
-                )?;
-                attempts.extend(rows.flatten());
-            }
-        }
-
-        Ok(attempts)
-    }
-
-    /// Count fix attempts with optional status/source filters.
-    pub fn count_attempts(&self, status: Option<&str>, source: Option<&str>) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-        let count: i64 = match (status, source) {
-            (Some(status), Some(source)) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1 AND source = ?2",
-                params![status, source],
-                |row| row.get(0),
-            )?,
-            (Some(status), None) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1",
-                params![status],
-                |row| row.get(0),
-            )?,
-            (None, Some(source)) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE source = ?1",
-                params![source],
-                |row| row.get(0),
-            )?,
-            (None, None) => {
-                conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?
-            }
-        };
-        Ok(count as usize)
-    }
-
-    /// List recent attempts ordered by attempted time descending.
-    pub fn list_recent_attempts(&self, limit: usize) -> Result<Vec<FixAttempt>> {
-        self.list_attempts(None, None, limit, 0)
-    }
-
-    /// List attempts since a timestamp, ordered by attempted time descending.
-    pub fn list_attempts_since(&self, since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
-        let conn = self.acquire_lock()?;
-        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE attempted_at >= ?1
-            ORDER BY attempted_at DESC
-            "#,
-        )?;
-        let rows = stmt.query_map(params![since_str], Self::row_to_fix_attempt)?;
-        Ok(rows.flatten().collect())
-    }
-
-    /// Record a cascade fix attempt linked to a parent attempt.
-    pub fn record_cascade_attempt(
-        &self,
-        source: &str,
-        issue_id: &str,
-        short_id: &str,
-        parent_attempt_id: i64,
-        cascade_repo: &str,
-    ) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        // Check if this cascade already exists
-        let exists: bool = conn
-            .prepare_cached(
-                "SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ?",
-            )?
-            .exists(params![source, issue_id, cascade_repo])?;
-
-        if exists {
-            tracing::info!(
-                source = source,
-                issue_id = issue_id,
-                cascade_repo = cascade_repo,
-                "Cascade attempt already exists, skipping"
-            );
-            let id: i64 = conn.query_row(
-                "SELECT id FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ?",
-                params![source, issue_id, cascade_repo],
-                |row| row.get(0),
-            )?;
-            return Ok(id);
-        }
-
-        conn.execute(
-            r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, parent_attempt_id, cascade_repo)
-               VALUES (?, ?, ?, 'pending', datetime('now'), ?, ?)"#,
-            params![source, issue_id, short_id, parent_attempt_id, cascade_repo],
-        )?;
-
-        let id = conn.last_insert_rowid();
-        tracing::info!(
-            source = source,
-            issue_id = issue_id,
-            cascade_repo = cascade_repo,
-            parent_attempt_id = parent_attempt_id,
-            attempt_id = id,
-            "Recorded cascade fix attempt"
-        );
-        Ok(id)
-    }
-
-    /// Update a cascade attempt's PR info.
-    pub fn update_attempt_pr(
-        &self,
-        attempt_id: i64,
-        pr_url: &str,
-        scm_repo: &str,
-        pr_number: i64,
-    ) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
-            "UPDATE fix_attempts SET pr_url = ?, scm_repo = ?, scm_pr_number = ?, status = 'success' WHERE id = ?",
-            params![pr_url, scm_repo, pr_number, attempt_id],
-        )?;
-        Ok(())
-    }
-
-    /// Mark a cascade attempt as failed.
-    pub fn mark_cascade_failed(&self, attempt_id: i64, error: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
-            "UPDATE fix_attempts SET status = 'failed', error_message = ? WHERE id = ?",
-            params![error, attempt_id],
-        )?;
-        Ok(())
-    }
-
-    /// Create a new regression watch.
-    pub fn create_regression_watch(&self, watch: &crate::types::RegressionWatch) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO regression_watches (
-                issue_type, issue_id, fix_attempt_id, status,
-                pr_merged_at, monitoring_started_at, resolved_at, regressed_at, created_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            "#,
-            params![
-                watch.issue_type.to_string(),
-                watch.issue_id,
-                watch.fix_attempt_id,
-                watch.status.to_string(),
-                watch
-                    .pr_merged_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                watch
-                    .monitoring_started_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                watch
-                    .resolved_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                watch
-                    .regressed_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                watch.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            ],
-        )?;
-
-        Ok(conn.last_insert_rowid())
     }
 
     /// Get a regression watch by ID.
@@ -6961,69 +7291,6 @@ impl SqliteTracker {
 
         let rows = stmt.query_map([], Self::row_to_regression_watch)?;
         Ok(rows.flatten().collect())
-    }
-
-    /// Update regression watch status.
-    pub fn update_regression_watch_status(
-        &self,
-        id: i64,
-        status: crate::types::RegressionWatchStatus,
-    ) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-        // Update specific timestamp based on status
-        let (monitoring_started, resolved, regressed) = match status {
-            crate::types::RegressionWatchStatus::Monitoring => (Some(now.clone()), None, None),
-            crate::types::RegressionWatchStatus::Resolved => (None, Some(now.clone()), None),
-            crate::types::RegressionWatchStatus::Regressed => (None, None, Some(now.clone())),
-            _ => (None, None, None),
-        };
-
-        conn.execute(
-            r#"
-            UPDATE regression_watches SET
-                status = ?1,
-                monitoring_started_at = COALESCE(?2, monitoring_started_at),
-                resolved_at = COALESCE(?3, resolved_at),
-                regressed_at = COALESCE(?4, regressed_at)
-            WHERE id = ?5
-            "#,
-            params![
-                status.to_string(),
-                monitoring_started,
-                resolved,
-                regressed,
-                id
-            ],
-        )?;
-
-        Ok(())
-    }
-
-    /// Record a release tracking entry.
-    pub fn record_release_tracking(&self, tracking: &crate::types::ReleaseTracking) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO release_tracking (
-                regression_watch_id, release_version, release_commit, released_at, created_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            "#,
-            params![
-                tracking.regression_watch_id,
-                tracking.release_version,
-                tracking.release_commit,
-                tracking
-                    .released_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                tracking.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            ],
-        )?;
-
-        Ok(conn.last_insert_rowid())
     }
 
     /// Record a regression check.
@@ -7112,310 +7379,8 @@ impl SqliteTracker {
         })
     }
 
-    pub fn create_user(
-        &self,
-        email: &str,
-        password_hash: &str,
-        name: &str,
-        role: &str,
-    ) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
-            "INSERT INTO users (email, password_hash, name, role) VALUES (?1, ?2, ?3, ?4)",
-            params![email, password_hash, name, role],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    pub fn get_user_by_id(&self, id: i64) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE id = ?1"
-        )?;
-        let user = stmt.query_row(params![id], UserRow::from_row).optional()?;
-        Ok(user)
-    }
-
-    pub fn get_user_by_email(&self, email: &str) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE email = ?1"
-        )?;
-        let user = stmt
-            .query_row(params![email], UserRow::from_row)
-            .optional()?;
-        Ok(user)
-    }
-
-    pub fn list_users(&self) -> Result<Vec<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users ORDER BY id"
-        )?;
-        let users = stmt
-            .query_map([], UserRow::from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(users)
-    }
-
-    pub fn update_user(
-        &self,
-        id: i64,
-        email: Option<&str>,
-        password_hash: Option<&str>,
-        name: Option<&str>,
-        role: Option<&str>,
-        avatar_url: Option<&str>,
-    ) -> Result<bool> {
-        let conn = self.acquire_lock()?;
-        let mut sets = Vec::new();
-        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(e) = email {
-            sets.push("email = ?");
-            values.push(Box::new(e.to_string()));
-        }
-        if let Some(p) = password_hash {
-            sets.push("password_hash = ?");
-            values.push(Box::new(p.to_string()));
-        }
-        if let Some(n) = name {
-            sets.push("name = ?");
-            values.push(Box::new(n.to_string()));
-        }
-        if let Some(r) = role {
-            sets.push("role = ?");
-            values.push(Box::new(r.to_string()));
-        }
-        if let Some(a) = avatar_url {
-            sets.push("avatar_url = ?");
-            values.push(Box::new(a.to_string()));
-        }
-
-        if sets.is_empty() {
-            return Ok(false);
-        }
-
-        sets.push("updated_at = datetime('now')");
-        values.push(Box::new(id));
-
-        let sql = format!("UPDATE users SET {} WHERE id = ?", sets.join(", "));
-        let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
-        let rows = conn.execute(&sql, params.as_slice())?;
-        Ok(rows > 0)
-    }
-
-    pub fn delete_user(&self, id: i64) -> Result<bool> {
-        let conn = self.acquire_lock()?;
-        let rows = conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
-        Ok(rows > 0)
-    }
-
-    pub fn count_users(&self) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
-        Ok(count)
-    }
-
-    pub fn create_session(&self, user_id: i64, expires_at: &str) -> Result<String> {
-        let token = generate_session_token();
-        let conn = self.acquire_lock()?;
-        conn.execute(
-            "INSERT INTO sessions (id, user_id, expires_at) VALUES (?1, ?2, ?3)",
-            params![token, user_id, expires_at],
-        )?;
-        Ok(token)
-    }
-
-    pub fn get_session_user(&self, token: &str) -> Result<Option<UserRow>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
-             FROM sessions s
-             JOIN users u ON s.user_id = u.id
-             WHERE s.id = ?1 AND s.expires_at > datetime('now')",
-        )?;
-        let user = stmt
-            .query_row(params![token], UserRow::from_row)
-            .optional()?;
-        Ok(user)
-    }
-
-    pub fn delete_session(&self, token: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![token])?;
-        Ok(())
-    }
-
-    pub fn cleanup_expired_sessions(&self) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-        let deleted = conn.execute(
-            "DELETE FROM sessions WHERE expires_at <= datetime('now')",
-            [],
-        )?;
-        Ok(deleted)
-    }
-
-    pub fn delete_user_sessions(&self, user_id: i64) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
-        Ok(())
-    }
 }
 
-/// An indexed repository stored in the database.
-#[derive(Debug, Clone, Serialize)]
-pub struct StoredIndexedRepo {
-    pub id: i64,
-    pub name: String,
-    pub path: String,
-    pub scm_url: Option<String>,
-    pub default_branch: String,
-    pub file_count: i64,
-    pub last_indexed_at: String,
-    pub created_at: String,
-}
-
-/// Index statistics.
-#[derive(Debug, Clone, Serialize)]
-pub struct IndexStats {
-    pub repo_count: usize,
-    pub file_count: usize,
-    pub last_indexed_at: Option<String>,
-}
-
-/// Current indexing progress.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct IndexingProgress {
-    pub status: String,
-    pub total_repos: usize,
-    pub indexed_repos: usize,
-    pub current_repo: Option<String>,
-    pub current_repo_files: usize,
-    pub total_files_indexed: usize,
-    pub started_at: Option<String>,
-    pub updated_at: Option<String>,
-}
-
-impl Default for IndexingProgress {
-    fn default() -> Self {
-        Self {
-            status: "idle".to_string(),
-            total_repos: 0,
-            indexed_repos: 0,
-            current_repo: None,
-            current_repo_files: 0,
-            total_files_indexed: 0,
-            started_at: None,
-            updated_at: None,
-        }
-    }
-}
-
-/// Inference statistics.
-#[derive(Debug, Clone, Serialize)]
-pub struct InferenceStats {
-    pub total_attempts: usize,
-    pub with_feedback: usize,
-    pub correct: usize,
-    pub accuracy: f64,
-    pub by_confidence: ConfidenceBreakdown,
-}
-
-/// Breakdown by confidence level.
-#[derive(Debug, Clone, Serialize)]
-pub struct ConfidenceBreakdown {
-    pub high: usize,
-    pub medium: usize,
-    pub low: usize,
-    pub none: usize,
-}
-
-/// A single inference attempt from the history.
-#[derive(Debug, Clone, Serialize)]
-pub struct InferenceHistoryEntry {
-    /// Unique ID of the inference attempt.
-    pub id: i64,
-    /// Issue ID that was being processed.
-    pub issue_id: String,
-    /// Source of the issue (e.g., "linear", "sentry").
-    pub issue_source: String,
-    /// Keywords extracted from the issue.
-    pub extracted_keywords: Option<String>,
-    /// Inferred repository name (if matched).
-    pub inferred_repo_name: Option<String>,
-    /// Confidence level ("high", "medium", "low", or None).
-    pub confidence: Option<String>,
-    /// Reason for the inference decision.
-    pub inference_reason: Option<String>,
-    /// Whether the inference was correct (if feedback provided).
-    pub was_correct: Option<bool>,
-    /// Duration of the inference in milliseconds.
-    pub duration_ms: Option<i64>,
-    /// When this inference was recorded.
-    pub created_at: String,
-}
-
-/// A stored PR review comment from the database.
-#[derive(Debug, Clone, Serialize)]
-pub struct StoredPrReviewComment {
-    pub id: i64,
-    pub scm_comment_id: i64,
-    pub pr_url: String,
-    pub review_id: Option<i64>,
-    pub path: String,
-    pub position: Option<i64>,
-    pub line: Option<i64>,
-    pub body: String,
-    pub author: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub html_url: Option<String>,
-}
-
-/// A repository stored in the database.
-#[derive(Debug, Clone, Serialize)]
-pub struct StoredRepository {
-    pub id: i64,
-    pub name: String,
-    pub path: Option<String>,
-    pub scm_url: String,
-    pub created_at: String,
-}
-
-/// A dependency relationship stored in the database.
-#[derive(Debug, Clone, Serialize)]
-pub struct StoredDependency {
-    pub id: i64,
-    pub upstream: String,
-    pub downstream: String,
-    pub dep_type: String,
-    pub created_at: String,
-}
-
-/// Diagnostic counts for all major tables.
-///
-/// Used by the `claudear diag db` command to verify database state.
-#[derive(Debug, Clone, Serialize)]
-pub struct DiagnosticCounts {
-    pub fix_attempts: i64,
-    pub fix_attempts_by_status: HashMap<String, i64>,
-    pub activity_log: i64,
-    pub claude_executions: i64,
-    pub pr_reviews: i64,
-    pub pr_review_states: i64,
-    pub issues: i64,
-    pub similar_issues: i64,
-    pub repositories: i64,
-    pub repo_files: i64,
-    pub inference_attempts: i64,
-    pub error_patterns: i64,
-    pub processing_metrics: i64,
-    pub feedback_outcomes: i64,
-    pub prs: i64,
-    /// Recent fix attempts (source, issue_id, short_id, status) - up to 5
-    pub recent_fix_attempts: Vec<(String, String, String, String)>,
-}
 
 // ============================================================
 // Continuous Learning SqliteTracker implementations
@@ -8165,68 +8130,6 @@ impl SqliteTracker {
             ],
         )?;
         Ok(())
-    }
-
-    pub fn store_eval_snapshot(
-        &self,
-        attempt_id: Option<i64>,
-        phase: &str,
-        snapshot: &crate::evaluation::EvalSnapshot,
-    ) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        let diagnostics_json =
-            serde_json::to_string(&snapshot.diagnostics).unwrap_or_else(|_| "[]".into());
-        conn.execute(
-            "INSERT INTO eval_snapshots (attempt_id, phase, category, tool_name, exit_code, passed, failed, skipped, warnings, errors, diagnostics_json, raw_output, duration_secs, line_coverage_pct, branch_coverage_pct)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                attempt_id,
-                phase,
-                snapshot.category.to_string(),
-                snapshot.tool_name,
-                snapshot.exit_code,
-                snapshot.passed,
-                snapshot.failed,
-                snapshot.skipped,
-                snapshot.warnings,
-                snapshot.errors,
-                diagnostics_json,
-                snapshot.raw_output,
-                snapshot.duration_secs,
-                snapshot.line_coverage_pct,
-                snapshot.branch_coverage_pct,
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    pub fn store_eval_delta(
-        &self,
-        attempt_id: Option<i64>,
-        repo: &str,
-        delta: &crate::evaluation::EvalDelta,
-    ) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        let regressions_json =
-            serde_json::to_string(&delta.regressions).unwrap_or_else(|_| "[]".into());
-        let fixed_json = serde_json::to_string(&delta.fixed).unwrap_or_else(|_| "[]".into());
-        conn.execute(
-            "INSERT INTO eval_deltas (attempt_id, repo, tool_name, category, new_passes, new_failures, regressions_json, fixed_json, coverage_delta_pct, overall_improved)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                attempt_id,
-                repo,
-                delta.after.tool_name,
-                delta.after.category.to_string(),
-                delta.new_passes,
-                delta.new_failures,
-                regressions_json,
-                fixed_json,
-                delta.coverage_delta_pct,
-                delta.is_improvement() as i32,
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
     }
 
     /// Get or create a repository ID by name.

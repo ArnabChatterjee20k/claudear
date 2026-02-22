@@ -14,7 +14,7 @@ use crate::qa::{
     format_reuse_context, format_timeout_context, normalize_text,
 };
 use crate::repo::{worktree_path, GitOps};
-use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
+use crate::runner::{self, AgentRunner};
 use crate::scm::{PrReviewState, ReviewWatcher};
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
 use crate::types::{
@@ -58,7 +58,7 @@ struct AppState {
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     user_registry: UserRegistry,
-    claude: ClaudeRunner,
+    agent: Arc<dyn AgentRunner>,
     github_handler: Option<GitHubWebhookHandler>,
     suppression_regex_cache: Option<crate::prioritisation::suppression::RegexCache>,
     /// Tracks currently processing webhooks with timestamps for TTL-based cleanup.
@@ -77,6 +77,7 @@ pub struct WebhookServer {
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     github_handler: Option<GitHubWebhookHandler>,
+    agent: Arc<dyn AgentRunner>,
     port: u16,
 }
 
@@ -89,6 +90,7 @@ impl WebhookServer {
         tracker: Arc<dyn FixAttemptTracker>,
         sqlite_tracker: Option<Arc<SqliteTracker>>,
         inferrer: Option<RepoInferrer>,
+        agent: Arc<dyn AgentRunner>,
     ) -> Self {
         Self::new_with_github(
             config,
@@ -98,6 +100,7 @@ impl WebhookServer {
             sqlite_tracker,
             inferrer,
             None,
+            agent,
         )
     }
 
@@ -110,6 +113,7 @@ impl WebhookServer {
         sqlite_tracker: Option<Arc<SqliteTracker>>,
         inferrer: Option<RepoInferrer>,
         github_handler: Option<GitHubWebhookHandler>,
+        agent: Arc<dyn AgentRunner>,
     ) -> Self {
         let port = config.webhook_port;
         Self {
@@ -122,6 +126,7 @@ impl WebhookServer {
             issue_embedding_service: None,
             review_watcher: None,
             github_handler,
+            agent,
             port,
         }
     }
@@ -155,7 +160,7 @@ impl WebhookServer {
         // Initialize FeedbackAnalyzer and warm-start with DB outcomes
         let mut feedback_analyzer = FeedbackAnalyzer::new();
         if let Some(ref sqlite_tracker) = self.sqlite_tracker {
-            feedback_analyzer = feedback_analyzer.with_sqlite_tracker(sqlite_tracker.clone());
+            feedback_analyzer = feedback_analyzer.with_tracker(sqlite_tracker.clone());
             match sqlite_tracker.get_feedback_outcomes(None, 1000) {
                 Ok(outcomes) if !outcomes.is_empty() => {
                     let count = outcomes.len();
@@ -179,16 +184,7 @@ impl WebhookServer {
         };
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: self.config.claude_timeout_secs,
-                    model: self.config.claude.model.clone(),
-                    instructions: self.config.claude.instructions.clone(),
-                    permissions: self.config.claude.permissions.clone(),
-                    skip_permissions: self.config.claude.skip_permissions,
-                },
-                self.tracker.clone(),
-            ),
+            agent: self.agent,
             config: self.config,
             handlers: self.handlers,
             notifier: self.notifier,
@@ -604,13 +600,9 @@ async fn webhook_handler(
     }
 
     // Persist full issue content to the issues table (independent of embeddings)
-    if let Some(db) = state
-        .tracker
-        .as_any()
-        .downcast_ref::<crate::storage::SqliteTracker>()
     {
         let stored = IssueEmbedding::from_issue(&issue);
-        if let Err(e) = db.store_issue(&stored) {
+        if let Err(e) = state.tracker.store_issue(&stored) {
             tracing::debug!(error = %e, "Failed to store issue content");
         }
     }
@@ -733,7 +725,7 @@ async fn process_issue(
     let resolution = resolve_repo_for_issue(
         state.inferrer.as_ref(),
         &issue,
-        state.sqlite_tracker.as_ref(),
+        Some(&state.tracker),
     );
 
     let project_dir = match &resolution {
@@ -945,7 +937,7 @@ async fn process_issue(
         let mut rounds: u8 = 0;
         let claude_result = loop {
             let prompt = state
-                .claude
+                .agent
                 .build_prompt_for_issue(&issue, &context, &effective_project_dir);
 
             // Enhance prompt with feedback learnings from past outcomes (semantic when possible)
@@ -971,7 +963,7 @@ async fn process_issue(
             );
 
             let mut run_result = state
-                .claude
+                .agent
                 .execute_with_attempt(&prompt, Some(&issue), attempt_id, &effective_project_dir)
                 .await?;
             run_result.used_qa_ids = used_qa_ids.clone();
@@ -1454,7 +1446,7 @@ async fn record_feedback_outcome_from_attempt(
 }
 
 async fn notify_failed_with_escalation(state: &AppState, issue: &Issue, error: &str) -> Result<()> {
-    if ClaudeRunner::is_hard_error(error) {
+    if runner::is_hard_error(error) {
         let mut global_issue = issue.clone();
         global_issue.metadata.remove("resolved_user");
         global_issue
@@ -1469,7 +1461,7 @@ async fn notify_failed_with_escalation(state: &AppState, issue: &Issue, error: &
         .with_issue(issue.id.clone(), issue.short_id.clone())
         .with_metadata(json!({
             "hard_error": true,
-            "rate_limited": ClaudeRunner::is_rate_limit_error(error),
+            "rate_limited": runner::is_rate_limit_error(error),
             "error": truncate_error_for_activity(error),
         }));
         state.tracker.record_activity(&activity).ok();
@@ -1582,7 +1574,7 @@ fn record_error_pattern(state: &AppState, source: &str, issue_id: &str, error_ms
 mod tests {
     use super::*;
     use crate::config::{
-        AskConfig, CascadeConfig, ClaudeConfig, CodeIndexConfig, DiscordConfig, EmailConfig,
+        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, DiscordConfig, EmailConfig,
         GitHubAppConfig, GitHubConfig, LearningConfig, PrioritisationConfig, PushConfig,
         RegressionConfig, RetryConfig, SlackConfig, SmsConfig,
     };
@@ -1703,8 +1695,7 @@ mod tests {
             processing_delay_ms: 1000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
-            claude_timeout_secs: 21600,
-            claude: ClaudeConfig::default(),
+            agent: AgentConfig::default(),
             discord: DiscordConfig::default(),
             slack: SlackConfig::default(),
             email: EmailConfig::default(),
@@ -1730,6 +1721,13 @@ mod tests {
         }
     }
 
+    fn test_agent(tracker: Arc<dyn FixAttemptTracker>) -> Arc<dyn AgentRunner> {
+        Arc::new(crate::runner::ClaudeAgentRunner::new(
+            crate::runner::ClaudeRunnerConfig::default(),
+            tracker,
+        ))
+    }
+
     #[test]
     fn test_webhook_server_new() {
         let config = test_config();
@@ -1737,7 +1735,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         assert_eq!(server.port, 8080);
     }
@@ -1750,7 +1748,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         assert_eq!(server.port, 3000);
     }
@@ -1966,13 +1964,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2009,13 +2004,10 @@ mod tests {
         processing_set.insert("sentry:issue2".to_string(), Instant::now());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2050,13 +2042,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2125,13 +2114,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2175,13 +2161,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2247,13 +2230,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2329,13 +2309,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2383,13 +2360,10 @@ mod tests {
         tracker.record_attempt("test", "1", "TEST-1").unwrap();
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2438,13 +2412,10 @@ mod tests {
         processing.insert("test:1".to_string(), Instant::now());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2489,13 +2460,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2562,13 +2530,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2666,7 +2631,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config.clone(), handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config.clone(), handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         assert_eq!(server.port, config.webhook_port);
         assert_eq!(server.config.work_dir, config.work_dir);
@@ -2682,13 +2647,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier,
@@ -2804,13 +2766,10 @@ mod tests {
         let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().unwrap());
         AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -2881,13 +2840,10 @@ mod tests {
     fn test_record_error_pattern_basic() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: 300,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config: test_config(),
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -2912,13 +2868,10 @@ mod tests {
     fn test_record_error_pattern_empty_error() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: 300,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config: test_config(),
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -2950,13 +2903,10 @@ mod tests {
     ) -> Arc<AppState> {
         let config = test_config();
         Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier: Arc::new(MockNotifier::new()),
@@ -2981,13 +2931,10 @@ mod tests {
     ) -> Arc<AppState> {
         let config = test_config();
         Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier: Arc::new(MockNotifier::new()),
@@ -3011,13 +2958,10 @@ mod tests {
     ) -> Arc<AppState> {
         let config = test_config();
         Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -3294,13 +3238,10 @@ mod tests {
         let cache = RegexCache::new(&config.prioritisation.suppression_rules);
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier: Arc::new(MockNotifier::new()),
@@ -3838,7 +3779,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let mut server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let mut server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         assert!(server.review_watcher.is_none());
         server.set_review_watcher(None);
@@ -3852,7 +3793,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let mut server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let mut server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         assert!(server.issue_embedding_service.is_none());
         server.set_issue_embedding_service(None);
@@ -3872,10 +3813,11 @@ mod tests {
             config,
             handlers,
             notifier,
-            tracker,
+            tracker.clone(),
             None,
             None,
             Some(github_handler),
+            test_agent(tracker),
         );
 
         assert!(server.github_handler.is_some());
@@ -3890,7 +3832,7 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let server =
-            WebhookServer::new_with_github(config, handlers, notifier, tracker, None, None, None);
+            WebhookServer::new_with_github(config, handlers, notifier, tracker.clone(), None, None, None, test_agent(tracker));
 
         assert!(server.github_handler.is_none());
     }
@@ -4079,13 +4021,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -4114,13 +4053,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -4151,13 +4087,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -4316,13 +4249,10 @@ mod tests {
 
         let config = test_config();
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier: Arc::new(MockNotifier::new()),
@@ -4478,6 +4408,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
+        let agent = test_agent(tracker.clone());
         let server = WebhookServer::new(
             config,
             handlers,
@@ -4485,6 +4416,7 @@ mod tests {
             tracker.clone(),
             Some(tracker),
             None,
+            agent,
         );
 
         assert!(server.sqlite_tracker.is_some());
@@ -4498,7 +4430,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         assert!(server.inferrer.is_none());
         assert!(server.sqlite_tracker.is_none());
@@ -4519,7 +4451,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         assert_eq!(server.port, 9999);
         assert_eq!(
@@ -4541,7 +4473,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let mut server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let mut server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         // Initially None
         assert!(server.review_watcher.is_none());
@@ -4558,7 +4490,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let mut server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let mut server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         // Initially None
         assert!(server.issue_embedding_service.is_none());
@@ -4583,6 +4515,7 @@ mod tests {
         let github_handler =
             GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
 
+        let agent = test_agent(tracker.clone());
         let server = WebhookServer::new_with_github(
             config,
             handlers,
@@ -4591,6 +4524,7 @@ mod tests {
             Some(tracker),
             None,
             Some(github_handler),
+            agent,
         );
 
         assert_eq!(server.port, 4321);
@@ -4609,13 +4543,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -4753,13 +4684,10 @@ mod tests {
     fn test_record_error_pattern_timeout() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: 300,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config: test_config(),
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -4797,13 +4725,10 @@ mod tests {
     fn test_record_error_pattern_multiple_for_same_issue() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: 300,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config: test_config(),
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -4921,13 +4846,10 @@ mod tests {
 
         let config = test_config();
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier: Arc::new(MockNotifier::new()),
@@ -5023,13 +4945,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -5059,13 +4978,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -5154,7 +5070,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
 
         // new() should result in github_handler being None
         assert!(server.github_handler.is_none());
@@ -5551,13 +5467,10 @@ mod tests {
         // No github_handler configured
         let config = test_config();
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier: Arc::new(MockNotifier::new()),
@@ -5752,13 +5665,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -5793,13 +5703,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -5830,13 +5737,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -5867,13 +5771,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -5904,13 +5805,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -5944,13 +5842,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -5980,13 +5875,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -6020,13 +5912,10 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: notifier.clone(),
@@ -6063,13 +5952,10 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -6105,13 +5991,10 @@ mod tests {
 
         let config = test_config();
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -6182,13 +6065,10 @@ mod tests {
     fn test_record_error_pattern_very_long_message() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: 300,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config: test_config(),
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -6214,13 +6094,10 @@ mod tests {
     fn test_record_error_pattern_unicode_error() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: 300,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config: test_config(),
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -6367,13 +6244,10 @@ mod tests {
         let cache = RegexCache::new(&config.prioritisation.suppression_rules);
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier: Arc::new(MockNotifier::new()),
@@ -6430,13 +6304,10 @@ mod tests {
         let cache = RegexCache::new(&config.prioritisation.suppression_rules);
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier: Arc::new(MockNotifier::new()),
@@ -6481,6 +6352,7 @@ mod tests {
         let github_handler =
             GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
 
+        let agent = test_agent(tracker.clone());
         let mut server = WebhookServer::new_with_github(
             config,
             handlers,
@@ -6489,6 +6361,7 @@ mod tests {
             Some(tracker),
             None,
             Some(github_handler),
+            agent,
         );
 
         assert_eq!(server.port, 5555);
@@ -6732,13 +6605,13 @@ mod tests {
     #[test]
     fn test_webhook_server_config_claude_timeout() {
         let mut config = test_config();
-        config.claude_timeout_secs = 999;
+        config.agent.timeout_secs = 999;
         let handlers = WebhookHandlerRegistry::new();
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
-        assert_eq!(server.config.claude_timeout_secs, 999);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        assert_eq!(server.config.agent.timeout_secs, 999);
     }
 
     #[test]
@@ -6749,7 +6622,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
         assert_eq!(server.config.max_concurrent, 10);
     }
 
@@ -6833,13 +6706,10 @@ mod tests {
         let cache = RegexCache::new(&config.prioritisation.suppression_rules);
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers,
             notifier: Arc::new(MockNotifier::new()),
@@ -7029,13 +6899,10 @@ mod tests {
         }
 
         let state = Arc::new(AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.claude_timeout_secs,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config,
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -7064,13 +6931,10 @@ mod tests {
     fn test_record_error_pattern_stores_source_and_issue() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: 300,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config: test_config(),
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),
@@ -7115,7 +6979,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
         assert_eq!(server.port, 8080);
     }
 
@@ -7127,7 +6991,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
         assert_eq!(server.port, 65535);
     }
 
@@ -7139,7 +7003,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
         assert_eq!(server.port, 80);
     }
 
@@ -7259,13 +7123,10 @@ mod tests {
     fn test_record_error_pattern() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let state = AppState {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: 300,
-                    ..Default::default()
-                },
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
+            )),
             config: test_config(),
             handlers: WebhookHandlerRegistry::new(),
             notifier: Arc::new(MockNotifier::new()),

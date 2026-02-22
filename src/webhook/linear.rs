@@ -63,7 +63,7 @@ impl WebhookHandler for LinearWebhookHandler {
             None => return false,
         };
 
-        let mut mac = match Hmac::<Sha256>::new_from_slice(secret.as_bytes()) {
+        let mut mac = match Hmac::<Sha256>::new_from_slice(secret.expose().as_bytes()) {
             Ok(m) => m,
             Err(_) => return false,
         };
@@ -314,12 +314,12 @@ mod tests {
     fn test_config() -> LinearConfig {
         LinearConfig {
             enabled: true,
-            api_key: "test".to_string(),
+            api_key: "test".into(),
             trigger_labels: vec!["auto-implement".to_string()],
             trigger_states: vec!["backlog".to_string(), "todo".to_string()],
             team_id: None,
             project_id: None,
-            webhook_secret: Some("test_secret".to_string()),
+            webhook_secret: Some("test_secret".into()),
             ..Default::default()
         }
     }
@@ -795,11 +795,11 @@ mod tests {
     fn test_matches_criteria_trigger_assignee_no_labels() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test".to_string(),
+            api_key: "test".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
-            webhook_secret: Some("test_secret".to_string()),
+            webhook_secret: Some("test_secret".into()),
             ..Default::default()
         };
         let handler = LinearWebhookHandler::new(config);
@@ -822,11 +822,11 @@ mod tests {
     fn test_matches_criteria_trigger_assignee_wrong_assignee() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test".to_string(),
+            api_key: "test".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
-            webhook_secret: Some("test_secret".to_string()),
+            webhook_secret: Some("test_secret".into()),
             ..Default::default()
         };
         let handler = LinearWebhookHandler::new(config);
@@ -850,11 +850,11 @@ mod tests {
     fn test_matches_criteria_trigger_assignee_and_labels_both_required() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test".to_string(),
+            api_key: "test".into(),
             trigger_labels: vec!["auto-implement".to_string()],
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
-            webhook_secret: Some("test_secret".to_string()),
+            webhook_secret: Some("test_secret".into()),
             ..Default::default()
         };
         let handler = LinearWebhookHandler::new(config);

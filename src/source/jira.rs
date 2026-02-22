@@ -447,10 +447,10 @@ fn parse_jira_datetime(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>>
 /// Build the Authorization header value from config.
 fn build_auth_header(config: &JiraConfig) -> String {
     match config.auth_mode.as_str() {
-        "bearer" => format!("Bearer {}", config.api_token),
+        "bearer" => format!("Bearer {}", config.api_token.expose()),
         _ => {
             // Default to Basic auth: base64(email:token)
-            let credentials = format!("{}:{}", config.email, config.api_token);
+            let credentials = format!("{}:{}", config.email, config.api_token.expose());
             format!("Basic {}", BASE64.encode(credentials.as_bytes()))
         }
     }
@@ -1078,7 +1078,7 @@ mod tests {
             enabled: true,
             base_url: "https://test.atlassian.net".to_string(),
             email: "user@test.com".to_string(),
-            api_token: "test-token".to_string(),
+            api_token: "test-token".into(),
             auth_mode: "basic".to_string(),
             project_keys: vec!["PROJ".to_string()],
             trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
@@ -1915,7 +1915,7 @@ mod tests {
             enabled: true,
             base_url: "https://test.atlassian.net".to_string(),
             email: "user@test.com".to_string(),
-            api_token: "token".to_string(),
+            api_token: "token".into(),
             auth_mode: "basic".to_string(),
             project_keys: vec![],
             trigger_labels: vec![],
@@ -2586,7 +2586,7 @@ mod tests {
     fn test_auth_header_basic_encoding() {
         let config = JiraConfig {
             email: "test@example.com".to_string(),
-            api_token: "my-secret-token".to_string(),
+            api_token: "my-secret-token".into(),
             auth_mode: "basic".to_string(),
             ..test_config()
         };

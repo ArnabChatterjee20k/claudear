@@ -1,19 +1,25 @@
 //! Issue source implementations.
 
 mod discord;
+mod github;
 mod gitlab;
 mod jira;
 mod linear;
 pub mod sentry;
 mod slack;
+mod telegram;
+mod whatsapp;
 
 pub use discord::DiscordSource;
+pub use github::GitHubSource;
 pub use gitlab::GitLabSource;
 pub(crate) use gitlab::{format_gitlab_context, gitlab_matches_criteria};
 pub use jira::JiraSource;
 pub use linear::LinearSource;
 pub use sentry::SentrySource;
 pub use slack::SlackSource;
+pub use telegram::TelegramSource;
+pub use whatsapp::{WhatsAppMessage, WhatsAppSource};
 
 use crate::error::Result;
 use crate::types::{Issue, MatchResult};

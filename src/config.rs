@@ -17,24 +17,246 @@ fn default_bind_address() -> String {
     "127.0.0.1".to_string()
 }
 
-/// Claude CLI configuration.
+/// Agent configuration -- replaces the old `[claude]` config section.
+///
+/// Supports multiple providers, experiments, and orchestration strategies.
+/// ```toml
+/// [agent]
+/// default_provider = "claude"
+/// timeout_secs = 21600
+///
+/// [agent.providers.claude]
+/// model = "opus"
+/// instructions = "Follow AGENT.md"
+/// permissions = ["Bash(git:*)", "Read", "Write"]
+/// skip_permissions = true
+/// binary = "claude"
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-#[derive(Default)]
-pub struct ClaudeConfig {
+pub struct AgentConfig {
+    /// Which provider to use by default.
+    pub default_provider: String,
+    /// Global timeout for agent process execution in seconds (default: 21600 = 6 hours).
+    pub timeout_secs: u64,
+    /// Per-provider configurations, keyed by provider name.
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, ProviderConfig>,
+    /// Optional A/B experiments.
+    #[serde(default)]
+    pub experiments: Vec<ExperimentConfig>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("claude".to_string(), ProviderConfig::default());
+        Self {
+            default_provider: "claude".to_string(),
+            timeout_secs: 21600,
+            providers,
+            experiments: Vec::new(),
+        }
+    }
+}
+
+impl AgentConfig {
+    /// Get the default provider's config.
+    pub fn default_provider_config(&self) -> Option<&ProviderConfig> {
+        self.providers.get(&self.default_provider)
+    }
+
+    /// Get a mutable reference to the default provider's config, inserting a
+    /// default entry if it does not exist.
+    pub fn default_provider_config_mut(&mut self) -> &mut ProviderConfig {
+        self.providers
+            .entry(self.default_provider.clone())
+            .or_default()
+    }
+}
+
+/// Per-provider configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderConfig {
     /// Model to use (e.g., sonnet, opus, haiku, or full model ID).
     pub model: Option<String>,
-    /// Custom instructions appended to Claude's system prompt.
+    /// Custom instructions appended to the agent's system prompt.
     pub instructions: Option<String>,
     /// Path to a file containing custom instructions.
-    /// Resolved relative to the config file directory. If both this and
-    /// `instructions` are set, file content comes first, then inline appended.
+    /// Resolved relative to the config file directory.
     pub instructions_file: Option<String>,
     /// Tool permissions granted without prompting (--allowedTools).
     #[serde(default)]
     pub permissions: Vec<String>,
     /// Skip all permission prompts (default: false).
     pub skip_permissions: bool,
+    /// CLI binary name/path (e.g., "claude", "codex").
+    pub binary: Option<String>,
+    /// API key for API-based providers.
+    pub api_key: Option<SecretValue>,
+    /// API base URL for API-based providers.
+    pub api_url: Option<String>,
+    /// Sandbox mode (e.g., "network-off" for Codex).
+    pub sandbox: Option<String>,
+    /// Provider-specific extra configuration.
+    #[serde(default)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Experiment configuration for A/B testing providers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentConfig {
+    /// Experiment name.
+    pub name: String,
+    /// Whether the experiment is active.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Selection strategy: "weighted_random" or "fallback".
+    #[serde(default = "default_experiment_strategy")]
+    pub strategy: String,
+    /// Provider weights for the experiment.
+    #[serde(default)]
+    pub providers: Vec<ExperimentProviderWeight>,
+}
+
+fn default_experiment_strategy() -> String {
+    "weighted_random".to_string()
+}
+
+/// Provider weight within an experiment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentProviderWeight {
+    /// Provider name (must match a key in `agent.providers`).
+    pub name: String,
+    /// Selection weight (higher = more traffic).
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+}
+
+fn default_weight() -> f64 {
+    1.0
+}
+
+/// SCM (Source Control Management) configuration group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScmConfig {
+    /// GitHub configuration for PR monitoring and issue management.
+    pub github: GitHubConfig,
+    /// GitLab configuration for MR monitoring and issue management.
+    pub gitlab: Option<GitLabConfig>,
+}
+
+impl Default for ScmConfig {
+    fn default() -> Self {
+        Self {
+            github: GitHubConfig::default(),
+            gitlab: None,
+        }
+    }
+}
+
+/// Issue sources configuration group.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IssuesConfig {
+    /// Linear source configuration.
+    pub linear: Option<LinearConfig>,
+    /// Sentry source configuration.
+    pub sentry: Option<SentryConfig>,
+    /// Jira source configuration.
+    pub jira: Option<JiraConfig>,
+    /// Discord as an issue source (bot_token + channel for inbound messages).
+    pub discord: Option<DiscordSourceConfig>,
+    /// Slack as an issue source (bot_token + channel for inbound messages).
+    pub slack: Option<SlackSourceConfig>,
+}
+
+/// Notifier configuration group.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifiersConfig {
+    /// Discord notification channel.
+    pub discord: DiscordNotifierConfig,
+    /// Slack notification channel.
+    pub slack: SlackNotifierConfig,
+    /// Email (SMTP) notification channel.
+    pub email: EmailConfig,
+    /// SMS (Twilio) notification channel.
+    pub sms: SmsConfig,
+    /// Push (Pushover) notification channel.
+    pub push: PushConfig,
+    /// WhatsApp Business notification channel.
+    pub whatsapp: WhatsAppConfig,
+    /// Telegram Bot notification channel.
+    pub telegram: TelegramConfig,
+}
+
+/// Discord source-only configuration (for issue ingestion).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscordSourceConfig {
+    /// Discord bot token for reading messages.
+    pub bot_token: Option<SecretValue>,
+    /// Channel ID to read issues from.
+    pub channel_id: Option<String>,
+    /// Channel to listen for issue messages (falls back to channel_id).
+    pub listen_channel_id: Option<String>,
+    /// Guild (server) ID for constructing message URLs.
+    pub guild_id: Option<String>,
+    /// Polling interval in milliseconds (overrides global).
+    pub poll_interval_ms: Option<u64>,
+}
+
+/// Discord notifier-only configuration (for outbound notifications).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscordNotifierConfig {
+    /// Discord webhook URL for notifications.
+    pub webhook_url: Option<SecretValue>,
+    /// Discord user ID to mention in notifications.
+    pub user_id: Option<String>,
+    /// Discord bot token (for reply polling).
+    pub bot_token: Option<SecretValue>,
+    /// Discord channel ID (for reply polling).
+    pub channel_id: Option<String>,
+    /// Guild (server) ID for constructing message URLs.
+    pub guild_id: Option<String>,
+}
+
+/// Slack source-only configuration (for issue ingestion).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlackSourceConfig {
+    /// Slack Bot Token (xoxb-) for reading messages.
+    pub bot_token: Option<SecretValue>,
+    /// Channel ID to read issues from.
+    pub channel_id: Option<String>,
+    /// Channel to listen for issue messages (falls back to channel_id).
+    pub listen_channel_id: Option<String>,
+    /// Workspace name for constructing message URLs.
+    pub workspace: Option<String>,
+    /// Polling interval in milliseconds (overrides global).
+    pub poll_interval_ms: Option<u64>,
+    /// Slack user ID (e.g., bot's own user ID for reply detection).
+    pub user_id: Option<String>,
+}
+
+/// Slack notifier-only configuration (for outbound notifications).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlackNotifierConfig {
+    /// Slack Incoming Webhook URL.
+    pub webhook_url: Option<SecretValue>,
+    /// Slack user ID to mention in notifications.
+    pub user_id: Option<String>,
+    /// Slack Bot Token (for reply polling).
+    pub bot_token: Option<SecretValue>,
+    /// Slack channel ID (for reply polling).
+    pub channel_id: Option<String>,
+    /// Workspace name for constructing message URLs.
+    pub workspace: Option<String>,
 }
 
 /// Main configuration for the application.
@@ -71,37 +293,22 @@ pub struct Config {
     pub max_activity_entries: usize,
     /// IPC request timeout in seconds (default: 30).
     pub ipc_timeout_secs: u64,
-    /// Claude process execution timeout in seconds (default: 21600 = 6 hours).
-    pub claude_timeout_secs: u64,
-    /// Claude CLI configuration.
-    pub claude: ClaudeConfig,
-    /// Discord configuration.
-    pub discord: DiscordConfig,
-    /// Slack configuration.
-    pub slack: SlackConfig,
-    /// Email configuration.
-    pub email: EmailConfig,
-    /// SMS configuration.
-    pub sms: SmsConfig,
-    /// Push notification configuration.
-    pub push: PushConfig,
+    /// Agent runner configuration (providers, experiments, orchestration).
+    #[serde(default)]
+    pub agent: AgentConfig,
+    /// SCM (Source Control Management) configuration group.
+    #[serde(default)]
+    pub scm: ScmConfig,
+    /// Issue sources configuration group.
+    #[serde(default)]
+    pub issues: IssuesConfig,
+    /// Notification channels configuration group.
+    #[serde(default)]
+    pub notifiers: NotifiersConfig,
     /// Human Q&A ask-loop configuration.
     pub ask: AskConfig,
-    /// GitHub configuration for PR monitoring.
-    pub github: GitHubConfig,
-    /// GitHub App configuration for App-based authentication.
-    #[serde(default)]
-    pub github_app: GitHubAppConfig,
     /// Retry configuration.
     pub retry: RetryConfig,
-    /// Linear source configuration.
-    pub linear: Option<LinearConfig>,
-    /// Sentry source configuration.
-    pub sentry: Option<SentryConfig>,
-    /// Jira source configuration.
-    pub jira: Option<JiraConfig>,
-    /// GitLab configuration for MR monitoring and issue management.
-    pub gitlab: Option<GitLabConfig>,
     /// Regression monitoring configuration.
     #[serde(default)]
     pub regression: RegressionConfig,
@@ -170,21 +377,12 @@ impl Default for Config {
             processing_delay_ms: 5000,
             max_activity_entries: 10_000,
             ipc_timeout_secs: 30,
-            claude_timeout_secs: 21600, // 6 hours
-            claude: ClaudeConfig::default(),
-            discord: DiscordConfig::default(),
-            slack: SlackConfig::default(),
-            email: EmailConfig::default(),
-            sms: SmsConfig::default(),
-            push: PushConfig::default(),
+            agent: AgentConfig::default(),
+            scm: ScmConfig::default(),
+            issues: IssuesConfig::default(),
+            notifiers: NotifiersConfig::default(),
             ask: AskConfig::default(),
-            github: GitHubConfig::default(),
-            github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),
-            linear: None,
-            sentry: None,
-            jira: None,
-            gitlab: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
@@ -739,6 +937,42 @@ pub struct PushConfig {
     pub priority: Option<i8>,
 }
 
+/// WhatsApp Business Cloud API configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WhatsAppConfig {
+    /// WhatsApp Business phone number ID.
+    pub phone_number_id: Option<String>,
+    /// Meta Graph API access token.
+    pub access_token: Option<SecretValue>,
+    /// Default recipient phone numbers.
+    pub to_numbers: Vec<String>,
+    /// Enable WhatsApp as an issue source.
+    pub source_enabled: bool,
+    /// Override phone number ID for source (falls back to phone_number_id).
+    pub listen_phone_number_id: Option<String>,
+    /// Polling interval in milliseconds for WhatsApp source (overrides global).
+    pub poll_interval_ms: Option<u64>,
+}
+
+/// Telegram Bot API configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    /// Telegram Bot API token.
+    pub bot_token: Option<SecretValue>,
+    /// Default chat ID for notifications.
+    pub chat_id: Option<String>,
+    /// Additional recipient chat IDs.
+    pub to_chat_ids: Vec<String>,
+    /// Enable Telegram as an issue source.
+    pub source_enabled: bool,
+    /// Override chat ID for source (falls back to chat_id).
+    pub listen_chat_id: Option<String>,
+    /// Polling interval in milliseconds for Telegram source (overrides global).
+    pub poll_interval_ms: Option<u64>,
+}
+
 /// Per-user configuration mapping source identifiers to notification channel IDs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -763,6 +997,10 @@ pub struct UserConfig {
     pub push_user_key: Option<String>,
     /// Phone number for SMS notifications.
     pub sms_number: Option<String>,
+    /// WhatsApp phone number for notifications.
+    pub whatsapp_number: Option<String>,
+    /// Telegram chat ID for notifications.
+    pub telegram_chat_id: Option<String>,
 }
 
 /// GitLab configuration for MR monitoring and issue management.
@@ -861,6 +1099,18 @@ pub struct GitHubConfig {
     /// Set to true if you have SSH keys configured for GitHub.
     #[serde(default)]
     pub use_ssh: bool,
+    /// Repositories to monitor for issues (e.g., ["owner/repo"]).
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Labels that trigger automation on GitHub issues.
+    #[serde(default)]
+    pub trigger_labels: Vec<String>,
+    /// Issue states that trigger automation (e.g., ["open"]).
+    #[serde(default)]
+    pub trigger_states: Vec<String>,
+    /// GitHub App configuration (nested under [scm.github.app]).
+    #[serde(default)]
+    pub app: GitHubAppConfig,
 }
 
 impl Default for GitHubConfig {
@@ -872,6 +1122,29 @@ impl Default for GitHubConfig {
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            repos: Vec::new(),
+            trigger_labels: Vec::new(),
+            trigger_states: Vec::new(),
+            app: GitHubAppConfig::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl GitHubConfig {
+    /// Create a GitHubConfig suitable for testing.
+    pub fn test_default() -> Self {
+        Self {
+            token: Some(SecretValue::new("ghp_test_token")),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: false,
+            webhook_secret: None,
+            review_trigger: "@claudear".to_string(),
+            use_ssh: false,
+            repos: Vec::new(),
+            trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
+            trigger_states: vec!["open".to_string()],
+            app: GitHubAppConfig::default(),
         }
     }
 }
@@ -1256,7 +1529,7 @@ impl Config {
         // Resolve instructions_file if set
         let config_dir = path.parent().unwrap_or(Path::new("."));
         let resolved_instructions = config.resolve_instructions_file(config_dir)?;
-        config.claude.instructions = resolved_instructions;
+        config.agent.default_provider_config_mut().instructions = resolved_instructions;
 
         // Resolve user slug references in global notification configs
         config.resolve_user_slugs();
@@ -1294,15 +1567,20 @@ impl Config {
         Ok(config)
     }
 
-    /// Resolve `claude.instructions_file` by reading the file and combining
-    /// with inline `claude.instructions`.
+    /// Resolve the default provider's `instructions_file` by reading it
+    /// and combining with inline `instructions`.
     ///
     /// - `config_dir`: directory containing the config file (for relative path resolution)
     /// - File content comes first, then inline instructions appended with a newline
     /// - Returns `None` if neither field is set
     /// - Returns error if the file path is set but the file cannot be read
     pub fn resolve_instructions_file(&self, config_dir: &Path) -> Result<Option<String>> {
-        let file_content = if let Some(ref file_path) = self.claude.instructions_file {
+        let provider = match self.agent.default_provider_config() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let file_content = if let Some(ref file_path) = provider.instructions_file {
             let path = Path::new(file_path);
             let resolved = if path.is_absolute() {
                 path.to_path_buf()
@@ -1326,7 +1604,7 @@ impl Config {
             None
         };
 
-        match (file_content, &self.claude.instructions) {
+        match (file_content, &provider.instructions) {
             (Some(file), Some(inline)) => Ok(Some(format!("{}\n{}", file, inline))),
             (Some(file), None) => Ok(Some(file)),
             (None, Some(inline)) => Ok(Some(inline.clone())),
@@ -1339,18 +1617,18 @@ impl Config {
     /// If a field like `discord.user_id` matches a key in `users`,
     /// replace it with the user's actual channel-specific ID.
     pub fn resolve_user_slugs(&mut self) {
-        // Resolve discord.user_id
-        if let Some(ref user_id) = self.discord.user_id {
+        // Resolve discord notifier user_id
+        if let Some(ref user_id) = self.notifiers.discord.user_id {
             if let Some(user) = self.users.get(user_id) {
                 if let Some(ref discord_id) = user.discord_id {
-                    self.discord.user_id = Some(discord_id.clone());
+                    self.notifiers.discord.user_id = Some(discord_id.clone());
                 }
             }
         }
 
         // Resolve email.to_addresses
         let resolved_emails: Vec<String> = self
-            .email
+            .notifiers.email
             .to_addresses
             .iter()
             .map(|addr| {
@@ -1361,20 +1639,20 @@ impl Config {
                 }
             })
             .collect();
-        self.email.to_addresses = resolved_emails;
+        self.notifiers.email.to_addresses = resolved_emails;
 
         // Resolve push.user_key
-        if let Some(ref user_key) = self.push.user_key {
+        if let Some(ref user_key) = self.notifiers.push.user_key {
             if let Some(user) = self.users.get(user_key) {
                 if let Some(ref push_key) = user.push_user_key {
-                    self.push.user_key = Some(push_key.clone());
+                    self.notifiers.push.user_key = Some(push_key.clone());
                 }
             }
         }
 
         // Resolve sms.to_numbers
         let resolved_numbers: Vec<String> = self
-            .sms
+            .notifiers.sms
             .to_numbers
             .iter()
             .map(|num| {
@@ -1385,7 +1663,7 @@ impl Config {
                 }
             })
             .collect();
-        self.sms.to_numbers = resolved_numbers;
+        self.notifiers.sms.to_numbers = resolved_numbers;
     }
 
     /// Apply environment variable overrides to the config.
@@ -1452,134 +1730,185 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
         {
-            self.claude_timeout_secs = v;
+            self.agent.timeout_secs = v;
         }
 
-        // Claude CLI
+        // Agent provider (Claude) CLI -- env vars write into the default provider.
         if let Ok(v) = env::var("CLAUDE_MODEL") {
             if !v.is_empty() {
-                self.claude.model = Some(v);
+                self.agent.default_provider_config_mut().model = Some(v);
             }
         }
         if let Ok(v) = env::var("CLAUDE_INSTRUCTIONS") {
             if !v.is_empty() {
-                self.claude.instructions = Some(v);
+                self.agent.default_provider_config_mut().instructions = Some(v);
             }
         }
         if let Ok(v) = env::var("CLAUDE_INSTRUCTIONS_FILE") {
             if !v.is_empty() {
-                self.claude.instructions_file = Some(v);
+                self.agent.default_provider_config_mut().instructions_file = Some(v);
             }
         }
         if let Ok(v) = env::var("CLAUDE_PERMISSIONS") {
             if !v.is_empty() {
-                self.claude.permissions = v.split(',').map(|s| s.trim().to_string()).collect();
+                self.agent.default_provider_config_mut().permissions =
+                    v.split(',').map(|s| s.trim().to_string()).collect();
             }
         }
         if let Ok(v) = env::var("CLAUDE_SKIP_PERMISSIONS") {
-            self.claude.skip_permissions = v.to_lowercase() == "true" || v == "1";
+            self.agent.default_provider_config_mut().skip_permissions =
+                v.to_lowercase() == "true" || v == "1";
         }
 
-        // Discord
+        // Discord notifier
         if let Ok(v) = env::var("DISCORD_WEBHOOK_URL") {
-            self.discord.webhook_url = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.discord.webhook_url = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("DISCORD_USER_ID") {
-            self.discord.user_id = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.discord.user_id = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("DISCORD_BOT_TOKEN") {
-            self.discord.bot_token = Some(v).filter(|s| !s.is_empty());
+            // Set on both notifier and source
+            let val = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.discord.bot_token = val.clone();
+            if let Some(ref mut src) = self.issues.discord {
+                src.bot_token = val;
+            }
         }
         if let Ok(v) = env::var("DISCORD_CHANNEL_ID") {
-            self.discord.channel_id = Some(v).filter(|s| !s.is_empty());
+            let val = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.discord.channel_id = val.clone();
+            if let Some(ref mut src) = self.issues.discord {
+                src.channel_id = val;
+            }
         }
         if let Ok(v) = env::var("DISCORD_SOURCE_ENABLED") {
-            self.discord.source_enabled = v == "true" || v == "1";
+            if v == "true" || v == "1" {
+                let src = self.issues.discord.get_or_insert_with(DiscordSourceConfig::default);
+                let _ = src; // ensure it exists
+            } else {
+                self.issues.discord = None;
+            }
         }
         if let Ok(v) = env::var("DISCORD_LISTEN_CHANNEL_ID") {
-            self.discord.listen_channel_id = Some(v).filter(|s| !s.is_empty());
+            let val = Some(v).filter(|s| !s.is_empty());
+            if let Some(ref mut src) = self.issues.discord {
+                src.listen_channel_id = val;
+            }
         }
         if let Ok(v) = env::var("DISCORD_GUILD_ID") {
-            self.discord.guild_id = Some(v).filter(|s| !s.is_empty());
+            let val = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.discord.guild_id = val.clone();
+            if let Some(ref mut src) = self.issues.discord {
+                src.guild_id = val;
+            }
         }
         if let Some(v) = env::var("DISCORD_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
-            self.discord.poll_interval_ms = Some(v);
+            if let Some(ref mut src) = self.issues.discord {
+                src.poll_interval_ms = Some(v);
+            }
         }
 
-        // Slack
+        // Slack notifier
         if let Ok(v) = env::var("SLACK_BOT_TOKEN") {
-            self.slack.bot_token = Some(v).filter(|s| !s.is_empty());
+            let val = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.slack.bot_token = val.clone();
+            if let Some(ref mut src) = self.issues.slack {
+                src.bot_token = val;
+            }
         }
         if let Ok(v) = env::var("SLACK_CHANNEL_ID") {
-            self.slack.channel_id = Some(v).filter(|s| !s.is_empty());
+            let val = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.slack.channel_id = val.clone();
+            if let Some(ref mut src) = self.issues.slack {
+                src.channel_id = val;
+            }
         }
         if let Ok(v) = env::var("SLACK_WEBHOOK_URL") {
-            self.slack.webhook_url = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.slack.webhook_url = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("SLACK_USER_ID") {
-            self.slack.user_id = Some(v).filter(|s| !s.is_empty());
+            let val = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.slack.user_id = val.clone();
+            if let Some(ref mut src) = self.issues.slack {
+                src.user_id = val;
+            }
         }
         if let Ok(v) = env::var("SLACK_SOURCE_ENABLED") {
-            self.slack.source_enabled = v == "true" || v == "1";
+            if v == "true" || v == "1" {
+                let src = self.issues.slack.get_or_insert_with(SlackSourceConfig::default);
+                let _ = src;
+            } else {
+                self.issues.slack = None;
+            }
         }
         if let Ok(v) = env::var("SLACK_LISTEN_CHANNEL_ID") {
-            self.slack.listen_channel_id = Some(v).filter(|s| !s.is_empty());
+            let val = Some(v).filter(|s| !s.is_empty());
+            if let Some(ref mut src) = self.issues.slack {
+                src.listen_channel_id = val;
+            }
         }
         if let Ok(v) = env::var("SLACK_WORKSPACE") {
-            self.slack.workspace = Some(v).filter(|s| !s.is_empty());
+            let val = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.slack.workspace = val.clone();
+            if let Some(ref mut src) = self.issues.slack {
+                src.workspace = val;
+            }
         }
         if let Some(v) = env::var("SLACK_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
-            self.slack.poll_interval_ms = Some(v);
+            if let Some(ref mut src) = self.issues.slack {
+                src.poll_interval_ms = Some(v);
+            }
         }
 
         // Email
         if let Ok(v) = env::var("SMTP_HOST") {
-            self.email.smtp_host = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.email.smtp_host = Some(v).filter(|s| !s.is_empty());
         }
         if let Some(v) = env::var("SMTP_PORT").ok().and_then(|v| v.parse().ok()) {
-            self.email.smtp_port = v;
+            self.notifiers.email.smtp_port = v;
         }
         if let Ok(v) = env::var("SMTP_USERNAME") {
-            self.email.smtp_username = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.email.smtp_username = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("SMTP_PASSWORD") {
-            self.email.smtp_password = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.email.smtp_password = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("EMAIL_FROM") {
-            self.email.from_address = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.email.from_address = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("EMAIL_TO") {
             if !v.is_empty() {
-                self.email.to_addresses = v.split(',').map(|s| s.trim().to_string()).collect();
+                self.notifiers.email.to_addresses = v.split(',').map(|s| s.trim().to_string()).collect();
             }
         }
         if let Ok(v) = env::var("SMTP_TLS") {
-            self.email.use_tls = v.to_lowercase() == "true" || v == "1";
+            self.notifiers.email.use_tls = v.to_lowercase() == "true" || v == "1";
         }
         if let Ok(v) = env::var("IMAP_HOST") {
-            self.email.imap_host = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.email.imap_host = Some(v).filter(|s| !s.is_empty());
         }
         if let Some(v) = env::var("IMAP_PORT").ok().and_then(|v| v.parse().ok()) {
-            self.email.imap_port = v;
+            self.notifiers.email.imap_port = v;
         }
         if let Ok(v) = env::var("IMAP_USERNAME") {
-            self.email.imap_username = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.email.imap_username = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("IMAP_PASSWORD") {
-            self.email.imap_password = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.email.imap_password = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("IMAP_TLS") {
-            self.email.imap_use_tls = v.to_lowercase() == "true" || v == "1";
+            self.notifiers.email.imap_use_tls = v.to_lowercase() == "true" || v == "1";
         }
         if let Ok(v) = env::var("IMAP_FOLDER") {
             if !v.is_empty() {
-                self.email.imap_folder = v;
+                self.notifiers.email.imap_folder = v;
             }
         }
 
@@ -1626,81 +1955,81 @@ impl Config {
 
         // SMS
         if let Ok(v) = env::var("TWILIO_ACCOUNT_SID") {
-            self.sms.account_sid = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.sms.account_sid = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("TWILIO_AUTH_TOKEN") {
-            self.sms.auth_token = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.sms.auth_token = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("TWILIO_FROM_NUMBER") {
-            self.sms.from_number = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.sms.from_number = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("TWILIO_TO_NUMBERS") {
             if !v.is_empty() {
-                self.sms.to_numbers = v.split(',').map(|s| s.trim().to_string()).collect();
+                self.notifiers.sms.to_numbers = v.split(',').map(|s| s.trim().to_string()).collect();
             }
         }
 
         // Push
         if let Ok(v) = env::var("PUSHOVER_API_TOKEN") {
-            self.push.api_token = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.push.api_token = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("PUSHOVER_USER_KEY") {
-            self.push.user_key = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.push.user_key = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("PUSHOVER_DEVICE") {
-            self.push.device = Some(v).filter(|s| !s.is_empty());
+            self.notifiers.push.device = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("PUSHOVER_PRIORITY") {
-            self.push.priority = v.parse().ok();
+            self.notifiers.push.priority = v.parse().ok();
         }
 
         // GitHub
         if let Ok(v) = env::var("GITHUB_TOKEN") {
-            self.github.token = Some(v).filter(|s| !s.is_empty());
+            self.scm.github.token = Some(v).filter(|s| !s.is_empty());
         }
         if let Some(v) = env::var("GITHUB_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
-            self.github.poll_interval_ms = v;
+            self.scm.github.poll_interval_ms = v;
         }
         if let Ok(v) = env::var("GITHUB_AUTO_RESOLVE_ON_MERGE") {
-            self.github.auto_resolve_on_merge = v.to_lowercase() == "true" || v == "1";
+            self.scm.github.auto_resolve_on_merge = v.to_lowercase() == "true" || v == "1";
         }
         if let Ok(v) = env::var("GITHUB_WEBHOOK_SECRET") {
-            self.github.webhook_secret = Some(v).filter(|s| !s.is_empty());
+            self.scm.github.webhook_secret = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("GITHUB_REVIEW_TRIGGER") {
-            self.github.review_trigger = v;
+            self.scm.github.review_trigger = v;
         }
 
         // GitHub App
         if let Some(v) = env::var("GITHUB_APP_ID").ok().and_then(|v| v.parse().ok()) {
-            self.github_app.app_id = Some(v);
+            self.scm.github.app.app_id = Some(v);
         }
         if let Ok(v) = env::var("GITHUB_APP_PRIVATE_KEY_PATH") {
-            self.github_app.private_key_path = Some(v).filter(|s| !s.is_empty()).map(PathBuf::from);
+            self.scm.github.app.private_key_path = Some(v).filter(|s| !s.is_empty()).map(PathBuf::from);
         }
         if let Ok(v) = env::var("GITHUB_APP_PRIVATE_KEY") {
-            self.github_app.private_key = Some(v).filter(|s| !s.is_empty());
+            self.scm.github.app.private_key = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("GITHUB_APP_WEBHOOK_SECRET") {
-            self.github_app.webhook_secret = Some(v).filter(|s| !s.is_empty());
+            self.scm.github.app.webhook_secret = Some(v).filter(|s| !s.is_empty());
         }
         if let Some(v) = env::var("GITHUB_APP_INSTALLATION_ID")
             .ok()
             .and_then(|v| v.parse().ok())
         {
-            self.github_app.installation_id = Some(v);
+            self.scm.github.app.installation_id = Some(v);
         }
         if let Ok(v) = env::var("GITHUB_APP_CLIENT_ID") {
-            self.github_app.client_id = Some(v).filter(|s| !s.is_empty());
+            self.scm.github.app.client_id = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("GITHUB_APP_CLIENT_SECRET") {
-            self.github_app.client_secret = Some(v).filter(|s| !s.is_empty());
+            self.scm.github.app.client_secret = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("GITHUB_APP_BASE_URL") {
-            self.github_app.base_url = Some(v).filter(|s| !s.is_empty());
+            self.scm.github.app.base_url = Some(v).filter(|s| !s.is_empty());
         }
 
         // Retry
@@ -1741,13 +2070,13 @@ impl Config {
         // If LINEAR_API_KEY is set in env, ensure we have a LinearConfig
         if let Ok(api_key) = env::var("LINEAR_API_KEY") {
             if !api_key.is_empty() {
-                let linear = self.linear.get_or_insert_with(LinearConfig::default);
+                let linear = self.issues.linear.get_or_insert_with(LinearConfig::default);
                 linear.api_key = api_key;
             }
         }
 
         // Apply other overrides if we have a LinearConfig
-        if let Some(ref mut linear) = self.linear {
+        if let Some(ref mut linear) = self.issues.linear {
             if let Ok(v) = env::var("LINEAR_ENABLED") {
                 linear.enabled = v.to_lowercase() == "true" || v == "1";
             }
@@ -1799,13 +2128,13 @@ impl Config {
         // If SENTRY_AUTH_TOKEN is set in env, ensure we have a SentryConfig
         if let Ok(auth_token) = env::var("SENTRY_AUTH_TOKEN") {
             if !auth_token.is_empty() {
-                let sentry = self.sentry.get_or_insert_with(SentryConfig::default);
+                let sentry = self.issues.sentry.get_or_insert_with(SentryConfig::default);
                 sentry.auth_token = auth_token;
             }
         }
 
         // Apply other overrides if we have a SentryConfig
-        if let Some(ref mut sentry) = self.sentry {
+        if let Some(ref mut sentry) = self.issues.sentry {
             if let Ok(v) = env::var("SENTRY_ENABLED") {
                 sentry.enabled = v.to_lowercase() == "true" || v == "1";
             }
@@ -1872,13 +2201,13 @@ impl Config {
         // If JIRA_API_TOKEN is set in env, ensure we have a JiraConfig
         if let Ok(api_token) = env::var("JIRA_API_TOKEN") {
             if !api_token.is_empty() {
-                let jira = self.jira.get_or_insert_with(JiraConfig::default);
+                let jira = self.issues.jira.get_or_insert_with(JiraConfig::default);
                 jira.api_token = api_token;
             }
         }
 
         // Apply other overrides if we have a JiraConfig
-        if let Some(ref mut jira) = self.jira {
+        if let Some(ref mut jira) = self.issues.jira {
             if let Ok(v) = env::var("JIRA_ENABLED") {
                 jira.enabled = v.to_lowercase() == "true" || v == "1";
             }
@@ -1955,14 +2284,14 @@ impl Config {
         // If GITLAB_TOKEN is set in env, ensure we have a GitLabConfig
         if let Ok(token) = env::var("GITLAB_TOKEN") {
             if !token.is_empty() {
-                let gitlab = self.gitlab.get_or_insert_with(GitLabConfig::default);
+                let gitlab = self.scm.gitlab.get_or_insert_with(GitLabConfig::default);
                 gitlab.token = Some(token);
                 gitlab.enabled = true;
             }
         }
 
         // Apply other overrides if we have a GitLabConfig
-        if let Some(ref mut gitlab) = self.gitlab {
+        if let Some(ref mut gitlab) = self.scm.gitlab {
             if let Ok(v) = env::var("GITLAB_ENABLED") {
                 gitlab.enabled = v.to_lowercase() == "true" || v == "1";
             }
@@ -2034,11 +2363,11 @@ impl Config {
             .as_ref()
             .is_some_and(|c| c.enabled && !c.api_token.is_empty());
         let has_gitlab = self
-            .gitlab
+            .scm.gitlab
             .as_ref()
             .is_some_and(|c| c.enabled && c.token.is_some());
-        let has_slack = self.slack.source_enabled && self.slack.bot_token.is_some();
-        let has_discord = self.discord.source_enabled && self.discord.bot_token.is_some();
+        let has_slack = self.issues.slack.as_ref().is_some_and(|s| s.bot_token.is_some());
+        let has_discord = self.discord.as_ref().is_some_and(|s| s.bot_token.is_some());
 
         if !has_linear && !has_sentry && !has_jira && !has_gitlab && !has_slack && !has_discord {
             return Err(Error::config(
@@ -2047,7 +2376,7 @@ impl Config {
         }
 
         // Validate Sentry has org_slug if enabled
-        if let Some(ref sentry) = self.sentry {
+        if let Some(ref sentry) = self.issues.sentry {
             if sentry.enabled && !sentry.auth_token.is_empty() && sentry.org_slug.is_empty() {
                 return Err(Error::config(
                     "sentry.org_slug is required when Sentry is enabled",
@@ -2056,7 +2385,7 @@ impl Config {
         }
 
         // Validate Jira has base_url when enabled
-        if let Some(ref jira) = self.jira {
+        if let Some(ref jira) = self.issues.jira {
             if jira.enabled && !jira.api_token.is_empty() && jira.base_url.is_empty() {
                 return Err(Error::config(
                     "jira.base_url is required when Jira is enabled",
@@ -2089,27 +2418,27 @@ impl Config {
 
     /// Check if Linear source is enabled.
     pub fn is_linear_enabled(&self) -> bool {
-        self.linear.as_ref().is_some_and(|c| c.enabled)
+        self.issues.linear.as_ref().is_some_and(|c| c.enabled)
     }
 
     /// Check if Sentry source is enabled.
     pub fn is_sentry_enabled(&self) -> bool {
-        self.sentry.as_ref().is_some_and(|c| c.enabled)
+        self.issues.sentry.as_ref().is_some_and(|c| c.enabled)
     }
 
     /// Check if Jira source is enabled.
     pub fn is_jira_enabled(&self) -> bool {
-        self.jira.as_ref().is_some_and(|c| c.enabled)
+        self.issues.jira.as_ref().is_some_and(|c| c.enabled)
     }
 
     /// Check if GitHub PR monitoring is enabled.
     pub fn is_github_enabled(&self) -> bool {
-        self.github.token.is_some() || self.github_app.is_configured()
+        self.github.token.is_some() || self.scm.github.app.is_configured()
     }
 
     /// Check if GitLab is enabled.
     pub fn is_gitlab_enabled(&self) -> bool {
-        self.gitlab
+        self.scm.gitlab
             .as_ref()
             .is_some_and(|c| c.enabled && c.token.is_some())
     }
@@ -2118,7 +2447,7 @@ impl Config {
     ///
     /// Returns `App` if GitHub App is configured, otherwise `Token`.
     pub fn github_auth_mode(&self) -> GitHubAuthMode {
-        if self.github_app.is_configured() {
+        if self.scm.github.app.is_configured() {
             GitHubAuthMode::App
         } else {
             GitHubAuthMode::Token
@@ -2128,6 +2457,71 @@ impl Config {
     /// Check if GitHub App is configured.
     pub fn is_github_app_configured(&self) -> bool {
         self.github_app.is_configured()
+    }
+
+    /// Accessor: get reference to GitHubConfig.
+    pub fn github(&self) -> &GitHubConfig { &self.scm.github }
+
+    /// Accessor: get mutable reference to GitHubConfig.
+    pub fn github_mut(&mut self) -> &mut GitHubConfig { &mut self.scm.github }
+
+    /// Accessor: get reference to GitHubAppConfig.
+    pub fn github_app(&self) -> &GitHubAppConfig { &self.github.app }
+
+    /// Accessor: get mutable reference to GitHubAppConfig.
+    pub fn github_app_mut(&mut self) -> &mut GitHubAppConfig { &mut self.github.app }
+
+    /// Accessor: get reference to GitLabConfig.
+    pub fn gitlab(&self) -> Option<&GitLabConfig> { self.scm.gitlab.as_ref() }
+
+    /// Accessor: get reference to LinearConfig.
+    pub fn linear(&self) -> Option<&LinearConfig> { self.issues.linear.as_ref() }
+
+    /// Accessor: get reference to SentryConfig.
+    pub fn sentry_config(&self) -> Option<&SentryConfig> { self.issues.sentry.as_ref() }
+
+    /// Accessor: get reference to JiraConfig.
+    pub fn jira(&self) -> Option<&JiraConfig> { self.issues.jira.as_ref() }
+
+    /// Accessor: get reference to EmailConfig.
+    pub fn email(&self) -> &EmailConfig { &self.notifiers.email }
+
+    /// Accessor: get reference to SmsConfig.
+    pub fn sms(&self) -> &SmsConfig { &self.notifiers.sms }
+
+    /// Accessor: get reference to PushConfig.
+    pub fn push_config(&self) -> &PushConfig { &self.notifiers.push }
+
+    /// Merge issues.discord + notifiers.discord into the legacy combined DiscordConfig.
+    pub fn discord_merged(&self) -> DiscordConfig {
+        let src = self.issues.discord.as_ref();
+        let notif = &self.notifiers.discord;
+        DiscordConfig {
+            webhook_url: notif.webhook_url.clone(),
+            user_id: notif.user_id.clone(),
+            bot_token: notif.bot_token.clone().or_else(|| src.and_then(|s| s.bot_token.clone())),
+            channel_id: notif.channel_id.clone().or_else(|| src.and_then(|s| s.channel_id.clone())),
+            source_enabled: src.is_some(),
+            listen_channel_id: src.and_then(|s| s.listen_channel_id.clone()),
+            guild_id: notif.guild_id.clone().or_else(|| src.and_then(|s| s.guild_id.clone())),
+            poll_interval_ms: src.and_then(|s| s.poll_interval_ms),
+        }
+    }
+
+    /// Merge issues.slack + notifiers.slack into the legacy combined SlackConfig.
+    pub fn slack_merged(&self) -> SlackConfig {
+        let src = self.issues.slack.as_ref();
+        let notif = &self.notifiers.slack;
+        SlackConfig {
+            bot_token: notif.bot_token.clone().or_else(|| src.and_then(|s| s.bot_token.clone())),
+            channel_id: notif.channel_id.clone().or_else(|| src.and_then(|s| s.channel_id.clone())),
+            webhook_url: notif.webhook_url.clone(),
+            user_id: notif.user_id.clone().or_else(|| src.and_then(|s| s.user_id.clone())),
+            source_enabled: src.is_some(),
+            listen_channel_id: src.and_then(|s| s.listen_channel_id.clone()),
+            workspace: notif.workspace.clone().or_else(|| src.and_then(|s| s.workspace.clone())),
+            poll_interval_ms: src.and_then(|s| s.poll_interval_ms),
+        }
     }
 
     /// Get the max issues per cycle for a specific source.
@@ -2150,7 +2544,7 @@ impl Config {
                 .and_then(|c| c.max_issues_per_cycle)
                 .unwrap_or(self.max_issues_per_cycle),
             "gitlab" => self
-                .gitlab
+                .scm.gitlab
                 .as_ref()
                 .and_then(|c| c.max_issues_per_cycle)
                 .unwrap_or(self.max_issues_per_cycle),
@@ -2178,7 +2572,7 @@ impl Config {
                 .and_then(|c| c.max_concurrent)
                 .unwrap_or(self.max_concurrent),
             "gitlab" => self
-                .gitlab
+                .scm.gitlab
                 .as_ref()
                 .and_then(|c| c.max_concurrent)
                 .unwrap_or(self.max_concurrent),
@@ -2191,27 +2585,32 @@ impl Config {
     pub fn poll_interval_ms_for(&self, source_name: &str) -> u64 {
         match source_name {
             "discord" => self
-                .discord
-                .poll_interval_ms
+                .issues.discord
+                .as_ref()
+                .and_then(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
-            "slack" => self.slack.poll_interval_ms.unwrap_or(self.poll_interval_ms),
+            "slack" => self
+                .issues.slack
+                .as_ref()
+                .and_then(|c| c.poll_interval_ms)
+                .unwrap_or(self.poll_interval_ms),
             "linear" => self
-                .linear
+                .issues.linear
                 .as_ref()
                 .and_then(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
             "sentry" => self
-                .sentry
+                .issues.sentry
                 .as_ref()
                 .and_then(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
             "jira" => self
-                .jira
+                .issues.jira
                 .as_ref()
                 .and_then(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
             "gitlab" => self
-                .gitlab
+                .scm.gitlab
                 .as_ref()
                 .and_then(|c| c.poll_interval_ms)
                 .unwrap_or(self.poll_interval_ms),
@@ -2391,7 +2790,7 @@ mod tests {
 work_dir = "/tmp/repos"
 known_orgs = ["appwrite", "utopia-php"]
 
-[linear]
+[issues.linear]
 api_key = "lin_test_key"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
@@ -2417,11 +2816,11 @@ max_issues_per_cycle = 10
 max_concurrent = 3
 processing_delay_ms = 10000
 
-[discord]
+[notifiers.discord]
 webhook_url = "https://discord.com/api/webhooks/123/abc"
 user_id = "987654321"
 
-[email]
+[notifiers.email]
 smtp_host = "smtp.example.com"
 smtp_port = 465
 smtp_username = "user@example.com"
@@ -2430,19 +2829,19 @@ from_address = "noreply@example.com"
 to_addresses = ["admin@example.com", "team@example.com"]
 use_tls = true
 
-[sms]
+[notifiers.sms]
 account_sid = "AC123"
 auth_token = "token123"
 from_number = "+15555555555"
 to_numbers = ["+16666666666"]
 
-[push]
+[notifiers.push]
 api_token = "pushover_token"
 user_key = "user_key"
 device = "iPhone"
 priority = 1
 
-[github]
+[scm.github]
 token = "ghp_token123"
 poll_interval_ms = 30000
 auto_resolve_on_merge = false
@@ -2452,7 +2851,7 @@ max_retries = 5
 base_delay_ms = 30000
 max_delay_ms = 7200000
 
-[linear]
+[issues.linear]
 enabled = true
 api_key = "lin_api_key"
 trigger_labels = ["auto", "implement"]
@@ -2461,7 +2860,7 @@ team_id = "team_123"
 project_id = "proj_456"
 webhook_secret = "webhook_secret"
 
-[sentry]
+[issues.sentry]
 enabled = true
 auth_token = "sentry_token"
 org_slug = "my-org"
@@ -2492,8 +2891,8 @@ client_secret = "client_secret"
 
             // Email
             assert_eq!(config.email.smtp_host, Some("smtp.example.com".to_string()));
-            assert_eq!(config.email.smtp_port, 465);
-            assert!(config.email.use_tls);
+            assert_eq!(config.notifiers.email.smtp_port, 465);
+            assert!(config.notifiers.email.use_tls);
 
             // Linear
             let linear = config.linear.unwrap();
@@ -2517,7 +2916,7 @@ client_secret = "client_secret"
 work_dir = "/tmp/repos"
 known_orgs = ["appwrite"]
 
-[linear]
+[issues.linear]
 api_key = "test_key"
 "#
     }
@@ -2601,7 +3000,7 @@ known_orgs = ["appwrite"]
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[linear]
+[issues.linear]
 api_key = "test_key"
 "#;
         let file = create_temp_toml(toml_str);
@@ -2669,7 +3068,7 @@ work_dir = "/tmp/repos"
 poll_interval_ms = 100000
 webhook_port = 3000
 
-[linear]
+[issues.linear]
 api_key = "lin_key"
 "#;
         let file = create_temp_toml(toml_str);
@@ -2694,7 +3093,7 @@ api_key = "lin_key"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[linear]
+[issues.linear]
 api_key = "toml_key"
 "#;
         let file = create_temp_toml(toml_str);
@@ -2724,7 +3123,7 @@ work_dir = "/tmp/repos"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[sentry]
+[issues.sentry]
 auth_token = "toml_token"
 org_slug = "toml-org"
 "#;
@@ -2769,10 +3168,10 @@ work_dir = "/tmp/repos"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[discord]
+[notifiers.discord]
 webhook_url = "https://toml.webhook"
 
-[linear]
+[issues.linear]
 api_key = "key"
 "#;
         let file = create_temp_toml(toml_str);
@@ -2791,12 +3190,12 @@ api_key = "key"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[github]
+[scm.github]
 token = "toml_token"
 poll_interval_ms = 30000
 auto_resolve_on_merge = true
 
-[linear]
+[issues.linear]
 api_key = "key"
 "#;
         let file = create_temp_toml(toml_str);
@@ -2940,15 +3339,18 @@ api_key = "key"
     fn test_per_source_max_issues_falls_back_to_global() {
         let config = Config {
             max_issues_per_cycle: 7,
-            linear: Some(LinearConfig {
-                api_key: "key".into(),
+            issues: IssuesConfig {
+                linear: Some(LinearConfig {
+                    api_key: "key".into(),
+                    ..Default::default()
+                }),
+                sentry: Some(SentryConfig {
+                    auth_token: "tok".into(),
+                    org_slug: "org".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            sentry: Some(SentryConfig {
-                auth_token: "tok".into(),
-                org_slug: "org".into(),
-                ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert_eq!(config.max_issues_per_cycle_for("linear"), 7);
@@ -2960,17 +3362,20 @@ api_key = "key"
     fn test_per_source_max_issues_overrides_global() {
         let config = Config {
             max_issues_per_cycle: 5,
-            linear: Some(LinearConfig {
-                api_key: "key".into(),
-                max_issues_per_cycle: Some(3),
+            issues: IssuesConfig {
+                linear: Some(LinearConfig {
+                    api_key: "key".into(),
+                    max_issues_per_cycle: Some(3),
+                    ..Default::default()
+                }),
+                sentry: Some(SentryConfig {
+                    auth_token: "tok".into(),
+                    org_slug: "org".into(),
+                    max_issues_per_cycle: Some(2),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            sentry: Some(SentryConfig {
-                auth_token: "tok".into(),
-                org_slug: "org".into(),
-                max_issues_per_cycle: Some(2),
-                ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert_eq!(config.max_issues_per_cycle_for("linear"), 3);
@@ -2982,15 +3387,18 @@ api_key = "key"
     fn test_per_source_max_concurrent_falls_back_to_global() {
         let config = Config {
             max_concurrent: 4,
-            linear: Some(LinearConfig {
-                api_key: "key".into(),
+            issues: IssuesConfig {
+                linear: Some(LinearConfig {
+                    api_key: "key".into(),
+                    ..Default::default()
+                }),
+                sentry: Some(SentryConfig {
+                    auth_token: "tok".into(),
+                    org_slug: "org".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            sentry: Some(SentryConfig {
-                auth_token: "tok".into(),
-                org_slug: "org".into(),
-                ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert_eq!(config.max_concurrent_for("linear"), 4);
@@ -3002,17 +3410,20 @@ api_key = "key"
     fn test_per_source_max_concurrent_overrides_global() {
         let config = Config {
             max_concurrent: 8,
-            linear: Some(LinearConfig {
-                api_key: "key".into(),
-                max_concurrent: Some(2),
+            issues: IssuesConfig {
+                linear: Some(LinearConfig {
+                    api_key: "key".into(),
+                    max_concurrent: Some(2),
+                    ..Default::default()
+                }),
+                sentry: Some(SentryConfig {
+                    auth_token: "tok".into(),
+                    org_slug: "org".into(),
+                    max_concurrent: Some(6),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            sentry: Some(SentryConfig {
-                auth_token: "tok".into(),
-                org_slug: "org".into(),
-                max_concurrent: Some(6),
-                ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert_eq!(config.max_concurrent_for("linear"), 2);
@@ -3028,12 +3439,12 @@ work_dir = "/tmp/repos"
 max_issues_per_cycle = 5
 max_concurrent = 8
 
-[linear]
+[issues.linear]
 api_key = "lin_key"
 max_issues_per_cycle = 3
 max_concurrent = 2
 
-[sentry]
+[issues.sentry]
 auth_token = "sentry_tok"
 org_slug = "org"
 max_issues_per_cycle = 2
@@ -3055,11 +3466,11 @@ work_dir = "/tmp/repos"
 max_issues_per_cycle = 5
 max_concurrent = 8
 
-[linear]
+[issues.linear]
 api_key = "lin_key"
 max_issues_per_cycle = 3
 
-[sentry]
+[issues.sentry]
 auth_token = "sentry_tok"
 org_slug = "org"
 max_concurrent = 6
@@ -3078,15 +3489,18 @@ max_concurrent = 6
     fn test_poll_interval_ms_for_falls_back_to_global() {
         let config = Config {
             poll_interval_ms: 300_000,
-            linear: Some(LinearConfig {
-                api_key: "key".into(),
+            issues: IssuesConfig {
+                linear: Some(LinearConfig {
+                    api_key: "key".into(),
+                    ..Default::default()
+                }),
+                sentry: Some(SentryConfig {
+                    auth_token: "tok".into(),
+                    org_slug: "org".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            sentry: Some(SentryConfig {
-                auth_token: "tok".into(),
-                org_slug: "org".into(),
-                ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert_eq!(config.poll_interval_ms_for("discord"), 300_000);
@@ -3099,21 +3513,21 @@ max_concurrent = 6
     fn test_poll_interval_ms_for_overrides_global() {
         let config = Config {
             poll_interval_ms: 300_000,
-            discord: DiscordConfig {
-                poll_interval_ms: Some(30_000),
+            issues: IssuesConfig {
+                discord: Some(DiscordSourceConfig { poll_interval_ms: Some(30_000), ..Default::default() }),
+                linear: Some(LinearConfig {
+                    api_key: "key".into(),
+                    poll_interval_ms: Some(600_000),
+                    ..Default::default()
+                }),
+                sentry: Some(SentryConfig {
+                    auth_token: "tok".into(),
+                    org_slug: "org".into(),
+                    poll_interval_ms: Some(120_000),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
-            linear: Some(LinearConfig {
-                api_key: "key".into(),
-                poll_interval_ms: Some(600_000),
-                ..Default::default()
-            }),
-            sentry: Some(SentryConfig {
-                auth_token: "tok".into(),
-                org_slug: "org".into(),
-                poll_interval_ms: Some(120_000),
-                ..Default::default()
-            }),
             ..Default::default()
         };
         assert_eq!(config.poll_interval_ms_for("discord"), 30_000);
@@ -3130,14 +3544,14 @@ max_concurrent = 6
 work_dir = "/tmp/repos"
 poll_interval_ms = 300000
 
-[discord]
+[issues.discord]
 poll_interval_ms = 30000
 
-[linear]
+[issues.linear]
 api_key = "lin_key"
 poll_interval_ms = 600000
 
-[sentry]
+[issues.sentry]
 auth_token = "sentry_tok"
 org_slug = "org"
 poll_interval_ms = 120000
@@ -3152,7 +3566,7 @@ poll_interval_ms = 120000
 
     #[test]
     fn test_poll_interval_ms_for_env_override() {
-        with_env(&[("DISCORD_POLL_INTERVAL_MS", "15000")], || {
+        with_env(&[("DISCORD_POLL_INTERVAL_MS", "15000"), ("DISCORD_SOURCE_ENABLED", "1")], || {
             let config = Config::from_toml("work_dir = \"/tmp\"").unwrap();
             assert_eq!(config.poll_interval_ms_for("discord"), 15_000);
             // Global unchanged
@@ -3348,7 +3762,7 @@ known_orgs = ["appwrite", "utopia-php"]
 auto_discover_paths = ["~/Local"]
 poll_interval_ms = 500000
 
-[linear]
+[issues.linear]
 enabled = true
 api_key = "test_key"
 trigger_labels = ["label1", "label2"]
@@ -3578,7 +3992,7 @@ monitoring_duration_hours = 12
             let toml_str = r#"
 work_dir = "/tmp/test"
 
-[github_app]
+[scm.github.app]
 app_id = 12345
 private_key_path = "/path/to/key.pem"
 webhook_secret = "secret123"
@@ -3650,8 +4064,8 @@ work_dir = "/tmp/repos"
     }
 
     #[test]
-    fn test_claude_config_default() {
-        let config = ClaudeConfig::default();
+    fn test_provider_config_default() {
+        let config = ProviderConfig::default();
         assert!(config.model.is_none());
         assert!(config.instructions.is_none());
         assert!(config.permissions.is_empty());
@@ -3661,32 +4075,32 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_config_default_includes_claude() {
         let config = Config::default();
-        assert!(config.claude.model.is_none());
-        assert!(config.claude.instructions.is_none());
-        assert!(config.claude.permissions.is_empty());
-        assert!(!config.claude.skip_permissions);
+        assert!(config.agent.default_provider_config().unwrap().model.is_none());
+        assert!(config.agent.default_provider_config().unwrap().instructions.is_none());
+        assert!(config.agent.default_provider_config().unwrap().permissions.is_empty());
+        assert!(!config.agent.default_provider_config().unwrap().skip_permissions);
     }
 
     #[test]
-    fn test_claude_config_from_toml() {
+    fn test_agent_provider_config_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
 work_dir = "/tmp/test"
 
-[claude]
+[agent.providers.claude]
 model = "sonnet"
 instructions = "Always write tests."
 permissions = ["Bash(git *)", "Read"]
 skip_permissions = false
 "#;
             let config = Config::from_toml(toml_str).unwrap();
-            assert_eq!(config.claude.model, Some("sonnet".to_string()));
+            assert_eq!(config.agent.default_provider_config().unwrap().model, Some("sonnet".to_string()));
             assert_eq!(
-                config.claude.instructions,
+                config.agent.default_provider_config().unwrap().instructions,
                 Some("Always write tests.".to_string())
             );
-            assert_eq!(config.claude.permissions, vec!["Bash(git *)", "Read"]);
-            assert!(!config.claude.skip_permissions);
+            assert_eq!(config.agent.default_provider_config().unwrap().permissions, vec!["Bash(git *)", "Read"]);
+            assert!(!config.agent.default_provider_config().unwrap().skip_permissions);
         });
     }
 
@@ -3697,10 +4111,10 @@ skip_permissions = false
 work_dir = "/tmp/test"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
-            assert!(config.claude.model.is_none());
-            assert!(config.claude.instructions.is_none());
-            assert!(config.claude.permissions.is_empty());
-            assert!(!config.claude.skip_permissions);
+            assert!(config.agent.default_provider_config().unwrap().model.is_none());
+            assert!(config.agent.default_provider_config().unwrap().instructions.is_none());
+            assert!(config.agent.default_provider_config().unwrap().permissions.is_empty());
+            assert!(!config.agent.default_provider_config().unwrap().skip_permissions);
         });
     }
 
@@ -3713,7 +4127,7 @@ work_dir = "/tmp/repos"
 
         with_env(&[("CLAUDE_MODEL", "opus")], || {
             let config = Config::load(file.path()).unwrap();
-            assert_eq!(config.claude.model, Some("opus".to_string()));
+            assert_eq!(config.agent.default_provider_config().unwrap().model, Some("opus".to_string()));
         });
     }
 
@@ -3726,7 +4140,7 @@ work_dir = "/tmp/repos"
 
         with_env(&[("CLAUDE_INSTRUCTIONS", "Be concise.")], || {
             let config = Config::load(file.path()).unwrap();
-            assert_eq!(config.claude.instructions, Some("Be concise.".to_string()));
+            assert_eq!(config.agent.default_provider_config().unwrap().instructions, Some("Be concise.".to_string()));
         });
     }
 
@@ -3744,12 +4158,12 @@ work_dir = "/tmp/repos"
             || {
                 let config = Config::load(&config_path).unwrap();
                 assert_eq!(
-                    config.claude.instructions_file,
+                    config.agent.default_provider_config().unwrap().instructions_file,
                     Some("my-instructions.md".to_string())
                 );
                 // After load, instructions should contain resolved file content
                 assert_eq!(
-                    config.claude.instructions,
+                    config.agent.default_provider_config().unwrap().instructions,
                     Some("File content.".to_string())
                 );
             },
@@ -3766,7 +4180,7 @@ work_dir = "/tmp/repos"
         with_env(&[("CLAUDE_PERMISSIONS", "Bash(git *), Read, Edit")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(
-                config.claude.permissions,
+                config.agent.default_provider_config().unwrap().permissions,
                 vec!["Bash(git *)", "Read", "Edit"]
             );
         });
@@ -3781,7 +4195,7 @@ work_dir = "/tmp/repos"
 
         with_env(&[("CLAUDE_SKIP_PERMISSIONS", "false")], || {
             let config = Config::load(file.path()).unwrap();
-            assert!(!config.claude.skip_permissions);
+            assert!(!config.agent.default_provider_config().unwrap().skip_permissions);
         });
     }
 
@@ -3790,14 +4204,14 @@ work_dir = "/tmp/repos"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[claude]
+[agent.providers.claude]
 skip_permissions = false
 "#;
         let file = create_temp_toml(toml_str);
 
         with_env(&[("CLAUDE_SKIP_PERMISSIONS", "1")], || {
             let config = Config::load(file.path()).unwrap();
-            assert!(config.claude.skip_permissions);
+            assert!(config.agent.default_provider_config().unwrap().skip_permissions);
         });
     }
 
@@ -3809,7 +4223,7 @@ skip_permissions = false
             fs::write(&instructions_path, "Be helpful and concise.").unwrap();
 
             let toml_str = format!(
-                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"{}\"",
+                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"{}\"",
                 instructions_path.display()
             );
             let config = Config::from_toml(&toml_str).unwrap();
@@ -3826,7 +4240,7 @@ skip_permissions = false
             fs::write(&instructions_path, "Write tests first.").unwrap();
 
             let toml_str =
-                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"my-instructions.md\"";
+                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"my-instructions.md\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, Some("Write tests first.".to_string()));
@@ -3840,7 +4254,7 @@ skip_permissions = false
             let instructions_path = dir.path().join("base.md");
             fs::write(&instructions_path, "Base instructions from file.").unwrap();
 
-            let toml_str = "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"base.md\"\ninstructions = \"Plus inline.\"";
+            let toml_str = "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"base.md\"\ninstructions = \"Plus inline.\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(
@@ -3855,7 +4269,7 @@ skip_permissions = false
         with_env(&[], || {
             let dir = tempfile::tempdir().unwrap();
 
-            let toml_str = "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions = \"Just inline.\"";
+            let toml_str = "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions = \"Just inline.\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, Some("Just inline.".to_string()));
@@ -3880,7 +4294,7 @@ skip_permissions = false
             let dir = tempfile::tempdir().unwrap();
 
             let toml_str =
-                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"nonexistent.md\"";
+                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"nonexistent.md\"";
             let config = Config::from_toml(toml_str).unwrap();
             let result = config.resolve_instructions_file(dir.path());
             assert!(result.is_err());
@@ -3896,7 +4310,7 @@ skip_permissions = false
             fs::write(&instructions_path, "").unwrap();
 
             let toml_str =
-                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"empty.md\"";
+                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"empty.md\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, None);
@@ -3909,7 +4323,7 @@ skip_permissions = false
         let instructions_path = dir.path().join("my-instructions.md");
         fs::write(&instructions_path, "Instructions from file.").unwrap();
 
-        let toml_str = "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"my-instructions.md\"\ninstructions = \"And inline.\"";
+        let toml_str = "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"my-instructions.md\"\ninstructions = \"And inline.\"";
         let config_path = dir.path().join("claudear.toml");
         fs::write(&config_path, toml_str).unwrap();
 
@@ -3917,7 +4331,7 @@ skip_permissions = false
             let config = Config::load(&config_path).unwrap();
             // After load, instructions should be the merged result
             assert_eq!(
-                config.claude.instructions,
+                config.agent.default_provider_config().unwrap().instructions,
                 Some("Instructions from file.\nAnd inline.".to_string())
             );
         });
@@ -3969,13 +4383,13 @@ email = "alice@example.com"
 discord_id = "123456789"
 email = "jake@example.com"
 
-[discord]
+[notifiers.discord]
 webhook_url = "https://discord.com/api/webhooks/123/abc"
 user_id = "jake"
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
-        assert_eq!(config.discord.user_id.as_deref(), Some("123456789"));
+        assert_eq!(config.notifiers.discord.user_id.as_deref(), Some("123456789"));
     }
 
     #[test]
@@ -3984,13 +4398,13 @@ user_id = "jake"
 [users.jake]
 discord_id = "123456789"
 
-[discord]
+[notifiers.discord]
 webhook_url = "https://discord.com/api/webhooks/123/abc"
 user_id = "999888777"
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
-        assert_eq!(config.discord.user_id.as_deref(), Some("999888777"));
+        assert_eq!(config.notifiers.discord.user_id.as_deref(), Some("999888777"));
     }
 
     #[test]
@@ -3999,14 +4413,14 @@ user_id = "999888777"
 [users.jake]
 email = "jake@resolved.com"
 
-[email]
+[notifiers.email]
 smtp_host = "smtp.example.com"
 to_addresses = ["jake", "other@example.com"]
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         assert_eq!(
-            config.email.to_addresses,
+            config.notifiers.email.to_addresses,
             vec!["jake@resolved.com", "other@example.com"]
         );
     }
@@ -4017,13 +4431,13 @@ to_addresses = ["jake", "other@example.com"]
 [users.jake]
 push_user_key = "resolved_push_key"
 
-[push]
+[notifiers.push]
 api_token = "token"
 user_key = "jake"
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
-        assert_eq!(config.push.user_key.as_deref(), Some("resolved_push_key"));
+        assert_eq!(config.notifiers.push.user_key.as_deref(), Some("resolved_push_key"));
     }
 
     #[test]
@@ -4032,13 +4446,13 @@ user_key = "jake"
 [users.jake]
 sms_number = "+1234567890"
 
-[sms]
+[notifiers.sms]
 account_sid = "sid"
 to_numbers = ["jake", "+9876543210"]
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
-        assert_eq!(config.sms.to_numbers, vec!["+1234567890", "+9876543210"]);
+        assert_eq!(config.notifiers.sms.to_numbers, vec!["+1234567890", "+9876543210"]);
     }
 
     #[test]
@@ -4059,15 +4473,15 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                assert_eq!(config.email.imap_host, Some("imap.example.com".to_string()));
-                assert_eq!(config.email.imap_port, 143);
+                assert_eq!(config.notifiers.email.imap_host, Some("imap.example.com".to_string()));
+                assert_eq!(config.notifiers.email.imap_port, 143);
                 assert_eq!(
-                    config.email.imap_username,
+                    config.notifiers.email.imap_username,
                     Some("user@example.com".to_string())
                 );
-                assert_eq!(config.email.imap_password, Some("secret".to_string()));
-                assert!(!config.email.imap_use_tls);
-                assert_eq!(config.email.imap_folder, "Junk");
+                assert_eq!(config.notifiers.email.imap_password, Some("secret".to_string()));
+                assert!(!config.notifiers.email.imap_use_tls);
+                assert_eq!(config.notifiers.email.imap_folder, "Junk");
             },
         );
     }
@@ -4120,10 +4534,10 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                assert_eq!(config.sms.account_sid, Some("AC_test".to_string()));
-                assert_eq!(config.sms.auth_token, Some("auth_tok".to_string()));
-                assert_eq!(config.sms.from_number, Some("+15551234567".to_string()));
-                assert_eq!(config.sms.to_numbers, vec!["+15559876543", "+15551111111"]);
+                assert_eq!(config.notifiers.sms.account_sid, Some("AC_test".to_string()));
+                assert_eq!(config.notifiers.sms.auth_token, Some("auth_tok".to_string()));
+                assert_eq!(config.notifiers.sms.from_number, Some("+15551234567".to_string()));
+                assert_eq!(config.notifiers.sms.to_numbers, vec!["+15559876543", "+15551111111"]);
             },
         );
     }
@@ -4144,10 +4558,10 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                assert_eq!(config.push.api_token, Some("api_tok".to_string()));
-                assert_eq!(config.push.user_key, Some("user_key".to_string()));
-                assert_eq!(config.push.device, Some("myphone".to_string()));
-                assert_eq!(config.push.priority, Some(2));
+                assert_eq!(config.notifiers.push.api_token, Some("api_tok".to_string()));
+                assert_eq!(config.notifiers.push.user_key, Some("user_key".to_string()));
+                assert_eq!(config.notifiers.push.device, Some("myphone".to_string()));
+                assert_eq!(config.notifiers.push.priority, Some(2));
             },
         );
     }
@@ -4179,7 +4593,7 @@ work_dir = "/tmp/repos"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[linear]
+[issues.linear]
 api_key = "toml_key"
 "#;
         let file = create_temp_toml(toml_str);
@@ -4213,7 +4627,7 @@ api_key = "toml_key"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[linear]
+[issues.linear]
 api_key = "key"
 enabled = true
 "#;
@@ -4230,7 +4644,7 @@ enabled = true
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[linear]
+[issues.linear]
 api_key = "key"
 "#;
         let file = create_temp_toml(toml_str);
@@ -4247,7 +4661,7 @@ api_key = "key"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[linear]
+[issues.linear]
 api_key = "key"
 trigger_assignee = "Previous Value"
 "#;
@@ -4266,7 +4680,7 @@ trigger_assignee = "Previous Value"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[sentry]
+[issues.sentry]
 auth_token = "toml_token"
 org_slug = "toml-org"
 "#;
@@ -4323,7 +4737,7 @@ work_dir = "/tmp/repos"
                 assert_eq!(config.db_path, PathBuf::from("/custom/db.sqlite"));
                 assert_eq!(config.max_activity_entries, 50000);
                 assert_eq!(config.ipc_timeout_secs, 60);
-                assert_eq!(config.claude_timeout_secs, 3600);
+                assert_eq!(config.agent.timeout_secs, 3600);
             },
         );
     }
@@ -4333,10 +4747,10 @@ work_dir = "/tmp/repos"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[discord]
+[notifiers.discord]
 webhook_url = "https://keep-this.url"
 
-[linear]
+[issues.linear]
 api_key = "keep_key"
 "#;
         let file = create_temp_toml(toml_str);
@@ -4355,7 +4769,7 @@ api_key = "keep_key"
                 // Empty KNOWN_ORGS should not override
                 assert!(config.known_orgs.is_empty());
                 // Empty DISCORD_WEBHOOK_URL should set to None
-                assert!(config.discord.webhook_url.is_none());
+                assert!(config.notifiers.discord.webhook_url.is_none());
                 // Empty LINEAR_API_KEY should not create config
                 assert_eq!(config.linear.as_ref().unwrap().api_key, "keep_key");
             },
@@ -4376,8 +4790,8 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                assert_eq!(config.github.webhook_secret, Some("gh_secret".to_string()));
-                assert_eq!(config.github.review_trigger, "@mybot");
+                assert_eq!(config.scm.github.webhook_secret, Some("gh_secret".to_string()));
+                assert_eq!(config.scm.github.review_trigger, "@mybot");
             },
         );
     }
@@ -4401,19 +4815,19 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                assert_eq!(config.email.smtp_host, Some("smtp.gmail.com".to_string()));
+                assert_eq!(config.notifiers.email.smtp_host, Some("smtp.gmail.com".to_string()));
                 assert_eq!(config.email.smtp_port, 465);
                 assert_eq!(
-                    config.email.smtp_username,
+                    config.notifiers.email.smtp_username,
                     Some("user@gmail.com".to_string())
                 );
-                assert_eq!(config.email.smtp_password, Some("app_password".to_string()));
+                assert_eq!(config.notifiers.email.smtp_password, Some("app_password".to_string()));
                 assert_eq!(
-                    config.email.from_address,
+                    config.notifiers.email.from_address,
                     Some("sender@gmail.com".to_string())
                 );
                 assert_eq!(
-                    config.email.to_addresses,
+                    config.notifiers.email.to_addresses,
                     vec!["admin@test.com", "dev@test.com"]
                 );
                 assert!(config.email.use_tls);
@@ -4579,8 +4993,8 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                assert_eq!(config.discord.bot_token, Some("bot_token_123".to_string()));
-                assert_eq!(config.discord.channel_id, Some("channel_456".to_string()));
+                assert_eq!(config.notifiers.discord.bot_token, Some("bot_token_123".to_string()));
+                assert_eq!(config.notifiers.discord.channel_id, Some("channel_456".to_string()));
             },
         );
     }
@@ -4597,7 +5011,7 @@ work_dir = "/tmp/repos"
             || {
                 let config = Config::load(file.path()).unwrap();
                 assert_eq!(
-                    config.github_app.private_key_path,
+                    config.scm.github.app.private_key_path,
                     Some(PathBuf::from("/path/to/key.pem"))
                 );
             },
@@ -4639,18 +5053,18 @@ work_dir = "/tmp/repos"
 [users.jake]
 linear_name = "Jake B"
 
-[discord]
+[notifiers.discord]
 user_id = "jake"
 
-[push]
+[notifiers.push]
 user_key = "jake"
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         // User exists but has no discord_id, should keep slug
-        assert_eq!(config.discord.user_id.as_deref(), Some("jake"));
+        assert_eq!(config.notifiers.discord.user_id.as_deref(), Some("jake"));
         // User exists but has no push_user_key, should keep slug
-        assert_eq!(config.push.user_key.as_deref(), Some("jake"));
+        assert_eq!(config.notifiers.push.user_key.as_deref(), Some("jake"));
     }
 
     #[test]
@@ -4659,13 +5073,13 @@ user_key = "jake"
 [users.jake]
 linear_name = "Jake B"
 
-[email]
+[notifiers.email]
 to_addresses = ["jake"]
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         // User exists but has no email field, should keep the slug as-is
-        assert_eq!(config.email.to_addresses, vec!["jake"]);
+        assert_eq!(config.notifiers.email.to_addresses, vec!["jake"]);
     }
 
     #[test]
@@ -4674,13 +5088,13 @@ to_addresses = ["jake"]
 [users.jake]
 linear_name = "Jake B"
 
-[sms]
+[notifiers.sms]
 to_numbers = ["jake"]
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.resolve_user_slugs();
         // User exists but has no sms_number, should keep the slug as-is
-        assert_eq!(config.sms.to_numbers, vec!["jake"]);
+        assert_eq!(config.notifiers.sms.to_numbers, vec!["jake"]);
     }
 
     #[test]
@@ -4688,8 +5102,8 @@ to_numbers = ["jake"]
         let mut config = Config::default();
         assert!(!config.is_github_app_configured());
 
-        config.github_app.app_id = Some(1);
-        config.github_app.private_key = Some("key".to_string());
+        config.scm.github.app.app_id = Some(1);
+        config.scm.github.app.private_key = Some("key".to_string());
         assert!(config.is_github_app_configured());
     }
 
@@ -5407,17 +5821,17 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                assert_eq!(config.slack.bot_token, Some("xoxb-test-token".to_string()));
-                assert_eq!(config.slack.channel_id, Some("C12345".to_string()));
+                assert_eq!(config.notifiers.slack.bot_token, Some("xoxb-test-token".to_string()));
+                assert_eq!(config.notifiers.slack.channel_id, Some("C12345".to_string()));
                 assert_eq!(
-                    config.slack.webhook_url,
+                    config.notifiers.slack.webhook_url,
                     Some("https://hooks.slack.com/test".to_string())
                 );
-                assert_eq!(config.slack.user_id, Some("U12345".to_string()));
-                assert!(config.slack.source_enabled);
-                assert_eq!(config.slack.listen_channel_id, Some("C67890".to_string()));
-                assert_eq!(config.slack.workspace, Some("myworkspace".to_string()));
-                assert_eq!(config.slack.poll_interval_ms, Some(45000));
+                assert_eq!(config.notifiers.slack.user_id, Some("U12345".to_string()));
+                assert!(config.issues.slack.is_some());
+                assert_eq!(config.issues.slack.as_ref().and_then(|s| s.listen_channel_id.clone()), Some("C67890".to_string()));
+                assert_eq!(config.notifiers.slack.workspace, Some("myworkspace".to_string()));
+                assert_eq!(config.issues.slack.as_ref().and_then(|s| s.poll_interval_ms), Some(45000));
             },
         );
     }
@@ -5450,9 +5864,9 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                assert!(config.discord.source_enabled);
-                assert_eq!(config.discord.listen_channel_id, Some("LC123".to_string()));
-                assert_eq!(config.discord.guild_id, Some("G456".to_string()));
+                assert!(config.discord.is_some());
+                assert_eq!(config.discord.as_ref().and_then(|s| s.listen_channel_id.clone()), Some("LC123".to_string()));
+                assert_eq!(config.notifiers.discord.guild_id, Some("G456".to_string()));
             },
         );
     }
@@ -5540,7 +5954,7 @@ max_concurrent = 3
         let mut config = Config::default();
         assert!(!config.is_gitlab_enabled());
 
-        config.gitlab = Some(GitLabConfig {
+        config.scm.gitlab = Some(GitLabConfig {
             enabled: true,
             token: Some("tok".to_string()),
             ..Default::default()
@@ -5548,7 +5962,7 @@ max_concurrent = 3
         assert!(config.is_gitlab_enabled());
 
         // Enabled but no token
-        config.gitlab = Some(GitLabConfig {
+        config.scm.gitlab = Some(GitLabConfig {
             enabled: true,
             token: None,
             ..Default::default()
@@ -5556,7 +5970,7 @@ max_concurrent = 3
         assert!(!config.is_gitlab_enabled());
 
         // Has token but disabled
-        config.gitlab = Some(GitLabConfig {
+        config.scm.gitlab = Some(GitLabConfig {
             enabled: false,
             token: Some("tok".to_string()),
             ..Default::default()
@@ -5588,7 +6002,7 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                let gitlab = config.gitlab.unwrap();
+                let gitlab = config.scm.gitlab.unwrap();
                 assert!(gitlab.enabled);
                 assert_eq!(gitlab.token, Some("glpat-env-token".to_string()));
                 assert_eq!(gitlab.base_url, "https://gitlab.custom.com");
@@ -5611,7 +6025,7 @@ work_dir = "/tmp/repos"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[gitlab]
+[scm.gitlab]
 enabled = true
 token = "tok"
 "#;
@@ -5619,7 +6033,7 @@ token = "tok"
 
         with_env(&[("GITLAB_ENABLED", "false")], || {
             let config = Config::load(file.path()).unwrap();
-            assert!(!config.gitlab.as_ref().unwrap().enabled);
+            assert!(!config.scm.gitlab.as_ref().unwrap().enabled);
         });
     }
 
@@ -5689,13 +6103,13 @@ poll_interval_ms = 60000
         let mut config = Config::default();
         assert!(!config.is_jira_enabled());
 
-        config.jira = Some(JiraConfig {
+        config.issues.jira = Some(JiraConfig {
             enabled: true,
             ..Default::default()
         });
         assert!(config.is_jira_enabled());
 
-        config.jira.as_mut().unwrap().enabled = false;
+        config.issues.jira.as_mut().unwrap().enabled = false;
         assert!(!config.is_jira_enabled());
     }
 
@@ -5703,7 +6117,7 @@ poll_interval_ms = 60000
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_with_jira() {
         let mut config = Config::default();
-        config.jira = Some(JiraConfig {
+        config.issues.jira = Some(JiraConfig {
             enabled: true,
             api_token: "token".into(),
             base_url: "https://myco.atlassian.net".into(),
@@ -5718,7 +6132,7 @@ poll_interval_ms = 60000
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_jira_missing_base_url() {
         let mut config = Config::default();
-        config.jira = Some(JiraConfig {
+        config.issues.jira = Some(JiraConfig {
             enabled: true,
             api_token: "token".into(),
             base_url: String::new(),
@@ -5734,7 +6148,7 @@ poll_interval_ms = 60000
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_jira_invalid_auth_mode() {
         let mut config = Config::default();
-        config.jira = Some(JiraConfig {
+        config.issues.jira = Some(JiraConfig {
             enabled: true,
             api_token: "token".into(),
             base_url: "https://myco.atlassian.net".into(),
@@ -5750,7 +6164,7 @@ poll_interval_ms = 60000
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_jira_basic_auth_missing_email() {
         let mut config = Config::default();
-        config.jira = Some(JiraConfig {
+        config.issues.jira = Some(JiraConfig {
             enabled: true,
             api_token: "token".into(),
             base_url: "https://myco.atlassian.net".into(),
@@ -5766,7 +6180,7 @@ poll_interval_ms = 60000
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_jira_bearer_auth_no_email_required() {
         let mut config = Config::default();
-        config.jira = Some(JiraConfig {
+        config.issues.jira = Some(JiraConfig {
             enabled: true,
             api_token: "token".into(),
             base_url: "https://myco.atlassian.net".into(),
@@ -5804,7 +6218,7 @@ work_dir = "/tmp/repos"
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                let jira = config.jira.unwrap();
+                let jira = config.issues.jira.unwrap();
                 assert!(jira.enabled);
                 assert_eq!(jira.api_token, "env_jira_token");
                 assert_eq!(jira.base_url, "https://env.atlassian.net");
@@ -5833,8 +6247,8 @@ work_dir = "/tmp/repos"
 
         with_env(&[("JIRA_API_TOKEN", "env_jira_token")], || {
             let config = Config::load(file.path()).unwrap();
-            assert!(config.jira.is_some());
-            assert_eq!(config.jira.as_ref().unwrap().api_token, "env_jira_token");
+            assert!(config.issues.jira.is_some());
+            assert_eq!(config.issues.jira.as_ref().unwrap().api_token, "env_jira_token");
         });
     }
 
@@ -5847,8 +6261,8 @@ work_dir = "/tmp/repos"
 
         with_env(&[("GITLAB_TOKEN", "glpat-env")], || {
             let config = Config::load(file.path()).unwrap();
-            assert!(config.gitlab.is_some());
-            let gitlab = config.gitlab.unwrap();
+            assert!(config.scm.gitlab.is_some());
+            let gitlab = config.scm.gitlab.unwrap();
             assert_eq!(gitlab.token, Some("glpat-env".to_string()));
             assert!(gitlab.enabled);
         });
@@ -5895,7 +6309,7 @@ sms_number = "+1111111111"
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_with_gitlab() {
         let mut config = Config::default();
-        config.gitlab = Some(GitLabConfig {
+        config.scm.gitlab = Some(GitLabConfig {
             enabled: true,
             token: Some("glpat-test".to_string()),
             ..Default::default()
@@ -5907,8 +6321,7 @@ sms_number = "+1111111111"
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_with_slack_source() {
         let mut config = Config::default();
-        config.slack.source_enabled = true;
-        config.slack.bot_token = Some("xoxb-test".to_string());
+        config.issues.slack = Some(SlackSourceConfig { bot_token: Some("xoxb-test".to_string()), ..Default::default() });
         assert!(config.validate().is_ok());
     }
 
@@ -5916,7 +6329,7 @@ sms_number = "+1111111111"
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_with_discord_source() {
         let mut config = Config::default();
-        config.discord.source_enabled = true;
+        config.discord.is_some() = true;
         config.discord.bot_token = Some("bot-token".to_string());
         assert!(config.validate().is_ok());
     }
@@ -5925,8 +6338,7 @@ sms_number = "+1111111111"
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_slack_source_without_bot_token() {
         let mut config = Config::default();
-        config.slack.source_enabled = true;
-        config.slack.bot_token = None;
+        config.issues.slack = Some(SlackSourceConfig { bot_token: None, ..Default::default() });
         assert!(config.validate().is_err());
     }
 
@@ -5934,7 +6346,7 @@ sms_number = "+1111111111"
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_discord_source_without_bot_token() {
         let mut config = Config::default();
-        config.discord.source_enabled = true;
+        config.discord.is_some() = true;
         config.discord.bot_token = None;
         assert!(config.validate().is_err());
     }
@@ -5943,7 +6355,7 @@ sms_number = "+1111111111"
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_prioritisation_skipped_when_disabled() {
         let mut config = Config::default();
-        config.linear = Some(LinearConfig {
+        config.issues.linear = Some(LinearConfig {
             enabled: true,
             api_key: "key".into(),
             ..Default::default()
@@ -5959,7 +6371,7 @@ sms_number = "+1111111111"
     #[allow(clippy::field_reassign_with_default)]
     fn test_validation_prioritisation_checked_when_enabled() {
         let mut config = Config::default();
-        config.linear = Some(LinearConfig {
+        config.issues.linear = Some(LinearConfig {
             enabled: true,
             api_key: "key".into(),
             ..Default::default()
@@ -5973,14 +6385,20 @@ sms_number = "+1111111111"
     fn test_per_source_max_issues_for_jira_and_gitlab() {
         let config = Config {
             max_issues_per_cycle: 5,
-            jira: Some(JiraConfig {
-                max_issues_per_cycle: Some(3),
+            issues: IssuesConfig {
+                jira: Some(JiraConfig {
+                    max_issues_per_cycle: Some(3),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            gitlab: Some(GitLabConfig {
-                max_issues_per_cycle: Some(4),
+            },
+            scm: ScmConfig {
+                gitlab: Some(GitLabConfig {
+                    max_issues_per_cycle: Some(4),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert_eq!(config.max_issues_per_cycle_for("jira"), 3);
@@ -5991,8 +6409,14 @@ sms_number = "+1111111111"
     fn test_per_source_max_issues_for_jira_gitlab_fallback() {
         let config = Config {
             max_issues_per_cycle: 5,
-            jira: Some(JiraConfig::default()),
-            gitlab: Some(GitLabConfig::default()),
+            issues: IssuesConfig {
+                jira: Some(JiraConfig::default()),
+                ..Default::default()
+            },
+            scm: ScmConfig {
+                gitlab: Some(GitLabConfig::default()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(config.max_issues_per_cycle_for("jira"), 5);
@@ -6003,14 +6427,20 @@ sms_number = "+1111111111"
     fn test_per_source_max_concurrent_for_jira_and_gitlab() {
         let config = Config {
             max_concurrent: 4,
-            jira: Some(JiraConfig {
-                max_concurrent: Some(2),
+            issues: IssuesConfig {
+                jira: Some(JiraConfig {
+                    max_concurrent: Some(2),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            gitlab: Some(GitLabConfig {
-                max_concurrent: Some(3),
+            },
+            scm: ScmConfig {
+                gitlab: Some(GitLabConfig {
+                    max_concurrent: Some(3),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert_eq!(config.max_concurrent_for("jira"), 2);
@@ -6021,8 +6451,14 @@ sms_number = "+1111111111"
     fn test_per_source_max_concurrent_for_jira_gitlab_fallback() {
         let config = Config {
             max_concurrent: 4,
-            jira: Some(JiraConfig::default()),
-            gitlab: Some(GitLabConfig::default()),
+            issues: IssuesConfig {
+                jira: Some(JiraConfig::default()),
+                ..Default::default()
+            },
+            scm: ScmConfig {
+                gitlab: Some(GitLabConfig::default()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(config.max_concurrent_for("jira"), 4);
@@ -6033,16 +6469,22 @@ sms_number = "+1111111111"
     fn test_poll_interval_ms_for_jira_and_gitlab() {
         let config = Config {
             poll_interval_ms: 300_000,
-            jira: Some(JiraConfig {
-                poll_interval_ms: Some(60_000),
+            issues: IssuesConfig {
+                jira: Some(JiraConfig {
+                    poll_interval_ms: Some(60_000),
+                    ..Default::default()
+                }),
+                slack: Some(SlackSourceConfig {
+                    poll_interval_ms: Some(45_000),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            gitlab: Some(GitLabConfig {
-                poll_interval_ms: Some(90_000),
-                ..Default::default()
-            }),
-            slack: SlackConfig {
-                poll_interval_ms: Some(45_000),
+            },
+            scm: ScmConfig {
+                gitlab: Some(GitLabConfig {
+                    poll_interval_ms: Some(90_000),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -6056,8 +6498,14 @@ sms_number = "+1111111111"
     fn test_poll_interval_ms_for_jira_gitlab_fallback() {
         let config = Config {
             poll_interval_ms: 300_000,
-            jira: Some(JiraConfig::default()),
-            gitlab: Some(GitLabConfig::default()),
+            issues: IssuesConfig {
+                jira: Some(JiraConfig::default()),
+                ..Default::default()
+            },
+            scm: ScmConfig {
+                gitlab: Some(GitLabConfig::default()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(config.poll_interval_ms_for("jira"), 300_000);
@@ -6143,9 +6591,9 @@ storage_dir = "/custom/storage"
     }
 
     #[test]
-    fn test_config_default_claude_timeout_secs() {
+    fn test_config_default_agent_timeout_secs() {
         let config = Config::default();
-        assert_eq!(config.claude_timeout_secs, 21600);
+        assert_eq!(config.agent.timeout_secs, 21600);
     }
 
     #[test]
@@ -6165,7 +6613,7 @@ storage_dir = "/custom/storage"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[linear]
+[issues.linear]
 api_key = "key"
 "#;
         let file = create_temp_toml(toml_str);
@@ -6173,7 +6621,7 @@ api_key = "key"
         with_env(&[("LINEAR_POLL_INTERVAL_MS", "120000")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(
-                config.linear.as_ref().unwrap().poll_interval_ms,
+                config.issues.linear.as_ref().unwrap().poll_interval_ms,
                 Some(120000)
             );
         });
@@ -6184,7 +6632,7 @@ api_key = "key"
         let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[sentry]
+[issues.sentry]
 auth_token = "tok"
 org_slug = "org"
 "#;
@@ -6193,7 +6641,7 @@ org_slug = "org"
         with_env(&[("SENTRY_POLL_INTERVAL_MS", "90000")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(
-                config.sentry.as_ref().unwrap().poll_interval_ms,
+                config.issues.sentry.as_ref().unwrap().poll_interval_ms,
                 Some(90000)
             );
         });
@@ -6205,13 +6653,13 @@ org_slug = "org"
             let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[linear]
+[issues.linear]
 api_key = "key"
 trigger_assignee = "Alice"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(
-                config.linear.as_ref().unwrap().trigger_assignee,
+                config.issues.linear.as_ref().unwrap().trigger_assignee,
                 Some("Alice".to_string())
             );
         });
@@ -6223,10 +6671,10 @@ trigger_assignee = "Alice"
             let config = Config::from_toml("").unwrap();
             assert!(config.work_dir.as_os_str().is_empty());
             assert_eq!(config.poll_interval_ms, 300_000);
-            assert!(config.linear.is_none());
-            assert!(config.sentry.is_none());
-            assert!(config.jira.is_none());
-            assert!(config.gitlab.is_none());
+            assert!(config.issues.linear.is_none());
+            assert!(config.issues.sentry.is_none());
+            assert!(config.issues.jira.is_none());
+            assert!(config.scm.gitlab.is_none());
         });
     }
 
@@ -6249,17 +6697,17 @@ cross_repo_window_hours = 48
     }
 
     #[test]
-    fn test_claude_config_instructions_file_from_toml() {
+    fn test_agent_provider_instructions_file_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[claude]
+[agent.providers.claude]
 instructions_file = "my-instructions.md"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(
-                config.claude.instructions_file,
+                config.agent.default_provider_config().and_then(|p| p.instructions_file.clone()),
                 Some("my-instructions.md".to_string())
             );
         });
@@ -6337,12 +6785,12 @@ instructions_file = "my-instructions.md"
             let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[github]
+[scm.github]
 token = "ghp_test"
 use_ssh = true
 "#;
             let config = Config::from_toml(toml_str).unwrap();
-            assert!(config.github.use_ssh);
+            assert!(config.scm.github.use_ssh);
         });
     }
 
@@ -6352,23 +6800,27 @@ use_ssh = true
             let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[slack]
+[notifiers.slack]
 bot_token = "xoxb-token"
 channel_id = "C123"
 webhook_url = "https://hooks.slack.com/x"
 user_id = "U123"
-source_enabled = true
+workspace = "myteam"
+
+[issues.slack]
+bot_token = "xoxb-token"
+channel_id = "C123"
 listen_channel_id = "C456"
 workspace = "myteam"
 poll_interval_ms = 30000
 "#;
             let config = Config::from_toml(toml_str).unwrap();
-            assert_eq!(config.slack.bot_token, Some("xoxb-token".to_string()));
-            assert_eq!(config.slack.channel_id, Some("C123".to_string()));
-            assert!(config.slack.source_enabled);
-            assert_eq!(config.slack.listen_channel_id, Some("C456".to_string()));
-            assert_eq!(config.slack.workspace, Some("myteam".to_string()));
-            assert_eq!(config.slack.poll_interval_ms, Some(30000));
+            assert_eq!(config.notifiers.slack.bot_token, Some("xoxb-token".to_string()));
+            assert_eq!(config.notifiers.slack.channel_id, Some("C123".to_string()));
+            assert!(config.issues.slack.is_some());
+            assert_eq!(config.issues.slack.as_ref().and_then(|s| s.listen_channel_id.clone()), Some("C456".to_string()));
+            assert_eq!(config.notifiers.slack.workspace, Some("myteam".to_string()));
+            assert_eq!(config.issues.slack.as_ref().and_then(|s| s.poll_interval_ms), Some(30000));
         });
     }
 
@@ -6378,7 +6830,7 @@ poll_interval_ms = 30000
             let toml_str = r#"
 work_dir = "/tmp/repos"
 
-[discord]
+[notifiers.discord]
 webhook_url = "https://discord.com/wh"
 user_id = "U789"
 bot_token = "bot_tok"
@@ -6390,13 +6842,13 @@ poll_interval_ms = 25000
 "#;
             let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(
-                config.discord.webhook_url,
+                config.notifiers.discord.webhook_url,
                 Some("https://discord.com/wh".to_string())
             );
-            assert_eq!(config.discord.bot_token, Some("bot_tok".to_string()));
-            assert!(config.discord.source_enabled);
-            assert_eq!(config.discord.guild_id, Some("G789".to_string()));
-            assert_eq!(config.discord.poll_interval_ms, Some(25000));
+            assert_eq!(config.notifiers.discord.bot_token, Some("bot_tok".to_string()));
+            assert!(config.discord.is_some());
+            assert_eq!(config.notifiers.discord.guild_id, Some("G789".to_string()));
+            assert_eq!(config.discord.as_ref().and_then(|s| s.poll_interval_ms), Some(25000));
         });
     }
 
@@ -6418,7 +6870,7 @@ poll_interval_ms = 25000
             fs::write(&instructions_path, "   \n\n  \t  \n").unwrap();
 
             let toml_str =
-                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"whitespace.md\"";
+                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"whitespace.md\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             // Whitespace-only file should be treated as empty

@@ -12,6 +12,7 @@ use super::WebhookHandler;
 use crate::config::GitLabConfig;
 use crate::error::Result;
 use crate::scm::ReviewWatcher;
+use crate::secret::OptionalSecretExt;
 use crate::types::{Issue, IssueStatus, MatchResult};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -76,6 +77,7 @@ impl GitLabMrWebhookHandler {
     ///
     /// GitLab uses `X-Gitlab-Token` header with a plain token value (not HMAC).
     pub fn verify_signature(&self, _payload: &[u8], headers: &HashMap<String, String>) -> bool {
+        // self.secret is Option<String>, which has as_deref()
         verify_gitlab_token(self.secret.as_deref(), headers)
     }
 
@@ -332,7 +334,7 @@ impl WebhookHandler for GitLabIssueWebhookHandler {
     }
 
     fn verify_signature(&self, _payload: &[u8], headers: &HashMap<String, String>) -> bool {
-        verify_gitlab_token(self.config.webhook_secret.as_deref(), headers)
+        verify_gitlab_token(self.config.webhook_secret.expose_as_deref(), headers)
     }
 
     async fn parse_payload(&self, payload: &serde_json::Value) -> Result<Option<Issue>> {

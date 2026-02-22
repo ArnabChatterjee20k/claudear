@@ -5,7 +5,7 @@
 
 use crate::error::Result;
 use crate::feedback::EmbeddingClient;
-use crate::storage::SqliteTracker;
+use crate::storage::FixAttemptTracker;
 use crate::types::{Issue, IssueEmbedding, SimilarIssue};
 use chrono::Utc;
 use std::sync::Arc;
@@ -50,7 +50,7 @@ pub struct SimilarIssueWithDetails {
 /// Service for managing issue embeddings and finding similar issues.
 pub struct IssueEmbeddingService {
     embedding_client: Arc<EmbeddingClient>,
-    tracker: Arc<SqliteTracker>,
+    tracker: Arc<dyn FixAttemptTracker>,
     config: IssueEmbeddingConfig,
 }
 
@@ -58,7 +58,7 @@ impl IssueEmbeddingService {
     /// Create a new issue embedding service.
     pub fn new(
         embedding_client: Arc<EmbeddingClient>,
-        tracker: Arc<SqliteTracker>,
+        tracker: Arc<dyn FixAttemptTracker>,
         config: IssueEmbeddingConfig,
     ) -> Self {
         Self {
@@ -71,7 +71,7 @@ impl IssueEmbeddingService {
     /// Create with default configuration.
     pub fn with_defaults(
         embedding_client: Arc<EmbeddingClient>,
-        tracker: Arc<SqliteTracker>,
+        tracker: Arc<dyn FixAttemptTracker>,
     ) -> Self {
         Self::new(embedding_client, tracker, IssueEmbeddingConfig::default())
     }

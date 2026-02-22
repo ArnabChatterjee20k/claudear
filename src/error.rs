@@ -9,7 +9,7 @@ pub enum Error {
     Config(String),
 
     #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(String),
 
     #[error("HTTP request error: {0}")]
     Http(#[from] reqwest::Error),
@@ -112,6 +112,17 @@ impl Error {
 
     pub fn io(msg: impl Into<String>) -> Self {
         Self::Other(format!("IO error: {}", msg.into()))
+    }
+
+    pub fn database(msg: impl Into<String>) -> Self {
+        Self::Database(msg.into())
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Error::Database(e.to_string())
     }
 }
 
@@ -334,7 +345,14 @@ mod tests {
 
     #[test]
     fn test_error_from_database() {
-        // Create a mock database error
+        let err = Error::database("query failed");
+        assert!(matches!(err, Error::Database(_)));
+        assert!(err.to_string().contains("query failed"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_error_from_rusqlite() {
         let db_err = rusqlite::Error::InvalidQuery;
         let err: Error = db_err.into();
         assert!(matches!(err, Error::Database(_)));
@@ -499,6 +517,7 @@ mod tests {
         assert!(err.to_string().contains("permission denied"));
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_error_from_rusqlite_query_returned_no_rows() {
         let db_err = rusqlite::Error::QueryReturnedNoRows;

@@ -729,10 +729,8 @@ pub struct ReviewWatcher {
     provider: Arc<dyn ScmProvider>,
     /// Map of PR URL -> review state.
     states: std::sync::RwLock<std::collections::HashMap<String, PrReviewState>>,
-    /// Optional tracker for recording reviews to the database.
+    /// Optional tracker for recording reviews and persisting review states to the database.
     tracker: Option<Arc<dyn FixAttemptTracker>>,
-    /// Optional sqlite tracker for persisting review states.
-    sqlite_tracker: Option<Arc<SqliteTracker>>,
 }
 
 impl ReviewWatcher {
@@ -742,11 +740,10 @@ impl ReviewWatcher {
             provider,
             states: std::sync::RwLock::new(std::collections::HashMap::new()),
             tracker: None,
-            sqlite_tracker: None,
         }
     }
 
-    /// Create a new review watcher with a tracker for analytics.
+    /// Create a new review watcher with a tracker for analytics and state persistence.
     pub fn with_tracker(
         provider: Arc<dyn ScmProvider>,
         tracker: Arc<dyn FixAttemptTracker>,
@@ -755,21 +752,6 @@ impl ReviewWatcher {
             provider,
             states: std::sync::RwLock::new(std::collections::HashMap::new()),
             tracker: Some(tracker),
-            sqlite_tracker: None,
-        }
-    }
-
-    /// Create a new review watcher with a sqlite tracker for state persistence.
-    pub fn with_sqlite_tracker(
-        provider: Arc<dyn ScmProvider>,
-        tracker: Arc<dyn FixAttemptTracker>,
-        sqlite_tracker: Option<Arc<SqliteTracker>>,
-    ) -> Self {
-        Self {
-            provider,
-            states: std::sync::RwLock::new(std::collections::HashMap::new()),
-            tracker: Some(tracker),
-            sqlite_tracker,
         }
     }
 
@@ -803,9 +785,9 @@ impl ReviewWatcher {
         states.insert(merged_state.pr_url.clone(), merged_state.clone());
         drop(states);
 
-        // Persist merged state if sqlite_tracker is available
-        if let Some(ref sqlite) = self.sqlite_tracker {
-            if let Err(e) = sqlite.save_pr_review_state(&merged_state) {
+        // Persist merged state if tracker is available
+        if let Some(ref tracker) = self.tracker {
+            if let Err(e) = tracker.save_pr_review_state(&merged_state) {
                 tracing::warn!(
                     component = "review_watcher",
                     pr_url = %merged_state.pr_url,
@@ -818,9 +800,9 @@ impl ReviewWatcher {
 
     /// Stop watching a PR.
     pub fn unwatch_pr(&self, pr_url: &str) {
-        // Deactivate in database first if sqlite_tracker is available
-        if let Some(ref sqlite) = self.sqlite_tracker {
-            if let Err(e) = sqlite.deactivate_pr_review_state(pr_url) {
+        // Deactivate in database first if tracker is available
+        if let Some(ref tracker) = self.tracker {
+            if let Err(e) = tracker.deactivate_pr_review_state(pr_url) {
                 tracing::warn!(
                     component = "review_watcher",
                     pr_url = %pr_url,
@@ -1068,8 +1050,8 @@ impl ReviewWatcher {
                 s.last_review_time = latest_review_time.clone();
 
                 // Persist state update to database
-                if let Some(ref sqlite) = self.sqlite_tracker {
-                    if let Err(e) = sqlite.save_pr_review_state(s) {
+                if let Some(ref tracker) = self.tracker {
+                    if let Err(e) = tracker.save_pr_review_state(s) {
                         tracing::warn!(
                             component = "review_watcher",
                             pr_url = %s.pr_url,
@@ -1171,14 +1153,14 @@ impl ReviewWatcher {
 
         if !attached_comment_ids.is_empty() || !standalone_comments.is_empty() {
             // Record all new comments to database
-            if let Some(ref sqlite) = self.sqlite_tracker {
+            if let Some(ref tracker) = self.tracker {
                 for event in &events {
                     if let ReviewEvent::ReviewSubmitted {
                         inline_comments, ..
                     } = event
                     {
                         for comment in inline_comments {
-                            if let Err(e) = sqlite.record_pr_review_comment(&state.pr_url, comment)
+                            if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment)
                             {
                                 tracing::warn!(
                                     component = "review_watcher",
@@ -1192,7 +1174,7 @@ impl ReviewWatcher {
                     }
                 }
                 for comment in &standalone_comments {
-                    if let Err(e) = sqlite.record_pr_review_comment(&state.pr_url, comment) {
+                    if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment) {
                         tracing::warn!(
                             component = "review_watcher",
                             pr_url = %state.pr_url,
@@ -1238,8 +1220,8 @@ impl ReviewWatcher {
                 }
 
                 // Persist state update to database
-                if let Some(ref sqlite) = self.sqlite_tracker {
-                    if let Err(e) = sqlite.save_pr_review_state(s) {
+                if let Some(ref tracker) = self.tracker {
+                    if let Err(e) = tracker.save_pr_review_state(s) {
                         tracing::warn!(
                             component = "review_watcher",
                             pr_url = %s.pr_url,
@@ -4110,11 +4092,11 @@ mod tests {
         }
 
         #[test]
-        fn test_with_sqlite_tracker_constructor_none() {
+        fn test_with_tracker_constructor_has_tracker() {
             let provider: Arc<dyn ScmProvider> =
                 Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTracker);
-            let watcher = ReviewWatcher::with_sqlite_tracker(provider, tracker, None);
+            let watcher = ReviewWatcher::with_tracker(provider, tracker);
 
             assert!(watcher.is_enabled());
             assert!(watcher.get_all_states().is_empty());
@@ -5146,7 +5128,7 @@ mod tests {
     }
 
     // ================================================================
-    // Additional coverage: record_review_to_db, with_sqlite_tracker
+    // Additional coverage: record_review_to_db, tracker
     // persistence, check_pr_reviews with sqlite, PrMonitor
     // activity log recording, and ReviewWatcher persistence paths.
     // ================================================================
@@ -5453,14 +5435,13 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_with_sqlite_tracker_persists_watch() {
+        async fn test_with_tracker_persists_watch() {
             let mock = MockScmProvider::new("github", true, "@claudear");
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
-            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTrackerWithRecording::new());
             let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+            let tracker: Arc<dyn FixAttemptTracker> = sqlite.clone();
 
-            let watcher =
-                ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite.clone()));
+            let watcher = ReviewWatcher::with_tracker(provider, tracker);
 
             let state = make_state("https://github.com/org/repo/pull/1", "org/repo", 1);
             watcher.watch_pr(state);
@@ -5476,14 +5457,13 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_with_sqlite_tracker_persists_unwatch() {
+        async fn test_with_tracker_persists_unwatch() {
             let mock = MockScmProvider::new("github", true, "@claudear");
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
-            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTrackerWithRecording::new());
             let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+            let tracker: Arc<dyn FixAttemptTracker> = sqlite.clone();
 
-            let watcher =
-                ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite.clone()));
+            let watcher = ReviewWatcher::with_tracker(provider, tracker);
 
             let state = make_state("https://github.com/org/repo/pull/1", "org/repo", 1);
             watcher.watch_pr(state);
@@ -5500,7 +5480,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_with_sqlite_tracker_persists_cursor_advance() {
+        async fn test_with_tracker_persists_cursor_advance() {
             let mock = MockScmProvider::new("github", true, "@claudear");
             mock.set_reviews(vec![make_review(
                 1,
@@ -5509,11 +5489,10 @@ mod tests {
                 "2025-01-01T00:00:00Z",
             )]);
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
-            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTrackerWithRecording::new());
             let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+            let tracker: Arc<dyn FixAttemptTracker> = sqlite.clone();
 
-            let watcher =
-                ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite.clone()));
+            let watcher = ReviewWatcher::with_tracker(provider, tracker);
 
             watcher.watch_pr(make_state(
                 "https://github.com/org/repo/pull/1",
@@ -5536,7 +5515,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_with_sqlite_tracker_persists_comment_cursor() {
+        async fn test_with_tracker_persists_comment_cursor() {
             let mock = MockScmProvider::new("github", true, "@claudear");
             mock.set_comments(vec![make_comment(
                 10,
@@ -5545,11 +5524,10 @@ mod tests {
                 None,
             )]);
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
-            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTrackerWithRecording::new());
             let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+            let tracker: Arc<dyn FixAttemptTracker> = sqlite.clone();
 
-            let watcher =
-                ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite.clone()));
+            let watcher = ReviewWatcher::with_tracker(provider, tracker);
 
             watcher.watch_pr(make_state(
                 "https://github.com/org/repo/pull/1",

@@ -94,7 +94,7 @@ impl LinearApiClient {
 
     /// Create from a LinearConfig.
     pub fn from_config(config: &LinearConfig) -> Self {
-        Self::new(config.api_key.clone())
+        Self::new(config.api_key.expose().to_string())
     }
 
     /// Register a new webhook with Linear.
@@ -347,6 +347,7 @@ impl LinearApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::SecretValue;
 
     #[test]
     fn test_linear_api_client_new() {
@@ -358,7 +359,7 @@ mod tests {
     fn test_linear_api_client_from_config() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "lin_config_key".to_string(),
+            api_key: SecretValue::new("lin_config_key"),
             trigger_labels: vec![],
             trigger_states: vec![],
             team_id: None,
@@ -603,13 +604,13 @@ mod tests {
     fn test_from_config_with_full_config() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "lin_full_config_key".to_string(),
+            api_key: SecretValue::new("lin_full_config_key"),
             trigger_labels: vec!["claudear".to_string(), "autofix".to_string()],
             trigger_assignee: Some("Jake".to_string()),
             trigger_states: vec!["Todo".to_string(), "In Progress".to_string()],
             team_id: Some("team_abc".to_string()),
             project_id: Some("proj_xyz".to_string()),
-            webhook_secret: Some("whsec_config".to_string()),
+            webhook_secret: Some("whsec_config".into()),
             max_issues_per_cycle: Some(10),
             max_concurrent: Some(3),
             poll_interval_ms: Some(5000),
@@ -688,13 +689,13 @@ mod tests {
         // Verify that from_config only extracts the api_key field
         let config = LinearConfig {
             enabled: false,
-            api_key: "only_this_matters".to_string(),
+            api_key: SecretValue::new("only_this_matters"),
             trigger_labels: vec!["irrelevant".to_string()],
             trigger_assignee: Some("ignored".to_string()),
             trigger_states: vec!["ignored".to_string()],
             team_id: Some("ignored".to_string()),
             project_id: Some("ignored".to_string()),
-            webhook_secret: Some("ignored".to_string()),
+            webhook_secret: Some("ignored".into()),
             max_issues_per_cycle: Some(999),
             max_concurrent: Some(999),
             poll_interval_ms: Some(999),

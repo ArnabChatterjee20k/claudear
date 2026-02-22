@@ -73,7 +73,7 @@ impl GitHubWebhookHandler {
             }
         };
 
-        let mut mac = match Hmac::<Sha256>::new_from_slice(secret.as_bytes()) {
+        let mut mac = match Hmac::<Sha256>::new_from_slice(secret.expose().as_bytes()) {
             Ok(m) => m,
             Err(_) => {
                 tracing::error!(source = "github", "Failed to create HMAC from secret");
@@ -458,15 +458,17 @@ impl GitHubWebhookHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::SecretValue;
 
     fn create_test_config(webhook_secret: Option<&str>) -> GitHubConfig {
         GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: false,
-            webhook_secret: webhook_secret.map(|s| s.to_string()),
+            webhook_secret: webhook_secret.map(|s| SecretValue::new(s)),
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         }
     }
 
@@ -2684,8 +2686,8 @@ mod tests {
     #[test]
     fn test_create_test_config_with_secret() {
         let config = create_test_config(Some("my_secret"));
-        assert_eq!(config.webhook_secret, Some("my_secret".to_string()));
-        assert_eq!(config.token, Some("test_token".to_string()));
+        assert_eq!(config.webhook_secret.as_ref().map(|s| s.expose()), Some("my_secret"));
+        assert_eq!(config.token.as_ref().map(|s| s.expose()), Some("test_token"));
         assert_eq!(config.review_trigger, "@claudear");
     }
 

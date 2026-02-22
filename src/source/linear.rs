@@ -258,7 +258,7 @@ impl<H: LinearHttpClient> LinearSource<H> {
 
         let response = self
             .http
-            .post("https://api.linear.app/graphql", &self.config.api_key, body)
+            .post("https://api.linear.app/graphql", self.config.api_key.expose(), body)
             .await?;
 
         if !response.is_success() {
@@ -1198,7 +1198,7 @@ mod tests {
     fn test_config() -> LinearConfig {
         LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
             trigger_states: vec!["backlog".to_string(), "todo".to_string()],
             team_id: None,
@@ -1344,7 +1344,7 @@ mod tests {
     fn test_matches_criteria_empty_trigger_labels() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![], // Empty - matches all
             trigger_states: vec!["backlog".to_string()],
             team_id: None,
@@ -1372,7 +1372,7 @@ mod tests {
     fn test_matches_criteria_empty_trigger_states() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec!["auto-implement".to_string()],
             trigger_states: vec![], // Empty - matches all
             team_id: None,
@@ -1587,12 +1587,12 @@ mod tests {
     fn test_config_with_filters() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec!["urgent".to_string()],
             trigger_states: vec!["todo".to_string()],
             team_id: Some("team_123".to_string()),
             project_id: Some("project_456".to_string()),
-            webhook_secret: Some("secret".to_string()),
+            webhook_secret: Some("secret".into()),
             ..Default::default()
         };
         let source = LinearSource::new(config);
@@ -3328,7 +3328,7 @@ mod tests {
     fn test_matches_criteria_trigger_assignee_no_labels() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
@@ -3357,7 +3357,7 @@ mod tests {
     fn test_matches_criteria_trigger_assignee_wrong_assignee() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
@@ -3387,7 +3387,7 @@ mod tests {
     fn test_matches_criteria_trigger_assignee_case_insensitive() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("jane smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
@@ -3416,7 +3416,7 @@ mod tests {
     fn test_matches_criteria_trigger_assignee_and_labels_both_required() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec!["auto-implement".to_string()],
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
@@ -3460,7 +3460,7 @@ mod tests {
     fn test_matches_criteria_trigger_assignee_unassigned_issue() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
@@ -3503,7 +3503,7 @@ mod tests {
 
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
@@ -3547,7 +3547,7 @@ mod tests {
 
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec!["auto-implement".to_string()],
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec!["backlog".to_string()],
@@ -3695,7 +3695,7 @@ mod tests {
         );
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: None,
             trigger_states: vec![],
@@ -3728,7 +3728,7 @@ mod tests {
         );
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: None,
             trigger_states: vec![],
@@ -3772,7 +3772,7 @@ mod tests {
     fn test_matches_criteria_assignee_set_labels_empty_skips_label_check() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test".to_string(),
+            api_key: "test".into(),
             trigger_labels: vec![], // empty labels
             trigger_assignee: Some("Jane Smith".to_string()),
             trigger_states: vec![],
@@ -3947,7 +3947,7 @@ mod tests {
         );
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("John".to_string()),
             trigger_states: vec![],
@@ -3979,7 +3979,7 @@ mod tests {
         );
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("".to_string()), // empty assignee
             trigger_states: vec![],
@@ -4317,7 +4317,7 @@ mod tests {
     fn test_matches_criteria_trigger_assignee_skip_label_check() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: Some("Alice".to_string()),
             trigger_states: vec![],
@@ -4345,7 +4345,7 @@ mod tests {
     fn test_matches_criteria_multiple_trigger_states_one_matches() {
         let config = LinearConfig {
             enabled: true,
-            api_key: "test_key".to_string(),
+            api_key: "test_key".into(),
             trigger_labels: vec![],
             trigger_assignee: None,
             trigger_states: vec![
@@ -4424,7 +4424,7 @@ mod tests {
     fn test_linear_config_default() {
         let config = LinearConfig::default();
         assert!(config.enabled);
-        assert!(config.api_key.is_empty());
+        assert!(config.api_key.expose().is_empty());
         assert_eq!(
             config.trigger_labels,
             vec!["auto-implement".to_string(), "claude".to_string()]

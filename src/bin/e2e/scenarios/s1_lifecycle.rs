@@ -367,7 +367,7 @@ fn build_reviewer_scm(
     match scm_name {
         "github" => {
             let config = claudear::config::GitHubConfig {
-                token: Some(reviewer_token.to_string()),
+                token: Some(reviewer_token.into()),
                 review_trigger: "@claudear".to_string(),
                 ..Default::default()
             };
@@ -378,7 +378,7 @@ fn build_reviewer_scm(
                 .unwrap_or_else(|_| "https://gitlab.com".to_string());
             let config = claudear::config::GitLabConfig {
                 enabled: true,
-                token: Some(reviewer_token.to_string()),
+                token: Some(reviewer_token.into()),
                 base_url,
                 review_trigger: "@claudear".to_string(),
                 ..Default::default()

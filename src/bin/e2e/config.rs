@@ -55,7 +55,7 @@ impl ConfigBuilder {
     }
 
     pub fn claude_timeout(mut self, secs: u64) -> Self {
-        self.config.claude_timeout_secs = secs;
+        self.config.agent.timeout_secs = secs;
         self
     }
 
@@ -65,7 +65,7 @@ impl ConfigBuilder {
     }
 
     pub fn skip_permissions(mut self) -> Self {
-        self.config.claude.skip_permissions = true;
+        self.config.agent.default_provider_config_mut().skip_permissions = true;
         self
     }
 
@@ -151,7 +151,7 @@ impl ConfigBuilder {
     }
 
     pub fn instructions(mut self, instructions: &str) -> Self {
-        self.config.claude.instructions = Some(instructions.to_string());
+        self.config.agent.default_provider_config_mut().instructions = Some(instructions.to_string());
         self
     }
 

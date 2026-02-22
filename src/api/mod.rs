@@ -10,7 +10,7 @@ pub use routes::{create_api_router, create_api_router_with_dashboard};
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::storage::{FixAttemptTracker, SqliteTracker};
+use crate::storage::FixAttemptTracker;
 use axum::http;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use std::path::PathBuf;
@@ -159,16 +159,14 @@ impl ApiServer {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
-                if let Some(db) = tracker_for_cleanup.as_any().downcast_ref::<SqliteTracker>() {
-                    match db.cleanup_expired_sessions() {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(deleted = count, "Cleaned up expired sessions");
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "Failed to clean up expired sessions");
-                        }
-                        _ => {}
+                match tracker_for_cleanup.cleanup_expired_sessions() {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(deleted = count, "Cleaned up expired sessions");
                     }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to clean up expired sessions");
+                    }
+                    _ => {}
                 }
             }
         });

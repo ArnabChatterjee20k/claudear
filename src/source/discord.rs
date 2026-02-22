@@ -25,7 +25,8 @@ impl DiscordSource {
     pub fn new(config: DiscordConfig) -> Self {
         let client = config
             .bot_token
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .and_then(|token| DiscordClient::new(token).ok());
         Self {
             config,
@@ -320,7 +321,7 @@ mod tests {
 
     fn make_config() -> DiscordConfig {
         DiscordConfig {
-            bot_token: Some("test-token".to_string()),
+            bot_token: Some("test-token".into()),
             channel_id: Some("chan-123".to_string()),
             source_enabled: true,
             listen_channel_id: None,

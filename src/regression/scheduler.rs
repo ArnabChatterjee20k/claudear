@@ -5,7 +5,7 @@
 
 use crate::error::Result;
 use crate::regression::RegressionChecker;
-use crate::storage::SqliteTracker;
+use crate::storage::{FixAttemptTracker, SqliteTracker};
 use crate::types::{RegressionCheck, RegressionWatch, RegressionWatchStatus};
 use chrono::{Duration, Utc};
 use std::sync::Arc;

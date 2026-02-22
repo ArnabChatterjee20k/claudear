@@ -3,7 +3,7 @@
 use super::auth::*;
 use crate::config::Config;
 use crate::retry::RetryManager;
-use crate::storage::{FixAttemptTracker, SqliteTracker};
+use crate::storage::FixAttemptTracker;
 use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, RegressionWatchStatus};
 use axum::{
     extract::{
@@ -286,29 +286,22 @@ async fn stats_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<FixAttemptStats>, StatusCode> {
-    state
-        .tracker
-        .get_stats()
-        .map(Json)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    state.tracker.get_stats().map(Json).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn overview_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<OverviewResponse>, StatusCode> {
-    let stats = state
-        .tracker
-        .get_stats()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let stats = state.tracker.get_stats().map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Calculate rates
     let completed = stats.merged + stats.closed + stats.failed + stats.cannot_fix;
@@ -323,23 +316,21 @@ async fn overview_handler(
         0.0
     };
 
-    // Get recent attempts (last 10) from SQL directly when available.
-    let recent = if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
-        db.list_recent_attempts(10)
-            .map(|records| {
-                records
-                    .into_iter()
-                    .map(|attempt| attempt_to_summary(&attempt))
-                    .collect()
-            })
-            .map_err(|e| {
+    // Get recent attempts (last 10).
+    let recent = state
+        .tracker
+        .list_recent_attempts(10)
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|attempt| attempt_to_summary(&attempt))
+                .collect()
+        })
+        .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
-        })?
-    } else {
-        get_attempts(&state.tracker, Some(10))
-    };
+        })?;
 
     // Build source summaries
     let sources: Vec<SourceSummary> = stats
@@ -407,44 +398,27 @@ async fn attempts_handler(
     let status_filter = status_filter.as_deref();
     let source_filter = source_filter.as_deref();
 
-    let (attempts, total) = if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>()
-    {
-        let offset = (page - 1) * per_page;
-        let rows = db
-            .list_attempts(status_filter, source_filter, per_page, offset)
-            .map_err(|e| {
+    let offset = (page - 1) * per_page;
+    let rows = state
+        .tracker
+        .list_attempts(status_filter, source_filter, per_page, offset)
+        .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        let total = db
-            .count_attempts(status_filter, source_filter)
-            .map_err(|e| {
+    let total = state
+        .tracker
+        .count_attempts(status_filter, source_filter)
+        .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        let attempts = rows
-            .into_iter()
-            .map(|attempt| attempt_to_summary(&attempt))
-            .collect();
-        (attempts, total)
-    } else {
-        // Fallback for non-SQLite tracker implementations.
-        let all_attempts = get_attempts(&state.tracker, None);
-        let filtered: Vec<AttemptSummary> = all_attempts
-            .into_iter()
-            .filter(|a| {
-                let status_match = status_filter.map(|s| a.status == s).unwrap_or(true);
-                let source_match = source_filter.map(|s| a.source == s).unwrap_or(true);
-                status_match && source_match
-            })
-            .collect();
-        let total = filtered.len();
-        let start = (page - 1) * per_page;
-        let attempts = filtered.into_iter().skip(start).take(per_page).collect();
-        (attempts, total)
-    };
+    let attempts: Vec<AttemptSummary> = rows
+        .into_iter()
+        .map(|attempt| attempt_to_summary(&attempt))
+        .collect();
 
     Ok(Json(AttemptsResponse {
         attempts,
@@ -495,6 +469,28 @@ async fn sources_handler(_user: AuthUser, State(state): State<ApiState>) -> Json
                 "project_slugs": sentry.project_slugs,
                 "min_event_count": sentry.min_event_count,
                 "has_client_secret": sentry.client_secret.is_some(),
+            }),
+        });
+    }
+
+    if state.config.whatsapp.source_enabled {
+        sources.push(SourceInfo {
+            name: "whatsapp".to_string(),
+            enabled: true,
+            config: serde_json::json!({
+                "has_access_token": state.config.whatsapp.access_token.is_some(),
+                "has_phone_number_id": state.config.whatsapp.phone_number_id.is_some(),
+            }),
+        });
+    }
+
+    if state.config.telegram.source_enabled {
+        sources.push(SourceInfo {
+            name: "telegram".to_string(),
+            enabled: true,
+            config: serde_json::json!({
+                "has_bot_token": state.config.telegram.bot_token.is_some(),
+                "chat_id": state.config.telegram.chat_id.is_some(),
             }),
         });
     }
@@ -553,9 +549,10 @@ fn attempt_to_summary(attempt: &FixAttempt) -> AttemptSummary {
 }
 
 /// Get attempts from tracker, optionally limited.
+#[cfg(test)]
 fn get_attempts(tracker: &Arc<dyn FixAttemptTracker>, limit: Option<usize>) -> Vec<AttemptSummary> {
-    if let (Some(db), Some(max)) = (tracker.as_any().downcast_ref::<SqliteTracker>(), limit) {
-        if let Ok(attempts) = db.list_recent_attempts(max) {
+    if let Some(max) = limit {
+        if let Ok(attempts) = tracker.list_recent_attempts(max) {
             return attempts
                 .into_iter()
                 .map(|a| attempt_to_summary(&a))
@@ -614,10 +611,8 @@ fn get_attempt_records_since(
     tracker: &Arc<dyn FixAttemptTracker>,
     since: DateTime<Utc>,
 ) -> Vec<FixAttempt> {
-    if let Some(db) = tracker.as_any().downcast_ref::<SqliteTracker>() {
-        if let Ok(attempts) = db.list_attempts_since(since) {
-            return attempts;
-        }
+    if let Ok(attempts) = tracker.list_attempts_since(since) {
+        return attempts;
     }
 
     get_attempt_records(tracker)
@@ -873,7 +868,7 @@ struct TelemetryPeriodQuery {
 #[derive(Serialize)]
 struct AttemptDetailResponse {
     attempt: FixAttempt,
-    executions: Vec<crate::types::ClaudeExecution>,
+    executions: Vec<crate::types::AgentExecution>,
     reviews: Vec<crate::types::PrReviewRecord>,
     feedback: Option<crate::feedback::FixOutcome>,
 }
@@ -1127,27 +1122,15 @@ async fn attempt_execution_log_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let execution = if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
-        db.get_execution_for_attempt(attempt_id, execution_id)
-            .map_err(|e| {
+    let execution = state
+        .tracker
+        .get_execution_for_attempt(attempt_id, execution_id)
+        .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
             sentry::capture_error(&e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
-            .ok_or(StatusCode::NOT_FOUND)?
-    } else {
-        state
-            .tracker
-            .get_executions_for_attempt(attempt_id)
-            .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-            .into_iter()
-            .find(|e| e.id == execution_id)
-            .ok_or(StatusCode::NOT_FOUND)?
-    };
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     let log_path = match stream.as_str() {
         "stdout" => execution.stdout_log_path.clone(),
@@ -1259,14 +1242,11 @@ async fn analytics_summary_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::types::AnalyticsSummary>, StatusCode> {
-    let mut summary = state
-        .tracker
-        .get_analytics_summary()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut summary = state.tracker.get_analytics_summary().map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     summary.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr().unwrap_or(None);
 
@@ -1340,17 +1320,12 @@ async fn issues_handler(
     State(state): State<ApiState>,
     Query(query): Query<IssuesQuery>,
 ) -> Result<Json<IssuesResponse>, StatusCode> {
-    let db = state
-        .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(100).min(500);
     let offset = (page - 1) * per_page;
 
-    let total = db
+    let total = state
+        .tracker
         .count_issues(query.source.as_deref())
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1358,7 +1333,8 @@ async fn issues_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let rows = db
+    let rows = state
+        .tracker
         .list_issues(query.source.as_deref(), per_page, offset)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -1423,14 +1399,11 @@ async fn pr_analytics_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::types::PrAnalytics>, StatusCode> {
-    let mut analytics = state
-        .tracker
-        .get_pr_analytics()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut analytics = state.tracker.get_pr_analytics().map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     analytics.avg_time_to_pr_mins = state.tracker.get_avg_time_to_pr().unwrap_or(None);
     analytics.rejection_reasons = state.tracker.get_rejection_reasons(10).unwrap_or_default();
@@ -1470,20 +1443,20 @@ async fn regressions_handler(
                 .get_regression_watches_by_status(status)
                 .map(Json)
                 .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+                    tracing::error!(error = %e, "Internal server error");
+                    sentry::capture_error(&e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })
         }
         None => state
             .tracker
             .get_all_regression_watches()
             .map(Json)
             .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        }),
+                tracing::error!(error = %e, "Internal server error");
+                sentry::capture_error(&e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }),
     }
 }
 
@@ -1522,30 +1495,22 @@ async fn repos_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<crate::storage::StoredIndexedRepo>>, StatusCode> {
-    state
-        .tracker
-        .list_indexed_repos()
-        .map(Json)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    state.tracker.list_indexed_repos().map(Json).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn repo_stats_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::storage::IndexStats>, StatusCode> {
-    state
-        .tracker
-        .get_index_stats()
-        .map(Json)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    state.tracker.get_index_stats().map(Json).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn dependencies_handler(
@@ -1619,13 +1584,11 @@ async fn repo_learning_handler(
 ) -> Result<Json<RepoLearningResponse>, StatusCode> {
     let tracker = &state.tracker;
 
-    let raw_knowledge = tracker
-        .get_repo_knowledge(&repo)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let raw_knowledge = tracker.get_repo_knowledge(&repo).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let mut groups_map: BTreeMap<String, Vec<KnowledgeEntry>> = BTreeMap::new();
     for rk in &raw_knowledge {
@@ -1651,21 +1614,17 @@ async fn repo_learning_handler(
         })
         .collect();
 
-    let instructions = tracker
-        .get_promoted_instructions(&repo)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let instructions = tracker.get_promoted_instructions(&repo).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    let review_patterns = tracker
-        .get_review_patterns(&repo, 200)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let review_patterns = tracker.get_review_patterns(&repo, 200).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let mut by_category: HashMap<String, usize> = HashMap::new();
     let mut promoted_count: usize = 0;
@@ -1681,13 +1640,11 @@ async fn repo_learning_handler(
         promoted_count,
     };
 
-    let strategies = tracker
-        .get_successful_strategies(&repo, 100)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let strategies = tracker.get_successful_strategies(&repo, 100).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let diff_analyses = tracker
         .get_diff_analyses_for_repo(&repo, 100)
@@ -1697,13 +1654,11 @@ async fn repo_learning_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let all_correlations = tracker
-        .get_cross_repo_correlations(1, 168)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let all_correlations = tracker.get_cross_repo_correlations(1, 168).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let correlations: Vec<_> = all_correlations
         .into_iter()
         .filter(|c| c.repo_a == repo || c.repo_b == repo)
@@ -1792,15 +1747,11 @@ async fn inference_stats_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
 ) -> Result<Json<crate::storage::InferenceStats>, StatusCode> {
-    state
-        .tracker
-        .get_inference_stats()
-        .map(Json)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    state.tracker.get_inference_stats().map(Json).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn inference_history_handler(
@@ -1826,14 +1777,11 @@ async fn telemetry_overview_handler(
     State(state): State<ApiState>,
 ) -> Result<Json<TelemetryOverviewResponse>, StatusCode> {
     let now = Utc::now();
-    let stats = state
-        .tracker
-        .get_stats()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let stats = state.tracker.get_stats().map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let recent_attempts = get_attempt_records_since(&state.tracker, now - Duration::days(7));
 
     let windows = vec![
@@ -1856,23 +1804,17 @@ async fn telemetry_overview_handler(
         .filter(|a| retry_manager.is_ready_for_retry(a))
         .count() as i64;
 
-    let pr_analytics = state
-        .tracker
-        .get_pr_analytics()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let pr_analytics = state.tracker.get_pr_analytics().map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    let watches = state
-        .tracker
-        .get_all_regression_watches()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Internal server error");
-            sentry::capture_error(&e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let watches = state.tracker.get_all_regression_watches().map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let mut queue = TelemetryQueueMetrics {
         pending_attempts: stats.pending as i64,
         retryable_attempts: retryable.len() as i64,
@@ -1904,23 +1846,10 @@ async fn telemetry_overview_handler(
 
     let top_errors = state.tracker.get_error_patterns(10).unwrap_or_default();
 
-    let activity_last_hour =
-        if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
-            db.get_activity_type_counts_since(now - Duration::hours(1))
-                .unwrap_or_default()
-        } else {
-            let mut counts = HashMap::new();
-            for entry in state
-                .tracker
-                .get_recent_activities_filtered(5_000, None)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|a| a.timestamp >= now - Duration::hours(1))
-            {
-                *counts.entry(entry.activity_type).or_insert(0) += 1;
-            }
-            counts
-        };
+    let activity_last_hour = state
+        .tracker
+        .get_activity_type_counts_since(now - Duration::hours(1))
+        .unwrap_or_default();
 
     let metric_names = [
         "processing_time",
@@ -1948,26 +1877,16 @@ async fn telemetry_overview_handler(
         "cascade_triggered",
         "cascade_failed",
     ];
+    let counts = state
+        .tracker
+        .get_metric_counts_since(&metric_names, now - Duration::hours(24))
+        .unwrap_or_default();
     let mut metric_counts_last_24h: HashMap<String, i64> = HashMap::new();
-    if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
-        let counts = db
-            .get_metric_counts_since(&metric_names, now - Duration::hours(24))
-            .unwrap_or_default();
-        for metric_name in metric_names {
-            metric_counts_last_24h.insert(
-                metric_name.to_string(),
-                counts.get(metric_name).copied().unwrap_or(0),
-            );
-        }
-    } else {
-        for metric_name in metric_names {
-            let count = state
-                .tracker
-                .get_metrics(metric_name, Some(now - Duration::hours(24)), 20_000)
-                .map(|m| m.len() as i64)
-                .unwrap_or(0);
-            metric_counts_last_24h.insert(metric_name.to_string(), count);
-        }
+    for metric_name in metric_names {
+        metric_counts_last_24h.insert(
+            metric_name.to_string(),
+            counts.get(metric_name).copied().unwrap_or(0),
+        );
     }
 
     let mut by_source: HashMap<String, SourceTelemetry> = HashMap::new();
@@ -2017,11 +1936,7 @@ async fn telemetry_overview_handler(
         .collect();
     source_breakdown.sort_by(|a, b| a.source.cmp(&b.source));
 
-    let diagnostics = state
-        .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .and_then(|db| db.get_diagnostic_counts().ok());
+    let diagnostics = state.tracker.get_diagnostic_counts().ok();
 
     let twenty_four_h_ago_iso = (now - Duration::hours(24))
         .format("%Y-%m-%d %H:%M:%S")
@@ -2155,236 +2070,58 @@ async fn telemetry_pipeline_handler(
     let mut totals = TelemetryPipelineTotals::default();
     let mut per_source: HashMap<String, TelemetryPipelineSource> = HashMap::new();
 
-    if let Some(db) = state.tracker.as_any().downcast_ref::<SqliteTracker>() {
-        let sums = db
-            .get_metric_sums_since(&total_metric_names, since)
-            .unwrap_or_default();
+    let sums = state
+        .tracker
+        .get_metric_sums_since(&total_metric_names, since)
+        .unwrap_or_default();
 
-        totals.fetched = sums.get("issues_fetched").copied().unwrap_or(0.0);
-        totals.matched = sums.get("issues_matched").copied().unwrap_or(0.0);
-        totals.queued = sums.get("issues_queued").copied().unwrap_or(0.0);
-        totals.processed = sums.get("batch_processed").copied().unwrap_or(0.0);
-        totals.pr_created = sums.get("pr_created").copied().unwrap_or(0.0);
-        totals.retries_found = sums.get("ready_retries_found").copied().unwrap_or(0.0);
-        totals.retries_executed = sums
-            .get("ready_retries_executed_total")
-            .copied()
-            .unwrap_or(0.0);
-        totals.retries_failed = sums
-            .get("ready_retries_failed_total")
-            .copied()
-            .unwrap_or(0.0);
-        totals.pr_status_checks = sums.get("pr_status_checks").copied().unwrap_or(0.0);
-        totals.pr_status_merged = sums.get("pr_status_merged").copied().unwrap_or(0.0);
-        totals.pr_status_closed = sums.get("pr_status_closed").copied().unwrap_or(0.0);
-        totals.pr_status_errors = sums.get("pr_status_errors").copied().unwrap_or(0.0);
-        totals.regression_watches_created = sums
-            .get("regression_watches_created")
-            .copied()
-            .unwrap_or(0.0);
-        totals.auto_resolved_on_merge = sums.get("auto_resolved_on_merge").copied().unwrap_or(0.0);
-        totals.cascade_triggered = sums.get("cascade_triggered").copied().unwrap_or(0.0);
-        totals.cascade_failed = sums.get("cascade_failed").copied().unwrap_or(0.0);
+    totals.fetched = sums.get("issues_fetched").copied().unwrap_or(0.0);
+    totals.matched = sums.get("issues_matched").copied().unwrap_or(0.0);
+    totals.queued = sums.get("issues_queued").copied().unwrap_or(0.0);
+    totals.processed = sums.get("batch_processed").copied().unwrap_or(0.0);
+    totals.pr_created = sums.get("pr_created").copied().unwrap_or(0.0);
+    totals.retries_found = sums.get("ready_retries_found").copied().unwrap_or(0.0);
+    totals.retries_executed = sums
+        .get("ready_retries_executed_total")
+        .copied()
+        .unwrap_or(0.0);
+    totals.retries_failed = sums
+        .get("ready_retries_failed_total")
+        .copied()
+        .unwrap_or(0.0);
+    totals.pr_status_checks = sums.get("pr_status_checks").copied().unwrap_or(0.0);
+    totals.pr_status_merged = sums.get("pr_status_merged").copied().unwrap_or(0.0);
+    totals.pr_status_closed = sums.get("pr_status_closed").copied().unwrap_or(0.0);
+    totals.pr_status_errors = sums.get("pr_status_errors").copied().unwrap_or(0.0);
+    totals.regression_watches_created = sums
+        .get("regression_watches_created")
+        .copied()
+        .unwrap_or(0.0);
+    totals.auto_resolved_on_merge = sums.get("auto_resolved_on_merge").copied().unwrap_or(0.0);
+    totals.cascade_triggered = sums.get("cascade_triggered").copied().unwrap_or(0.0);
+    totals.cascade_failed = sums.get("cascade_failed").copied().unwrap_or(0.0);
 
-        let per_source_sums = db
-            .get_metric_sums_by_source_since(&per_source_metric_names, since)
-            .unwrap_or_default();
-        for ((metric_name, source), value) in per_source_sums {
-            let entry =
-                per_source
-                    .entry(source.clone())
-                    .or_insert_with(|| TelemetryPipelineSource {
-                        source,
-                        ..TelemetryPipelineSource::default()
-                    });
-            match metric_name.as_str() {
-                "issues_fetched" => entry.fetched += value,
-                "issues_matched" => entry.matched += value,
-                "issues_queued" => entry.queued += value,
-                "batch_processed" => entry.processed += value,
-                "pr_created" => entry.pr_created += value,
-                "ready_retry_executed" => entry.retries_executed += value,
-                "ready_retry_failed" => entry.retries_failed += value,
-                _ => {}
-            }
-        }
-    } else {
-        let issues_fetched = state
-            .tracker
-            .get_metrics("issues_fetched", Some(since), 50_000)
-            .unwrap_or_default();
-        let issues_matched = state
-            .tracker
-            .get_metrics("issues_matched", Some(since), 50_000)
-            .unwrap_or_default();
-        let issues_queued = state
-            .tracker
-            .get_metrics("issues_queued", Some(since), 50_000)
-            .unwrap_or_default();
-        let batch_processed = state
-            .tracker
-            .get_metrics("batch_processed", Some(since), 50_000)
-            .unwrap_or_default();
-        let pr_created = state
-            .tracker
-            .get_metrics("pr_created", Some(since), 50_000)
-            .unwrap_or_default();
-        let retries_found = state
-            .tracker
-            .get_metrics("ready_retries_found", Some(since), 50_000)
-            .unwrap_or_default();
-        let retries_executed = state
-            .tracker
-            .get_metrics("ready_retries_executed_total", Some(since), 50_000)
-            .unwrap_or_default();
-        let retries_failed = state
-            .tracker
-            .get_metrics("ready_retries_failed_total", Some(since), 50_000)
-            .unwrap_or_default();
-        let pr_status_checks = state
-            .tracker
-            .get_metrics("pr_status_checks", Some(since), 50_000)
-            .unwrap_or_default();
-        let pr_status_merged = state
-            .tracker
-            .get_metrics("pr_status_merged", Some(since), 50_000)
-            .unwrap_or_default();
-        let pr_status_closed = state
-            .tracker
-            .get_metrics("pr_status_closed", Some(since), 50_000)
-            .unwrap_or_default();
-        let pr_status_errors = state
-            .tracker
-            .get_metrics("pr_status_errors", Some(since), 50_000)
-            .unwrap_or_default();
-        let regression_watches_created = state
-            .tracker
-            .get_metrics("regression_watches_created", Some(since), 50_000)
-            .unwrap_or_default();
-        let auto_resolved_on_merge = state
-            .tracker
-            .get_metrics("auto_resolved_on_merge", Some(since), 50_000)
-            .unwrap_or_default();
-        let cascade_triggered = state
-            .tracker
-            .get_metrics("cascade_triggered", Some(since), 50_000)
-            .unwrap_or_default();
-        let cascade_failed = state
-            .tracker
-            .get_metrics("cascade_failed", Some(since), 50_000)
-            .unwrap_or_default();
-
-        totals = TelemetryPipelineTotals {
-            fetched: sum_metric_values(&issues_fetched),
-            matched: sum_metric_values(&issues_matched),
-            queued: sum_metric_values(&issues_queued),
-            processed: sum_metric_values(&batch_processed),
-            pr_created: sum_metric_values(&pr_created),
-            retries_found: sum_metric_values(&retries_found),
-            retries_executed: sum_metric_values(&retries_executed),
-            retries_failed: sum_metric_values(&retries_failed),
-            pr_status_checks: sum_metric_values(&pr_status_checks),
-            pr_status_merged: sum_metric_values(&pr_status_merged),
-            pr_status_closed: sum_metric_values(&pr_status_closed),
-            pr_status_errors: sum_metric_values(&pr_status_errors),
-            regression_watches_created: sum_metric_values(&regression_watches_created),
-            auto_resolved_on_merge: sum_metric_values(&auto_resolved_on_merge),
-            cascade_triggered: sum_metric_values(&cascade_triggered),
-            cascade_failed: sum_metric_values(&cascade_failed),
-        };
-
-        let per_source_retry_executed = state
-            .tracker
-            .get_metrics("ready_retry_executed", Some(since), 50_000)
-            .unwrap_or_default();
-        let per_source_retry_failed = state
-            .tracker
-            .get_metrics("ready_retry_failed", Some(since), 50_000)
-            .unwrap_or_default();
-
-        for metric in &issues_fetched {
-            if let Some(source) = &metric.source {
-                let entry =
-                    per_source
-                        .entry(source.clone())
-                        .or_insert_with(|| TelemetryPipelineSource {
-                            source: source.clone(),
-                            ..TelemetryPipelineSource::default()
-                        });
-                entry.fetched += metric.metric_value;
-            }
-        }
-        for metric in &issues_matched {
-            if let Some(source) = &metric.source {
-                let entry =
-                    per_source
-                        .entry(source.clone())
-                        .or_insert_with(|| TelemetryPipelineSource {
-                            source: source.clone(),
-                            ..TelemetryPipelineSource::default()
-                        });
-                entry.matched += metric.metric_value;
-            }
-        }
-        for metric in &issues_queued {
-            if let Some(source) = &metric.source {
-                let entry =
-                    per_source
-                        .entry(source.clone())
-                        .or_insert_with(|| TelemetryPipelineSource {
-                            source: source.clone(),
-                            ..TelemetryPipelineSource::default()
-                        });
-                entry.queued += metric.metric_value;
-            }
-        }
-        for metric in &batch_processed {
-            if let Some(source) = &metric.source {
-                let entry =
-                    per_source
-                        .entry(source.clone())
-                        .or_insert_with(|| TelemetryPipelineSource {
-                            source: source.clone(),
-                            ..TelemetryPipelineSource::default()
-                        });
-                entry.processed += metric.metric_value;
-            }
-        }
-        for metric in &pr_created {
-            if let Some(source) = &metric.source {
-                let entry =
-                    per_source
-                        .entry(source.clone())
-                        .or_insert_with(|| TelemetryPipelineSource {
-                            source: source.clone(),
-                            ..TelemetryPipelineSource::default()
-                        });
-                entry.pr_created += metric.metric_value;
-            }
-        }
-        for metric in &per_source_retry_executed {
-            if let Some(source) = &metric.source {
-                let entry =
-                    per_source
-                        .entry(source.clone())
-                        .or_insert_with(|| TelemetryPipelineSource {
-                            source: source.clone(),
-                            ..TelemetryPipelineSource::default()
-                        });
-                entry.retries_executed += metric.metric_value;
-            }
-        }
-        for metric in &per_source_retry_failed {
-            if let Some(source) = &metric.source {
-                let entry =
-                    per_source
-                        .entry(source.clone())
-                        .or_insert_with(|| TelemetryPipelineSource {
-                            source: source.clone(),
-                            ..TelemetryPipelineSource::default()
-                        });
-                entry.retries_failed += metric.metric_value;
-            }
+    let per_source_sums = state
+        .tracker
+        .get_metric_sums_by_source_since(&per_source_metric_names, since)
+        .unwrap_or_default();
+    for ((metric_name, source), value) in per_source_sums {
+        let entry =
+            per_source
+                .entry(source.clone())
+                .or_insert_with(|| TelemetryPipelineSource {
+                    source,
+                    ..TelemetryPipelineSource::default()
+                });
+        match metric_name.as_str() {
+            "issues_fetched" => entry.fetched += value,
+            "issues_matched" => entry.matched += value,
+            "issues_queued" => entry.queued += value,
+            "batch_processed" => entry.processed += value,
+            "pr_created" => entry.pr_created += value,
+            "ready_retry_executed" => entry.retries_executed += value,
+            "ready_retry_failed" => entry.retries_failed += value,
+            _ => {}
         }
     }
 
@@ -2622,10 +2359,11 @@ async fn put_config_handler(
 mod tests {
     use super::*;
     use crate::config::{
-        AskConfig, CascadeConfig, ClaudeConfig, CodeIndexConfig, DiscordConfig, EmailConfig,
+        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, DiscordConfig, EmailConfig,
         GitHubAppConfig, GitHubConfig, LearningConfig, PrioritisationConfig, PushConfig,
         RegressionConfig, RetryConfig, SlackConfig, SmsConfig,
     };
+    use crate::secret::SecretValue;
     use crate::storage::{IndexingProgress, SqliteTracker};
     use axum::body::Body;
     use axum::http::Request;
@@ -2647,8 +2385,7 @@ mod tests {
             processing_delay_ms: 5000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
-            claude_timeout_secs: 21600,
-            claude: ClaudeConfig::default(),
+            agent: AgentConfig::default(),
             discord: DiscordConfig::default(),
             slack: SlackConfig::default(),
             email: EmailConfig::default(),
@@ -2690,11 +2427,11 @@ mod tests {
         let config = test_config();
 
         // Create a test user and session
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap(); // cost=4 for speed
-        db.create_user("test@example.com", &password_hash, "Test User", "admin")
+        tracker
+            .create_user("test@example.com", &password_hash, "Test User", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = test_indexing_rx(tracker);
         let router = create_api_router(
@@ -3588,11 +3325,11 @@ mod tests {
         let config = test_config();
 
         // Use a nonexistent config path to test the error case
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("admin@test.com", &password_hash, "Admin", "admin")
+        tracker
+            .create_user("admin@test.com", &password_hash, "Admin", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
@@ -3617,11 +3354,11 @@ mod tests {
         let tracker = create_test_tracker();
         let config = test_config();
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("admin@test.com", &password_hash, "Admin", "admin")
+        tracker
+            .create_user("admin@test.com", &password_hash, "Admin", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         // Write a temp config file
         let config_path = std::env::temp_dir().join("claudear_test_config.toml");
@@ -3650,11 +3387,11 @@ mod tests {
     async fn test_get_config_endpoint_viewer_forbidden() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+        tracker
+            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
@@ -3700,11 +3437,11 @@ mod tests {
     async fn test_put_config_endpoint_viewer_forbidden() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+        tracker
+            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
@@ -5390,15 +5127,15 @@ mod tests {
             enabled: true,
             trigger_labels: vec!["autofix".to_string()],
             trigger_states: vec!["Triage".to_string()],
-            webhook_secret: Some("whsec_123".to_string()),
+            webhook_secret: Some("whsec_123".into()),
             ..crate::config::LinearConfig::default()
         });
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("test@example.com", &password_hash, "Test", "admin")
+        tracker
+            .create_user("test@example.com", &password_hash, "Test", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
@@ -5437,11 +5174,11 @@ mod tests {
             ..crate::config::SentryConfig::default()
         });
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("test@example.com", &password_hash, "Test", "admin")
+        tracker
+            .create_user("test@example.com", &password_hash, "Test", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
@@ -5474,11 +5211,11 @@ mod tests {
         config.linear = Some(crate::config::LinearConfig::default());
         config.sentry = Some(crate::config::SentryConfig::default());
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("test@example.com", &password_hash, "Test", "admin")
+        tracker
+            .create_user("test@example.com", &password_hash, "Test", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
@@ -5927,8 +5664,6 @@ mod tests {
         let tracker = create_test_tracker();
         let (router, token) = create_authenticated_router(&tracker);
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
-
         let issue = crate::types::IssueEmbedding {
             id: 0,
             source: "linear".to_string(),
@@ -5945,7 +5680,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: None,
         };
-        db.store_issue(&issue).unwrap();
+        tracker.store_issue(&issue).unwrap();
 
         let response = router
             .oneshot(auth_get("/api/issues", &token))
@@ -5973,7 +5708,6 @@ mod tests {
         let tracker = create_test_tracker();
         let (router, token) = create_authenticated_router(&tracker);
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         for i in 1..=5 {
             let issue = crate::types::IssueEmbedding {
                 id: 0,
@@ -5991,7 +5725,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: None,
             };
-            db.store_issue(&issue).unwrap();
+            tracker.store_issue(&issue).unwrap();
         }
 
         let response = router
@@ -6014,7 +5748,6 @@ mod tests {
         let tracker = create_test_tracker();
         let (router, token) = create_authenticated_router(&tracker);
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let pr = crate::types::PrRecord {
             id: 0,
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
@@ -6044,7 +5777,7 @@ mod tests {
             lines_added: Some(50),
             lines_removed: Some(10),
         };
-        db.upsert_pr(&pr).unwrap();
+        tracker.upsert_pr(&pr).unwrap();
 
         let response = router.oneshot(auth_get("/api/prs", &token)).await.unwrap();
 
@@ -6061,7 +5794,6 @@ mod tests {
         let tracker = create_test_tracker();
         let (router, token) = create_authenticated_router(&tracker);
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let pr_open = crate::types::PrRecord {
             id: 0,
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
@@ -6097,8 +5829,8 @@ mod tests {
         pr_merged.status = "merged".to_string();
         pr_merged.merged_at = Some(chrono::Utc::now());
 
-        db.upsert_pr(&pr_open).unwrap();
-        db.upsert_pr(&pr_merged).unwrap();
+        tracker.upsert_pr(&pr_open).unwrap();
+        tracker.upsert_pr(&pr_merged).unwrap();
 
         let response = router
             .oneshot(auth_get("/api/prs/analytics", &token))
@@ -6158,7 +5890,7 @@ mod tests {
 
         seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
 
-        let mut execution = crate::types::ClaudeExecution::new();
+        let mut execution = crate::types::AgentExecution::new();
         execution.attempt_id = Some(1);
         execution.completed_at = Some(chrono::Utc::now());
         execution.duration_secs = Some(30.0);
@@ -6187,11 +5919,11 @@ mod tests {
         let tracker = create_test_tracker();
 
         // Test that "events" is also a valid stream
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("test@example.com", &password_hash, "Test", "admin")
+        tracker
+            .create_user("test@example.com", &password_hash, "Test", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
@@ -6204,7 +5936,7 @@ mod tests {
 
         seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
 
-        let mut execution = crate::types::ClaudeExecution::new();
+        let mut execution = crate::types::AgentExecution::new();
         execution.attempt_id = Some(1);
         execution.completed_at = Some(chrono::Utc::now());
         execution.duration_secs = Some(10.0);
@@ -6236,7 +5968,7 @@ mod tests {
 
         seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
 
-        let mut execution = crate::types::ClaudeExecution::new();
+        let mut execution = crate::types::AgentExecution::new();
         execution.attempt_id = Some(1);
         execution.completed_at = Some(chrono::Utc::now());
         execution.duration_secs = Some(10.0);
@@ -6265,7 +5997,7 @@ mod tests {
 
         seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
 
-        let mut execution = crate::types::ClaudeExecution::new();
+        let mut execution = crate::types::AgentExecution::new();
         execution.attempt_id = Some(1);
         execution.completed_at = Some(chrono::Utc::now());
         execution.duration_secs = Some(10.0);
@@ -6314,16 +6046,16 @@ mod tests {
         // with a non-empty API key)
         let mut valid_config = test_config();
         valid_config.linear = Some(crate::config::LinearConfig {
-            api_key: "lin_api_test_key_123".to_string(),
+            api_key: SecretValue::new("lin_api_test_key_123"),
             ..crate::config::LinearConfig::default()
         });
         let valid_toml = toml::to_string_pretty(&valid_config).unwrap();
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("admin@test.com", &password_hash, "Admin", "admin")
+        tracker
+            .create_user("admin@test.com", &password_hash, "Admin", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
@@ -6618,7 +6350,6 @@ mod tests {
             .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
             .unwrap();
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let watch = crate::types::RegressionWatch {
             id: 0,
             issue_type: crate::types::IssueType::LinearBug,
@@ -6631,7 +6362,7 @@ mod tests {
             regressed_at: None,
             created_at: chrono::Utc::now(),
         };
-        db.create_regression_watch(&watch).unwrap();
+        tracker.create_regression_watch(&watch).unwrap();
 
         let response = router
             .oneshot(auth_get("/api/telemetry/overview", &token))
@@ -6784,12 +6515,12 @@ mod tests {
     async fn test_expired_session_returns_401() {
         let tracker = create_test_tracker();
         let config = test_config();
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
-        db.create_user("test@test.com", &password_hash, "Test", "admin")
+        tracker
+            .create_user("test@test.com", &password_hash, "Test", "admin")
             .unwrap();
         // Create a session that already expired
-        let token = db.create_session(1, "2020-01-01 00:00:00").unwrap();
+        let token = tracker.create_session(1, "2020-01-01 00:00:00").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(
@@ -7163,10 +6894,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_attempt_records_since_with_recent_data() {
         let tracker = create_test_tracker();
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
 
         // Seed an attempt
-        db.record_attempt("linear", "test-issue-since", "TEST-SINCE")
+        tracker
+            .record_attempt("linear", "test-issue-since", "TEST-SINCE")
             .unwrap();
 
         // Query since 1 hour ago -- should include the just-created attempt
@@ -7178,9 +6909,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_attempt_records_since_far_future_returns_empty() {
         let tracker = create_test_tracker();
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
 
-        db.record_attempt("linear", "test-issue-future", "TEST-FUTURE")
+        tracker
+            .record_attempt("linear", "test-issue-future", "TEST-FUTURE")
             .unwrap();
 
         // Query since far in the future -- should exclude everything

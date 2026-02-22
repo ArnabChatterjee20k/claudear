@@ -266,7 +266,7 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
                 "text": message.text,
                 "blocks": message.blocks,
             });
-            let response = self.http.post_json(webhook_url, &body, None).await?;
+            let response = self.http.post_json(webhook_url.expose(), &body, None).await?;
 
             if response.status < 200 || response.status >= 300 {
                 return Err(Error::notifier(
@@ -281,8 +281,9 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
         if let (Some(ref token), Some(ref channel_id)) =
             (&self.config.bot_token, &self.config.channel_id)
         {
-            if !token.is_empty() && !channel_id.is_empty() {
-                self.post_chat_message(token, channel_id, &message).await?;
+            let token_str = token.expose();
+            if !token_str.is_empty() && !channel_id.is_empty() {
+                self.post_chat_message(token_str, channel_id, &message).await?;
                 return Ok(());
             }
         }
@@ -296,8 +297,11 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
     /// Used by `ask_question` and `send_to_channel` where we need the
     /// timestamp for threading.
     async fn send_to_channel(&self, message: SlackMessage) -> Result<Option<String>> {
-        let token = match self.config.bot_token.as_deref() {
-            Some(t) if !t.is_empty() => t,
+        let token = match self.config.bot_token.as_ref() {
+            Some(t) => {
+                let exposed = t.expose();
+                if !exposed.is_empty() { exposed } else { return Ok(None); }
+            }
             _ => return Ok(None),
         };
         let channel_id = match self.config.channel_id.as_deref() {
@@ -357,7 +361,7 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
         self.config
             .bot_token
             .as_ref()
-            .map(|v| !v.is_empty())
+            .map(|v| !v.expose().is_empty())
             .unwrap_or(false)
             && self
                 .config
@@ -1204,8 +1208,11 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
         request: &AskRequest,
         since: DateTime<Utc>,
     ) -> Result<Vec<AskReply>> {
-        let token_str = match self.config.bot_token.as_deref() {
-            Some(t) if !t.is_empty() => t,
+        let token_str = match self.config.bot_token.as_ref() {
+            Some(t) => {
+                let exposed = t.expose();
+                if !exposed.is_empty() { exposed } else { return Ok(Vec::new()); }
+            }
             _ => return Ok(Vec::new()),
         };
         let channel_id = match self.config.channel_id.as_deref() {
@@ -1461,14 +1468,14 @@ mod tests {
 
     fn webhook_config() -> SlackConfig {
         SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             ..Default::default()
         }
     }
 
     fn webhook_config_with_user() -> SlackConfig {
         SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             user_id: Some("U987654321".to_string()),
             ..Default::default()
         }
@@ -1476,7 +1483,7 @@ mod tests {
 
     fn bot_config() -> SlackConfig {
         SlackConfig {
-            bot_token: Some("xoxb-test-token".to_string()),
+            bot_token: Some("xoxb-test-token".into()),
             channel_id: Some("C12345678".to_string()),
             ..Default::default()
         }
@@ -1484,7 +1491,7 @@ mod tests {
 
     fn bot_config_with_user() -> SlackConfig {
         SlackConfig {
-            bot_token: Some("xoxb-test-token".to_string()),
+            bot_token: Some("xoxb-test-token".into()),
             channel_id: Some("C12345678".to_string()),
             user_id: Some("U987654321".to_string()),
             ..Default::default()
@@ -1563,7 +1570,7 @@ mod tests {
     #[test]
     fn test_is_enabled_false_with_only_bot_token() {
         let config = SlackConfig {
-            bot_token: Some("xoxb-token".to_string()),
+            bot_token: Some("xoxb-token".into()),
             ..Default::default()
         };
         let notifier = SlackNotifier::with_http_client(config, MockSlackHttpClient::success());
@@ -1583,7 +1590,7 @@ mod tests {
     #[test]
     fn test_is_enabled_false_with_empty_bot_token() {
         let config = SlackConfig {
-            bot_token: Some("".to_string()),
+            bot_token: Some("".into()),
             channel_id: Some("C12345678".to_string()),
             ..Default::default()
         };
@@ -1594,7 +1601,7 @@ mod tests {
     #[test]
     fn test_is_enabled_false_with_empty_channel_id() {
         let config = SlackConfig {
-            bot_token: Some("xoxb-token".to_string()),
+            bot_token: Some("xoxb-token".into()),
             channel_id: Some("".to_string()),
             ..Default::default()
         };
@@ -1930,7 +1937,7 @@ mod tests {
         );
         let registry = UserRegistry::new(users);
         let config = SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             ..Default::default()
         };
         let notifier = SlackNotifier::with_http_client_and_registry(config, mock, registry);
@@ -1955,7 +1962,7 @@ mod tests {
         );
         let registry = UserRegistry::new(users);
         let config = SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             user_id: Some("U999999999".to_string()),
             ..Default::default()
         };
@@ -1974,7 +1981,7 @@ mod tests {
         let mock = MockSlackHttpClient::success();
         let registry = empty_registry();
         let config = SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             user_id: Some("U999999999".to_string()),
             ..Default::default()
         };
@@ -1988,7 +1995,7 @@ mod tests {
     #[test]
     fn test_get_user_mention_for_issue_no_resolved_user_no_global() {
         let config = SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             ..Default::default()
         };
         let notifier = SlackNotifier::with_http_client(config, MockSlackHttpClient::success());
@@ -2008,7 +2015,7 @@ mod tests {
         );
         let registry = UserRegistry::new(users);
         let config = SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             user_id: Some("Ufallback".to_string()),
             ..Default::default()
         };
@@ -2103,7 +2110,7 @@ mod tests {
         );
         let registry = UserRegistry::new(users);
         let config = SlackConfig {
-            bot_token: Some("xoxb-test-token".to_string()),
+            bot_token: Some("xoxb-test-token".into()),
             channel_id: Some("C12345678".to_string()),
             user_id: Some("U999999999".to_string()),
             ..Default::default()
@@ -2124,7 +2131,7 @@ mod tests {
     async fn test_ask_question_falls_back_to_global_target() {
         let mock = MockSlackHttpClient::success_api();
         let config = SlackConfig {
-            bot_token: Some("xoxb-test-token".to_string()),
+            bot_token: Some("xoxb-test-token".into()),
             channel_id: Some("C12345678".to_string()),
             user_id: Some("U999999999".to_string()),
             ..Default::default()
@@ -2250,7 +2257,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_returns_empty_without_bot_token() {
         let config = SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             ..Default::default()
         };
         let mock = MockSlackHttpClient::success();
@@ -2277,7 +2284,7 @@ mod tests {
     #[test]
     fn test_supports_replies_false_when_no_bot_token() {
         let config = SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             channel_id: Some("C12345678".to_string()),
             ..Default::default()
         };
@@ -2288,7 +2295,7 @@ mod tests {
     #[test]
     fn test_supports_replies_false_when_no_channel_id() {
         let config = SlackConfig {
-            bot_token: Some("xoxb-token".to_string()),
+            bot_token: Some("xoxb-token".into()),
             ..Default::default()
         };
         let notifier = SlackNotifier::with_http_client(config, MockSlackHttpClient::success());
@@ -3102,8 +3109,8 @@ mod tests {
     async fn test_send_prefers_webhook_over_bot() {
         let mock = MockSlackHttpClient::success();
         let config = SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
-            bot_token: Some("xoxb-test-token".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
+            bot_token: Some("xoxb-test-token".into()),
             channel_id: Some("C12345678".to_string()),
             ..Default::default()
         };
@@ -3205,7 +3212,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_returns_empty_without_channel_id() {
         let config = SlackConfig {
-            bot_token: Some("xoxb-token".to_string()),
+            bot_token: Some("xoxb-token".into()),
             channel_id: None, // No channel
             ..Default::default()
         };
@@ -3222,7 +3229,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_returns_empty_with_empty_bot_token() {
         let config = SlackConfig {
-            bot_token: Some("".to_string()),
+            bot_token: Some("".into()),
             channel_id: Some("C123".to_string()),
             ..Default::default()
         };
@@ -3378,7 +3385,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_with_empty_bot_token_and_channel_drops_message() {
         let config = SlackConfig {
-            bot_token: Some("".to_string()),
+            bot_token: Some("".into()),
             channel_id: Some("".to_string()),
             ..Default::default()
         };
@@ -3392,7 +3399,7 @@ mod tests {
     #[test]
     fn test_has_bot_channel_false_for_empty_strings() {
         let config = SlackConfig {
-            bot_token: Some("".to_string()),
+            bot_token: Some("".into()),
             channel_id: Some("C123".to_string()),
             ..Default::default()
         };
@@ -3862,7 +3869,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_channel_returns_none_with_empty_channel_id() {
         let config = SlackConfig {
-            bot_token: Some("xoxb-token".to_string()),
+            bot_token: Some("xoxb-token".into()),
             channel_id: Some("".to_string()),
             ..Default::default()
         };
@@ -3883,7 +3890,7 @@ mod tests {
     async fn test_ask_question_returns_none_ts_when_no_bot() {
         let mock = MockSlackHttpClient::success();
         let config = SlackConfig {
-            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
             ..Default::default()
         };
         let notifier = SlackNotifier::with_http_client(config, mock);
@@ -4161,7 +4168,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_returns_empty_with_empty_channel_id() {
         let config = SlackConfig {
-            bot_token: Some("xoxb-token".to_string()),
+            bot_token: Some("xoxb-token".into()),
             channel_id: Some("".to_string()),
             ..Default::default()
         };
@@ -4425,7 +4432,7 @@ mod tests {
 
         // Only bot_token, no channel -> false
         let config_no_channel = SlackConfig {
-            bot_token: Some("xoxb-test-token".to_string()),
+            bot_token: Some("xoxb-test-token".into()),
             channel_id: None,
             ..Default::default()
         };
@@ -4445,7 +4452,7 @@ mod tests {
 
         // Both empty strings -> false
         let config_empty = SlackConfig {
-            bot_token: Some("".to_string()),
+            bot_token: Some("".into()),
             channel_id: Some("".to_string()),
             ..Default::default()
         };
@@ -4461,7 +4468,7 @@ mod tests {
 
         // Token non-empty, channel empty -> false
         let config_mixed = SlackConfig {
-            bot_token: Some("xoxb-token".to_string()),
+            bot_token: Some("xoxb-token".into()),
             channel_id: Some("".to_string()),
             ..Default::default()
         };

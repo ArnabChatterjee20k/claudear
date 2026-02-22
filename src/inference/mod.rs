@@ -8,7 +8,7 @@ mod context;
 pub use context::IssueContext;
 
 use crate::repo::{IndexedRepo, RepoIndex};
-use crate::storage::SqliteTracker;
+use crate::storage::FixAttemptTracker;
 use crate::types::{ActivityLogEntry, Issue};
 use serde_json::json;
 use std::path::PathBuf;
@@ -121,7 +121,7 @@ pub fn resolve_repo_for_cascade(
 pub fn resolve_repo_for_issue(
     inferrer: Option<&RepoInferrer>,
     issue: &Issue,
-    tracker: Option<&Arc<SqliteTracker>>,
+    tracker: Option<&Arc<dyn FixAttemptTracker>>,
 ) -> RepoResolution {
     resolve_repo_for_issue_with_embedding(inferrer, issue, tracker, None)
 }
@@ -130,7 +130,7 @@ pub fn resolve_repo_for_issue(
 pub fn resolve_repo_for_issue_with_embedding(
     inferrer: Option<&RepoInferrer>,
     issue: &Issue,
-    tracker: Option<&Arc<SqliteTracker>>,
+    tracker: Option<&Arc<dyn FixAttemptTracker>>,
     query_embedding: Option<&[f32]>,
 ) -> RepoResolution {
     let inference_start = Instant::now();
@@ -274,7 +274,7 @@ pub fn resolve_repo_for_issue_with_embedding(
 
 /// Record an inference attempt for analytics.
 fn record_inference_attempt(
-    tracker: Option<&Arc<SqliteTracker>>,
+    tracker: Option<&Arc<dyn FixAttemptTracker>>,
     issue: &Issue,
     context: &IssueContext,
     inferred: Option<&InferredRepo>,
@@ -2088,7 +2088,7 @@ mod tests {
 
     #[test]
     fn test_record_inference_attempt_with_tracker_no_match() {
-        let db = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
         let issue = create_test_issue("linear", "test", "desc");
         let context = IssueContext {
             filenames: vec![],
@@ -2106,7 +2106,7 @@ mod tests {
 
     #[test]
     fn test_record_inference_attempt_with_tracker_and_match() {
-        let db = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
         let issue = create_test_issue("sentry", "Auth error", "error in auth");
         let context = IssueContext {
             filenames: vec!["auth.ts".to_string()],
@@ -2180,7 +2180,7 @@ mod tests {
 
     #[test]
     fn test_resolve_repo_for_issue_with_tracker_records_analytics() {
-        let db = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
         let index = create_test_index();
         let inferrer = RepoInferrer::new(index);
 
@@ -2196,7 +2196,7 @@ mod tests {
 
     #[test]
     fn test_resolve_repo_for_issue_no_match_with_tracker() {
-        let db = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
         let index = create_test_index();
         let inferrer = RepoInferrer::new(index);
 

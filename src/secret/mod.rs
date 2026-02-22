@@ -6,6 +6,9 @@
 //! - Explicit access via `.expose()` — forces conscious decision to reveal the secret
 //! - Serde support — deserializes/serializes as a plain string for TOML round-tripping
 //! - Constant-time equality — uses `subtle::ConstantTimeEq` to prevent timing attacks
+//! - Encryption at rest — AES-256-GCM encryption with `ENC[v1:...]` format
+
+pub mod encryption;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use subtle::ConstantTimeEq;
@@ -68,6 +71,18 @@ impl PartialEq for SecretValue {
 
 impl Eq for SecretValue {}
 
+impl From<String> for SecretValue {
+    fn from(s: String) -> Self {
+        SecretValue::new(s)
+    }
+}
+
+impl From<&str> for SecretValue {
+    fn from(s: &str) -> Self {
+        SecretValue::new(s)
+    }
+}
+
 impl<'de> Deserialize<'de> for SecretValue {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -97,6 +112,52 @@ impl OptionalSecretExt for Option<SecretValue> {
     fn expose_as_deref(&self) -> Option<&str> {
         self.as_ref().map(|s| s.expose())
     }
+}
+
+/// Known secret prefixes/patterns to redact from log output.
+const SECRET_PATTERNS: &[&str] = &[
+    "ghp_",        // GitHub personal access token
+    "ghs_",        // GitHub App server-to-server token
+    "ghu_",        // GitHub App user-to-server token
+    "github_pat_", // GitHub fine-grained PAT
+    "glpat-",      // GitLab personal access token
+    "lin_api_",    // Linear API key
+    "xoxb-",       // Slack bot token
+    "xoxp-",       // Slack user token
+    "xoxa-",       // Slack app token
+    "xoxr-",       // Slack refresh token
+    "sntryu_",     // Sentry user token
+    "sntrys_",     // Sentry system token
+    "-----BEGIN",  // PEM private key
+    "ENC[v1:",     // Encrypted secret prefix
+];
+
+/// Redact known secret patterns from a string.
+///
+/// Replaces any occurrence of a known secret prefix (plus following non-whitespace
+/// characters) with `[REDACTED]`. Used by the log redaction layer to prevent
+/// accidental secret leakage in log output.
+pub fn redact_secrets(input: &str) -> String {
+    let mut output = input.to_string();
+    for pattern in SECRET_PATTERNS {
+        while let Some(start) = output.find(pattern) {
+            let after_pattern = start + pattern.len();
+            let end = output[after_pattern..]
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || c == '"'
+                        || c == '\''
+                        || c == ','
+                        || c == '}'
+                        || c == ')'
+                        || c == ']'
+                })
+                .map(|pos| after_pattern + pos)
+                .unwrap_or(output.len());
+            output.replace_range(start..end, "[REDACTED]");
+        }
+    }
+    output
 }
 
 #[cfg(test)]
@@ -165,5 +226,59 @@ mod tests {
         let original = SecretValue::new("secret");
         let cloned = original.clone();
         assert_eq!(cloned.expose(), "secret");
+    }
+
+    #[test]
+    fn test_redact_github_token() {
+        let input = "Authorization: Bearer ghp_abc123XYZ456";
+        let output = redact_secrets(input);
+        assert_eq!(output, "Authorization: Bearer [REDACTED]");
+        assert!(!output.contains("ghp_"));
+    }
+
+    #[test]
+    fn test_redact_gitlab_token() {
+        let input = "token = \"glpat-mytoken123\"";
+        let output = redact_secrets(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("glpat-"));
+    }
+
+    #[test]
+    fn test_redact_slack_token() {
+        let input = "Bot token: xoxb-123-456-abc";
+        let output = redact_secrets(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("xoxb-"));
+    }
+
+    #[test]
+    fn test_redact_multiple_secrets() {
+        let input = "github=ghp_tok1 slack=xoxb-tok2";
+        let output = redact_secrets(input);
+        assert_eq!(output, "github=[REDACTED] slack=[REDACTED]");
+    }
+
+    #[test]
+    fn test_redact_no_secrets() {
+        let input = "No secrets in this log message";
+        let output = redact_secrets(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_redact_pem_key() {
+        let input = "key: -----BEGIN RSA PRIVATE KEY-----";
+        let output = redact_secrets(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("-----BEGIN"));
+    }
+
+    #[test]
+    fn test_redact_encrypted_prefix() {
+        let input = "field = \"ENC[v1:abc123def456]\"";
+        let output = redact_secrets(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("ENC[v1:"));
     }
 }

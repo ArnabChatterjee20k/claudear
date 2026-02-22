@@ -195,6 +195,7 @@ impl GitHubAppAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::SecretValue;
 
     // Test RSA private key (for testing only - NOT a real key, generated for testing)
     const TEST_PRIVATE_KEY: &str = r#"-----BEGIN RSA PRIVATE KEY-----
@@ -229,15 +230,15 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         GitHubAppConfig {
             app_id: Some(12345),
             private_key: if with_key {
-                Some(TEST_PRIVATE_KEY.to_string())
+                Some(SecretValue::new(TEST_PRIVATE_KEY))
             } else {
                 None
             },
             private_key_path: None,
-            webhook_secret: Some("test_secret".to_string()),
+            webhook_secret: Some("test_secret".into()),
             installation_id: Some(67890),
             client_id: Some("Iv1.abc123".to_string()),
-            client_secret: Some("secret".to_string()),
+            client_secret: Some("secret".into()),
             base_url: Some("https://example.com".to_string()),
         }
     }

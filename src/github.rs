@@ -6,6 +6,7 @@ use crate::scm::{
     CodeReview, PostReviewAction, PrSummary, RemoteRepo, ReviewComment, ReviewUser, ScmProvider,
     ScmRelease,
 };
+use crate::secret::OptionalSecretExt;
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -39,6 +40,28 @@ struct PullRequest {
 struct PullRequestRef {
     #[serde(rename = "ref")]
     ref_name: String,
+}
+
+/// A GitHub issue from the Issues API.
+#[derive(Debug, Deserialize)]
+pub struct GitHubIssue {
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub html_url: String,
+    #[serde(default)]
+    pub labels: Vec<GitHubLabel>,
+    pub user: Option<ReviewUser>,
+    pub assignee: Option<ReviewUser>,
+    /// Present when the "issue" is actually a pull request.
+    pub pull_request: Option<serde_json::Value>,
+}
+
+/// A label on a GitHub issue.
+#[derive(Debug, Deserialize)]
+pub struct GitHubLabel {
+    pub name: String,
 }
 
 impl GitHubClient<ReqwestHttpClient> {
@@ -83,7 +106,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
         let headers = self.build_headers(token);
@@ -118,7 +142,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
         let headers = self.build_headers(token);
@@ -145,7 +170,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let base_url = format!(
             "https://api.github.com/repos/{}/pulls/{}/reviews",
@@ -201,7 +227,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let base_url = format!(
             "https://api.github.com/repos/{}/pulls/{}/comments",
@@ -249,7 +276,7 @@ impl<H: HttpClient> GitHubClient<H> {
 
     /// Get the GitHub token (if configured).
     pub fn token(&self) -> Option<&str> {
-        self.config.token.as_deref()
+        self.config.token.expose_as_deref()
     }
 
     /// Fetch the raw unified diff for a PR.
@@ -258,7 +285,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
         let headers = vec![
@@ -289,7 +317,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let mut all_repos = Vec::new();
         let mut page = 1;
@@ -346,7 +375,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!(
             "https://api.github.com/repos/{}/pulls/{}/merge",
@@ -371,7 +401,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
         let headers = self.build_headers(token);
@@ -393,7 +424,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!(
             "https://api.github.com/repos/{}/git/refs/heads/{}",
@@ -423,7 +455,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!(
             "https://api.github.com/repos/{}/pulls/{}/reviews",
@@ -459,7 +492,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!(
             "https://api.github.com/repos/{}/pulls?state=open&per_page=100",
@@ -495,7 +529,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
         let headers = self.build_headers(token);
@@ -544,7 +579,8 @@ impl<H: HttpClient> GitHubClient<H> {
             .config
             .token
             .as_ref()
-            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
 
         let url = format!("https://api.github.com/repos/{}/releases", repo);
         let headers = self.build_headers(token);
@@ -554,10 +590,7 @@ impl<H: HttpClient> GitHubClient<H> {
             "body": body,
         });
 
-        let response = self
-            .http
-            .post(&url, headers, &payload.to_string())
-            .await?;
+        let response = self.http.post(&url, headers, &payload.to_string()).await?;
 
         if !response.is_success() {
             return Err(Error::Other(format!(
@@ -592,6 +625,161 @@ impl<H: HttpClient> GitHubClient<H> {
         let re = regex_lite::Regex::new(r"/pulls?/(\d+)").ok()?;
         let caps = re.captures(url)?;
         caps.get(1)?.as_str().parse().ok()
+    }
+
+    /// List issues for a repository, filtering by state and labels.
+    ///
+    /// Filters out pull requests (GitHub Issues API returns PRs as issues).
+    pub async fn list_repo_issues(
+        &self,
+        repo: &str,
+        state: Option<&str>,
+        labels: &[String],
+    ) -> Result<Vec<GitHubIssue>> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let mut all_issues = Vec::new();
+        let mut page = 1usize;
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 10;
+
+        loop {
+            let mut url = format!(
+                "https://api.github.com/repos/{}/issues?per_page={}&page={}",
+                repo, PER_PAGE, page
+            );
+            if let Some(state) = state {
+                url.push_str(&format!("&state={}", state));
+            }
+            if !labels.is_empty() {
+                url.push_str(&format!("&labels={}", labels.join(",")));
+            }
+
+            let headers = self.build_headers(token);
+            let response = self.http.get(&url, headers).await?;
+
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "GitHub API error listing issues for {}: {}",
+                    repo, response.body
+                )));
+            }
+
+            let issues: Vec<GitHubIssue> = response.json()?;
+            let count = issues.len();
+
+            // Filter out pull requests (GitHub Issues API includes PRs)
+            let real_issues: Vec<GitHubIssue> =
+                issues.into_iter().filter(|i| i.pull_request.is_none()).collect();
+            all_issues.extend(real_issues);
+
+            if count < PER_PAGE {
+                break;
+            }
+
+            page += 1;
+            if page > MAX_PAGES {
+                tracing::warn!(repo = %repo, "Hit pagination limit for repo issues");
+                break;
+            }
+        }
+
+        Ok(all_issues)
+    }
+
+    /// Fetch a single issue by number.
+    pub async fn get_issue(&self, repo: &str, issue_number: i64) -> Result<GitHubIssue> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let url = format!(
+            "https://api.github.com/repos/{}/issues/{}",
+            repo, issue_number
+        );
+        let headers = self.build_headers(token);
+        let response = self.http.get(&url, headers).await?;
+
+        if response.is_not_found() {
+            return Err(Error::Other(format!(
+                "Issue not found: {}/issues/{}",
+                repo, issue_number
+            )));
+        }
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "GitHub API error: {}",
+                response.body
+            )));
+        }
+
+        response.json()
+    }
+
+    /// Close an issue.
+    pub async fn close_issue(&self, repo: &str, issue_number: i64) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let url = format!(
+            "https://api.github.com/repos/{}/issues/{}",
+            repo, issue_number
+        );
+        let headers = self.build_headers(token);
+        let body = serde_json::json!({"state": "closed"}).to_string();
+
+        let response = self.http.patch(&url, headers, &body).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to close issue {}/issues/{}: {}",
+                repo, issue_number, response.body
+            )));
+        }
+        Ok(())
+    }
+
+    /// Add a comment to an issue.
+    pub async fn add_issue_comment(
+        &self,
+        repo: &str,
+        issue_number: i64,
+        comment: &str,
+    ) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let url = format!(
+            "https://api.github.com/repos/{}/issues/{}/comments",
+            repo, issue_number
+        );
+        let headers = self.build_headers(token);
+        let body = serde_json::json!({"body": comment}).to_string();
+
+        let response = self.http.post(&url, headers, &body).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to add comment to {}/issues/{}: {}",
+                repo, issue_number, response.body
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -833,12 +1021,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -856,12 +1045,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -879,12 +1069,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -898,12 +1089,13 @@ mod tests {
         // No mock response means 404
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -922,12 +1114,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -959,12 +1152,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1000,12 +1194,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1034,12 +1229,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1067,12 +1263,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1112,12 +1309,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1149,12 +1347,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1180,12 +1379,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1210,12 +1410,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1240,12 +1441,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1266,12 +1468,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1296,12 +1499,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1326,12 +1530,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1353,12 +1558,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("my_secret_token".to_string()),
+            token: Some("my_secret_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -1391,12 +1597,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1432,12 +1639,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1481,12 +1689,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1516,12 +1725,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1551,12 +1761,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1590,12 +1801,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1638,12 +1850,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1684,12 +1897,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1726,12 +1940,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1773,12 +1988,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -1803,12 +2019,13 @@ mod tests {
     #[test]
     fn test_client_enabled_with_token() {
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         assert!(client.is_enabled());
@@ -1975,12 +2192,13 @@ mod tests {
     #[test]
     fn test_review_watcher_watch_unwatch() {
         let config = GitHubConfig {
-            token: Some("test".to_string()),
+            token: Some("test".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -2001,12 +2219,13 @@ mod tests {
     #[test]
     fn test_review_watcher_watch_pr_preserves_existing_cursors() {
         let config = GitHubConfig {
-            token: Some("test".to_string()),
+            token: Some("test".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -2053,12 +2272,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -2093,12 +2313,13 @@ mod tests {
     #[test]
     fn test_review_watcher_active_states() {
         let config = GitHubConfig {
-            token: Some("test".to_string()),
+            token: Some("test".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -2119,12 +2340,13 @@ mod tests {
     #[test]
     fn test_review_watcher_load_states() {
         let config = GitHubConfig {
-            token: Some("test".to_string()),
+            token: Some("test".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -2154,12 +2376,13 @@ mod tests {
     #[test]
     fn test_client_token_accessor() {
         let config = GitHubConfig {
-            token: Some("my_token".to_string()),
+            token: Some("my_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         assert_eq!(client.token(), Some("my_token"));
@@ -2340,12 +2563,13 @@ mod tests {
     #[test]
     fn test_review_watcher_is_enabled() {
         let config_enabled = GitHubConfig {
-            token: Some("test".to_string()),
+            token: Some("test".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client_enabled = GitHubClient::new(config_enabled);
         let provider_enabled: Arc<dyn ScmProvider> = Arc::new(client_enabled);
@@ -2545,12 +2769,13 @@ mod tests {
     #[test]
     fn test_review_watcher_overwrite_state() {
         let config = GitHubConfig {
-            token: Some("test".to_string()),
+            token: Some("test".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -2667,12 +2892,13 @@ mod tests {
     #[test]
     fn test_unwatch_nonexistent_pr() {
         let config = GitHubConfig {
-            token: Some("test".to_string()),
+            token: Some("test".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         let provider: Arc<dyn ScmProvider> = Arc::new(client);
@@ -2724,12 +2950,13 @@ mod tests {
     #[test]
     fn test_github_client_new() {
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 30000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         assert!(client.is_enabled());
@@ -2860,7 +3087,7 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test-token".to_string()),
+            token: Some("test-token".into()),
             ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -2902,7 +3129,7 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test-token".to_string()),
+            token: Some("test-token".into()),
             ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -2919,7 +3146,7 @@ mod tests {
         // No mock response added, so it will return 404
 
         let config = GitHubConfig {
-            token: Some("test-token".to_string()),
+            token: Some("test-token".into()),
             ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -2958,12 +3185,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -2988,12 +3216,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -3014,12 +3243,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -3050,12 +3280,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -3074,12 +3305,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -3103,12 +3335,13 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
 
@@ -3157,7 +3390,7 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -3180,7 +3413,7 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -3193,12 +3426,13 @@ mod tests {
     #[test]
     fn test_build_headers_structure() {
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, MockHttpClient::new());
 
@@ -3232,12 +3466,13 @@ mod tests {
     #[test]
     fn test_scm_provider_review_trigger() {
         let config = GitHubConfig {
-            token: Some("test".to_string()),
+            token: Some("test".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
             review_trigger: "@custom-trigger".to_string(),
             use_ssh: false,
+            ..Default::default()
         };
         let client = GitHubClient::new(config);
         let provider: &dyn ScmProvider = &client;
@@ -3247,7 +3482,7 @@ mod tests {
     #[test]
     fn test_scm_provider_is_enabled_delegates() {
         let config_enabled = GitHubConfig {
-            token: Some("test".to_string()),
+            token: Some("test".into()),
             ..Default::default()
         };
         let client_enabled = GitHubClient::new(config_enabled);
@@ -3270,7 +3505,7 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -3298,7 +3533,7 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -3319,7 +3554,7 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -3348,7 +3583,7 @@ mod tests {
         );
 
         let config = GitHubConfig {
-            token: Some("test_token".to_string()),
+            token: Some("test_token".into()),
             ..Default::default()
         };
         let client = GitHubClient::with_http_client(config, mock);

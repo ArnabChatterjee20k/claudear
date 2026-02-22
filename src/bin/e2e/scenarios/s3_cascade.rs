@@ -97,10 +97,8 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     // Configure issue source
     match ctx.source_name {
         "linear" => {
-            let api_key =
-                std::env::var("CLAUDEAR_E2E_LINEAR_API_KEY").context("LINEAR_API_KEY")?;
-            let team_id =
-                std::env::var("CLAUDEAR_E2E_LINEAR_TEAM_ID").context("LINEAR_TEAM_ID")?;
+            let api_key = std::env::var("CLAUDEAR_E2E_LINEAR_API_KEY").context("LINEAR_API_KEY")?;
+            let team_id = std::env::var("CLAUDEAR_E2E_LINEAR_TEAM_ID").context("LINEAR_TEAM_ID")?;
             builder = builder.linear(&api_key, &team_id);
         }
         "jira" => {
@@ -203,11 +201,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
 
     cleanup.track_pr(repo2, merge_cascade_pr_number);
 
-    if let Ok(branch) = ctx
-        .scm
-        .get_pr_branch(repo2, merge_cascade_pr_number)
-        .await
-    {
+    if let Ok(branch) = ctx.scm.get_pr_branch(repo2, merge_cascade_pr_number).await {
         cleanup.track_branch(repo2, &branch);
     }
 

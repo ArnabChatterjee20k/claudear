@@ -387,12 +387,12 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     fn create_test_config() -> GitHubAppConfig {
         GitHubAppConfig {
             app_id: Some(12345),
-            private_key: Some(TEST_PRIVATE_KEY.to_string()),
+            private_key: Some(TEST_PRIVATE_KEY.into()),
             private_key_path: None,
-            webhook_secret: Some("test_secret".to_string()),
+            webhook_secret: Some("test_secret".into()),
             installation_id: Some(67890),
             client_id: Some("Iv1.abc123".to_string()),
-            client_secret: Some("secret".to_string()),
+            client_secret: Some("secret".into()),
             base_url: Some("https://example.com".to_string()),
         }
     }
@@ -618,7 +618,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
     #[test]
     fn test_jwt_generation_fails_with_invalid_private_key() {
         let mut config = create_test_config();
-        config.private_key = Some("not-a-valid-pem-key".to_string());
+        config.private_key = Some("not-a-valid-pem-key".into());
         let client = GitHubAppClient::new(config);
 
         let result = client.auth().generate_jwt();

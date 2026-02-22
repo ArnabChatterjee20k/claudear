@@ -30,7 +30,7 @@ impl EmailNotifier {
             config.smtp_username.as_ref(),
             config.smtp_password.as_ref(),
         ) {
-            let creds = Credentials::new(username.clone(), password.clone());
+            let creds = Credentials::new(username.clone(), password.expose().to_string());
 
             let builder = if config.use_tls {
                 AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
@@ -398,8 +398,11 @@ impl Notifier for EmailNotifier {
             Some(v) if !v.is_empty() => v,
             _ => return Ok(Vec::new()),
         };
-        let imap_password = match self.config.imap_password.clone() {
-            Some(v) if !v.is_empty() => v,
+        let imap_password = match self.config.imap_password.as_ref() {
+            Some(v) => {
+                let exposed = v.expose().to_string();
+                if !exposed.is_empty() { exposed } else { return Ok(Vec::new()); }
+            }
             _ => return Ok(Vec::new()),
         };
 
@@ -528,7 +531,7 @@ impl Notifier for EmailNotifier {
                 .config
                 .imap_password
                 .as_ref()
-                .map(|v| !v.is_empty())
+                .map(|v| !v.expose().is_empty())
                 .unwrap_or(false)
     }
 }
@@ -560,7 +563,7 @@ mod tests {
             smtp_host: Some("smtp.example.com".to_string()),
             smtp_port: 587,
             smtp_username: Some("user".to_string()),
-            smtp_password: Some("pass".to_string()),
+            smtp_password: Some("pass".into()),
             from_address: None, // Missing from address
             to_addresses: vec!["test@example.com".to_string()],
             use_tls: true,
@@ -573,7 +576,7 @@ mod tests {
             smtp_host: Some("smtp.example.com".to_string()),
             smtp_port: 587,
             smtp_username: Some("user".to_string()),
-            smtp_password: Some("pass".to_string()),
+            smtp_password: Some("pass".into()),
             from_address: Some("from@example.com".to_string()),
             to_addresses: vec![], // No recipients
             use_tls: true,
@@ -764,7 +767,7 @@ mod tests {
             smtp_host: Some("localhost".to_string()),
             smtp_port: 25,
             smtp_username: Some("user".to_string()),
-            smtp_password: Some("pass".to_string()),
+            smtp_password: Some("pass".into()),
             from_address: Some("test@localhost".to_string()),
             to_addresses: vec!["recipient@localhost".to_string()],
             use_tls: false,
@@ -1136,7 +1139,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("imap.example.com".to_string()),
             imap_username: Some("user".to_string()),
-            imap_password: Some("pass".to_string()),
+            imap_password: Some("pass".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1148,7 +1151,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: None,
             imap_username: Some("user".to_string()),
-            imap_password: Some("pass".to_string()),
+            imap_password: Some("pass".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1160,7 +1163,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("".to_string()),
             imap_username: Some("user".to_string()),
-            imap_password: Some("pass".to_string()),
+            imap_password: Some("pass".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1172,7 +1175,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("imap.example.com".to_string()),
             imap_username: None,
-            imap_password: Some("pass".to_string()),
+            imap_password: Some("pass".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1196,7 +1199,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("imap.example.com".to_string()),
             imap_username: Some("user".to_string()),
-            imap_password: Some("".to_string()),
+            imap_password: Some("".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1542,7 +1545,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("imap.example.com".to_string()),
             imap_username: Some("".to_string()),
-            imap_password: Some("pass".to_string()),
+            imap_password: Some("pass".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1589,7 +1592,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("".to_string()),
             imap_username: Some("user".to_string()),
-            imap_password: Some("pass".to_string()),
+            imap_password: Some("pass".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1622,7 +1625,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("imap.example.com".to_string()),
             imap_username: Some("".to_string()),
-            imap_password: Some("pass".to_string()),
+            imap_password: Some("pass".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1655,7 +1658,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("imap.example.com".to_string()),
             imap_username: Some("user".to_string()),
-            imap_password: Some("".to_string()),
+            imap_password: Some("".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1688,7 +1691,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("imap.example.com".to_string()),
             imap_username: None,
-            imap_password: Some("pass".to_string()),
+            imap_password: Some("pass".into()),
             ..Default::default()
         };
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
@@ -1836,7 +1839,7 @@ mod tests {
             smtp_host: Some("smtp.gmail.com".to_string()),
             smtp_port: 587,
             smtp_username: Some("user@gmail.com".to_string()),
-            smtp_password: Some("password".to_string()),
+            smtp_password: Some("password".into()),
             from_address: Some("user@gmail.com".to_string()),
             to_addresses: vec!["recipient@example.com".to_string()],
             use_tls: true,
@@ -2249,7 +2252,7 @@ mod tests {
         let config = EmailConfig {
             imap_host: Some("imap.example.com".to_string()),
             imap_username: Some("user".to_string()),
-            imap_password: Some("pass".to_string()),
+            imap_password: Some("pass".into()),
             imap_use_tls: false,
             ..Default::default()
         };

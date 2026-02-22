@@ -1,6 +1,5 @@
 //! Authentication and user management handlers.
 
-use crate::storage::SqliteTracker;
 use axum::{
     extract::{FromRequestParts, Path, State},
     http::{request::Parts, HeaderMap, StatusCode},
@@ -191,9 +190,6 @@ impl FromRequestParts<ApiState> for AuthUser {
 
         let user = state
             .tracker
-            .as_any()
-            .downcast_ref::<SqliteTracker>()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
             .get_session_user(&token)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .ok_or(StatusCode::UNAUTHORIZED)?;
@@ -324,14 +320,9 @@ pub async fn login_handler(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    let db = state
-        .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
     // Look up user by email
-    let user = db
+    let user = state
+        .tracker
         .get_user_by_email(&body.email)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -367,7 +358,8 @@ pub async fn login_handler(
     let expires_at = chrono::Utc::now() + chrono::Duration::days(SESSION_MAX_AGE_DAYS);
     let expires_str = expires_at.format("%Y-%m-%d %H:%M:%S").to_string();
 
-    let token = db
+    let token = state
+        .tracker
         .create_session(user.id, &expires_str)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -408,16 +400,10 @@ pub async fn logout_handler(
     State(state): State<ApiState>,
     cookies: Cookies,
 ) -> Result<Json<MessageResponse>, StatusCode> {
-    let db = state
-        .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
     // Get session token from cookie
     if let Some(cookie) = cookies.get(SESSION_COOKIE) {
         let token = cookie.value().to_string();
-        let _ = db.delete_session(&token);
+        let _ = state.tracker.delete_session(&token);
     }
 
     // Clear cookie
@@ -449,12 +435,6 @@ pub async fn update_profile_handler(
     State(state): State<ApiState>,
     Json(body): Json<UpdateProfileRequest>,
 ) -> Result<Json<UserResponse>, StatusCode> {
-    let db = state
-        .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
     // Validate name if provided
     if let Some(ref name) = body.name {
         if name.trim().is_empty() {
@@ -478,7 +458,8 @@ pub async fn update_profile_handler(
                 .ok_or(StatusCode::BAD_REQUEST)?;
 
             // Fetch current user to verify password
-            let current_user = db
+            let current_user = state
+                .tracker
                 .get_user_by_id(user.id)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                 .ok_or(StatusCode::NOT_FOUND)?;
@@ -509,17 +490,20 @@ pub async fn update_profile_handler(
 
     let trimmed_name = body.name.as_deref().map(str::trim);
 
-    db.update_user(
-        user.id,
-        None,
-        password_hash.as_deref(),
-        trimmed_name,
-        None,
-        None,
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .tracker
+        .update_user(
+            user.id,
+            None,
+            password_hash.as_deref(),
+            trimmed_name,
+            None,
+            None,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let updated = db
+    let updated = state
+        .tracker
         .get_user_by_id(user.id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -610,13 +594,9 @@ pub async fn upload_avatar_handler(
         let avatar_url = format!("/avatars/{}", filename);
 
         // Update user's avatar_url in DB
-        let db = state
+        state
             .tracker
-            .as_any()
-            .downcast_ref::<SqliteTracker>()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        db.update_user(user.id, None, None, None, None, Some(&avatar_url))
+            .update_user(user.id, None, None, None, None, Some(&avatar_url))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         return Ok(Json(serde_json::json!({ "avatar_url": avatar_url })));
@@ -630,13 +610,8 @@ pub async fn list_users_handler(
     _admin: AdminUser,
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<UserResponse>>, StatusCode> {
-    let db = state
+    let users = state
         .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let users = db
         .list_users()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -662,13 +637,8 @@ pub async fn get_user_handler(
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<UserResponse>, StatusCode> {
-    let db = state
+    let user = state
         .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let user = db
         .get_user_by_id(id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -710,14 +680,9 @@ pub async fn create_user_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let db = state
-        .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
     // Check for duplicate email
-    if db
+    if state
+        .tracker
         .get_user_by_email(&body.email)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .is_some()
@@ -733,11 +698,13 @@ pub async fn create_user_handler(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let id = db
+    let id = state
+        .tracker
         .create_user(&body.email, &password_hash, &body.name, &body.role)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let user = db
+    let user = state
+        .tracker
         .get_user_by_id(id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -777,12 +744,6 @@ pub async fn update_user_handler(
         }
     }
 
-    let db = state
-        .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
     // Hash password if provided (use spawn_blocking to avoid blocking the async runtime)
     let password_hash = match &body.password {
         Some(pw) => {
@@ -797,7 +758,8 @@ pub async fn update_user_handler(
         None => None,
     };
 
-    let updated = db
+    let updated = state
+        .tracker
         .update_user(
             id,
             body.email.as_deref(),
@@ -812,7 +774,8 @@ pub async fn update_user_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let user = db
+    let user = state
+        .tracker
         .get_user_by_id(id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -839,16 +802,11 @@ pub async fn delete_user_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let db = state
-        .tracker
-        .as_any()
-        .downcast_ref::<SqliteTracker>()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
     // Delete user sessions first
-    let _ = db.delete_user_sessions(id);
+    let _ = state.tracker.delete_user_sessions(id);
 
-    let deleted = db
+    let deleted = state
+        .tracker
         .delete_user(id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -866,11 +824,11 @@ mod tests {
     use super::*;
     use crate::api::routes::create_api_router;
     use crate::config::{
-        AskConfig, CascadeConfig, ClaudeConfig, CodeIndexConfig, Config, DiscordConfig,
+        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, Config, DiscordConfig,
         EmailConfig, GitHubAppConfig, GitHubConfig, LearningConfig, PrioritisationConfig,
         PushConfig, RegressionConfig, RetryConfig, SlackConfig, SmsConfig,
     };
-    use crate::storage::SqliteTracker;
+    use crate::storage::{FixAttemptTracker, SqliteTracker};
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -891,8 +849,7 @@ mod tests {
             processing_delay_ms: 5000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
-            claude_timeout_secs: 21600,
-            claude: ClaudeConfig::default(),
+            agent: AgentConfig::default(),
             discord: DiscordConfig::default(),
             slack: SlackConfig::default(),
             email: EmailConfig::default(),
@@ -918,7 +875,7 @@ mod tests {
         }
     }
 
-    /// Create router + tracker Arc. Seed functions can downcast the Arc.
+    /// Create router + tracker Arc for testing.
     fn create_test_app() -> (
         axum::Router,
         std::sync::Arc<dyn crate::storage::FixAttemptTracker>,
@@ -940,12 +897,11 @@ mod tests {
     fn seed_admin(
         tracker: &std::sync::Arc<dyn crate::storage::FixAttemptTracker>,
     ) -> (i64, String) {
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        let user_id = db
+        let user_id = tracker
             .create_user("admin@test.com", &password_hash, "Admin User", "admin")
             .unwrap();
-        let token = db.create_session(user_id, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(user_id, "2099-12-31 23:59:59").unwrap();
         (user_id, token)
     }
 
@@ -953,12 +909,11 @@ mod tests {
     fn seed_viewer(
         tracker: &std::sync::Arc<dyn crate::storage::FixAttemptTracker>,
     ) -> (i64, String) {
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        let user_id = db
+        let user_id = tracker
             .create_user("viewer@test.com", &password_hash, "Viewer User", "viewer")
             .unwrap();
-        let token = db.create_session(user_id, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(user_id, "2099-12-31 23:59:59").unwrap();
         (user_id, token)
     }
 
@@ -967,9 +922,8 @@ mod tests {
         let (router, tracker) = create_test_app();
 
         // Seed a user (not via seed_admin, to test login flow directly)
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("secret123", 4).unwrap();
-        db.create_user("user@test.com", &password_hash, "Test User", "admin")
+        tracker.create_user("user@test.com", &password_hash, "Test User", "admin")
             .unwrap();
 
         let response = router
@@ -1008,9 +962,8 @@ mod tests {
     async fn test_login_wrong_password() {
         let (router, tracker) = create_test_app();
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("correct_password", 4).unwrap();
-        db.create_user("user@test.com", &password_hash, "Test User", "admin")
+        tracker.create_user("user@test.com", &password_hash, "Test User", "admin")
             .unwrap();
 
         let response = router
@@ -1170,12 +1123,11 @@ mod tests {
         tracker: &std::sync::Arc<dyn crate::storage::FixAttemptTracker>,
         email: &str,
     ) -> (i64, String) {
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        let user_id = db
+        let user_id = tracker
             .create_user(email, &password_hash, "Admin User", "admin")
             .unwrap();
-        let token = db.create_session(user_id, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(user_id, "2099-12-31 23:59:59").unwrap();
         (user_id, token)
     }
 
@@ -1340,9 +1292,8 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-dup@test.com");
 
         // Create a user first
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        db.create_user("dup@test.com", &hash, "Dup User", "viewer")
+        tracker.create_user("dup@test.com", &hash, "Dup User", "viewer")
             .unwrap();
 
         // Try to create another user with the same email
@@ -1370,9 +1321,8 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-role@test.com");
 
         // Create a target user to update
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        let target_id = db
+        let target_id = tracker
             .create_user("target-update@test.com", &hash, "Target", "viewer")
             .unwrap();
 
@@ -1419,9 +1369,8 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-del-ok@test.com");
 
         // Create a target user to delete
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        let target_id = db
+        let target_id = tracker
             .create_user("target-del@test.com", &hash, "Target", "viewer")
             .unwrap();
 
@@ -1470,9 +1419,8 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-list@test.com");
 
         // Create an additional user
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        db.create_user("extra-list@test.com", &hash, "Extra User", "viewer")
+        tracker.create_user("extra-list@test.com", &hash, "Extra User", "viewer")
             .unwrap();
 
         let response = router
@@ -1505,9 +1453,8 @@ mod tests {
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-getuser@test.com");
 
         // Create a target user
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        let target_id = db
+        let target_id = tracker
             .create_user("target-get@test.com", &hash, "Target Get", "viewer")
             .unwrap();
 
@@ -1746,9 +1693,8 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-shortpw@test.com");
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        let target_id = db
+        let target_id = tracker
             .create_user("target-update-pw@test.com", &hash, "Target", "viewer")
             .unwrap();
 
@@ -1773,9 +1719,8 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-longpw@test.com");
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        let target_id = db
+        let target_id = tracker
             .create_user("target-update-longpw@test.com", &hash, "Target", "viewer")
             .unwrap();
 
@@ -1803,9 +1748,8 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-validpw@test.com");
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        let target_id = db
+        let target_id = tracker
             .create_user("target-update-validpw@test.com", &hash, "Target", "viewer")
             .unwrap();
 
@@ -1830,9 +1774,8 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-name@test.com");
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        let target_id = db
+        let target_id = tracker
             .create_user("target-name-upd@test.com", &hash, "Original Name", "viewer")
             .unwrap();
 
@@ -1860,9 +1803,8 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-role-to-admin@test.com");
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        let target_id = db
+        let target_id = tracker
             .create_user("target-role-upd@test.com", &hash, "Target", "viewer")
             .unwrap();
 
@@ -1940,9 +1882,8 @@ mod tests {
     #[tokio::test]
     async fn test_login_sends_x_forwarded_for_ip() {
         let (router, tracker) = create_test_app();
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("secret123", 4).unwrap();
-        db.create_user("iptest@test.com", &password_hash, "IP User", "admin")
+        tracker.create_user("iptest@test.com", &password_hash, "IP User", "admin")
             .unwrap();
 
         let response = router
@@ -2311,9 +2252,8 @@ mod tests {
     #[tokio::test]
     async fn test_login_response_body_structure() {
         let (router, tracker) = create_test_app();
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("testpass1", 4).unwrap();
-        db.create_user("struct@test.com", &password_hash, "Struct User", "viewer")
+        tracker.create_user("struct@test.com", &password_hash, "Struct User", "viewer")
             .unwrap();
 
         let response = router
@@ -2345,9 +2285,8 @@ mod tests {
         let (router, tracker) = create_test_app();
         let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-email@test.com");
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let hash = bcrypt::hash("password", 4).unwrap();
-        let target_id = db
+        let target_id = tracker
             .create_user("original-email@test.com", &hash, "Email User", "viewer")
             .unwrap();
 
@@ -2412,11 +2351,10 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        db.create_user("avatar@test.com", &password_hash, "Avatar User", "admin")
+        tracker.create_user("avatar@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = tracker.subscribe_indexing_progress();
         let router = create_api_router(
@@ -2480,11 +2418,10 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        db.create_user("avatar2@test.com", &password_hash, "Avatar User", "admin")
+        tracker.create_user("avatar2@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = tracker.subscribe_indexing_progress();
         let router = create_api_router(
@@ -2533,11 +2470,10 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        db.create_user("avatar3@test.com", &password_hash, "Avatar User", "admin")
+        tracker.create_user("avatar3@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = tracker.subscribe_indexing_progress();
         let router = create_api_router(
@@ -2592,11 +2528,10 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        db.create_user("avatar4@test.com", &password_hash, "Avatar User", "admin")
+        tracker.create_user("avatar4@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = tracker.subscribe_indexing_progress();
         let router = create_api_router(
@@ -2646,11 +2581,10 @@ mod tests {
         let mut config = test_config();
         config.storage_dir = storage_dir;
 
-        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        db.create_user("avatar5@test.com", &password_hash, "Avatar User", "admin")
+        tracker.create_user("avatar5@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
-        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
         let indexing_rx = tracker.subscribe_indexing_progress();
         let router = create_api_router(

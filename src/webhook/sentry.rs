@@ -65,7 +65,7 @@ impl WebhookHandler for SentryWebhookHandler {
             None => return false,
         };
 
-        let mut mac = match Hmac::<Sha256>::new_from_slice(secret.as_bytes()) {
+        let mut mac = match Hmac::<Sha256>::new_from_slice(secret.expose().as_bytes()) {
             Ok(m) => m,
             Err(_) => return false,
         };
@@ -335,14 +335,14 @@ mod tests {
     fn test_config() -> SentryConfig {
         SentryConfig {
             enabled: true,
-            auth_token: "test".to_string(),
+            auth_token: "test".into(),
             org_slug: "test-org".to_string(),
             project_slugs: vec![],
             top_issues_count: 100,
             top_issues_period: TopIssuesPeriod::OneDay,
             min_event_count: 10,
             escalation_threshold_percent: 50,
-            client_secret: Some("test_secret".to_string()),
+            client_secret: Some("test_secret".into()),
             ..Default::default()
         }
     }

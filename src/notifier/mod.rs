@@ -52,6 +52,8 @@ mod email;
 mod push;
 mod slack;
 mod sms;
+mod telegram;
+mod whatsapp;
 
 pub use ask_orchestrator::send_to_all_and_wait_first_reply;
 pub use console::ConsoleNotifier;
@@ -60,6 +62,8 @@ pub use email::EmailNotifier;
 pub use push::PushNotifier;
 pub use slack::SlackNotifier;
 pub use sms::SmsNotifier;
+pub use telegram::TelegramNotifier;
+pub use whatsapp::WhatsAppNotifier;
 
 use crate::error::Result;
 use crate::reports::Report;
@@ -75,8 +79,10 @@ pub(crate) fn get_source_emoji(source: &str) -> &'static str {
         "sentry" => "\u{1F534}", // red circle
         "github" => "\u{1F419}", // octopus
         "jira" => "\u{1F3AB}",   // ticket
-        "slack" => "\u{1F4AC}",  // speech balloon
-        _ => "\u{1F4CC}",        // pushpin
+        "slack" => "\u{1F4AC}",     // speech balloon
+        "whatsapp" => "\u{1F4F1}", // mobile phone
+        "telegram" => "\u{2708}",  // airplane/paper plane
+        _ => "\u{1F4CC}",          // pushpin
     }
 }
 

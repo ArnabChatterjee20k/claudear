@@ -60,7 +60,6 @@ pub mod watcher;
 pub mod webhook;
 
 pub use config::{CascadeConfig, CodeIndexConfig, Config, EvaluationConfig, RetryConfig};
-pub use secret::SecretValue;
 pub use discord::{DiscordClient, ThreadManager, ThreadState};
 pub use error::{Error, Result};
 pub use evaluation::{
@@ -79,6 +78,7 @@ pub use scm::{
     PrReviewState, PrStatus, PrStatusUpdate, PrSummary, RemoteRepo, ReviewComment, ReviewEvent,
     ReviewUser, ReviewWatcher, ScmProvider, ScmRelease,
 };
+pub use secret::SecretValue;
 // Backward-compat alias
 pub use github_app::{
     AppManifest, AppPermissions, CachedToken, GitHubAppAuth, GitHubAppClient, HookAttributes,
@@ -100,8 +100,10 @@ pub use reports::{Report, ReportFrequency, ReportGenerator, ReportSchedule, Repo
 pub use retry::{RetryDecision, RetryManager};
 pub use scm::GitHubUser;
 pub use storage::{
-    classify_error, compute_error_hash, AnalyticsService, FixAttemptTracker, SqliteTracker,
-    StoredDependency, StoredRepository, TimePeriod, TrendAnalysis, TrendDirection,
+    classify_error, compute_error_hash, AnalyticsService, FixAttemptTracker, StoredDependency,
+    StoredRepository, TimePeriod, TrendAnalysis, TrendDirection,
 };
+#[cfg(feature = "sqlite")]
+pub use storage::{SqliteTracker, is_vectorlite_available, try_load_vectorlite};
 pub use types::*;
 pub use users::{ResolvedUser, UserRegistry};

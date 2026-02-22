@@ -135,7 +135,8 @@ impl SlackSource {
         let bot_token = self
             .config
             .bot_token
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .ok_or_else(|| Error::config("Slack bot_token is required for source polling"))?;
 
         let mut url = format!(
@@ -282,7 +283,8 @@ impl IssueSource for SlackSource {
         let bot_token = self
             .config
             .bot_token
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .ok_or_else(|| Error::config("Slack bot_token is required to create an issue"))?;
 
         let channel_id = self
@@ -302,7 +304,7 @@ impl IssueSource for SlackSource {
         if let Some(ref webhook_url) = self.config.webhook_url {
             let resp = self
                 .client
-                .post(webhook_url)
+                .post(webhook_url.expose())
                 .json(&serde_json::json!({ "text": content }))
                 .send()
                 .await
@@ -424,7 +426,8 @@ impl IssueSource for SlackSource {
         let bot_token = self
             .config
             .bot_token
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .ok_or_else(|| Error::config("Slack bot_token is required to fetch an issue"))?;
 
         // Use conversations.history with oldest=ts&latest=ts&inclusive=true to fetch
@@ -467,7 +470,7 @@ mod tests {
 
     fn make_config() -> SlackConfig {
         SlackConfig {
-            bot_token: Some("xoxb-test-token".to_string()),
+            bot_token: Some("xoxb-test-token".into()),
             channel_id: Some("C12345".to_string()),
             source_enabled: true,
             listen_channel_id: None,
@@ -1278,7 +1281,7 @@ mod tests {
     fn test_new_creates_source_with_defaults() {
         let source = SlackSource::new(make_config());
         assert!(source.last_seen_ts.read().unwrap().is_none());
-        assert_eq!(source.config.bot_token.as_deref(), Some("xoxb-test-token"));
+        assert_eq!(source.config.bot_token.as_ref().map(|s| s.expose()), Some("xoxb-test-token"));
     }
 
     #[test]
@@ -1411,7 +1414,7 @@ mod tests {
     #[test]
     fn test_slack_config_field_access() {
         let config = SlackConfig {
-            bot_token: Some("xoxb-abc-123".to_string()),
+            bot_token: Some("xoxb-abc-123".into()),
             channel_id: Some("C_MAIN".to_string()),
             source_enabled: true,
             listen_channel_id: Some("C_LISTEN".to_string()),
@@ -1419,7 +1422,7 @@ mod tests {
             poll_interval_ms: Some(5000),
             ..Default::default()
         };
-        assert_eq!(config.bot_token.as_deref(), Some("xoxb-abc-123"));
+        assert_eq!(config.bot_token.as_ref().map(|s| s.expose()), Some("xoxb-abc-123"));
         assert_eq!(config.channel_id.as_deref(), Some("C_MAIN"));
         assert!(config.source_enabled);
         assert_eq!(config.listen_channel_id.as_deref(), Some("C_LISTEN"));
@@ -1614,7 +1617,7 @@ mod tests {
     #[test]
     fn test_new_source_config_preserved() {
         let config = SlackConfig {
-            bot_token: Some("xoxb-test-123".to_string()),
+            bot_token: Some("xoxb-test-123".into()),
             channel_id: Some("C_TEST".to_string()),
             source_enabled: true,
             listen_channel_id: Some("C_LISTEN".to_string()),
@@ -1623,7 +1626,7 @@ mod tests {
             ..Default::default()
         };
         let source = SlackSource::new(config);
-        assert_eq!(source.config.bot_token.as_deref(), Some("xoxb-test-123"));
+        assert_eq!(source.config.bot_token.as_ref().map(|s| s.expose()), Some("xoxb-test-123"));
         assert_eq!(source.config.workspace.as_deref(), Some("testws"));
         assert_eq!(source.config.poll_interval_ms, Some(10000));
     }

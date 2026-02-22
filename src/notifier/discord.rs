@@ -104,7 +104,8 @@ impl DiscordNotifier<ReqwestDiscordWebhookClient> {
     pub fn new(config: DiscordConfig, user_registry: UserRegistry) -> Self {
         let bot_client = config
             .bot_token
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .filter(|t| !t.is_empty())
             .and_then(|token| DiscordClient::new(token).ok());
         Self {
@@ -138,7 +139,8 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     pub fn with_http_client(config: DiscordConfig, http: H) -> Self {
         let bot_client = config
             .bot_token
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .filter(|t| !t.is_empty())
             .and_then(|token| DiscordClient::new(token).ok());
         Self {
@@ -157,7 +159,8 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     ) -> Self {
         let bot_client = config
             .bot_token
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .filter(|t| !t.is_empty())
             .and_then(|token| DiscordClient::new(token).ok());
         Self {
@@ -171,7 +174,7 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     async fn send(&self, message: DiscordMessage) -> Result<()> {
         if let Some(ref webhook_url) = self.config.webhook_url {
             let body = serde_json::to_value(&message)?;
-            let response = self.http.post_json(webhook_url, &body).await?;
+            let response = self.http.post_json(webhook_url.expose(), &body).await?;
 
             if response.status < 200 || response.status >= 300 {
                 return Err(Error::notifier(
@@ -199,7 +202,7 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         self.config
             .bot_token
             .as_ref()
-            .map(|v| !v.is_empty())
+            .map(|v| !v.expose().is_empty())
             .unwrap_or(false)
             && self
                 .config
@@ -1145,7 +1148,7 @@ mod tests {
     #[test]
     fn test_user_mention() {
         let config_with_id = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: Some("123456".to_string()),
             ..Default::default()
         };
@@ -1153,7 +1156,7 @@ mod tests {
         assert_eq!(notifier.get_user_mention(), Some("<@123456>".to_string()));
 
         let config_without_id = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
             ..Default::default()
         };
@@ -1164,7 +1167,7 @@ mod tests {
     #[test]
     fn test_is_enabled() {
         let enabled_config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
             ..Default::default()
         };
@@ -1185,7 +1188,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: None,
             user_id: None,
-            bot_token: Some("bot-token".to_string()),
+            bot_token: Some("bot-token".into()),
             channel_id: Some("channel-123".to_string()),
             ..Default::default()
         };
@@ -1198,7 +1201,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: None,
             user_id: None,
-            bot_token: Some("bot-token".to_string()),
+            bot_token: Some("bot-token".into()),
             channel_id: None,
             ..Default::default()
         };
@@ -1224,7 +1227,7 @@ mod tests {
         let config = DiscordConfig {
             webhook_url: None,
             user_id: None,
-            bot_token: Some("".to_string()),
+            bot_token: Some("".into()),
             channel_id: Some("channel-123".to_string()),
             ..Default::default()
         };
@@ -1426,7 +1429,7 @@ mod tests {
     #[tokio::test]
     async fn test_notify_urgent_issues_empty() {
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
             ..Default::default()
         };
@@ -1495,7 +1498,7 @@ mod tests {
 
     fn enabled_config() -> DiscordConfig {
         DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: None,
             ..Default::default()
         }
@@ -1503,7 +1506,7 @@ mod tests {
 
     fn enabled_config_with_user() -> DiscordConfig {
         DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: Some("987654321".to_string()),
             ..Default::default()
         }
@@ -1912,7 +1915,7 @@ mod tests {
         );
         let registry = crate::users::UserRegistry::new(users);
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: None,
             ..Default::default()
         };
@@ -1938,7 +1941,7 @@ mod tests {
         );
         let registry = crate::users::UserRegistry::new(users);
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: Some("999999999".to_string()),
             ..Default::default()
         };
@@ -1957,7 +1960,7 @@ mod tests {
         let mock = MockDiscordWebhookClient::success();
         let registry = crate::users::UserRegistry::new(std::collections::HashMap::new());
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: Some("999999999".to_string()),
             ..Default::default()
         };
@@ -1982,7 +1985,7 @@ mod tests {
         );
         let registry = crate::users::UserRegistry::new(users);
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: Some("999999999".to_string()),
             ..Default::default()
         };
@@ -2020,7 +2023,7 @@ mod tests {
         let mock = MockDiscordWebhookClient::success();
         let registry = crate::users::UserRegistry::new(std::collections::HashMap::new());
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: Some("999999999".to_string()),
             ..Default::default()
         };
@@ -2147,9 +2150,9 @@ mod tests {
     #[test]
     fn test_supports_replies_true_when_both_set() {
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
-            bot_token: Some("bot-token".to_string()),
+            bot_token: Some("bot-token".into()),
             channel_id: Some("channel-123".to_string()),
             ..Default::default()
         };
@@ -2160,7 +2163,7 @@ mod tests {
     #[test]
     fn test_supports_replies_false_when_no_bot_token() {
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
             bot_token: None,
             channel_id: Some("channel-123".to_string()),
@@ -2173,9 +2176,9 @@ mod tests {
     #[test]
     fn test_supports_replies_false_when_no_channel_id() {
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
-            bot_token: Some("bot-token".to_string()),
+            bot_token: Some("bot-token".into()),
             channel_id: None,
             ..Default::default()
         };
@@ -2186,9 +2189,9 @@ mod tests {
     #[test]
     fn test_supports_replies_false_when_empty_bot_token() {
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
-            bot_token: Some("".to_string()),
+            bot_token: Some("".into()),
             channel_id: Some("channel-123".to_string()),
             ..Default::default()
         };
@@ -2199,9 +2202,9 @@ mod tests {
     #[test]
     fn test_supports_replies_false_when_empty_channel_id() {
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
-            bot_token: Some("bot-token".to_string()),
+            bot_token: Some("bot-token".into()),
             channel_id: Some("".to_string()),
             ..Default::default()
         };
@@ -2212,7 +2215,7 @@ mod tests {
     #[test]
     fn test_get_user_mention_for_issue_no_resolved_user_no_global() {
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
             ..Default::default()
         };
@@ -2233,7 +2236,7 @@ mod tests {
         );
         let registry = crate::users::UserRegistry::new(users);
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: Some("fallback".to_string()),
             ..Default::default()
         };
@@ -2914,7 +2917,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_question_replies_no_bot_token_returns_empty() {
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: None,
             bot_token: None,
             channel_id: Some("channel-123".to_string()),
@@ -2934,9 +2937,9 @@ mod tests {
     #[tokio::test]
     async fn test_poll_question_replies_empty_bot_token_returns_empty() {
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: None,
-            bot_token: Some("".to_string()),
+            bot_token: Some("".into()),
             channel_id: Some("channel-123".to_string()),
             ..Default::default()
         };
@@ -2954,9 +2957,9 @@ mod tests {
     #[tokio::test]
     async fn test_poll_question_replies_no_channel_id_returns_empty() {
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: None,
-            bot_token: Some("valid-token".to_string()),
+            bot_token: Some("valid-token".into()),
             channel_id: None,
             ..Default::default()
         };
@@ -2974,9 +2977,9 @@ mod tests {
     #[tokio::test]
     async fn test_poll_question_replies_empty_channel_id_returns_empty() {
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: None,
-            bot_token: Some("valid-token".to_string()),
+            bot_token: Some("valid-token".into()),
             channel_id: Some("".to_string()),
             ..Default::default()
         };
@@ -3003,7 +3006,7 @@ mod tests {
         );
         let registry = crate::users::UserRegistry::new(users);
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: Some("global-id".to_string()),
             ..Default::default()
         };
@@ -3024,7 +3027,7 @@ mod tests {
     #[test]
     fn test_get_target_discord_id_for_issue_fallback_to_global() {
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: Some("global-id".to_string()),
             ..Default::default()
         };
@@ -3050,7 +3053,7 @@ mod tests {
         );
         let registry = crate::users::UserRegistry::new(users);
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: Some("global-id".to_string()),
             ..Default::default()
         };
@@ -3071,7 +3074,7 @@ mod tests {
     #[test]
     fn test_get_target_discord_id_for_issue_no_user_at_all() {
         let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
+            webhook_url: Some("https://example.com".into()),
             user_id: None,
             ..Default::default()
         };
@@ -3277,7 +3280,7 @@ mod tests {
         );
         let registry = crate::users::UserRegistry::new(users);
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: Some("fallback-id".to_string()),
             ..Default::default()
         };
@@ -3825,9 +3828,9 @@ mod tests {
     async fn test_send_prefers_webhook_when_both_configured() {
         let mock = MockDiscordWebhookClient::success();
         let config = DiscordConfig {
-            webhook_url: Some("https://discord.com/api/webhooks/123/abc".to_string()),
+            webhook_url: Some("https://discord.com/api/webhooks/123/abc".into()),
             user_id: None,
-            bot_token: Some("bot-token".to_string()),
+            bot_token: Some("bot-token".into()),
             channel_id: Some("channel-123".to_string()),
             ..Default::default()
         };

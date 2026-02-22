@@ -13,7 +13,7 @@
 use crate::error::Result;
 use crate::release::ReleaseClient;
 use crate::repo::{DependencyType, RepoRelationships};
-use crate::storage::SqliteTracker;
+use crate::storage::FixAttemptTracker;
 use crate::types::{RegressionWatch, RegressionWatchStatus, ReleaseTracking};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub struct ReleaseTrackerConfig {
 /// Tracks releases to detect when bug fixes are included in production.
 pub struct ReleaseTracker<C: crate::github::HttpClient = crate::github::ReqwestHttpClient> {
     client: ReleaseClient<C>,
-    tracker: Arc<SqliteTracker>,
+    tracker: Arc<dyn FixAttemptTracker>,
     config: ReleaseTrackerConfig,
     /// Dependency graph for tracing fix propagation.
     relationships: RepoRelationships,
@@ -40,7 +40,7 @@ pub struct ReleaseTracker<C: crate::github::HttpClient = crate::github::ReqwestH
 
 impl ReleaseTracker<crate::github::ReqwestHttpClient> {
     /// Create a new release tracker with the default HTTP client.
-    pub fn new(token: impl Into<String>, tracker: Arc<SqliteTracker>) -> Self {
+    pub fn new(token: impl Into<String>, tracker: Arc<dyn FixAttemptTracker>) -> Self {
         Self {
             client: ReleaseClient::new(token),
             tracker,
@@ -52,7 +52,7 @@ impl ReleaseTracker<crate::github::ReqwestHttpClient> {
     /// Create a new release tracker with custom configuration.
     pub fn with_config(
         token: impl Into<String>,
-        tracker: Arc<SqliteTracker>,
+        tracker: Arc<dyn FixAttemptTracker>,
         config: ReleaseTrackerConfig,
     ) -> Self {
         Self {
@@ -66,7 +66,7 @@ impl ReleaseTracker<crate::github::ReqwestHttpClient> {
     /// Create a new release tracker with custom configuration and relationships.
     pub fn with_relationships(
         token: impl Into<String>,
-        tracker: Arc<SqliteTracker>,
+        tracker: Arc<dyn FixAttemptTracker>,
         config: ReleaseTrackerConfig,
         relationships: RepoRelationships,
     ) -> Self {
@@ -83,7 +83,7 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
     /// Create a new release tracker with a custom HTTP client.
     pub fn with_http_client(
         client: ReleaseClient<C>,
-        tracker: Arc<SqliteTracker>,
+        tracker: Arc<dyn FixAttemptTracker>,
         config: ReleaseTrackerConfig,
     ) -> Self {
         Self {
@@ -97,7 +97,7 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
     /// Create a new release tracker with a custom HTTP client and relationships.
     pub fn with_http_client_and_relationships(
         client: ReleaseClient<C>,
-        tracker: Arc<SqliteTracker>,
+        tracker: Arc<dyn FixAttemptTracker>,
         config: ReleaseTrackerConfig,
         relationships: RepoRelationships,
     ) -> Self {
@@ -627,7 +627,7 @@ mod tests {
     use super::*;
     use crate::http::HttpClient;
     use crate::http::HttpResponse;
-    use crate::storage::FixAttemptTracker;
+    use crate::storage::{FixAttemptTracker, SqliteTracker};
     use crate::types::IssueType;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};

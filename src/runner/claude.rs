@@ -1,9 +1,11 @@
 //! Claude CLI runner for executing fixes.
 
+use super::{AgentRunner, ProviderCapabilities};
+use async_trait::async_trait;
 use crate::error::{Error, Result};
 use crate::storage::FixAttemptTracker;
 use crate::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
-use crate::types::{ActivityLogEntry, BlockingQuestion, ClaudeExecution, ClaudeResult, Issue};
+use crate::types::{ActivityLogEntry, BlockingQuestion, AgentExecution, AgentResult, Issue};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -195,7 +197,7 @@ impl Default for ClaudeRunnerConfig {
 }
 
 /// Runs Claude Code to fix issues.
-pub struct ClaudeRunner {
+pub struct ClaudeAgentRunner {
     config: ClaudeRunnerConfig,
     template_renderer: TemplateRenderer,
     tracker: Arc<dyn FixAttemptTracker>,
@@ -204,7 +206,7 @@ pub struct ClaudeRunner {
     base_env: HashMap<String, String>,
 }
 
-impl ClaudeRunner {
+impl ClaudeAgentRunner {
     /// Create a new Claude runner.
     pub fn new(config: ClaudeRunnerConfig, tracker: Arc<dyn FixAttemptTracker>) -> Self {
         let template_renderer = TemplateRenderer::new();
@@ -233,7 +235,7 @@ impl ClaudeRunner {
         issue: &Issue,
         context: &str,
         project_dir: &Path,
-    ) -> Result<ClaudeResult> {
+    ) -> Result<AgentResult> {
         let prompt = self.build_prompt(issue, context, project_dir);
         self.execute(&prompt, Some(issue), project_dir).await
     }
@@ -244,7 +246,7 @@ impl ClaudeRunner {
         issue_identifier: &str,
         issue_url: &str,
         project_dir: &Path,
-    ) -> Result<ClaudeResult> {
+    ) -> Result<AgentResult> {
         tracing::info!(component = "claude", issue_id = %issue_identifier, "Running /issue skill");
 
         let mut env = self.base_env.clone();
@@ -261,7 +263,7 @@ impl ClaudeRunner {
     }
 
     /// Run Claude Code with a custom prompt.
-    pub async fn run_custom(&self, prompt: &str, project_dir: &Path) -> Result<ClaudeResult> {
+    pub async fn run_custom(&self, prompt: &str, project_dir: &Path) -> Result<AgentResult> {
         self.execute(prompt, None, project_dir).await
     }
 
@@ -307,59 +309,16 @@ The PR title should include the issue ID: {}
         template_loader.load_agent_md()
     }
 
-    /// Build a prompt for the given issue and context.
-    ///
-    /// This is public to allow callers to get the prompt string for analytics/logging.
-    pub fn build_prompt_for_issue(
-        &self,
-        issue: &Issue,
-        context: &str,
-        project_dir: &Path,
-    ) -> String {
-        self.build_prompt(issue, context, project_dir)
-    }
-
-    /// Best-effort detection for Claude/API rate limit failures.
+    /// Best-effort detection for rate limit failures.
+    /// Delegates to the free function in the parent module.
     pub fn is_rate_limit_error(message: &str) -> bool {
-        let lower = message.to_lowercase();
-        Self::is_rate_limit_error_lower(&lower)
-    }
-
-    /// Rate-limit detection on an already-lowercased string (avoids double allocation).
-    fn is_rate_limit_error_lower(lower: &str) -> bool {
-        [
-            "rate limit",
-            "ratelimit",
-            "too many requests",
-            "429",
-            "quota exceeded",
-            "resource exhausted",
-            "retry-after",
-            "try again later",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
+        super::is_rate_limit_error(message)
     }
 
     /// Detect "hard" runtime failures that should be escalated immediately.
+    /// Delegates to the free function in the parent module.
     pub fn is_hard_error(message: &str) -> bool {
-        let lower = message.to_lowercase();
-        Self::is_rate_limit_error_lower(&lower)
-            || [
-                "failed to spawn claude",
-                "failed to wait for claude",
-                "failed to capture stdout",
-                "failed to capture stderr",
-                "process timed out",
-                "timed out after",
-                "connection reset",
-                "service unavailable",
-                "internal server error",
-                "network error",
-                "broken pipe",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle))
+        super::is_hard_error(message)
     }
 
     fn sanitize_label(label: &str) -> String {
@@ -551,7 +510,7 @@ The PR title should include the issue ID: {}
         prompt: &str,
         issue: Option<&Issue>,
         project_dir: &Path,
-    ) -> Result<ClaudeResult> {
+    ) -> Result<AgentResult> {
         let (env, label) = self.prepare_env_and_label(issue);
         self.execute_with_env(prompt, label, env, project_dir).await
     }
@@ -562,21 +521,8 @@ The PR title should include the issue ID: {}
         label: &str,
         env: HashMap<String, String>,
         project_dir: &Path,
-    ) -> Result<ClaudeResult> {
+    ) -> Result<AgentResult> {
         self.execute_with_env_and_attempt(prompt, label, env, None, project_dir)
-            .await
-    }
-
-    /// Execute Claude with optional attempt ID for analytics tracking.
-    pub async fn execute_with_attempt(
-        &self,
-        prompt: &str,
-        issue: Option<&Issue>,
-        attempt_id: Option<i64>,
-        project_dir: &Path,
-    ) -> Result<ClaudeResult> {
-        let (env, label) = self.prepare_env_and_label(issue);
-        self.execute_with_env_and_attempt(prompt, label, env, attempt_id, project_dir)
             .await
     }
 
@@ -587,9 +533,9 @@ The PR title should include the issue ID: {}
         env: HashMap<String, String>,
         attempt_id: Option<i64>,
         project_dir: &Path,
-    ) -> Result<ClaudeResult> {
+    ) -> Result<AgentResult> {
         // Create execution record for analytics
-        let mut execution = ClaudeExecution::new();
+        let mut execution = AgentExecution::new();
         if let Some(id) = attempt_id {
             execution = execution.with_attempt_id(id);
         }
@@ -822,7 +768,7 @@ The PR title should include the issue ID: {}
                     Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(e) => {
-                        ClaudeRunner::append_execution_event(
+                        ClaudeAgentRunner::append_execution_event(
                             &stdout_event_writer,
                             label_stdout.as_str(),
                             "stdout_read_error",
@@ -842,7 +788,7 @@ The PR title should include the issue ID: {}
                 };
 
                 line_number = line_number.saturating_add(1);
-                ClaudeRunner::append_execution_event(
+                ClaudeAgentRunner::append_execution_event(
                     &stdout_event_writer,
                     label_stdout.as_str(),
                     "stdout_line",
@@ -871,7 +817,7 @@ The PR title should include the issue ID: {}
                                                         .is_err()
                                                 {
                                                     write_failed = true;
-                                                    ClaudeRunner::append_execution_event(
+                                                    ClaudeAgentRunner::append_execution_event(
                                                         &stdout_event_writer,
                                                         label_stdout.as_str(),
                                                         "stdout_log_write_failed",
@@ -949,7 +895,7 @@ The PR title should include the issue ID: {}
                 }
             }
 
-            ClaudeRunner::append_execution_event(
+            ClaudeAgentRunner::append_execution_event(
                 &stdout_event_writer,
                 label_stdout.as_str(),
                 "stdout_stream_closed",
@@ -1007,7 +953,7 @@ The PR title should include the issue ID: {}
                     Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(e) => {
-                        ClaudeRunner::append_execution_event(
+                        ClaudeAgentRunner::append_execution_event(
                             &stderr_event_writer,
                             label_stderr.as_str(),
                             "stderr_read_error",
@@ -1027,7 +973,7 @@ The PR title should include the issue ID: {}
                 };
 
                 line_number = line_number.saturating_add(1);
-                ClaudeRunner::append_execution_event(
+                ClaudeAgentRunner::append_execution_event(
                     &stderr_event_writer,
                     label_stderr.as_str(),
                     "stderr_line",
@@ -1053,7 +999,7 @@ The PR title should include the issue ID: {}
                             || file.write_all(b"\n").await.is_err())
                     {
                         write_failed = true;
-                        ClaudeRunner::append_execution_event(
+                        ClaudeAgentRunner::append_execution_event(
                             &stderr_event_writer,
                             label_stderr.as_str(),
                             "stderr_log_write_failed",
@@ -1071,7 +1017,7 @@ The PR title should include the issue ID: {}
                 output.push_str(&line);
                 output.push('\n');
             }
-            ClaudeRunner::append_execution_event(
+            ClaudeAgentRunner::append_execution_event(
                 &stderr_event_writer,
                 label_stderr.as_str(),
                 "stderr_stream_closed",
@@ -1199,7 +1145,7 @@ The PR title should include the issue ID: {}
                 }
 
                 // Return a result indicating timeout
-                return Ok(ClaudeResult {
+                return Ok(AgentResult {
                     success: false,
                     output: String::new(),
                     pr_url: None,
@@ -1444,7 +1390,7 @@ The PR title should include the issue ID: {}
             .await;
         }
 
-        Ok(ClaudeResult {
+        Ok(AgentResult {
             success: result_success,
             output: result_output,
             pr_url,
@@ -1535,6 +1481,44 @@ The PR title should include the issue ID: {}
         }
 
         None
+    }
+}
+
+#[async_trait]
+impl AgentRunner for ClaudeAgentRunner {
+    fn name(&self) -> &str {
+        "claude"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            structured_output: true,
+            tool_permissions: true,
+            custom_instructions: true,
+            streaming_events: true,
+            cost_reporting: true,
+        }
+    }
+
+    fn build_prompt_for_issue(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> String {
+        self.build_prompt(issue, context, project_dir)
+    }
+
+    async fn execute_with_attempt(
+        &self,
+        prompt: &str,
+        issue: Option<&Issue>,
+        attempt_id: Option<i64>,
+        project_dir: &Path,
+    ) -> Result<AgentResult> {
+        let (env, label) = self.prepare_env_and_label(issue);
+        self.execute_with_env_and_attempt(prompt, label, env, attempt_id, project_dir)
+            .await
     }
 }
 
@@ -1742,7 +1726,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_no_question_protocol() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "context", std::path::Path::new("/tmp"));
         assert!(!prompt.contains("CLAUDEAR_QUESTION"));
@@ -1750,7 +1734,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_no_pr_url_instruction() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "context", std::path::Path::new("/tmp"));
         assert!(!prompt.contains("PR_URL:"));
@@ -1760,7 +1744,7 @@ mod tests {
     fn test_extract_pr_url_explicit() {
         let output = "Some output\nPR_URL: https://github.com/org/repo/pull/123\nMore output";
         assert_eq!(
-            ClaudeRunner::extract_pr_url(output),
+            ClaudeAgentRunner::extract_pr_url(output),
             Some("https://github.com/org/repo/pull/123".to_string())
         );
     }
@@ -1769,7 +1753,7 @@ mod tests {
     fn test_extract_pr_url_github() {
         let output = "Created PR at https://github.com/myorg/myrepo/pull/456 successfully";
         assert_eq!(
-            ClaudeRunner::extract_pr_url(output),
+            ClaudeAgentRunner::extract_pr_url(output),
             Some("https://github.com/myorg/myrepo/pull/456".to_string())
         );
     }
@@ -1778,7 +1762,7 @@ mod tests {
     fn test_extract_pr_url_gitlab() {
         let output = "MR created: https://gitlab.com/group/project/-/merge_requests/789";
         assert_eq!(
-            ClaudeRunner::extract_pr_url(output),
+            ClaudeAgentRunner::extract_pr_url(output),
             Some("https://gitlab.com/group/project/-/merge_requests/789".to_string())
         );
     }
@@ -1786,12 +1770,12 @@ mod tests {
     #[test]
     fn test_extract_pr_url_none() {
         let output = "No PR URL in this output";
-        assert_eq!(ClaudeRunner::extract_pr_url(output), None);
+        assert_eq!(ClaudeAgentRunner::extract_pr_url(output), None);
     }
 
     #[test]
     fn test_build_prompt() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
 
         let issue = Issue::new(
             "123",
@@ -1812,7 +1796,7 @@ mod tests {
     #[test]
     fn test_extract_pr_url_with_trailing_punctuation() {
         let output = "Created PR: https://github.com/org/repo/pull/123.";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_some());
         let url = url.unwrap();
         assert!(url.starts_with("https://github.com/org/repo/pull/123"));
@@ -1821,7 +1805,7 @@ mod tests {
     #[test]
     fn test_extract_pr_url_multiple_urls() {
         let output = "First PR: https://github.com/org/repo1/pull/100\nSecond PR: https://github.com/org/repo2/pull/200";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_some());
         assert!(url.unwrap().contains("/pull/"));
     }
@@ -1829,7 +1813,7 @@ mod tests {
     #[test]
     fn test_extract_pr_url_explicit_takes_precedence() {
         let output = "Random text https://github.com/org/repo/pull/999\nPR_URL: https://github.com/org/main/pull/123";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert_eq!(
             url,
             Some("https://github.com/org/main/pull/123".to_string())
@@ -1839,14 +1823,14 @@ mod tests {
     #[test]
     fn test_extract_pr_url_with_query_params() {
         let output = "PR at https://github.com/org/repo/pull/123?diff=split created";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_some());
     }
 
     #[test]
     fn test_extract_pr_url_gitlab_nested_groups() {
         let output = "MR: https://gitlab.com/group/subgroup/project/-/merge_requests/42";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert_eq!(
             url,
             Some("https://gitlab.com/group/subgroup/project/-/merge_requests/42".to_string())
@@ -1855,19 +1839,19 @@ mod tests {
 
     #[test]
     fn test_extract_pr_url_empty_string() {
-        assert_eq!(ClaudeRunner::extract_pr_url(""), None);
+        assert_eq!(ClaudeAgentRunner::extract_pr_url(""), None);
     }
 
     #[test]
     fn test_extract_pr_url_similar_but_not_valid() {
         let output = "See https://github.com/org/repo/issues/123";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_none());
     }
 
     #[test]
     fn test_build_prompt_sentry_source() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
 
         let issue = Issue::new(
             "456",
@@ -1890,7 +1874,7 @@ mod tests {
 
     #[test]
     fn test_claude_result_success() {
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: true,
             output: "Success output".to_string(),
             pr_url: Some("https://github.com/org/repo/pull/123".to_string()),
@@ -1906,7 +1890,7 @@ mod tests {
 
     #[test]
     fn test_claude_result_failure() {
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: false,
             output: "Error occurred".to_string(),
             pr_url: None,
@@ -1923,7 +1907,7 @@ mod tests {
     #[test]
     fn test_runner_config() {
         let config = ClaudeRunnerConfig::default();
-        let runner = ClaudeRunner::new_simple(config);
+        let runner = ClaudeAgentRunner::new_simple(config);
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "linear");
         let project_dir = std::path::Path::new("/path/to/project");
         let prompt = runner.build_prompt(&issue, "context", project_dir);
@@ -1932,7 +1916,7 @@ mod tests {
 
     #[test]
     fn test_claude_result_default_fields() {
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: false,
             output: String::new(),
             pr_url: None,
@@ -1959,20 +1943,20 @@ mod tests {
 
     #[test]
     fn test_extract_pr_url_whitespace_only() {
-        assert_eq!(ClaudeRunner::extract_pr_url("   \n\t  "), None);
+        assert_eq!(ClaudeAgentRunner::extract_pr_url("   \n\t  "), None);
     }
 
     #[test]
     fn test_extract_pr_url_github_enterprise() {
         let output = "PR at https://github.mycompany.com/org/repo/pull/99";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_none());
     }
 
     #[test]
     fn test_extract_pr_url_with_newlines() {
         let output = "PR created\n\nhttps://github.com/org/repo/pull/42\n\nDone";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_some());
         assert!(url.unwrap().contains("/pull/42"));
     }
@@ -1980,13 +1964,13 @@ mod tests {
     #[test]
     fn test_extract_pr_url_pr_url_colon_space() {
         let output = "PR_URL:   https://github.com/org/repo/pull/1  ";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert_eq!(url, Some("https://github.com/org/repo/pull/1".to_string()));
     }
 
     #[test]
     fn test_build_prompt_github_source() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "789",
             "#789",
@@ -2001,7 +1985,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_unknown_source() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "123",
             "JIRA-123",
@@ -2015,13 +1999,13 @@ mod tests {
 
     #[test]
     fn test_has_agent_md() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         assert!(!runner.has_agent_md(std::path::Path::new("/nonexistent/path")));
     }
 
     #[test]
     fn test_get_agent_md_nonexistent() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         assert!(runner
             .get_agent_md(std::path::Path::new("/nonexistent/path"))
             .is_none());
@@ -2030,7 +2014,7 @@ mod tests {
     #[test]
     fn test_claude_result_with_long_output() {
         let output = "x".repeat(10000);
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: true,
             output,
             pr_url: None,
@@ -2045,7 +2029,7 @@ mod tests {
 
     #[test]
     fn test_claude_result_with_empty_error() {
-        let result = ClaudeResult {
+        let result = AgentResult {
             success: false,
             output: "Output".to_string(),
             pr_url: None,
@@ -2061,14 +2045,14 @@ mod tests {
     #[test]
     fn test_extract_pr_url_case_sensitivity() {
         let output = "pr_url: https://github.com/org/repo/pull/1";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_some());
     }
 
     #[test]
     fn test_extract_pr_url_gitlab_with_path() {
         let output = "MR: https://gitlab.com/a/b/c/d/-/merge_requests/123";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert_eq!(
             url,
             Some("https://gitlab.com/a/b/c/d/-/merge_requests/123".to_string())
@@ -2088,7 +2072,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_empty_context() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Test", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "", std::path::Path::new("/tmp"));
         assert!(!prompt.is_empty());
@@ -2097,7 +2081,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_special_characters() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "1",
             "TEST-1",
@@ -2115,13 +2099,13 @@ mod tests {
 
     #[test]
     fn test_extract_pr_url_no_scheme() {
-        assert!(ClaudeRunner::extract_pr_url("github.com/org/repo/pull/123").is_none());
+        assert!(ClaudeAgentRunner::extract_pr_url("github.com/org/repo/pull/123").is_none());
     }
 
     #[test]
     fn test_extract_pr_url_http_not_https() {
         assert!(
-            ClaudeRunner::extract_pr_url("PR at http://github.com/org/repo/pull/123").is_none()
+            ClaudeAgentRunner::extract_pr_url("PR at http://github.com/org/repo/pull/123").is_none()
         );
     }
 
@@ -2129,14 +2113,14 @@ mod tests {
     fn test_extract_pr_url_multiline_pr_url() {
         let output = "Creating PR...\nPR_URL: https://github.com/org/repo/pull/42\nDone!";
         assert_eq!(
-            ClaudeRunner::extract_pr_url(output),
+            ClaudeAgentRunner::extract_pr_url(output),
             Some("https://github.com/org/repo/pull/42".to_string())
         );
     }
 
     #[test]
     fn test_build_prompt_multiline_context() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -2148,7 +2132,7 @@ mod tests {
 
     #[test]
     fn test_extract_pr_url_gitlab_self_hosted() {
-        let url = ClaudeRunner::extract_pr_url(
+        let url = ClaudeAgentRunner::extract_pr_url(
             "MR: https://gitlab.mycompany.com/group/project/-/merge_requests/123",
         );
         assert_eq!(
@@ -2159,13 +2143,13 @@ mod tests {
 
     #[test]
     fn test_extract_pr_url_github_pr_zero() {
-        assert!(ClaudeRunner::extract_pr_url("PR: https://github.com/org/repo/pull/0").is_some());
+        assert!(ClaudeAgentRunner::extract_pr_url("PR: https://github.com/org/repo/pull/0").is_some());
     }
 
     #[test]
     fn test_extract_pr_url_very_long_pr_number() {
         assert_eq!(
-            ClaudeRunner::extract_pr_url("PR: https://github.com/org/repo/pull/999999999999"),
+            ClaudeAgentRunner::extract_pr_url("PR: https://github.com/org/repo/pull/999999999999"),
             Some("https://github.com/org/repo/pull/999999999999".to_string())
         );
     }
@@ -2173,7 +2157,7 @@ mod tests {
     #[test]
     fn test_extract_pr_url_org_with_dashes() {
         assert_eq!(
-            ClaudeRunner::extract_pr_url(
+            ClaudeAgentRunner::extract_pr_url(
                 "PR: https://github.com/my-org-name/my-repo-name/pull/123"
             ),
             Some("https://github.com/my-org-name/my-repo-name/pull/123".to_string())
@@ -2183,7 +2167,7 @@ mod tests {
     #[test]
     fn test_extract_pr_url_org_with_dots() {
         assert_eq!(
-            ClaudeRunner::extract_pr_url("PR: https://github.com/org.name/repo.name/pull/123"),
+            ClaudeAgentRunner::extract_pr_url("PR: https://github.com/org.name/repo.name/pull/123"),
             Some("https://github.com/org.name/repo.name/pull/123".to_string())
         );
     }
@@ -2191,14 +2175,14 @@ mod tests {
     #[test]
     fn test_claude_result_pr_url_with_trailing_slash() {
         assert!(
-            ClaudeRunner::extract_pr_url("PR_URL: https://github.com/org/repo/pull/123/ Done")
+            ClaudeAgentRunner::extract_pr_url("PR_URL: https://github.com/org/repo/pull/123/ Done")
                 .is_some()
         );
     }
 
     #[test]
     fn test_build_prompt_unicode_context() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "1",
             "TEST-1",
@@ -2218,7 +2202,7 @@ mod tests {
     fn test_claude_runner_new_with_tracker() {
         use crate::storage::SqliteTracker;
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-        let runner = ClaudeRunner::new(ClaudeRunnerConfig::default(), tracker);
+        let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         assert!(!runner.has_agent_md(std::path::Path::new("/tmp")));
     }
 
@@ -2234,29 +2218,29 @@ mod tests {
 
     #[test]
     fn test_is_rate_limit_error_detection() {
-        assert!(ClaudeRunner::is_rate_limit_error(
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
             "Claude API returned 429 Too Many Requests"
         ));
-        assert!(ClaudeRunner::is_rate_limit_error("rate limit exceeded"));
-        assert!(!ClaudeRunner::is_rate_limit_error("cargo test failed"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("rate limit exceeded"));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error("cargo test failed"));
     }
 
     #[test]
     fn test_is_hard_error_detection() {
-        assert!(ClaudeRunner::is_hard_error(
+        assert!(ClaudeAgentRunner::is_hard_error(
             "Failed to spawn claude: No such file or directory"
         ));
-        assert!(ClaudeRunner::is_hard_error(
+        assert!(ClaudeAgentRunner::is_hard_error(
             "Process timed out after 3600 seconds"
         ));
-        assert!(ClaudeRunner::is_hard_error("429 too many requests"));
-        assert!(!ClaudeRunner::is_hard_error("tests failed"));
+        assert!(ClaudeAgentRunner::is_hard_error("429 too many requests"));
+        assert!(!ClaudeAgentRunner::is_hard_error("tests failed"));
     }
 
     #[test]
     fn test_extract_blocking_question_valid_payload() {
         let output = "some logs\nCLAUDEAR_QUESTION: {\"question\":\"Which branch?\",\"context\":\"unclear\",\"options\":[\"main\",\"develop\"],\"why\":\"need branch\"}\ndone";
-        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        let parsed = ClaudeAgentRunner::extract_blocking_question(output).unwrap();
         assert_eq!(parsed.question, "Which branch?");
         assert_eq!(parsed.context.as_deref(), Some("unclear"));
         assert_eq!(parsed.options, vec!["main", "develop"]);
@@ -2266,20 +2250,20 @@ mod tests {
     #[test]
     fn test_extract_blocking_question_ignores_malformed() {
         assert!(
-            ClaudeRunner::extract_blocking_question("CLAUDEAR_QUESTION: {not valid json}")
+            ClaudeAgentRunner::extract_blocking_question("CLAUDEAR_QUESTION: {not valid json}")
                 .is_none()
         );
     }
 
     #[test]
     fn test_extract_blocking_question_empty() {
-        assert!(ClaudeRunner::extract_blocking_question("").is_none());
+        assert!(ClaudeAgentRunner::extract_blocking_question("").is_none());
     }
 
     #[test]
     fn test_extract_blocking_question_only_required_field() {
         let output = "CLAUDEAR_QUESTION: {\"question\":\"minimal\"}";
-        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        let parsed = ClaudeAgentRunner::extract_blocking_question(output).unwrap();
         assert_eq!(parsed.question, "minimal");
         assert!(parsed.context.is_none());
         assert!(parsed.options.is_empty());
@@ -2288,102 +2272,102 @@ mod tests {
 
     #[test]
     fn test_truncate_shorter_than_max() {
-        assert_eq!(ClaudeRunner::truncate("hello", 100), "hello");
+        assert_eq!(ClaudeAgentRunner::truncate("hello", 100), "hello");
     }
 
     #[test]
     fn test_truncate_exactly_at_max() {
-        assert_eq!(ClaudeRunner::truncate("hello", 5), "hello");
+        assert_eq!(ClaudeAgentRunner::truncate("hello", 5), "hello");
     }
 
     #[test]
     fn test_truncate_one_byte_over_max() {
-        let result = ClaudeRunner::truncate("abcdef", 5);
+        let result = ClaudeAgentRunner::truncate("abcdef", 5);
         assert!(result.ends_with("..."));
         assert_eq!(result, "ab...");
     }
 
     #[test]
     fn test_truncate_multibyte_unicode_at_boundary() {
-        let result = ClaudeRunner::truncate("aéb", 3);
+        let result = ClaudeAgentRunner::truncate("aéb", 3);
         assert!(result.ends_with("..."));
         assert_eq!(result, "...");
     }
 
     #[test]
     fn test_truncate_empty_string_zero_max() {
-        assert_eq!(ClaudeRunner::truncate("", 0), "");
+        assert_eq!(ClaudeAgentRunner::truncate("", 0), "");
     }
 
     #[test]
     fn test_truncate_max_len_of_3() {
-        assert_eq!(ClaudeRunner::truncate("abcdef", 3), "...");
+        assert_eq!(ClaudeAgentRunner::truncate("abcdef", 3), "...");
     }
 
     #[test]
     fn test_truncate_max_len_of_2() {
-        assert_eq!(ClaudeRunner::truncate("abcdef", 2), "...");
+        assert_eq!(ClaudeAgentRunner::truncate("abcdef", 2), "...");
     }
 
     #[test]
     fn test_truncate_very_long_string() {
         let s = "a".repeat(10_000);
-        let result = ClaudeRunner::truncate(&s, 100);
+        let result = ClaudeAgentRunner::truncate(&s, 100);
         assert!(result.ends_with("..."));
         assert_eq!(result.len(), 100);
     }
 
     #[test]
     fn test_truncate_max_len_of_4() {
-        assert_eq!(ClaudeRunner::truncate("abcdef", 4), "a...");
+        assert_eq!(ClaudeAgentRunner::truncate("abcdef", 4), "a...");
     }
 
     #[test]
     fn test_sanitize_label_normal_alphanumeric() {
-        assert_eq!(ClaudeRunner::sanitize_label("hello123"), "hello123");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("hello123"), "hello123");
     }
 
     #[test]
     fn test_sanitize_label_special_characters() {
         assert_eq!(
-            ClaudeRunner::sanitize_label("hello world.foo/bar"),
+            ClaudeAgentRunner::sanitize_label("hello world.foo/bar"),
             "hello_world_foo_bar"
         );
     }
 
     #[test]
     fn test_sanitize_label_empty() {
-        assert_eq!(ClaudeRunner::sanitize_label(""), "custom");
+        assert_eq!(ClaudeAgentRunner::sanitize_label(""), "custom");
     }
 
     #[test]
     fn test_sanitize_label_longer_than_64_chars() {
-        let result = ClaudeRunner::sanitize_label(&"a".repeat(100));
+        let result = ClaudeAgentRunner::sanitize_label(&"a".repeat(100));
         assert_eq!(result.len(), 64);
     }
 
     #[test]
     fn test_sanitize_label_unicode_characters() {
-        assert_eq!(ClaudeRunner::sanitize_label("café☕日本"), "caf____");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("café☕日本"), "caf____");
     }
 
     #[test]
     fn test_sanitize_label_hyphens_and_underscores_preserved() {
         assert_eq!(
-            ClaudeRunner::sanitize_label("my-label_name"),
+            ClaudeAgentRunner::sanitize_label("my-label_name"),
             "my-label_name"
         );
     }
 
     #[test]
     fn test_sanitize_label_all_special_chars_non_empty() {
-        assert_eq!(ClaudeRunner::sanitize_label("@#$"), "___");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("@#$"), "___");
     }
 
     #[test]
     fn test_compose_failure_message_both_empty() {
         assert_eq!(
-            ClaudeRunner::compose_failure_message(1, "", ""),
+            ClaudeAgentRunner::compose_failure_message(1, "", ""),
             "Process exited with code 1"
         );
     }
@@ -2391,7 +2375,7 @@ mod tests {
     #[test]
     fn test_compose_failure_message_only_stderr() {
         assert_eq!(
-            ClaudeRunner::compose_failure_message(1, "", "error occurred"),
+            ClaudeAgentRunner::compose_failure_message(1, "", "error occurred"),
             "error occurred"
         );
     }
@@ -2399,7 +2383,7 @@ mod tests {
     #[test]
     fn test_compose_failure_message_only_stdout() {
         assert_eq!(
-            ClaudeRunner::compose_failure_message(1, "some output", ""),
+            ClaudeAgentRunner::compose_failure_message(1, "some output", ""),
             "Process exited with code 1. Output: some output"
         );
     }
@@ -2407,32 +2391,32 @@ mod tests {
     #[test]
     fn test_compose_failure_message_both_present_stderr_takes_priority() {
         assert_eq!(
-            ClaudeRunner::compose_failure_message(1, "stdout text", "stderr text"),
+            ClaudeAgentRunner::compose_failure_message(1, "stdout text", "stderr text"),
             "stderr text"
         );
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_in_stderr() {
-        let msg = ClaudeRunner::compose_failure_message(1, "", "rate limit exceeded");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "rate limit exceeded");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_in_stdout() {
-        let msg = ClaudeRunner::compose_failure_message(1, "429 too many requests", "");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "429 too many requests", "");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_in_combined() {
-        let msg = ClaudeRunner::compose_failure_message(1, "some output", "rate limit hit");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "some output", "rate limit hit");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_very_long_stderr_truncated() {
-        let msg = ClaudeRunner::compose_failure_message(1, "", &"e".repeat(5000));
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", &"e".repeat(5000));
         assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 3);
         assert!(msg.ends_with("..."));
     }
@@ -2440,204 +2424,204 @@ mod tests {
     #[test]
     fn test_compose_failure_message_whitespace_only_inputs() {
         assert_eq!(
-            ClaudeRunner::compose_failure_message(42, "   ", "  \n\t  "),
+            ClaudeAgentRunner::compose_failure_message(42, "   ", "  \n\t  "),
             "Process exited with code 42"
         );
     }
 
     #[test]
     fn test_is_rate_limit_error_rate_limit() {
-        assert!(ClaudeRunner::is_rate_limit_error("rate limit exceeded"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("rate limit exceeded"));
     }
 
     #[test]
     fn test_is_rate_limit_error_ratelimit() {
-        assert!(ClaudeRunner::is_rate_limit_error("ratelimit error"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("ratelimit error"));
     }
 
     #[test]
     fn test_is_rate_limit_error_too_many_requests() {
-        assert!(ClaudeRunner::is_rate_limit_error("too many requests"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("too many requests"));
     }
 
     #[test]
     fn test_is_rate_limit_error_429() {
-        assert!(ClaudeRunner::is_rate_limit_error("HTTP 429 returned"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("HTTP 429 returned"));
     }
 
     #[test]
     fn test_is_rate_limit_error_quota_exceeded() {
-        assert!(ClaudeRunner::is_rate_limit_error("quota exceeded for api"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("quota exceeded for api"));
     }
 
     #[test]
     fn test_is_rate_limit_error_resource_exhausted() {
-        assert!(ClaudeRunner::is_rate_limit_error("resource exhausted"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("resource exhausted"));
     }
 
     #[test]
     fn test_is_rate_limit_error_retry_after() {
-        assert!(ClaudeRunner::is_rate_limit_error("retry-after: 30 seconds"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("retry-after: 30 seconds"));
     }
 
     #[test]
     fn test_is_rate_limit_error_try_again_later() {
-        assert!(ClaudeRunner::is_rate_limit_error("please try again later"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("please try again later"));
     }
 
     #[test]
     fn test_is_rate_limit_error_case_insensitivity() {
-        assert!(ClaudeRunner::is_rate_limit_error("Rate Limit Exceeded"));
-        assert!(ClaudeRunner::is_rate_limit_error("RATE LIMIT"));
-        assert!(ClaudeRunner::is_rate_limit_error("RateLimit"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("Rate Limit Exceeded"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("RATE LIMIT"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("RateLimit"));
     }
 
     #[test]
     fn test_is_rate_limit_error_empty_string() {
-        assert!(!ClaudeRunner::is_rate_limit_error(""));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error(""));
     }
 
     #[test]
     fn test_is_rate_limit_error_substring_match() {
-        assert!(ClaudeRunner::is_rate_limit_error(
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
             "we hit a rate limit here"
         ));
     }
 
     #[test]
     fn test_is_rate_limit_error_unrelated_message() {
-        assert!(!ClaudeRunner::is_rate_limit_error(
+        assert!(!ClaudeAgentRunner::is_rate_limit_error(
             "compilation error in main.rs"
         ));
     }
 
     #[test]
     fn test_is_hard_error_failed_to_spawn_claude() {
-        assert!(ClaudeRunner::is_hard_error(
+        assert!(ClaudeAgentRunner::is_hard_error(
             "Failed to spawn claude: not found"
         ));
     }
 
     #[test]
     fn test_is_hard_error_failed_to_wait_for_claude() {
-        assert!(ClaudeRunner::is_hard_error("failed to wait for claude"));
+        assert!(ClaudeAgentRunner::is_hard_error("failed to wait for claude"));
     }
 
     #[test]
     fn test_is_hard_error_failed_to_capture_stdout() {
-        assert!(ClaudeRunner::is_hard_error("failed to capture stdout"));
+        assert!(ClaudeAgentRunner::is_hard_error("failed to capture stdout"));
     }
 
     #[test]
     fn test_is_hard_error_failed_to_capture_stderr() {
-        assert!(ClaudeRunner::is_hard_error("failed to capture stderr"));
+        assert!(ClaudeAgentRunner::is_hard_error("failed to capture stderr"));
     }
 
     #[test]
     fn test_is_hard_error_process_timed_out() {
-        assert!(ClaudeRunner::is_hard_error("process timed out"));
+        assert!(ClaudeAgentRunner::is_hard_error("process timed out"));
     }
 
     #[test]
     fn test_is_hard_error_timed_out_after() {
-        assert!(ClaudeRunner::is_hard_error("timed out after 3600 seconds"));
+        assert!(ClaudeAgentRunner::is_hard_error("timed out after 3600 seconds"));
     }
 
     #[test]
     fn test_is_hard_error_connection_reset() {
-        assert!(ClaudeRunner::is_hard_error("connection reset by peer"));
+        assert!(ClaudeAgentRunner::is_hard_error("connection reset by peer"));
     }
 
     #[test]
     fn test_is_hard_error_service_unavailable() {
-        assert!(ClaudeRunner::is_hard_error("503 service unavailable"));
+        assert!(ClaudeAgentRunner::is_hard_error("503 service unavailable"));
     }
 
     #[test]
     fn test_is_hard_error_internal_server_error() {
-        assert!(ClaudeRunner::is_hard_error("500 internal server error"));
+        assert!(ClaudeAgentRunner::is_hard_error("500 internal server error"));
     }
 
     #[test]
     fn test_is_hard_error_network_error() {
-        assert!(ClaudeRunner::is_hard_error("network error: timeout"));
+        assert!(ClaudeAgentRunner::is_hard_error("network error: timeout"));
     }
 
     #[test]
     fn test_is_hard_error_broken_pipe() {
-        assert!(ClaudeRunner::is_hard_error("broken pipe"));
+        assert!(ClaudeAgentRunner::is_hard_error("broken pipe"));
     }
 
     #[test]
     fn test_is_hard_error_rate_limit_is_also_hard() {
-        assert!(ClaudeRunner::is_hard_error("rate limit exceeded"));
-        assert!(ClaudeRunner::is_hard_error("429 too many requests"));
+        assert!(ClaudeAgentRunner::is_hard_error("rate limit exceeded"));
+        assert!(ClaudeAgentRunner::is_hard_error("429 too many requests"));
     }
 
     #[test]
     fn test_is_hard_error_case_insensitivity() {
-        assert!(ClaudeRunner::is_hard_error("FAILED TO SPAWN CLAUDE"));
-        assert!(ClaudeRunner::is_hard_error("Connection Reset"));
-        assert!(ClaudeRunner::is_hard_error("Broken Pipe"));
+        assert!(ClaudeAgentRunner::is_hard_error("FAILED TO SPAWN CLAUDE"));
+        assert!(ClaudeAgentRunner::is_hard_error("Connection Reset"));
+        assert!(ClaudeAgentRunner::is_hard_error("Broken Pipe"));
     }
 
     #[test]
     fn test_is_hard_error_empty_string() {
-        assert!(!ClaudeRunner::is_hard_error(""));
+        assert!(!ClaudeAgentRunner::is_hard_error(""));
     }
 
     #[test]
     fn test_is_hard_error_normal_error_is_not_hard() {
-        assert!(!ClaudeRunner::is_hard_error("tests failed"));
-        assert!(!ClaudeRunner::is_hard_error("compilation error"));
-        assert!(!ClaudeRunner::is_hard_error("undefined variable"));
+        assert!(!ClaudeAgentRunner::is_hard_error("tests failed"));
+        assert!(!ClaudeAgentRunner::is_hard_error("compilation error"));
+        assert!(!ClaudeAgentRunner::is_hard_error("undefined variable"));
     }
 
     #[test]
     fn test_hash_prompt_deterministic() {
         assert_eq!(
-            ClaudeRunner::hash_prompt("same prompt"),
-            ClaudeRunner::hash_prompt("same prompt")
+            ClaudeAgentRunner::hash_prompt("same prompt"),
+            ClaudeAgentRunner::hash_prompt("same prompt")
         );
     }
 
     #[test]
     fn test_hash_prompt_different_prompts_different_hashes() {
         assert_ne!(
-            ClaudeRunner::hash_prompt("prompt one"),
-            ClaudeRunner::hash_prompt("prompt two")
+            ClaudeAgentRunner::hash_prompt("prompt one"),
+            ClaudeAgentRunner::hash_prompt("prompt two")
         );
     }
 
     #[test]
     fn test_hash_prompt_empty_produces_hash() {
-        let h = ClaudeRunner::hash_prompt("");
+        let h = ClaudeAgentRunner::hash_prompt("");
         assert!(!h.is_empty());
         assert_eq!(h.len(), 16);
     }
 
     #[test]
     fn test_hash_prompt_length_is_16() {
-        assert_eq!(ClaudeRunner::hash_prompt("any prompt here").len(), 16);
+        assert_eq!(ClaudeAgentRunner::hash_prompt("any prompt here").len(), 16);
     }
 
     #[test]
     fn test_hash_prompt_only_hex_chars() {
-        assert!(ClaudeRunner::hash_prompt("test")
+        assert!(ClaudeAgentRunner::hash_prompt("test")
             .chars()
             .all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn test_hash_prompt_unicode_works() {
-        let h = ClaudeRunner::hash_prompt("こんにちは 🌍");
+        let h = ClaudeAgentRunner::hash_prompt("こんにちは 🌍");
         assert_eq!(h.len(), 16);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn test_claude_execution_new_defaults() {
-        let exec = ClaudeExecution::new();
+        let exec = AgentExecution::new();
         assert_eq!(exec.id, 0);
         assert!(exec.attempt_id.is_none());
         assert!(exec.completed_at.is_none());
@@ -2649,14 +2633,14 @@ mod tests {
     #[test]
     fn test_claude_execution_with_attempt_id() {
         assert_eq!(
-            ClaudeExecution::new().with_attempt_id(42).attempt_id,
+            AgentExecution::new().with_attempt_id(42).attempt_id,
             Some(42)
         );
     }
 
     #[test]
     fn test_claude_execution_complete_sets_fields() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.complete(Some(0), false);
         assert!(exec.completed_at.is_some());
         assert!(exec.duration_secs.is_some());
@@ -2666,7 +2650,7 @@ mod tests {
 
     #[test]
     fn test_claude_execution_complete_with_timeout() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.complete(None, true);
         assert!(exec.timed_out);
         assert!(exec.exit_code.is_none());
@@ -2674,7 +2658,7 @@ mod tests {
 
     #[test]
     fn test_claude_execution_complete_with_nonzero_exit() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.complete(Some(1), false);
         assert_eq!(exec.exit_code, Some(1));
         assert!(!exec.timed_out);
@@ -2682,15 +2666,15 @@ mod tests {
 
     #[test]
     fn test_claude_execution_duration_is_non_negative() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.complete(Some(0), false);
         assert!(exec.duration_secs.unwrap() >= 0.0);
     }
 
     #[test]
     fn test_claude_execution_default_matches_new() {
-        let from_new = ClaudeExecution::new();
-        let from_default = ClaudeExecution::default();
+        let from_new = AgentExecution::new();
+        let from_default = AgentExecution::default();
         assert_eq!(from_new.id, from_default.id);
         assert_eq!(from_new.attempt_id, from_default.attempt_id);
         assert_eq!(from_new.timed_out, from_default.timed_out);
@@ -2779,13 +2763,13 @@ mod tests {
 
     #[test]
     fn test_resolve_log_root_private_matches_public() {
-        // The private method ClaudeRunner::resolve_log_root() should match
+        // The private method ClaudeAgentRunner::resolve_log_root() should match
         // the public function resolve_log_root() since they share the same logic.
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         std::env::remove_var("CLAUDEAR_LOG_DIR");
 
         let public_root = resolve_log_root();
-        let private_root = ClaudeRunner::resolve_log_root();
+        let private_root = ClaudeAgentRunner::resolve_log_root();
         assert_eq!(public_root, private_root);
 
         if let Some(val) = prev {
@@ -2840,7 +2824,7 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join("claudear_test_exec_logs");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
 
-        let files = ClaudeRunner::create_execution_log_files("test-label");
+        let files = ClaudeAgentRunner::create_execution_log_files("test-label");
         assert!(files.is_some());
 
         let files = files.unwrap();
@@ -2871,7 +2855,7 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join("claudear_test_sanitize_logs");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
 
-        let files = ClaudeRunner::create_execution_log_files("hello world/foo@bar");
+        let files = ClaudeAgentRunner::create_execution_log_files("hello world/foo@bar");
         assert!(files.is_some());
         let files = files.unwrap();
         let stem = files
@@ -2896,7 +2880,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_with_issue() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("id-42", "PROJ-42", "A bug", "https://ex.com", "linear");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -2914,7 +2898,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_without_issue() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let (env, label) = runner.prepare_env_and_label(None);
 
         assert_eq!(label, "custom");
@@ -2924,7 +2908,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_sentry_source() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("s-1", "SENTRY-1", "Error", "https://sentry.io/1", "sentry");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -2942,7 +2926,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_github_source() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "789",
             "#789",
@@ -2959,7 +2943,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_for_issue_matches_build_prompt() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let project_dir = Path::new("/tmp");
 
@@ -2974,7 +2958,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp_dir);
         std::fs::write(tmp_dir.join("AGENT.md"), "# Agent instructions\nDo things.").unwrap();
 
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         assert!(runner.has_agent_md(&tmp_dir));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -2987,7 +2971,7 @@ mod tests {
         let content = "# Agent\nCustom instructions here.";
         std::fs::write(tmp_dir.join("AGENT.md"), content).unwrap();
 
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let loaded = runner.get_agent_md(&tmp_dir);
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap(), content);
@@ -2997,7 +2981,7 @@ mod tests {
 
     #[test]
     fn test_get_agent_md_returns_none_for_missing() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         assert!(runner
             .get_agent_md(Path::new("/nonexistent/path/xyz"))
             .is_none());
@@ -3170,39 +3154,39 @@ mod tests {
     fn test_extract_blocking_question_prefix_only_empty_payload() {
         // "CLAUDEAR_QUESTION:" followed by whitespace only => None
         let output = "CLAUDEAR_QUESTION:   ";
-        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+        assert!(ClaudeAgentRunner::extract_blocking_question(output).is_none());
     }
 
     #[test]
     fn test_extract_blocking_question_prefix_without_colon() {
         let output = "CLAUDEAR_QUESTION {\"question\":\"test\"}";
-        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+        assert!(ClaudeAgentRunner::extract_blocking_question(output).is_none());
     }
 
     #[test]
     fn test_extract_blocking_question_multiple_lines_picks_first() {
         let output = "CLAUDEAR_QUESTION: {\"question\":\"first\"}\nCLAUDEAR_QUESTION: {\"question\":\"second\"}";
-        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        let parsed = ClaudeAgentRunner::extract_blocking_question(output).unwrap();
         assert_eq!(parsed.question, "first");
     }
 
     #[test]
     fn test_extract_blocking_question_with_surrounding_whitespace() {
         let output = "   CLAUDEAR_QUESTION:  {\"question\":\"trimmed\"}  ";
-        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        let parsed = ClaudeAgentRunner::extract_blocking_question(output).unwrap();
         assert_eq!(parsed.question, "trimmed");
     }
 
     #[test]
     fn test_extract_blocking_question_no_prefix_present() {
         let output = "Just some regular output\nwithout any question markers\n";
-        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+        assert!(ClaudeAgentRunner::extract_blocking_question(output).is_none());
     }
 
     #[test]
     fn test_extract_blocking_question_with_all_fields() {
         let output = r#"CLAUDEAR_QUESTION: {"question":"Which DB?","context":"Found postgres and mysql","options":["postgres","mysql","sqlite"],"why":"Cannot determine from config"}"#;
-        let parsed = ClaudeRunner::extract_blocking_question(output).unwrap();
+        let parsed = ClaudeAgentRunner::extract_blocking_question(output).unwrap();
         assert_eq!(parsed.question, "Which DB?");
         assert_eq!(parsed.context.as_deref(), Some("Found postgres and mysql"));
         assert_eq!(parsed.options, vec!["postgres", "mysql", "sqlite"]);
@@ -3213,14 +3197,14 @@ mod tests {
     fn test_compose_failure_message_rate_limit_combined_empty_gives_default() {
         // When both are empty but still trigger rate limit through combined being empty,
         // this should not happen, but let's verify the fallback.
-        let msg = ClaudeRunner::compose_failure_message(1, "", "");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "");
         assert!(!msg.starts_with("Claude rate limit hit:"));
         assert_eq!(msg, "Process exited with code 1");
     }
 
     #[test]
     fn test_compose_failure_message_whitespace_stderr_ignored() {
-        let msg = ClaudeRunner::compose_failure_message(2, "actual output", "   ");
+        let msg = ClaudeAgentRunner::compose_failure_message(2, "actual output", "   ");
         assert!(msg.contains("actual output"));
         assert!(msg.contains("Process exited with code 2"));
     }
@@ -3228,34 +3212,34 @@ mod tests {
     #[test]
     fn test_compose_failure_message_very_long_stdout_truncated() {
         let long_stdout = "o".repeat(5000);
-        let msg = ClaudeRunner::compose_failure_message(1, &long_stdout, "");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, &long_stdout, "");
         assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 50); // +50 for prefix
         assert!(msg.contains("Process exited with code 1"));
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_429_in_stderr() {
-        let msg = ClaudeRunner::compose_failure_message(1, "", "HTTP 429");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "HTTP 429");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_exit_code_zero_with_stderr() {
         // Even exit code 0 can produce a failure message if called
-        let msg = ClaudeRunner::compose_failure_message(0, "", "some stderr");
+        let msg = ClaudeAgentRunner::compose_failure_message(0, "", "some stderr");
         assert_eq!(msg, "some stderr");
     }
 
     #[test]
     fn test_compose_failure_message_negative_exit_code() {
-        let msg = ClaudeRunner::compose_failure_message(-1, "", "");
+        let msg = ClaudeAgentRunner::compose_failure_message(-1, "", "");
         assert_eq!(msg, "Process exited with code -1");
     }
 
     #[test]
     fn test_truncate_max_len_of_0_non_empty_input() {
         // max_len = 0 means we want 0 chars + "..." => the "..." itself
-        let result = ClaudeRunner::truncate("hello", 0);
+        let result = ClaudeAgentRunner::truncate("hello", 0);
         assert_eq!(result, "...");
     }
 
@@ -3264,7 +3248,7 @@ mod tests {
         // Emoji is 4 bytes. With max_len=5, we have room for 2 chars before "...",
         // but the emoji won't fit in 2 bytes, so we should get safe truncation.
         let input = "\u{1F600}abc"; // grinning face (4 bytes) + "abc"
-        let result = ClaudeRunner::truncate(input, 5);
+        let result = ClaudeAgentRunner::truncate(input, 5);
         assert!(result.ends_with("..."));
         // Must be valid UTF-8
         assert!(result.len() <= 8); // at most the emoji (4) + "..." (3)
@@ -3273,7 +3257,7 @@ mod tests {
     #[test]
     fn test_truncate_all_multibyte() {
         let input = "\u{00e9}\u{00e9}\u{00e9}\u{00e9}"; // "eeee" with accents, 2 bytes each = 8 bytes
-        let result = ClaudeRunner::truncate(input, 6);
+        let result = ClaudeAgentRunner::truncate(input, 6);
         assert!(result.ends_with("..."));
         // Should safely truncate at a char boundary
         assert!(result.is_char_boundary(0));
@@ -3281,14 +3265,14 @@ mod tests {
 
     #[test]
     fn test_truncate_max_len_of_1() {
-        let result = ClaudeRunner::truncate("abcdef", 1);
+        let result = ClaudeAgentRunner::truncate("abcdef", 1);
         assert_eq!(result, "...");
     }
 
     #[test]
     fn test_hash_prompt_very_long_string() {
         let long = "x".repeat(100_000);
-        let h = ClaudeRunner::hash_prompt(&long);
+        let h = ClaudeAgentRunner::hash_prompt(&long);
         assert_eq!(h.len(), 16);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -3296,29 +3280,29 @@ mod tests {
     #[test]
     fn test_hash_prompt_whitespace_differences_produce_different_hashes() {
         assert_ne!(
-            ClaudeRunner::hash_prompt("hello world"),
-            ClaudeRunner::hash_prompt("hello  world")
+            ClaudeAgentRunner::hash_prompt("hello world"),
+            ClaudeAgentRunner::hash_prompt("hello  world")
         );
     }
 
     #[test]
     fn test_hash_prompt_case_sensitive() {
         assert_ne!(
-            ClaudeRunner::hash_prompt("Hello"),
-            ClaudeRunner::hash_prompt("hello")
+            ClaudeAgentRunner::hash_prompt("Hello"),
+            ClaudeAgentRunner::hash_prompt("hello")
         );
     }
 
     #[test]
     fn test_is_rate_limit_error_mixed_case_embedded() {
-        assert!(ClaudeRunner::is_rate_limit_error(
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
             "Error: The API returned a RateLimit error"
         ));
     }
 
     #[test]
     fn test_is_rate_limit_error_quota_in_longer_message() {
-        assert!(ClaudeRunner::is_rate_limit_error(
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
             "Your project quota exceeded the monthly limit"
         ));
     }
@@ -3326,7 +3310,7 @@ mod tests {
     #[test]
     fn test_is_rate_limit_error_not_triggered_by_partial_substring() {
         // "rate" alone should not trigger it
-        assert!(!ClaudeRunner::is_rate_limit_error("first rate code"));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error("first rate code"));
     }
 
     #[test]
@@ -3347,7 +3331,7 @@ mod tests {
         ];
         for needle in needles {
             assert!(
-                ClaudeRunner::is_hard_error(needle),
+                ClaudeAgentRunner::is_hard_error(needle),
                 "Expected hard error for: {}",
                 needle
             );
@@ -3365,7 +3349,7 @@ mod tests {
         ];
         for msg in soft_errors {
             assert!(
-                !ClaudeRunner::is_hard_error(msg),
+                !ClaudeAgentRunner::is_hard_error(msg),
                 "Should NOT be hard error: {}",
                 msg
             );
@@ -3374,24 +3358,24 @@ mod tests {
 
     #[test]
     fn test_sanitize_label_numbers_only() {
-        assert_eq!(ClaudeRunner::sanitize_label("12345"), "12345");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("12345"), "12345");
     }
 
     #[test]
     fn test_sanitize_label_single_char() {
-        assert_eq!(ClaudeRunner::sanitize_label("a"), "a");
-        assert_eq!(ClaudeRunner::sanitize_label("@"), "_");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("a"), "a");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("@"), "_");
     }
 
     #[test]
     fn test_sanitize_label_mixed_valid_and_invalid() {
-        assert_eq!(ClaudeRunner::sanitize_label("PROJ-123/fix"), "PROJ-123_fix");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("PROJ-123/fix"), "PROJ-123_fix");
     }
 
     #[test]
     fn test_sanitize_label_65_chars_truncated() {
         let label = "a".repeat(65);
-        let result = ClaudeRunner::sanitize_label(&label);
+        let result = ClaudeAgentRunner::sanitize_label(&label);
         assert_eq!(result.len(), 64);
     }
 
@@ -3428,7 +3412,7 @@ mod tests {
             permissions: vec!["Bash".to_string()],
             skip_permissions: true,
         };
-        let runner = ClaudeRunner::new_simple(config);
+        let runner = ClaudeAgentRunner::new_simple(config);
         // Verify the runner works by calling methods that depend on proper initialization
         assert!(!runner.has_agent_md(Path::new("/nonexistent")));
         let issue = Issue::new("1", "T-1", "Bug", "https://example.com", "linear");
@@ -3602,7 +3586,7 @@ mod tests {
     #[test]
     fn test_extract_pr_url_self_hosted_gitlab_multiple_segments() {
         let output = "MR: https://git.internal.company.io/engineering/backend/-/merge_requests/55";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert_eq!(
             url.as_deref(),
             Some("https://git.internal.company.io/engineering/backend/-/merge_requests/55")
@@ -3613,7 +3597,7 @@ mod tests {
     fn test_extract_pr_url_does_not_match_merge_request_without_dash_slash() {
         // Ensure patterns require the /-/ separator for GitLab
         let output = "https://gitlab.com/group/project/merge_requests/123";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_none());
     }
 
@@ -3634,7 +3618,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_contains_issue_source() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "LIN-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -3650,7 +3634,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_contains_context() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "LIN-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -3665,7 +3649,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_contains_short_id() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "PROJ-999", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -3680,7 +3664,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_instructs_pr_creation() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "linear");
         let prompt =
             runner.build_prompt(&issue, "ctx", Path::new("/tmp/nonexistent_project_dir_xyz"));
@@ -3694,7 +3678,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_execution_event_with_none_writer_is_noop() {
         // Should return immediately without error when writer is None
-        ClaudeRunner::append_execution_event(&None, "test", "some_event", json!({"key": "value"}))
+        ClaudeAgentRunner::append_execution_event(&None, "test", "some_event", json!({"key": "value"}))
             .await;
     }
 
@@ -3712,7 +3696,7 @@ mod tests {
             .unwrap();
         let writer = Some(Arc::new(Mutex::new(file)));
 
-        ClaudeRunner::append_execution_event(
+        ClaudeAgentRunner::append_execution_event(
             &writer,
             "my-label",
             "test_event",
@@ -3750,9 +3734,9 @@ mod tests {
             .unwrap();
         let writer = Some(Arc::new(Mutex::new(file)));
 
-        ClaudeRunner::append_execution_event(&writer, "lbl", "event_1", json!({"seq": 1})).await;
+        ClaudeAgentRunner::append_execution_event(&writer, "lbl", "event_1", json!({"seq": 1})).await;
 
-        ClaudeRunner::append_execution_event(&writer, "lbl", "event_2", json!({"seq": 2})).await;
+        ClaudeAgentRunner::append_execution_event(&writer, "lbl", "event_2", json!({"seq": 2})).await;
 
         drop(writer);
 
@@ -3774,7 +3758,7 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join("claudear_test_date_in_path");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
 
-        let files = ClaudeRunner::create_execution_log_files("mytest");
+        let files = ClaudeAgentRunner::create_execution_log_files("mytest");
         assert!(files.is_some());
 
         let files = files.unwrap();
@@ -3802,7 +3786,7 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join("claudear_test_pid_stem");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
 
-        let files = ClaudeRunner::create_execution_log_files("pidtest");
+        let files = ClaudeAgentRunner::create_execution_log_files("pidtest");
         assert!(files.is_some());
 
         let files = files.unwrap();
@@ -3829,7 +3813,7 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join("claudear_test_shared_stem");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
 
-        let files = ClaudeRunner::create_execution_log_files("shared").unwrap();
+        let files = ClaudeAgentRunner::create_execution_log_files("shared").unwrap();
         let stdout_stem = files.stdout.file_stem().unwrap().to_str().unwrap();
         let stderr_stem = files.stderr.file_stem().unwrap().to_str().unwrap();
         // events has double extension .events.jsonl, so check the full name
@@ -3864,7 +3848,7 @@ mod tests {
     fn test_compose_failure_message_rate_limit_only_in_combined_not_individual() {
         // stderr has "rate" and stdout has "limit" -- combined has "rate limit"
         // but each alone does not
-        let msg = ClaudeRunner::compose_failure_message(1, "limit issues", "check rate");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "limit issues", "check rate");
         // Combined is "check rate\nlimit issues" which contains "rate" and "limit"
         // but not "rate limit" as a substring (there's a newline between).
         // So this should NOT trigger rate limit detection
@@ -3878,26 +3862,26 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_quota_exceeded_in_stdout() {
-        let msg = ClaudeRunner::compose_failure_message(1, "quota exceeded for project", "");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "quota exceeded for project", "");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_try_again_later_in_stderr() {
-        let msg = ClaudeRunner::compose_failure_message(1, "", "please try again later");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "please try again later");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_resource_exhausted_in_combined() {
-        let msg = ClaudeRunner::compose_failure_message(1, "some output", "resource exhausted");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "some output", "resource exhausted");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_very_long_rate_limit_truncated() {
         let long_rate_limit = format!("rate limit: {}", "x".repeat(5000));
-        let msg = ClaudeRunner::compose_failure_message(1, &long_rate_limit, "");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, &long_rate_limit, "");
         assert!(msg.starts_with("Claude rate limit hit:"));
         // The inner message should be truncated
         assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 30);
@@ -4003,8 +3987,8 @@ mod tests {
     #[test]
     fn test_legacy_fallback_extracts_pr_and_question() {
         let text_output = "Some output\nhttps://github.com/org/repo/pull/42\nCLAUDEAR_QUESTION: {\"question\":\"Which branch?\"}";
-        let pr = ClaudeRunner::extract_pr_url(text_output);
-        let bq = ClaudeRunner::extract_blocking_question(text_output);
+        let pr = ClaudeAgentRunner::extract_pr_url(text_output);
+        let bq = ClaudeAgentRunner::extract_blocking_question(text_output);
         assert_eq!(pr.as_deref(), Some("https://github.com/org/repo/pull/42"));
         assert_eq!(bq.unwrap().question, "Which branch?");
     }
@@ -4012,15 +3996,15 @@ mod tests {
     #[test]
     fn test_legacy_fallback_no_pr_no_question() {
         let text_output = "Just some output text without any special markers";
-        let pr = ClaudeRunner::extract_pr_url(text_output);
-        let bq = ClaudeRunner::extract_blocking_question(text_output);
+        let pr = ClaudeAgentRunner::extract_pr_url(text_output);
+        let bq = ClaudeAgentRunner::extract_blocking_question(text_output);
         assert!(pr.is_none());
         assert!(bq.is_none());
     }
 
     #[test]
     fn test_prepare_env_and_label_gitlab_source() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("gl-1", "MR-1", "Fix", "https://gitlab.com/1", "gitlab");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -4035,7 +4019,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_jira_source() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("j-99", "JIRA-99", "Task", "https://jira.ex.com/99", "jira");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -4046,7 +4030,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_custom_source() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "c-1",
             "CUSTOM-1",
@@ -4066,7 +4050,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_env_contains_inherited_vars() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let (_env, _label) = runner.prepare_env_and_label(None);
         // The environment should contain inherited env vars from the process
         // PATH should always be present
@@ -4088,7 +4072,7 @@ mod tests {
         )
         .unwrap();
 
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(&issue, "error context here", &tmp_dir);
 
@@ -4108,7 +4092,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp_dir);
         std::fs::write(tmp_dir.join("AGENT.md"), "# Agent v2").unwrap();
 
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "sentry");
         let from_public = runner.build_prompt_for_issue(&issue, "ctx", &tmp_dir);
         let from_private = runner.build_prompt(&issue, "ctx", &tmp_dir);
@@ -4119,52 +4103,52 @@ mod tests {
 
     #[test]
     fn test_is_rate_limit_error_lower_already_lowercase() {
-        assert!(ClaudeRunner::is_rate_limit_error_lower("rate limit"));
-        assert!(ClaudeRunner::is_rate_limit_error_lower("ratelimit"));
-        assert!(ClaudeRunner::is_rate_limit_error_lower("too many requests"));
-        assert!(ClaudeRunner::is_rate_limit_error_lower("429"));
-        assert!(ClaudeRunner::is_rate_limit_error_lower("quota exceeded"));
-        assert!(ClaudeRunner::is_rate_limit_error_lower(
+        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("rate limit"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("ratelimit"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("too many requests"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("429"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("quota exceeded"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error_lower(
             "resource exhausted"
         ));
-        assert!(ClaudeRunner::is_rate_limit_error_lower("retry-after"));
-        assert!(ClaudeRunner::is_rate_limit_error_lower("try again later"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("retry-after"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("try again later"));
     }
 
     #[test]
     fn test_is_rate_limit_error_lower_negative() {
-        assert!(!ClaudeRunner::is_rate_limit_error_lower(""));
-        assert!(!ClaudeRunner::is_rate_limit_error_lower("normal error"));
-        assert!(!ClaudeRunner::is_rate_limit_error_lower(
+        assert!(!ClaudeAgentRunner::is_rate_limit_error_lower(""));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error_lower("normal error"));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error_lower(
             "compilation failed"
         ));
     }
 
     #[test]
     fn test_is_hard_error_retry_after_is_hard_via_rate_limit() {
-        assert!(ClaudeRunner::is_hard_error("retry-after: 60"));
+        assert!(ClaudeAgentRunner::is_hard_error("retry-after: 60"));
     }
 
     #[test]
     fn test_is_hard_error_quota_exceeded_is_hard_via_rate_limit() {
-        assert!(ClaudeRunner::is_hard_error("quota exceeded"));
+        assert!(ClaudeAgentRunner::is_hard_error("quota exceeded"));
     }
 
     #[test]
     fn test_is_hard_error_resource_exhausted_is_hard_via_rate_limit() {
-        assert!(ClaudeRunner::is_hard_error("resource exhausted"));
+        assert!(ClaudeAgentRunner::is_hard_error("resource exhausted"));
     }
 
     #[test]
     fn test_truncate_ascii_at_exact_boundary() {
         // max_len = 10, string is exactly 10 chars -> no truncation
-        assert_eq!(ClaudeRunner::truncate("0123456789", 10), "0123456789");
+        assert_eq!(ClaudeAgentRunner::truncate("0123456789", 10), "0123456789");
     }
 
     #[test]
     fn test_truncate_ascii_one_over() {
         // max_len = 10, string is 11 chars -> truncate
-        let result = ClaudeRunner::truncate("01234567890", 10);
+        let result = ClaudeAgentRunner::truncate("01234567890", 10);
         assert_eq!(result, "0123456...");
         assert_eq!(result.len(), 10);
     }
@@ -4173,7 +4157,7 @@ mod tests {
     fn test_truncate_three_byte_utf8() {
         // Chinese characters are 3 bytes each
         let input = "\u{4e16}\u{754c}hello"; // "世界hello" = 6 + 5 = 11 bytes
-        let result = ClaudeRunner::truncate(input, 8);
+        let result = ClaudeAgentRunner::truncate(input, 8);
         assert!(result.ends_with("..."));
         // Should not split a multi-byte char
         for (i, _) in result.char_indices() {
@@ -4184,28 +4168,28 @@ mod tests {
     #[test]
     fn test_truncate_preserves_full_string_when_max_is_large() {
         let input = "short";
-        assert_eq!(ClaudeRunner::truncate(input, 1000), "short");
+        assert_eq!(ClaudeAgentRunner::truncate(input, 1000), "short");
     }
 
     #[test]
     fn test_sanitize_label_tabs_and_newlines() {
-        assert_eq!(ClaudeRunner::sanitize_label("a\tb\nc"), "a_b_c");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("a\tb\nc"), "a_b_c");
     }
 
     #[test]
     fn test_sanitize_label_starts_with_number() {
-        assert_eq!(ClaudeRunner::sanitize_label("123abc"), "123abc");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("123abc"), "123abc");
     }
 
     #[test]
     fn test_sanitize_label_only_hyphens_and_underscores() {
-        assert_eq!(ClaudeRunner::sanitize_label("---___"), "---___");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("---___"), "---___");
     }
 
     #[test]
     fn test_sanitize_label_emoji_only() {
         // All non-ASCII -> all replaced with "_"
-        let result = ClaudeRunner::sanitize_label("\u{1F600}\u{1F601}");
+        let result = ClaudeAgentRunner::sanitize_label("\u{1F600}\u{1F601}");
         assert!(!result.is_empty());
         // Should not be "custom" because chars are replaced with '_'
         assert!(result.chars().all(|c| c == '_'));
@@ -4215,14 +4199,14 @@ mod tests {
     fn test_hash_prompt_known_value() {
         // SHA256 of "" is e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
         // First 16 hex chars (8 bytes) = "e3b0c44298fc1c14"
-        assert_eq!(ClaudeRunner::hash_prompt(""), "e3b0c44298fc1c14");
+        assert_eq!(ClaudeAgentRunner::hash_prompt(""), "e3b0c44298fc1c14");
     }
 
     #[test]
     fn test_hash_prompt_known_value_hello() {
         // SHA256 of "hello" is 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
         // First 16 hex chars = "2cf24dba5fb0a30e"
-        assert_eq!(ClaudeRunner::hash_prompt("hello"), "2cf24dba5fb0a30e");
+        assert_eq!(ClaudeAgentRunner::hash_prompt("hello"), "2cf24dba5fb0a30e");
     }
 
     #[test]
@@ -4232,7 +4216,7 @@ mod tests {
             r#"CLAUDEAR_QUESTION: {"question":"test?","extra_field":"ignored","another":123}"#;
         // This may or may not parse depending on serde config
         // If it fails, that's also valid behavior
-        let result = ClaudeRunner::extract_blocking_question(output);
+        let result = ClaudeAgentRunner::extract_blocking_question(output);
         // Either it parses successfully (ignoring extras) or returns None
         if let Some(bq) = result {
             assert_eq!(bq.question, "test?");
@@ -4242,7 +4226,7 @@ mod tests {
     #[test]
     fn test_extract_blocking_question_with_empty_question_field() {
         let output = r#"CLAUDEAR_QUESTION: {"question":""}"#;
-        let result = ClaudeRunner::extract_blocking_question(output);
+        let result = ClaudeAgentRunner::extract_blocking_question(output);
         // Should parse but question will be empty
         if let Some(bq) = result {
             assert!(bq.question.is_empty());
@@ -4252,26 +4236,26 @@ mod tests {
     #[test]
     fn test_extract_blocking_question_mixed_with_other_output() {
         let output = "INFO: Starting fix...\nDEBUG: Analyzing code\nCLAUDEAR_QUESTION: {\"question\":\"Which module?\"}\nINFO: Waiting for response";
-        let bq = ClaudeRunner::extract_blocking_question(output).unwrap();
+        let bq = ClaudeAgentRunner::extract_blocking_question(output).unwrap();
         assert_eq!(bq.question, "Which module?");
     }
 
     #[test]
     fn test_compose_failure_message_max_exit_code() {
-        let msg = ClaudeRunner::compose_failure_message(255, "", "");
+        let msg = ClaudeAgentRunner::compose_failure_message(255, "", "");
         assert_eq!(msg, "Process exited with code 255");
     }
 
     #[test]
     fn test_compose_failure_message_signal_exit_code() {
-        let msg = ClaudeRunner::compose_failure_message(137, "", "");
+        let msg = ClaudeAgentRunner::compose_failure_message(137, "", "");
         assert_eq!(msg, "Process exited with code 137");
     }
 
     #[test]
     fn test_extract_pr_url_in_markdown_link() {
         let output = "Created [PR #42](https://github.com/org/repo/pull/42) for this fix";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_some());
         assert!(url.unwrap().contains("/pull/42"));
     }
@@ -4279,7 +4263,7 @@ mod tests {
     #[test]
     fn test_extract_pr_url_in_json_string() {
         let output = r#"{"pr_url": "https://github.com/org/repo/pull/99"}"#;
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_some());
     }
 
@@ -4312,9 +4296,9 @@ mod tests {
 
     #[test]
     fn test_claude_execution_prompt_hash_and_model() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.prompt_used = Some("Fix the bug".to_string());
-        exec.prompt_hash = Some(ClaudeRunner::hash_prompt("Fix the bug"));
+        exec.prompt_hash = Some(ClaudeAgentRunner::hash_prompt("Fix the bug"));
         exec.model_version = Some("opus".to_string());
         exec.working_directory = Some("/tmp/project".to_string());
 
@@ -4326,7 +4310,7 @@ mod tests {
 
     #[test]
     fn test_claude_execution_log_paths() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.stdout_log_path = Some("/logs/claude/2026-02-20/test.stdout.log".to_string());
         exec.stderr_log_path = Some("/logs/claude/2026-02-20/test.stderr.log".to_string());
         exec.event_log_path = Some("/logs/claude/2026-02-20/test.events.jsonl".to_string());
@@ -4350,7 +4334,7 @@ mod tests {
 
     #[test]
     fn test_claude_execution_cost_and_token_fields() {
-        let mut exec = ClaudeExecution::new();
+        let mut exec = AgentExecution::new();
         exec.total_cost_usd = Some(0.123);
         exec.num_turns = Some(5);
         exec.session_id = Some("sess-abc".to_string());
@@ -4372,8 +4356,8 @@ mod tests {
 
     #[test]
     fn test_claude_execution_preview_fields() {
-        let mut exec = ClaudeExecution::new();
-        exec.stdout_preview = Some(ClaudeRunner::truncate(
+        let mut exec = AgentExecution::new();
+        exec.stdout_preview = Some(ClaudeAgentRunner::truncate(
             &"x".repeat(5000),
             EXECUTION_LOG_PREVIEW_LIMIT,
         ));
@@ -4437,7 +4421,7 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_tabs_and_newlines_only() {
-        let msg = ClaudeRunner::compose_failure_message(3, "\t\n", "\n\t\n");
+        let msg = ClaudeAgentRunner::compose_failure_message(3, "\t\n", "\n\t\n");
         assert_eq!(msg, "Process exited with code 3");
     }
 
@@ -4447,7 +4431,7 @@ mod tests {
             model: Some("haiku".to_string()),
             ..Default::default()
         };
-        let runner = ClaudeRunner::new_simple(config);
+        let runner = ClaudeAgentRunner::new_simple(config);
         assert_eq!(runner.config.model.as_deref(), Some("haiku"));
     }
 
@@ -4457,7 +4441,7 @@ mod tests {
             timeout_secs: 42,
             ..Default::default()
         };
-        let runner = ClaudeRunner::new_simple(config);
+        let runner = ClaudeAgentRunner::new_simple(config);
         assert_eq!(runner.config.timeout_secs, 42);
     }
 
@@ -4467,7 +4451,7 @@ mod tests {
             skip_permissions: true,
             ..Default::default()
         };
-        let runner = ClaudeRunner::new_simple(config);
+        let runner = ClaudeAgentRunner::new_simple(config);
         assert!(runner.config.skip_permissions);
     }
 
@@ -4477,7 +4461,7 @@ mod tests {
             instructions: Some("Be thorough".to_string()),
             ..Default::default()
         };
-        let runner = ClaudeRunner::new_simple(config);
+        let runner = ClaudeAgentRunner::new_simple(config);
         assert_eq!(runner.config.instructions.as_deref(), Some("Be thorough"));
     }
 
@@ -4487,13 +4471,13 @@ mod tests {
             permissions: vec!["Bash".to_string(), "Read".to_string()],
             ..Default::default()
         };
-        let runner = ClaudeRunner::new_simple(config);
+        let runner = ClaudeAgentRunner::new_simple(config);
         assert_eq!(runner.config.permissions, vec!["Bash", "Read"]);
     }
 
     #[test]
     fn test_runner_base_env_captures_process_env() {
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         // The base_env should be a snapshot of the process environment
         assert!(!runner.base_env.is_empty());
         // PATH is virtually always present
@@ -4534,7 +4518,7 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_npm_test_failure() {
-        let msg = ClaudeRunner::compose_failure_message(
+        let msg = ClaudeAgentRunner::compose_failure_message(
             1,
             "",
             "npm ERR! Test failed. See above for more details.",
@@ -4546,14 +4530,14 @@ mod tests {
     #[test]
     fn test_compose_failure_message_cargo_test_failure() {
         let stderr = "error[E0308]: mismatched types\n  --> src/main.rs:10:5";
-        let msg = ClaudeRunner::compose_failure_message(101, "", stderr);
+        let msg = ClaudeAgentRunner::compose_failure_message(101, "", stderr);
         assert!(msg.contains("mismatched types"));
     }
 
     #[test]
     fn test_compose_failure_message_git_push_failure() {
         let stderr = "remote: Permission to org/repo.git denied.\nfatal: unable to access";
-        let msg = ClaudeRunner::compose_failure_message(128, "", stderr);
+        let msg = ClaudeAgentRunner::compose_failure_message(128, "", stderr);
         assert!(msg.contains("Permission"));
     }
 
@@ -4562,14 +4546,14 @@ mod tests {
         let mut output = "x".repeat(100_000);
         output.push_str("\nhttps://github.com/org/repo/pull/42\n");
         output.push_str(&"y".repeat(100_000));
-        let url = ClaudeRunner::extract_pr_url(&output);
+        let url = ClaudeAgentRunner::extract_pr_url(&output);
         assert_eq!(url.as_deref(), Some("https://github.com/org/repo/pull/42"));
     }
 
     #[test]
     fn test_extract_pr_url_unicode_surrounding() {
         let output = "PR \u{1F389}\u{1F389} https://github.com/org/repo/pull/1 \u{1F389}\u{1F389}";
-        let url = ClaudeRunner::extract_pr_url(output);
+        let url = ClaudeAgentRunner::extract_pr_url(output);
         assert!(url.is_some());
         assert!(url.unwrap().contains("/pull/1"));
     }
@@ -4613,7 +4597,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp_dir);
         std::fs::write(tmp_dir.join("AGENT.md"), "# GitHub Agent").unwrap();
 
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "42",
             "#42",
@@ -4635,7 +4619,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp_dir);
         std::fs::write(tmp_dir.join("AGENT.md"), "# Sentry Handler").unwrap();
 
-        let runner = ClaudeRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "99",
             "SENTRY-99",
@@ -4652,13 +4636,13 @@ mod tests {
 
     #[test]
     fn test_sanitize_label_empty_string() {
-        assert_eq!(ClaudeRunner::sanitize_label(""), "custom");
+        assert_eq!(ClaudeAgentRunner::sanitize_label(""), "custom");
     }
 
     #[test]
     fn test_sanitize_label_special_chars() {
         assert_eq!(
-            ClaudeRunner::sanitize_label("hello world!@#$%"),
+            ClaudeAgentRunner::sanitize_label("hello world!@#$%"),
             "hello_world_____"
         );
     }
@@ -4666,18 +4650,18 @@ mod tests {
     #[test]
     fn test_sanitize_label_unicode() {
         // Unicode chars are not ascii alphanumeric, so replaced with '_'
-        assert_eq!(ClaudeRunner::sanitize_label("café"), "caf_");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("café"), "caf_");
     }
 
     #[test]
     fn test_sanitize_label_already_clean() {
-        assert_eq!(ClaudeRunner::sanitize_label("my-label_123"), "my-label_123");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("my-label_123"), "my-label_123");
     }
 
     #[test]
     fn test_sanitize_label_exactly_64_chars() {
         let label = "a".repeat(64);
-        let result = ClaudeRunner::sanitize_label(&label);
+        let result = ClaudeAgentRunner::sanitize_label(&label);
         assert_eq!(result.len(), 64);
         assert_eq!(result, label);
     }
@@ -4685,58 +4669,58 @@ mod tests {
     #[test]
     fn test_sanitize_label_100_chars_truncated() {
         let label = "x".repeat(100);
-        let result = ClaudeRunner::sanitize_label(&label);
+        let result = ClaudeAgentRunner::sanitize_label(&label);
         assert_eq!(result.len(), 64);
     }
 
     #[test]
     fn test_sanitize_label_only_special_chars() {
         // All chars replaced with '_', so not empty
-        assert_eq!(ClaudeRunner::sanitize_label("!@#"), "___");
+        assert_eq!(ClaudeAgentRunner::sanitize_label("!@#"), "___");
     }
 
     #[test]
     fn test_compose_failure_message_empty_both() {
-        let msg = ClaudeRunner::compose_failure_message(1, "", "");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "");
         assert_eq!(msg, "Process exited with code 1");
     }
 
     #[test]
     fn test_compose_failure_message_both_stderr_and_stdout() {
-        let msg = ClaudeRunner::compose_failure_message(1, "stdout text", "stderr text");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "stdout text", "stderr text");
         // When both present and no rate limit, stderr is used (priority)
         assert_eq!(msg, "stderr text");
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_429_in_stdout() {
-        let msg = ClaudeRunner::compose_failure_message(1, "Error 429 too many requests", "");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "Error 429 too many requests", "");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_rate_limit_quota_exceeded() {
-        let msg = ClaudeRunner::compose_failure_message(1, "", "Quota exceeded for model");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", "Quota exceeded for model");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
     #[test]
     fn test_compose_failure_message_long_stderr_truncated() {
         let long_stderr = "e".repeat(3000);
-        let msg = ClaudeRunner::compose_failure_message(1, "", &long_stderr);
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", &long_stderr);
         assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 3); // +3 for "..."
     }
 
     #[test]
     fn test_compose_failure_message_long_stdout_truncated() {
         let long_stdout = "o".repeat(3000);
-        let msg = ClaudeRunner::compose_failure_message(1, &long_stdout, "");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, &long_stdout, "");
         assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 50); // prefix + "..."
     }
 
     #[test]
     fn test_compose_failure_message_whitespace_only_stderr() {
-        let msg = ClaudeRunner::compose_failure_message(1, "output", "   \n  ");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "output", "   \n  ");
         // Whitespace-only stderr is trimmed to empty, so stdout is used
         assert!(msg.contains("output"));
         assert!(msg.contains("Process exited with code 1"));
@@ -4744,7 +4728,7 @@ mod tests {
 
     #[test]
     fn test_extract_blocking_question_no_question() {
-        assert!(ClaudeRunner::extract_blocking_question("just some regular output").is_none());
+        assert!(ClaudeAgentRunner::extract_blocking_question("just some regular output").is_none());
     }
 
     #[test]
@@ -4752,7 +4736,7 @@ mod tests {
         let output = r#"some preamble
 CLAUDEAR_QUESTION: {"question":"Which branch should I target?","context":"There are multiple release branches","options":["main","develop"],"why":"Ambiguous target"}
 more output"#;
-        let q = ClaudeRunner::extract_blocking_question(output).unwrap();
+        let q = ClaudeAgentRunner::extract_blocking_question(output).unwrap();
         assert_eq!(q.question, "Which branch should I target?");
         assert_eq!(
             q.context.as_deref(),
@@ -4765,7 +4749,7 @@ more output"#;
     #[test]
     fn test_extract_blocking_question_minimal_json() {
         let output = r#"CLAUDEAR_QUESTION: {"question":"What should I do?"}"#;
-        let q = ClaudeRunner::extract_blocking_question(output).unwrap();
+        let q = ClaudeAgentRunner::extract_blocking_question(output).unwrap();
         assert_eq!(q.question, "What should I do?");
         assert!(q.context.is_none());
         assert!(q.options.is_empty());
@@ -4775,72 +4759,72 @@ more output"#;
     #[test]
     fn test_extract_blocking_question_invalid_json() {
         let output = "CLAUDEAR_QUESTION: not valid json {{{";
-        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+        assert!(ClaudeAgentRunner::extract_blocking_question(output).is_none());
     }
 
     #[test]
     fn test_extract_blocking_question_empty_payload() {
         let output = "CLAUDEAR_QUESTION: ";
-        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+        assert!(ClaudeAgentRunner::extract_blocking_question(output).is_none());
     }
 
     #[test]
     fn test_extract_blocking_question_prefix_only() {
         let output = "CLAUDEAR_QUESTION:";
-        assert!(ClaudeRunner::extract_blocking_question(output).is_none());
+        assert!(ClaudeAgentRunner::extract_blocking_question(output).is_none());
     }
 
     #[test]
     fn test_extract_blocking_question_among_many_lines() {
         let output = "line 1\nline 2\nCLAUDEAR_QUESTION: {\"question\":\"How?\"}\nline 4";
-        let q = ClaudeRunner::extract_blocking_question(output).unwrap();
+        let q = ClaudeAgentRunner::extract_blocking_question(output).unwrap();
         assert_eq!(q.question, "How?");
     }
 
     #[test]
     fn test_is_rate_limit_error_mixed_case() {
-        assert!(ClaudeRunner::is_rate_limit_error("RATE LIMIT"));
-        assert!(ClaudeRunner::is_rate_limit_error("Rate limit"));
-        assert!(ClaudeRunner::is_rate_limit_error("rAtE LiMiT"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("RATE LIMIT"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("Rate limit"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("rAtE LiMiT"));
     }
 
     #[test]
     fn test_is_rate_limit_error_non_matching() {
-        assert!(!ClaudeRunner::is_rate_limit_error("everything is fine"));
-        assert!(!ClaudeRunner::is_rate_limit_error(""));
-        assert!(!ClaudeRunner::is_rate_limit_error("generic error occurred"));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error("everything is fine"));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error(""));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error("generic error occurred"));
     }
 
     #[test]
     fn test_is_hard_error_rate_limit_strings() {
         // Hard errors include all rate limit errors
-        assert!(ClaudeRunner::is_hard_error("rate limit hit"));
-        assert!(ClaudeRunner::is_hard_error("429"));
+        assert!(ClaudeAgentRunner::is_hard_error("rate limit hit"));
+        assert!(ClaudeAgentRunner::is_hard_error("429"));
     }
 
     #[test]
     fn test_is_hard_error_failed_to_spawn() {
-        assert!(ClaudeRunner::is_hard_error(
+        assert!(ClaudeAgentRunner::is_hard_error(
             "Failed to spawn Claude process"
         ));
     }
 
     #[test]
     fn test_is_hard_error_failed_to_wait() {
-        assert!(ClaudeRunner::is_hard_error("Failed to wait for Claude"));
+        assert!(ClaudeAgentRunner::is_hard_error("Failed to wait for Claude"));
     }
 
     #[test]
     fn test_is_hard_error_mixed_case() {
-        assert!(ClaudeRunner::is_hard_error("FAILED TO SPAWN CLAUDE"));
-        assert!(ClaudeRunner::is_hard_error("PROCESS TIMED OUT"));
+        assert!(ClaudeAgentRunner::is_hard_error("FAILED TO SPAWN CLAUDE"));
+        assert!(ClaudeAgentRunner::is_hard_error("PROCESS TIMED OUT"));
     }
 
     #[test]
     fn test_is_hard_error_non_matching() {
-        assert!(!ClaudeRunner::is_hard_error("everything is fine"));
-        assert!(!ClaudeRunner::is_hard_error(""));
-        assert!(!ClaudeRunner::is_hard_error("some random failure message"));
+        assert!(!ClaudeAgentRunner::is_hard_error("everything is fine"));
+        assert!(!ClaudeAgentRunner::is_hard_error(""));
+        assert!(!ClaudeAgentRunner::is_hard_error("some random failure message"));
     }
 
     #[test]
@@ -4851,8 +4835,8 @@ more output"#;
         let root = resolve_log_root();
         assert_eq!(root, PathBuf::from("./logs"));
 
-        // Also test the ClaudeRunner method version
-        let root2 = ClaudeRunner::resolve_log_root();
+        // Also test the ClaudeAgentRunner method version
+        let root2 = ClaudeAgentRunner::resolve_log_root();
         assert_eq!(root2, PathBuf::from("./logs"));
 
         if let Some(val) = prev {

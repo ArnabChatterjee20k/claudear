@@ -9,7 +9,7 @@ use claudear::{
     ipc::{default_socket_path, is_daemon_running, print_response, IpcClient, IpcServer},
     notifier::{
         CompositeNotifier, ConsoleNotifier, DiscordNotifier, EmailNotifier, Notifier, PushNotifier,
-        SlackNotifier, SmsNotifier,
+        SlackNotifier, SmsNotifier, TelegramNotifier, WhatsAppNotifier,
     },
     regression::{
         CompositeChecker, LinearRegressionChecker, LinearRegressionConfig, NoOpChecker,
@@ -21,7 +21,11 @@ use claudear::{
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
-    source::{DiscordSource, IssueSource, JiraSource, LinearSource, SentrySource, SlackSource},
+    source::{
+        DiscordSource, IssueSource, JiraSource, LinearSource, SentrySource, SlackSource,
+        TelegramSource, WhatsAppSource,
+    },
+    runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     storage::{FixAttemptTracker, SqliteTracker},
     types::{ActivityLogEntry, FixAttemptStatus, Issue},
     users::UserRegistry,
@@ -509,7 +513,7 @@ fn create_review_watcher(
 
     let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
     let review_watcher =
-        ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite_tracker.clone()));
+        ReviewWatcher::with_tracker(provider, tracker);
 
     // Restore states from database
     match sqlite_tracker.get_active_pr_review_states() {
@@ -587,6 +591,26 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
         }
     }
 
+    if config.whatsapp.source_enabled {
+        if config.whatsapp.access_token.is_some() && config.whatsapp.phone_number_id.is_some() {
+            sources.push(Arc::new(WhatsAppSource::new(config.whatsapp.clone())));
+            tracing::info!("WhatsApp source initialized");
+        } else {
+            tracing::warn!(
+                "WhatsApp source_enabled but missing access_token or phone_number_id; skipping"
+            );
+        }
+    }
+
+    if config.telegram.source_enabled {
+        if config.telegram.bot_token.is_some() {
+            sources.push(Arc::new(TelegramSource::new(config.telegram.clone())));
+            tracing::info!("Telegram source initialized");
+        } else {
+            tracing::warn!("Telegram source_enabled but missing bot_token; skipping");
+        }
+    }
+
     sources
 }
 
@@ -659,10 +683,24 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
     }
 
     // Add Push if configured
-    let push_notifier = PushNotifier::new(config.push.clone(), user_registry);
+    let push_notifier = PushNotifier::new(config.push.clone(), user_registry.clone());
     if push_notifier.is_enabled() {
         composite.add(Arc::new(push_notifier));
         tracing::info!("Push notifier enabled");
+    }
+
+    // Add WhatsApp if configured
+    let whatsapp_notifier = WhatsAppNotifier::new(config.whatsapp.clone(), user_registry.clone());
+    if whatsapp_notifier.is_enabled() {
+        composite.add(Arc::new(whatsapp_notifier));
+        tracing::info!("WhatsApp notifier enabled");
+    }
+
+    // Add Telegram if configured
+    let telegram_notifier = TelegramNotifier::new(config.telegram.clone(), user_registry);
+    if telegram_notifier.is_enabled() {
+        composite.add(Arc::new(telegram_notifier));
+        tracing::info!("Telegram notifier enabled");
     }
 
     Arc::new(composite)
@@ -2099,7 +2137,6 @@ async fn async_main() -> anyhow::Result<()> {
                 sources: sources.clone(),
                 notifier: notifier.clone(),
                 tracker: tracker.clone(),
-                sqlite_tracker: Some(sqlite_tracker.clone()),
                 inferrer: inferrer.clone(),
                 embedding_client,
                 review_watcher: review_watcher.clone(),
@@ -2229,6 +2266,16 @@ async fn async_main() -> anyhow::Result<()> {
                 }
 
                 // Webhook server also serves health endpoint which dashboard uses
+                let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
+                    ClaudeRunnerConfig {
+                        timeout_secs: config.agent.timeout_secs,
+                        model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
+                        instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
+                        permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
+                        skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
+                    },
+                    tracker.clone(),
+                ));
                 let mut server = WebhookServer::new_with_github(
                     config.clone(),
                     handlers,
@@ -2237,6 +2284,7 @@ async fn async_main() -> anyhow::Result<()> {
                     Some(sqlite_tracker.clone()),
                     inferrer_clone,
                     github_webhook_handler_for_http,
+                    agent,
                 );
                 server.set_issue_embedding_service(issue_embedding_service.clone());
                 server.set_review_watcher(review_watcher.clone());
@@ -2574,7 +2622,6 @@ async fn async_main() -> anyhow::Result<()> {
             sources,
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: Some(sqlite_tracker.clone()),
             inferrer,
             embedding_client,
             review_watcher,
@@ -2795,6 +2842,16 @@ async fn async_main() -> anyhow::Result<()> {
 
             let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
 
+            let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.agent.timeout_secs,
+                    model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
+                    instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
+                    permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
+                    skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
+                },
+                tracker.clone(),
+            ));
             let mut server = WebhookServer::new_with_github(
                 config,
                 handlers,
@@ -2803,6 +2860,7 @@ async fn async_main() -> anyhow::Result<()> {
                 Some(sqlite_tracker),
                 inferrer,
                 github_webhook_handler,
+                agent,
             );
             server.set_issue_embedding_service(issue_embedding_service);
             server.set_review_watcher(review_watcher);
@@ -2853,7 +2911,6 @@ async fn async_main() -> anyhow::Result<()> {
                 sources,
                 notifier,
                 tracker,
-                sqlite_tracker: Some(sqlite_tracker.clone()),
                 inferrer,
                 embedding_client,
                 review_watcher,

@@ -15,7 +15,7 @@ use crate::qa::{
 };
 use crate::repo::{worktree_path, GitOps, RepoIndex, RepoRelationships};
 use crate::retry::RetryManager;
-use crate::runner::{ClaudeRunner, ClaudeRunnerConfig};
+use crate::runner::{self, AgentRunner};
 use crate::scm::{PrReviewState, PrStatus, ReviewEvent, ReviewWatcher, ScmProvider};
 use crate::source::IssueSource;
 use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
@@ -40,7 +40,6 @@ pub struct WatcherOptions {
     pub sources: Vec<Arc<dyn IssueSource>>,
     pub notifier: Arc<dyn Notifier>,
     pub tracker: Arc<dyn FixAttemptTracker>,
-    pub sqlite_tracker: Option<Arc<SqliteTracker>>,
     pub inferrer: Option<RepoInferrer>,
     pub embedding_client: Option<crate::feedback::EmbeddingClient>,
     pub review_watcher: Option<Arc<ReviewWatcher>>,
@@ -51,6 +50,7 @@ pub struct WatcherOptions {
     /// When set, this is used for merge detection instead of github_client.
     pub scm_provider: Option<Arc<dyn ScmProvider>>,
     pub user_registry: UserRegistry,
+    pub agent: Arc<dyn AgentRunner>,
     pub dry_run: bool,
 }
 
@@ -60,7 +60,6 @@ pub struct Watcher {
     sources: Vec<Arc<dyn IssueSource>>,
     notifier: Arc<dyn Notifier>,
     tracker: Arc<dyn FixAttemptTracker>,
-    sqlite_tracker: Option<Arc<SqliteTracker>>,
     inferrer: Option<RepoInferrer>,
     embedding_client: Option<crate::feedback::EmbeddingClient>,
     review_watcher: Option<Arc<ReviewWatcher>>,
@@ -69,7 +68,7 @@ pub struct Watcher {
     github_client: Option<GitHubClient>,
     scm_provider: Option<Arc<dyn ScmProvider>>,
     user_registry: UserRegistry,
-    claude: ClaudeRunner,
+    agent: Arc<dyn AgentRunner>,
     dry_run: bool,
     is_running: AtomicBool,
     processing: RwLock<HashSet<String>>,
@@ -83,30 +82,15 @@ pub struct Watcher {
 impl Watcher {
     /// Create a new watcher.
     pub fn new(options: WatcherOptions) -> Self {
-        let feedback_analyzer = {
-            let analyzer = FeedbackAnalyzer::new();
-            match &options.sqlite_tracker {
-                Some(st) => analyzer.with_sqlite_tracker(st.clone()),
-                None => analyzer,
-            }
-        };
+        let feedback_analyzer =
+            FeedbackAnalyzer::new().with_tracker(options.tracker.clone());
 
         Self {
-            claude: ClaudeRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: options.config.claude_timeout_secs,
-                    model: options.config.claude.model.clone(),
-                    instructions: options.config.claude.instructions.clone(),
-                    permissions: options.config.claude.permissions.clone(),
-                    skip_permissions: options.config.claude.skip_permissions,
-                },
-                options.tracker.clone(),
-            ),
+            agent: options.agent,
             config: options.config,
             sources: options.sources,
             notifier: options.notifier,
             tracker: options.tracker,
-            sqlite_tracker: options.sqlite_tracker,
             inferrer: options.inferrer,
             embedding_client: options.embedding_client,
             review_watcher: options.review_watcher,
@@ -362,12 +346,7 @@ impl Watcher {
             None => return Ok(0),
         };
 
-        let sqlite_tracker = match &self.sqlite_tracker {
-            Some(t) => t,
-            None => return Ok(0),
-        };
-
-        inferrer.with_index(|index| sqlite_tracker.sync_from_index(index, sync_files))
+        inferrer.with_index(|index| self.tracker.sync_from_index(index, sync_files))
     }
 
     /// Start the watcher with polling.
@@ -460,17 +439,13 @@ impl Watcher {
         // Sync repository index to database (includes file lists)
         // Use spawn_blocking since sync_repos_to_db performs blocking I/O
         let inferrer = self.inferrer.clone();
-        let sqlite_tracker = self.sqlite_tracker.clone();
+        let tracker = self.tracker.clone();
         let sync_result = tokio::task::spawn_blocking(move || -> crate::error::Result<usize> {
             let inferrer = match &inferrer {
                 Some(inf) => inf,
                 None => return Ok(0),
             };
-            let sqlite_tracker = match &sqlite_tracker {
-                Some(t) => t,
-                None => return Ok(0),
-            };
-            inferrer.with_index(|index| sqlite_tracker.sync_from_index(index, true))
+            inferrer.with_index(|index| tracker.sync_from_index(index, true))
         })
         .await;
 
@@ -488,17 +463,15 @@ impl Watcher {
         }
 
         // Warm-start: load feedback outcomes from DB for learning
-        if let Some(ref sqlite_tracker) = self.sqlite_tracker {
-            match sqlite_tracker.get_feedback_outcomes(None, 1000) {
-                Ok(outcomes) if !outcomes.is_empty() => {
-                    let count = outcomes.len();
-                    let mut analyzer = self.feedback_analyzer.lock().await;
-                    analyzer.load_outcomes(outcomes);
-                    tracing::info!(count = count, "Loaded feedback outcomes for learning");
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "Failed to load feedback outcomes"),
+        match self.tracker.get_feedback_outcomes(None, 1000) {
+            Ok(outcomes) if !outcomes.is_empty() => {
+                let count = outcomes.len();
+                let mut analyzer = self.feedback_analyzer.lock().await;
+                analyzer.load_outcomes(outcomes);
+                tracing::info!(count = count, "Loaded feedback outcomes for learning");
             }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "Failed to load feedback outcomes"),
         }
 
         self.is_running.store(true, Ordering::SeqCst);
@@ -779,15 +752,13 @@ impl Watcher {
         );
 
         // Increment the review_cycles count
-        if let Some(sqlite) = &self.sqlite_tracker {
-            if let Some(ref pr_url) = attempt.pr_url {
-                // Update the PR record with incremented review_cycles
-                if let Ok(Some(mut pr_record)) = sqlite.get_pr(pr_url) {
-                    pr_record.review_cycles += 1;
-                    pr_record.last_review_at = Some(chrono::Utc::now());
-                    if let Err(e) = sqlite.upsert_pr(&pr_record) {
-                        tracing::warn!(error = %e, "Failed to update PR review cycles");
-                    }
+        if let Some(ref pr_url) = attempt.pr_url {
+            // Update the PR record with incremented review_cycles
+            if let Ok(Some(mut pr_record)) = self.tracker.get_pr(pr_url) {
+                pr_record.review_cycles += 1;
+                pr_record.last_review_at = Some(chrono::Utc::now());
+                if let Err(e) = self.tracker.upsert_pr(&pr_record) {
+                    tracing::warn!(error = %e, "Failed to update PR review cycles");
                 }
             }
         }
@@ -874,13 +845,12 @@ impl Watcher {
         // Process the issue with the review feedback appended to context.
         if let Some(pr_url) = &attempt.pr_url {
             // Look up the existing PR branch so the worktree can check it out
-            let existing_pr_branch = self.sqlite_tracker.as_ref().and_then(|sqlite| {
-                sqlite
-                    .get_pr(pr_url)
-                    .ok()
-                    .flatten()
-                    .and_then(|pr| pr.head_branch)
-            });
+            let existing_pr_branch = self
+                .tracker
+                .get_pr(pr_url)
+                .ok()
+                .flatten()
+                .and_then(|pr| pr.head_branch);
 
             tracing::info!(
                 pr_url = %pr_url,
@@ -1076,9 +1046,11 @@ impl Watcher {
                 .cascade
                 .find_rule_for_trigger(&scm_repo, &dependant.name, &trigger_type)
                 .or_else(|| {
-                    self.config
-                        .cascade
-                        .find_rule_for_trigger(repo_short_name, &dependant.name, &trigger_type)
+                    self.config.cascade.find_rule_for_trigger(
+                        repo_short_name,
+                        &dependant.name,
+                        &trigger_type,
+                    )
                 });
 
             // If no rule matches this trigger type, check if there's a rule with a
@@ -1126,10 +1098,10 @@ impl Watcher {
 
         // Process cascade-rule-only downstreams (explicitly configured, no code dependency detected)
         for downstream in rule_only_downstreams {
-            let rule = self
-                .config
-                .cascade
-                .find_rule_for_trigger(&scm_repo, downstream, &trigger_type);
+            let rule =
+                self.config
+                    .cascade
+                    .find_rule_for_trigger(&scm_repo, downstream, &trigger_type);
 
             if let Err(e) = self
                 .cascade_to_repo(
@@ -1209,13 +1181,10 @@ impl Watcher {
 
             // Find the most recently merged attempt for this upstream repo
             let merged_attempt = self
-                .sqlite_tracker
-                .as_ref()
-                .and_then(|t| {
-                    t.get_most_recent_merged_attempt_for_repo(upstream)
-                        .ok()
-                        .flatten()
-                });
+                .tracker
+                .get_most_recent_merged_attempt_for_repo(upstream)
+                .ok()
+                .flatten();
 
             let attempt = match merged_attempt {
                 Some(a) => a,
@@ -1230,11 +1199,7 @@ impl Watcher {
 
             let pr_url = attempt.pr_url.clone().unwrap_or_default();
             match self
-                .trigger_cascade(
-                    &attempt,
-                    &pr_url,
-                    crate::config::CascadeTrigger::Release,
-                )
+                .trigger_cascade(&attempt, &pr_url, crate::config::CascadeTrigger::Release)
                 .await
             {
                 Ok(()) => {
@@ -1265,11 +1230,7 @@ impl Watcher {
 
         while let Some(parent_id) = current_parent {
             depth += 1;
-            match self
-                .sqlite_tracker
-                .as_ref()
-                .and_then(|t| t.get_attempt_by_id(parent_id).ok().flatten())
-            {
+            match self.tracker.get_attempt_by_id(parent_id).ok().flatten() {
                 Some(parent) => current_parent = parent.parent_attempt_id,
                 None => break,
             }
@@ -1319,15 +1280,7 @@ impl Watcher {
         };
 
         // Record cascade attempt
-        let sqlite = match &self.sqlite_tracker {
-            Some(t) => t,
-            None => {
-                tracing::warn!("No SQLite tracker available for cascade tracking");
-                return Ok(());
-            }
-        };
-
-        let attempt_id = sqlite.record_cascade_attempt(
+        let attempt_id = self.tracker.record_cascade_attempt(
             &parent_attempt.source,
             &parent_attempt.issue_id,
             &parent_attempt.short_id,
@@ -1413,7 +1366,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // Run Claude
         let result = self
-            .claude
+            .agent
             .execute_with_attempt(&prompt, None, Some(attempt_id), effective_dir)
             .await?;
 
@@ -1427,7 +1380,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
                 // Update the cascade attempt with PR details
                 if let Some((repo, pr_num)) = SqliteTracker::parse_pr_url(pr_url) {
-                    sqlite.update_attempt_pr(attempt_id, pr_url, &repo, pr_num)?;
+                    self.tracker.update_attempt_pr(attempt_id, pr_url, &repo, pr_num)?;
                 }
 
                 // Register for review watching — this enables recursive cascade
@@ -1501,7 +1454,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     downstream = %downstream_repo_name,
                     "Cascade succeeded but no PR URL"
                 );
-                sqlite.mark_cascade_failed(attempt_id, &no_pr_error)?;
+                self.tracker.mark_cascade_failed(attempt_id, &no_pr_error)?;
 
                 let mut cascade_issue = Issue::new(
                     &parent_attempt.issue_id,
@@ -1541,7 +1494,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 error = %error,
                 "Cascade fix failed"
             );
-            sqlite.mark_cascade_failed(attempt_id, &error)?;
+            self.tracker.mark_cascade_failed(attempt_id, &error)?;
 
             // Notify cascade failure
             let mut cascade_issue = Issue::new(
@@ -2018,57 +1971,51 @@ Create a PR with your changes.{custom_instructions}"#,
                         .update_qa_outcome_stats_for_attempt(attempt.id, true);
 
                     // Update prs record to merged
-                    if let Some(ref sqlite) = self.sqlite_tracker {
-                        if let Some(ref pr_url) = attempt.pr_url {
-                            if let Ok(Some(mut pr_record)) = sqlite.get_pr(pr_url) {
-                                pr_record.status = "merged".to_string();
-                                pr_record.merged_at = Some(chrono::Utc::now());
-                                if let Err(e) = sqlite.upsert_pr(&pr_record) {
-                                    tracing::warn!(error = %e, "Failed to update PR status to merged");
-                                }
+                    if let Some(ref pr_url) = attempt.pr_url {
+                        if let Ok(Some(mut pr_record)) = self.tracker.get_pr(pr_url) {
+                            pr_record.status = "merged".to_string();
+                            pr_record.merged_at = Some(chrono::Utc::now());
+                            if let Err(e) = self.tracker.upsert_pr(&pr_record) {
+                                tracing::warn!(error = %e, "Failed to update PR status to merged");
                             }
                         }
                     }
 
                     // For bug-type issues, create a regression watch instead of immediate auto-resolve.
                     let regression_watch_id = if attempt.is_bug() {
-                        if let Some(ref sqlite_tracker) = self.sqlite_tracker {
-                            let issue_type = match attempt.source.as_str() {
-                                "sentry" => IssueType::SentryIssue,
-                                "linear" => IssueType::LinearBug,
-                                _ => IssueType::SentryIssue,
-                            };
-                            let mut watch =
-                                RegressionWatch::new(issue_type, &attempt.issue_id, attempt.id);
-                            watch.pr_merged_at = Some(chrono::Utc::now());
+                        let issue_type = match attempt.source.as_str() {
+                            "sentry" => IssueType::SentryIssue,
+                            "linear" => IssueType::LinearBug,
+                            _ => IssueType::SentryIssue,
+                        };
+                        let mut watch =
+                            RegressionWatch::new(issue_type, &attempt.issue_id, attempt.id);
+                        watch.pr_merged_at = Some(chrono::Utc::now());
 
-                            match sqlite_tracker.create_regression_watch(&watch) {
-                                Ok(watch_id) => {
-                                    regression_watches_created += 1;
-                                    tracing::info!(
-                                        component = "watcher",
-                                        source = %attempt.source,
-                                        issue_id = %attempt.issue_id,
-                                        short_id = %attempt.short_id,
-                                        watch_id = watch_id,
-                                        "Created regression watch for merged bug fix"
-                                    );
-                                    Some(watch_id)
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        component = "watcher",
-                                        source = %attempt.source,
-                                        issue_id = %attempt.issue_id,
-                                        short_id = %attempt.short_id,
-                                        error = %e,
-                                        "Failed to create regression watch"
-                                    );
-                                    None
-                                }
+                        match self.tracker.create_regression_watch(&watch) {
+                            Ok(watch_id) => {
+                                regression_watches_created += 1;
+                                tracing::info!(
+                                    component = "watcher",
+                                    source = %attempt.source,
+                                    issue_id = %attempt.issue_id,
+                                    short_id = %attempt.short_id,
+                                    watch_id = watch_id,
+                                    "Created regression watch for merged bug fix"
+                                );
+                                Some(watch_id)
                             }
-                        } else {
-                            None
+                            Err(e) => {
+                                tracing::error!(
+                                    component = "watcher",
+                                    source = %attempt.source,
+                                    issue_id = %attempt.issue_id,
+                                    short_id = %attempt.short_id,
+                                    error = %e,
+                                    "Failed to create regression watch"
+                                );
+                                None
+                            }
                         }
                     } else {
                         None
@@ -2125,7 +2072,10 @@ Create a PR with your changes.{custom_instructions}"#,
 
                     let pr_url = attempt.pr_url.as_deref().unwrap_or("");
                     if self.config.cascade.enabled {
-                        match self.trigger_cascade(attempt, pr_url, crate::config::CascadeTrigger::Merge).await {
+                        match self
+                            .trigger_cascade(attempt, pr_url, crate::config::CascadeTrigger::Merge)
+                            .await
+                        {
                             Ok(()) => {
                                 cascade_triggered += 1;
                             }
@@ -2470,7 +2420,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 let resolution = resolve_repo_for_issue_with_embedding(
                     self.inferrer.as_ref(),
                     issue,
-                    self.sqlite_tracker.as_ref(),
+                    Some(&self.tracker),
                     query_embedding.as_deref(),
                 );
                 match resolution {
@@ -2647,16 +2597,16 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         // Persist full issue content to the issues table (independent of embeddings)
-        if let Some(ref sqlite) = self.sqlite_tracker {
+        {
             let stored = IssueEmbedding::from_issue(&issue);
-            if let Err(e) = sqlite.store_issue(&stored) {
+            if let Err(e) = self.tracker.store_issue(&stored) {
                 tracing::debug!(error = %e, "Failed to store issue content");
             }
         }
 
         // Infer the target repository using the shared resolution function
         let resolution =
-            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, self.sqlite_tracker.as_ref());
+            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
 
         let project_dir = match &resolution {
             RepoResolution::Resolved { project_dir, .. } => {
@@ -2848,16 +2798,14 @@ Create a PR with your changes.{custom_instructions}"#,
                 }
 
                 // Sync updated files to database
-                if let Some(tracker) = &self.sqlite_tracker {
-                    if let Some(repo) = inferrer.get_repo(repo_name) {
-                        if let Err(e) = tracker.sync_repo_files(&repo) {
-                            tracing::warn!(
-                                short_id = %issue.short_id,
-                                repo = %repo_name,
-                                error = %e,
-                                "Failed to sync repository files to database"
-                            );
-                        }
+                if let Some(repo) = inferrer.get_repo(repo_name) {
+                    if let Err(e) = self.tracker.sync_repo_files(&repo) {
+                        tracing::warn!(
+                            short_id = %issue.short_id,
+                            repo = %repo_name,
+                            error = %e,
+                            "Failed to sync repository files to database"
+                        );
                     }
                 }
             }
@@ -3088,7 +3036,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
             let mut rounds: u8 = 0;
             let (claude_result, last_prompt) = loop {
-                let prompt = self.claude.build_prompt_for_issue(&issue, &context, &effective_project_dir);
+                let prompt = self.agent.build_prompt_for_issue(&issue, &context, &effective_project_dir);
 
                 // Enhance prompt with learnings from past outcomes (semantic when possible).
                 let prompt = {
@@ -3109,7 +3057,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     resolution.repo_name(),
                 );
                 let mut run_result = self
-                    .claude
+                    .agent
                     .execute_with_attempt(&prompt, Some(&issue), attempt_id, &effective_project_dir)
                     .await?;
                 run_result.used_qa_ids = used_qa_ids.clone();
@@ -3309,21 +3257,19 @@ Create a PR with your changes.{custom_instructions}"#,
             };
 
             if self.config.learning.strategy_fingerprinting {
-                if let Some(sqlite) = &self.sqlite_tracker {
-                    if let Some(aid) = attempt_id {
-                        if let Ok(execs) = sqlite.get_executions_for_attempt(aid) {
-                            if let Some(exec) = execs.first() {
-                                if let Some(ref log_path) = exec.stdout_log_path {
-                                    let path = std::path::Path::new(log_path);
-                                    if path.exists() {
-                                        match crate::learning::StrategyParser::parse_from_log(path, aid) {
-                                            Ok(fp) => {
-                                                if let Err(e) = self.tracker.store_strategy_fingerprint(&fp) {
-                                                    tracing::warn!(error = %e, "Failed to store strategy fingerprint");
-                                                }
+                if let Some(aid) = attempt_id {
+                    if let Ok(execs) = self.tracker.get_executions_for_attempt(aid) {
+                        if let Some(exec) = execs.first() {
+                            if let Some(ref log_path) = exec.stdout_log_path {
+                                let path = std::path::Path::new(log_path);
+                                if path.exists() {
+                                    match crate::learning::StrategyParser::parse_from_log(path, aid) {
+                                        Ok(fp) => {
+                                            if let Err(e) = self.tracker.store_strategy_fingerprint(&fp) {
+                                                tracing::warn!(error = %e, "Failed to store strategy fingerprint");
                                             }
-                                            Err(e) => tracing::debug!(error = %e, "Failed to parse strategy from log"),
                                         }
+                                        Err(e) => tracing::debug!(error = %e, "Failed to parse strategy from log"),
                                     }
                                 }
                             }
@@ -3401,40 +3347,38 @@ Create a PR with your changes.{custom_instructions}"#,
                     }
 
                     // Create or update prs table record
-                    if let Some(ref sqlite) = self.sqlite_tracker {
-                        if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(pr_url) {
-                            // Try to load existing record to preserve accumulated fields
-                            let mut pr_record = if let Ok(Some(existing)) = sqlite.get_pr(pr_url) {
-                                existing
-                            } else {
-                                crate::types::PrRecord::for_issue(
-                                    pr_url.clone(),
-                                    &repo,
-                                    pr_number,
-                                    source.name(),
-                                    &issue.id,
-                                )
-                            };
-                            pr_record.attempt_id = attempt_id;
+                    if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(pr_url) {
+                        // Try to load existing record to preserve accumulated fields
+                        let mut pr_record = if let Ok(Some(existing)) = self.tracker.get_pr(pr_url) {
+                            existing
+                        } else {
+                            crate::types::PrRecord::for_issue(
+                                pr_url.clone(),
+                                &repo,
+                                pr_number,
+                                source.name(),
+                                &issue.id,
+                            )
+                        };
+                        pr_record.attempt_id = attempt_id;
 
-                            // Fetch branch info from GitHub
-                            if let Some(ref gh) = self.github_client {
-                                match gh.get_pr_info(&repo, pr_number).await {
-                                    Ok(info) => {
-                                        pr_record.head_branch = info.head_branch;
-                                        pr_record.base_branch = info.base_branch;
-                                        pr_record.title = info.title;
-                                        pr_record.author = info.author;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Failed to fetch PR info from GitHub");
-                                    }
+                        // Fetch branch info from GitHub
+                        if let Some(ref gh) = self.github_client {
+                            match gh.get_pr_info(&repo, pr_number).await {
+                                Ok(info) => {
+                                    pr_record.head_branch = info.head_branch;
+                                    pr_record.base_branch = info.base_branch;
+                                    pr_record.title = info.title;
+                                    pr_record.author = info.author;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to fetch PR info from GitHub");
                                 }
                             }
+                        }
 
-                            if let Err(e) = sqlite.upsert_pr(&pr_record) {
-                                tracing::warn!(error = %e, "Failed to upsert PR record");
-                            }
+                        if let Err(e) = self.tracker.upsert_pr(&pr_record) {
+                            tracing::warn!(error = %e, "Failed to upsert PR record");
                         }
                     }
 
@@ -3708,14 +3652,14 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Route hard failures to the global notifier user (override per-issue assignee routing).
     async fn notify_failed_with_escalation(&self, issue: &Issue, error: &str) -> Result<()> {
-        if ClaudeRunner::is_hard_error(error) {
+        if runner::is_hard_error(error) {
             self.record_issue_decision(
                 issue,
                 "hard_error_escalated",
                 format!("Escalating hard error for {}", issue.short_id),
                 json!({
                     "error": Self::truncate_error_for_activity(error),
-                    "rate_limited": ClaudeRunner::is_rate_limit_error(error),
+                    "rate_limited": runner::is_rate_limit_error(error),
                 }),
             );
             let mut global_issue = issue.clone();
@@ -3732,7 +3676,7 @@ Create a PR with your changes.{custom_instructions}"#,
             .with_issue(issue.id.clone(), issue.short_id.clone())
             .with_metadata(json!({
                 "hard_error": true,
-                "rate_limited": ClaudeRunner::is_rate_limit_error(error),
+                "rate_limited": runner::is_rate_limit_error(error),
                 "error": Self::truncate_error_for_activity(error),
             }));
             self.tracker.record_activity(&activity).ok();
@@ -3813,9 +3757,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // Try to get the prompt from the most recent execution
         let prompt = self
-            .sqlite_tracker
-            .as_ref()
-            .and_then(|t| t.get_executions_for_attempt(attempt.id).ok())
+            .tracker
+            .get_executions_for_attempt(attempt.id)
+            .ok()
             .and_then(|execs| execs.into_iter().next())
             .and_then(|exec| exec.prompt_used)
             .unwrap_or_default();
@@ -3970,33 +3914,31 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // System 1: Auto-extract learnings from execution logs
         if learning.auto_extract_learnings {
-            if let Some(sqlite) = &self.sqlite_tracker {
-                if let Ok(execs) = sqlite.get_executions_for_attempt(attempt.id) {
-                    if let Some(exec) = execs.first() {
-                        if let Some(ref log_path) = exec.stdout_log_path {
-                            let path = std::path::Path::new(log_path);
-                            if path.exists() {
-                                match crate::learning::LogExtractor::extract_learnings_from_log(
-                                    path,
-                                ) {
-                                    Ok(learnings) => {
-                                        let summary =
-                                            crate::learning::LogExtractor::summarize(&learnings);
-                                        // Store learnings on the feedback outcome
-                                        if let Ok(Some(outcome)) =
-                                            self.tracker.get_feedback_outcome_by_attempt(attempt.id)
+            if let Ok(execs) = self.tracker.get_executions_for_attempt(attempt.id) {
+                if let Some(exec) = execs.first() {
+                    if let Some(ref log_path) = exec.stdout_log_path {
+                        let path = std::path::Path::new(log_path);
+                        if path.exists() {
+                            match crate::learning::LogExtractor::extract_learnings_from_log(
+                                path,
+                            ) {
+                                Ok(learnings) => {
+                                    let summary =
+                                        crate::learning::LogExtractor::summarize(&learnings);
+                                    // Store learnings on the feedback outcome
+                                    if let Ok(Some(outcome)) =
+                                        self.tracker.get_feedback_outcome_by_attempt(attempt.id)
+                                    {
+                                        if let Err(e) = self
+                                            .tracker
+                                            .update_feedback_learnings(outcome.id, &summary)
                                         {
-                                            if let Err(e) = self
-                                                .tracker
-                                                .update_feedback_learnings(outcome.id, &summary)
-                                            {
-                                                tracing::warn!(error = %e, "Failed to store extracted learnings");
-                                            }
+                                            tracing::warn!(error = %e, "Failed to store extracted learnings");
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::debug!(error = %e, "Failed to extract learnings from log")
-                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "Failed to extract learnings from log")
                                 }
                             }
                         }
@@ -4024,12 +3966,10 @@ Create a PR with your changes.{custom_instructions}"#,
                         }
 
                         // Update prs record with files_changed from diff analysis
-                        if let Some(sqlite) = &self.sqlite_tracker {
-                            if let Ok(Some(mut pr_record)) = sqlite.get_pr(pr_url) {
-                                pr_record.files_changed = Some(analysis.files_changed.len() as i64);
-                                if let Err(e) = sqlite.upsert_pr(&pr_record) {
-                                    tracing::warn!(error = %e, "Failed to update PR files_changed");
-                                }
+                        if let Ok(Some(mut pr_record)) = self.tracker.get_pr(pr_url) {
+                            pr_record.files_changed = Some(analysis.files_changed.len() as i64);
+                            if let Err(e) = self.tracker.upsert_pr(&pr_record) {
+                                tracing::warn!(error = %e, "Failed to update PR files_changed");
                             }
                         }
 
@@ -4051,16 +3991,14 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // System 7: Compute quality score
         if learning.quality_scoring {
-            if let Some(sqlite) = &self.sqlite_tracker {
-                if let Some(ref pr_url) = attempt.pr_url {
-                    if let Ok(Some(pr_record)) = sqlite.get_pr(pr_url) {
-                        let quality = crate::learning::QualityScorer::compute(&pr_record);
-                        if let Err(e) = self
-                            .tracker
-                            .update_pr_fix_quality_score(pr_url, quality.score)
-                        {
-                            tracing::warn!(error = %e, "Failed to store quality score");
-                        }
+            if let Some(ref pr_url) = attempt.pr_url {
+                if let Ok(Some(pr_record)) = self.tracker.get_pr(pr_url) {
+                    let quality = crate::learning::QualityScorer::compute(&pr_record);
+                    if let Err(e) = self
+                        .tracker
+                        .update_pr_fix_quality_score(pr_url, quality.score)
+                    {
+                        tracing::warn!(error = %e, "Failed to store quality score");
                     }
                 }
             }
@@ -4593,8 +4531,7 @@ mod tests {
             processing_delay_ms: 1000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
-            claude_timeout_secs: 21600,
-            claude: crate::config::ClaudeConfig::default(),
+            agent: crate::config::AgentConfig::default(),
             discord: crate::config::DiscordConfig::default(),
             slack: crate::config::SlackConfig::default(),
             email: crate::config::EmailConfig::default(),
@@ -4626,12 +4563,17 @@ mod tests {
         sources: Vec<Arc<dyn IssueSource>>,
         dry_run: bool,
     ) -> Watcher {
+        let agent: Arc<dyn crate::runner::AgentRunner> = Arc::new(
+            crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            ),
+        );
         Watcher::new(WatcherOptions {
             config: test_config(),
             sources,
             notifier,
             tracker,
-            sqlite_tracker: None, // Tests don't need DB sync
             inferrer: None,       // Tests don't need inference
             embedding_client: None,
             review_watcher: None,
@@ -4640,6 +4582,7 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent,
             dry_run,
         })
     }
@@ -4930,7 +4873,6 @@ mod tests {
             sources: sources.clone(),
             notifier: notifier.clone(),
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -5504,7 +5446,6 @@ mod tests {
             sources: vec![source.clone()],
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -5553,7 +5494,6 @@ mod tests {
             sources: vec![source.clone()],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -5617,7 +5557,6 @@ mod tests {
             sources: vec![source.clone()],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -5673,7 +5612,6 @@ mod tests {
             sources: vec![source],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -6082,7 +6020,6 @@ mod tests {
             sources,
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -6163,7 +6100,6 @@ mod tests {
             sources: vec![source.clone()],
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -6204,7 +6140,6 @@ mod tests {
             sources: vec![source],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -6633,14 +6568,12 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_repos_to_db_no_sqlite_tracker_returns_zero() {
+    fn test_sync_repos_to_db_no_inferrer_returns_zero_basic() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let sources: Vec<Arc<dyn IssueSource>> = vec![];
 
-        // create_test_watcher sets sqlite_tracker to None
         let watcher = create_test_watcher(notifier, tracker, sources, false);
-        assert!(watcher.sqlite_tracker.is_none());
 
         let result = watcher.sync_repos_to_db(false).unwrap();
         assert_eq!(result, 0);
@@ -6833,11 +6766,11 @@ mod tests {
     }
 
     // =========================================================================
-    // Tests for Watcher::new with sqlite_tracker
+    // Tests for Watcher::new with tracker
     // =========================================================================
 
     #[test]
-    fn test_watcher_new_with_sqlite_tracker() {
+    fn test_watcher_new_with_tracker() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = sqlite.clone() as Arc<dyn FixAttemptTracker>;
@@ -6848,7 +6781,6 @@ mod tests {
             sources,
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite.clone()),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -6860,7 +6792,6 @@ mod tests {
             dry_run: false,
         });
 
-        assert!(watcher.sqlite_tracker.is_some());
         assert!(!watcher.dry_run);
     }
 
@@ -7215,14 +7146,13 @@ mod tests {
         config.max_concurrent = 7;
         config.processing_delay_ms = 1500;
         config.poll_interval_ms = 30000;
-        config.claude_timeout_secs = 999;
+        config.agent.timeout_secs = 999;
 
         let watcher = Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7238,7 +7168,7 @@ mod tests {
         assert_eq!(watcher.config.max_concurrent, 7);
         assert_eq!(watcher.config.processing_delay_ms, 1500);
         assert_eq!(watcher.config.poll_interval_ms, 30000);
-        assert_eq!(watcher.config.claude_timeout_secs, 999);
+        assert_eq!(watcher.config.agent.timeout_secs, 999);
     }
 
     #[test]
@@ -7296,7 +7226,11 @@ mod tests {
         };
 
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1", crate::config::CascadeTrigger::Merge)
+            .trigger_cascade(
+                &attempt,
+                "https://github.com/org/repo/pull/1",
+                crate::config::CascadeTrigger::Merge,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -7327,7 +7261,6 @@ mod tests {
             sources,
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7361,7 +7294,11 @@ mod tests {
 
         // Even with relationships, cascade disabled returns Ok
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/upstream/pull/1", crate::config::CascadeTrigger::Merge)
+            .trigger_cascade(
+                &attempt,
+                "https://github.com/org/upstream/pull/1",
+                crate::config::CascadeTrigger::Merge,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -7382,7 +7319,6 @@ mod tests {
             sources,
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7414,7 +7350,9 @@ mod tests {
             cascade_repo: None,
         };
 
-        let result = watcher.trigger_cascade(&attempt, "", crate::config::CascadeTrigger::Merge).await;
+        let result = watcher
+            .trigger_cascade(&attempt, "", crate::config::CascadeTrigger::Merge)
+            .await;
         assert!(result.is_ok());
     }
 
@@ -7434,7 +7372,6 @@ mod tests {
             sources,
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7467,7 +7404,11 @@ mod tests {
         };
 
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1", crate::config::CascadeTrigger::Merge)
+            .trigger_cascade(
+                &attempt,
+                "https://github.com/org/repo/pull/1",
+                crate::config::CascadeTrigger::Merge,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -7489,7 +7430,6 @@ mod tests {
             sources,
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7522,7 +7462,11 @@ mod tests {
         };
 
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/my-lib/pull/1", crate::config::CascadeTrigger::Merge)
+            .trigger_cascade(
+                &attempt,
+                "https://github.com/org/my-lib/pull/1",
+                crate::config::CascadeTrigger::Merge,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -7572,7 +7516,7 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let sources: Vec<Arc<dyn IssueSource>> = vec![];
 
-        // No sqlite_tracker means parent lookups always fail
+        // Trait default returns None for parent lookups
         let watcher = create_test_watcher(notifier, tracker, sources, false);
 
         let attempt = FixAttempt {
@@ -7670,7 +7614,6 @@ mod tests {
             sources: vec![source],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7811,7 +7754,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7833,7 +7775,6 @@ mod tests {
         assert!(watcher.issue_embedding_service.is_none());
         assert!(watcher.relationships.is_none());
         assert!(watcher.github_client.is_none());
-        assert!(watcher.sqlite_tracker.is_none());
         assert!(watcher.sources.is_empty());
     }
 
@@ -7901,7 +7842,6 @@ mod tests {
             sources: vec![source.clone()],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7987,7 +7927,6 @@ mod tests {
             sources,
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite.clone()),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8015,7 +7954,11 @@ mod tests {
         // The child is at depth 1 already, and max_depth is 1
         // So trigger_cascade should bail out early
         let result = watcher
-            .trigger_cascade(&child, "https://github.com/org/upstream/pull/1", crate::config::CascadeTrigger::Merge)
+            .trigger_cascade(
+                &child,
+                "https://github.com/org/upstream/pull/1",
+                crate::config::CascadeTrigger::Merge,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -8104,7 +8047,6 @@ mod tests {
             sources: vec![source.clone()],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8146,7 +8088,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8293,7 +8234,7 @@ mod tests {
             cascade_repo: None,
         };
 
-        // Should not panic, even without sqlite_tracker
+        // Should not panic with default trait impl
         watcher
             .record_feedback_outcome_from_attempt(&attempt, Outcome::Failed)
             .await;
@@ -8310,7 +8251,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite.clone()),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8347,7 +8287,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite.clone()),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8392,7 +8331,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8426,7 +8364,6 @@ mod tests {
             sources: vec![source],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8459,7 +8396,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8491,7 +8427,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8526,7 +8461,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8578,7 +8512,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: None, // No sqlite
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8610,7 +8543,7 @@ mod tests {
             cascade_repo: None,
         };
 
-        // Should skip extraction path because sqlite_tracker is None
+        // Should skip extraction path when no executions exist
         watcher.run_post_merge_learning(&attempt).await;
     }
 
@@ -8631,7 +8564,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8684,7 +8616,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8737,7 +8668,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8788,7 +8718,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite.clone()),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8840,7 +8769,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite.clone()),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8883,7 +8811,11 @@ mod tests {
         // With max_depth=0, cascade should NOT be blocked by depth
         // It will still return Ok because there are no dependants
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/repo/pull/1", crate::config::CascadeTrigger::Merge)
+            .trigger_cascade(
+                &attempt,
+                "https://github.com/org/repo/pull/1",
+                crate::config::CascadeTrigger::Merge,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -8971,7 +8903,6 @@ mod tests {
             sources: vec![source.clone()],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9225,7 +9156,6 @@ mod tests {
             ],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9238,7 +9168,6 @@ mod tests {
         });
 
         assert!(watcher.dry_run);
-        assert!(watcher.sqlite_tracker.is_some());
         assert!(watcher.relationships.is_some());
         assert_eq!(watcher.sources.len(), 2);
         assert!(!watcher.is_running());
@@ -9274,7 +9203,6 @@ mod tests {
             sources: vec![source],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9341,7 +9269,6 @@ mod tests {
             sources: vec![source],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9463,7 +9390,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9500,7 +9426,11 @@ mod tests {
         // It will find dependants via the short name "upstream-lib"
         // but cascade_to_repo will fail because no inferrer is configured
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/upstream-lib/pull/1", crate::config::CascadeTrigger::Merge)
+            .trigger_cascade(
+                &attempt,
+                "https://github.com/org/upstream-lib/pull/1",
+                crate::config::CascadeTrigger::Merge,
+            )
             .await;
         // Should still return Ok even if individual cascade_to_repo fails
         assert!(result.is_ok());
@@ -9651,7 +9581,6 @@ mod tests {
             sources: vec![source.clone()],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9730,7 +9659,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9764,7 +9692,11 @@ mod tests {
 
         // This exercises the full_name match path (not the short_name fallback)
         let result = watcher
-            .trigger_cascade(&attempt, "https://github.com/org/upstream-lib/pull/1", crate::config::CascadeTrigger::Merge)
+            .trigger_cascade(
+                &attempt,
+                "https://github.com/org/upstream-lib/pull/1",
+                crate::config::CascadeTrigger::Merge,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -9787,7 +9719,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9893,13 +9824,12 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = sqlite.clone() as Arc<dyn FixAttemptTracker>;
 
-        // This tests the branch where sqlite_tracker is Some
+        // This tests the branch where tracker is a real SqliteTracker
         let watcher = Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9920,13 +9850,12 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        // This tests the branch where sqlite_tracker is None
+        // This tests the branch where tracker has default impl
         let watcher = Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -10118,7 +10047,6 @@ mod tests {
             sources: vec![source],
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: None,
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -10162,7 +10090,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker,
-            sqlite_tracker: Some(sqlite.clone()),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -10226,7 +10153,6 @@ mod tests {
             sources,
             notifier,
             tracker: tracker.clone(),
-            sqlite_tracker: Some(tracker),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -10445,17 +10371,16 @@ mod tests {
     }
 
     // =========================================================================
-    // 8. test_watcher_new_with_sqlite_tracker_coverage
+    // 8. test_watcher_new_with_tracker_coverage
     // =========================================================================
 
     #[test]
-    fn test_watcher_new_with_sqlite_tracker_coverage() {
+    fn test_watcher_new_with_tracker_coverage() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
         let notifier = Arc::new(MockNotifier::new(true));
         let watcher = create_test_watcher_with_sqlite(notifier, sqlite.clone(), vec![]);
 
         // Verify the Some(st) branch in the constructor was taken
-        assert!(watcher.sqlite_tracker.is_some());
         assert!(!watcher.dry_run);
         assert!(!watcher.is_running());
         assert_eq!(watcher.active_count(), 0);
@@ -10491,10 +10416,9 @@ mod tests {
     fn test_sync_repos_to_db_no_sqlite() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-        // create_test_watcher sets sqlite_tracker to None
         let watcher = create_test_watcher(notifier, tracker, vec![], false);
 
-        assert!(watcher.sqlite_tracker.is_none());
+        // No inferrer, so sync returns 0
         let result = watcher.sync_repos_to_db(false).unwrap();
         assert_eq!(result, 0);
     }
@@ -10623,7 +10547,6 @@ mod tests {
             sources: vec![],
             notifier,
             tracker: sqlite.clone(),
-            sqlite_tracker: Some(sqlite),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,

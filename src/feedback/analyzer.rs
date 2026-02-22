@@ -2,7 +2,7 @@
 
 use super::outcomes::{FixOutcome, Outcome, OutcomeTracker};
 use crate::error::Result;
-use crate::storage::SqliteTracker;
+use crate::storage::FixAttemptTracker;
 use crate::types::{FixAttempt, Issue};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -45,7 +45,7 @@ pub enum SuggestionType {
 /// Analyzes past fix outcomes to improve future prompts.
 pub struct FeedbackAnalyzer {
     tracker: OutcomeTracker,
-    sqlite_tracker: Option<Arc<SqliteTracker>>,
+    fix_tracker: Option<Arc<dyn FixAttemptTracker>>,
     min_similarity: f64,
     max_similar_results: usize,
 }
@@ -55,7 +55,7 @@ impl FeedbackAnalyzer {
     pub fn new() -> Self {
         Self {
             tracker: OutcomeTracker::new(),
-            sqlite_tracker: None,
+            fix_tracker: None,
             min_similarity: 0.1,
             max_similar_results: 5,
         }
@@ -65,15 +65,15 @@ impl FeedbackAnalyzer {
     pub fn with_settings(min_similarity: f64, max_similar_results: usize) -> Self {
         Self {
             tracker: OutcomeTracker::new(),
-            sqlite_tracker: None,
+            fix_tracker: None,
             min_similarity,
             max_similar_results,
         }
     }
 
-    /// Attach a SqliteTracker for HNSW-based semantic search on outcomes.
-    pub fn with_sqlite_tracker(mut self, sqlite_tracker: Arc<SqliteTracker>) -> Self {
-        self.sqlite_tracker = Some(sqlite_tracker);
+    /// Attach a tracker for HNSW-based semantic search on outcomes.
+    pub fn with_tracker(mut self, tracker: Arc<dyn FixAttemptTracker>) -> Self {
+        self.fix_tracker = Some(tracker);
         self
     }
 
@@ -98,8 +98,8 @@ impl FeedbackAnalyzer {
     ///
     /// Uses HNSW via vectorlite. Returns empty if no results found.
     pub fn find_similar(&self, query_embedding: &[f32]) -> Vec<SimilarIssue> {
-        if let Some(ref sqlite) = self.sqlite_tracker {
-            match sqlite.find_similar_outcomes_vector(
+        if let Some(ref tracker) = self.fix_tracker {
+            match tracker.find_similar_outcomes_vector(
                 query_embedding,
                 self.min_similarity,
                 self.max_similar_results,
@@ -1555,9 +1555,9 @@ mod tests {
     }
 
     #[test]
-    fn test_with_sqlite_tracker() {
+    fn test_with_tracker() {
         let sqlite = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
-        let analyzer = FeedbackAnalyzer::new().with_sqlite_tracker(sqlite);
+        let analyzer = FeedbackAnalyzer::new().with_tracker(sqlite);
         // With sqlite tracker attached, find_similar should attempt HNSW search
         // but return empty because no outcomes are stored
         let results = analyzer.find_similar(&[1.0, 0.0, 0.0]);
@@ -1705,9 +1705,9 @@ mod tests {
     }
 
     #[test]
-    fn test_find_similar_with_sqlite_tracker_empty_db() {
+    fn test_find_similar_with_tracker_empty_db() {
         let sqlite = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
-        let analyzer = FeedbackAnalyzer::new().with_sqlite_tracker(sqlite);
+        let analyzer = FeedbackAnalyzer::new().with_tracker(sqlite);
 
         let results = analyzer.find_similar(&[0.1, 0.2, 0.3, 0.4]);
         assert!(results.is_empty());

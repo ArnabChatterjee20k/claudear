@@ -15,6 +15,10 @@ path = "src/bin/e2e/main.rs"
 name = "claudear"
 path = "src/lib.rs"
 
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full", "process", "signal"] }
@@ -26,7 +30,7 @@ tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 
 # Database
-rusqlite = { version = "0.38", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.38", features = ["bundled", "load_extension"], optional = true }
 
 # Embeddings
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls"] }
@@ -60,7 +64,8 @@ sentry = { version = "0.46", features = ["tower-axum-matched-path", "tracing", "
 thiserror = "2"
 anyhow = "1"
 
-# Crypto for webhook signatures
+# Crypto for webhook signatures and config encryption
+aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"

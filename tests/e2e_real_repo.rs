@@ -312,7 +312,10 @@ fn build_config(temp_dir: &TempDir) -> Config {
         processing_delay_ms: 0,
         max_concurrent: 1,
         max_issues_per_cycle: 10,
-        claude_timeout_secs: 30,
+        agent: claudear::config::AgentConfig {
+            timeout_secs: 30,
+            ..Default::default()
+        },
         retry: RetryConfig {
             base_delay_ms: 0,
             max_delay_ms: 0,

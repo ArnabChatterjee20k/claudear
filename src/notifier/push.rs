@@ -71,7 +71,7 @@ impl PushNotifier {
         issue: Option<&Issue>,
     ) -> Result<()> {
         let api_token = match &self.config.api_token {
-            Some(token) => token,
+            Some(token) => token.expose().to_string(),
             None => return Ok(()),
         };
 
@@ -88,7 +88,7 @@ impl PushNotifier {
         };
 
         let push_message = PushoverMessage {
-            token: api_token.clone(),
+            token: api_token,
             user: user_key,
             message: truncated_message,
             title: Some(title.to_string()),
@@ -391,7 +391,7 @@ mod tests {
 
     fn partial_config_no_user() -> PushConfig {
         PushConfig {
-            api_token: Some("api_token".to_string()),
+            api_token: Some("api_token".into()),
             user_key: None,
             device: None,
             priority: None,
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn test_is_enabled() {
         let enabled_config = PushConfig {
-            api_token: Some("test".to_string()),
+            api_token: Some("test".into()),
             user_key: Some("test".to_string()),
             device: None,
             priority: None,
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn test_config_with_device_and_priority() {
         let config = PushConfig {
-            api_token: Some("token".to_string()),
+            api_token: Some("token".into()),
             user_key: Some("user".to_string()),
             device: Some("iphone".to_string()),
             priority: Some(1),
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn test_resolve_user_key_returns_config_when_no_issue() {
         let config = PushConfig {
-            api_token: Some("token".to_string()),
+            api_token: Some("token".into()),
             user_key: Some("global-key".to_string()),
             device: None,
             priority: None,
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn test_resolve_user_key_returns_config_when_no_resolved_user() {
         let config = PushConfig {
-            api_token: Some("token".to_string()),
+            api_token: Some("token".into()),
             user_key: Some("global-key".to_string()),
             device: None,
             priority: None,
@@ -684,7 +684,7 @@ mod tests {
         );
         let registry = UserRegistry::new(users);
         let config = PushConfig {
-            api_token: Some("token".to_string()),
+            api_token: Some("token".into()),
             user_key: Some("global-key".to_string()),
             device: None,
             priority: None,
@@ -710,7 +710,7 @@ mod tests {
         );
         let registry = UserRegistry::new(users);
         let config = PushConfig {
-            api_token: Some("token".to_string()),
+            api_token: Some("token".into()),
             user_key: Some("global-key".to_string()),
             device: None,
             priority: None,
@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn test_resolve_user_key_none_when_config_has_no_key() {
         let config = PushConfig {
-            api_token: Some("token".to_string()),
+            api_token: Some("token".into()),
             user_key: None,
             device: None,
             priority: None,
@@ -835,7 +835,7 @@ mod tests {
     fn test_is_enabled_requires_both_fields() {
         // Only api_token
         let config = PushConfig {
-            api_token: Some("token".to_string()),
+            api_token: Some("token".into()),
             user_key: None,
             device: None,
             priority: None,
@@ -853,7 +853,7 @@ mod tests {
 
         // Both present
         let config = PushConfig {
-            api_token: Some("token".to_string()),
+            api_token: Some("token".into()),
             user_key: Some("key".to_string()),
             device: None,
             priority: None,
@@ -982,7 +982,7 @@ mod tests {
     #[test]
     fn test_resolve_user_key_unknown_user_falls_back() {
         let config = PushConfig {
-            api_token: Some("token".to_string()),
+            api_token: Some("token".into()),
             user_key: Some("global-key".to_string()),
             device: None,
             priority: None,

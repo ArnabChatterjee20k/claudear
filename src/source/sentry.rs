@@ -181,7 +181,7 @@ impl<H: SentryHttpClient> SentrySource<H> {
 
     async fn fetch<T: for<'de> Deserialize<'de>>(&self, endpoint: &str) -> Result<T> {
         let url = format!("https://sentry.io/api/0{}", endpoint);
-        let response = self.http.get(&url, &self.config.auth_token).await?;
+        let response = self.http.get(&url, self.config.auth_token.expose()).await?;
 
         if !response.is_success() {
             return Err(Error::source(
@@ -622,7 +622,7 @@ impl<H: SentryHttpClient + 'static> IssueSource for SentrySource<H> {
             .http
             .put(
                 &url,
-                &self.config.auth_token,
+                self.config.auth_token.expose(),
                 serde_json::json!({
                     "status": "resolved"
                 }),
@@ -1263,7 +1263,7 @@ mod tests {
     fn test_config() -> SentryConfig {
         SentryConfig {
             enabled: true,
-            auth_token: "test_token".to_string(),
+            auth_token: "test_token".into(),
             org_slug: "test-org".to_string(),
             project_slugs: vec![],
             top_issues_count: 100,
@@ -1551,14 +1551,14 @@ mod tests {
     fn test_config_with_project_filters() {
         let config = SentryConfig {
             enabled: true,
-            auth_token: "test_token".to_string(),
+            auth_token: "test_token".into(),
             org_slug: "test-org".to_string(),
             project_slugs: vec!["frontend".to_string(), "backend".to_string()],
             top_issues_count: 50,
             top_issues_period: TopIssuesPeriod::OneDay,
             min_event_count: 5,
             escalation_threshold_percent: 25,
-            client_secret: Some("secret".to_string()),
+            client_secret: Some("secret".into()),
             ..Default::default()
         };
         let source = SentrySource::new(config);
@@ -1569,7 +1569,7 @@ mod tests {
     fn test_matches_criteria_threshold_boundary() {
         let config = SentryConfig {
             enabled: true,
-            auth_token: "test_token".to_string(),
+            auth_token: "test_token".into(),
             org_slug: "test-org".to_string(),
             project_slugs: vec![],
             top_issues_count: 100,
@@ -1604,7 +1604,7 @@ mod tests {
     fn test_matches_criteria_exact_escalation_threshold() {
         let config = SentryConfig {
             enabled: true,
-            auth_token: "test_token".to_string(),
+            auth_token: "test_token".into(),
             org_slug: "test-org".to_string(),
             project_slugs: vec![],
             top_issues_count: 100,
@@ -2604,7 +2604,7 @@ mod tests {
         let mock = MockSentryClient::new();
         let config = SentryConfig {
             enabled: true,
-            auth_token: "test_token".to_string(),
+            auth_token: "test_token".into(),
             org_slug: "test-org".to_string(),
             project_slugs: vec!["frontend".to_string(), "backend".to_string()],
             top_issues_count: 100,
