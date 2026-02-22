@@ -23,51 +23,117 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen bg-background flex items-center justify-center">
-      <div className="w-full max-w-sm space-y-6">
-        <div className="text-center space-y-2">
-          <Activity className="h-10 w-10 text-primary mx-auto" />
-          <h1 className="text-2xl font-bold">Claudear</h1>
-          <p className="text-sm text-muted-foreground">Sign in to your dashboard</p>
-        </div>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {error && (
-            <div className="bg-destructive/10 text-destructive text-sm p-3 rounded-md">
-              {error}
+    <div className="relative min-h-screen overflow-hidden bg-background">
+      <div className="pointer-events-none absolute inset-0">
+        <div className="absolute left-1/2 top-24 h-72 w-72 -translate-x-1/2 rounded-full bg-primary/12 blur-3xl" />
+        <div className="absolute inset-x-0 top-0 h-40 bg-gradient-to-b from-primary/5 to-transparent" />
+        <div className="absolute bottom-0 left-1/4 h-40 w-40 rounded-full bg-primary/5 blur-2xl" />
+      </div>
+
+      <div className="relative z-10 flex min-h-screen items-center justify-center px-6 py-10">
+        <section className="w-full max-w-lg">
+          <div className="relative overflow-hidden rounded-2xl border border-border/80 bg-card/95 shadow-2xl shadow-black/15 backdrop-blur">
+            <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-primary/70 to-transparent" />
+
+            <div className="border-b border-border/80 bg-background/60 px-4 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <span className="h-2.5 w-2.5 rounded-full bg-rose-400/70" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-amber-400/70" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-primary/80" />
+                </div>
+                <div className="font-mono text-[11px] text-muted-foreground">auth://dashboard</div>
+                <div className="rounded-full border border-primary/20 bg-primary/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-primary">
+                  secure
+                </div>
+              </div>
             </div>
-          )}
-          <div className="space-y-2">
-            <label htmlFor="email" className="text-sm font-medium">Email</label>
-            <input
-              id="email"
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-              autoFocus
-              className="w-full px-3 py-2 border rounded-md bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary"
-              placeholder="admin@example.com"
-            />
+
+            <div className="p-6 sm:p-8">
+              <div className="relative mb-6 overflow-hidden rounded-xl border border-border/70 bg-background/70 p-4">
+                <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary/8 via-transparent to-transparent" />
+                <div className="relative flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <div className="mb-1 flex items-center gap-0 font-mono text-sm font-semibold tracking-tight">
+                      claudear
+                      <span className="ml-1 inline-block h-3.5 w-1.5 rounded-[1px] bg-primary" />
+                    </div>
+                    <h1 className="mt-3 text-2xl font-semibold tracking-tight text-foreground">
+                      Sign in
+                    </h1>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      Dashboard access
+                    </p>
+                  </div>
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-primary/25 bg-primary/10">
+                    <Activity className={`h-4 w-4 text-primary ${loading ? 'animate-spin' : ''}`} />
+                  </div>
+                </div>
+              </div>
+
+              <form onSubmit={handleSubmit} className="space-y-4">
+                {error && (
+                  <div
+                    role="alert"
+                    className="rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2.5 text-sm text-destructive"
+                  >
+                    {error}
+                  </div>
+                )}
+
+                <div className="space-y-2">
+                  <label
+                    htmlFor="email"
+                    className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground"
+                  >
+                    Email
+                  </label>
+                  <input
+                    id="email"
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    required
+                    autoFocus
+                    autoComplete="email"
+                    className="w-full rounded-lg border border-input/90 bg-background/85 px-3 py-2.5 text-sm shadow-inner shadow-black/5 outline-none transition placeholder:text-muted-foreground/70 hover:border-border focus:border-primary/40 focus:ring-2 focus:ring-primary/20"
+                    placeholder="admin@example.com"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label
+                    htmlFor="password"
+                    className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground"
+                  >
+                    Password
+                  </label>
+                  <input
+                    id="password"
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    required
+                    autoComplete="current-password"
+                    className="w-full rounded-lg border border-input/90 bg-background/85 px-3 py-2.5 text-sm shadow-inner shadow-black/5 outline-none transition placeholder:text-muted-foreground/70 hover:border-border focus:border-primary/40 focus:ring-2 focus:ring-primary/20"
+                    placeholder="Enter your password"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="group relative w-full overflow-hidden rounded-lg border border-primary/25 bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/20 transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <span className="absolute inset-0 opacity-0 transition group-hover:opacity-100">
+                    <span className="absolute inset-y-0 left-[-30%] w-1/2 rotate-12 bg-white/20 blur-md" />
+                  </span>
+                  <span className="relative">{loading ? 'Signing in...' : 'Sign in'}</span>
+                </button>
+              </form>
+            </div>
           </div>
-          <div className="space-y-2">
-            <label htmlFor="password" className="text-sm font-medium">Password</label>
-            <input
-              id="password"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              className="w-full px-3 py-2 border rounded-md bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary"
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full py-2 px-4 bg-primary text-primary-foreground rounded-md text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
-          >
-            {loading ? 'Signing in...' : 'Sign in'}
-          </button>
-        </form>
+        </section>
       </div>
     </div>
   )
