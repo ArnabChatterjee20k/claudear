@@ -39,23 +39,91 @@ impl Notifier for ConsoleNotifier {
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            let upstream = issue
+                .get_metadata::<String>("cascade_upstream_repo")
+                .unwrap_or_default();
+            let downstream = issue
+                .get_metadata::<String>("cascade_downstream_repo")
+                .unwrap_or_default();
+            println!(
+                "[{}] Cascade PR: {} ({} -> {}) - PR: {}",
+                issue.source, issue.short_id, upstream, downstream, pr_url
+            );
+        } else if issue.get_metadata::<bool>("is_pr_update").unwrap_or(false) {
+            println!(
+                "[{}] PR Updated: {} - PR: {}",
+                issue.source, issue.short_id, pr_url
+            );
+        } else {
+            println!(
+                "[{}] Success: {} - PR: {}",
+                issue.source, issue.short_id, pr_url
+            );
+        }
+        Ok(())
+    }
+
+    async fn notify_completed(&self, issue: &Issue) -> Result<()> {
+        if issue
+            .get_metadata::<bool>("regression_resolved")
+            .unwrap_or(false)
+        {
+            println!(
+                "[{}] Regression Resolved: {} (no regression after monitoring)",
+                issue.source, issue.short_id
+            );
+        } else {
+            println!(
+                "[{}] Completed: {} (no PR URL found)",
+                issue.source, issue.short_id
+            );
+        }
+        Ok(())
+    }
+
+    async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
+        if issue
+            .get_metadata::<bool>("regression_detected")
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[{}] Regression Detected: {} - {}",
+                issue.source, issue.short_id, error
+            );
+        } else if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            let downstream = issue
+                .get_metadata::<String>("cascade_downstream_repo")
+                .unwrap_or_default();
+            eprintln!(
+                "[{}] Cascade Failed: {} ({}) - {}",
+                issue.source, issue.short_id, downstream, error
+            );
+        } else {
+            eprintln!("[{}] Failed: {} - {}", issue.source, issue.short_id, error);
+        }
+        Ok(())
+    }
+
+    async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         println!(
-            "[{}] Success: {} - PR: {}",
+            "[{}] PR Merged: {} - PR: {}",
             issue.source, issue.short_id, pr_url
         );
         Ok(())
     }
 
-    async fn notify_completed(&self, issue: &Issue) -> Result<()> {
+    async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         println!(
-            "[{}] Completed: {} (no PR URL found)",
-            issue.source, issue.short_id
+            "[{}] PR Closed: {} - PR: {}",
+            issue.source, issue.short_id, pr_url
         );
-        Ok(())
-    }
-
-    async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
-        eprintln!("[{}] Failed: {} - {}", issue.source, issue.short_id, error);
         Ok(())
     }
 
@@ -247,8 +315,6 @@ mod tests {
             assert!(result.is_ok());
         }
     }
-
-    // ── Edge case tests ──
 
     #[tokio::test]
     async fn test_notify_start_empty_fields() {

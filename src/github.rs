@@ -2,7 +2,9 @@
 
 use crate::config::GitHubConfig;
 use crate::error::{Error, Result};
-use crate::scm::{CodeReview, RemoteRepo, ReviewComment, ReviewUser, ScmProvider};
+use crate::scm::{
+    CodeReview, PostReviewAction, PrSummary, RemoteRepo, ReviewComment, ReviewUser, ScmProvider,
+};
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -59,7 +61,7 @@ impl<H: HttpClient> GitHubClient<H> {
         self.config.token.is_some()
     }
 
-    /// Get the review trigger tag (e.g., "/claudear").
+    /// Get the review trigger tag (e.g., "@claudear").
     pub fn review_trigger(&self) -> &str {
         &self.config.review_trigger
     }
@@ -336,6 +338,163 @@ impl<H: HttpClient> GitHubClient<H> {
         tracing::info!(org = %org, count = all_repos.len(), "Fetched organization repositories");
         Ok(all_repos)
     }
+
+    /// Merge a PR using squash merge.
+    pub async fn merge_pr(&self, repo: &str, pr_number: i64) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let url = format!(
+            "https://api.github.com/repos/{}/pulls/{}/merge",
+            repo, pr_number
+        );
+        let headers = self.build_headers(token);
+        let body = serde_json::json!({"merge_method": "squash"}).to_string();
+
+        let response = self.http.put(&url, headers, &body).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to merge PR {}/pull/{}: {}",
+                repo, pr_number, response.body
+            )));
+        }
+        Ok(())
+    }
+
+    /// Close a PR without merging.
+    pub async fn close_pr(&self, repo: &str, pr_number: i64) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
+        let headers = self.build_headers(token);
+        let body = serde_json::json!({"state": "closed"}).to_string();
+
+        let response = self.http.patch(&url, headers, &body).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to close PR {}/pull/{}: {}",
+                repo, pr_number, response.body
+            )));
+        }
+        Ok(())
+    }
+
+    /// Delete a remote branch.
+    pub async fn delete_branch(&self, repo: &str, branch: &str) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let url = format!(
+            "https://api.github.com/repos/{}/git/refs/heads/{}",
+            repo, branch
+        );
+        let headers = self.build_headers(token);
+
+        let response = self.http.delete(&url, headers).await?;
+        if !response.is_success() && !response.is_not_found() {
+            return Err(Error::Other(format!(
+                "Failed to delete branch {} in {}: {}",
+                branch, repo, response.body
+            )));
+        }
+        Ok(())
+    }
+
+    /// Post a review on a PR.
+    pub async fn post_review(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        action: PostReviewAction,
+        body_text: &str,
+    ) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let url = format!(
+            "https://api.github.com/repos/{}/pulls/{}/reviews",
+            repo, pr_number
+        );
+        let headers = self.build_headers(token);
+
+        let event = match action {
+            PostReviewAction::Comment => "COMMENT",
+            PostReviewAction::RequestChanges => "REQUEST_CHANGES",
+            PostReviewAction::Approve => "APPROVE",
+        };
+
+        let body = serde_json::json!({
+            "event": event,
+            "body": body_text,
+        })
+        .to_string();
+
+        let response = self.http.post(&url, headers, &body).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to post review on {}/pull/{}: {}",
+                repo, pr_number, response.body
+            )));
+        }
+        Ok(())
+    }
+
+    /// List open PRs for a repository.
+    pub async fn list_open_prs(&self, repo: &str) -> Result<Vec<PrSummary>> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?;
+
+        let url = format!(
+            "https://api.github.com/repos/{}/pulls?state=open&per_page=100",
+            repo
+        );
+        let headers = self.build_headers(token);
+        let response = self.http.get(&url, headers).await?;
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to list open PRs for {}: {}",
+                repo, response.body
+            )));
+        }
+
+        let prs: Vec<serde_json::Value> = response.json()?;
+        Ok(prs
+            .into_iter()
+            .filter_map(|pr| {
+                Some(PrSummary {
+                    number: pr.get("number")?.as_i64()?,
+                    title: pr.get("title")?.as_str()?.to_string(),
+                    branch: pr.get("head")?.get("ref")?.as_str()?.to_string(),
+                    url: pr.get("html_url")?.as_str()?.to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// Parse a PR number from a GitHub PR URL.
+    pub fn parse_pr_number(url: &str) -> Option<i64> {
+        // Match /pull/123 or /pulls/123
+        let re = regex_lite::Regex::new(r"/pulls?/(\d+)").ok()?;
+        let caps = re.captures(url)?;
+        caps.get(1)?.as_str().parse().ok()
+    }
 }
 
 #[async_trait]
@@ -374,6 +533,50 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
 
     async fn list_repos(&self, org_or_group: &str) -> Result<Vec<RemoteRepo>> {
         self.list_org_repos(org_or_group).await
+    }
+
+    async fn merge_pr(&self, project: &str, number: i64) -> Result<()> {
+        GitHubClient::merge_pr(self, project, number).await
+    }
+
+    async fn close_pr(&self, project: &str, number: i64) -> Result<()> {
+        GitHubClient::close_pr(self, project, number).await
+    }
+
+    async fn delete_branch(&self, project: &str, branch: &str) -> Result<()> {
+        GitHubClient::delete_branch(self, project, branch).await
+    }
+
+    async fn post_review(
+        &self,
+        project: &str,
+        number: i64,
+        action: PostReviewAction,
+        body: &str,
+    ) -> Result<()> {
+        GitHubClient::post_review(self, project, number, action, body).await
+    }
+
+    async fn list_open_prs(&self, project: &str) -> Result<Vec<PrSummary>> {
+        GitHubClient::list_open_prs(self, project).await
+    }
+
+    async fn get_pr_branch(&self, project: &str, number: i64) -> Result<String> {
+        let info = self.get_pr_info(project, number).await?;
+        info.head_branch.ok_or_else(|| {
+            Error::Other(format!(
+                "No head branch found for PR {} in {}",
+                number, project
+            ))
+        })
+    }
+
+    fn pr_url_pattern(&self) -> &str {
+        "https://github.com/%"
+    }
+
+    fn parse_pr_number(&self, url: &str) -> Option<i64> {
+        GitHubClient::<H>::parse_pr_number(url)
     }
 }
 
@@ -522,7 +725,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -545,7 +748,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -568,7 +771,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -587,7 +790,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -611,7 +814,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -648,7 +851,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -689,7 +892,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -723,7 +926,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -756,7 +959,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -801,7 +1004,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -838,7 +1041,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -869,7 +1072,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -899,7 +1102,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -929,7 +1132,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -955,7 +1158,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -985,7 +1188,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1015,7 +1218,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1042,7 +1245,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1080,7 +1283,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1121,7 +1324,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1170,7 +1373,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1205,7 +1408,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1240,7 +1443,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1279,7 +1482,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1327,7 +1530,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1364,7 +1567,7 @@ mod tests {
             "https://api.github.com/repos/owner/repo/pulls/1/comments",
             200,
             r#"[
-                {"id": 1, "path": "file.rs", "body": "/claudear Fix this", "user": {"id": 123, "login": "user", "type": "User"}, "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z", "html_url": "url"}
+                {"id": 1, "path": "file.rs", "body": "@claudear Fix this", "user": {"id": 123, "login": "user", "type": "User"}, "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z", "html_url": "url"}
             ]"#,
         );
 
@@ -1373,7 +1576,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1388,7 +1591,7 @@ mod tests {
         match &events[0] {
             ReviewEvent::CommentsAdded { comments, .. } => {
                 assert_eq!(comments.len(), 1);
-                assert_eq!(comments[0].body, "/claudear Fix this");
+                assert_eq!(comments[0].body, "@claudear Fix this");
             }
             _ => panic!("Expected CommentsAdded event"),
         }
@@ -1415,7 +1618,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1462,7 +1665,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1492,7 +1695,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
@@ -1664,7 +1867,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
@@ -1690,7 +1893,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
@@ -1742,7 +1945,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::with_http_client(config, mock);
@@ -1782,7 +1985,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
@@ -1808,7 +2011,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
@@ -1843,7 +2046,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
@@ -2029,7 +2232,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client_enabled = GitHubClient::new(config_enabled);
@@ -2234,7 +2437,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
@@ -2356,7 +2559,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
@@ -2413,7 +2616,7 @@ mod tests {
             poll_interval_ms: 30000,
             auto_resolve_on_merge: true,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         };
         let client = GitHubClient::new(config);
@@ -2623,5 +2826,424 @@ mod tests {
         let result = client.list_org_repos("test-org").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("token"));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_info_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            200,
+            r#"{
+                "number": 1,
+                "state": "open",
+                "merged": false,
+                "title": "Fix authentication bug",
+                "head": {"ref": "fix/auth-bug"},
+                "base": {"ref": "main"},
+                "user": {"id": 42, "login": "testuser"}
+            }"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "@claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let info = client.get_pr_info("owner/repo", 1).await.unwrap();
+        assert_eq!(info.head_branch, Some("fix/auth-bug".to_string()));
+        assert_eq!(info.base_branch, Some("main".to_string()));
+        assert_eq!(info.title, Some("Fix authentication bug".to_string()));
+        assert_eq!(info.author, Some("testuser".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_info_missing_optional_fields() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/2",
+            200,
+            r#"{
+                "number": 2,
+                "state": "open",
+                "merged": false
+            }"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "@claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let info = client.get_pr_info("owner/repo", 2).await.unwrap();
+        assert!(info.head_branch.is_none());
+        assert!(info.base_branch.is_none());
+        assert!(info.title.is_none());
+        assert!(info.author.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_info_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/3",
+            500,
+            "Internal Server Error",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "@claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let result = client.get_pr_info("owner/repo", 3).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("GitHub API error"));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_info_no_token() {
+        let mock = MockHttpClient::new();
+        let config = GitHubConfig::default();
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let result = client.get_pr_info("owner/repo", 1).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("token"));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_diff_success() {
+        let mock = MockHttpClient::new();
+        let diff_content = "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n fn main() {\n+    println!(\"Hello\");\n }";
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            200,
+            diff_content,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "@claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let diff = client.get_pr_diff("owner/repo", 1).await.unwrap();
+        assert!(diff.contains("diff --git"));
+        assert!(diff.contains("println!"));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_diff_uses_diff_accept_header() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/5",
+            200,
+            "diff content",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "@claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let _ = client.get_pr_diff("owner/repo", 5).await;
+
+        let requests = client.http.get_requests();
+        assert_eq!(requests.len(), 1);
+        let (_, headers) = &requests[0];
+        let accept = headers.iter().find(|(k, _)| k == "Accept");
+        assert!(accept.is_some());
+        assert_eq!(accept.unwrap().1, "application/vnd.github.v3.diff");
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_diff_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            403,
+            "Forbidden",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "@claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let result = client.get_pr_diff("owner/repo", 1).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("GitHub API error"));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_diff_no_token() {
+        let mock = MockHttpClient::new();
+        let config = GitHubConfig::default();
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let result = client.get_pr_diff("owner/repo", 1).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("token"));
+    }
+
+    #[tokio::test]
+    async fn test_list_org_repos_paginates() {
+        let mock = MockHttpClient::new();
+
+        // First page: 100 repos (triggers pagination)
+        let first_page: Vec<String> = (1..=100)
+            .map(|i| {
+                format!(
+                    r#"{{"id": {i}, "full_name": "org/repo{i}", "name": "repo{i}", "default_branch": "main", "clone_url": "https://github.com/org/repo{i}.git", "html_url": "https://github.com/org/repo{i}", "private": false, "archived": false}}"#
+                )
+            })
+            .collect();
+        mock.mock_response(
+            "https://api.github.com/orgs/org/repos?per_page=100&page=1",
+            200,
+            format!("[{}]", first_page.join(",")),
+        );
+
+        // Second page: 2 repos (stops pagination)
+        mock.mock_response(
+            "https://api.github.com/orgs/org/repos?per_page=100&page=2",
+            200,
+            r#"[
+                {"id": 101, "full_name": "org/repo101", "name": "repo101", "default_branch": "main", "clone_url": "https://github.com/org/repo101.git", "html_url": "https://github.com/org/repo101", "private": false, "archived": false},
+                {"id": 102, "full_name": "org/repo102", "name": "repo102", "default_branch": "main", "clone_url": "https://github.com/org/repo102.git", "html_url": "https://github.com/org/repo102", "private": false, "archived": false}
+            ]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let repos = client.list_org_repos("org").await.unwrap();
+        assert_eq!(repos.len(), 102);
+
+        // Verify pagination happened - 2 requests total
+        let requests = client.http.get_requests();
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_org_repos_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/orgs/test-org/repos?per_page=100&page=1",
+            500,
+            "Internal Server Error",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+
+        let result = client.list_org_repos("test-org").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("GitHub API error"));
+    }
+
+    #[test]
+    fn test_build_headers_structure() {
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "@claudear".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::with_http_client(config, MockHttpClient::new());
+
+        let headers = client.build_headers("my_token");
+        assert_eq!(headers.len(), 4);
+
+        let auth = headers.iter().find(|(k, _)| *k == "Authorization").unwrap();
+        assert_eq!(auth.1, "Bearer my_token");
+
+        let accept = headers.iter().find(|(k, _)| *k == "Accept").unwrap();
+        assert_eq!(accept.1, "application/vnd.github+json");
+
+        let ua = headers.iter().find(|(k, _)| *k == "User-Agent").unwrap();
+        assert_eq!(ua.1, "claudear");
+
+        let api_ver = headers
+            .iter()
+            .find(|(k, _)| *k == "X-GitHub-Api-Version")
+            .unwrap();
+        assert_eq!(api_ver.1, "2022-11-28");
+    }
+
+    #[test]
+    fn test_scm_provider_name() {
+        let config = GitHubConfig::default();
+        let client = GitHubClient::new(config);
+        let provider: &dyn ScmProvider = &client;
+        assert_eq!(provider.name(), "github");
+    }
+
+    #[test]
+    fn test_scm_provider_review_trigger() {
+        let config = GitHubConfig {
+            token: Some("test".to_string()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "@custom-trigger".to_string(),
+            use_ssh: false,
+        };
+        let client = GitHubClient::new(config);
+        let provider: &dyn ScmProvider = &client;
+        assert_eq!(provider.review_trigger(), "@custom-trigger");
+    }
+
+    #[test]
+    fn test_scm_provider_is_enabled_delegates() {
+        let config_enabled = GitHubConfig {
+            token: Some("test".to_string()),
+            ..Default::default()
+        };
+        let client_enabled = GitHubClient::new(config_enabled);
+        let provider_enabled: &dyn ScmProvider = &client_enabled;
+        assert!(provider_enabled.is_enabled());
+
+        let config_disabled = GitHubConfig::default();
+        let client_disabled = GitHubClient::new(config_disabled);
+        let provider_disabled: &dyn ScmProvider = &client_disabled;
+        assert!(!provider_disabled.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_get_pr_status_delegates() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            200,
+            r#"{"number": 1, "state": "open", "merged": false}"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let provider: &dyn ScmProvider = &client;
+
+        let status = provider.get_pr_status("owner/repo", 1).await.unwrap();
+        assert_eq!(status, PrStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_get_pr_info_delegates() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            200,
+            r#"{
+                "number": 1,
+                "state": "open",
+                "merged": false,
+                "title": "Test PR",
+                "head": {"ref": "feature"},
+                "base": {"ref": "main"},
+                "user": {"id": 1, "login": "author"}
+            }"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let provider: &dyn ScmProvider = &client;
+
+        let info = provider.get_pr_info("owner/repo", 1).await.unwrap();
+        assert_eq!(info.title, Some("Test PR".to_string()));
+        assert_eq!(info.head_branch, Some("feature".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_get_pr_diff_delegates() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            200,
+            "diff content here",
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let provider: &dyn ScmProvider = &client;
+
+        let diff = provider.get_pr_diff("owner/repo", 1).await.unwrap();
+        assert_eq!(diff, "diff content here");
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_list_repos_delegates() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/orgs/test-org/repos?per_page=100&page=1",
+            200,
+            r#"[{
+                "id": 1,
+                "full_name": "test-org/repo1",
+                "name": "repo1",
+                "default_branch": "main",
+                "clone_url": "https://github.com/test-org/repo1.git",
+                "html_url": "https://github.com/test-org/repo1",
+                "private": false,
+                "archived": false
+            }]"#,
+        );
+
+        let config = GitHubConfig {
+            token: Some("test_token".to_string()),
+            ..Default::default()
+        };
+        let client = GitHubClient::with_http_client(config, mock);
+        let provider: &dyn ScmProvider = &client;
+
+        let repos = provider.list_repos("test-org").await.unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].full_name, "test-org/repo1");
     }
 }

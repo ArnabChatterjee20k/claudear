@@ -395,8 +395,6 @@ mod tests {
         assert!(result.text.is_none());
     }
 
-    // ── Edge case tests ──
-
     #[test]
     fn test_cosine_similarity_single_element() {
         assert!((cosine_similarity(&[3.0], &[5.0]) - 1.0).abs() < 0.001);

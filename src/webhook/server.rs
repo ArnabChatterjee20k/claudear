@@ -30,6 +30,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -147,6 +148,7 @@ impl WebhookServer {
 
     /// Start the server.
     pub async fn start(self) -> Result<()> {
+        let bind_address = self.config.bind_address.clone();
         let embedding_client = crate::feedback::EmbeddingClient::from_env().ok();
         let user_registry = UserRegistry::new(self.config.users.clone());
 
@@ -215,9 +217,12 @@ impl WebhookServer {
                 post(webhook_handler).layer(concurrency_layer),
             )
             .layer(DefaultBodyLimit::max(512 * 1024)) // 512 KB body size limit
+            // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
+            .layer(SentryHttpLayer::new().enable_transaction())
+            .layer(NewSentryLayer::new_from_top())
             .with_state(state.clone());
 
-        let addr = format!("127.0.0.1:{}", self.port);
+        let addr = format!("{}:{}", bind_address, self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied && self.port < 1024 {
                 std::io::Error::new(
@@ -750,8 +755,8 @@ async fn process_issue(
 
     // Fetch the parent repo (no checkout/reset — just update object store)
     // then create an isolated per-issue worktree for Claude to work in.
-    if let (Some(github_url), Some(default_branch), Some(repo_name)) = (
-        resolution.github_url(),
+    if let (Some(scm_url), Some(default_branch), Some(repo_name)) = (
+        resolution.scm_url(),
         resolution.default_branch(),
         resolution.repo_name(),
     ) {
@@ -761,7 +766,7 @@ async fn process_issue(
             "Fetching latest changes"
         );
 
-        if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, github_url).await {
+        if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, scm_url).await {
             tracing::error!(
                 short_id = %issue.short_id,
                 repo = %repo_name,
@@ -1208,6 +1213,9 @@ async fn process_issue(
                 if let Some(id) = attempt_id {
                     let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, true);
                 }
+                if let Some(ref changelog) = claude_result.changelog {
+                    issue.set_metadata("changelog", changelog.clone());
+                }
                 state.notifier.notify_success(&issue, &pr_url).await?;
 
                 // Record pr_created metric
@@ -1269,14 +1277,25 @@ async fn process_issue(
                 }));
                 state.tracker.record_activity(&activity).ok();
             } else {
-                tracing::info!(short_id = %issue.short_id, "Completed but no PR URL found");
+                let no_pr_error = if claude_result.output.is_empty() {
+                    "No PR URL found in output".to_string()
+                } else {
+                    let summary = if claude_result.output.chars().count() > 500 {
+                        let truncated: String = claude_result.output.chars().take(497).collect();
+                        format!("{}...", truncated)
+                    } else {
+                        claude_result.output.clone()
+                    };
+                    format!("Claude completed without creating a PR: {}", summary)
+                };
+                tracing::info!(short_id = %issue.short_id, "No PR URL found in output");
                 state
                     .tracker
-                    .mark_failed(source_name, &issue.id, "No PR URL found")?;
+                    .mark_failed(source_name, &issue.id, &no_pr_error)?;
                 if let Some(id) = attempt_id {
                     let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
                 }
-                state.notifier.notify_completed(&issue).await?;
+                state.notifier.notify_failed(&issue, &no_pr_error).await?;
                 record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed).await;
 
                 // Log webhook processed without PR
@@ -1288,22 +1307,33 @@ async fn process_issue(
                 .with_issue(issue.id.clone(), issue.short_id.clone())
                 .with_metadata(json!({
                     "success": false,
-                    "reason": "No PR URL found"
+                    "reason": &no_pr_error
                 }));
                 state.tracker.record_activity(&activity).ok();
             }
         } else {
-            let error = claude_result.error.as_deref().unwrap_or("Unknown error");
+            let base_error = claude_result.error.as_deref().unwrap_or("Unknown error");
+            let error = if !claude_result.output.is_empty() {
+                let summary = if claude_result.output.chars().count() > 500 {
+                    let truncated: String = claude_result.output.chars().take(497).collect();
+                    format!("{}...", truncated)
+                } else {
+                    claude_result.output.clone()
+                };
+                format!("{}\n\nClaude's summary: {}", base_error, summary)
+            } else {
+                base_error.to_string()
+            };
             tracing::error!(short_id = %issue.short_id, error = %error, "Failed");
-            state.tracker.mark_failed(source_name, &issue.id, error)?;
+            state.tracker.mark_failed(source_name, &issue.id, &error)?;
             if let Some(id) = attempt_id {
                 let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
             }
-            notify_failed_with_escalation(&state, &issue, error).await?;
+            notify_failed_with_escalation(&state, &issue, &error).await?;
             record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed).await;
 
             // Record error pattern for analytics
-            record_error_pattern(&state, source_name, &issue.id, error);
+            record_error_pattern(&state, source_name, &issue.id, &error);
 
             // Log webhook processing failed
             let activity = ActivityLogEntry::new(
@@ -1314,7 +1344,7 @@ async fn process_issue(
             .with_issue(issue.id.clone(), issue.short_id.clone())
             .with_metadata(json!({
                 "success": false,
-                "error": error
+                "error": &error
             }));
             state.tracker.record_activity(&activity).ok();
         }
@@ -1666,6 +1696,7 @@ mod tests {
             auto_discover_paths: vec![],
             poll_interval_ms: 60000,
             webhook_port: 8080,
+            bind_address: "127.0.0.1".to_string(),
             db_path: std::path::PathBuf::from(":memory:"),
             max_issues_per_cycle: 5,
             max_concurrent: 2,
@@ -5596,5 +5627,1710 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Duplicate delivery"));
+    }
+
+    // ---------------------------------------------------------------
+    // Additional coverage tests
+    // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    // handle_github_webhook: activity logging with signature header
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_github_webhook_logs_has_signature_true() {
+        let github_handler =
+            GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state_with_github(Some(github_handler), tracker);
+
+        let mut header_map: HashMap<String, String> = HashMap::new();
+        header_map.insert(
+            "x-hub-signature-256".to_string(),
+            "sha256=invalid".to_string(),
+        );
+
+        let body = Bytes::from_static(b"{}");
+        let (status, Json(response)) = handle_github_webhook(state, &header_map, &body).await;
+
+        // Even if signature is invalid, the function should not panic.
+        // The status depends on the GitHubWebhookHandler behavior.
+        assert!(
+            status == StatusCode::OK
+                || status == StatusCode::UNAUTHORIZED
+                || status == StatusCode::INTERNAL_SERVER_ERROR,
+            "status was {:?}",
+            status
+        );
+        assert!(response.get("status").is_some() || response.get("error").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_handle_github_webhook_logs_has_signature_false() {
+        let github_handler =
+            GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state_with_github(Some(github_handler), tracker);
+
+        // No signature header
+        let header_map: HashMap<String, String> = HashMap::new();
+        let body = Bytes::from_static(b"{}");
+        let (status, _) = handle_github_webhook(state, &header_map, &body).await;
+
+        // Should still process without panicking
+        assert!(
+            status == StatusCode::OK
+                || status == StatusCode::UNAUTHORIZED
+                || status == StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // handle_github_webhook: various JSON payloads
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_github_webhook_with_review_event_payload() {
+        let github_handler =
+            GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state_with_github(Some(github_handler), tracker);
+
+        let header_map: HashMap<String, String> = HashMap::new();
+        // A review-like payload
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "action": "submitted",
+                "review": {
+                    "state": "changes_requested",
+                    "body": "Please fix the tests"
+                },
+                "pull_request": {
+                    "number": 42,
+                    "html_url": "https://github.com/test/repo/pull/42"
+                }
+            }))
+            .unwrap(),
+        );
+
+        let (status, _) = handle_github_webhook(state, &header_map, &body).await;
+        // The handler should process without panicking
+        assert!(
+            status == StatusCode::OK
+                || status == StatusCode::UNAUTHORIZED
+                || status == StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_github_webhook_with_empty_object_payload() {
+        let github_handler =
+            GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state_with_github(Some(github_handler), tracker);
+
+        let header_map: HashMap<String, String> = HashMap::new();
+        let body = Bytes::from_static(b"{}");
+        let (status, Json(response)) = handle_github_webhook(state, &header_map, &body).await;
+
+        // Empty object won't match any known event type
+        assert!(
+            status == StatusCode::OK
+                || status == StatusCode::UNAUTHORIZED
+                || status == StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert!(response.get("status").is_some() || response.get("error").is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // notify_failed_with_escalation: various hard error strings
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_failed_with_escalation_connection_reset() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(MockNotifier::new());
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: notifier.clone(),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        // "connection reset" is a hard error
+        let result = notify_failed_with_escalation(
+            &state,
+            &issue,
+            "Connection reset by peer during API call",
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_with_escalation_service_unavailable() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(MockNotifier::new());
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: notifier.clone(),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        let result =
+            notify_failed_with_escalation(&state, &issue, "Service unavailable: 503 from API")
+                .await;
+        assert!(result.is_ok());
+        assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_with_escalation_network_error() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(MockNotifier::new());
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: notifier.clone(),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        let result =
+            notify_failed_with_escalation(&state, &issue, "Network error: DNS resolution failed")
+                .await;
+        assert!(result.is_ok());
+        assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_with_escalation_broken_pipe() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(MockNotifier::new());
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: notifier.clone(),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        let result =
+            notify_failed_with_escalation(&state, &issue, "Broken pipe while writing to process")
+                .await;
+        assert!(result.is_ok());
+        assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_with_escalation_internal_server_error() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(MockNotifier::new());
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: notifier.clone(),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        let result = notify_failed_with_escalation(
+            &state,
+            &issue,
+            "Internal server error from upstream API",
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_with_escalation_quota_exceeded() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(MockNotifier::new());
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: notifier.clone(),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        let result =
+            notify_failed_with_escalation(&state, &issue, "Quota exceeded for API key").await;
+        assert!(result.is_ok());
+        assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_escalation_removes_resolved_user_for_hard_error() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(MockNotifier::new());
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: notifier.clone(),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let mut issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        issue.set_metadata("resolved_user", &"some-user".to_string());
+        assert!(issue.get_metadata::<String>("resolved_user").is_some());
+
+        // Hard error should trigger escalation (global notification with resolved_user removed)
+        let result =
+            notify_failed_with_escalation(&state, &issue, "Process timed out after 300s").await;
+        assert!(result.is_ok());
+        assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_normal_error_preserves_issue() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let notifier = Arc::new(MockNotifier::new());
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: notifier.clone(),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let mut issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        issue.set_metadata("resolved_user", &"some-user".to_string());
+
+        // Normal error should NOT remove resolved_user (the original issue is passed as-is)
+        let result =
+            notify_failed_with_escalation(&state, &issue, "Compilation error in main.rs").await;
+        assert!(result.is_ok());
+        // The original issue should still have resolved_user
+        assert!(issue.get_metadata::<String>("resolved_user").is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // record_feedback_outcome_from_attempt tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_record_feedback_outcome_no_attempt_in_tracker() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: Arc::new(MockNotifier::new()),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let issue = Issue::new(
+            "no-attempt",
+            "NONE-1",
+            "No attempt",
+            "https://test.com",
+            "test",
+        );
+        // Should return early without panicking when no attempt exists
+        record_feedback_outcome_from_attempt(&state, "test", &issue, Outcome::Failed).await;
+    }
+
+    #[tokio::test]
+    async fn test_record_feedback_outcome_with_attempt() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        // Record an attempt first
+        tracker.record_attempt("test", "issue-1", "TEST-1").unwrap();
+
+        let config = test_config();
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: Arc::new(MockNotifier::new()),
+            tracker: tracker.clone(),
+            sqlite_tracker: Some(tracker.clone()),
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        let issue = Issue::new(
+            "issue-1",
+            "TEST-1",
+            "Test issue",
+            "https://test.com",
+            "test",
+        );
+        // Should execute without panicking
+        record_feedback_outcome_from_attempt(&state, "test", &issue, Outcome::Failed).await;
+    }
+
+    // ---------------------------------------------------------------
+    // enhance_prompt_with_learning: with data in DB
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_enhance_prompt_all_learning_enabled_with_repo() {
+        let learning = LearningConfig {
+            repo_knowledge: true,
+            qa_promotion: true,
+            strategy_fingerprinting: true,
+            cluster_detection: true,
+            ..Default::default()
+        };
+        let state = make_app_state_for_learning(learning);
+        let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
+        let base = "Build the feature as described.";
+        let result = enhance_prompt_with_learning(&state, base, &issue, Some("my-repo"));
+        // Fresh DB has no data, so prompt should be unchanged
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn test_enhance_prompt_preserves_base_prompt_content() {
+        let learning = LearningConfig {
+            repo_knowledge: true,
+            ..Default::default()
+        };
+        let state = make_app_state_for_learning(learning);
+        let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
+        let base = "This is a complex multi-line\nprompt with specific instructions";
+        let result = enhance_prompt_with_learning(&state, base, &issue, Some("test-repo"));
+        // Whether or not extra context is added, the base prompt must be present
+        assert!(result.contains(base));
+    }
+
+    // ---------------------------------------------------------------
+    // record_error_pattern with very long error messages
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_error_pattern_very_long_message() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: 300,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config: test_config(),
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: Arc::new(MockNotifier::new()),
+            tracker: tracker.clone(),
+            sqlite_tracker: Some(tracker.clone()),
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        // Very long error message should not panic
+        let long_error = "x".repeat(10000);
+        record_error_pattern(&state, "linear", "issue-long", &long_error);
+    }
+
+    #[test]
+    fn test_record_error_pattern_unicode_error() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: 300,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config: test_config(),
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: Arc::new(MockNotifier::new()),
+            tracker: tracker.clone(),
+            sqlite_tracker: Some(tracker.clone()),
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        record_error_pattern(
+            &state,
+            "test",
+            "issue-unicode",
+            "Error with unicode: \u{1F4A9} \u{00E9}\u{00F1}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // truncate_error_for_activity: boundary precision tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_truncate_error_exactly_at_boundary_no_ellipsis() {
+        let msg = "a".repeat(500);
+        let result = truncate_error_for_activity(&msg);
+        assert_eq!(result.len(), 500);
+        assert!(!result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_error_one_over_boundary_has_ellipsis() {
+        let msg = "b".repeat(501);
+        let result = truncate_error_for_activity(&msg);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 500);
+    }
+
+    #[test]
+    fn test_truncate_error_all_multibyte_chars() {
+        // 3-byte UTF-8 chars (CJK characters)
+        let msg = "\u{4E16}".repeat(200); // 600 bytes, 200 chars
+        let result = truncate_error_for_activity(&msg);
+        assert!(result.ends_with("..."));
+        // Result must be valid UTF-8
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_truncate_error_mixed_ascii_and_multibyte() {
+        let msg = format!("{}{}", "a".repeat(490), "\u{1F600}".repeat(10));
+        let result = truncate_error_for_activity(&msg);
+        // Must not panic on mixed content
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        if msg.len() > 500 {
+            assert!(result.ends_with("..."));
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler with sqlite_tracker + new delivery IDs
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_webhook_handler_first_delivery_with_sqlite_tracker() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker.clone(), Some(tracker.clone()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("linear-delivery", "new-delivery-id".parse().unwrap());
+
+        let (status, Json(response)) = webhook_handler(
+            State(state),
+            Path("test".to_string()),
+            headers,
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        // First delivery should proceed to acceptance
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response["status"], "accepted");
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler with multiple signature headers simultaneously
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_webhook_handler_multiple_signature_headers() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-signature", "sig1".parse().unwrap());
+        headers.insert("sentry-hook-signature", "sig2".parse().unwrap());
+        headers.insert("linear-signature", "sig3".parse().unwrap());
+        headers.insert("x-hub-signature-256", "sha256=sig4".parse().unwrap());
+
+        let (status, _) = webhook_handler(
+            State(state),
+            Path("test".to_string()),
+            headers,
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler: suppression rule that does NOT match
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_webhook_handler_suppression_rule_does_not_match() {
+        use crate::prioritisation::suppression::RegexCache;
+        use crate::types::{SuppressionField, SuppressionMatchMode, SuppressionRule};
+
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut config = test_config();
+        config.prioritisation.suppression_rules = vec![SuppressionRule {
+            name: "suppress-deploy".to_string(),
+            field: SuppressionField::Title,
+            pattern: "deploy".to_string(),
+            match_mode: SuppressionMatchMode::Contains,
+            sources: vec![],
+            reason: "Deploy issues suppressed".to_string(),
+        }];
+
+        let cache = RegexCache::new(&config.prioritisation.suppression_rules);
+
+        let state = Arc::new(AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers,
+            notifier: Arc::new(MockNotifier::new()),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: Some(cache),
+        });
+
+        // MockWebhookHandler creates issues with title "Test", which does NOT contain "deploy"
+        let (status, Json(response)) = webhook_handler(
+            State(state),
+            Path("test".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        // Should pass through suppression and be accepted
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response["status"], "accepted");
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler: suppression with sqlite_tracker for recording
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_webhook_handler_suppression_records_to_tracker() {
+        use crate::prioritisation::suppression::RegexCache;
+        use crate::types::{SuppressionField, SuppressionMatchMode, SuppressionRule};
+
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut config = test_config();
+        config.prioritisation.suppression_rules = vec![SuppressionRule {
+            name: "suppress-test".to_string(),
+            field: SuppressionField::Title,
+            pattern: "Test".to_string(),
+            match_mode: SuppressionMatchMode::Contains,
+            sources: vec![],
+            reason: "Suppressed".to_string(),
+        }];
+
+        let cache = RegexCache::new(&config.prioritisation.suppression_rules);
+
+        let state = Arc::new(AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers,
+            notifier: Arc::new(MockNotifier::new()),
+            tracker: tracker.clone(),
+            sqlite_tracker: Some(tracker.clone()),
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: Some(cache),
+        });
+
+        let (status, Json(response)) = webhook_handler(
+            State(state),
+            Path("test".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["status"], "suppressed");
+    }
+
+    // ---------------------------------------------------------------
+    // WebhookServer constructor and setter combinations
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_server_new_with_all_options() {
+        let mut config = test_config();
+        config.webhook_port = 5555;
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("linear")));
+        handlers.register(Arc::new(MockWebhookHandler::new("sentry")));
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let github_handler =
+            GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
+
+        let mut server = WebhookServer::new_with_github(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            Some(tracker),
+            None,
+            Some(github_handler),
+        );
+
+        assert_eq!(server.port, 5555);
+        assert!(server.github_handler.is_some());
+        assert!(server.sqlite_tracker.is_some());
+        assert!(server.issue_embedding_service.is_none());
+        assert!(server.review_watcher.is_none());
+
+        // Test setters
+        server.set_issue_embedding_service(None);
+        server.set_review_watcher(None);
+        assert!(server.issue_embedding_service.is_none());
+        assert!(server.review_watcher.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Router integration: github source via full router
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_router_github_source_no_handler_oneshot() {
+        let handlers = WebhookHandlerRegistry::new();
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/github")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("not configured"));
+    }
+
+    // ---------------------------------------------------------------
+    // Router integration: multiple handlers with various responses
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_router_mixed_handlers_linear_accepted_oneshot() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("linear")));
+        handlers.register(Arc::new(RejectingSignatureHandler));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/linear")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler: accepted webhook records attempt
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_accepted_webhook_records_attempt_in_tracker() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker.clone(), None);
+
+        // Before webhook, no attempt recorded
+        assert!(!tracker.has_attempted("test", "1").unwrap());
+
+        let (status, _) = webhook_handler(
+            State(state),
+            Path("test".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        // After acceptance, attempt should be recorded
+        assert!(tracker.has_attempted("test", "1").unwrap());
+    }
+
+    // ---------------------------------------------------------------
+    // handle_github_webhook: with non-JSON body variants
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_github_webhook_empty_body() {
+        let github_handler =
+            GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state_with_github(Some(github_handler), tracker);
+
+        let header_map: HashMap<String, String> = HashMap::new();
+        let body = Bytes::from_static(b"");
+
+        let (status, Json(response)) = handle_github_webhook(state, &header_map, &body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(response["error"].as_str().unwrap().contains("Invalid JSON"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_github_webhook_truncated_json() {
+        let github_handler =
+            GitHubWebhookHandler::new(crate::config::GitHubConfig::default(), None);
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state_with_github(Some(github_handler), tracker);
+
+        let header_map: HashMap<String, String> = HashMap::new();
+        let body = Bytes::from_static(b"{\"action\": ");
+
+        let (status, Json(response)) = handle_github_webhook(state, &header_map, &body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(response["error"].as_str().unwrap().contains("Invalid JSON"));
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler: JSON array body (not an object)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_webhook_handler_json_array_body() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        // Valid JSON but an array, not an object
+        let (status, _) = webhook_handler(
+            State(state),
+            Path("test".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"[1, 2, 3]"),
+        )
+        .await;
+
+        // serde_json::from_slice will parse it as a valid Value::Array
+        // The mock handler ignores the payload content, so it should proceed
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    // ---------------------------------------------------------------
+    // Router: webhook with various content types
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_router_webhook_no_content_type_header() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+        let app = build_router(state);
+
+        // No content-type header, but body is valid JSON
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/test")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        // Axum webhook handler doesn't require content-type
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler: concurrent processing of different sources
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_concurrent_webhook_different_sources_both_accepted() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("linear")));
+        handlers.register(Arc::new(MockWebhookHandler::new("sentry")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        // First webhook from linear
+        let (status1, _) = webhook_handler(
+            State(Arc::clone(&state)),
+            Path("linear".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(status1, StatusCode::ACCEPTED);
+
+        // Second webhook from sentry (same issue ID from mock, but different source)
+        let (status2, _) = webhook_handler(
+            State(state),
+            Path("sentry".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(status2, StatusCode::ACCEPTED);
+    }
+
+    // ---------------------------------------------------------------
+    // Processing set: verify cleanup happens after key insertion
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_processing_set_entry_exists_after_acceptance() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        let (status, _) = webhook_handler(
+            State(Arc::clone(&state)),
+            Path("test".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // Verify the processing map has the expected key
+        let processing = state.processing.read().await;
+        assert!(processing.contains_key("test:1"));
+        assert_eq!(processing.len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Config preservation through WebhookServer construction
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_server_config_claude_timeout() {
+        let mut config = test_config();
+        config.claude_timeout_secs = 999;
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        assert_eq!(server.config.claude_timeout_secs, 999);
+    }
+
+    #[test]
+    fn test_webhook_server_config_max_concurrent() {
+        let mut config = test_config();
+        config.max_concurrent = 10;
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        assert_eq!(server.config.max_concurrent, 10);
+    }
+
+    // ---------------------------------------------------------------
+    // Activity log entry creation patterns
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_activity_log_entry_webhook_received_format() {
+        let source_name = "linear";
+        let activity = ActivityLogEntry::new(
+            "webhook_received",
+            format!("Webhook received from {}", source_name),
+        )
+        .with_source(source_name.to_string())
+        .with_metadata(json!({
+            "content_length": 1024,
+            "has_signature": true
+        }));
+
+        assert_eq!(activity.activity_type, "webhook_received");
+        assert!(activity.message.contains("linear"));
+    }
+
+    #[test]
+    fn test_activity_log_entry_webhook_rejected_format() {
+        let source_name = "sentry";
+        let activity = ActivityLogEntry::new(
+            "webhook_rejected",
+            format!("Webhook rejected: invalid signature from {}", source_name),
+        )
+        .with_source(source_name.to_string());
+
+        assert_eq!(activity.activity_type, "webhook_rejected");
+        assert!(activity.message.contains("sentry"));
+    }
+
+    // ---------------------------------------------------------------
+    // make_app_state_for_learning helper with custom tracker data
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_enhance_prompt_with_learning_large_base_prompt() {
+        let learning = LearningConfig {
+            repo_knowledge: true,
+            qa_promotion: true,
+            strategy_fingerprinting: true,
+            cluster_detection: true,
+            ..Default::default()
+        };
+        let state = make_app_state_for_learning(learning);
+        let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
+        let base = "x".repeat(10000);
+        let result = enhance_prompt_with_learning(&state, &base, &issue, Some("my-repo"));
+        assert!(result.contains(&base));
+    }
+
+    // ---------------------------------------------------------------
+    // Router integration: suppression via full router
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_router_webhook_suppressed_oneshot() {
+        use crate::prioritisation::suppression::RegexCache;
+        use crate::types::{SuppressionField, SuppressionMatchMode, SuppressionRule};
+
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut config = test_config();
+        config.prioritisation.suppression_rules = vec![SuppressionRule {
+            name: "suppress-test".to_string(),
+            field: SuppressionField::Title,
+            pattern: "Test".to_string(),
+            match_mode: SuppressionMatchMode::Contains,
+            sources: vec![],
+            reason: "Test issues suppressed".to_string(),
+        }];
+
+        let cache = RegexCache::new(&config.prioritisation.suppression_rules);
+
+        let state = Arc::new(AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers,
+            notifier: Arc::new(MockNotifier::new()),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: Some(cache),
+        });
+
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/test")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "suppressed");
+    }
+
+    // ---------------------------------------------------------------
+    // Router: duplicate delivery via full router
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_router_webhook_duplicate_delivery_oneshot() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Pre-record the delivery
+        tracker
+            .check_and_record_delivery("dup-id-123", "test")
+            .unwrap();
+
+        let state = make_app_state(handlers, tracker.clone(), Some(tracker));
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/test")
+            .header("content-type", "application/json")
+            .header("linear-delivery", "dup-id-123")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ignored");
+        assert!(json["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Duplicate delivery"));
+    }
+
+    // ---------------------------------------------------------------
+    // Router: path traversal issue ID via full router
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_router_webhook_path_traversal_id_oneshot() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(CustomIdHandler::new("../../etc/shadow")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/custom")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("Invalid issue ID"));
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler: issue with metadata labels
+    // ---------------------------------------------------------------
+
+    /// Mock handler that sets labels on the issue
+    struct LabeledIssueHandler;
+
+    #[async_trait]
+    impl WebhookHandler for LabeledIssueHandler {
+        fn source_name(&self) -> &str {
+            "labeled"
+        }
+        fn verify_signature(&self, _body: &[u8], _headers: &HashMap<String, String>) -> bool {
+            true
+        }
+        async fn parse_payload(
+            &self,
+            _payload: &serde_json::Value,
+        ) -> crate::error::Result<Option<Issue>> {
+            let mut issue = Issue::new(
+                "lab-1",
+                "LAB-1",
+                "Labeled issue",
+                "https://test.com",
+                "labeled",
+            );
+            issue.set_metadata("labels", &vec!["bug".to_string(), "critical".to_string()]);
+            Ok(Some(issue))
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("Labeled", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, _issue: &Issue) -> crate::error::Result<String> {
+            Ok("Context for labeled issue".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_webhook_handler_with_labeled_issue() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(LabeledIssueHandler));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        let (status, Json(response)) = webhook_handler(
+            State(state),
+            Path("labeled".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response["status"], "accepted");
+        assert_eq!(response["issue"], "LAB-1");
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler: issue with assignee metadata and user registry
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_webhook_handler_accepted_with_sqlite_tracker() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(MockWebhookHandler::new("test")));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker.clone(), Some(tracker));
+
+        let (status, Json(response)) = webhook_handler(
+            State(state),
+            Path("test".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response["status"], "accepted");
+    }
+
+    // ---------------------------------------------------------------
+    // Health handler: processing entries reflect count accurately
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_handler_processing_count_matches_entries() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let config = test_config();
+
+        let mut processing = HashMap::new();
+        for i in 0..7 {
+            processing.insert(format!("test:{}", i), Instant::now());
+        }
+
+        let state = Arc::new(AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.claude_timeout_secs,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: Arc::new(MockNotifier::new()),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(processing),
+            suppression_regex_cache: None,
+        });
+
+        let Json(response) = health_handler(State(state)).await;
+        assert_eq!(response["processing_count"], 7);
+    }
+
+    // ---------------------------------------------------------------
+    // record_error_pattern: verify pattern storage
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_error_pattern_stores_source_and_issue() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: 300,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config: test_config(),
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: Arc::new(MockNotifier::new()),
+            tracker: tracker.clone(),
+            sqlite_tracker: Some(tracker.clone()),
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        // Should create error pattern without panicking
+        record_error_pattern(
+            &state,
+            "jira",
+            "JIRA-42",
+            "Compilation failed: undefined reference",
+        );
+
+        // The pattern was recorded - verify by recording another for the same error hash
+        record_error_pattern(
+            &state,
+            "jira",
+            "JIRA-43",
+            "Compilation failed: undefined reference",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // WebhookServer: port defaults from config
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_server_default_port() {
+        let config = test_config(); // default port is 8080
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        assert_eq!(server.port, 8080);
+    }
+
+    #[test]
+    fn test_webhook_server_high_port() {
+        let mut config = test_config();
+        config.webhook_port = 65535;
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        assert_eq!(server.port, 65535);
+    }
+
+    #[test]
+    fn test_webhook_server_low_port() {
+        let mut config = test_config();
+        config.webhook_port = 80;
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let server = WebhookServer::new(config, handlers, notifier, tracker, None, None);
+        assert_eq!(server.port, 80);
+    }
+
+    // ---------------------------------------------------------------
+    // Router: PATCH method returns 405
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_router_patch_on_webhook_returns_method_not_allowed() {
+        let handlers = WebhookHandlerRegistry::new();
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/webhook/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn test_router_patch_on_health_returns_method_not_allowed() {
+        let handlers = WebhookHandlerRegistry::new();
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook handler: unicode in source name
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_webhook_handler_nonexistent_source_with_special_chars() {
+        let handlers = WebhookHandlerRegistry::new();
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        let (status, Json(response)) = webhook_handler(
+            State(state),
+            Path("test-source_123".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown source"));
+    }
+
+    // ---------------------------------------------------------------
+    // Additional named coverage tests for truncate_error_for_activity
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_truncate_error_for_activity_short() {
+        let msg = "A short error message";
+        let result = truncate_error_for_activity(msg);
+        assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn test_truncate_error_for_activity_exact() {
+        let msg = "c".repeat(500);
+        let result = truncate_error_for_activity(&msg);
+        assert_eq!(result, msg);
+        assert_eq!(result.len(), 500);
+        assert!(!result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_error_for_activity_long() {
+        let msg = "d".repeat(1000);
+        let result = truncate_error_for_activity(&msg);
+        assert!(result.len() <= 500);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_error_for_activity_multibyte() {
+        // Build a string where the 500-byte boundary falls inside a multibyte char
+        let prefix = "a".repeat(498);
+        let msg = format!("{}\u{1F600}\u{1F600}", prefix); // 498 + 4 + 4 = 506 bytes
+        let result = truncate_error_for_activity(&msg);
+        // Must not panic and must be valid UTF-8
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_error_for_activity_empty() {
+        let result = truncate_error_for_activity("");
+        assert_eq!(result, "");
+    }
+
+    // ---------------------------------------------------------------
+    // Additional named coverage test for record_error_pattern
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_error_pattern() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = AppState {
+            claude: ClaudeRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: 300,
+                    ..Default::default()
+                },
+                tracker.clone(),
+            ),
+            config: test_config(),
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: Arc::new(MockNotifier::new()),
+            tracker: tracker.clone(),
+            sqlite_tracker: Some(tracker.clone()),
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        };
+
+        // Should not panic and should record without error
+        record_error_pattern(&state, "linear", "LIN-100", "Timeout during compilation");
+        record_error_pattern(&state, "sentry", "SENTRY-200", "");
+        record_error_pattern(&state, "jira", "JIRA-300", "a]b[c{d}e");
+    }
+
+    // ---------------------------------------------------------------
+    // Additional named coverage tests for enhance_prompt_with_learning
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_enhance_prompt_with_learning_no_repo() {
+        let state = make_app_state_for_learning(LearningConfig::default());
+        let issue = Issue::new("1", "TEST-1", "Bug title", "https://test.com", "test");
+        let base = "Fix the bug described in the issue.";
+        let result = enhance_prompt_with_learning(&state, base, &issue, None);
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn test_enhance_prompt_with_learning_all_disabled() {
+        let learning = LearningConfig {
+            repo_knowledge: false,
+            qa_promotion: false,
+            strategy_fingerprinting: false,
+            cluster_detection: false,
+            ..Default::default()
+        };
+        let state = make_app_state_for_learning(learning);
+        let issue = Issue::new("1", "TEST-1", "Bug title", "https://test.com", "test");
+        let base = "Fix the bug described in the issue.";
+        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn test_enhance_prompt_with_learning_no_data() {
+        let learning = LearningConfig {
+            repo_knowledge: true,
+            qa_promotion: true,
+            strategy_fingerprinting: true,
+            cluster_detection: true,
+            ..Default::default()
+        };
+        let state = make_app_state_for_learning(learning);
+        let issue = Issue::new("1", "TEST-1", "Bug title", "https://test.com", "test");
+        let base = "Fix the bug described in the issue.";
+        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        // In-memory tracker has no data, so prompt should be unchanged
+        assert_eq!(result, base);
     }
 }

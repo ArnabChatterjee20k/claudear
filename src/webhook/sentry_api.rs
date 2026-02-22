@@ -437,8 +437,6 @@ mod tests {
         assert_eq!(hooks[1].url, "https://example.com/hook2");
     }
 
-    // ── validate_slug tests ──
-
     #[test]
     fn test_validate_slug_valid_alphanumeric() {
         assert!(validate_slug("my-project", "test").is_ok());
@@ -517,8 +515,6 @@ mod tests {
         assert!(validate_slug("123", "test").is_ok());
     }
 
-    // ── Deserialization tests ──
-
     #[test]
     fn test_sentry_error_response_deserialization() {
         let json = r#"{"detail": "Project not found"}"#;
@@ -567,8 +563,6 @@ mod tests {
         assert!(item.events.is_empty());
     }
 
-    // ── Struct field tests ──
-
     #[test]
     fn test_sentry_webhook_registration_clone() {
         let original = SentryWebhookRegistration {
@@ -584,6 +578,53 @@ mod tests {
         assert_eq!(cloned.secret, original.secret);
         assert_eq!(cloned.events, original.events);
         assert_eq!(cloned.project_slug, original.project_slug);
+    }
+
+    #[test]
+    fn test_validate_slug_valid() {
+        // Various valid slugs: alphanumeric, hyphens, underscores, dots
+        assert!(validate_slug("my-project", "test").is_ok());
+        assert!(validate_slug("my_project", "test").is_ok());
+        assert!(validate_slug("my.project.v2", "test").is_ok());
+        assert!(validate_slug("abc123", "test").is_ok());
+        assert!(validate_slug("a", "test").is_ok());
+        assert!(validate_slug("UPPERCASE", "test").is_ok());
+        assert!(validate_slug("mix-Case_123.v4", "test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_slug_invalid_chars() {
+        // Slugs with spaces, slashes, unicode symbols
+        let space = validate_slug("has space", "test");
+        assert!(space.is_err());
+        assert!(space
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains("invalid"));
+
+        let slash = validate_slug("has/slash", "test");
+        assert!(slash.is_err());
+        assert!(slash
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains("invalid"));
+
+        // Non-alphanumeric unicode symbol (snowman)
+        let unicode = validate_slug("proj-\u{2603}", "test");
+        assert!(unicode.is_err());
+        assert!(unicode
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains("invalid"));
+
+        let at_sign = validate_slug("proj@v2", "test");
+        assert!(at_sign.is_err());
+
+        let bang = validate_slug("proj!", "test");
+        assert!(bang.is_err());
     }
 
     #[test]

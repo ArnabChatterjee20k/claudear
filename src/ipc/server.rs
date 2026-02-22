@@ -624,8 +624,6 @@ mod tests {
         assert_eq!(state.issues_processed.load(Ordering::SeqCst), 0);
     }
 
-    // ── Mocks and helpers ──────────────────────────────────────────
-
     use crate::error::Result as CrateResult;
     use crate::notifier::Notifier;
     use crate::source::IssueSource;
@@ -731,8 +729,6 @@ mod tests {
     fn mock_notifier() -> Arc<dyn Notifier> {
         Arc::new(MockNotifier)
     }
-
-    // ── handle_command tests ───────────────────────────────────────
 
     #[tokio::test]
     async fn test_handle_command_ping() {
@@ -1121,8 +1117,6 @@ mod tests {
         }
     }
 
-    // ── IpcServerBuilder tests ─────────────────────────────────────
-
     #[test]
     fn test_builder_default_max_activity_entries() {
         let builder = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier());
@@ -1168,8 +1162,6 @@ mod tests {
         assert!(server.state.source_names.contains(&"sentry".to_string()));
         assert!(server.state.source_names.contains(&"jira".to_string()));
     }
-
-    // ── IpcServer method tests ─────────────────────────────────────
 
     #[test]
     fn test_is_paused_initially_false() {
@@ -1297,8 +1289,6 @@ mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
-    // ── Status with poll interval set ──────────────────────────────
-
     #[tokio::test]
     async fn test_handle_command_status_with_poll_interval() {
         let tracker = mock_tracker();
@@ -1327,8 +1317,6 @@ mod tests {
         }
     }
 
-    // ── Status with paused state ───────────────────────────────────
-
     #[tokio::test]
     async fn test_handle_command_status_reflects_paused() {
         let tracker = mock_tracker();
@@ -1355,5 +1343,176 @@ mod tests {
             }
             other => panic!("Expected State, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_ipc_server_set_mode() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(*server.state.mode.read().await, "initializing");
+        server.set_mode("webhook").await;
+        assert_eq!(*server.state.mode.read().await, "webhook");
+        server.set_mode("poll").await;
+        assert_eq!(*server.state.mode.read().await, "poll");
+    }
+
+    #[test]
+    fn test_ipc_server_set_poll_interval() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(server.state.poll_interval_ms.load(Ordering::SeqCst), 0);
+        server.set_poll_interval(60_000);
+        assert_eq!(server.state.poll_interval_ms.load(Ordering::SeqCst), 60_000);
+        server.set_poll_interval(120_000);
+        assert_eq!(
+            server.state.poll_interval_ms.load(Ordering::SeqCst),
+            120_000
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipc_server_is_paused() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        // Default is not paused
+        assert!(!server.is_paused());
+        // Toggle paused via state
+        server.state.paused.store(true, Ordering::SeqCst);
+        assert!(server.is_paused());
+        // Toggle back
+        server.state.paused.store(false, Ordering::SeqCst);
+        assert!(!server.is_paused());
+    }
+
+    #[test]
+    fn test_ipc_server_inc_issues_processed() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(server.state.issues_processed.load(Ordering::SeqCst), 0);
+        server.inc_issues_processed();
+        assert_eq!(server.state.issues_processed.load(Ordering::SeqCst), 1);
+        server.inc_issues_processed();
+        server.inc_issues_processed();
+        assert_eq!(server.state.issues_processed.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_ipc_server_inc_prs_created() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(server.state.prs_created.load(Ordering::SeqCst), 0);
+        server.inc_prs_created();
+        assert_eq!(server.state.prs_created.load(Ordering::SeqCst), 1);
+        server.inc_prs_created();
+        assert_eq!(server.state.prs_created.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_server_add_remove_processing() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert!(server.state.processing.read().await.is_empty());
+
+        server.add_processing("ISSUE-1").await;
+        server.add_processing("ISSUE-2").await;
+        server.add_processing("ISSUE-3").await;
+        assert_eq!(server.state.processing.read().await.len(), 3);
+
+        server.remove_processing("ISSUE-2").await;
+        let processing = server.state.processing.read().await;
+        assert_eq!(processing.len(), 2);
+        assert!(processing.contains(&"ISSUE-1".to_string()));
+        assert!(!processing.contains(&"ISSUE-2".to_string()));
+        assert!(processing.contains(&"ISSUE-3".to_string()));
+        drop(processing);
+
+        // Remove non-existent is a no-op
+        server.remove_processing("DOES-NOT-EXIST").await;
+        assert_eq!(server.state.processing.read().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_server_log_activity() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+
+        server
+            .log_activity(
+                ActivityType::IssueDetected,
+                "Detected issue LIN-1",
+                Some("LIN-1"),
+                Some("linear"),
+            )
+            .await;
+        server
+            .log_activity(
+                ActivityType::PrCreated,
+                "Created PR for LIN-1",
+                Some("LIN-1"),
+                Some("linear"),
+            )
+            .await;
+        server
+            .log_activity(ActivityType::WatcherStarted, "Watcher started", None, None)
+            .await;
+
+        let activity = server.state.activity.lock().await;
+        assert_eq!(activity.len(), 3);
+        assert_eq!(activity[0].message, "Detected issue LIN-1");
+        assert_eq!(activity[0].issue_id, Some("LIN-1".to_string()));
+        assert_eq!(activity[0].source, Some("linear".to_string()));
+        assert_eq!(activity[1].message, "Created PR for LIN-1");
+        assert_eq!(activity[2].message, "Watcher started");
+        assert_eq!(activity[2].issue_id, None);
+        assert_eq!(activity[2].source, None);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_server_log_activity_overflow() {
+        let server = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier())
+            .max_activity_entries(5)
+            .build();
+
+        // Add 8 entries to overflow the capacity of 5
+        for i in 0..8 {
+            server
+                .log_activity(
+                    ActivityType::IssueDetected,
+                    &format!("entry-{}", i),
+                    None,
+                    None,
+                )
+                .await;
+        }
+
+        let activity = server.state.activity.lock().await;
+        assert_eq!(activity.len(), 5);
+        // Oldest entries (0, 1, 2) should have been evicted; entries 3..7 remain
+        assert_eq!(activity[0].message, "entry-3");
+        assert_eq!(activity[1].message, "entry-4");
+        assert_eq!(activity[2].message, "entry-5");
+        assert_eq!(activity[3].message, "entry-6");
+        assert_eq!(activity[4].message, "entry-7");
+    }
+
+    #[test]
+    fn test_ipc_server_builder_defaults() {
+        let builder = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(builder.max_activity_entries, DEFAULT_MAX_ACTIVITY_ENTRIES);
+        assert_eq!(builder.max_retries, 2);
+
+        let server = builder.build();
+        assert_eq!(
+            server.state.max_activity_entries,
+            DEFAULT_MAX_ACTIVITY_ENTRIES
+        );
+        assert_eq!(server.state.max_retries, 2);
+        assert!(!server.is_paused());
+        assert_eq!(server.state.issues_processed.load(Ordering::SeqCst), 0);
+        assert_eq!(server.state.prs_created.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_ipc_server_builder_custom() {
+        let server = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier())
+            .max_activity_entries(250)
+            .max_retries(10)
+            .build();
+
+        assert_eq!(server.state.max_activity_entries, 250);
+        assert_eq!(server.state.max_retries, 10);
     }
 }

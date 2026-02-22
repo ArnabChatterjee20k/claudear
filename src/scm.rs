@@ -10,9 +10,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-// ──────────────────────────────────────────────────────────────────────────────
 // ScmProvider trait
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Trait abstracting a source-control management provider (GitHub, GitLab, ...).
 ///
@@ -25,7 +23,7 @@ pub trait ScmProvider: Send + Sync {
     /// Whether the provider is configured and ready to use.
     fn is_enabled(&self) -> bool;
 
-    /// The review trigger tag (e.g. `"/claudear"`).
+    /// The review trigger tag (e.g. `"@claudear"`).
     fn review_trigger(&self) -> &str;
 
     /// Get the merge/close status of a PR/MR.
@@ -90,11 +88,71 @@ pub trait ScmProvider: Send + Sync {
 
     /// List repositories for an organization / group.
     async fn list_repos(&self, org_or_group: &str) -> Result<Vec<RemoteRepo>>;
+
+    /// Merge (squash) a PR/MR.
+    async fn merge_pr(&self, _project: &str, _number: i64) -> Result<()> {
+        Err(crate::error::Error::Other(
+            "merge_pr not supported by this SCM provider".into(),
+        ))
+    }
+
+    /// Close a PR/MR without merging.
+    async fn close_pr(&self, _project: &str, _number: i64) -> Result<()> {
+        Err(crate::error::Error::Other(
+            "close_pr not supported by this SCM provider".into(),
+        ))
+    }
+
+    /// Delete a remote branch.
+    async fn delete_branch(&self, _project: &str, _branch: &str) -> Result<()> {
+        Err(crate::error::Error::Other(
+            "delete_branch not supported by this SCM provider".into(),
+        ))
+    }
+
+    /// Post a review on a PR/MR.
+    async fn post_review(
+        &self,
+        _project: &str,
+        _number: i64,
+        _action: PostReviewAction,
+        _body: &str,
+    ) -> Result<()> {
+        Err(crate::error::Error::Other(
+            "post_review not supported by this SCM provider".into(),
+        ))
+    }
+
+    /// List open PRs/MRs for a project.
+    async fn list_open_prs(&self, _project: &str) -> Result<Vec<PrSummary>> {
+        Err(crate::error::Error::Other(
+            "list_open_prs not supported by this SCM provider".into(),
+        ))
+    }
+
+    /// Get the source branch name for a PR/MR.
+    async fn get_pr_branch(&self, project: &str, number: i64) -> Result<String> {
+        let info = self.get_pr_info(project, number).await?;
+        info.head_branch.ok_or_else(|| {
+            crate::error::Error::Other(format!(
+                "No head branch found for PR {} in {}",
+                number, project
+            ))
+        })
+    }
+
+    /// URL pattern for matching PR URLs in LIKE queries (e.g. `"https://github.com/%"`).
+    fn pr_url_pattern(&self) -> &str {
+        "%"
+    }
+
+    /// Extract a PR number from a PR URL. Returns `None` if the URL doesn't match.
+    fn parse_pr_number(&self, _url: &str) -> Option<i64> {
+        None
+    }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Shared types
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Status of a PR / merge request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +169,26 @@ pub struct PrInfo {
     pub base_branch: Option<String>,
     pub title: Option<String>,
     pub author: Option<String>,
+}
+
+/// Action to take when posting a review on a PR/MR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostReviewAction {
+    /// Leave a comment without approving or requesting changes.
+    Comment,
+    /// Request changes before the PR can be merged.
+    RequestChanges,
+    /// Approve the PR.
+    Approve,
+}
+
+/// Summary of an open PR/MR for listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrSummary {
+    pub number: i64,
+    pub title: String,
+    pub branch: String,
+    pub url: String,
 }
 
 /// A code review (was `PrReview` in github.rs).
@@ -353,9 +431,7 @@ impl ReviewEvent {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Free function
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Compare two RFC 3339 timestamps, falling back to lexicographic ordering.
 pub fn compare_timestamps(a: &str, b: &str) -> std::cmp::Ordering {
@@ -376,9 +452,7 @@ pub fn timestamp_at_or_after(candidate: &str, since: &str) -> bool {
     compare_timestamps(candidate, since) != std::cmp::Ordering::Less
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // PrMonitor
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Watches pending PRs and updates their merge/close status.
 pub struct PrMonitor {
@@ -457,12 +531,12 @@ impl PrMonitor {
 
     /// Check a single PR and update its status if needed.
     async fn check_pr(&self, attempt: &FixAttempt) -> Result<Option<PrStatusUpdate>> {
-        let repo = match &attempt.github_repo {
+        let repo = match &attempt.scm_repo {
             Some(r) => r,
             None => return Ok(None),
         };
 
-        let pr_number = match attempt.github_pr_number {
+        let pr_number = match attempt.scm_pr_number {
             Some(n) => n,
             None => return Ok(None),
         };
@@ -617,9 +691,7 @@ impl PrMonitor {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // ReviewWatcher
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Watches PRs for review activity (new reviews and inline comments).
 pub struct ReviewWatcher {
@@ -1002,7 +1074,7 @@ impl ReviewWatcher {
             }
         };
 
-        // Get the review trigger (e.g. "/claudear")
+        // Get the review trigger (e.g. "@claudear")
         let trigger = self.provider.review_trigger();
 
         // Cursor comments are all non-bot comments after the current cursor.
@@ -1161,16 +1233,12 @@ impl ReviewWatcher {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Tests
-// ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cmp::Ordering;
-
-    // ── compare_timestamps ──────────────────────────────────────────────
 
     #[test]
     fn compare_timestamps_equal() {
@@ -1219,8 +1287,6 @@ mod tests {
         assert_eq!(compare_timestamps(invalid, valid), Ordering::Greater);
     }
 
-    // ── timestamp_at_or_after ───────────────────────────────────────────
-
     #[test]
     fn timestamp_at_or_after_equal() {
         let ts = "2024-06-01T00:00:00Z";
@@ -1257,8 +1323,6 @@ mod tests {
         assert!(!timestamp_at_or_after("aaa", "zzz")); // "aaa" < "zzz"
     }
 
-    // ── PrStatus ────────────────────────────────────────────────────────
-
     #[test]
     fn pr_status_equality() {
         assert_eq!(PrStatus::Open, PrStatus::Open);
@@ -1286,8 +1350,6 @@ mod tests {
         let cloned = status.clone();
         assert_eq!(status, cloned);
     }
-
-    // ── ReviewEvent ─────────────────────────────────────────────────────
 
     fn make_review_user() -> ReviewUser {
         ReviewUser {
@@ -1510,8 +1572,6 @@ mod tests {
         assert!(summary.is_empty());
     }
 
-    // ── PrReviewState ───────────────────────────────────────────────────
-
     #[test]
     fn pr_review_state_new_creates_correct_initial_state() {
         let state = PrReviewState::new(
@@ -1593,8 +1653,6 @@ mod tests {
         );
     }
 
-    // ── Backward-compat aliases ─────────────────────────────────────────
-
     #[test]
     fn backward_compat_pr_review_alias() {
         let _: PrReview = CodeReview {
@@ -1665,8 +1723,6 @@ mod tests {
         };
         use async_trait::async_trait;
         use std::sync::Arc;
-
-        // ── MockScmProvider ─────────────────────────────────────────────
 
         struct MockScmProvider {
             name: String,
@@ -1746,8 +1802,6 @@ mod tests {
             }
         }
 
-        // ── Helpers ─────────────────────────────────────────────────────
-
         fn make_review(id: i64, submitted_at: Option<&str>) -> CodeReview {
             CodeReview {
                 id,
@@ -1785,16 +1839,14 @@ mod tests {
             }
         }
 
-        // ── Tests ───────────────────────────────────────────────────────
-
         #[tokio::test]
         async fn trait_object_creation_and_dispatch() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
 
             assert_eq!(provider.name(), "github");
             assert!(provider.is_enabled());
-            assert_eq!(provider.review_trigger(), "/claudear");
+            assert_eq!(provider.review_trigger(), "@claudear");
         }
 
         #[tokio::test]
@@ -1814,7 +1866,7 @@ mod tests {
                 make_review(2, Some("2025-06-15T12:00:00Z")),
                 make_review(3, Some("2025-12-31T23:59:59Z")),
             ];
-            let mock = MockScmProvider::new("github", true, "/claudear").with_reviews(reviews);
+            let mock = MockScmProvider::new("github", true, "@claudear").with_reviews(reviews);
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
 
             let filtered = provider
@@ -1834,7 +1886,7 @@ mod tests {
                 make_review(2, Some("2025-06-15T12:00:00Z")),
                 make_review(3, Some("2025-12-31T23:59:59Z")),
             ];
-            let mock = MockScmProvider::new("github", true, "/claudear").with_reviews(reviews);
+            let mock = MockScmProvider::new("github", true, "@claudear").with_reviews(reviews);
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
 
             let all = provider.get_new_reviews("org/repo", 1, None).await.unwrap();
@@ -1848,7 +1900,7 @@ mod tests {
                 make_review(2, None),
                 make_review(3, Some("2025-12-31T23:59:59Z")),
             ];
-            let mock = MockScmProvider::new("github", true, "/claudear").with_reviews(reviews);
+            let mock = MockScmProvider::new("github", true, "@claudear").with_reviews(reviews);
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
 
             let filtered = provider
@@ -1868,7 +1920,7 @@ mod tests {
                 make_review(1, Some("2025-01-01T00:00:00Z")),
                 make_review(2, Some("2025-06-15T12:00:00Z")),
             ];
-            let mock = MockScmProvider::new("github", true, "/claudear").with_reviews(reviews);
+            let mock = MockScmProvider::new("github", true, "@claudear").with_reviews(reviews);
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
 
             let filtered = provider
@@ -1936,7 +1988,7 @@ mod tests {
 
         #[tokio::test]
         async fn provider_interchangeability() {
-            let github = MockScmProvider::new("github", true, "/claudear")
+            let github = MockScmProvider::new("github", true, "@claudear")
                 .with_reviews(vec![make_review(1, Some("2025-01-01T00:00:00Z"))]);
             let gitlab = MockScmProvider::new("gitlab", true, "/review")
                 .with_comments(vec![make_comment(10, "2025-06-01T00:00:00Z")]);
@@ -1996,7 +2048,7 @@ mod tests {
 
         #[tokio::test]
         async fn trait_object_with_empty_reviews_and_comments() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
 
             let reviews = provider.get_new_reviews("org/repo", 1, None).await.unwrap();
@@ -2012,7 +2064,7 @@ mod tests {
         #[tokio::test]
         async fn get_new_reviews_exact_boundary_is_inclusive() {
             let reviews = vec![make_review(1, Some("2025-06-15T12:00:00Z"))];
-            let mock = MockScmProvider::new("github", true, "/claudear").with_reviews(reviews);
+            let mock = MockScmProvider::new("github", true, "@claudear").with_reviews(reviews);
             let provider: Arc<dyn ScmProvider> = Arc::new(mock);
 
             // "at or after" means the exact timestamp should be included
@@ -2050,8 +2102,6 @@ mod tests {
         use chrono::Utc;
         use std::collections::{HashMap, HashSet};
         use std::sync::{Arc, Mutex};
-
-        // ── MockScmProvider for PrMonitor tests ──────────────────────────
 
         /// A mock SCM provider that returns configurable PrStatus per (repo, pr_number).
         struct MockPrScmProvider {
@@ -2136,8 +2186,6 @@ mod tests {
                 Ok(vec![])
             }
         }
-
-        // ── MockFixAttemptTracker ────────────────────────────────────────
 
         struct MockFixAttemptTracker {
             pending_prs: Arc<Mutex<Vec<FixAttempt>>>,
@@ -2270,8 +2318,6 @@ mod tests {
             }
         }
 
-        // ── Helpers ──────────────────────────────────────────────────────
-
         fn make_fix_attempt(
             source: &str,
             issue_id: &str,
@@ -2288,8 +2334,8 @@ mod tests {
                 source: source.to_string(),
                 attempted_at: Utc::now(),
                 pr_url: pr_url.map(|u| u.to_string()),
-                github_repo: repo.map(|r| r.to_string()),
-                github_pr_number: pr_number,
+                scm_repo: repo.map(|r| r.to_string()),
+                scm_pr_number: pr_number,
                 status: FixAttemptStatus::Success,
                 error_message: None,
                 merged_at: None,
@@ -2301,8 +2347,6 @@ mod tests {
                 cascade_repo: None,
             }
         }
-
-        // ── Tests ────────────────────────────────────────────────────────
 
         #[tokio::test]
         async fn test_check_pending_prs_disabled_provider() {
@@ -2639,8 +2683,6 @@ mod tests {
         use async_trait::async_trait;
         use std::sync::{Arc, Mutex};
 
-        // ── MockScmProvider for ReviewWatcher ────────────────────────────
-
         struct MockScmProvider {
             name: String,
             enabled: bool,
@@ -2730,8 +2772,6 @@ mod tests {
             }
         }
 
-        // ── Helpers ─────────────────────────────────────────────────────
-
         fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
             CodeReview {
                 id,
@@ -2793,12 +2833,10 @@ mod tests {
             PrReviewState::new(pr_url, repo, pr_number, "ISSUE-1", "linear")
         }
 
-        // ── State management (sync tests) ───────────────────────────────
-
         #[test]
         fn test_watch_pr_adds_state() {
             let provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", true, "/claudear"));
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let watcher = ReviewWatcher::new(provider);
 
             let state = make_state("https://github.com/org/repo/pull/1", "org/repo", 1);
@@ -2816,7 +2854,7 @@ mod tests {
         #[test]
         fn test_unwatch_pr_removes() {
             let provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", true, "/claudear"));
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let watcher = ReviewWatcher::new(provider);
 
             let state = make_state("https://github.com/org/repo/pull/1", "org/repo", 1);
@@ -2830,7 +2868,7 @@ mod tests {
         #[test]
         fn test_get_active_states_filters_inactive() {
             let provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", true, "/claudear"));
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let watcher = ReviewWatcher::new(provider);
 
             watcher.watch_pr(make_state(
@@ -2853,7 +2891,7 @@ mod tests {
         #[test]
         fn test_get_all_states_excludes_unwatched() {
             let provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", true, "/claudear"));
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let watcher = ReviewWatcher::new(provider);
 
             watcher.watch_pr(make_state(
@@ -2876,7 +2914,7 @@ mod tests {
         #[test]
         fn test_load_states_only_active() {
             let provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", true, "/claudear"));
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let watcher = ReviewWatcher::new(provider);
 
             let mut active_state = make_state("https://github.com/org/repo/pull/1", "org/repo", 1);
@@ -2896,7 +2934,7 @@ mod tests {
         #[test]
         fn test_watch_pr_preserves_existing_cursors() {
             let provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", true, "/claudear"));
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let watcher = ReviewWatcher::new(provider);
 
             // First watch with cursors already set
@@ -2930,9 +2968,9 @@ mod tests {
         #[test]
         fn test_is_enabled_delegates_to_provider() {
             let enabled_provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", true, "/claudear"));
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let disabled_provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", false, "/claudear"));
+                Arc::new(MockScmProvider::new("github", false, "@claudear"));
 
             let watcher_enabled = ReviewWatcher::new(enabled_provider);
             let watcher_disabled = ReviewWatcher::new(disabled_provider);
@@ -2940,8 +2978,6 @@ mod tests {
             assert!(watcher_enabled.is_enabled());
             assert!(!watcher_disabled.is_enabled());
         }
-
-        // ── comment_is_after_cursor (sync tests) ────────────────────────
 
         #[test]
         fn test_comment_after_cursor_no_cursor() {
@@ -3001,12 +3037,10 @@ mod tests {
             ));
         }
 
-        // ── Async review checking ───────────────────────────────────────
-
         #[tokio::test]
         async fn test_check_for_reviews_disabled() {
             let provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", false, "/claudear"));
+                Arc::new(MockScmProvider::new("github", false, "@claudear"));
             let watcher = ReviewWatcher::new(provider);
 
             let events = watcher.check_for_reviews().await.unwrap();
@@ -3016,7 +3050,7 @@ mod tests {
         #[tokio::test]
         async fn test_check_for_reviews_no_active_states() {
             let provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", true, "/claudear"));
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let watcher = ReviewWatcher::new(provider);
             // No watch_pr called, so no active states
             let events = watcher.check_for_reviews().await.unwrap();
@@ -3025,7 +3059,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_check_for_reviews_new_review() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             mock.set_reviews(vec![make_review(
                 1,
                 "CHANGES_REQUESTED",
@@ -3064,7 +3098,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_check_for_reviews_skips_bot_reviews() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             mock.set_reviews(vec![make_bot_review(
                 1,
                 "COMMENTED",
@@ -3089,7 +3123,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_check_for_reviews_skips_pending_reviews() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             mock.set_reviews(vec![make_review(
                 1,
                 "PENDING",
@@ -3115,7 +3149,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_check_for_reviews_skips_already_processed() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             mock.set_reviews(vec![make_review(
                 5,
                 "COMMENTED",
@@ -3142,7 +3176,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_check_for_reviews_advances_cursor() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             mock.set_reviews(vec![
                 make_review(1, "COMMENTED", "reviewer", "2025-01-01T00:00:00Z"),
                 make_review(2, "CHANGES_REQUESTED", "reviewer", "2025-01-02T00:00:00Z"),
@@ -3172,7 +3206,7 @@ mod tests {
         #[tokio::test]
         async fn test_check_for_pr_unwatched() {
             let provider: Arc<dyn ScmProvider> =
-                Arc::new(MockScmProvider::new("github", true, "/claudear"));
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
             let watcher = ReviewWatcher::new(provider);
 
             let events = watcher
@@ -3184,11 +3218,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_check_for_reviews_standalone_comment_with_trigger() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             // No reviews, just a standalone comment with the trigger
             mock.set_comments(vec![make_comment(
                 1,
-                "Please fix this /claudear",
+                "Please fix this @claudear",
                 "2025-01-01T00:00:00Z",
                 None,
             )]);
@@ -3211,7 +3245,7 @@ mod tests {
             if let ReviewEvent::CommentsAdded { comments, .. } = &comments_events[0] {
                 assert_eq!(comments.len(), 1);
                 assert_eq!(comments[0].id, 1);
-                assert!(comments[0].body.contains("/claudear"));
+                assert!(comments[0].body.contains("@claudear"));
             } else {
                 panic!("Expected CommentsAdded");
             }
@@ -3219,7 +3253,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_check_for_reviews_standalone_comment_without_trigger() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             // Comment without the trigger keyword and no
             // pull_request_review_id
             mock.set_comments(vec![make_comment(
@@ -3250,7 +3284,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_check_for_reviews_comment_attached_to_review() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             let review_id = 10;
             mock.set_reviews(vec![make_review(
                 review_id,
@@ -3297,7 +3331,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_check_for_reviews_comment_fetch_error_preserves_events() {
-            let mock = MockScmProvider::new("github", true, "/claudear");
+            let mock = MockScmProvider::new("github", true, "@claudear");
             mock.set_reviews(vec![make_review(
                 1,
                 "CHANGES_REQUESTED",
@@ -3329,8 +3363,6 @@ mod tests {
     // state management, comment_is_after_cursor boundary cases,
     // and compare_timestamps with sub-second precision.
     // ================================================================
-
-    // ── CodeReview serde round-trip ──────────────────────────────────
 
     #[test]
     fn code_review_serde_round_trip_full() {
@@ -3376,8 +3408,6 @@ mod tests {
         assert!(review.html_url.is_none());
     }
 
-    // ── ReviewUser serde with "type" rename ──────────────────────────
-
     #[test]
     fn review_user_serde_type_field_rename() {
         let json = r#"{"id":99,"login":"bot-user","type":"Bot"}"#;
@@ -3407,8 +3437,6 @@ mod tests {
         assert_eq!(user.login, "anon");
         assert!(user.user_type.is_none());
     }
-
-    // ── RemoteRepo serde ─────────────────────────────────────────────
 
     #[test]
     fn remote_repo_serde_round_trip() {
@@ -3442,8 +3470,6 @@ mod tests {
         let repo: RemoteRepo = serde_json::from_str(json).unwrap();
         assert_eq!(repo.ssh_url, "");
     }
-
-    // ── ReviewComment serde ──────────────────────────────────────────
 
     #[test]
     fn review_comment_serde_round_trip() {
@@ -3500,8 +3526,6 @@ mod tests {
         assert!(comment.side.is_none());
     }
 
-    // ── PrReviewState JSON deserialization from external payloads ────
-
     #[test]
     fn pr_review_state_deserialize_from_json() {
         let json = r#"{
@@ -3548,8 +3572,6 @@ mod tests {
         assert!(!state.is_active);
     }
 
-    // ── PrInfo ───────────────────────────────────────────────────────
-
     #[test]
     fn pr_info_all_none() {
         let info = PrInfo {
@@ -3578,8 +3600,6 @@ mod tests {
         assert!(debug.contains("My PR"));
     }
 
-    // ── PrStatusUpdate ───────────────────────────────────────────────
-
     #[test]
     fn pr_status_update_debug_format() {
         let update = PrStatusUpdate {
@@ -3595,8 +3615,6 @@ mod tests {
         assert!(debug.contains("Merged"));
         assert!(debug.contains("LIN-99"));
     }
-
-    // ── ReviewEvent: requires_action edge cases ──────────────────────
 
     #[test]
     fn review_event_requires_action_dismissed() {
@@ -3647,8 +3665,6 @@ mod tests {
         assert!(event.requires_action());
     }
 
-    // ── ReviewEvent: get_feedback_summary edge cases ─────────────────
-
     #[test]
     fn review_event_feedback_summary_review_with_inline_no_body() {
         // Review with no body but with inline comments
@@ -3682,8 +3698,6 @@ mod tests {
         assert!(!summary.contains("(line"));
     }
 
-    // ── ReviewEvent: pr_url on cloned events ─────────────────────────
-
     #[test]
     fn review_event_clone_preserves_pr_url() {
         let event = ReviewEvent::ReviewSubmitted {
@@ -3696,8 +3710,6 @@ mod tests {
         let cloned = event.clone();
         assert_eq!(cloned.pr_url(), "https://github.com/org/repo/pull/42");
     }
-
-    // ── compare_timestamps: sub-second precision ─────────────────────
 
     #[test]
     fn compare_timestamps_subsecond_precision() {
@@ -3712,8 +3724,6 @@ mod tests {
         let ts = "2025-06-15T12:00:00.123456789Z";
         assert_eq!(compare_timestamps(ts, ts), Ordering::Equal);
     }
-
-    // ── timestamp_at_or_after: subsecond boundaries ──────────────────
 
     #[test]
     fn timestamp_at_or_after_subsecond_candidate_after() {
@@ -3731,8 +3741,6 @@ mod tests {
         ));
     }
 
-    // ── PrReviewState: clone and mutation ─────────────────────────────
-
     #[test]
     fn pr_review_state_clone_independence() {
         let state = PrReviewState::new("url", "repo", 1, "issue", "src");
@@ -3745,8 +3753,6 @@ mod tests {
         assert!(state.is_active);
     }
 
-    // ── PrStatus: Copy semantics ─────────────────────────────────────
-
     #[test]
     fn pr_status_copy_semantics() {
         let status = PrStatus::Open;
@@ -3754,8 +3760,6 @@ mod tests {
         assert_eq!(status, copied); // Both still valid
         assert_eq!(status, PrStatus::Open);
     }
-
-    // ── ReviewEvent debug output ─────────────────────────────────────
 
     #[test]
     fn review_event_debug_review_submitted() {
@@ -3782,8 +3786,6 @@ mod tests {
         assert!(debug.contains("CommentsAdded"));
     }
 
-    // ── PrReviewState: new with Into conversions ─────────────────────
-
     #[test]
     fn pr_review_state_new_accepts_string_types() {
         let state = PrReviewState::new(
@@ -3807,8 +3809,6 @@ mod tests {
         assert_eq!(state.source, "sentry");
     }
 
-    // ── ReviewComment: debug format ──────────────────────────────────
-
     #[test]
     fn review_comment_debug_contains_fields() {
         let comment = make_review_comment("src/test.rs", "needs work", Some(42));
@@ -3817,8 +3817,6 @@ mod tests {
         assert!(debug.contains("needs work"));
     }
 
-    // ── CodeReview: debug format ─────────────────────────────────────
-
     #[test]
     fn code_review_debug_contains_state() {
         let review = make_review("CHANGES_REQUESTED", Some("Please fix"));
@@ -3826,8 +3824,6 @@ mod tests {
         assert!(debug.contains("CHANGES_REQUESTED"));
         assert!(debug.contains("Please fix"));
     }
-
-    // ── compare_timestamps: edge with empty strings ──────────────────
 
     #[test]
     fn compare_timestamps_empty_strings() {
@@ -3842,17 +3838,1803 @@ mod tests {
         assert_eq!(compare_timestamps(valid, ""), Ordering::Greater);
     }
 
-    // ── timestamp_at_or_after: empty strings ─────────────────────────
-
     #[test]
     fn timestamp_at_or_after_both_empty() {
         assert!(timestamp_at_or_after("", ""));
     }
+
+    // ================================================================
+    // Additional coverage: ReviewWatcher constructors, check_for_pr
+    // with active/disabled, PrMonitor with_regression_tracking,
+    // empty trigger filter, standalone inline comments, cursor
+    // advancement for comments, multiple interleaved reviews,
+    // comment_is_after_cursor same-timestamp-same-id edge case.
+    // ================================================================
+
+    mod review_watcher_extended_tests {
+        use crate::error::Result;
+        use crate::scm::{
+            CodeReview, PrInfo, PrReviewState, PrStatus, RemoteRepo, ReviewComment, ReviewEvent,
+            ReviewUser, ReviewWatcher, ScmProvider,
+        };
+        use crate::storage::FixAttemptTracker;
+        use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
+        use async_trait::async_trait;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        struct MockScmProvider {
+            name: String,
+            enabled: bool,
+            trigger: String,
+            reviews: Arc<Mutex<Vec<CodeReview>>>,
+            comments: Arc<Mutex<Vec<ReviewComment>>>,
+        }
+
+        impl MockScmProvider {
+            fn new(name: &str, enabled: bool, trigger: &str) -> Self {
+                Self {
+                    name: name.to_string(),
+                    enabled,
+                    trigger: trigger.to_string(),
+                    reviews: Arc::new(Mutex::new(Vec::new())),
+                    comments: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            fn set_reviews(&self, reviews: Vec<CodeReview>) {
+                *self.reviews.lock().unwrap() = reviews;
+            }
+
+            fn set_comments(&self, comments: Vec<ReviewComment>) {
+                *self.comments.lock().unwrap() = comments;
+            }
+        }
+
+        #[async_trait]
+        impl ScmProvider for MockScmProvider {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn is_enabled(&self) -> bool {
+                self.enabled
+            }
+            fn review_trigger(&self) -> &str {
+                &self.trigger
+            }
+            async fn get_pr_status(&self, _project: &str, _number: i64) -> Result<PrStatus> {
+                Ok(PrStatus::Open)
+            }
+            async fn get_pr_info(&self, _project: &str, _number: i64) -> Result<PrInfo> {
+                Ok(PrInfo {
+                    head_branch: None,
+                    base_branch: None,
+                    title: None,
+                    author: None,
+                })
+            }
+            async fn get_pr_diff(&self, _project: &str, _number: i64) -> Result<String> {
+                Ok(String::new())
+            }
+            async fn get_reviews(&self, _project: &str, _number: i64) -> Result<Vec<CodeReview>> {
+                Ok(self.reviews.lock().unwrap().clone())
+            }
+            async fn get_review_comments(
+                &self,
+                _project: &str,
+                _number: i64,
+            ) -> Result<Vec<ReviewComment>> {
+                Ok(self.comments.lock().unwrap().clone())
+            }
+            async fn list_repos(&self, _org_or_group: &str) -> Result<Vec<RemoteRepo>> {
+                Ok(vec![])
+            }
+        }
+
+        struct MockTracker;
+
+        impl FixAttemptTracker for MockTracker {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn get_attempted_issue_ids(&self, _source: &str) -> HashSet<String> {
+                HashSet::new()
+            }
+            fn record_attempt(
+                &self,
+                _source: &str,
+                _issue_id: &str,
+                _short_id: &str,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn record_attempt_with_labels(
+                &self,
+                _source: &str,
+                _issue_id: &str,
+                _short_id: &str,
+                _labels: &[String],
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn mark_success(&self, _source: &str, _issue_id: &str, _pr_url: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_failed(
+                &self,
+                _source: &str,
+                _issue_id: &str,
+                _error_message: &str,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn mark_merged(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_closed(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_resolved(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get_attempt(&self, _source: &str, _issue_id: &str) -> Result<Option<FixAttempt>> {
+                Ok(None)
+            }
+            fn get_attempts_by_status(&self, _status: FixAttemptStatus) -> Result<Vec<FixAttempt>> {
+                Ok(vec![])
+            }
+            fn get_pending_prs(&self) -> Result<Vec<FixAttempt>> {
+                Ok(vec![])
+            }
+            fn get_attempt_by_pr_url(&self, _pr_url: &str) -> Result<Option<FixAttempt>> {
+                Ok(None)
+            }
+            fn reset_attempt(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get_stats(&self) -> Result<FixAttemptStats> {
+                Ok(FixAttemptStats {
+                    total: 0,
+                    pending: 0,
+                    success: 0,
+                    failed: 0,
+                    merged: 0,
+                    closed: 0,
+                    cannot_fix: 0,
+                    by_source: Default::default(),
+                })
+            }
+            fn increment_retry(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_cannot_fix(&self, _source: &str, _issue_id: &str, _reason: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get_retryable_issues(&self, _max_retries: u32) -> Result<Vec<FixAttempt>> {
+                Ok(vec![])
+            }
+            fn prepare_for_retry(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
+            CodeReview {
+                id,
+                state: state.to_string(),
+                body: Some(format!("Review body {}", id)),
+                user: ReviewUser {
+                    id: id + 1000,
+                    login: user.to_string(),
+                    user_type: Some("User".to_string()),
+                },
+                submitted_at: Some(submitted_at.to_string()),
+                html_url: Some(format!("https://github.com/org/repo/pull/1#review-{}", id)),
+            }
+        }
+
+        fn make_comment(
+            id: i64,
+            body: &str,
+            updated_at: &str,
+            pull_request_review_id: Option<i64>,
+        ) -> ReviewComment {
+            ReviewComment {
+                id,
+                path: format!("src/file_{}.rs", id),
+                position: Some(10),
+                original_position: Some(10),
+                body: body.to_string(),
+                user: ReviewUser {
+                    id: id + 2000,
+                    login: "commenter".to_string(),
+                    user_type: Some("User".to_string()),
+                },
+                created_at: updated_at.to_string(),
+                updated_at: updated_at.to_string(),
+                html_url: format!("https://github.com/org/repo/pull/1#comment-{}", id),
+                pull_request_review_id,
+                line: Some(10),
+                start_line: None,
+                side: Some("RIGHT".to_string()),
+            }
+        }
+
+        fn make_state(pr_url: &str, repo: &str, pr_number: i64) -> PrReviewState {
+            PrReviewState::new(pr_url, repo, pr_number, "ISSUE-1", "linear")
+        }
+
+        #[test]
+        fn test_with_tracker_constructor() {
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTracker);
+            let watcher = ReviewWatcher::with_tracker(provider, tracker);
+
+            assert!(watcher.is_enabled());
+            assert!(watcher.get_all_states().is_empty());
+        }
+
+        #[test]
+        fn test_with_sqlite_tracker_constructor_none() {
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTracker);
+            let watcher = ReviewWatcher::with_sqlite_tracker(provider, tracker, None);
+
+            assert!(watcher.is_enabled());
+            assert!(watcher.get_all_states().is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_check_for_pr_disabled() {
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", false, "@claudear"));
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher
+                .check_for_pr("https://github.com/org/repo/pull/1")
+                .await
+                .unwrap();
+            assert!(events.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_check_for_pr_with_active_state() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_reviews(vec![make_review(
+                1,
+                "CHANGES_REQUESTED",
+                "reviewer",
+                "2025-01-01T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher
+                .check_for_pr("https://github.com/org/repo/pull/1")
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert!(matches!(&events[0], ReviewEvent::ReviewSubmitted { .. }));
+        }
+
+        #[tokio::test]
+        async fn test_check_for_pr_inactive_state() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_reviews(vec![make_review(
+                1,
+                "CHANGES_REQUESTED",
+                "reviewer",
+                "2025-01-01T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            // Watch then unwatch to remove the state entirely
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+            watcher.unwatch_pr("https://github.com/org/repo/pull/1");
+
+            let events = watcher
+                .check_for_pr("https://github.com/org/repo/pull/1")
+                .await
+                .unwrap();
+            assert!(events.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_empty_trigger_accepts_all_standalone_comments() {
+            let mock = MockScmProvider::new("github", true, ""); // empty trigger
+            mock.set_comments(vec![make_comment(
+                1,
+                "any old comment with no trigger",
+                "2025-01-01T00:00:00Z",
+                None, // standalone, not part of a review
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let comments_events: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                .collect();
+            assert_eq!(comments_events.len(), 1);
+            if let ReviewEvent::CommentsAdded { comments, .. } = &comments_events[0] {
+                assert_eq!(comments.len(), 1);
+                assert_eq!(comments[0].id, 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_standalone_inline_comment_from_older_review() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            // No reviews returned this cycle, but a comment references an
+            // older review_id (999) that we did not process this cycle.
+            mock.set_comments(vec![make_comment(
+                50,
+                "leftover inline feedback",
+                "2025-01-01T00:00:00Z",
+                Some(999), // review ID not in this cycle
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            // Should still produce a CommentsAdded event because inline
+            // comments (pull_request_review_id.is_some()) are always
+            // actionable.
+            let comments_events: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                .collect();
+            assert_eq!(comments_events.len(), 1);
+            if let ReviewEvent::CommentsAdded { comments, .. } = &comments_events[0] {
+                assert_eq!(comments.len(), 1);
+                assert_eq!(comments[0].id, 50);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_comment_cursor_advancement() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_comments(vec![
+                make_comment(10, "@claudear fix A", "2025-01-01T00:00:00Z", None),
+                make_comment(20, "@claudear fix B", "2025-01-02T00:00:00Z", None),
+            ]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let _ = watcher.check_for_reviews().await.unwrap();
+
+            // Cursor should have advanced to the latest comment
+            let state = watcher
+                .get_state("https://github.com/org/repo/pull/1")
+                .unwrap();
+            assert_eq!(state.last_comment_id, Some(20));
+            assert_eq!(
+                state.last_comment_time,
+                Some("2025-01-02T00:00:00Z".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn test_multiple_reviews_interleaved_ids() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            // IDs are out of order vs timestamps
+            mock.set_reviews(vec![
+                make_review(5, "COMMENTED", "alice", "2025-01-01T00:00:00Z"),
+                make_review(3, "CHANGES_REQUESTED", "bob", "2025-01-02T00:00:00Z"),
+                make_review(7, "APPROVED", "carol", "2025-01-03T00:00:00Z"),
+            ]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let review_events: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::ReviewSubmitted { .. }))
+                .collect();
+            // All 3 should be processed (APPROVED does not require action
+            // but still emits an event)
+            assert_eq!(review_events.len(), 3);
+
+            // After processing, cursor should reflect the max
+            let state = watcher
+                .get_state("https://github.com/org/repo/pull/1")
+                .unwrap();
+            assert_eq!(state.last_review_id, Some(7));
+            assert_eq!(
+                state.last_review_time,
+                Some("2025-01-03T00:00:00Z".to_string())
+            );
+        }
+
+        #[test]
+        fn test_comment_after_cursor_same_timestamp_same_id() {
+            let comment = make_comment(5, "body", "2025-01-01T00:00:00Z", None);
+            // Same timestamp, same id => not strictly after
+            assert!(!ReviewWatcher::comment_is_after_cursor(
+                &comment,
+                Some("2025-01-01T00:00:00Z"),
+                Some(5),
+            ));
+        }
+
+        #[test]
+        fn test_watch_pr_incoming_cursors_override_existing() {
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let watcher = ReviewWatcher::new(provider);
+
+            // First watch with some cursors
+            let mut state = make_state("https://github.com/org/repo/pull/1", "org/repo", 1);
+            state.last_review_id = Some(10);
+            state.last_review_time = Some("2025-01-01T00:00:00Z".to_string());
+            watcher.watch_pr(state);
+
+            // Re-watch with newer cursors already set
+            let mut new_state = make_state("https://github.com/org/repo/pull/1", "org/repo", 1);
+            new_state.last_review_id = Some(20);
+            new_state.last_review_time = Some("2025-02-01T00:00:00Z".to_string());
+            watcher.watch_pr(new_state);
+
+            let retrieved = watcher
+                .get_state("https://github.com/org/repo/pull/1")
+                .unwrap();
+            // Incoming cursor was set, so it wins
+            assert_eq!(retrieved.last_review_id, Some(20));
+            assert_eq!(
+                retrieved.last_review_time,
+                Some("2025-02-01T00:00:00Z".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn test_bot_comments_are_filtered() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            let mut bot_comment =
+                make_comment(1, "@claudear please fix", "2025-01-01T00:00:00Z", None);
+            bot_comment.user.user_type = Some("Bot".to_string());
+            mock.set_comments(vec![bot_comment]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            // Bot comments should be filtered out entirely
+            let comments_events: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                .collect();
+            assert!(comments_events.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_trigger_case_insensitive() {
+            let mock = MockScmProvider::new("github", true, "@Claudear");
+            mock.set_comments(vec![make_comment(
+                1,
+                "hey @claudear please look",
+                "2025-01-01T00:00:00Z",
+                None,
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let comments_events: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                .collect();
+            assert_eq!(comments_events.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_check_for_reviews_multiple_prs() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_reviews(vec![make_review(
+                1,
+                "COMMENTED",
+                "reviewer",
+                "2025-01-01T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/2",
+                "org/repo",
+                2,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            // Both PRs get the same mock data, so both should have events
+            let review_count = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::ReviewSubmitted { .. }))
+                .count();
+            assert_eq!(review_count, 2);
+        }
+
+        #[test]
+        fn test_get_state_nonexistent() {
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let watcher = ReviewWatcher::new(provider);
+            assert!(watcher.get_state("https://nonexistent").is_none());
+        }
+
+        #[test]
+        fn test_load_states_overwrites() {
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let watcher = ReviewWatcher::new(provider);
+
+            // Add one state manually
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            // Load different states
+            let loaded = vec![make_state(
+                "https://github.com/org/repo/pull/99",
+                "org/repo",
+                99,
+            )];
+            watcher.load_states(loaded);
+
+            let all = watcher.get_all_states();
+            assert_eq!(all.len(), 2);
+        }
+
+        #[test]
+        fn test_load_states_empty() {
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let watcher = ReviewWatcher::new(provider);
+            watcher.load_states(vec![]);
+            assert!(watcher.get_all_states().is_empty());
+        }
+
+        #[test]
+        fn test_unwatch_nonexistent_pr_no_panic() {
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let watcher = ReviewWatcher::new(provider);
+            // Should not panic
+            watcher.unwatch_pr("https://nonexistent");
+        }
+
+        #[tokio::test]
+        async fn test_with_tracker_records_review() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_reviews(vec![make_review(
+                1,
+                "CHANGES_REQUESTED",
+                "reviewer",
+                "2025-01-01T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTracker);
+            let watcher = ReviewWatcher::with_tracker(provider, tracker);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            // Should not panic even though MockTracker returns Ok(0)
+            let events = watcher.check_for_reviews().await.unwrap();
+            assert_eq!(events.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_second_poll_cycle_no_duplicates() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_reviews(vec![make_review(
+                1,
+                "COMMENTED",
+                "reviewer",
+                "2025-01-01T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(Arc::clone(&provider));
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            // First poll
+            let events1 = watcher.check_for_reviews().await.unwrap();
+            assert_eq!(events1.len(), 1);
+
+            // Second poll with same data - review already processed
+            let events2 = watcher.check_for_reviews().await.unwrap();
+            let review_count = events2
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::ReviewSubmitted { .. }))
+                .count();
+            assert_eq!(review_count, 0);
+        }
+    }
+
+    mod pr_monitor_extended_tests {
+        use super::*;
+        use crate::error::Result;
+        use crate::scm::{PrInfo, PrMonitor, PrStatus, RemoteRepo};
+        use crate::storage::FixAttemptTracker;
+        use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
+        use async_trait::async_trait;
+        use chrono::Utc;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::{Arc, Mutex};
+
+        struct MockPrScmProvider {
+            enabled: bool,
+            statuses: Arc<Mutex<HashMap<(String, i64), Result<PrStatus>>>>,
+        }
+
+        impl MockPrScmProvider {
+            fn new(enabled: bool) -> Self {
+                Self {
+                    enabled,
+                    statuses: Arc::new(Mutex::new(HashMap::new())),
+                }
+            }
+
+            fn with_status(self, repo: &str, pr_number: i64, status: PrStatus) -> Self {
+                self.statuses
+                    .lock()
+                    .unwrap()
+                    .insert((repo.to_string(), pr_number), Ok(status));
+                self
+            }
+        }
+
+        #[async_trait]
+        impl ScmProvider for MockPrScmProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            fn is_enabled(&self) -> bool {
+                self.enabled
+            }
+            fn review_trigger(&self) -> &str {
+                "/mock"
+            }
+            async fn get_pr_status(&self, project: &str, number: i64) -> Result<PrStatus> {
+                let map = self.statuses.lock().unwrap();
+                match map.get(&(project.to_string(), number)) {
+                    Some(Ok(status)) => Ok(*status),
+                    Some(Err(_)) => Err(crate::error::Error::Config("mock error".to_string())),
+                    None => Ok(PrStatus::Open),
+                }
+            }
+            async fn get_pr_info(&self, _project: &str, _number: i64) -> Result<PrInfo> {
+                Ok(PrInfo {
+                    head_branch: None,
+                    base_branch: None,
+                    title: None,
+                    author: None,
+                })
+            }
+            async fn get_pr_diff(&self, _project: &str, _number: i64) -> Result<String> {
+                Ok(String::new())
+            }
+            async fn get_reviews(&self, _project: &str, _number: i64) -> Result<Vec<CodeReview>> {
+                Ok(vec![])
+            }
+            async fn get_review_comments(
+                &self,
+                _project: &str,
+                _number: i64,
+            ) -> Result<Vec<ReviewComment>> {
+                Ok(vec![])
+            }
+            async fn list_repos(&self, _org_or_group: &str) -> Result<Vec<RemoteRepo>> {
+                Ok(vec![])
+            }
+        }
+
+        struct MockFixAttemptTracker {
+            pending_prs: Arc<Mutex<Vec<FixAttempt>>>,
+            mark_merged_calls: Arc<Mutex<Vec<(String, String)>>>,
+            mark_closed_calls: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        impl MockFixAttemptTracker {
+            fn new(pending_prs: Vec<FixAttempt>) -> Self {
+                Self {
+                    pending_prs: Arc::new(Mutex::new(pending_prs)),
+                    mark_merged_calls: Arc::new(Mutex::new(Vec::new())),
+                    mark_closed_calls: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+        }
+
+        impl FixAttemptTracker for MockFixAttemptTracker {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn get_attempted_issue_ids(&self, _source: &str) -> HashSet<String> {
+                HashSet::new()
+            }
+            fn record_attempt(
+                &self,
+                _source: &str,
+                _issue_id: &str,
+                _short_id: &str,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn record_attempt_with_labels(
+                &self,
+                _source: &str,
+                _issue_id: &str,
+                _short_id: &str,
+                _labels: &[String],
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn mark_success(&self, _source: &str, _issue_id: &str, _pr_url: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_failed(
+                &self,
+                _source: &str,
+                _issue_id: &str,
+                _error_message: &str,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn mark_merged(&self, source: &str, issue_id: &str) -> Result<()> {
+                self.mark_merged_calls
+                    .lock()
+                    .unwrap()
+                    .push((source.to_string(), issue_id.to_string()));
+                Ok(())
+            }
+            fn mark_closed(&self, source: &str, issue_id: &str) -> Result<()> {
+                self.mark_closed_calls
+                    .lock()
+                    .unwrap()
+                    .push((source.to_string(), issue_id.to_string()));
+                Ok(())
+            }
+            fn mark_resolved(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get_attempt(&self, _source: &str, _issue_id: &str) -> Result<Option<FixAttempt>> {
+                Ok(None)
+            }
+            fn get_attempts_by_status(&self, _status: FixAttemptStatus) -> Result<Vec<FixAttempt>> {
+                Ok(vec![])
+            }
+            fn get_pending_prs(&self) -> Result<Vec<FixAttempt>> {
+                Ok(self.pending_prs.lock().unwrap().clone())
+            }
+            fn get_attempt_by_pr_url(&self, _pr_url: &str) -> Result<Option<FixAttempt>> {
+                Ok(None)
+            }
+            fn reset_attempt(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get_stats(&self) -> Result<FixAttemptStats> {
+                Ok(FixAttemptStats {
+                    total: 0,
+                    pending: 0,
+                    success: 0,
+                    failed: 0,
+                    merged: 0,
+                    closed: 0,
+                    cannot_fix: 0,
+                    by_source: Default::default(),
+                })
+            }
+            fn increment_retry(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_cannot_fix(&self, _source: &str, _issue_id: &str, _reason: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get_retryable_issues(&self, _max_retries: u32) -> Result<Vec<FixAttempt>> {
+                Ok(vec![])
+            }
+            fn prepare_for_retry(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn make_fix_attempt(
+            source: &str,
+            issue_id: &str,
+            short_id: &str,
+            repo: Option<&str>,
+            pr_number: Option<i64>,
+            pr_url: Option<&str>,
+            labels: Vec<String>,
+        ) -> FixAttempt {
+            FixAttempt {
+                id: 1,
+                issue_id: issue_id.to_string(),
+                short_id: short_id.to_string(),
+                source: source.to_string(),
+                attempted_at: Utc::now(),
+                pr_url: pr_url.map(|u| u.to_string()),
+                scm_repo: repo.map(|r| r.to_string()),
+                scm_pr_number: pr_number,
+                status: FixAttemptStatus::Success,
+                error_message: None,
+                merged_at: None,
+                resolved_at: None,
+                retry_count: 0,
+                last_retry_at: None,
+                issue_labels: labels,
+                parent_attempt_id: None,
+                cascade_repo: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn test_with_regression_tracking_constructor() {
+            let provider = Arc::new(MockPrScmProvider::new(true).with_status(
+                "org/repo",
+                42,
+                PrStatus::Merged,
+            ));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+
+            let sqlite_tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+
+            let monitor = PrMonitor::with_regression_tracking(
+                provider,
+                tracker.clone(),
+                true,
+                sqlite_tracker,
+            );
+
+            // Even with regression tracking enabled, creating the watch
+            // will fail because the fix_attempts foreign key constraint
+            // is not satisfied in this isolated test. The code handles
+            // that gracefully (logs a warning and returns None).
+            let attempt = make_fix_attempt(
+                "sentry",
+                "issue-bug",
+                "SENTRY-BUG",
+                Some("org/repo"),
+                Some(42),
+                Some("https://github.com/org/repo/pull/42"),
+                vec!["bug".to_string()],
+            );
+
+            let result = monitor.check_pr(&attempt).await.unwrap().unwrap();
+            assert_eq!(result.new_status, PrStatus::Merged);
+            // The regression watch creation fails due to FK constraint,
+            // so it falls back to normal auto-resolve behavior.
+            assert!(result.regression_watch_id.is_none());
+            assert!(result.should_resolve);
+
+            // Verify mark_merged was still called
+            let merged_calls = tracker.mark_merged_calls.lock().unwrap();
+            assert_eq!(merged_calls.len(), 1);
+            assert_eq!(merged_calls[0].1, "issue-bug");
+        }
+
+        #[tokio::test]
+        async fn test_is_bug_type_sentry() {
+            let provider = Arc::new(MockPrScmProvider::new(true));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+            let monitor = PrMonitor::new(provider, tracker, true);
+
+            let attempt =
+                make_fix_attempt("sentry", "issue-1", "SENTRY-1", None, None, None, vec![]);
+            assert!(monitor.is_bug_type(&attempt));
+        }
+
+        #[tokio::test]
+        async fn test_is_bug_type_linear_with_bug_label() {
+            let provider = Arc::new(MockPrScmProvider::new(true));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+            let monitor = PrMonitor::new(provider, tracker, true);
+
+            let attempt = make_fix_attempt(
+                "linear",
+                "issue-1",
+                "LIN-1",
+                None,
+                None,
+                None,
+                vec!["bug".to_string()],
+            );
+            assert!(monitor.is_bug_type(&attempt));
+        }
+
+        #[tokio::test]
+        async fn test_is_bug_type_linear_no_bug_label() {
+            let provider = Arc::new(MockPrScmProvider::new(true));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+            let monitor = PrMonitor::new(provider, tracker, true);
+
+            let attempt = make_fix_attempt(
+                "linear",
+                "issue-1",
+                "LIN-1",
+                None,
+                None,
+                None,
+                vec!["feature".to_string()],
+            );
+            assert!(!monitor.is_bug_type(&attempt));
+        }
+
+        #[tokio::test]
+        async fn test_merged_non_bug_no_regression_watch() {
+            let provider = Arc::new(MockPrScmProvider::new(true).with_status(
+                "org/repo",
+                42,
+                PrStatus::Merged,
+            ));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+
+            let sqlite_tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+
+            let monitor = PrMonitor::with_regression_tracking(
+                provider,
+                tracker.clone(),
+                true,
+                sqlite_tracker,
+            );
+
+            // Linear with no bug labels - not a bug type, so regression
+            // tracking does not apply
+            let attempt = make_fix_attempt(
+                "linear",
+                "issue-feature",
+                "LIN-FEAT",
+                Some("org/repo"),
+                Some(42),
+                Some("https://github.com/org/repo/pull/42"),
+                vec!["feature".to_string()],
+            );
+
+            let result = monitor.check_pr(&attempt).await.unwrap().unwrap();
+            assert_eq!(result.new_status, PrStatus::Merged);
+            assert!(result.regression_watch_id.is_none());
+            assert!(result.should_resolve); // auto_resolve is true and no regression watch
+        }
+
+        #[tokio::test]
+        async fn test_merged_pr_url_defaults_empty() {
+            let provider = Arc::new(MockPrScmProvider::new(true).with_status(
+                "org/repo",
+                42,
+                PrStatus::Merged,
+            ));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+            let monitor = PrMonitor::new(provider, tracker, true);
+
+            let attempt = make_fix_attempt(
+                "linear",
+                "issue-1",
+                "LIN-1",
+                Some("org/repo"),
+                Some(42),
+                None, // no pr_url
+                vec![],
+            );
+
+            let result = monitor.check_pr(&attempt).await.unwrap().unwrap();
+            assert_eq!(result.pr_url, "");
+        }
+
+        #[tokio::test]
+        async fn test_closed_pr_url_defaults_empty() {
+            let provider = Arc::new(MockPrScmProvider::new(true).with_status(
+                "org/repo",
+                42,
+                PrStatus::Closed,
+            ));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+            let monitor = PrMonitor::new(provider, tracker, true);
+
+            let attempt = make_fix_attempt(
+                "linear",
+                "issue-1",
+                "LIN-1",
+                Some("org/repo"),
+                Some(42),
+                None,
+                vec![],
+            );
+
+            let result = monitor.check_pr(&attempt).await.unwrap().unwrap();
+            assert_eq!(result.pr_url, "");
+            assert_eq!(result.new_status, PrStatus::Closed);
+        }
+
+        #[tokio::test]
+        async fn test_check_pending_prs_empty() {
+            let provider = Arc::new(MockPrScmProvider::new(true));
+            let tracker = Arc::new(MockFixAttemptTracker::new(vec![]));
+            let monitor = PrMonitor::new(provider, tracker, true);
+
+            let updates = monitor.check_pending_prs().await.unwrap();
+            assert!(updates.is_empty());
+        }
+    }
+
+    #[test]
+    fn review_event_requires_action_unknown_state() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("SOME_UNKNOWN_STATE", None),
+            inline_comments: vec![],
+        };
+        assert!(!event.requires_action());
+    }
+
+    #[test]
+    fn review_event_requires_action_empty_state() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("", None),
+            inline_comments: vec![],
+        };
+        assert!(!event.requires_action());
+    }
+
+    #[test]
+    fn pr_status_exhaustive_match() {
+        for status in [PrStatus::Open, PrStatus::Merged, PrStatus::Closed] {
+            match status {
+                PrStatus::Open => assert_eq!(status, PrStatus::Open),
+                PrStatus::Merged => assert_eq!(status, PrStatus::Merged),
+                PrStatus::Closed => assert_eq!(status, PrStatus::Closed),
+            }
+        }
+    }
+
+    #[test]
+    fn pr_info_clone() {
+        let info = PrInfo {
+            head_branch: Some("feat".to_string()),
+            base_branch: Some("main".to_string()),
+            title: Some("title".to_string()),
+            author: Some("author".to_string()),
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.head_branch.as_deref(), Some("feat"));
+        assert_eq!(cloned.base_branch.as_deref(), Some("main"));
+        assert_eq!(cloned.title.as_deref(), Some("title"));
+        assert_eq!(cloned.author.as_deref(), Some("author"));
+    }
+
+    #[test]
+    fn pr_status_update_clone() {
+        let update = PrStatusUpdate {
+            source: "sentry".to_string(),
+            issue_id: "id".to_string(),
+            short_id: "sid".to_string(),
+            pr_url: "url".to_string(),
+            new_status: PrStatus::Merged,
+            should_resolve: true,
+            regression_watch_id: Some(1),
+        };
+        let cloned = update.clone();
+        assert_eq!(cloned.source, "sentry");
+        assert_eq!(cloned.new_status, PrStatus::Merged);
+        assert_eq!(cloned.regression_watch_id, Some(1));
+    }
+
+    #[test]
+    fn review_event_feedback_summary_multiple_inline_comments_with_lines() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("CHANGES_REQUESTED", Some("Overall, needs work.")),
+            inline_comments: vec![
+                make_review_comment("src/a.rs", "fix error handling", Some(10)),
+                make_review_comment("src/b.rs", "add docs", Some(20)),
+                make_review_comment("src/c.rs", "remove debug print", None),
+            ],
+        };
+        let summary = event.get_feedback_summary();
+        assert!(summary.contains("Overall, needs work."));
+        assert!(summary.contains("Inline comments (3):"));
+        assert!(summary.contains("`src/a.rs`"));
+        assert!(summary.contains("(line 10)"));
+        assert!(summary.contains("`src/b.rs`"));
+        assert!(summary.contains("(line 20)"));
+        assert!(summary.contains("`src/c.rs`"));
+        assert!(summary.contains("remove debug print"));
+    }
+
+    #[test]
+    fn remote_repo_private_archived_flags() {
+        let repo = RemoteRepo {
+            id: 1,
+            full_name: "org/private-archived".to_string(),
+            name: "private-archived".to_string(),
+            default_branch: "main".to_string(),
+            clone_url: "https://github.com/org/private-archived.git".to_string(),
+            ssh_url: "git@github.com:org/private-archived.git".to_string(),
+            html_url: "https://github.com/org/private-archived".to_string(),
+            private: true,
+            archived: true,
+        };
+        assert!(repo.private);
+        assert!(repo.archived);
+
+        let json = serde_json::to_string(&repo).unwrap();
+        let deserialized: RemoteRepo = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.private);
+        assert!(deserialized.archived);
+    }
+
+    #[test]
+    fn compare_timestamps_different_days() {
+        let jan = "2025-01-15T00:00:00Z";
+        let feb = "2025-02-15T00:00:00Z";
+        assert_eq!(compare_timestamps(jan, feb), std::cmp::Ordering::Less);
+        assert_eq!(compare_timestamps(feb, jan), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_timestamps_different_years() {
+        let y2024 = "2024-06-15T12:00:00Z";
+        let y2025 = "2025-06-15T12:00:00Z";
+        assert_eq!(compare_timestamps(y2024, y2025), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn code_review_clone() {
+        let review = CodeReview {
+            id: 42,
+            state: "APPROVED".to_string(),
+            body: Some("lgtm".to_string()),
+            user: ReviewUser {
+                id: 7,
+                login: "dev".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            submitted_at: Some("2025-01-01T00:00:00Z".to_string()),
+            html_url: Some("https://url".to_string()),
+        };
+        let cloned = review.clone();
+        assert_eq!(cloned.id, 42);
+        assert_eq!(cloned.state, "APPROVED");
+        assert_eq!(cloned.body.as_deref(), Some("lgtm"));
+        assert_eq!(cloned.user.id, 7);
+        assert_eq!(cloned.user.login, "dev");
+        assert_eq!(cloned.submitted_at.as_deref(), Some("2025-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn review_comment_clone() {
+        let comment = ReviewComment {
+            id: 99,
+            path: "src/test.rs".to_string(),
+            position: Some(5),
+            original_position: Some(5),
+            body: "fix".to_string(),
+            user: ReviewUser {
+                id: 1,
+                login: "u".to_string(),
+                user_type: None,
+            },
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-02T00:00:00Z".to_string(),
+            html_url: "https://url".to_string(),
+            pull_request_review_id: Some(10),
+            line: Some(5),
+            start_line: Some(3),
+            side: Some("LEFT".to_string()),
+        };
+        let cloned = comment.clone();
+        assert_eq!(cloned.id, 99);
+        assert_eq!(cloned.path, "src/test.rs");
+        assert_eq!(cloned.position, Some(5));
+        assert_eq!(cloned.original_position, Some(5));
+        assert_eq!(cloned.pull_request_review_id, Some(10));
+        assert_eq!(cloned.line, Some(5));
+        assert_eq!(cloned.start_line, Some(3));
+        assert_eq!(cloned.side.as_deref(), Some("LEFT"));
+    }
+
+    // ================================================================
+    // Additional coverage: record_review_to_db, with_sqlite_tracker
+    // persistence, check_pr_reviews with sqlite, PrMonitor
+    // activity log recording, and ReviewWatcher persistence paths.
+    // ================================================================
+
+    mod sqlite_persistence_tests {
+        use crate::error::Result;
+        use crate::scm::{
+            CodeReview, PrInfo, PrReviewState, PrStatus, RemoteRepo, ReviewComment, ReviewUser,
+            ReviewWatcher, ScmProvider,
+        };
+        use crate::storage::{FixAttemptTracker, SqliteTracker};
+        use crate::types::{
+            ActivityLogEntry, FixAttempt, FixAttemptStats, FixAttemptStatus, PrReviewRecord,
+        };
+        use async_trait::async_trait;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        struct MockScmProvider {
+            name: String,
+            enabled: bool,
+            trigger: String,
+            reviews: Arc<Mutex<Vec<CodeReview>>>,
+            comments: Arc<Mutex<Vec<ReviewComment>>>,
+        }
+
+        impl MockScmProvider {
+            fn new(name: &str, enabled: bool, trigger: &str) -> Self {
+                Self {
+                    name: name.to_string(),
+                    enabled,
+                    trigger: trigger.to_string(),
+                    reviews: Arc::new(Mutex::new(Vec::new())),
+                    comments: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            fn set_reviews(&self, reviews: Vec<CodeReview>) {
+                *self.reviews.lock().unwrap() = reviews;
+            }
+
+            fn set_comments(&self, comments: Vec<ReviewComment>) {
+                *self.comments.lock().unwrap() = comments;
+            }
+        }
+
+        #[async_trait]
+        impl ScmProvider for MockScmProvider {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn is_enabled(&self) -> bool {
+                self.enabled
+            }
+            fn review_trigger(&self) -> &str {
+                &self.trigger
+            }
+            async fn get_pr_status(&self, _project: &str, _number: i64) -> Result<PrStatus> {
+                Ok(PrStatus::Open)
+            }
+            async fn get_pr_info(&self, _project: &str, _number: i64) -> Result<PrInfo> {
+                Ok(PrInfo {
+                    head_branch: None,
+                    base_branch: None,
+                    title: None,
+                    author: None,
+                })
+            }
+            async fn get_pr_diff(&self, _project: &str, _number: i64) -> Result<String> {
+                Ok(String::new())
+            }
+            async fn get_reviews(&self, _project: &str, _number: i64) -> Result<Vec<CodeReview>> {
+                Ok(self.reviews.lock().unwrap().clone())
+            }
+            async fn get_review_comments(
+                &self,
+                _project: &str,
+                _number: i64,
+            ) -> Result<Vec<ReviewComment>> {
+                Ok(self.comments.lock().unwrap().clone())
+            }
+            async fn list_repos(&self, _org_or_group: &str) -> Result<Vec<RemoteRepo>> {
+                Ok(vec![])
+            }
+        }
+
+        struct MockTrackerWithRecording {
+            review_calls: Arc<Mutex<Vec<String>>>,
+            activity_calls: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl MockTrackerWithRecording {
+            fn new() -> Self {
+                Self {
+                    review_calls: Arc::new(Mutex::new(Vec::new())),
+                    activity_calls: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+        }
+
+        impl FixAttemptTracker for MockTrackerWithRecording {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn get_attempted_issue_ids(&self, _source: &str) -> HashSet<String> {
+                HashSet::new()
+            }
+            fn record_attempt(
+                &self,
+                _source: &str,
+                _issue_id: &str,
+                _short_id: &str,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn record_attempt_with_labels(
+                &self,
+                _source: &str,
+                _issue_id: &str,
+                _short_id: &str,
+                _labels: &[String],
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn mark_success(&self, _source: &str, _issue_id: &str, _pr_url: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_failed(
+                &self,
+                _source: &str,
+                _issue_id: &str,
+                _error_message: &str,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn mark_merged(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_closed(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_resolved(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get_attempt(&self, _source: &str, _issue_id: &str) -> Result<Option<FixAttempt>> {
+                Ok(None)
+            }
+            fn get_attempts_by_status(&self, _status: FixAttemptStatus) -> Result<Vec<FixAttempt>> {
+                Ok(vec![])
+            }
+            fn get_pending_prs(&self) -> Result<Vec<FixAttempt>> {
+                Ok(vec![])
+            }
+            fn get_attempt_by_pr_url(&self, _pr_url: &str) -> Result<Option<FixAttempt>> {
+                Ok(None)
+            }
+            fn reset_attempt(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get_stats(&self) -> Result<FixAttemptStats> {
+                Ok(FixAttemptStats {
+                    total: 0,
+                    pending: 0,
+                    success: 0,
+                    failed: 0,
+                    merged: 0,
+                    closed: 0,
+                    cannot_fix: 0,
+                    by_source: Default::default(),
+                })
+            }
+            fn increment_retry(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn mark_cannot_fix(&self, _source: &str, _issue_id: &str, _reason: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get_retryable_issues(&self, _max_retries: u32) -> Result<Vec<FixAttempt>> {
+                Ok(vec![])
+            }
+            fn prepare_for_retry(&self, _source: &str, _issue_id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn record_pr_review(&self, review: &PrReviewRecord) -> Result<i64> {
+                self.review_calls
+                    .lock()
+                    .unwrap()
+                    .push(review.pr_url.clone());
+                Ok(1)
+            }
+            fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
+                self.activity_calls
+                    .lock()
+                    .unwrap()
+                    .push(entry.activity_type.clone());
+                Ok(1)
+            }
+        }
+
+        fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
+            CodeReview {
+                id,
+                state: state.to_string(),
+                body: Some(format!("Review body {}", id)),
+                user: ReviewUser {
+                    id: id + 1000,
+                    login: user.to_string(),
+                    user_type: Some("User".to_string()),
+                },
+                submitted_at: Some(submitted_at.to_string()),
+                html_url: Some(format!("https://github.com/org/repo/pull/1#review-{}", id)),
+            }
+        }
+
+        fn make_comment(
+            id: i64,
+            body: &str,
+            updated_at: &str,
+            pull_request_review_id: Option<i64>,
+        ) -> ReviewComment {
+            ReviewComment {
+                id,
+                path: format!("src/file_{}.rs", id),
+                position: Some(10),
+                original_position: Some(10),
+                body: body.to_string(),
+                user: ReviewUser {
+                    id: id + 2000,
+                    login: "commenter".to_string(),
+                    user_type: Some("User".to_string()),
+                },
+                created_at: updated_at.to_string(),
+                updated_at: updated_at.to_string(),
+                html_url: format!("https://github.com/org/repo/pull/1#comment-{}", id),
+                pull_request_review_id,
+                line: Some(10),
+                start_line: None,
+                side: Some("RIGHT".to_string()),
+            }
+        }
+
+        fn make_state(pr_url: &str, repo: &str, pr_number: i64) -> PrReviewState {
+            PrReviewState::new(pr_url, repo, pr_number, "ISSUE-1", "linear")
+        }
+
+        #[tokio::test]
+        async fn test_record_review_to_db_calls_tracker() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_reviews(vec![make_review(
+                1,
+                "CHANGES_REQUESTED",
+                "reviewer",
+                "2025-01-01T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker = Arc::new(MockTrackerWithRecording::new());
+            let watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            assert_eq!(events.len(), 1);
+
+            // Verify record_pr_review was called
+            let review_calls = tracker.review_calls.lock().unwrap();
+            assert_eq!(review_calls.len(), 1);
+            assert_eq!(review_calls[0], "https://github.com/org/repo/pull/1");
+
+            // Verify record_activity was called
+            let activity_calls = tracker.activity_calls.lock().unwrap();
+            assert_eq!(activity_calls.len(), 1);
+            assert_eq!(activity_calls[0], "pr_review_received");
+        }
+
+        #[tokio::test]
+        async fn test_record_review_to_db_no_submitted_at() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            let mut review = make_review(1, "COMMENTED", "reviewer", "2025-01-01T00:00:00Z");
+            review.submitted_at = None;
+            mock.set_reviews(vec![review]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker = Arc::new(MockTrackerWithRecording::new());
+            let watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            // Review without submitted_at should still be processed
+            assert_eq!(events.len(), 1);
+
+            let review_calls = tracker.review_calls.lock().unwrap();
+            assert_eq!(review_calls.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_with_sqlite_tracker_persists_watch() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTrackerWithRecording::new());
+            let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+
+            let watcher =
+                ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite.clone()));
+
+            let state = make_state("https://github.com/org/repo/pull/1", "org/repo", 1);
+            watcher.watch_pr(state);
+
+            // State should be in the watcher
+            let retrieved = watcher.get_state("https://github.com/org/repo/pull/1");
+            assert!(retrieved.is_some());
+
+            // Verify it was persisted to sqlite
+            let db_states = sqlite.get_active_pr_review_states().unwrap_or_default();
+            assert_eq!(db_states.len(), 1);
+            assert_eq!(db_states[0].pr_url, "https://github.com/org/repo/pull/1");
+        }
+
+        #[tokio::test]
+        async fn test_with_sqlite_tracker_persists_unwatch() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTrackerWithRecording::new());
+            let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+
+            let watcher =
+                ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite.clone()));
+
+            let state = make_state("https://github.com/org/repo/pull/1", "org/repo", 1);
+            watcher.watch_pr(state);
+            watcher.unwatch_pr("https://github.com/org/repo/pull/1");
+
+            // In-memory state should be removed
+            assert!(watcher
+                .get_state("https://github.com/org/repo/pull/1")
+                .is_none());
+
+            // DB state should be deactivated
+            let db_states = sqlite.get_active_pr_review_states().unwrap_or_default();
+            assert_eq!(db_states.len(), 0);
+        }
+
+        #[tokio::test]
+        async fn test_with_sqlite_tracker_persists_cursor_advance() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_reviews(vec![make_review(
+                1,
+                "CHANGES_REQUESTED",
+                "reviewer",
+                "2025-01-01T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTrackerWithRecording::new());
+            let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+
+            let watcher =
+                ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite.clone()));
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let _ = watcher.check_for_reviews().await.unwrap();
+
+            // Verify cursor was advanced and persisted
+            let state = watcher
+                .get_state("https://github.com/org/repo/pull/1")
+                .unwrap();
+            assert_eq!(state.last_review_id, Some(1));
+
+            // Check the DB state has the cursor too
+            let db_states = sqlite.get_active_pr_review_states().unwrap_or_default();
+            assert_eq!(db_states.len(), 1);
+            assert_eq!(db_states[0].last_review_id, Some(1));
+        }
+
+        #[tokio::test]
+        async fn test_with_sqlite_tracker_persists_comment_cursor() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_comments(vec![make_comment(
+                10,
+                "@claudear fix this",
+                "2025-01-01T00:00:00Z",
+                None,
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker: Arc<dyn FixAttemptTracker> = Arc::new(MockTrackerWithRecording::new());
+            let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
+
+            let watcher =
+                ReviewWatcher::with_sqlite_tracker(provider, tracker, Some(sqlite.clone()));
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let _ = watcher.check_for_reviews().await.unwrap();
+
+            // Verify comment cursor was advanced
+            let state = watcher
+                .get_state("https://github.com/org/repo/pull/1")
+                .unwrap();
+            assert_eq!(state.last_comment_id, Some(10));
+            assert_eq!(
+                state.last_comment_time,
+                Some("2025-01-01T00:00:00Z".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn test_multiple_reviews_record_each_to_db() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_reviews(vec![
+                make_review(1, "COMMENTED", "alice", "2025-01-01T00:00:00Z"),
+                make_review(2, "CHANGES_REQUESTED", "bob", "2025-01-02T00:00:00Z"),
+            ]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker = Arc::new(MockTrackerWithRecording::new());
+            let watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            assert_eq!(events.len(), 2);
+
+            // Each review should be recorded individually
+            let review_calls = tracker.review_calls.lock().unwrap();
+            assert_eq!(review_calls.len(), 2);
+
+            let activity_calls = tracker.activity_calls.lock().unwrap();
+            assert_eq!(activity_calls.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn test_check_for_reviews_handles_provider_error() {
+            // Use a provider that returns an error for get_reviews
+            struct ErrorProvider;
+            #[async_trait]
+            impl ScmProvider for ErrorProvider {
+                fn name(&self) -> &str {
+                    "error"
+                }
+                fn is_enabled(&self) -> bool {
+                    true
+                }
+                fn review_trigger(&self) -> &str {
+                    "@claudear"
+                }
+                async fn get_pr_status(&self, _project: &str, _number: i64) -> Result<PrStatus> {
+                    Ok(PrStatus::Open)
+                }
+                async fn get_pr_info(&self, _project: &str, _number: i64) -> Result<PrInfo> {
+                    Ok(PrInfo {
+                        head_branch: None,
+                        base_branch: None,
+                        title: None,
+                        author: None,
+                    })
+                }
+                async fn get_pr_diff(&self, _project: &str, _number: i64) -> Result<String> {
+                    Ok(String::new())
+                }
+                async fn get_reviews(
+                    &self,
+                    _project: &str,
+                    _number: i64,
+                ) -> Result<Vec<CodeReview>> {
+                    Err(crate::error::Error::Source {
+                        source_name: "error".to_string(),
+                        message: "simulated error".to_string(),
+                    })
+                }
+                async fn get_review_comments(
+                    &self,
+                    _project: &str,
+                    _number: i64,
+                ) -> Result<Vec<ReviewComment>> {
+                    Ok(vec![])
+                }
+                async fn list_repos(&self, _org_or_group: &str) -> Result<Vec<RemoteRepo>> {
+                    Ok(vec![])
+                }
+            }
+
+            let provider: Arc<dyn ScmProvider> = Arc::new(ErrorProvider);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            // Should not propagate the error; just logs it and returns empty
+            let events = watcher.check_for_reviews().await.unwrap();
+            assert!(events.is_empty());
+        }
+    }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Backward-compatibility aliases
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Alias for backward compatibility (was `PrReview` in github.rs).
 pub type PrReview = CodeReview;

@@ -401,8 +401,6 @@ mod tests {
         );
     }
 
-    // ─── shell_words edge cases ──────────────────────────────────
-
     #[test]
     fn test_shell_words_single_word() {
         assert_eq!(shell_words("cargo"), vec!["cargo"]);
@@ -429,8 +427,6 @@ mod tests {
             vec!["cargo", "test", "--json"]
         );
     }
-
-    // ─── Custom override tests ──────────────────────────────────
 
     #[test]
     fn test_custom_lint_override() {
@@ -496,8 +492,6 @@ mod tests {
         assert!(tools.iter().any(|t| t.category == EvalCategory::Coverage));
     }
 
-    // ─── Override prevents auto-detection ──────────────────────────
-
     #[test]
     fn test_custom_test_override_prevents_rust_autodetect() {
         let dir = TempDir::new().unwrap();
@@ -515,8 +509,6 @@ mod tests {
         assert_eq!(test_tools.len(), 1);
         assert_eq!(test_tools[0].name, "custom");
     }
-
-    // ─── DetectedTool tests ──────────────────────────────────
 
     #[test]
     fn test_detected_tool_clone() {
@@ -542,8 +534,6 @@ mod tests {
         assert!(dbg.contains("Lint"));
         assert!(dbg.contains("eslint"));
     }
-
-    // ─── ToolOverrides tests ──────────────────────────────────
 
     #[test]
     fn test_tool_overrides_default() {
@@ -575,8 +565,6 @@ mod tests {
         assert!(dbg.contains("ToolOverrides"));
     }
 
-    // ─── JS/TS project detection ──────────────────────────────────
-
     #[test]
     fn test_detect_js_project() {
         let dir = TempDir::new().unwrap();
@@ -599,8 +587,6 @@ mod tests {
         }
     }
 
-    // ─── Rust project detection details ──────────────────────────
-
     #[test]
     fn test_detect_rust_project_includes_clippy_and_fmt() {
         let dir = TempDir::new().unwrap();
@@ -616,8 +602,6 @@ mod tests {
         assert!(test_tool.command.contains(&"json".to_string()));
     }
 
-    // ─── Multiple project files ──────────────────────────────────
-
     #[test]
     fn test_detect_mixed_rust_and_js_project() {
         let dir = TempDir::new().unwrap();
@@ -629,8 +613,6 @@ mod tests {
         assert!(has_cargo, "Should detect Rust tools");
     }
 
-    // ─── Nonexistent directory ──────────────────────────────────
-
     #[test]
     fn test_detect_nonexistent_directory() {
         let tools = detect_tools(
@@ -640,8 +622,6 @@ mod tests {
         // Should not panic and return empty
         assert!(tools.is_empty());
     }
-
-    // ─── which_exists tests ──────────────────────────────────
 
     #[test]
     fn test_which_exists_for_known_binary() {
@@ -654,5 +634,277 @@ mod tests {
         assert!(!which_exists(
             "nonexistent_binary_that_does_not_exist_12345"
         ));
+    }
+
+    #[test]
+    fn test_detect_php_project_with_phpunit() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/phpunit"), "#!/bin/sh").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(tools.iter().any(|t| t.name == "phpunit"));
+        let phpunit = tools.iter().find(|t| t.name == "phpunit").unwrap();
+        assert_eq!(phpunit.category, EvalCategory::Test);
+        assert!(phpunit.command.contains(&"vendor/bin/phpunit".to_string()));
+    }
+
+    #[test]
+    fn test_detect_php_project_with_phpstan() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/phpstan"), "#!/bin/sh").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(tools.iter().any(|t| t.name == "phpstan"));
+        let phpstan = tools.iter().find(|t| t.name == "phpstan").unwrap();
+        assert_eq!(phpstan.category, EvalCategory::StaticAnalysis);
+    }
+
+    #[test]
+    fn test_detect_php_project_with_cs_fixer() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/php-cs-fixer"), "#!/bin/sh").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(tools.iter().any(|t| t.name == "php-cs-fixer"));
+        let fixer = tools.iter().find(|t| t.name == "php-cs-fixer").unwrap();
+        assert_eq!(fixer.category, EvalCategory::Lint);
+    }
+
+    #[test]
+    fn test_detect_php_project_with_coverage() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/phpunit"), "#!/bin/sh").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(tools.iter().any(|t| t.name == "phpunit coverage"));
+        let cov = tools.iter().find(|t| t.name == "phpunit coverage").unwrap();
+        assert_eq!(cov.category, EvalCategory::Coverage);
+        assert!(cov.command.contains(&"--coverage-clover".to_string()));
+    }
+
+    #[test]
+    fn test_detect_php_project_no_vendor_bin() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        // No vendor/bin directory
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(!tools.iter().any(|t| t.name == "phpunit"));
+        assert!(!tools.iter().any(|t| t.name == "phpstan"));
+    }
+
+    #[test]
+    fn test_detect_php_overrides_prevent_autodetect() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/phpunit"), "#!/bin/sh").unwrap();
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("custom-test".into()),
+            custom_coverage_cmd: Some("custom-cov".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        // Custom overrides should prevent phpunit auto-detect for test and coverage
+        let test_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Test)
+            .collect();
+        assert_eq!(test_tools.len(), 1);
+        assert_eq!(test_tools[0].name, "custom");
+        let cov_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Coverage)
+            .collect();
+        assert_eq!(cov_tools.len(), 1);
+        assert_eq!(cov_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_detect_kotlin_project_gradle_kts() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins { }").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(tools.iter().any(|t| t.name == "gradle test"));
+        let test_tool = tools.iter().find(|t| t.name == "gradle test").unwrap();
+        assert_eq!(test_tool.category, EvalCategory::Test);
+        // Without gradlew, should use "gradle"
+        assert_eq!(test_tool.command[0], "gradle");
+    }
+
+    #[test]
+    fn test_detect_kotlin_project_gradle_groovy() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build.gradle"), "plugins { }").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(tools.iter().any(|t| t.name == "gradle test"));
+    }
+
+    #[test]
+    fn test_detect_kotlin_project_with_gradlew() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins { }").unwrap();
+        fs::write(dir.path().join("gradlew"), "#!/bin/sh").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        let test_tool = tools.iter().find(|t| t.name == "gradle test").unwrap();
+        assert_eq!(test_tool.command[0], "./gradlew");
+    }
+
+    #[test]
+    fn test_detect_kotlin_all_tools() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins { }").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // gradle test always detected; detekt/ktlint/jacoco depend on which_exists(gradle)
+        assert!(tools.iter().any(|t| t.name == "gradle test"));
+    }
+
+    #[test]
+    fn test_detect_swift_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("Package.swift"),
+            "// swift-tools-version:5.5",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // swift test depends on which_exists("swift")
+        // At minimum, detection logic should not panic
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_csharp_project_csproj() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("MyProject.csproj"), "<Project></Project>").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // dotnet tools depend on which_exists("dotnet")
+        // At minimum, detection should not panic
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_csharp_project_sln() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("MySolution.sln"), "").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_csharp_not_detected_without_csproj_or_sln() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Program.cs"), "class Program {}").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // Should not detect dotnet tools with just a .cs file
+        assert!(!tools.iter().any(|t| t.name.contains("dotnet")));
+    }
+
+    #[test]
+    fn test_custom_lint_override_prevents_autodetect_for_all_languages() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name": "test"}"#).unwrap();
+        let overrides = ToolOverrides {
+            custom_lint_cmd: Some("my-linter".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        let lint_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Lint)
+            .collect();
+        assert_eq!(lint_tools.len(), 1);
+        assert_eq!(lint_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_custom_analysis_override_prevents_autodetect() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        let overrides = ToolOverrides {
+            custom_analysis_cmd: Some("my-analyzer".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        let analysis_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::StaticAnalysis)
+            .collect();
+        assert_eq!(analysis_tools.len(), 1);
+        assert_eq!(analysis_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_custom_coverage_override_prevents_autodetect() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        let overrides = ToolOverrides {
+            custom_coverage_cmd: Some("my-coverage".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        let cov_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Coverage)
+            .collect();
+        assert_eq!(cov_tools.len(), 1);
+        assert_eq!(cov_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_detect_php_project_all_vendor_tools() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/phpunit"), "#!/bin/sh").unwrap();
+        fs::write(dir.path().join("vendor/bin/phpstan"), "#!/bin/sh").unwrap();
+        fs::write(dir.path().join("vendor/bin/php-cs-fixer"), "#!/bin/sh").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(tools.iter().any(|t| t.name == "phpunit"), "phpunit");
+        assert!(tools.iter().any(|t| t.name == "phpstan"), "phpstan");
+        assert!(
+            tools.iter().any(|t| t.name == "php-cs-fixer"),
+            "php-cs-fixer"
+        );
+        assert!(
+            tools.iter().any(|t| t.name == "phpunit coverage"),
+            "phpunit coverage"
+        );
+    }
+
+    #[test]
+    fn test_detect_rust_kotlin_mixed_detects_both() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins { }").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // Both cargo test and gradle test are detected (has_test only blocks custom overrides)
+        assert!(tools.iter().any(|t| t.name == "cargo test"));
+        assert!(tools.iter().any(|t| t.name == "gradle test"));
     }
 }

@@ -350,8 +350,6 @@ mod tests {
         }
     }
 
-    // ── Integration tests with SqliteTracker ──
-
     #[test]
     fn test_learn_from_diff_stores_dirs_and_types() {
         let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
@@ -359,7 +357,7 @@ mod tests {
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec![
                 "src/handlers/auth.rs".to_string(),
@@ -402,7 +400,7 @@ mod tests {
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec![],
             file_types: std::collections::HashMap::new(),
@@ -425,7 +423,7 @@ mod tests {
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec!["src/handlers/auth.rs".to_string()],
             file_types: std::collections::HashMap::new(),
@@ -481,7 +479,7 @@ mod tests {
 
         let pattern = crate::types::ReviewPattern {
             id: 1,
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             category: crate::types::ReviewCategory::MissingTests,
             pattern_text: "Always add tests for new endpoints".to_string(),
             example_comments: vec!["Add tests!".to_string()],
@@ -610,8 +608,6 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
         assert!(agent_md.contains("Review preferences"));
     }
 
-    // ── Bug-hunting: Knowledge storage and retrieval edge cases ──
-
     #[test]
     fn test_learn_from_diff_file_without_directory() {
         // Files at the repo root (no '/') should NOT produce a common_fix_dirs entry.
@@ -620,7 +616,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec!["Makefile".to_string(), "README.md".to_string()],
             file_types: std::collections::HashMap::new(),
@@ -650,7 +646,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec!["a/b/c/d/e/deep.rs".to_string()],
             file_types: std::collections::HashMap::new(),
@@ -676,7 +672,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec![],
             file_types: {
@@ -765,8 +761,6 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             .unwrap();
         assert!(result.is_empty());
     }
-
-    // ── Bug-hunting: Deduplication of knowledge entries ──
 
     #[test]
     fn test_upsert_deduplicates_by_repo_key_value_triple() {
@@ -875,7 +869,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec![
                 "src/handlers/auth.rs".to_string(),
@@ -901,8 +895,6 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
         assert_eq!(dirs[0].knowledge_value, "src/handlers");
     }
 
-    // ── Bug-hunting: Confidence scoring and thresholds ──
-
     #[test]
     fn test_learn_from_diff_initial_confidence_values() {
         let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
@@ -910,7 +902,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec!["src/main.rs".to_string()],
             file_types: {
@@ -998,7 +990,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
 
         let pattern = crate::types::ReviewPattern {
             id: 1,
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             category: crate::types::ReviewCategory::Security,
             pattern_text: "Never store secrets in code".to_string(),
             example_comments: vec![],
@@ -1020,8 +1012,6 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             knowledge[0].confidence
         );
     }
-
-    // ── Bug-hunting: Format of stored knowledge (valid markdown, proper escaping) ──
 
     #[test]
     fn test_format_knowledge_context_produces_valid_markdown_headers() {
@@ -1155,7 +1145,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
         for (cat, expected_label) in categories {
             let pattern = crate::types::ReviewPattern {
                 id: 1,
-                github_repo: "org/repo".to_string(),
+                scm_repo: "org/repo".to_string(),
                 category: cat,
                 pattern_text: format!("Pattern for {}", expected_label),
                 example_comments: vec![],
@@ -1188,8 +1178,6 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
         }
     }
 
-    // ── Bug-hunting: Empty/null handling in all fields ──
-
     #[test]
     fn test_learn_from_diff_empty_file_path() {
         // An empty string file path: no slash, so no directory entry.
@@ -1198,7 +1186,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec!["".to_string()],
             file_types: std::collections::HashMap::new(),
@@ -1251,7 +1239,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
 
         let pattern = crate::types::ReviewPattern {
             id: 1,
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             category: crate::types::ReviewCategory::Other,
             pattern_text: "".to_string(),
             example_comments: vec![],
@@ -1277,7 +1265,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "".to_string(),
+            scm_repo: "".to_string(),
             pr_number: 1,
             files_changed: vec!["src/main.rs".to_string()],
             file_types: std::collections::HashMap::new(),
@@ -1335,8 +1323,6 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
         // Should have an empty list item but not panic
         assert!(md.contains("- \n"));
     }
-
-    // ── Bug-hunting: Ordering and retrieval semantics ──
 
     #[test]
     fn test_get_repo_knowledge_ordered_by_occurrence_count_desc() {
@@ -1441,8 +1427,6 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
         );
     }
 
-    // ── Bug-hunting: Unicode and special characters ──
-
     #[test]
     fn test_knowledge_with_unicode_values() {
         let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
@@ -1530,8 +1514,6 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
         assert!(ctx.contains("DROP TABLE"));
     }
 
-    // ── Bug-hunting: Multiple learn calls from different sources ──
-
     #[test]
     fn test_mixed_learning_sources_all_coexist() {
         let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
@@ -1541,7 +1523,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec!["src/api/handler.rs".to_string()],
             file_types: {
@@ -1572,7 +1554,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
         // learn_from_review_pattern
         let pattern = crate::types::ReviewPattern {
             id: 1,
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             category: crate::types::ReviewCategory::MissingTests,
             pattern_text: "Add integration tests".to_string(),
             example_comments: vec!["Need tests".to_string()],
@@ -1642,7 +1624,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec!["src/handlers/".to_string()],
             file_types: std::collections::HashMap::new(),
@@ -1670,7 +1652,7 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             id: 0,
             attempt_id: 1,
             pr_url: "url".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec![],
             file_types: {
@@ -1745,5 +1727,352 @@ diff --git a/tests/test_auth.rs b/tests/test_auth.rs
             second_updated,
             first_updated
         );
+    }
+
+    #[test]
+    fn test_generate_agent_md_with_multiple_instructions() {
+        let instructions = vec![
+            PromotedInstruction {
+                id: 1,
+                repo: "foo/bar".to_string(),
+                source_type: "qa_promotion".to_string(),
+                instruction_text: "Always run clippy".to_string(),
+                occurrence_count: 5,
+                confidence: 0.9,
+                is_active: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            PromotedInstruction {
+                id: 2,
+                repo: "foo/bar".to_string(),
+                source_type: "qa_promotion".to_string(),
+                instruction_text: "Use async/await".to_string(),
+                occurrence_count: 3,
+                confidence: 0.8,
+                is_active: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            PromotedInstruction {
+                id: 3,
+                repo: "foo/bar".to_string(),
+                source_type: "qa_promotion".to_string(),
+                instruction_text: "Add error context".to_string(),
+                occurrence_count: 4,
+                confidence: 0.85,
+                is_active: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ];
+        let md = RepoKnowledgeManager::generate_agent_md(&[], &instructions);
+        assert!(md.contains("## Standing Instructions\n\n"));
+        assert!(md.contains("- Always run clippy\n"));
+        assert!(md.contains("- Use async/await\n"));
+        assert!(md.contains("- Add error context\n"));
+    }
+
+    #[test]
+    fn test_generate_agent_md_with_both_knowledge_and_instructions() {
+        let knowledge = vec![
+            RepoKnowledge {
+                id: 1,
+                repo: "foo/bar".to_string(),
+                knowledge_key: "common_fix_dirs".to_string(),
+                knowledge_value: "src/api".to_string(),
+                source_type: "diff".to_string(),
+                confidence: 0.7,
+                occurrence_count: 5,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            RepoKnowledge {
+                id: 2,
+                repo: "foo/bar".to_string(),
+                knowledge_key: "review_preferences".to_string(),
+                knowledge_value: "[missing_tests] Add tests".to_string(),
+                source_type: "review".to_string(),
+                confidence: 0.7,
+                occurrence_count: 3,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ];
+        let instructions = vec![PromotedInstruction {
+            id: 1,
+            repo: "foo/bar".to_string(),
+            source_type: "qa_promotion".to_string(),
+            instruction_text: "Always validate input".to_string(),
+            occurrence_count: 5,
+            confidence: 0.9,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+
+        let md = RepoKnowledgeManager::generate_agent_md(&knowledge, &instructions);
+        // Should have both the Standing Instructions section and knowledge sections
+        assert!(md.contains("## Standing Instructions"));
+        assert!(md.contains("- Always validate input"));
+        assert!(md.contains("# Repo Knowledge"));
+        assert!(md.contains("## Common fix directories"));
+        assert!(md.contains("src/api"));
+        assert!(md.contains("## Review preferences"));
+    }
+
+    #[test]
+    fn test_format_knowledge_context_multiple_keys_each_limited() {
+        let mut knowledge = Vec::new();
+        // 7 entries for common_fix_dirs
+        for i in 0..7 {
+            knowledge.push(RepoKnowledge {
+                id: i,
+                repo: "foo/bar".to_string(),
+                knowledge_key: "common_fix_dirs".to_string(),
+                knowledge_value: format!("dir_{}", i),
+                source_type: "diff".to_string(),
+                confidence: 0.5,
+                occurrence_count: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        }
+        // 7 entries for review_preferences
+        for i in 0..7 {
+            knowledge.push(RepoKnowledge {
+                id: 100 + i,
+                repo: "foo/bar".to_string(),
+                knowledge_key: "review_preferences".to_string(),
+                knowledge_value: format!("pref_{}", i),
+                source_type: "review".to_string(),
+                confidence: 0.7,
+                occurrence_count: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        }
+
+        let ctx = RepoKnowledgeManager::format_knowledge_context(&knowledge);
+        // Each key gets at most 5 entries
+        let dir_count = ctx.matches("dir_").count();
+        let pref_count = ctx.matches("pref_").count();
+        assert_eq!(dir_count, 5, "common_fix_dirs should be limited to 5");
+        assert_eq!(pref_count, 5, "review_preferences should be limited to 5");
+    }
+
+    #[test]
+    fn test_format_knowledge_context_header_is_h1() {
+        let knowledge = vec![RepoKnowledge {
+            id: 1,
+            repo: "r".to_string(),
+            knowledge_key: "common_fix_dirs".to_string(),
+            knowledge_value: "v".to_string(),
+            source_type: "t".to_string(),
+            confidence: 0.5,
+            occurrence_count: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let ctx = RepoKnowledgeManager::format_knowledge_context(&knowledge);
+        assert!(
+            ctx.starts_with("# Repo Knowledge\n\n"),
+            "Context should start with H1 header"
+        );
+    }
+
+    #[test]
+    fn test_learn_from_diff_mixed_root_and_nested_files() {
+        let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
+        let analysis = DiffAnalysis {
+            id: 0,
+            attempt_id: 1,
+            pr_url: "url".to_string(),
+            scm_repo: "org/repo".to_string(),
+            pr_number: 1,
+            files_changed: vec![
+                "README.md".to_string(),          // root - no directory
+                "src/main.rs".to_string(),        // dir: src
+                "src/api/handler.rs".to_string(), // dir: src/api
+            ],
+            file_types: std::collections::HashMap::new(),
+            change_categories: vec![],
+            diff_summary: "mixed".to_string(),
+            created_at: Utc::now(),
+        };
+
+        RepoKnowledgeManager::learn_from_diff(&tracker, "org/repo", &analysis).unwrap();
+
+        let dirs = tracker
+            .get_repo_knowledge_by_key("org/repo", "common_fix_dirs")
+            .unwrap();
+        let dir_values: Vec<&str> = dirs.iter().map(|d| d.knowledge_value.as_str()).collect();
+        // Should have src and src/api but NOT an entry for README.md's root
+        assert!(dir_values.contains(&"src"));
+        assert!(dir_values.contains(&"src/api"));
+        assert_eq!(dirs.len(), 2);
+    }
+
+    #[test]
+    fn test_learn_from_promotion_source_type_is_qa_promotion() {
+        let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
+        let instruction = PromotedInstruction {
+            id: 1,
+            repo: "org/repo".to_string(),
+            source_type: "qa_promotion".to_string(),
+            instruction_text: "Test instruction".to_string(),
+            occurrence_count: 1,
+            confidence: 0.8,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        RepoKnowledgeManager::learn_from_promotion(&tracker, "org/repo", &instruction).unwrap();
+
+        let knowledge = tracker
+            .get_repo_knowledge_by_key("org/repo", "promoted_qa")
+            .unwrap();
+        assert_eq!(knowledge[0].source_type, "qa_promotion");
+    }
+
+    #[test]
+    fn test_learn_from_review_pattern_source_type_is_review_pattern() {
+        let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
+        let pattern = crate::types::ReviewPattern {
+            id: 1,
+            scm_repo: "org/repo".to_string(),
+            category: crate::types::ReviewCategory::Other,
+            pattern_text: "Test pattern".to_string(),
+            example_comments: vec![],
+            occurrence_count: 1,
+            promoted_to_instruction: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        RepoKnowledgeManager::learn_from_review_pattern(&tracker, "org/repo", &pattern).unwrap();
+
+        let knowledge = tracker
+            .get_repo_knowledge_by_key("org/repo", "review_preferences")
+            .unwrap();
+        assert_eq!(knowledge[0].source_type, "review_pattern");
+    }
+
+    #[test]
+    fn test_generate_agent_md_description_line() {
+        let md = RepoKnowledgeManager::generate_agent_md(&[], &[]);
+        assert!(
+            md.contains("This file contains accumulated knowledge from successful fix attempts.")
+        );
+    }
+
+    #[test]
+    fn test_learn_from_diff_file_convention_format() {
+        let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
+        let analysis = DiffAnalysis {
+            id: 0,
+            attempt_id: 1,
+            pr_url: "url".to_string(),
+            scm_repo: "org/repo".to_string(),
+            pr_number: 1,
+            files_changed: vec![],
+            file_types: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("ts".to_string(), 7);
+                m
+            },
+            change_categories: vec![],
+            diff_summary: "test".to_string(),
+            created_at: Utc::now(),
+        };
+
+        RepoKnowledgeManager::learn_from_diff(&tracker, "org/repo", &analysis).unwrap();
+
+        let conventions = tracker
+            .get_repo_knowledge_by_key("org/repo", "file_conventions")
+            .unwrap();
+        assert_eq!(conventions.len(), 1);
+        assert_eq!(
+            conventions[0].knowledge_value,
+            "Uses .ts files (seen 7 in diffs)"
+        );
+    }
+
+    #[test]
+    fn test_format_knowledge_context_unknown_key_uses_key_as_label() {
+        let knowledge = vec![RepoKnowledge {
+            id: 1,
+            repo: "foo/bar".to_string(),
+            knowledge_key: "totally_custom_key".to_string(),
+            knowledge_value: "custom value".to_string(),
+            source_type: "test".to_string(),
+            confidence: 0.5,
+            occurrence_count: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let ctx = RepoKnowledgeManager::format_knowledge_context(&knowledge);
+        // Unknown keys fall through to using the key itself as the label
+        assert!(ctx.contains("## totally_custom_key\n"));
+        assert!(ctx.contains("- custom value\n"));
+    }
+
+    #[test]
+    fn test_generate_agent_md_instructions_before_knowledge() {
+        let knowledge = vec![RepoKnowledge {
+            id: 1,
+            repo: "foo/bar".to_string(),
+            knowledge_key: "common_fix_dirs".to_string(),
+            knowledge_value: "src/api".to_string(),
+            source_type: "diff".to_string(),
+            confidence: 0.6,
+            occurrence_count: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let instructions = vec![PromotedInstruction {
+            id: 1,
+            repo: "foo/bar".to_string(),
+            source_type: "qa".to_string(),
+            instruction_text: "Do the thing".to_string(),
+            occurrence_count: 1,
+            confidence: 0.9,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+
+        let md = RepoKnowledgeManager::generate_agent_md(&knowledge, &instructions);
+        let instructions_pos = md.find("Standing Instructions").unwrap();
+        let knowledge_pos = md.find("Repo Knowledge").unwrap();
+        assert!(
+            instructions_pos < knowledge_pos,
+            "Standing Instructions should appear before Repo Knowledge in AGENT.md"
+        );
+    }
+
+    #[test]
+    fn test_learn_from_diff_common_fix_dirs_source_type() {
+        let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
+        let analysis = DiffAnalysis {
+            id: 0,
+            attempt_id: 1,
+            pr_url: "url".to_string(),
+            scm_repo: "org/repo".to_string(),
+            pr_number: 1,
+            files_changed: vec!["src/main.rs".to_string()],
+            file_types: std::collections::HashMap::new(),
+            change_categories: vec![],
+            diff_summary: "test".to_string(),
+            created_at: Utc::now(),
+        };
+
+        RepoKnowledgeManager::learn_from_diff(&tracker, "org/repo", &analysis).unwrap();
+
+        let dirs = tracker
+            .get_repo_knowledge_by_key("org/repo", "common_fix_dirs")
+            .unwrap();
+        assert_eq!(dirs[0].source_type, "diff_analysis");
     }
 }

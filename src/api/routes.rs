@@ -110,6 +110,7 @@ pub fn create_api_router_with_dashboard(
             get(indexing_progress_handler),
         )
         .route("/api/repos/dependencies", get(dependencies_handler))
+        .route("/api/repos/{repo}/learning", get(repo_learning_handler))
         .route("/api/inference/stats", get(inference_stats_handler))
         .route("/api/inference/history", get(inference_history_handler))
         .route("/api/telemetry/overview", get(telemetry_overview_handler))
@@ -758,8 +759,6 @@ fn floor_to_bucket(timestamp: DateTime<Utc>, bucket_minutes: i64) -> DateTime<Ut
     Utc.timestamp_opt(floored, 0).single().unwrap_or(timestamp)
 }
 
-// ─── New query types ──────────────────────────────────
-
 #[derive(Deserialize)]
 struct ActivityQuery {
     limit: Option<usize>,
@@ -842,8 +841,6 @@ struct TelemetryTimeseriesQuery {
 struct TelemetryPeriodQuery {
     period: Option<String>,
 }
-
-// ─── New response types ──────────────────────────────────
 
 #[derive(Serialize)]
 struct AttemptDetailResponse {
@@ -1041,8 +1038,6 @@ struct TelemetryLatencyResponse {
     by_status: Vec<TelemetryLatencyByStatus>,
     histogram: Vec<TelemetryLatencyHistogramBucket>,
 }
-
-// ─── New handlers ──────────────────────────────────
 
 async fn attempt_full_detail_handler(
     _user: AuthUser,
@@ -1458,6 +1453,141 @@ async fn dependencies_handler(
         .list_all_dependencies()
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Serialize)]
+struct KnowledgeEntry {
+    id: i64,
+    value: String,
+    source_type: String,
+    confidence: f64,
+    occurrence_count: i64,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct KnowledgeGroup {
+    key: String,
+    label: String,
+    entries: Vec<KnowledgeEntry>,
+}
+
+#[derive(Serialize)]
+struct ReviewPatternSummary {
+    total_patterns: usize,
+    by_category: HashMap<String, usize>,
+    promoted_count: usize,
+}
+
+#[derive(Serialize)]
+struct RepoLearningResponse {
+    repo: String,
+    knowledge: Vec<KnowledgeGroup>,
+    knowledge_total: usize,
+    instructions: Vec<crate::types::PromotedInstruction>,
+    review_patterns: Vec<crate::types::ReviewPattern>,
+    review_pattern_summary: ReviewPatternSummary,
+    strategies: Vec<crate::types::StrategyFingerprint>,
+    diff_analyses: Vec<crate::types::DiffAnalysis>,
+    correlations: Vec<crate::learning::cross_repo_correlator::CrossRepoCorrelation>,
+}
+
+fn knowledge_key_label(key: &str) -> &str {
+    match key {
+        "common_fix_dirs" => "Common Fix Directories",
+        "file_conventions" => "File Conventions",
+        "test_pattern" => "Test Patterns",
+        "review_preferences" => "Review Preferences",
+        "common_root_causes" => "Common Root Causes",
+        "promoted_qa" => "Promoted Q&A",
+        _ => key,
+    }
+}
+
+async fn repo_learning_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+    Path(repo): Path<String>,
+) -> Result<Json<RepoLearningResponse>, StatusCode> {
+    let tracker = &state.tracker;
+
+    let raw_knowledge = tracker
+        .get_repo_knowledge(&repo)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut groups_map: BTreeMap<String, Vec<KnowledgeEntry>> = BTreeMap::new();
+    for rk in &raw_knowledge {
+        groups_map
+            .entry(rk.knowledge_key.clone())
+            .or_default()
+            .push(KnowledgeEntry {
+                id: rk.id,
+                value: rk.knowledge_value.clone(),
+                source_type: rk.source_type.clone(),
+                confidence: rk.confidence,
+                occurrence_count: rk.occurrence_count,
+                updated_at: rk.updated_at,
+            });
+    }
+    let knowledge_total = raw_knowledge.len();
+    let knowledge: Vec<KnowledgeGroup> = groups_map
+        .into_iter()
+        .map(|(key, entries)| KnowledgeGroup {
+            label: knowledge_key_label(&key).to_string(),
+            key,
+            entries,
+        })
+        .collect();
+
+    let instructions = tracker
+        .get_promoted_instructions(&repo)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let review_patterns = tracker
+        .get_review_patterns(&repo, 200)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut by_category: HashMap<String, usize> = HashMap::new();
+    let mut promoted_count: usize = 0;
+    for rp in &review_patterns {
+        *by_category.entry(rp.category.to_string()).or_default() += 1;
+        if rp.promoted_to_instruction {
+            promoted_count += 1;
+        }
+    }
+    let review_pattern_summary = ReviewPatternSummary {
+        total_patterns: review_patterns.len(),
+        by_category,
+        promoted_count,
+    };
+
+    let strategies = tracker
+        .get_successful_strategies(&repo, 100)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let diff_analyses = tracker
+        .get_diff_analyses_for_repo(&repo, 100)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let all_correlations = tracker
+        .get_cross_repo_correlations(1, 168)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let correlations: Vec<_> = all_correlations
+        .into_iter()
+        .filter(|c| c.repo_a == repo || c.repo_b == repo)
+        .collect();
+
+    Ok(Json(RepoLearningResponse {
+        repo,
+        knowledge,
+        knowledge_total,
+        instructions,
+        review_patterns,
+        review_pattern_summary,
+        strategies,
+        diff_analyses,
+        correlations,
+    }))
 }
 
 async fn indexing_progress_handler(
@@ -2251,8 +2381,6 @@ async fn telemetry_latency_handler(
     }))
 }
 
-// ─── Config handlers ──────────────────────────────────
-
 #[derive(Serialize)]
 struct ConfigResponse {
     content: String,
@@ -2356,6 +2484,7 @@ mod tests {
             auto_discover_paths: vec![],
             poll_interval_ms: 300_000,
             webhook_port: 3100,
+            bind_address: "127.0.0.1".to_string(),
             db_path: ":memory:".into(),
             max_issues_per_cycle: 5,
             max_concurrent: 1,
@@ -2616,8 +2745,8 @@ mod tests {
             short_id: "PROJ-123".to_string(),
             status: FixAttemptStatus::Success,
             pr_url: Some("https://github.com/org/repo/pull/1".to_string()),
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             error_message: None,
             attempted_at: chrono::Utc::now(),
             resolved_at: None,
@@ -2886,8 +3015,8 @@ mod tests {
             short_id: "SENTRY-456".to_string(),
             status: FixAttemptStatus::Failed,
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             error_message: Some("Error message".to_string()),
             attempted_at: chrono::Utc::now(),
             resolved_at: None,
@@ -2943,8 +3072,6 @@ mod tests {
         assert!(json.contains("empty"));
         assert!(json.contains("0"));
     }
-
-    // ─── New integration tests for uncovered handlers ──────────────────────────
 
     #[tokio::test]
     async fn test_activity_endpoint_empty() {
@@ -3490,8 +3617,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    // ─── Tests with seeded data ──────────────────────────────────
-
     /// Helper to seed a fix attempt and return the tracker.
     fn seed_attempt(
         tracker: &Arc<dyn FixAttemptTracker>,
@@ -4018,8 +4143,6 @@ mod tests {
         assert!(resp["histogram"].as_array().unwrap().len() > 0);
     }
 
-    // ─── Utility function tests ──────────────────────────────────
-
     #[test]
     fn test_tail_utf8_short_string() {
         let (result, truncated) = tail_utf8("hello", 100);
@@ -4125,8 +4248,8 @@ mod tests {
                 short_id: "P-1".to_string(),
                 status: FixAttemptStatus::Success,
                 pr_url: None,
-                github_repo: None,
-                github_pr_number: None,
+                scm_repo: None,
+                scm_pr_number: None,
                 error_message: None,
                 attempted_at: now,
                 resolved_at: None,
@@ -4144,8 +4267,8 @@ mod tests {
                 short_id: "P-2".to_string(),
                 status: FixAttemptStatus::Failed,
                 pr_url: None,
-                github_repo: None,
-                github_pr_number: None,
+                scm_repo: None,
+                scm_pr_number: None,
                 error_message: Some("error".to_string()),
                 attempted_at: now,
                 resolved_at: None,
@@ -4164,8 +4287,6 @@ mod tests {
         assert_eq!(metric.failed, 1);
         assert!((metric.success_rate - 50.0).abs() < 0.01);
     }
-
-    // ─── Additional utility function tests ──────────────────────────
 
     #[test]
     fn test_sum_metric_values_empty() {
@@ -4524,8 +4645,8 @@ mod tests {
                 short_id: "P-1".to_string(),
                 status: FixAttemptStatus::Merged,
                 pr_url: None,
-                github_repo: None,
-                github_pr_number: None,
+                scm_repo: None,
+                scm_pr_number: None,
                 error_message: None,
                 attempted_at: now,
                 resolved_at: None,
@@ -4543,8 +4664,8 @@ mod tests {
                 short_id: "P-2".to_string(),
                 status: FixAttemptStatus::CannotFix,
                 pr_url: None,
-                github_repo: None,
-                github_pr_number: None,
+                scm_repo: None,
+                scm_pr_number: None,
                 error_message: None,
                 attempted_at: now,
                 resolved_at: None,
@@ -4562,8 +4683,8 @@ mod tests {
                 short_id: "P-3".to_string(),
                 status: FixAttemptStatus::Closed,
                 pr_url: None,
-                github_repo: None,
-                github_pr_number: None,
+                scm_repo: None,
+                scm_pr_number: None,
                 error_message: None,
                 attempted_at: now,
                 resolved_at: None,
@@ -4581,8 +4702,8 @@ mod tests {
                 short_id: "P-4".to_string(),
                 status: FixAttemptStatus::Pending,
                 pr_url: None,
-                github_repo: None,
-                github_pr_number: None,
+                scm_repo: None,
+                scm_pr_number: None,
                 error_message: None,
                 attempted_at: now,
                 resolved_at: None,
@@ -4597,7 +4718,7 @@ mod tests {
         let metric = summarize_window(&attempts, "7d", now - Duration::days(7));
         assert_eq!(metric.processed, 3);
         assert_eq!(metric.successful, 1);
-        assert_eq!(metric.failed, 3);
+        assert_eq!(metric.failed, 2);
         assert_eq!(metric.merged, 1);
     }
 
@@ -4612,8 +4733,8 @@ mod tests {
             short_id: "P-1".to_string(),
             status: FixAttemptStatus::Success,
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             error_message: None,
             attempted_at: old_time,
             resolved_at: None,
@@ -4639,8 +4760,8 @@ mod tests {
             short_id: "P-1".to_string(),
             status: FixAttemptStatus::Success,
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             error_message: None,
             attempted_at: now,
             resolved_at: None,
@@ -4657,8 +4778,6 @@ mod tests {
         let metric = summarize_window(&attempts, "24h", now - Duration::hours(24));
         assert!((metric.throughput_per_hour - 1.0 / 24.0).abs() < 0.01);
     }
-
-    // ─── Query deserialization tests ──────────────────────────────
 
     #[test]
     fn test_activity_query_deserialization() {
@@ -4808,8 +4927,6 @@ mod tests {
             serde_json::from_str(r#"{"content": "key = \"value\""}"#).unwrap();
         assert_eq!(req.content, r#"key = "value""#);
     }
-
-    // ─── Response type serialization tests ──────────────────────────
 
     #[test]
     fn test_database_status_skip_error_when_none() {
@@ -5059,5 +5176,1915 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    fn make_attempt(id: i64, source: &str, status: FixAttemptStatus) -> FixAttempt {
+        FixAttempt {
+            id,
+            source: source.to_string(),
+            issue_id: format!("issue-{}", id),
+            short_id: format!("P-{}", id),
+            status,
+            pr_url: None,
+            scm_repo: None,
+            scm_pr_number: None,
+            error_message: None,
+            attempted_at: chrono::Utc::now(),
+            resolved_at: None,
+            merged_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        }
+    }
+
+    fn make_metric(name: &str, value: f64, source: Option<&str>) -> crate::types::ProcessingMetric {
+        crate::types::ProcessingMetric {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            metric_name: name.to_string(),
+            metric_value: value,
+            source: source.map(|s| s.to_string()),
+            tags: None,
+        }
+    }
+
+    fn make_metric_with_tags(
+        name: &str,
+        value: f64,
+        tags: serde_json::Value,
+    ) -> crate::types::ProcessingMetric {
+        crate::types::ProcessingMetric {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            metric_name: name.to_string(),
+            metric_value: value,
+            source: None,
+            tags: Some(tags),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sources_with_linear_configured() {
+        let tracker = create_test_tracker();
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            trigger_labels: vec!["autofix".to_string()],
+            trigger_states: vec!["Triage".to_string()],
+            webhook_secret: Some("whsec_123".to_string()),
+            ..crate::config::LinearConfig::default()
+        });
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("test@example.com", &password_hash, "Test", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/sources", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sources = resp["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["name"], "linear");
+        assert_eq!(sources[0]["enabled"], true);
+        assert_eq!(sources[0]["config"]["has_webhook_secret"], true);
+    }
+
+    #[tokio::test]
+    async fn test_sources_with_sentry_configured() {
+        let tracker = create_test_tracker();
+        let mut config = test_config();
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            org_slug: "my-org".to_string(),
+            project_slugs: vec!["proj-1".to_string()],
+            min_event_count: 5,
+            client_secret: None,
+            ..crate::config::SentryConfig::default()
+        });
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("test@example.com", &password_hash, "Test", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/sources", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sources = resp["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["name"], "sentry");
+        assert_eq!(sources[0]["config"]["org_slug"], "my-org");
+        assert_eq!(sources[0]["config"]["has_client_secret"], false);
+    }
+
+    #[tokio::test]
+    async fn test_sources_with_both_linear_and_sentry() {
+        let tracker = create_test_tracker();
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig::default());
+        config.sentry = Some(crate::config::SentryConfig::default());
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("test@example.com", &password_hash, "Test", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/sources", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sources = resp["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 2);
+    }
+
+    #[test]
+    fn test_get_attempts_with_limit() {
+        let tracker = create_test_tracker();
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        seed_attempt(&tracker, "linear", "issue-2", "PROJ-2");
+        seed_attempt(&tracker, "linear", "issue-3", "PROJ-3");
+
+        let attempts = get_attempts(&tracker, Some(2));
+        assert_eq!(attempts.len(), 2);
+    }
+
+    #[test]
+    fn test_get_attempts_without_limit() {
+        let tracker = create_test_tracker();
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        seed_attempt(&tracker, "linear", "issue-2", "PROJ-2");
+        seed_attempt(&tracker, "linear", "issue-3", "PROJ-3");
+
+        let attempts = get_attempts(&tracker, None);
+        assert_eq!(attempts.len(), 3);
+    }
+
+    #[test]
+    fn test_get_attempts_empty() {
+        let tracker = create_test_tracker();
+        let attempts = get_attempts(&tracker, None);
+        assert!(attempts.is_empty());
+    }
+
+    #[test]
+    fn test_get_attempt_records_empty() {
+        let tracker = create_test_tracker();
+        let records = get_attempt_records(&tracker);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_get_attempt_records_with_data() {
+        let tracker = create_test_tracker();
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        seed_attempt(&tracker, "linear", "issue-2", "PROJ-2");
+        tracker
+            .mark_failed("linear", "issue-2", "Build failed")
+            .unwrap();
+
+        let records = get_attempt_records(&tracker);
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn test_get_attempt_records_since_filters_by_time() {
+        let tracker = create_test_tracker();
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+
+        let since = chrono::Utc::now() - Duration::seconds(1);
+        let records = get_attempt_records_since(&tracker, since);
+        assert_eq!(records.len(), 1);
+
+        // Future timestamp should yield no records
+        let future = chrono::Utc::now() + Duration::hours(1);
+        let records = get_attempt_records_since(&tracker, future);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_summarize_window_unknown_window_label() {
+        let now = chrono::Utc::now();
+        let attempts = vec![make_attempt(1, "linear", FixAttemptStatus::Success)];
+        let metric = summarize_window(&attempts, "unknown", now - Duration::hours(1));
+        // Unknown windows default to hours=1.0
+        assert!((metric.throughput_per_hour - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_floor_to_bucket_1_minute() {
+        use chrono::{TimeZone, Timelike};
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2024, 6, 15, 10, 37, 42)
+            .unwrap();
+        let floored = floor_to_bucket(ts, 1);
+        assert_eq!(floored.minute(), 37);
+        assert_eq!(floored.second(), 0);
+    }
+
+    #[test]
+    fn test_floor_to_bucket_large_bucket() {
+        use chrono::{TimeZone, Timelike};
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2024, 6, 15, 10, 37, 42)
+            .unwrap();
+        // 360-minute bucket = 6 hours
+        let floored = floor_to_bucket(ts, 360);
+        assert_eq!(floored.minute(), 0);
+        assert_eq!(floored.second(), 0);
+        // 10:37 should floor to 6:00 (0, 6, 12, 18)
+        assert_eq!(floored.hour(), 6);
+    }
+
+    #[test]
+    fn test_compute_processing_value_summary_large_dataset() {
+        let values: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let summary = compute_processing_value_summary(values);
+        assert_eq!(summary.samples, 100);
+        assert!((summary.avg_secs.unwrap() - 50.5).abs() < 0.01);
+        assert!((summary.max_secs.unwrap() - 100.0).abs() < 0.01);
+        assert!((summary.p50_secs.unwrap() - 50.5).abs() < 2.0);
+        assert!(summary.p95_secs.unwrap() >= 94.0);
+        assert!(summary.p99_secs.unwrap() >= 98.0);
+    }
+
+    #[test]
+    fn test_redact_secrets_single_quoted_values() {
+        let content = "api_token = 'sk-12345'\n";
+        let redacted = redact_secrets(content);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("sk-12345"));
+    }
+
+    #[test]
+    fn test_redact_secrets_unquoted_values() {
+        let content = "auth_token = mytoken123\n";
+        let redacted = redact_secrets(content);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("mytoken123"));
+    }
+
+    #[test]
+    fn test_redact_secrets_with_leading_whitespace() {
+        let content = "  client_secret = \"supersecret\"\n";
+        let redacted = redact_secrets(content);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("supersecret"));
+    }
+
+    #[test]
+    fn test_redact_secrets_preserves_structure() {
+        let content = "[linear]\napi_key = \"lin_key\"\ntrigger_labels = [\"autofix\"]\n";
+        let redacted = redact_secrets(content);
+        assert!(!redacted.contains("lin_key"));
+        assert!(redacted.contains("trigger_labels"));
+        assert!(redacted.contains("[\"autofix\"]"));
+    }
+
+    #[test]
+    fn test_redact_secrets_empty_string() {
+        let redacted = redact_secrets("");
+        assert_eq!(redacted, "");
+    }
+
+    #[test]
+    fn test_tail_utf8_max_bytes_1() {
+        let (result, truncated) = tail_utf8("hello", 1);
+        assert!(truncated);
+        assert!(result.contains("...[truncated]"));
+        assert!(result.contains("o"));
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_overview_with_seeded_attempts() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Seed some attempts and metrics
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_merged("linear", "issue-1").unwrap();
+
+        seed_attempt(&tracker, "sentry", "issue-2", "SENTRY-1");
+        tracker
+            .mark_failed("sentry", "issue-2", "Build failed")
+            .unwrap();
+
+        // Record some processing time metrics
+        tracker
+            .record_metric(&make_metric("processing_time", 15.0, Some("linear")))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("processing_time", 30.0, Some("sentry")))
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(resp["generated_at"].as_str().is_some());
+        assert!(resp["uptime_secs"].as_u64().is_some());
+        assert!(resp["windows"].as_array().unwrap().len() == 3);
+        assert!(resp["queue"].is_object());
+        assert!(resp["processing_time"].is_object());
+        assert!(resp["source_breakdown"].as_array().unwrap().len() > 0);
+        assert!(resp["pr_analytics"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_timeseries_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get(
+                "/api/telemetry/timeseries?period=hour&bucket_minutes=5",
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp["period"], "hour");
+        assert_eq!(resp["bucket_minutes"], 5);
+        let points = resp["points"].as_array().unwrap();
+        assert!(!points.is_empty());
+
+        // At least one point should have non-zero total
+        let total: i64 = points
+            .iter()
+            .map(|p| p["total"].as_i64().unwrap_or(0))
+            .sum();
+        assert!(total > 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_timeseries_month_period() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/timeseries?period=month", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["period"], "month");
+        // Default bucket for month is 360 minutes
+        assert_eq!(resp["bucket_minutes"], 360);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_timeseries_default_period() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/timeseries", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["period"], "week");
+        assert_eq!(resp["bucket_minutes"], 60);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_latency_with_seeded_metrics() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Seed processing_time metrics with status tags
+        tracker
+            .record_metric(&make_metric_with_tags(
+                "processing_time",
+                10.0,
+                serde_json::json!({"status": "success"}),
+            ))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric_with_tags(
+                "processing_time",
+                25.0,
+                serde_json::json!({"status": "success"}),
+            ))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric_with_tags(
+                "processing_time",
+                45.0,
+                serde_json::json!({"status": "failed"}),
+            ))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric_with_tags(
+                "processing_time",
+                120.0,
+                serde_json::json!({"status": "failed"}),
+            ))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("processing_time", 350.0, None))
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/latency?period=week", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp["period"], "week");
+        assert!(resp["overall"]["samples"].as_i64().unwrap() > 0);
+        assert!(resp["by_status"].as_array().unwrap().len() > 0);
+
+        // Verify histogram has 6 buckets (5 defined + 1 overflow)
+        let histogram = resp["histogram"].as_array().unwrap();
+        assert_eq!(histogram.len(), 6);
+        assert_eq!(histogram[0]["label"], "<=15s");
+        assert_eq!(histogram[5]["label"], ">5m");
+
+        // Verify histogram counts sum to total samples
+        let hist_total: i64 = histogram
+            .iter()
+            .map(|b| b["count"].as_i64().unwrap_or(0))
+            .sum();
+        assert_eq!(hist_total, resp["overall"]["samples"].as_i64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_latency_hour_period() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/latency?period=hour", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["period"], "hour");
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_pipeline_with_seeded_metrics() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Seed pipeline metrics
+        tracker
+            .record_metric(&make_metric("issues_fetched", 100.0, Some("linear")))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("issues_matched", 50.0, Some("linear")))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("issues_queued", 40.0, Some("linear")))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("batch_processed", 35.0, Some("linear")))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("pr_created", 20.0, Some("linear")))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("poll_cycle_duration_secs", 2.5, None))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("active_processing", 3.0, None))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("pending_attempts", 5.0, None))
+            .unwrap();
+        tracker
+            .record_metric(&make_metric("total_attempts", 50.0, None))
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/pipeline?period=week", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp["period"], "week");
+        assert!(resp["totals"]["fetched"].as_f64().unwrap() > 0.0);
+        assert!(resp["totals"]["matched"].as_f64().unwrap() > 0.0);
+        assert!(resp["conversion"]["match_rate"].as_f64().is_some());
+        assert!(resp["poll_load"]["poll_cycles"].as_i64().unwrap() > 0);
+        assert!(resp["per_source"].as_array().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_pipeline_hour_period() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/pipeline?period=hour", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["period"], "hour");
+    }
+
+    #[tokio::test]
+    async fn test_issues_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+
+        let issue = crate::types::IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "LIN-100".to_string(),
+            short_id: Some("LIN-100".to_string()),
+            title: Some("Fix authentication bug".to_string()),
+            description: Some("Users unable to log in".to_string()),
+            url: Some("https://linear.app/issue/LIN-100".to_string()),
+            priority: Some("high".to_string()),
+            status: Some("open".to_string()),
+            labels: Some(r#"["bug","auth"]"#.to_string()),
+            embedding: None,
+            embedding_model: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+        };
+        db.store_issue(&issue).unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/issues", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["total"], 1);
+        assert_eq!(resp["page"], 1);
+        let issues = resp["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0]["source"], "linear");
+        assert_eq!(issues[0]["issue_id"], "LIN-100");
+        assert_eq!(issues[0]["title"], "Fix authentication bug");
+        assert_eq!(issues[0]["priority"], "high");
+        assert_eq!(issues[0]["has_embedding"], false);
+        let labels = issues[0]["labels"].as_array().unwrap();
+        assert_eq!(labels.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_issues_pagination_with_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        for i in 1..=5 {
+            let issue = crate::types::IssueEmbedding {
+                id: 0,
+                source: "linear".to_string(),
+                issue_id: format!("LIN-{}", i),
+                short_id: Some(format!("LIN-{}", i)),
+                title: Some(format!("Issue {}", i)),
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                embedding: None,
+                embedding_model: None,
+                created_at: chrono::Utc::now(),
+                updated_at: None,
+            };
+            db.store_issue(&issue).unwrap();
+        }
+
+        let response = router
+            .oneshot(auth_get("/api/issues?page=2&per_page=2", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["total"], 5);
+        assert_eq!(resp["page"], 2);
+        assert_eq!(resp["per_page"], 2);
+        let issues = resp["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_prs_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let pr = crate::types::PrRecord {
+            id: 0,
+            pr_url: "https://github.com/org/repo/pull/1".to_string(),
+            scm_repo: "org/repo".to_string(),
+            pr_number: 1,
+            attempt_id: None,
+            issue_id: Some("LIN-1".to_string()),
+            issue_source: Some("linear".to_string()),
+            title: Some("Fix auth bug".to_string()),
+            description: None,
+            author: Some("claudear-bot".to_string()),
+            head_branch: Some("fix/lin-1".to_string()),
+            base_branch: Some("main".to_string()),
+            status: "open".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            merged_at: None,
+            closed_at: None,
+            approvals_count: 0,
+            changes_requested_count: 0,
+            comments_count: 0,
+            last_review_at: None,
+            time_to_first_review_mins: None,
+            time_to_merge_mins: None,
+            review_cycles: 0,
+            files_changed: Some(3),
+            lines_added: Some(50),
+            lines_removed: Some(10),
+        };
+        db.upsert_pr(&pr).unwrap();
+
+        let response = router.oneshot(auth_get("/api/prs", &token)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let prs: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0]["status"], "open");
+        assert_eq!(prs[0]["pr_url"], "https://github.com/org/repo/pull/1");
+    }
+
+    #[tokio::test]
+    async fn test_pr_analytics_with_seeded_prs() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let pr_open = crate::types::PrRecord {
+            id: 0,
+            pr_url: "https://github.com/org/repo/pull/1".to_string(),
+            scm_repo: "org/repo".to_string(),
+            pr_number: 1,
+            attempt_id: None,
+            issue_id: None,
+            issue_source: None,
+            title: Some("Fix bug 1".to_string()),
+            description: None,
+            author: None,
+            head_branch: None,
+            base_branch: None,
+            status: "open".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            merged_at: None,
+            closed_at: None,
+            approvals_count: 0,
+            changes_requested_count: 0,
+            comments_count: 0,
+            last_review_at: None,
+            time_to_first_review_mins: None,
+            time_to_merge_mins: None,
+            review_cycles: 0,
+            files_changed: None,
+            lines_added: None,
+            lines_removed: None,
+        };
+        let mut pr_merged = pr_open.clone();
+        pr_merged.pr_url = "https://github.com/org/repo/pull/2".to_string();
+        pr_merged.pr_number = 2;
+        pr_merged.status = "merged".to_string();
+        pr_merged.merged_at = Some(chrono::Utc::now());
+
+        db.upsert_pr(&pr_open).unwrap();
+        db.upsert_pr(&pr_merged).unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/prs/analytics", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let analytics: crate::types::PrAnalytics = serde_json::from_slice(&body).unwrap();
+        assert_eq!(analytics.open, 1);
+        assert_eq!(analytics.merged, 1);
+    }
+
+    #[tokio::test]
+    async fn test_feedback_with_seeded_data() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let outcome = crate::feedback::FixOutcome {
+            id: 0,
+            attempt_id: 1,
+            source: "linear".to_string(),
+            issue_id: "issue-1".to_string(),
+            issue_text: "Fix login bug".to_string(),
+            prompt_used: "fix this issue".to_string(),
+            outcome: crate::feedback::Outcome::Merged,
+            error_type: None,
+            learnings: Some("Always check auth middleware".to_string()),
+            keywords: vec!["auth".to_string(), "login".to_string()],
+            embedding: None,
+            created_at: chrono::Utc::now(),
+        };
+        tracker.store_feedback_outcome(&outcome).unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/feedback", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let feedback: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(feedback[0]["source"], "linear");
+        assert_eq!(feedback[0]["outcome"], "merged");
+    }
+
+    #[tokio::test]
+    async fn test_attempt_full_detail_with_executions() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+
+        let mut execution = crate::types::ClaudeExecution::new();
+        execution.attempt_id = Some(1);
+        execution.completed_at = Some(chrono::Utc::now());
+        execution.duration_secs = Some(30.0);
+        execution.exit_code = Some(0);
+        execution.stdout_preview = Some("All tests passed".to_string());
+        execution.prompt_used = Some("Fix the bug".to_string());
+        tracker.record_execution(&execution).unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/attempts/1/detail", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp["attempt"]["source"], "linear");
+        let executions = resp["executions"].as_array().unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0]["duration_secs"], 30.0);
+    }
+
+    #[tokio::test]
+    async fn test_attempt_execution_log_valid_streams() {
+        let tracker = create_test_tracker();
+
+        // Test that "events" is also a valid stream
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("test@example.com", &password_hash, "Test", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            test_config(),
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+
+        let mut execution = crate::types::ClaudeExecution::new();
+        execution.attempt_id = Some(1);
+        execution.completed_at = Some(chrono::Utc::now());
+        execution.duration_secs = Some(10.0);
+        execution.exit_code = Some(0);
+        execution.stdout_preview = Some("stdout content".to_string());
+        execution.stderr_preview = Some("stderr content".to_string());
+        let exec_id = tracker.record_execution(&execution).unwrap();
+
+        // Test stdout stream returns fallback preview
+        let response = router
+            .oneshot(auth_get(
+                &format!("/api/attempts/1/logs/{}/stdout", exec_id),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["stream"], "stdout");
+        assert_eq!(resp["content"], "stdout content");
+        assert_eq!(resp["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn test_attempt_execution_log_stderr_stream() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+
+        let mut execution = crate::types::ClaudeExecution::new();
+        execution.attempt_id = Some(1);
+        execution.completed_at = Some(chrono::Utc::now());
+        execution.duration_secs = Some(10.0);
+        execution.exit_code = Some(1);
+        execution.stderr_preview = Some("error output".to_string());
+        let exec_id = tracker.record_execution(&execution).unwrap();
+
+        let response = router
+            .oneshot(auth_get(
+                &format!("/api/attempts/1/logs/{}/stderr", exec_id),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["stream"], "stderr");
+        assert_eq!(resp["content"], "error output");
+    }
+
+    #[tokio::test]
+    async fn test_attempt_execution_log_events_stream() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+
+        let mut execution = crate::types::ClaudeExecution::new();
+        execution.attempt_id = Some(1);
+        execution.completed_at = Some(chrono::Utc::now());
+        execution.duration_secs = Some(10.0);
+        execution.exit_code = Some(0);
+        let exec_id = tracker.record_execution(&execution).unwrap();
+
+        let response = router
+            .oneshot(auth_get(
+                &format!("/api/attempts/1/logs/{}/events", exec_id),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["stream"], "events");
+        // No event_log_path and no fallback_preview for events
+        assert!(resp["content"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_attempt_execution_log_missing_execution() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+
+        let response = router
+            .oneshot(auth_get("/api/attempts/1/logs/999/stdout", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_endpoint_success() {
+        let tracker = create_test_tracker();
+
+        // Write a temp file to overwrite
+        let config_path = std::env::temp_dir().join("claudear_put_test_config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        // Build a valid config TOML (must pass validate(), which requires a source
+        // with a non-empty API key)
+        let mut valid_config = test_config();
+        valid_config.linear = Some(crate::config::LinearConfig {
+            api_key: "lin_api_test_key_123".to_string(),
+            ..crate::config::LinearConfig::default()
+        });
+        let valid_toml = toml::to_string_pretty(&valid_config).unwrap();
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            test_config(),
+            tracker.clone(),
+            config_path.clone(),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/api/config")
+            .header("cookie", format!("claudear_session={}", token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "content": valid_toml
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["ok"], true);
+        assert!(resp["message"].as_str().unwrap().contains("Config saved"));
+
+        // Verify file was written
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("work_dir"));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    async fn test_retries_with_multiple_failed_attempts() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_failed("linear", "issue-1", "Compile error")
+            .unwrap();
+
+        seed_attempt(&tracker, "sentry", "issue-2", "SENTRY-1");
+        tracker
+            .mark_failed("sentry", "issue-2", "Test failure")
+            .unwrap();
+
+        seed_attempt(&tracker, "linear", "issue-3", "PROJ-3");
+        tracker
+            .mark_cannot_fix("linear", "issue-3", "Too complex")
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/retries", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Failed attempts should show in retryable list
+        let retryable = resp["retryable"].as_array().unwrap();
+        assert!(retryable.len() >= 2); // At least the 2 failed ones
+    }
+
+    #[tokio::test]
+    async fn test_overview_zero_totals() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/stats/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // With no data, rates should be 0
+        assert!((resp["success_rate"].as_f64().unwrap() - 0.0).abs() < f64::EPSILON);
+        assert!((resp["merge_rate"].as_f64().unwrap() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(resp["stats"]["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_with_week_period() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        tracker
+            .record_metric(&make_metric("processing_time", 5.0, None))
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/metrics?period=week", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let metrics: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_with_hour_period() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        tracker
+            .record_metric(&make_metric("processing_time", 5.0, None))
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/metrics?period=hour", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_with_month_period() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        tracker
+            .record_metric(&make_metric("processing_time", 5.0, None))
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/metrics?period=month", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_with_invalid_period_returns_all() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        tracker
+            .record_metric(&make_metric("processing_time", 5.0, None))
+            .unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/metrics?period=bogus", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let metrics: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        // Invalid period gives None for since, so returns all metrics
+        assert_eq!(metrics.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_limit_capping() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Insert 5 metrics
+        for i in 0..5 {
+            tracker
+                .record_metric(&make_metric("processing_time", i as f64, None))
+                .unwrap();
+        }
+
+        // Request with limit=3
+        let response = router
+            .oneshot(auth_get("/api/metrics?limit=3", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let metrics: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_activity_with_limit_and_source() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        for i in 0..5 {
+            let entry = crate::types::ActivityLogEntry::new(
+                "issue_received",
+                &format!("Received PROJ-{}", i),
+            )
+            .with_source("linear")
+            .with_issue(&format!("issue-{}", i), &format!("PROJ-{}", i));
+            tracker.record_activity(&entry).unwrap();
+        }
+
+        let response = router
+            .oneshot(auth_get("/api/activity?limit=2&source=linear", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_activity_limit_capped_at_500() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/activity?limit=9999", &token))
+            .await
+            .unwrap();
+
+        // Should succeed even with a huge limit (capped to 500 internally)
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_errors_limit_capped_at_200() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/errors?limit=9999", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_regressions_with_monitoring_status() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/regressions?status=monitoring", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_regressions_with_resolved_status() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/regressions?status=resolved", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_regressions_with_regressed_status() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/regressions?status=regressed", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_overview_queue_with_regression_watches() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let watch = crate::types::RegressionWatch {
+            id: 0,
+            issue_type: crate::types::IssueType::LinearBug,
+            issue_id: "issue-1".to_string(),
+            fix_attempt_id: 1,
+            status: RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: Some(chrono::Utc::now()),
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        db.create_regression_watch(&watch).unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp["queue"]["watches_awaiting_release"], 1);
+    }
+
+    #[test]
+    fn test_parse_telemetry_period_unknown_with_month_default() {
+        let (label, _) = parse_telemetry_period(Some("invalid"), "month");
+        assert_eq!(label, "month");
+    }
+
+    #[test]
+    fn test_parse_telemetry_period_unknown_with_hour_default() {
+        let (label, _) = parse_telemetry_period(Some("invalid"), "hour");
+        assert_eq!(label, "hour");
+    }
+
+    #[test]
+    fn test_parse_telemetry_period_unknown_with_day_default() {
+        let (label, _) = parse_telemetry_period(Some("invalid"), "day");
+        assert_eq!(label, "day");
+    }
+
+    #[test]
+    fn test_parse_telemetry_period_unknown_with_unknown_default() {
+        let (label, _) = parse_telemetry_period(Some("invalid"), "invalid");
+        assert_eq!(label, "week");
+    }
+
+    #[test]
+    fn test_telemetry_pipeline_source_default() {
+        let src = TelemetryPipelineSource::default();
+        assert_eq!(src.source, "");
+        assert!((src.fetched - 0.0).abs() < f64::EPSILON);
+        assert!(src.match_rate.is_none());
+    }
+
+    #[test]
+    fn test_telemetry_processing_time_default() {
+        let pt = TelemetryProcessingTime::default();
+        assert_eq!(pt.all_time.samples, 0);
+        assert_eq!(pt.last_24h.samples, 0);
+    }
+
+    #[test]
+    fn test_telemetry_latency_by_status_serialization() {
+        let lbs = TelemetryLatencyByStatus {
+            status: "success".to_string(),
+            summary: ProcessingTimeSummary {
+                samples: 10,
+                avg_secs: Some(5.0),
+                p50_secs: Some(4.0),
+                p95_secs: Some(8.0),
+                p99_secs: Some(9.5),
+                max_secs: Some(10.0),
+            },
+        };
+        let json = serde_json::to_string(&lbs).unwrap();
+        assert!(json.contains("\"status\":\"success\""));
+        assert!(json.contains("\"samples\":10"));
+        assert!(json.contains("5.0"));
+    }
+
+    #[test]
+    fn test_attempt_detail_response_serialization() {
+        let resp = AttemptDetailResponse {
+            attempt: FixAttempt {
+                id: 1,
+                source: "linear".to_string(),
+                issue_id: "issue-1".to_string(),
+                short_id: "P-1".to_string(),
+                status: FixAttemptStatus::Success,
+                pr_url: None,
+                scm_repo: None,
+                scm_pr_number: None,
+                error_message: None,
+                attempted_at: chrono::Utc::now(),
+                resolved_at: None,
+                merged_at: None,
+                retry_count: 0,
+                last_retry_at: None,
+                issue_labels: vec![],
+                parent_attempt_id: None,
+                cascade_repo: None,
+            },
+            executions: vec![],
+            reviews: vec![],
+            feedback: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"attempt\""));
+        assert!(json.contains("\"executions\""));
+        assert!(json.contains("\"reviews\""));
+        assert!(json.contains("\"feedback\":null"));
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_health_returns_401() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router =
+            create_api_router(config, tracker, PathBuf::from("claudear.toml"), indexing_rx)
+                .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_telemetry_returns_401() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router =
+            create_api_router(config, tracker, PathBuf::from("claudear.toml"), indexing_rx)
+                .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/telemetry/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_expired_session_returns_401() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        db.create_user("test@test.com", &password_hash, "Test", "admin")
+            .unwrap();
+        // Create a session that already expired
+        let token = db.create_session(1, "2020-01-01 00:00:00").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/health", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_session_cookie_returns_401() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router =
+            create_api_router(config, tracker, PathBuf::from("claudear.toml"), indexing_rx)
+                .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/health", "invalid-token-value"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_overview_merge_rate_with_completed() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Create 3 attempts: 1 merged, 1 closed, 1 failed
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_merged("linear", "issue-1").unwrap();
+
+        seed_attempt(&tracker, "linear", "issue-2", "PROJ-2");
+        tracker
+            .mark_success("linear", "issue-2", "https://github.com/org/repo/pull/2")
+            .unwrap();
+        tracker.mark_closed("linear", "issue-2").unwrap();
+
+        seed_attempt(&tracker, "linear", "issue-3", "PROJ-3");
+        tracker.mark_failed("linear", "issue-3", "Error").unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/stats/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // merge_rate = merged / (merged + closed + failed + cannot_fix) * 100
+        // = 1 / 3 * 100 = 33.33...
+        let merge_rate = resp["merge_rate"].as_f64().unwrap();
+        assert!(merge_rate > 30.0 && merge_rate < 35.0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_timeseries_bucket_minutes_clamped() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Test that bucket_minutes is clamped to [1, 1440]
+        let response = router
+            .oneshot(auth_get(
+                "/api/telemetry/timeseries?period=day&bucket_minutes=0",
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["bucket_minutes"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_timeseries_bucket_minutes_max_clamped() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get(
+                "/api/telemetry/timeseries?period=day&bucket_minutes=99999",
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["bucket_minutes"], 1440);
+    }
+
+    #[tokio::test]
+    async fn test_attempts_page_0_clamped_to_1() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+
+        let response = router
+            .oneshot(auth_get("/api/attempts?page=0", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["page"], 1);
+    }
+
+    #[test]
+    fn test_telemetry_pipeline_conversion_with_data() {
+        let conv = TelemetryPipelineConversion {
+            match_rate: ratio(50.0, 100.0),
+            queue_rate: ratio(40.0, 50.0),
+            processing_rate: ratio(35.0, 40.0),
+            pr_yield_rate: ratio(20.0, 35.0),
+        };
+        assert!((conv.match_rate.unwrap() - 0.5).abs() < 0.001);
+        assert!((conv.queue_rate.unwrap() - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_summarize_window_7d_throughput() {
+        let now = chrono::Utc::now();
+        let attempts: Vec<FixAttempt> = (0..10)
+            .map(|i| make_attempt(i, "linear", FixAttemptStatus::Success))
+            .collect();
+        let metric = summarize_window(&attempts, "7d", now - Duration::days(7));
+        // 10 processed / (24 * 7) hours
+        let expected_throughput = 10.0 / (24.0 * 7.0);
+        assert!((metric.throughput_per_hour - expected_throughput).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_feedback_with_source_filter_returns_matching() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        seed_attempt(&tracker, "linear", "issue-1", "PROJ-1");
+        seed_attempt(&tracker, "sentry", "issue-2", "SENTRY-1");
+
+        let outcome1 = crate::feedback::FixOutcome {
+            id: 0,
+            attempt_id: 1,
+            source: "linear".to_string(),
+            issue_id: "issue-1".to_string(),
+            issue_text: "Fix linear bug".to_string(),
+            prompt_used: "fix".to_string(),
+            outcome: crate::feedback::Outcome::Merged,
+            error_type: None,
+            learnings: None,
+            keywords: vec![],
+            embedding: None,
+            created_at: chrono::Utc::now(),
+        };
+        let outcome2 = crate::feedback::FixOutcome {
+            id: 0,
+            attempt_id: 2,
+            source: "sentry".to_string(),
+            issue_id: "issue-2".to_string(),
+            issue_text: "Fix sentry error".to_string(),
+            prompt_used: "fix".to_string(),
+            outcome: crate::feedback::Outcome::Failed,
+            error_type: Some("build_error".to_string()),
+            learnings: None,
+            keywords: vec![],
+            embedding: None,
+            created_at: chrono::Utc::now(),
+        };
+        tracker.store_feedback_outcome(&outcome1).unwrap();
+        tracker.store_feedback_outcome(&outcome2).unwrap();
+
+        let response = router
+            .oneshot(auth_get("/api/feedback?source=sentry", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let feedback: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(feedback[0]["source"], "sentry");
+    }
+
+    #[tokio::test]
+    async fn test_analytics_summary_structure() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/analytics/summary", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify key fields are present
+        assert!(resp.get("total_processed").is_some());
+        assert!(resp.get("total_successful").is_some());
+        assert!(resp.get("total_merged").is_some());
+        assert!(resp.get("success_rate").is_some());
+        assert!(resp.get("mttr_trend").is_some());
+        assert!(resp.get("repo_leaderboard").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_inference_history_limit_capped() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/inference/history?limit=9999", &token))
+            .await
+            .unwrap();
+
+        // Should succeed (limit capped to 500 internally)
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_health_response_contains_package_version() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/health", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Version should match CARGO_PKG_VERSION
+        let version = resp["version"].as_str().unwrap();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn test_issues_endpoint_returns_empty_array() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/issues", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resp.is_object());
+        assert!(resp["issues"].is_array());
+        assert_eq!(resp["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_overview_endpoint_response() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resp.get("generated_at").is_some());
+        assert!(resp.get("windows").is_some());
+        assert!(resp.get("queue").is_some());
+        assert!(resp.get("processing_time").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_overview_returns_windows_array() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resp["windows"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_overview_returns_queue_metrics() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resp["queue"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_overview_returns_processing_time() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resp["processing_time"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_pipeline_endpoint_response() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/pipeline", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_latency_endpoint_response() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/telemetry/latency", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_attempt_records_since_with_recent_data() {
+        let tracker = create_test_tracker();
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+
+        // Seed an attempt
+        db.record_attempt("linear", "test-issue-since", "TEST-SINCE")
+            .unwrap();
+
+        // Query since 1 hour ago -- should include the just-created attempt
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let records = get_attempt_records_since(&tracker, since);
+        assert_eq!(records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_attempt_records_since_far_future_returns_empty() {
+        let tracker = create_test_tracker();
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+
+        db.record_attempt("linear", "test-issue-future", "TEST-FUTURE")
+            .unwrap();
+
+        // Query since far in the future -- should exclude everything
+        let since = chrono::Utc::now() + chrono::Duration::hours(24);
+        let records = get_attempt_records_since(&tracker, since);
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_config_endpoint_response() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/config", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resp.is_object());
+    }
+
+    #[tokio::test]
+    async fn test_repos_endpoint_no_indexed_repos() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/repos", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_compute_processing_time_summary_hundred_items() {
+        let now = chrono::Utc::now();
+        let metrics: Vec<crate::types::ProcessingMetric> = (1..=100)
+            .map(|i| crate::types::ProcessingMetric {
+                id: i,
+                timestamp: now,
+                metric_name: "processing_time".to_string(),
+                metric_value: i as f64,
+                source: None,
+                tags: None,
+            })
+            .collect();
+
+        let result = compute_processing_time_summary(metrics);
+        assert_eq!(result.samples, 100);
+        assert_eq!(result.avg_secs, Some(50.5));
+        assert_eq!(result.max_secs, Some(100.0));
+        // p50 should be around 50
+        assert!(result.p50_secs.unwrap() >= 49.0 && result.p50_secs.unwrap() <= 51.0);
+        // p95 should be around 95
+        assert!(result.p95_secs.unwrap() >= 94.0 && result.p95_secs.unwrap() <= 96.0);
+        // p99 should be around 99
+        assert!(result.p99_secs.unwrap() >= 98.0 && result.p99_secs.unwrap() <= 100.0);
     }
 }

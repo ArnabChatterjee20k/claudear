@@ -65,6 +65,11 @@ FINAL_STATUS="failed"
 # Warning counter
 WARN_COUNT=0
 
+# Active Docker container and volume for current scenario (used by db_query/db_count)
+ACTIVE_CONTAINER=""
+ACTIVE_VOLUME=""
+declare -a DOCKER_VOLUMES=()
+
 # =============================================================================
 # 2. Utility Functions
 # =============================================================================
@@ -192,22 +197,36 @@ wait_for_pr_verbose() {
   done
 }
 
-# DB helpers
+# DB helpers — route through Docker when running in container mode.
+# When the daemon container is running: use "docker exec".
+# When the daemon is stopped but volume exists: use "docker run --rm" with the volume.
+# When not in Docker mode: use host sqlite3 directly.
+_docker_sqlite3() {
+  local db="$1"; shift
+  if [[ -n "$ACTIVE_CONTAINER" ]]; then
+    docker exec "$ACTIVE_CONTAINER" sqlite3 "$db" "$@"
+  elif [[ -n "$ACTIVE_VOLUME" ]]; then
+    docker run --rm -v "${ACTIVE_VOLUME}:/app/data" --entrypoint sqlite3 "${DOCKER_IMAGE}" "$db" "$@"
+  else
+    sqlite3 "$db" "$@"
+  fi
+}
+
 db_query() {
   local db="$1" sql="$2"
-  sqlite3 -readonly -noheader -separator $'\t' "$db" "$sql" 2>/dev/null || true
+  _docker_sqlite3 "$db" -noheader -separator $'\t' "$sql" 2>/dev/null || true
 }
 
 db_count() {
   local db="$1" sql="$2"
   local result
-  result="$(sqlite3 -readonly -noheader "$db" "SELECT COUNT(*) FROM ($sql);" 2>/dev/null || echo "0")"
+  result="$(_docker_sqlite3 "$db" -noheader "SELECT COUNT(*) FROM ($sql);" 2>/dev/null || echo "0")"
   echo "${result:-0}"
 }
 
 db_exec() {
   local db="$1" sql="$2"
-  sqlite3 "$db" "$sql"
+  _docker_sqlite3 "$db" "$sql"
 }
 
 # assert_db DB TABLE WHERE_CLAUSE MIN_COUNT MESSAGE [FATAL=true]
@@ -437,10 +456,20 @@ start_daemon() {
       printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$claude_oauth"
     } > "$env_file"
 
+    # Create a Docker volume for the DB (native ext4, not VirtioFS bind mount).
+    # SQLite WAL mode is incompatible with Docker Desktop's VirtioFS bind mounts.
+    # Reuse existing volume if present (daemon restart within same scenario preserves DB).
+    local vol_name="claudear-e2e-db-${port}"
+    if ! docker volume inspect "$vol_name" >/dev/null 2>&1; then
+      docker volume create "$vol_name" >/dev/null
+      DOCKER_VOLUMES+=("$vol_name")
+    fi
+
     docker run -d \
       --name "$name" \
       -p "${port}:${port}" \
       -v "${mount_dir}:${mount_dir}" \
+      -v "${vol_name}:/app/data" \
       --env-file "$env_file" \
       "${DOCKER_IMAGE}" \
       claudear --config "$config_path" start --poll --poll-interval 5000 --port "$port" --no-webhooks \
@@ -450,6 +479,9 @@ start_daemon() {
     # Stream container logs to the daemon log file
     docker logs -f "$name" >>"$daemon_log" 2>&1 &
     DOCKER_CONTAINERS+=("$name")
+    # Note: ACTIVE_CONTAINER/ACTIVE_VOLUME must be set by the CALLER after
+    # start_daemon returns, since $(cmd) runs in a subshell where variable
+    # assignments don't propagate.  See activate_daemon() below.
     echo "$name"
   else
     "$CLAUDEAR_BIN" --config "$config_path" start --poll --poll-interval 5000 --port "$port" --no-webhooks >>"$daemon_log" 2>&1 &
@@ -459,11 +491,32 @@ start_daemon() {
   fi
 }
 
+# Set ACTIVE_CONTAINER/ACTIVE_VOLUME from the daemon handle returned by start_daemon.
+# Must be called in the parent shell (not inside $(...)).
+activate_daemon() {
+  local handle="$1" port="$2"
+  if [[ "$USE_DOCKER" == "true" ]]; then
+    ACTIVE_CONTAINER="$handle"
+    ACTIVE_VOLUME="claudear-e2e-db-${port}"
+  fi
+}
+
+# Remove Docker volume for a scenario port (called once at scenario start to clear stale data).
+reset_scenario_volume() {
+  local port="$1"
+  if [[ "$USE_DOCKER" == "true" ]]; then
+    local vol_name="claudear-e2e-db-${port}"
+    docker volume rm "$vol_name" >/dev/null 2>&1 || true
+  fi
+}
+
 # Unified daemon kill
 kill_daemon() {
   local handle="$1"
   [[ -n "$handle" ]] || return 0
   if [[ "$USE_DOCKER" == "true" ]]; then
+    ACTIVE_CONTAINER=""
+    # ACTIVE_VOLUME is preserved so db_* functions can use "docker run --rm"
     stop_container "$handle"
   else
     kill_daemon_pid "$handle"
@@ -578,6 +631,11 @@ cleanup() {
     resolve_linear_issue "$issue_id"
   done
 
+  # Remove Docker volumes
+  for vol in ${DOCKER_VOLUMES[@]+"${DOCKER_VOLUMES[@]}"}; do
+    docker volume rm "$vol" 2>/dev/null || true
+  done
+
   # Clean temp directories
   for dir in "${S1_TMP_DIR:-}" "${S2_TMP_DIR:-}" "${S3_TMP_DIR:-}"; do
     if [[ -n "$dir" && -d "$dir" ]]; then
@@ -688,7 +746,7 @@ find_or_create_label() {
   resp="$(linear_graphql "$query" "$vars")"
 
   local label_id
-  label_id="$(jq -r --arg name "$label_name" '.data.team.labels.nodes[]? | select(.name==$name) | .id' <<<"$resp" | head -n1)"
+  label_id="$(jq -r --arg name "$label_name" '.data.team.labels.nodes[]? | select(.name | ascii_downcase == ($name | ascii_downcase)) | .id' <<<"$resp" | head -n1)"
 
   if [[ -n "$label_id" ]]; then
     echo "$label_id"
@@ -699,7 +757,7 @@ find_or_create_label() {
   local ws_query='query { issueLabels { nodes { id name } } }'
   local ws_resp
   ws_resp="$(linear_graphql "$ws_query")" 2>/dev/null || true
-  label_id="$(jq -r --arg name "$label_name" '.data.issueLabels.nodes[]? | select(.name==$name) | .id' <<<"$ws_resp" | head -n1)" 2>/dev/null || true
+  label_id="$(jq -r --arg name "$label_name" '.data.issueLabels.nodes[]? | select(.name | ascii_downcase == ($name | ascii_downcase)) | .id' <<<"$ws_resp" | head -n1)" 2>/dev/null || true
 
   if [[ -n "$label_id" ]]; then
     echo "$label_id"
@@ -774,6 +832,7 @@ generate_config() {
   local claude_instructions="${8:-}"
   local cascade_enabled="${9:-false}"
   local cascade_max_depth="${10:-3}"
+  local linear_enabled="${11:-true}"
 
   cat >"$config_path" <<TOML
 work_dir = "${work_dir}"
@@ -793,7 +852,7 @@ instructions = "${claude_instructions}"
 
 [ask]
 enabled = ${ask_enabled}
-wait_timeout_secs = 120
+wait_timeout_secs = 300
 poll_interval_secs = 5
 best_effort_on_timeout = true
 
@@ -803,13 +862,15 @@ auto_resolve_on_merge = false
 review_trigger = "/claudear"
 
 [discord]
+webhook_url = "${CLAUDEAR_E2E_DISCORD_WEBHOOK_URL:-}"
+user_id = "${CLAUDEAR_E2E_DISCORD_USER_ID:-}"
 bot_token = "${CLAUDEAR_E2E_DISCORD_BOT_TOKEN:-}"
 channel_id = "${CLAUDEAR_E2E_DISCORD_CHANNEL_ID:-}"
 source_enabled = ${discord_source}
 listen_channel_id = "${CLAUDEAR_E2E_DISCORD_CHANNEL_ID:-}"
 
 [linear]
-enabled = true
+enabled = ${linear_enabled}
 api_key = "${CLAUDEAR_E2E_LINEAR_API_KEY}"
 trigger_labels = ["claudear"]
 trigger_states = []
@@ -820,9 +881,29 @@ enabled = true
 check_interval_secs = 10
 monitoring_duration_secs = 10
 
+[retry]
+max_retries = 3
+base_delay_ms = 1000
+max_delay_ms = 5000
+
 [cascade]
 enabled = ${cascade_enabled}
 max_depth = ${cascade_max_depth}
+TOML
+
+  # Append cascade rules if both repos are set
+  if [[ "${cascade_enabled}" == "true" && -n "${CLAUDEAR_E2E_GITHUB_REPO_2:-}" ]]; then
+    cat >>"$config_path" <<TOML
+
+[[cascade.rules]]
+upstream = "${CLAUDEAR_E2E_GITHUB_REPO}"
+downstream = "${CLAUDEAR_E2E_GITHUB_REPO_2}"
+trigger = "merge"
+version_update = true
+TOML
+  fi
+
+  cat >>"$config_path" <<TOML
 
 [learning]
 auto_extract_learnings = true
@@ -879,6 +960,13 @@ check_regression_watch_resolved() {
   [[ "$status" == "resolved" ]]
 }
 
+db_has_rows() {
+  local db="$1" sql="$2"
+  local count
+  count="$(db_count "$db" "$sql")"
+  [[ "$count" -ge 1 ]]
+}
+
 check_claude_executions_count() {
   local db="$1" min="$2"
   local count
@@ -922,13 +1010,47 @@ check_cascade_attempt_merged() {
 }
 
 # Run repos index to discover dependencies before starting daemon
+# Usage: run_repos_index CONFIG_PATH [PORT]
+# When PORT is given and USE_DOCKER=true, mounts the named DB volume so the
+# repos index writes to the same SQLite DB that the daemon will use.
 run_repos_index() {
   local config_path="$1"
+  local port="${2:-}"
   if [[ "$USE_DOCKER" == "true" ]]; then
     local mount_dir
     mount_dir="$(dirname "$config_path")"
-    docker run --rm -v "${mount_dir}:${mount_dir}" "${DOCKER_IMAGE}" \
+
+    # Resolve Claude auth (same logic as start_daemon)
+    local claude_oauth="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+    local api_key="${ANTHROPIC_API_KEY:-}"
+    if [[ -z "$api_key" && -z "$claude_oauth" ]]; then
+      local keychain_json
+      keychain_json="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+      if [[ -n "$keychain_json" ]]; then
+        claude_oauth="$(echo "$keychain_json" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)"
+      fi
+    fi
+
+    local env_file="${mount_dir}/.docker-env-repos-index"
+    {
+      printf 'ANTHROPIC_API_KEY=%s\n' "$api_key"
+      printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$claude_oauth"
+    } > "$env_file"
+
+    # Mount the named DB volume so repos index and daemon share the same DB
+    local vol_args=()
+    if [[ -n "$port" ]]; then
+      local vol_name="claudear-e2e-db-${port}"
+      if ! docker volume inspect "$vol_name" >/dev/null 2>&1; then
+        docker volume create "$vol_name" >/dev/null
+        DOCKER_VOLUMES+=("$vol_name")
+      fi
+      vol_args=(-v "${vol_name}:/app/data")
+    fi
+
+    docker run --rm -v "${mount_dir}:${mount_dir}" "${vol_args[@]}" --env-file "$env_file" "${DOCKER_IMAGE}" \
       claudear --config "$config_path" repos index 2>&1 || fail "repos index failed"
+    rm -f "$env_file"
   else
     "$CLAUDEAR_BIN" --config "$config_path" repos index 2>&1 || fail "repos index failed"
   fi
@@ -952,7 +1074,12 @@ run_scenario_1() {
   local work_root="${S1_TMP_DIR}/work"
   local repos_dir="${work_root}/repos"
   local local_repo="${repos_dir}/${REPO_NAME}"
-  local db_path="${S1_TMP_DIR}/claudear-s1.db"
+  local db_path
+  if [[ "$USE_DOCKER" == "true" ]]; then
+    db_path="/app/data/claudear-s1.db"
+  else
+    db_path="${S1_TMP_DIR}/claudear-s1.db"
+  fi
   local config_path="${S1_TMP_DIR}/claudear.s1.toml"
   local daemon_log="${S1_TMP_DIR}/daemon.log"
 
@@ -1026,9 +1153,11 @@ EOF
   log "Issue URL: ${S1_ISSUE_URL}"
 
   # --- Step 3: Start Daemon ---
+  reset_scenario_volume "$S1_PORT"
   log "Starting daemon (Scenario 1, port ${S1_PORT})..."
   local daemon_pid
   daemon_pid="$(start_daemon "$config_path" "$S1_PORT" "$daemon_log")"
+  activate_daemon "$daemon_pid" "$S1_PORT"
   log "Daemon handle: ${daemon_pid}"
   sleep 3
 
@@ -1049,48 +1178,48 @@ EOF
     1 "fix_attempts: issue accepted with short_id"
 
   assert_db "$db_path" "repositories" "1=1" 1 "repositories: mock repo indexed"
-  assert_db "$db_path" "repo_files" "1=1" 1 "repo_files: files indexed" "false"
+  assert_db "$db_path" "repo_files" "1=1" 1 "repo_files: files indexed"
 
   assert_db "$db_path" "inference_attempts" \
     "issue_id='${S1_ISSUE_ID}' AND issue_source='linear' AND inferred_repo_id IS NOT NULL AND confidence > 0" \
-    1 "inference_attempts: repo inferred" "false"
+    1 "inference_attempts: repo inferred"
 
   assert_db "$db_path" "activity_log" "issue_id='${S1_ISSUE_ID}'" 1 "activity_log: entry exists"
 
   assert_db "$db_path" "processing_metrics" \
-    "metric_name='issues_fetched'" 1 "processing_metrics: issues_fetched recorded" "false"
+    "metric_name='issues_fetched'" 1 "processing_metrics: issues_fetched recorded"
 
   assert_db "$db_path" "issues" \
-    "source='linear' AND issue_id='${S1_ISSUE_ID}'" 0 "issues: issue record created" "false"
+    "source='linear' AND issue_id='${S1_ISSUE_ID}'" 0 "issues: issue record created"
 
   # Indexing progress (single-row table, always seeded)
   assert_db "$db_path" "indexing_progress" "id=1" 1 "indexing_progress: singleton row exists"
 
   # Webhook deliveries: not expected in polling mode (--no-webhooks)
-  assert_db "$db_path" "webhook_deliveries" "1=1" 0 "webhook_deliveries: none expected in poll mode" "false"
+  assert_db "$db_path" "webhook_deliveries" "1=1" 0 "webhook_deliveries: none expected in poll mode"
 
   # Code indexing tables: may be populated during repo indexing
-  assert_db "$db_path" "code_symbols" "1=1" 0 "code_symbols: may populate during indexing" "false"
-  assert_db "$db_path" "code_chunks" "1=1" 0 "code_chunks: may populate during indexing" "false"
-  assert_db "$db_path" "code_chunk_embeddings" "1=1" 0 "code_chunk_embeddings: may populate" "false"
+  assert_db "$db_path" "code_symbols" "1=1" 0 "code_symbols: may populate during indexing"
+  assert_db "$db_path" "code_chunks" "1=1" 0 "code_chunks: may populate during indexing"
+  assert_db "$db_path" "code_chunk_embeddings" "1=1" 0 "code_chunk_embeddings: may populate"
 
   # Prioritisation engine tables: may be populated during issue processing
-  assert_db "$db_path" "severity_scores" "1=1" 0 "severity_scores: may populate" "false"
-  assert_db "$db_path" "content_clusters" "1=1" 0 "content_clusters: may populate" "false"
-  assert_db "$db_path" "suppression_log" "1=1" 0 "suppression_log: may populate" "false"
+  assert_db "$db_path" "severity_scores" "1=1" 0 "severity_scores: may populate"
+  assert_db "$db_path" "content_clusters" "1=1" 0 "content_clusters: may populate"
+  assert_db "$db_path" "suppression_log" "1=1" 0 "suppression_log: may populate"
 
   # Code complexity: populated during code indexing
-  assert_db "$db_path" "code_complexity" "1=1" 0 "code_complexity: may populate during indexing" "false"
+  assert_db "$db_path" "code_complexity" "1=1" 0 "code_complexity: may populate during indexing"
 
   # Evaluation tables: disabled by default but schema must exist
-  assert_db "$db_path" "eval_snapshots" "1=1" 0 "eval_snapshots: none expected (evaluation disabled)" "false"
-  assert_db "$db_path" "eval_deltas" "1=1" 0 "eval_deltas: none expected (evaluation disabled)" "false"
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "eval_snapshots: none expected (evaluation disabled)"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "eval_deltas: none expected (evaluation disabled)"
 
   # Similar issues: populated when embedding service is available
-  assert_db "$db_path" "similar_issues" "1=1" 0 "similar_issues: may populate" "false"
+  assert_db "$db_path" "similar_issues" "1=1" 0 "similar_issues: may populate"
 
   # Prompt experiments: admin feature, not populated during normal processing
-  assert_db "$db_path" "prompt_experiments" "1=1" 0 "prompt_experiments: none expected" "false"
+  assert_db "$db_path" "prompt_experiments" "1=1" 0 "prompt_experiments: none expected"
 
   # --- Step 5: Checkpoint B - PR Created ---
   log_checkpoint "S1 Checkpoint B: PR Created"
@@ -1108,7 +1237,7 @@ EOF
   log "PR created: ${S1_PR_URL} (#${S1_PR_NUMBER}, branch: ${S1_PR_BRANCH:-unknown})"
 
   assert_db "$db_path" "fix_attempts" \
-    "source='linear' AND issue_id='${S1_ISSUE_ID}' AND status='success' AND pr_url LIKE 'https://github.com/%' AND github_pr_number > 0 AND github_repo='${CLAUDEAR_E2E_GITHUB_REPO}' AND issue_labels LIKE '%bug%'" \
+    "source='linear' AND issue_id='${S1_ISSUE_ID}' AND status='success' AND pr_url LIKE 'https://github.com/%' AND scm_pr_number > 0 AND scm_repo='${CLAUDEAR_E2E_GITHUB_REPO}' AND issue_labels LIKE '%bug%'" \
     1 "fix_attempts: success with PR and bug label"
 
   assert_db "$db_path" "prs" \
@@ -1122,11 +1251,11 @@ EOF
   assert_db "$db_path" "activity_log" "issue_id='${S1_ISSUE_ID}'" 2 "activity_log: >= 2 entries"
 
   # Issue clusters: may form if similar issues exist
-  assert_db "$db_path" "issue_clusters" "1=1" 0 "issue_clusters: may populate" "false"
-  assert_db "$db_path" "issue_cluster_members" "1=1" 0 "issue_cluster_members: may populate" "false"
+  assert_db "$db_path" "issue_clusters" "1=1" 0 "issue_clusters: may populate"
+  assert_db "$db_path" "issue_cluster_members" "1=1" 0 "issue_cluster_members: may populate"
 
   # Promoted instructions: requires repeated Q&A patterns
-  assert_db "$db_path" "promoted_instructions" "1=1" 0 "promoted_instructions: may populate" "false"
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "promoted_instructions: may populate"
 
   # --- Step 6: Post COMMENT Review (using reviewer token) ---
   # Use a PR review (not an issue comment) so the review watcher picks it up
@@ -1162,7 +1291,7 @@ EOF
   # pr_review_comments tracks inline diff comments only (no inline comments in this test)
   assert_db "$db_path" "pr_review_comments" \
     "pr_url='${S1_PR_URL}'" \
-    0 "pr_review_comments: no inline comments expected" "false"
+    0 "pr_review_comments: no inline comments expected"
 
   # --- Step 8: Verify PR unchanged (worktrees prevent new PR creation) ---
   log "Verifying PR URL unchanged after COMMENT review..."
@@ -1170,7 +1299,7 @@ EOF
   s1_current_pr_url="$(db_query "$db_path" \
     "SELECT pr_url FROM fix_attempts WHERE source='linear' AND issue_id='${S1_ISSUE_ID}' ORDER BY id DESC LIMIT 1")"
   if [[ -n "$s1_current_pr_url" && "$s1_current_pr_url" != "$S1_PR_URL" ]]; then
-    warn "PR URL changed after COMMENT review: ${S1_PR_URL} -> ${s1_current_pr_url} (worktree should have prevented this)"
+    fail "PR URL changed after COMMENT review: ${S1_PR_URL} -> ${s1_current_pr_url} (worktree should have prevented this)"
   else
     log "  PR URL unchanged: ${S1_PR_URL}"
   fi
@@ -1195,9 +1324,9 @@ EOF
 
   assert_db "$db_path" "pr_reviews" \
     "review_state='CHANGES_REQUESTED'" \
-    1 "pr_reviews: changes_requested review recorded" "false"
+    1 "pr_reviews: changes_requested review recorded"
 
-  assert_db "$db_path" "review_patterns" "1=1" 0 "review_patterns: may populate" "false"
+  assert_db "$db_path" "review_patterns" "1=1" 0 "review_patterns: may populate"
 
   # --- Step 11: Re-read latest PR (may have changed during reviews) ---
   local s1_latest_pr_url
@@ -1232,30 +1361,30 @@ EOF
 
   assert_db "$db_path" "prs" \
     "pr_url='${S1_PR_URL}' AND status='merged' AND merged_at IS NOT NULL AND review_cycles >= 1" \
-    1 "prs: merged with review_cycles" "false"
+    1 "prs: merged with review_cycles"
 
   assert_db "$db_path" "diff_analyses" \
     "attempt_id IS NOT NULL AND files_changed > 0 AND change_categories IS NOT NULL" \
-    1 "diff_analyses: analysis recorded" "false"
+    1 "diff_analyses: analysis recorded"
 
   assert_db "$db_path" "strategy_fingerprints" \
     "attempt_id IS NOT NULL AND fix_approach IS NOT NULL AND tools_used IS NOT NULL" \
-    1 "strategy_fingerprints: fingerprint recorded" "false"
+    1 "strategy_fingerprints: fingerprint recorded"
 
   assert_db "$db_path" "feedback_outcomes" \
     "attempt_id IS NOT NULL AND outcome='merged'" \
-    1 "feedback_outcomes: success outcome" "false"
+    1 "feedback_outcomes: success outcome"
 
-  assert_db "$db_path" "repo_knowledge" "1=1" 0 "repo_knowledge: may populate" "false"
+  assert_db "$db_path" "repo_knowledge" "1=1" 0 "repo_knowledge: may populate"
 
   # Error patterns: may detect recurring errors
-  assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate" "false"
+  assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate"
 
   # Release tracking: may be populated during regression watch creation
-  assert_db "$db_path" "release_tracking" "1=1" 0 "release_tracking: may populate" "false"
+  assert_db "$db_path" "release_tracking" "1=1" 0 "release_tracking: may populate"
 
   # Cross-repo correlations: not expected in single-repo scenario
-  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "cross_repo_correlations: none expected in single-repo" "false"
+  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "cross_repo_correlations: none expected in single-repo"
 
   # --- Step 12: Checkpoint F - Regression Watch Created ---
   log_checkpoint "S1 Checkpoint F: Regression Watch Created"
@@ -1276,6 +1405,7 @@ EOF
     db_exec "$db_path" "UPDATE regression_watches SET status='monitoring', monitoring_started_at=datetime('now') WHERE issue_id='${S1_ISSUE_ID}'"
     log "Restarting daemon..."
     daemon_pid="$(start_daemon "$config_path" "$S1_PORT" "$daemon_log")"
+    activate_daemon "$daemon_pid" "$S1_PORT"
     sleep 3
   fi
 
@@ -1303,39 +1433,39 @@ EOF
   # files_changed is populated asynchronously by post-merge learning (after mark_merged)
   assert_db "$db_path" "prs" \
     "pr_url='${S1_PR_URL}' AND files_changed > 0" \
-    1 "prs: files_changed populated after learning" "false"
+    1 "prs: files_changed populated after learning"
 
-  assert_db "$db_path" "diff_analyses" "diff_summary IS NOT NULL" 1 "learnings: diff_analyses" "false"
-  assert_db "$db_path" "strategy_fingerprints" "fix_approach IS NOT NULL" 1 "learnings: strategy_fingerprints" "false"
-  assert_db "$db_path" "feedback_outcomes" "outcome IS NOT NULL" 1 "learnings: feedback_outcomes" "false"
-  assert_db "$db_path" "repo_knowledge" "1=1" 0 "learnings: repo_knowledge" "false"
-  assert_db "$db_path" "review_patterns" "1=1" 0 "learnings: review_patterns" "false"
-  assert_db "$db_path" "promoted_instructions" "1=1" 0 "learnings: promoted_instructions" "false"
-  assert_db "$db_path" "issue_clusters" "1=1" 0 "learnings: issue_clusters" "false"
-  assert_db "$db_path" "content_clusters" "1=1" 0 "learnings: content_clusters" "false"
-  assert_db "$db_path" "severity_scores" "1=1" 0 "learnings: severity_scores" "false"
-  assert_db "$db_path" "suppression_log" "1=1" 0 "learnings: suppression_log" "false"
-  assert_db "$db_path" "error_patterns" "1=1" 0 "learnings: error_patterns" "false"
-  assert_db "$db_path" "processing_metrics" "1=1" 3 "learnings: processing_metrics >= 3" "false"
+  assert_db "$db_path" "diff_analyses" "diff_summary IS NOT NULL" 1 "learnings: diff_analyses"
+  assert_db "$db_path" "strategy_fingerprints" "fix_approach IS NOT NULL" 1 "learnings: strategy_fingerprints"
+  assert_db "$db_path" "feedback_outcomes" "outcome IS NOT NULL" 1 "learnings: feedback_outcomes"
+  assert_db "$db_path" "repo_knowledge" "1=1" 0 "learnings: repo_knowledge"
+  assert_db "$db_path" "review_patterns" "1=1" 0 "learnings: review_patterns"
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "learnings: promoted_instructions"
+  assert_db "$db_path" "issue_clusters" "1=1" 0 "learnings: issue_clusters"
+  assert_db "$db_path" "content_clusters" "1=1" 0 "learnings: content_clusters"
+  assert_db "$db_path" "severity_scores" "1=1" 0 "learnings: severity_scores"
+  assert_db "$db_path" "suppression_log" "1=1" 0 "learnings: suppression_log"
+  assert_db "$db_path" "error_patterns" "1=1" 0 "learnings: error_patterns"
+  assert_db "$db_path" "processing_metrics" "1=1" 3 "learnings: processing_metrics >= 3"
   assert_db "$db_path" "activity_log" "issue_id='${S1_ISSUE_ID}'" 5 "learnings: activity_log >= 5"
 
   # Verify code indexing state at end
-  assert_db "$db_path" "code_symbols" "1=1" 0 "learnings: code_symbols" "false"
-  assert_db "$db_path" "code_chunks" "1=1" 0 "learnings: code_chunks" "false"
-  assert_db "$db_path" "code_complexity" "1=1" 0 "learnings: code_complexity" "false"
+  assert_db "$db_path" "code_symbols" "1=1" 0 "learnings: code_symbols"
+  assert_db "$db_path" "code_chunks" "1=1" 0 "learnings: code_chunks"
+  assert_db "$db_path" "code_complexity" "1=1" 0 "learnings: code_complexity"
 
   # Verify evaluation state at end
-  assert_db "$db_path" "eval_snapshots" "1=1" 0 "learnings: eval_snapshots" "false"
-  assert_db "$db_path" "eval_deltas" "1=1" 0 "learnings: eval_deltas" "false"
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "learnings: eval_snapshots"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "learnings: eval_deltas"
 
   # Verify indexing_progress final state
   assert_db "$db_path" "indexing_progress" "id=1" 1 "learnings: indexing_progress singleton"
 
   # Verify remaining tables touched during full lifecycle
-  assert_db "$db_path" "similar_issues" "1=1" 0 "learnings: similar_issues" "false"
-  assert_db "$db_path" "release_tracking" "1=1" 0 "learnings: release_tracking" "false"
-  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "learnings: cross_repo_correlations" "false"
-  assert_db "$db_path" "prompt_experiments" "1=1" 0 "learnings: prompt_experiments" "false"
+  assert_db "$db_path" "similar_issues" "1=1" 0 "learnings: similar_issues"
+  assert_db "$db_path" "release_tracking" "1=1" 0 "learnings: release_tracking"
+  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "learnings: cross_repo_correlations"
+  assert_db "$db_path" "prompt_experiments" "1=1" 0 "learnings: prompt_experiments"
 
   # --- Step 15: Kill Daemon ---
   kill_daemon "$daemon_pid"
@@ -1374,7 +1504,12 @@ run_scenario_2() {
   local work_root="${S2_TMP_DIR}/work"
   local repos_dir="${work_root}/repos"
   local local_repo="${repos_dir}/${REPO_NAME}"
-  local db_path="${S2_TMP_DIR}/claudear-s2.db"
+  local db_path
+  if [[ "$USE_DOCKER" == "true" ]]; then
+    db_path="/app/data/claudear-s2.db"
+  else
+    db_path="${S2_TMP_DIR}/claudear-s2.db"
+  fi
   local config_path="${S2_TMP_DIR}/claudear.s2.toml"
   local daemon_log="${S2_TMP_DIR}/daemon.log"
 
@@ -1383,20 +1518,35 @@ run_scenario_2() {
   log "Cloning mock repo for Scenario 2..."
   clone_mock_repo "$local_repo"
 
-  local ask_instructions="IMPORTANT: Before making any code changes, you MUST ask the user a blocking question: Which testing framework should I use for this change? Provide these options: pytest, unittest, none. Wait for their answer before proceeding with the fix."
+  local ask_instructions="IMPORTANT: Before making any code changes, you MUST set success=false and populate the blocking_question field in your structured output to ask: Which testing framework should I use for this change? Set options to [pytest, unittest, none]. Do NOT use the AskUserQuestion tool - use the blocking_question field in the structured output schema instead. Do not proceed with the fix until you receive an answer."
 
   generate_config "$config_path" "${work_root}/cloned" "$repos_dir" "$db_path" "$S2_PORT" \
-    "true" "true" "$ask_instructions"
+    "true" "true" "$ask_instructions" "false" "3" "false"
 
   # --- Step 2: Start Daemon + Seed ---
+  reset_scenario_volume "$S2_PORT"
   log "Starting daemon (Scenario 2, port ${S2_PORT})..."
   local daemon_pid
   daemon_pid="$(start_daemon "$config_path" "$S2_PORT" "$daemon_log")"
+  activate_daemon "$daemon_pid" "$S2_PORT"
   log "Daemon handle: ${daemon_pid}"
 
-  # Wait for Discord source to seed cursor (first poll returns empty)
-  log "Waiting 8s for Discord source to seed cursor..."
-  sleep 8
+  # Wait for Discord source to seed cursor (first poll returns empty).
+  # In Docker mode, startup can take 15-20s, so poll the daemon log for the seed message.
+  log "Waiting for Discord source to seed cursor..."
+  local cursor_elapsed=0
+  local cursor_timeout=60
+  while [[ $cursor_elapsed -lt $cursor_timeout ]]; do
+    if grep -q "Discord source seeded cursor" "$daemon_log" 2>/dev/null; then
+      log "Discord cursor seeded (${cursor_elapsed}s)"
+      break
+    fi
+    sleep 2
+    cursor_elapsed=$((cursor_elapsed + 2))
+  done
+  if [[ $cursor_elapsed -ge $cursor_timeout ]]; then
+    fail "Discord cursor not seeded after ${cursor_timeout}s"
+  fi
 
   if ! check_daemon_alive "$daemon_pid"; then
     warn "Scenario 2 daemon exited early. Logs:"
@@ -1423,8 +1573,15 @@ EOF
 
   log "Posting issue message to Discord channel..."
   local discord_resp
-  discord_resp="$(discord_api POST "/channels/${CLAUDEAR_E2E_DISCORD_CHANNEL_ID}/messages" \
-    --data "$(jq -cn --arg content "$discord_msg_body" '{content: $content}')")"
+  if [[ -n "${CLAUDEAR_E2E_DISCORD_WEBHOOK_URL:-}" ]]; then
+    # Webhook posts appear as a non-bot user, so the Discord source won't filter them
+    discord_resp="$(curl -sSfL -X POST "${CLAUDEAR_E2E_DISCORD_WEBHOOK_URL}?wait=true" \
+      -H "Content-Type: application/json" \
+      --data "$(jq -cn --arg content "$discord_msg_body" '{content: $content, username: "E2E Tester"}')")"
+  else
+    discord_resp="$(discord_api POST "/channels/${CLAUDEAR_E2E_DISCORD_CHANNEL_ID}/messages" \
+      --data "$(jq -cn --arg content "$discord_msg_body" '{content: $content}')")"
+  fi
 
   local S2_DISCORD_MSG_ID
   S2_DISCORD_MSG_ID="$(jq -r '.id // empty' <<<"$discord_resp")"
@@ -1442,11 +1599,11 @@ EOF
     1 "fix_attempts: discord issue accepted"
 
   assert_db "$db_path" "repositories" "1=1" 1 "repositories: repo indexed"
-  assert_db "$db_path" "repo_files" "1=1" 1 "repo_files: files indexed" "false"
+  assert_db "$db_path" "repo_files" "1=1" 1 "repo_files: files indexed"
 
   assert_db "$db_path" "inference_attempts" \
     "issue_id='${S2_DISCORD_MSG_ID}' AND issue_source='discord' AND inferred_repo_id IS NOT NULL" \
-    1 "inference_attempts: repo inferred" "false"
+    1 "inference_attempts: repo inferred"
 
   assert_db "$db_path" "activity_log" "1=1" 1 "activity_log: entry exists"
 
@@ -1454,49 +1611,69 @@ EOF
   assert_db "$db_path" "indexing_progress" "id=1" 1 "indexing_progress: singleton row exists"
 
   # Webhook deliveries: not expected in polling mode
-  assert_db "$db_path" "webhook_deliveries" "1=1" 0 "webhook_deliveries: none expected in poll mode" "false"
+  assert_db "$db_path" "webhook_deliveries" "1=1" 0 "webhook_deliveries: none expected in poll mode"
 
   # Code indexing tables
-  assert_db "$db_path" "code_symbols" "1=1" 0 "code_symbols: may populate during indexing" "false"
-  assert_db "$db_path" "code_chunks" "1=1" 0 "code_chunks: may populate during indexing" "false"
-  assert_db "$db_path" "code_chunk_embeddings" "1=1" 0 "code_chunk_embeddings: may populate" "false"
+  assert_db "$db_path" "code_symbols" "1=1" 0 "code_symbols: may populate during indexing"
+  assert_db "$db_path" "code_chunks" "1=1" 0 "code_chunks: may populate during indexing"
+  assert_db "$db_path" "code_chunk_embeddings" "1=1" 0 "code_chunk_embeddings: may populate"
 
   # Prioritisation engine tables
-  assert_db "$db_path" "severity_scores" "1=1" 0 "severity_scores: may populate" "false"
-  assert_db "$db_path" "content_clusters" "1=1" 0 "content_clusters: may populate" "false"
-  assert_db "$db_path" "suppression_log" "1=1" 0 "suppression_log: may populate" "false"
+  assert_db "$db_path" "severity_scores" "1=1" 0 "severity_scores: may populate"
+  assert_db "$db_path" "content_clusters" "1=1" 0 "content_clusters: may populate"
+  assert_db "$db_path" "suppression_log" "1=1" 0 "suppression_log: may populate"
 
   # Code complexity: populated during code indexing
-  assert_db "$db_path" "code_complexity" "1=1" 0 "code_complexity: may populate during indexing" "false"
+  assert_db "$db_path" "code_complexity" "1=1" 0 "code_complexity: may populate during indexing"
 
   # Evaluation tables: disabled by default
-  assert_db "$db_path" "eval_snapshots" "1=1" 0 "eval_snapshots: none expected (evaluation disabled)" "false"
-  assert_db "$db_path" "eval_deltas" "1=1" 0 "eval_deltas: none expected (evaluation disabled)" "false"
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "eval_snapshots: none expected (evaluation disabled)"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "eval_deltas: none expected (evaluation disabled)"
 
   # Similar issues: populated when embedding service is available
-  assert_db "$db_path" "similar_issues" "1=1" 0 "similar_issues: may populate" "false"
+  assert_db "$db_path" "similar_issues" "1=1" 0 "similar_issues: may populate"
 
   # Prompt experiments: admin feature
-  assert_db "$db_path" "prompt_experiments" "1=1" 0 "prompt_experiments: none expected" "false"
+  assert_db "$db_path" "prompt_experiments" "1=1" 0 "prompt_experiments: none expected"
 
   # Question channel cursor: Discord source seeds cursor during first poll
-  assert_db "$db_path" "question_channel_cursor" "1=1" 0 "question_channel_cursor: may be seeded by Discord source" "false"
+  assert_db "$db_path" "question_channel_cursor" "1=1" 0 "question_channel_cursor: may be seeded by Discord source"
 
-  # --- Step 5: Checkpoint B - Ask Flow Initiated (non-fatal) ---
-  log_checkpoint "S2 Checkpoint B: Ask Flow (non-fatal)"
+  # --- Step 5: Checkpoint B - Ask Flow Initiated ---
+  log_checkpoint "S2 Checkpoint B: Ask Flow"
 
   local ask_detected=false
   local ask_elapsed=0
-  local ask_timeout=120
-  log "Polling Discord channel for blocking question (timeout: ${ask_timeout}s, non-fatal)..."
+  local ask_timeout=300
+  local ask_message_id=""
+  log "Polling Discord channel for blocking question (timeout: ${ask_timeout}s)..."
 
   while [[ $ask_elapsed -lt $ask_timeout ]]; do
     local recent_messages
     recent_messages="$(discord_api_nofail GET "/channels/${CLAUDEAR_E2E_DISCORD_CHANNEL_ID}/messages?limit=10")"
-    if echo "$recent_messages" | jq -e '.[]? | select(.author.bot == true) | .content' 2>/dev/null | grep -qi "testing framework\|which.*framework\|pytest\|unittest"; then
+    # Log first poll result for debugging
+    if [[ $ask_elapsed -eq 0 ]]; then
+      local msg_count
+      msg_count="$(echo "$recent_messages" | jq 'length' 2>/dev/null || echo "parse-error")"
+      log "  Discord poll: ${msg_count} messages returned"
+      if [[ "$msg_count" == "parse-error" || "$msg_count" == "0" ]]; then
+        log "  Discord API response (first 200 chars): ${recent_messages:0:200}"
+      fi
+    fi
+    # Detect ask messages by embed title ("Input needed:") or embed description containing the question keywords.
+    # Only accept messages NEWER than the issue message (Snowflake IDs are chronologically ordered).
+    ask_message_id="$(echo "$recent_messages" | jq -r --arg min_id "$S2_DISCORD_MSG_ID" '[.[]? | select((.id | tonumber) > ($min_id | tonumber)) | select(any(.embeds[]?; ((.title // "") | test("Input needed:"; "i")) or ((.description // "") | test("testing framework|which.*framework|pytest|unittest"; "i"))))] | first | .id // empty' 2>/dev/null || true)"
+    if [[ -n "$ask_message_id" ]]; then
       ask_detected=true
-      log "Blocking question detected in Discord!"
+      log "Blocking question detected in Discord! (message ID: ${ask_message_id})"
       break
+    fi
+    # Log progress every 30 seconds
+    if [[ $((ask_elapsed % 30)) -eq 0 && $ask_elapsed -gt 0 ]]; then
+      local newer_count newer_embed_titles
+      newer_count="$(echo "$recent_messages" | jq -r --arg min_id "$S2_DISCORD_MSG_ID" '[.[]? | select((.id | tonumber) > ($min_id | tonumber))] | length' 2>/dev/null || echo "?")"
+      newer_embed_titles="$(echo "$recent_messages" | jq -r --arg min_id "$S2_DISCORD_MSG_ID" '[.[]? | select((.id | tonumber) > ($min_id | tonumber)) | {id: .id, embed_titles: [.embeds[]?.title], content_prefix: (.content[0:40] // "")}]' 2>/dev/null || echo "jq-error")"
+      log "  ...${ask_elapsed}s | ${newer_count} newer messages | embeds: ${newer_embed_titles}"
     fi
     sleep "$POLL_INTERVAL"
     ask_elapsed=$((ask_elapsed + POLL_INTERVAL))
@@ -1504,24 +1681,27 @@ EOF
 
   if [[ "$ask_detected" == "true" ]]; then
     assert_db "$db_path" "activity_log" "message LIKE '%question%' OR message LIKE '%ask%' OR message LIKE '%blocking%'" \
-      0 "activity_log: ask-related entry" "false"
+      0 "activity_log: ask-related entry"
 
-    # --- Step 6: Reply to Question ---
-    log "Replying 'none' to blocking question on Discord..."
+    # --- Step 6: Reply to Question (using Discord reply) ---
+    log "Replying 'none' to blocking question on Discord (reply to message ${ask_message_id})..."
     discord_api POST "/channels/${CLAUDEAR_E2E_DISCORD_CHANNEL_ID}/messages" \
-      --data '{"content":"none"}' >/dev/null
+      --data "{\"content\":\"none\",\"message_reference\":{\"message_id\":\"${ask_message_id}\"}}" >/dev/null
 
-    # --- Step 7: Checkpoint C - Ask Reply Processed (non-fatal) ---
-    log_checkpoint "S2 Checkpoint C: Ask Reply Processed (non-fatal)"
-    sleep 15
+    # --- Step 7: Checkpoint C - Ask Reply Processed ---
+    log_checkpoint "S2 Checkpoint C: Ask Reply Processed"
+
+    # Wait for qa_knowledge to be populated (daemon needs to poll reply, process it, store it)
+    wait_for "qa_knowledge row for ask reply" 300 "$POLL_INTERVAL" \
+      db_has_rows "$db_path" "SELECT 1 FROM qa_knowledge WHERE question_text IS NOT NULL AND answer_text IS NOT NULL AND source='discord'"
 
     assert_db "$db_path" "qa_knowledge" \
       "question_text IS NOT NULL AND answer_text IS NOT NULL AND source='discord'" \
-      1 "qa_knowledge: Q&A recorded" "false"
+      1 "qa_knowledge: Q&A recorded"
 
-    assert_db "$db_path" "qa_usage" "1=1" 0 "qa_usage: may populate" "false"
+    assert_db "$db_path" "qa_usage" "1=1" 0 "qa_usage: may populate"
   else
-    warn "Blocking question not detected in Discord within ${ask_timeout}s (non-fatal)"
+    fail "Blocking question not detected in Discord within ${ask_timeout}s"
   fi
 
   # --- Step 8: Checkpoint D - PR Created ---
@@ -1540,7 +1720,7 @@ EOF
   log "PR created: ${S2_PR_URL} (#${S2_PR_NUMBER}, branch: ${S2_PR_BRANCH:-unknown})"
 
   assert_db "$db_path" "fix_attempts" \
-    "source='discord' AND issue_id='${S2_DISCORD_MSG_ID}' AND status='success' AND pr_url LIKE 'https://github.com/%' AND github_pr_number > 0" \
+    "source='discord' AND issue_id='${S2_DISCORD_MSG_ID}' AND status='success' AND pr_url LIKE 'https://github.com/%' AND scm_pr_number > 0" \
     1 "fix_attempts: success with PR"
 
   assert_db "$db_path" "prs" \
@@ -1549,14 +1729,14 @@ EOF
 
   assert_db "$db_path" "claude_executions" "1=1" 1 "claude_executions: at least 1"
 
-  assert_db "$db_path" "discord_threads" "1=1" 0 "discord_threads: may create thread" "false"
+  assert_db "$db_path" "discord_threads" "1=1" 0 "discord_threads: may create thread"
 
   # Issue clusters: may form if similar issues exist
-  assert_db "$db_path" "issue_clusters" "1=1" 0 "issue_clusters: may populate" "false"
-  assert_db "$db_path" "issue_cluster_members" "1=1" 0 "issue_cluster_members: may populate" "false"
+  assert_db "$db_path" "issue_clusters" "1=1" 0 "issue_clusters: may populate"
+  assert_db "$db_path" "issue_cluster_members" "1=1" 0 "issue_cluster_members: may populate"
 
   # Promoted instructions: requires repeated Q&A patterns
-  assert_db "$db_path" "promoted_instructions" "1=1" 0 "promoted_instructions: may populate" "false"
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "promoted_instructions: may populate"
 
   # --- Step 9: Add "bug" label to fix_attempts ---
   log "Adding 'bug' label to fix_attempts for regression watch creation..."
@@ -1584,9 +1764,9 @@ EOF
     "pr_url='${S2_PR_URL}' AND status='merged'" \
     1 "prs: merged"
 
-  assert_db "$db_path" "diff_analyses" "1=1" 1 "diff_analyses: analysis exists" "false"
-  assert_db "$db_path" "strategy_fingerprints" "1=1" 1 "strategy_fingerprints: fingerprint exists" "false"
-  assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate" "false"
+  assert_db "$db_path" "diff_analyses" "1=1" 1 "diff_analyses: analysis exists"
+  assert_db "$db_path" "strategy_fingerprints" "1=1" 1 "strategy_fingerprints: fingerprint exists"
+  assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate"
 
   # --- Step 11: Checkpoint F - Regression Watch ---
   log_checkpoint "S2 Checkpoint F: Regression Watch"
@@ -1617,14 +1797,38 @@ EOF
   # Set watch to regressed
   db_exec "$db_path" "UPDATE regression_watches SET status='regressed', regressed_at=datetime('now') WHERE id=${s2_watch_id}"
 
-  # Reset fix_attempts for retry
-  db_exec "$db_path" "UPDATE fix_attempts SET status='pending', retry_count=retry_count+1, pr_url=NULL, github_pr_number=NULL, error_message=NULL WHERE source='discord' AND issue_id='${S2_DISCORD_MSG_ID}'"
+  # Reset fix_attempts to failed so the retry manager picks it up.
+  # The retry manager only retries attempts with status='failed' or 'closed'.
+  db_exec "$db_path" "UPDATE fix_attempts SET status='failed', pr_url=NULL, scm_pr_number=NULL, error_message='Regression detected (simulated)' WHERE source='discord' AND issue_id='${S2_DISCORD_MSG_ID}'"
+
+  # Mark any other discord fix_attempts as 'ignored' so the retry manager
+  # only retries our test message (stale notification messages may have created attempts)
+  db_exec "$db_path" "UPDATE fix_attempts SET status='ignored' WHERE source='discord' AND issue_id != '${S2_DISCORD_MSG_ID}' AND status IN ('failed', 'closed')"
 
   # Delete old regression watch (UNIQUE constraint on issue_type+issue_id prevents new one)
   db_exec "$db_path" "DELETE FROM regression_watches WHERE id=${s2_watch_id}"
 
+  # Reset main to BEFORE the squash merge so Claude sees a clean pre-fix history.
+  # Using a revert commit would leave history that confuses Claude into thinking
+  # the fix was intentionally reverted ("already handled"), causing it to skip PR creation.
+  log "Resetting main to pre-merge state for retry..."
+  git -C "$local_repo" fetch origin main >/dev/null 2>&1
+  git -C "$local_repo" checkout main >/dev/null 2>&1
+  git -C "$local_repo" reset --hard origin/main >/dev/null 2>&1
+  # The squash merge is the top commit; reset to its parent to remove it entirely.
+  git -C "$local_repo" reset --hard HEAD~1 >/dev/null 2>&1
+  git -C "$local_repo" push --force origin main >/dev/null 2>&1
+  log "  Reset main to pre-merge state (force pushed)"
+
+  # Delete the old PR branch so Claude can create a fresh one
+  local s2_branch="${S2_PR_BRANCH:-}"
+  if [[ -n "$s2_branch" ]]; then
+    gh_api_nofail DELETE "/repos/${CLAUDEAR_E2E_GITHUB_REPO}/git/refs/heads/${s2_branch}" >/dev/null 2>&1 || true
+    log "  Deleted remote branch: ${s2_branch}"
+  fi
+
   assert_db "$db_path" "fix_attempts" \
-    "source='discord' AND issue_id='${S2_DISCORD_MSG_ID}' AND status='pending' AND retry_count >= 1 AND pr_url IS NULL" \
+    "source='discord' AND issue_id='${S2_DISCORD_MSG_ID}' AND status='failed' AND pr_url IS NULL" \
     1 "fix_attempts: reset for retry"
 
   assert_db "$db_path" "regression_checks" \
@@ -1633,6 +1837,7 @@ EOF
   # --- Step 13: Restart Daemon for Retry ---
   log "Restarting daemon for retry..."
   daemon_pid="$(start_daemon "$config_path" "$S2_PORT" "$daemon_log")"
+  activate_daemon "$daemon_pid" "$S2_PORT"
   log "Daemon handle: ${daemon_pid}"
   sleep 3
 
@@ -1652,7 +1857,7 @@ EOF
   log "Retry PR created: ${S2_RETRY_PR_URL} (#${S2_RETRY_PR_NUMBER})"
 
   assert_db "$db_path" "fix_attempts" \
-    "source='discord' AND issue_id='${S2_DISCORD_MSG_ID}' AND status='success' AND pr_url IS NOT NULL AND retry_count >= 1 AND github_pr_number > 0" \
+    "source='discord' AND issue_id='${S2_DISCORD_MSG_ID}' AND status='success' AND pr_url IS NOT NULL AND retry_count >= 1 AND scm_pr_number > 0" \
     1 "fix_attempts: retry succeeded with new PR"
 
   assert_db "$db_path" "prs" \
@@ -1694,6 +1899,7 @@ EOF
     kill_daemon "$daemon_pid"
     db_exec "$db_path" "UPDATE regression_watches SET status='monitoring', monitoring_started_at=datetime('now') WHERE issue_id='${S2_DISCORD_MSG_ID}'"
     daemon_pid="$(start_daemon "$config_path" "$S2_PORT" "$daemon_log")"
+    activate_daemon "$daemon_pid" "$S2_PORT"
     sleep 3
   fi
 
@@ -1718,40 +1924,40 @@ EOF
   # files_changed is populated asynchronously by post-merge learning
   assert_db "$db_path" "prs" \
     "pr_url='${S2_RETRY_PR_URL}' AND files_changed > 0" \
-    1 "prs: files_changed populated after learning" "false"
+    1 "prs: files_changed populated after learning"
 
-  assert_db "$db_path" "diff_analyses" "1=1" 2 "learnings: diff_analyses >= 2 (original + retry)" "false"
-  assert_db "$db_path" "strategy_fingerprints" "1=1" 2 "learnings: strategy_fingerprints >= 2" "false"
-  assert_db "$db_path" "feedback_outcomes" "outcome IS NOT NULL" 1 "learnings: feedback_outcomes >= 1" "false"
-  assert_db "$db_path" "repo_knowledge" "1=1" 0 "learnings: repo_knowledge" "false"
-  assert_db "$db_path" "qa_knowledge" "1=1" 1 "learnings: qa_knowledge >= 1" "false"
-  assert_db "$db_path" "promoted_instructions" "1=1" 0 "learnings: promoted_instructions" "false"
-  assert_db "$db_path" "issue_clusters" "1=1" 0 "learnings: issue_clusters" "false"
-  assert_db "$db_path" "content_clusters" "1=1" 0 "learnings: content_clusters" "false"
-  assert_db "$db_path" "severity_scores" "1=1" 0 "learnings: severity_scores" "false"
-  assert_db "$db_path" "suppression_log" "1=1" 0 "learnings: suppression_log" "false"
-  assert_db "$db_path" "error_patterns" "1=1" 0 "learnings: error_patterns" "false"
-  assert_db "$db_path" "review_patterns" "1=1" 0 "learnings: review_patterns" "false"
-  assert_db "$db_path" "processing_metrics" "1=1" 3 "learnings: processing_metrics >= 3" "false"
+  assert_db "$db_path" "diff_analyses" "1=1" 2 "learnings: diff_analyses >= 2 (original + retry)"
+  assert_db "$db_path" "strategy_fingerprints" "1=1" 2 "learnings: strategy_fingerprints >= 2"
+  assert_db "$db_path" "feedback_outcomes" "outcome IS NOT NULL" 1 "learnings: feedback_outcomes >= 1"
+  assert_db "$db_path" "repo_knowledge" "1=1" 0 "learnings: repo_knowledge"
+  assert_db "$db_path" "qa_knowledge" "1=1" 1 "learnings: qa_knowledge >= 1"
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "learnings: promoted_instructions"
+  assert_db "$db_path" "issue_clusters" "1=1" 0 "learnings: issue_clusters"
+  assert_db "$db_path" "content_clusters" "1=1" 0 "learnings: content_clusters"
+  assert_db "$db_path" "severity_scores" "1=1" 0 "learnings: severity_scores"
+  assert_db "$db_path" "suppression_log" "1=1" 0 "learnings: suppression_log"
+  assert_db "$db_path" "error_patterns" "1=1" 0 "learnings: error_patterns"
+  assert_db "$db_path" "review_patterns" "1=1" 0 "learnings: review_patterns"
+  assert_db "$db_path" "processing_metrics" "1=1" 3 "learnings: processing_metrics >= 3"
   assert_db "$db_path" "activity_log" "1=1" 8 "learnings: activity_log >= 8"
 
   # Verify code indexing state at end
-  assert_db "$db_path" "code_symbols" "1=1" 0 "learnings: code_symbols" "false"
-  assert_db "$db_path" "code_chunks" "1=1" 0 "learnings: code_chunks" "false"
-  assert_db "$db_path" "code_complexity" "1=1" 0 "learnings: code_complexity" "false"
+  assert_db "$db_path" "code_symbols" "1=1" 0 "learnings: code_symbols"
+  assert_db "$db_path" "code_chunks" "1=1" 0 "learnings: code_chunks"
+  assert_db "$db_path" "code_complexity" "1=1" 0 "learnings: code_complexity"
 
   # Verify evaluation state at end
-  assert_db "$db_path" "eval_snapshots" "1=1" 0 "learnings: eval_snapshots" "false"
-  assert_db "$db_path" "eval_deltas" "1=1" 0 "learnings: eval_deltas" "false"
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "learnings: eval_snapshots"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "learnings: eval_deltas"
 
   # Verify indexing_progress final state
   assert_db "$db_path" "indexing_progress" "id=1" 1 "learnings: indexing_progress singleton"
 
   # Verify remaining tables touched during full lifecycle
-  assert_db "$db_path" "similar_issues" "1=1" 0 "learnings: similar_issues" "false"
-  assert_db "$db_path" "release_tracking" "1=1" 0 "learnings: release_tracking" "false"
-  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "learnings: cross_repo_correlations" "false"
-  assert_db "$db_path" "prompt_experiments" "1=1" 0 "learnings: prompt_experiments" "false"
+  assert_db "$db_path" "similar_issues" "1=1" 0 "learnings: similar_issues"
+  assert_db "$db_path" "release_tracking" "1=1" 0 "learnings: release_tracking"
+  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "learnings: cross_repo_correlations"
+  assert_db "$db_path" "prompt_experiments" "1=1" 0 "learnings: prompt_experiments"
 
   # --- Step 18: Kill Daemon ---
   kill_daemon "$daemon_pid"
@@ -1785,7 +1991,12 @@ run_scenario_3() {
   local repos_dir="${work_root}/repos"
   local local_repo="${repos_dir}/${REPO_NAME}"
   local local_repo_2="${repos_dir}/${REPO_NAME_2}"
-  local db_path="${S3_TMP_DIR}/claudear-s3.db"
+  local db_path
+  if [[ "$USE_DOCKER" == "true" ]]; then
+    db_path="/app/data/claudear-s3.db"
+  else
+    db_path="${S3_TMP_DIR}/claudear-s3.db"
+  fi
   local config_path="${S3_TMP_DIR}/claudear.s3.toml"
   local daemon_log="${S3_TMP_DIR}/daemon.log"
 
@@ -1831,8 +2042,11 @@ PKGJSON
     "false" "false" "" "true" "3"
 
   # --- Step 1c: Run repos index to discover npm dependency ---
+  # Reset the DB volume first, then run repos index with the same volume
+  # so the daemon sees the discovered dependencies.
+  reset_scenario_volume "$S3_PORT"
   log "Running repos index to discover dependencies..."
-  run_repos_index "$config_path"
+  run_repos_index "$config_path" "$S3_PORT"
   log "repos index complete"
 
   # --- Step 2: Create Linear Issue targeting upstream ---
@@ -1895,9 +2109,11 @@ EOF
   log "Issue URL: ${S3_ISSUE_URL}"
 
   # --- Step 3: Start Daemon (loads dependency graph from DB) ---
+  # Volume already created by run_repos_index above; don't reset it.
   log "Starting daemon (Scenario 3, port ${S3_PORT})..."
   local daemon_pid
   daemon_pid="$(start_daemon "$config_path" "$S3_PORT" "$daemon_log")"
+  activate_daemon "$daemon_pid" "$S3_PORT"
   log "Daemon handle: ${daemon_pid}"
   sleep 3
 
@@ -1919,7 +2135,7 @@ EOF
 
   assert_db "$db_path" "repositories" "1=1" 2 "repositories: both repos indexed"
   assert_db "$db_path" "repository_dependencies" "1=1" 1 "repository_dependencies: npm dependency discovered"
-  assert_db "$db_path" "repo_files" "1=1" 1 "repo_files: files indexed" "false"
+  assert_db "$db_path" "repo_files" "1=1" 1 "repo_files: files indexed"
 
   # --- Step 5: Checkpoint B - Upstream PR Created ---
   log_checkpoint "S3 Checkpoint B: Upstream PR Created"
@@ -1939,7 +2155,7 @@ EOF
   log "Upstream PR created: ${S3_PR_URL} (#${S3_PR_NUMBER})"
 
   assert_db "$db_path" "fix_attempts" \
-    "source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NULL AND status='success' AND pr_url IS NOT NULL AND github_repo='${CLAUDEAR_E2E_GITHUB_REPO}'" \
+    "source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NULL AND status='success' AND pr_url IS NOT NULL AND scm_repo='${CLAUDEAR_E2E_GITHUB_REPO}'" \
     1 "fix_attempts: upstream PR recorded"
 
   assert_db "$db_path" "prs" \
@@ -1975,7 +2191,7 @@ EOF
   local cascade_repo_val
   cascade_repo_val="$(db_query "$db_path" "SELECT cascade_repo FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NOT NULL LIMIT 1")"
   if [[ "$cascade_repo_val" != *"${REPO_NAME_2}"* ]]; then
-    warn "Cascade repo mismatch: expected to contain '${REPO_NAME_2}', got '${cascade_repo_val}'"
+    fail "Cascade repo mismatch: expected to contain '${REPO_NAME_2}', got '${cascade_repo_val}'"
   else
     log "  DB OK: cascade_repo matches expected downstream (${cascade_repo_val})"
   fi
@@ -1985,7 +2201,7 @@ EOF
   parent_id="$(db_query "$db_path" "SELECT id FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NULL LIMIT 1")"
   cascade_parent_id="$(db_query "$db_path" "SELECT parent_attempt_id FROM fix_attempts WHERE source='linear' AND issue_id='${S3_ISSUE_ID}' AND cascade_repo IS NOT NULL LIMIT 1")"
   if [[ "$parent_id" != "$cascade_parent_id" ]]; then
-    warn "Cascade parent_attempt_id mismatch: expected ${parent_id}, got ${cascade_parent_id}"
+    fail "Cascade parent_attempt_id mismatch: expected ${parent_id}, got ${cascade_parent_id}"
   else
     log "  DB OK: cascade parent_attempt_id matches upstream attempt id (${parent_id})"
   fi
@@ -2039,27 +2255,27 @@ EOF
   # Upstream PR learning (files_changed populated asynchronously)
   assert_db "$db_path" "prs" \
     "pr_url='${S3_PR_URL}' AND status='merged' AND files_changed > 0" \
-    1 "prs: upstream PR merged with files_changed" "false"
+    1 "prs: upstream PR merged with files_changed"
 
   assert_db "$db_path" "activity_log" "1=1" 4 "activity_log: >= 4 entries"
 
   # Cross-repo correlations: cascade scenario may detect correlated failures
-  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "cross_repo_correlations: may populate in cascade" "false"
+  assert_db "$db_path" "cross_repo_correlations" "1=1" 0 "cross_repo_correlations: may populate in cascade"
 
   # Verify learning and indexing tables at end of cascade
-  assert_db "$db_path" "diff_analyses" "1=1" 0 "diff_analyses: may populate" "false"
-  assert_db "$db_path" "strategy_fingerprints" "1=1" 0 "strategy_fingerprints: may populate" "false"
-  assert_db "$db_path" "feedback_outcomes" "1=1" 0 "feedback_outcomes: may populate" "false"
-  assert_db "$db_path" "repo_knowledge" "1=1" 0 "repo_knowledge: may populate" "false"
-  assert_db "$db_path" "review_patterns" "1=1" 0 "review_patterns: may populate" "false"
-  assert_db "$db_path" "promoted_instructions" "1=1" 0 "promoted_instructions: may populate" "false"
-  assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate" "false"
-  assert_db "$db_path" "processing_metrics" "1=1" 1 "processing_metrics: >= 1" "false"
-  assert_db "$db_path" "code_complexity" "1=1" 0 "code_complexity: may populate" "false"
-  assert_db "$db_path" "eval_snapshots" "1=1" 0 "eval_snapshots: may populate" "false"
-  assert_db "$db_path" "eval_deltas" "1=1" 0 "eval_deltas: may populate" "false"
-  assert_db "$db_path" "similar_issues" "1=1" 0 "similar_issues: may populate" "false"
-  assert_db "$db_path" "release_tracking" "1=1" 0 "release_tracking: may populate" "false"
+  assert_db "$db_path" "diff_analyses" "1=1" 0 "diff_analyses: may populate"
+  assert_db "$db_path" "strategy_fingerprints" "1=1" 0 "strategy_fingerprints: may populate"
+  assert_db "$db_path" "feedback_outcomes" "1=1" 0 "feedback_outcomes: may populate"
+  assert_db "$db_path" "repo_knowledge" "1=1" 0 "repo_knowledge: may populate"
+  assert_db "$db_path" "review_patterns" "1=1" 0 "review_patterns: may populate"
+  assert_db "$db_path" "promoted_instructions" "1=1" 0 "promoted_instructions: may populate"
+  assert_db "$db_path" "error_patterns" "1=1" 0 "error_patterns: may populate"
+  assert_db "$db_path" "processing_metrics" "1=1" 1 "processing_metrics: >= 1"
+  assert_db "$db_path" "code_complexity" "1=1" 0 "code_complexity: may populate"
+  assert_db "$db_path" "eval_snapshots" "1=1" 0 "eval_snapshots: may populate"
+  assert_db "$db_path" "eval_deltas" "1=1" 0 "eval_deltas: may populate"
+  assert_db "$db_path" "similar_issues" "1=1" 0 "similar_issues: may populate"
+  assert_db "$db_path" "release_tracking" "1=1" 0 "release_tracking: may populate"
   assert_db "$db_path" "indexing_progress" "id=1" 1 "indexing_progress: singleton"
 
   # --- Step 10: Kill Daemon ---
@@ -2077,6 +2293,69 @@ EOF
 
 ###############################################################################
 #
+#  CLEANUP STALE E2E RESOURCES
+#
+###############################################################################
+
+cleanup_stale_e2e_prs() {
+  log "Cleaning up stale e2e PRs..."
+
+  # Close open PRs with [claudear-e2e] in title on repo 1
+  local prs
+  prs="$(gh_api GET "/repos/${CLAUDEAR_E2E_GITHUB_REPO}/pulls?state=open&per_page=100" 2>/dev/null || echo '[]')"
+  echo "$prs" | jq -r '.[] | select(.title | contains("[claudear-e2e]")) | .number' | while read -r pr_num; do
+    log "  Closing stale PR #${pr_num} on ${CLAUDEAR_E2E_GITHUB_REPO}"
+    gh_api_nofail PATCH "/repos/${CLAUDEAR_E2E_GITHUB_REPO}/pulls/${pr_num}" \
+      -H "Content-Type: application/json" \
+      --data '{"state":"closed"}' >/dev/null
+    # Delete the branch if configured
+    if [[ "${CLAUDEAR_E2E_DELETE_BRANCH:-false}" == "true" ]]; then
+      local branch
+      branch="$(echo "$prs" | jq -r --argjson n "$pr_num" '.[] | select(.number == $n) | .head.ref')"
+      if [[ -n "$branch" ]]; then
+        delete_github_branch "$branch"
+      fi
+    fi
+  done
+
+  # Same for repo 2
+  if [[ -n "${CLAUDEAR_E2E_GITHUB_REPO_2:-}" ]]; then
+    local prs2
+    prs2="$(gh_api_on "${CLAUDEAR_E2E_GITHUB_REPO_2}" GET "/pulls?state=open&per_page=100" 2>/dev/null || echo '[]')"
+    echo "$prs2" | jq -r '.[] | select(.title | test("claudear-e2e|cascade"; "i")) | .number' | while read -r pr_num; do
+      log "  Closing stale PR #${pr_num} on ${CLAUDEAR_E2E_GITHUB_REPO_2}"
+      gh_api_on_nofail "${CLAUDEAR_E2E_GITHUB_REPO_2}" PATCH "/pulls/${pr_num}" \
+        -H "Content-Type: application/json" \
+        --data '{"state":"closed"}' >/dev/null
+    done
+  fi
+
+  # Close stale Linear issues with [claudear-e2e] in title
+  local search_query='query SearchIssues($teamId: String!, $filter: IssueFilter) {
+    issues(filter: $filter, first: 50) {
+      nodes { id identifier title }
+    }
+  }'
+  local search_vars
+  search_vars="$(jq -cn --arg teamId "$CLAUDEAR_E2E_LINEAR_TEAM_ID" \
+    '{teamId: $teamId, filter: {team: {id: {eq: $teamId}}, title: {contains: "[claudear-e2e]"}, state: {type: {nin: ["completed", "canceled"]}}}}')"
+  local search_resp
+  search_resp="$(linear_graphql "$search_query" "$search_vars" 2>/dev/null || echo '{}')"
+  local stale_ids
+  stale_ids="$(echo "$search_resp" | jq -r '.data.issues.nodes[]?.id // empty' 2>/dev/null)"
+  if [[ -n "$stale_ids" ]]; then
+    while read -r issue_id; do
+      [[ -n "$issue_id" ]] || continue
+      log "  Resolving stale Linear issue ${issue_id}"
+      resolve_linear_issue "$issue_id"
+    done <<< "$stale_ids"
+  fi
+
+  log "Stale e2e cleanup complete"
+}
+
+###############################################################################
+#
 #  MAIN
 #
 ###############################################################################
@@ -2090,14 +2369,42 @@ log "Cascade available: ${HAS_CASCADE}"
 log "Binary: ${CLAUDEAR_BIN}"
 log ""
 
-run_scenario_1
+# Clean up stale e2e PRs and issues from previous runs
+cleanup_stale_e2e_prs
 
-run_scenario_2
+# Optional: CLAUDEAR_E2E_SCENARIOS="1,2,3" to run only specific scenarios
+SCENARIOS="${CLAUDEAR_E2E_SCENARIOS:-1,2,3}"
 
-run_scenario_3
+if [[ "$SCENARIOS" == *"1"* ]]; then
+  run_scenario_1
+else
+  log "Skipping Scenario 1 (CLAUDEAR_E2E_SCENARIOS=${SCENARIOS})"
+  S1_STATUS="skipped"
+fi
 
-# Final status
-if [[ "$S1_STATUS" == "passed" &&
+# S2 requires posting Discord messages as a non-bot user (the Discord source
+# filters bot-authored messages). Skip when only a bot token is available.
+if [[ "$SCENARIOS" == *"2"* ]]; then
+  if [[ -n "${CLAUDEAR_E2E_DISCORD_WEBHOOK_URL:-}" ]]; then
+    run_scenario_2
+  else
+    log "Skipping Scenario 2: CLAUDEAR_E2E_DISCORD_WEBHOOK_URL not set (bot token messages are filtered by Discord source)"
+    S2_STATUS="skipped"
+  fi
+else
+  log "Skipping Scenario 2 (CLAUDEAR_E2E_SCENARIOS=${SCENARIOS})"
+  S2_STATUS="skipped"
+fi
+
+if [[ "$SCENARIOS" == *"3"* ]]; then
+  run_scenario_3
+else
+  log "Skipping Scenario 3 (CLAUDEAR_E2E_SCENARIOS=${SCENARIOS})"
+  S3_STATUS="skipped"
+fi
+
+# Final status - each scenario must be "passed" or "skipped"
+if [[ ("$S1_STATUS" == "passed" || "$S1_STATUS" == "skipped") &&
       ("$S2_STATUS" == "passed" || "$S2_STATUS" == "skipped") &&
       ("$S3_STATUS" == "passed" || "$S3_STATUS" == "skipped") ]]; then
   FINAL_STATUS="passed"

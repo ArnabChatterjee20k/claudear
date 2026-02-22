@@ -272,6 +272,7 @@ mod tests {
             auto_discover_paths: vec![],
             poll_interval_ms: 300_000,
             webhook_port: 3100,
+            bind_address: "127.0.0.1".to_string(),
             db_path: "/tmp/test.db".into(),
             max_issues_per_cycle: 5,
             max_concurrent: 1,
@@ -374,8 +375,6 @@ mod tests {
         assert!(!configurator.needs_configuration());
     }
 
-    // ── mask_secret edge cases ──
-
     #[test]
     fn test_mask_secret_empty_string() {
         // Empty input now returns "****" instead of an empty string.
@@ -426,8 +425,6 @@ mod tests {
         // 12 <= 12, so should be all asterisks
         assert_eq!(mask_secret("abcdefghijkl"), "************");
     }
-
-    // ── needs_configuration with Sentry config ──
 
     #[test]
     fn test_needs_configuration_sentry_enabled_no_secret() {
@@ -534,8 +531,6 @@ mod tests {
         );
     }
 
-    // ── WebhookSetupResult ──
-
     #[test]
     fn test_webhook_setup_result_default_all_fields() {
         let result = WebhookSetupResult::default();
@@ -569,8 +564,6 @@ mod tests {
         assert_eq!(result.warnings[0], "warn1");
         assert_eq!(result.warnings[1], "warn2");
     }
-
-    // ── WebhookConfigurator::new() constructor tests ──
 
     #[test]
     fn test_configurator_new_stores_config_and_path() {
@@ -645,8 +638,6 @@ mod tests {
             "key-123"
         );
     }
-
-    // ── needs_configuration() additional edge cases ──
 
     #[test]
     fn test_needs_configuration_linear_disabled_no_secret() {
@@ -767,8 +758,6 @@ mod tests {
         );
     }
 
-    // ── mask_secret additional edge cases ──
-
     #[test]
     fn test_mask_secret_six_chars() {
         // 6 <= 12, so should be all asterisks
@@ -826,8 +815,6 @@ mod tests {
         assert_eq!(mask_secret(secret), "123...456");
     }
 
-    // ── WebhookSetupResult Debug trait ──
-
     #[test]
     fn test_webhook_setup_result_debug_format() {
         let result = WebhookSetupResult::default();
@@ -853,8 +840,6 @@ mod tests {
         assert!(debug_str.contains("wh-999"));
         assert!(debug_str.contains("warning-1"));
     }
-
-    // ── WebhookSetupResult field manipulation ──
 
     #[test]
     fn test_webhook_setup_result_warnings_can_be_added() {
@@ -901,8 +886,6 @@ mod tests {
         assert!(result.sentry_configured);
         assert_eq!(result.sentry_project_count, 5);
     }
-
-    // ── print_setup_result tests ──
 
     #[test]
     fn test_print_setup_result_linear_only() {
@@ -1062,6 +1045,131 @@ mod tests {
     }
 
     #[test]
+    fn test_print_setup_result() {
+        // Comprehensive test: verify print_setup_result does not panic for various configurations
+        // and exercises all branches (linear, sentry, warnings, secrets, missing IDs)
+
+        // Both configured with secrets
+        let full_result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: Some("wh-full".to_string()),
+            linear_secret: Some("abcdef1234567890".to_string()),
+            sentry_configured: true,
+            sentry_project_count: 2,
+            sentry_secret: Some("1234567890abcdef".to_string()),
+            warnings: vec!["Some warning".to_string()],
+        };
+        print_setup_result(&full_result); // should not panic
+
+        // No configured sources, just warnings
+        let empty_result = WebhookSetupResult {
+            linear_configured: false,
+            linear_webhook_id: None,
+            linear_secret: None,
+            sentry_configured: false,
+            sentry_project_count: 0,
+            sentry_secret: None,
+            warnings: vec!["warning A".to_string(), "warning B".to_string()],
+        };
+        print_setup_result(&empty_result); // should not panic
+
+        // Linear without webhook ID or secret
+        let partial_result = WebhookSetupResult {
+            linear_configured: true,
+            linear_webhook_id: None,
+            linear_secret: None,
+            sentry_configured: false,
+            sentry_project_count: 0,
+            sentry_secret: None,
+            warnings: vec![],
+        };
+        print_setup_result(&partial_result); // should not panic
+    }
+
+    #[test]
+    fn test_needs_configuration_edge_cases() {
+        // Edge case 1: Both sources enabled, both missing secrets
+        let mut config1 = test_config();
+        config1.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            webhook_secret: None,
+            ..Default::default()
+        });
+        config1.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            client_secret: None,
+            ..Default::default()
+        });
+        let c1 = WebhookConfigurator::new(config1, "/tmp/.env");
+        assert!(
+            c1.needs_configuration(),
+            "both enabled, both missing secrets"
+        );
+
+        // Edge case 2: Both sources present but disabled
+        let mut config2 = test_config();
+        config2.linear = Some(crate::config::LinearConfig {
+            enabled: false,
+            webhook_secret: None,
+            ..Default::default()
+        });
+        config2.sentry = Some(crate::config::SentryConfig {
+            enabled: false,
+            client_secret: None,
+            ..Default::default()
+        });
+        let c2 = WebhookConfigurator::new(config2, "/tmp/.env");
+        assert!(
+            !c2.needs_configuration(),
+            "both disabled should not need config"
+        );
+
+        // Edge case 3: One enabled with secret, one enabled without
+        let mut config3 = test_config();
+        config3.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            webhook_secret: Some("secret".to_string()),
+            ..Default::default()
+        });
+        config3.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            client_secret: None,
+            ..Default::default()
+        });
+        let c3 = WebhookConfigurator::new(config3, "/tmp/.env");
+        assert!(
+            c3.needs_configuration(),
+            "one missing secret should need config"
+        );
+
+        // Edge case 4: Both enabled, both have secrets
+        let mut config4 = test_config();
+        config4.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            webhook_secret: Some("lin-secret".to_string()),
+            ..Default::default()
+        });
+        config4.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            client_secret: Some("sen-secret".to_string()),
+            ..Default::default()
+        });
+        let c4 = WebhookConfigurator::new(config4, "/tmp/.env");
+        assert!(
+            !c4.needs_configuration(),
+            "both have secrets should not need config"
+        );
+
+        // Edge case 5: No sources configured at all
+        let config5 = test_config(); // linear=None, sentry=None
+        let c5 = WebhookConfigurator::new(config5, "/tmp/.env");
+        assert!(
+            !c5.needs_configuration(),
+            "no sources means no config needed"
+        );
+    }
+
+    #[test]
     fn test_print_setup_result_sentry_zero_projects() {
         let result = WebhookSetupResult {
             linear_configured: false,
@@ -1075,5 +1183,290 @@ mod tests {
 
         // Should not panic even with 0 projects
         print_setup_result(&result);
+    }
+
+    #[tokio::test]
+    async fn test_configure_no_sources_enabled_returns_error() {
+        // No linear or sentry configured at all => error about no sources enabled
+        let config = test_config(); // linear=None, sentry=None
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-no-sources.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err(), "configure with no sources should error");
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No webhook sources are enabled"),
+            "Error should mention no sources are enabled, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_linear_disabled_sentry_disabled_returns_error() {
+        // Both sources present but disabled => error about no sources enabled
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-disabled.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(
+            result.is_err(),
+            "configure with disabled sources should error"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No webhook sources are enabled"),
+            "Error should mention no sources are enabled, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_linear_disabled_sentry_none_returns_error() {
+        // Linear present but disabled, sentry absent => error
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        config.sentry = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-lin-disabled.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No webhook sources are enabled"),
+            "Expected no-sources error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_sentry_disabled_linear_none_returns_error() {
+        // Sentry present but disabled, linear absent => error
+        let mut config = test_config();
+        config.linear = None;
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-sen-disabled.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No webhook sources are enabled"),
+            "Expected no-sources error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_linear_enabled_but_fails_api_returns_error_with_warnings() {
+        // Linear enabled with a dummy API key that will fail when trying to connect.
+        // This exercises the warning-accumulation path (lines 75-80) and then the
+        // "Failed to configure any webhooks" error path (lines 117-122).
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            api_key: "invalid-api-key".to_string(),
+            trigger_labels: vec![],
+            trigger_states: vec![],
+            team_id: None,
+            project_id: None,
+            webhook_secret: None,
+            ..Default::default()
+        });
+        config.sentry = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-lin-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(
+            result.is_err(),
+            "configure should error when Linear API fails"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to configure any webhooks"),
+            "Error should mention failure to configure, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_sentry_enabled_but_fails_api_returns_error_with_warnings() {
+        // Sentry enabled with dummy credentials that will fail.
+        // Exercises the sentry warning-accumulation path (lines 97-101) and then the
+        // "Failed to configure any webhooks" error path (lines 117-122).
+        let mut config = test_config();
+        config.linear = None;
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            auth_token: "invalid-token".to_string(),
+            org_slug: "nonexistent-org".to_string(),
+            project_slugs: vec!["fake-project".to_string()],
+            client_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-sen-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(
+            result.is_err(),
+            "configure should error when Sentry API fails"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to configure any webhooks"),
+            "Error should mention failure to configure, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_both_enabled_both_fail_returns_combined_warnings() {
+        // Both sources enabled with invalid credentials -- both will fail,
+        // and the error message should include warnings from both.
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            api_key: "invalid-linear-key".to_string(),
+            webhook_secret: None,
+            ..Default::default()
+        });
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            auth_token: "invalid-sentry-token".to_string(),
+            org_slug: "nonexistent-org".to_string(),
+            project_slugs: vec!["fake-project".to_string()],
+            client_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-both-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(
+            result.is_err(),
+            "configure should error when both APIs fail"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to configure any webhooks"),
+            "Error should mention failure, got: {}",
+            err_msg
+        );
+        // The error should contain both warnings joined by ";"
+        assert!(
+            err_msg.contains("Linear") || err_msg.contains("Sentry") || err_msg.contains(";"),
+            "Error should contain warning info from at least one source, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_base_url_trailing_slash_is_handled() {
+        // Even though the API call will fail, this verifies configure()
+        // does not panic with a trailing-slash base_url.
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            api_key: "test-key".to_string(),
+            webhook_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-trailing.env");
+
+        let result = configurator.configure("https://example.com/").await;
+        // Will fail at the API level, but should not panic
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_configure_base_url_no_trailing_slash() {
+        // Verifies configure() works without trailing slash
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            api_key: "test-key".to_string(),
+            webhook_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-no-trailing.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_configure_linear_enabled_sentry_disabled_linear_fails() {
+        // Linear enabled but fails, Sentry present but disabled.
+        // Only the Linear warning should appear.
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            api_key: "bad-key".to_string(),
+            webhook_secret: None,
+            ..Default::default()
+        });
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-mixed.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to configure any webhooks"),
+            "Should get failure error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_sentry_enabled_linear_disabled_sentry_fails() {
+        // Sentry enabled but fails, Linear present but disabled.
+        let mut config = test_config();
+        config.linear = Some(crate::config::LinearConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        config.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            auth_token: "bad-token".to_string(),
+            org_slug: "fake-org".to_string(),
+            project_slugs: vec!["fake".to_string()],
+            client_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-mixed2.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to configure any webhooks"),
+            "Should get failure error, got: {}",
+            err_msg
+        );
     }
 }

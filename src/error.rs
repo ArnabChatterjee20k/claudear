@@ -477,8 +477,6 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("inner failure"));
     }
 
-    // ── Edge case tests ──
-
     #[test]
     fn test_error_storage() {
         let err = Error::storage("disk full");

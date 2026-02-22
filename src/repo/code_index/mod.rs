@@ -219,6 +219,12 @@ impl CodeIndexer {
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
+                // Always include the root directory (depth 0) so that
+                // repositories whose directory name starts with '.' or
+                // matches a skip-name are still walked.
+                if e.depth() == 0 {
+                    return true;
+                }
                 let name = e.file_name().to_string_lossy();
                 !name.starts_with('.')
                     && name != "node_modules"

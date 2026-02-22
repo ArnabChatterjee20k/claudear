@@ -263,8 +263,6 @@ mod tests {
         assert_eq!(normalized, "appwrite/sdk");
     }
 
-    // ── Edge case tests ──
-
     #[test]
     fn test_is_known_org_no_slash() {
         let discovery = DependencyDiscovery::new(vec!["utopia-php".to_string()]);

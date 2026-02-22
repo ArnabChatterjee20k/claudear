@@ -221,8 +221,6 @@ mod tests {
         assert!(score.cluster_boost == 0.0 || score.cluster_boost == 1.0);
     }
 
-    // ── New scorer edge-case tests ──────────────────────────────────────
-
     #[test]
     fn test_frequency_no_metadata() {
         // Issue with no event_count, user_count, or escalation_rate metadata

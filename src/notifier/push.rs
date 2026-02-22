@@ -145,9 +145,141 @@ impl Notifier for PushNotifier {
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
-        let title = format!("\u{2705} PR Created: {}", issue.short_id);
-        let message = format!("{}\n\nPR URL: {}", issue.title, pr_url);
+        if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            let upstream = issue
+                .get_metadata::<String>("cascade_upstream_repo")
+                .unwrap_or_default();
+            let downstream = issue
+                .get_metadata::<String>("cascade_downstream_repo")
+                .unwrap_or_default();
+            let title = format!("\u{1F517} Cascade PR: {}", issue.short_id);
+            let message = format!("{} -> {}\n\nPR URL: {}", upstream, downstream, pr_url);
+            self.send_push(
+                &title,
+                &message,
+                Some(pr_url),
+                Some("View PR"),
+                Some(0),
+                Some(issue),
+            )
+            .await
+        } else if issue.get_metadata::<bool>("is_pr_update").unwrap_or(false) {
+            let title = format!("\u{270F}\u{FE0F} PR Updated: {}", issue.short_id);
+            let message = format!("{}\n\nPR URL: {}", issue.title, pr_url);
+            self.send_push(
+                &title,
+                &message,
+                Some(pr_url),
+                Some("View PR"),
+                Some(0),
+                Some(issue),
+            )
+            .await
+        } else {
+            let title = format!("\u{2705} PR Created: {}", issue.short_id);
+            let message = format!("{}\n\nPR URL: {}", issue.title, pr_url);
+            self.send_push(
+                &title,
+                &message,
+                Some(pr_url),
+                Some("View PR"),
+                Some(0),
+                Some(issue),
+            )
+            .await
+        }
+    }
 
+    async fn notify_completed(&self, issue: &Issue) -> Result<()> {
+        if issue
+            .get_metadata::<bool>("regression_resolved")
+            .unwrap_or(false)
+        {
+            let title = format!("\u{2705} Regression Resolved: {}", issue.short_id);
+            let message =
+                "No regression detected after monitoring period.\nIssue resolved.".to_string();
+            self.send_push(
+                &title,
+                &message,
+                Some(&issue.url),
+                Some("View Issue"),
+                Some(-1),
+                Some(issue),
+            )
+            .await
+        } else {
+            let title = format!("\u{2714}\u{FE0F} Completed: {}", issue.short_id);
+            let message = format!("{}\n\nNo PR URL was captured.", issue.title);
+            self.send_push(
+                &title,
+                &message,
+                Some(&issue.url),
+                Some("View Issue"),
+                Some(-1),
+                Some(issue),
+            )
+            .await
+        }
+    }
+
+    async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
+        if issue
+            .get_metadata::<bool>("regression_detected")
+            .unwrap_or(false)
+        {
+            let title = format!("\u{1F4C9} Regression Detected: {}", issue.short_id);
+            let message = format!(
+                "A previously fixed issue has regressed.\n\n{}\n\nRetry scheduled.",
+                error
+            );
+            self.send_push(
+                &title,
+                &message,
+                Some(&issue.url),
+                Some("View Issue"),
+                Some(1),
+                Some(issue),
+            )
+            .await
+        } else if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            let downstream = issue
+                .get_metadata::<String>("cascade_downstream_repo")
+                .unwrap_or_default();
+            let title = format!("\u{26A0}\u{FE0F} Cascade Failed: {}", issue.short_id);
+            let message = format!("Failed to adapt {}\n\nError: {}", downstream, error);
+            self.send_push(
+                &title,
+                &message,
+                Some(&issue.url),
+                Some("View Issue"),
+                Some(1),
+                Some(issue),
+            )
+            .await
+        } else {
+            let title = format!("\u{274C} Failed: {}", issue.short_id);
+            let message = format!("{}\n\nError: {}", issue.title, error);
+            self.send_push(
+                &title,
+                &message,
+                Some(&issue.url),
+                Some("View Issue"),
+                Some(1),
+                Some(issue),
+            )
+            .await
+        }
+    }
+
+    async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let title = format!("\u{1F389} PR Merged: {}", issue.short_id);
+        let message = format!("{}\n\nPR URL: {}", issue.title, pr_url);
         self.send_push(
             &title,
             &message,
@@ -159,32 +291,15 @@ impl Notifier for PushNotifier {
         .await
     }
 
-    async fn notify_completed(&self, issue: &Issue) -> Result<()> {
-        let title = format!("\u{2714}\u{FE0F} Completed: {}", issue.short_id);
-        let message = format!("{}\n\nNo PR URL was captured.", issue.title);
-
+    async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let title = format!("\u{1F6AB} PR Closed: {}", issue.short_id);
+        let message = format!("{}\n\nPR was closed without merging.", issue.title);
         self.send_push(
             &title,
             &message,
-            Some(&issue.url),
-            Some("View Issue"),
+            Some(pr_url),
+            Some("View PR"),
             Some(-1),
-            Some(issue),
-        )
-        .await
-    }
-
-    async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
-        let title = format!("\u{274C} Failed: {}", issue.short_id);
-        let message = format!("{}\n\nError: {}", issue.title, error);
-
-        // Higher priority for failures
-        self.send_push(
-            &title,
-            &message,
-            Some(&issue.url),
-            Some("View Issue"),
-            Some(1),
             Some(issue),
         )
         .await
@@ -228,8 +343,8 @@ impl Notifier for PushNotifier {
     ) -> Result<Option<AskDelivery>> {
         let title = format!("Human input needed: {}", issue.short_id);
         let message = format!(
-            "[CLAUDEAR-Q:{}]\n{}\n\nReply in Discord or Email.",
-            request.correlation_id, request.question.question
+            "{}\n\nReply in Discord, Slack, or Email.",
+            request.question.question
         );
         self.send_push(
             &title,
@@ -744,5 +859,171 @@ mod tests {
             priority: None,
         };
         assert!(PushNotifier::new(config, empty_registry()).is_enabled());
+    }
+
+    // --- Tests for cascade success (disabled config) ---
+
+    #[tokio::test]
+    async fn test_notify_success_cascade_disabled() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+        issue.set_metadata("cascade_upstream_repo", "upstream/repo");
+
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // --- Tests for PR update success (disabled config) ---
+
+    #[tokio::test]
+    async fn test_notify_success_pr_update_disabled() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("is_pr_update", true);
+
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // --- Tests for regression resolved completed (disabled config) ---
+
+    #[tokio::test]
+    async fn test_notify_completed_regression_resolved_disabled() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let mut issue = Issue::new("1", "SEN-1", "Error", "https://sentry.io/1", "sentry");
+        issue.set_metadata("regression_resolved", true);
+
+        let result = notifier.notify_completed(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    // --- Tests for regression detected failed (disabled config) ---
+
+    #[tokio::test]
+    async fn test_notify_failed_regression_detected_disabled() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let mut issue = Issue::new("1", "SEN-1", "Error", "https://sentry.io/1", "sentry");
+        issue.set_metadata("regression_detected", true);
+
+        let result = notifier.notify_failed(&issue, "Tests failing").await;
+        assert!(result.is_ok());
+    }
+
+    // --- Tests for cascade failed (disabled config) ---
+
+    #[tokio::test]
+    async fn test_notify_failed_cascade_disabled() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+
+        let result = notifier.notify_failed(&issue, "Build error").await;
+        assert!(result.is_ok());
+    }
+
+    // --- Tests for notify_merged and notify_closed (disabled config) ---
+
+    #[tokio::test]
+    async fn test_notify_merged_disabled() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let issue = Issue::new("1", "PROJ-1", "Fix", "https://example.com", "linear");
+
+        let result = notifier
+            .notify_merged(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_closed_disabled() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let issue = Issue::new("1", "PROJ-1", "Fix", "https://example.com", "linear");
+
+        let result = notifier
+            .notify_closed(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // --- Tests for PushoverMessage truncation ---
+
+    #[test]
+    fn test_pushover_message_long_message_truncation() {
+        // When a PushoverMessage is constructed with a message > 1000 chars,
+        // the send_push method truncates it. Test the truncation logic directly.
+        let long_msg = "x".repeat(1500);
+        let truncated = if long_msg.len() > 1000 {
+            format!("{}...", &long_msg[..long_msg.floor_char_boundary(997)])
+        } else {
+            long_msg.clone()
+        };
+        assert!(truncated.len() <= 1000);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn test_pushover_message_short_message_not_truncated() {
+        let short_msg = "Hello world";
+        let truncated = if short_msg.len() > 1000 {
+            format!("{}...", &short_msg[..short_msg.floor_char_boundary(997)])
+        } else {
+            short_msg.to_string()
+        };
+        assert_eq!(truncated, "Hello world");
+    }
+
+    // --- Tests for resolve_user_key with user not found in registry ---
+
+    #[test]
+    fn test_resolve_user_key_unknown_user_falls_back() {
+        let config = PushConfig {
+            api_token: Some("token".to_string()),
+            user_key: Some("global-key".to_string()),
+            device: None,
+            priority: None,
+        };
+        let notifier = PushNotifier::new(config, empty_registry());
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "nonexistent_user");
+        // Unknown user slug falls back to global config key
+        assert_eq!(
+            notifier.resolve_user_key(Some(&issue)),
+            Some("global-key".to_string())
+        );
+    }
+
+    // --- Test notify_urgent_issues with multiple sources (disabled) ---
+
+    #[tokio::test]
+    async fn test_notify_urgent_issues_multiple_sources_disabled() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let issues = vec![
+            Issue::new("1", "LIN-1", "Linear Bug", "https://linear.app/1", "linear"),
+            Issue::new(
+                "2",
+                "SEN-1",
+                "Sentry Error",
+                "https://sentry.io/1",
+                "sentry",
+            ),
+            Issue::new(
+                "3",
+                "GH-1",
+                "GitHub Issue",
+                "https://github.com/1",
+                "github",
+            ),
+            Issue::new("4", "JIRA-1", "Jira Ticket", "https://jira.com/1", "jira"),
+            Issue::new("5", "X-1", "Custom", "https://example.com", "custom"),
+            Issue::new("6", "X-2", "Extra", "https://example.com", "custom"),
+        ];
+
+        let result = notifier.notify_urgent_issues(&issues).await;
+        assert!(result.is_ok());
     }
 }

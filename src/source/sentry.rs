@@ -3895,4 +3895,555 @@ mod tests {
 
         assert!(calculate_escalation_rate(&issue).is_none());
     }
+
+    #[test]
+    fn test_source_name_and_display_name() {
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, MockSentryClient::new());
+        assert_eq!(source.name(), "sentry");
+        assert_eq!(source.display_name(), "Sentry");
+    }
+
+    #[test]
+    fn test_is_terminal_status_resolved() {
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, MockSentryClient::new());
+        assert!(source.is_terminal_status("resolved"));
+    }
+
+    #[test]
+    fn test_is_terminal_status_ignored() {
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, MockSentryClient::new());
+        assert!(source.is_terminal_status("ignored"));
+    }
+
+    #[test]
+    fn test_is_terminal_status_unresolved_is_not_terminal() {
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, MockSentryClient::new());
+        assert!(!source.is_terminal_status("unresolved"));
+        assert!(!source.is_terminal_status(""));
+    }
+
+    #[test]
+    fn test_is_issue_resolved_case_insensitive() {
+        assert!(SentrySource::<MockSentryClient>::is_issue_resolved(
+            "Resolved"
+        ));
+        assert!(SentrySource::<MockSentryClient>::is_issue_resolved(
+            "IGNORED"
+        ));
+        assert!(SentrySource::<MockSentryClient>::is_issue_resolved(
+            "RESOLVED"
+        ));
+        assert!(!SentrySource::<MockSentryClient>::is_issue_resolved(
+            "Unresolved"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_returns_status_string() {
+        let config = test_config();
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/12345/",
+            200,
+            r#"{
+                "id": "12345",
+                "shortId": "SENTRY-123",
+                "title": "Test Error",
+                "culprit": "src/app.js",
+                "permalink": "https://sentry.io/issues/12345",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "100",
+                "userCount": 50,
+                "project": {"name": "Frontend", "slug": "frontend"},
+                "status": "unresolved",
+                "level": "error",
+                "metadata": {"type": "TypeError", "value": "undefined is not a function"},
+                "statusDetails": {},
+                "isEscalating": false
+            }"#,
+        );
+        let source = SentrySource::with_http_client(config, mock);
+        let status = source.get_issue_status("12345").await.unwrap();
+        // The issue is "unresolved" -> IssueStatus::Open -> "open"
+        assert_eq!(status, "open");
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_event_404_still_returns_context() {
+        let config = test_config();
+        let mock = MockSentryClient::new();
+        // Don't mock the event endpoint, so it returns 404
+        let source = SentrySource::with_http_client(config, mock);
+
+        let mut issue = Issue::new(
+            "12345",
+            "SENTRY-123",
+            "Test Error",
+            "https://sentry.io/issue/12345",
+            "sentry",
+        );
+        issue.set_metadata("level", "error");
+        issue.set_metadata("event_count", 42i64);
+        issue.set_metadata("user_count", 10i64);
+        issue.set_metadata("project", "test-project");
+        issue.set_metadata("culprit", "src/main.rs");
+        issue.set_metadata("error_type", "TypeError");
+        issue.set_metadata("error_value", "undefined is not a function");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+        // Should still contain the metadata context even though event fetch failed
+        assert!(context.contains("# Sentry Issue: SENTRY-123"));
+        assert!(context.contains("**Level:** error"));
+        assert!(context.contains("**Event Count:** 42"));
+        assert!(context.contains("**Culprit:** src/main.rs"));
+        assert!(context.contains("## Error Details"));
+        assert!(context.contains("TypeError"));
+        // Should NOT contain stack trace since event fetch failed
+        assert!(!context.contains("## Stack Trace"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_with_event() {
+        let config = test_config();
+        let mock = MockSentryClient::new();
+        let event_json = serde_json::json!({
+            "tags": [
+                { "key": "browser", "value": "Chrome" },
+                { "key": "os", "value": "Linux" }
+            ],
+            "entries": [
+                {
+                    "type": "exception",
+                    "data": {
+                        "values": [
+                            {
+                                "type": "TypeError",
+                                "value": "cannot read property",
+                                "stacktrace": {
+                                    "frames": [
+                                        {
+                                            "function": "main",
+                                            "filename": "src/main.rs",
+                                            "lineNo": 42,
+                                            "colNo": 5
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/12345/events/latest/",
+            200,
+            &event_json.to_string(),
+        );
+        let source = SentrySource::with_http_client(config, mock);
+
+        let mut issue = Issue::new("12345", "SENTRY-123", "Test Error", "url", "sentry");
+        issue.set_metadata("level", "error");
+        issue.set_metadata("event_count", 42i64);
+        issue.set_metadata("project", "test-project");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+        assert!(context.contains("## Stack Trace"));
+        assert!(context.contains("TypeError: cannot read property"));
+        assert!(context.contains("main"));
+        assert!(context.contains("src/main.rs"));
+        assert!(context.contains("## Tags"));
+        assert!(context.contains("browser"));
+        assert!(context.contains("Chrome"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_no_culprit() {
+        let mut issue = Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        issue.set_metadata("level", "error");
+        issue.set_metadata("event_count", 100i64);
+        issue.set_metadata("project", "test");
+        // No culprit set
+        let context = format_sentry_context(&issue);
+        assert!(!context.contains("**Culprit:**"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_empty_culprit() {
+        let mut issue = Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        issue.set_metadata("level", "error");
+        issue.set_metadata("culprit", "");
+        let context = format_sentry_context(&issue);
+        assert!(!context.contains("**Culprit:**"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_with_error_type_only() {
+        let mut issue = Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        issue.set_metadata("error_type", "ValueError");
+        // No error_value
+        let context = format_sentry_context(&issue);
+        assert!(context.contains("## Error Details"));
+        assert!(context.contains("- **Type:** ValueError"));
+        assert!(!context.contains("- **Value:**"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_with_error_value_only() {
+        let mut issue = Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        issue.set_metadata("error_value", "something went wrong");
+        // No error_type
+        let context = format_sentry_context(&issue);
+        assert!(context.contains("## Error Details"));
+        assert!(!context.contains("- **Type:**"));
+        assert!(context.contains("- **Value:** something went wrong"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_with_filename_and_function() {
+        let mut issue = Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        issue.set_metadata("error_type", "RuntimeError");
+        issue.set_metadata("error_value", "oops");
+        issue.set_metadata("filename", "src/app.py");
+        issue.set_metadata("function", "handle_request");
+        let context = format_sentry_context(&issue);
+        assert!(context.contains("- **File:** src/app.py"));
+        assert!(context.contains("- **Function:** handle_request"));
+    }
+
+    #[test]
+    fn test_format_sentry_context_no_error_details() {
+        let issue = Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        let context = format_sentry_context(&issue);
+        assert!(!context.contains("## Error Details"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_no_entries() {
+        let event = SentryEvent {
+            tags: Some(vec![SentryTag {
+                key: "env".to_string(),
+                value: "prod".to_string(),
+            }]),
+            entries: None,
+        };
+        let context = format_sentry_event_context(&event);
+        assert!(!context.contains("## Stack Trace"));
+        assert!(context.contains("## Tags"));
+        assert!(context.contains("**env:** prod"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_no_tags() {
+        let event = SentryEvent {
+            tags: None,
+            entries: None,
+        };
+        let context = format_sentry_event_context(&event);
+        assert!(!context.contains("## Tags"));
+        assert!(context.is_empty());
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_only_request_entry() {
+        let event = SentryEvent {
+            tags: None,
+            entries: Some(vec![SentryEntry {
+                entry_type: "request".to_string(),
+                data: serde_json::json!({}),
+            }]),
+        };
+        let context = format_sentry_event_context(&event);
+        assert!(!context.contains("## Stack Trace"));
+    }
+
+    #[test]
+    fn test_format_sentry_event_context_exception_without_stacktrace() {
+        let event = SentryEvent {
+            tags: None,
+            entries: Some(vec![SentryEntry {
+                entry_type: "exception".to_string(),
+                data: serde_json::json!({
+                    "values": [{
+                        "type": "Error",
+                        "value": "test error"
+                    }]
+                }),
+            }]),
+        };
+        let context = format_sentry_event_context(&event);
+        assert!(context.contains("## Stack Trace"));
+        assert!(context.contains("Error: test error"));
+        // No frame output
+        assert!(!context.contains("at "));
+    }
+
+    #[test]
+    fn test_matches_criteria_no_escalation_low_priority() {
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, MockSentryClient::new());
+
+        let mut issue = Issue::new("1", "SENTRY-1", "Warning Issue", "url", "sentry");
+        issue.priority = IssuePriority::Low;
+        issue.status = IssueStatus::Open;
+        issue.set_metadata("event_count", 500i64);
+        issue.set_metadata("is_escalating", false);
+        // No escalation_rate metadata set
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Normal);
+    }
+
+    #[test]
+    fn test_matches_criteria_escalation_rate_below_threshold() {
+        let mut config = test_config();
+        config.escalation_threshold_percent = 50;
+        let source = SentrySource::with_http_client(config, MockSentryClient::new());
+
+        let mut issue = Issue::new("1", "SENTRY-1", "Moderate Issue", "url", "sentry");
+        issue.priority = IssuePriority::Low;
+        issue.status = IssueStatus::Open;
+        issue.set_metadata("event_count", 500i64);
+        issue.set_metadata("is_escalating", false);
+        issue.set_metadata("escalation_rate", 20.0f64); // below threshold of 50%
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Normal);
+    }
+
+    #[test]
+    fn test_matches_criteria_high_priority_with_escalation_rate() {
+        let mut config = test_config();
+        config.escalation_threshold_percent = 50;
+        let source = SentrySource::with_http_client(config, MockSentryClient::new());
+
+        let mut issue = Issue::new("1", "SENTRY-1", "High Priority Issue", "url", "sentry");
+        issue.priority = IssuePriority::High;
+        issue.status = IssueStatus::Open;
+        issue.set_metadata("event_count", 500i64);
+        issue.set_metadata("is_escalating", false);
+        issue.set_metadata("escalation_rate", 20.0f64); // below threshold
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::High);
+    }
+
+    #[test]
+    fn test_matches_criteria_critical_priority_no_escalation_data() {
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, MockSentryClient::new());
+
+        let mut issue = Issue::new("1", "SENTRY-1", "Critical Issue", "url", "sentry");
+        issue.priority = IssuePriority::Critical;
+        issue.status = IssueStatus::Open;
+        issue.set_metadata("event_count", 500i64);
+        issue.set_metadata("is_escalating", false);
+        // No escalation_rate
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::High);
+    }
+
+    #[test]
+    fn test_calculate_escalation_rate_first_half_zero_second_positive() {
+        let issue = SentryApiIssue {
+            id: "100".to_string(),
+            short_id: "TEST-100".to_string(),
+            title: "Test".to_string(),
+            culprit: None,
+            permalink: "url".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "100".to_string(),
+            user_count: None,
+            project: SentryProject {
+                name: "Test".to_string(),
+                slug: "test".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "error".to_string(),
+            is_unhandled: None,
+            metadata: None,
+            stats: Some(SentryStats {
+                last_24h: Some(vec![(0, 0), (1, 0), (2, 5), (3, 10)]),
+            }),
+        };
+        let rate = calculate_escalation_rate(&issue).unwrap();
+        assert_eq!(rate, 100.0);
+    }
+
+    #[test]
+    fn test_calculate_escalation_rate_all_zeros_returns_zero() {
+        let issue = SentryApiIssue {
+            id: "101".to_string(),
+            short_id: "TEST-101".to_string(),
+            title: "Test".to_string(),
+            culprit: None,
+            permalink: "url".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "0".to_string(),
+            user_count: None,
+            project: SentryProject {
+                name: "Test".to_string(),
+                slug: "test".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "error".to_string(),
+            is_unhandled: None,
+            metadata: None,
+            stats: Some(SentryStats {
+                last_24h: Some(vec![(0, 0), (1, 0), (2, 0), (3, 0)]),
+            }),
+        };
+        let rate = calculate_escalation_rate(&issue).unwrap();
+        assert_eq!(rate, 0.0);
+    }
+
+    #[test]
+    fn test_map_issue_with_escalating_flag() {
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, MockSentryClient::new());
+
+        // Set up escalating IDs
+        {
+            let mut ids = source.escalating_issue_ids.write().unwrap();
+            ids.insert("esc-1".to_string());
+        }
+
+        let api_issue = SentryApiIssue {
+            id: "esc-1".to_string(),
+            short_id: "ESC-1".to_string(),
+            title: "Escalating Issue".to_string(),
+            culprit: Some("handler.py".to_string()),
+            permalink: "https://sentry.io/issue/esc-1".to_string(),
+            first_seen: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: "2024-01-02T00:00:00Z".to_string(),
+            count: "5000".to_string(),
+            user_count: Some(200),
+            project: SentryProject {
+                name: "Backend".to_string(),
+                slug: "backend".to_string(),
+            },
+            status: "unresolved".to_string(),
+            level: "error".to_string(),
+            is_unhandled: Some(true),
+            metadata: Some(SentryMetadata {
+                error_type: Some("ValueError".to_string()),
+                value: Some("invalid input".to_string()),
+                filename: Some("src/handler.py".to_string()),
+                function: Some("process".to_string()),
+            }),
+            stats: None,
+        };
+
+        let issue = source.map_issue(api_issue);
+        assert_eq!(issue.get_metadata::<bool>("is_escalating"), Some(true));
+        assert_eq!(issue.get_metadata::<bool>("is_unhandled"), Some(true));
+        assert_eq!(issue.get_metadata::<i64>("user_count"), Some(200));
+        assert_eq!(
+            issue.get_metadata::<String>("error_type"),
+            Some("ValueError".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("filename"),
+            Some("src/handler.py".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("function"),
+            Some("process".to_string())
+        );
+    }
+
+    #[test]
+    fn test_reqwest_sentry_client_default() {
+        let client = ReqwestSentryClient::default();
+        assert!(std::mem::size_of_val(&client) > 0);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_dedup_and_escalating_tracking() {
+        let config = test_config();
+        let mock = MockSentryClient::new();
+
+        // Escalating endpoint returns one issue
+        let escalating_issue = serde_json::json!([
+            {
+                "id": "dup-1",
+                "shortId": "DUP-1",
+                "title": "Duplicate Issue",
+                "culprit": null,
+                "permalink": "url",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "100",
+                "userCount": null,
+                "project": { "name": "Test", "slug": "test" },
+                "status": "unresolved",
+                "level": "error",
+                "isUnhandled": null,
+                "metadata": null,
+                "stats": null
+            }
+        ]);
+        mock.mock_get(
+            &format!(
+                "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=date&limit=100",
+                config.org_slug,
+                urlencoding::encode("is:unresolved is:escalating")
+            ),
+            200,
+            &escalating_issue.to_string(),
+        );
+
+        // Top issues endpoint returns the same issue (duplicate)
+        let top_issues = serde_json::json!([
+            {
+                "id": "dup-1",
+                "shortId": "DUP-1",
+                "title": "Duplicate Issue",
+                "culprit": null,
+                "permalink": "url",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "100",
+                "userCount": null,
+                "project": { "name": "Test", "slug": "test" },
+                "status": "unresolved",
+                "level": "error",
+                "isUnhandled": null,
+                "metadata": null,
+                "stats": null
+            }
+        ]);
+        mock.mock_get(
+            &format!(
+                "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=freq&limit={}&statsPeriod={}",
+                config.org_slug,
+                urlencoding::encode("is:unresolved"),
+                config.top_issues_count,
+                config.top_issues_period.to_stats_period()
+            ),
+            200,
+            &top_issues.to_string(),
+        );
+
+        let source = SentrySource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        // Should be deduped to 1 issue
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "dup-1");
+        // The issue should be marked as escalating
+        assert_eq!(issues[0].get_metadata::<bool>("is_escalating"), Some(true));
+    }
 }

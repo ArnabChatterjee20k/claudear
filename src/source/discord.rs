@@ -42,9 +42,49 @@ impl DiscordSource {
             .or(self.config.channel_id.as_deref())
     }
 
-    /// Check if a message is from a bot.
+    /// Check if a message is from a bot (excludes webhook messages, which
+    /// appear as bot-authored but are user-triggered via webhook URLs).
     fn is_bot_message(msg: &DiscordMessage) -> bool {
+        if msg.webhook_id.is_some() {
+            return false;
+        }
         msg.author.as_ref().is_some_and(|a| a.bot)
+    }
+
+    /// Check if a message is one of our own notifications (e.g. ask questions,
+    /// success/failure alerts). These are sent via webhook and should not be
+    /// treated as new issues.
+    fn is_own_notification(msg: &DiscordMessage) -> bool {
+        // Ask question messages have an embed with "Input needed:" title.
+        if msg.embeds.iter().any(|e| {
+            e.title
+                .as_ref()
+                .is_some_and(|t| t.contains("Input needed:"))
+        }) {
+            return true;
+        }
+        // Webhook messages with Claudear embeds are our notifications.
+        // Their text content is either empty or only user mentions (<@123>).
+        if msg.webhook_id.is_some() {
+            let stripped = Self::strip_mentions(&msg.content);
+            if stripped.trim().is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Strip Discord user mentions (<@123>, <@!123>) from text.
+    fn strip_mentions(content: &str) -> String {
+        let mut result = content.to_string();
+        while let Some(start) = result.find("<@") {
+            if let Some(end) = result[start..].find('>') {
+                result.replace_range(start..start + end + 1, "");
+            } else {
+                break;
+            }
+        }
+        result
     }
 
     /// Extract a title from message content (first line, max 100 chars).
@@ -150,10 +190,11 @@ impl IssueSource for DiscordSource {
                     *lock = Some(latest.id.clone());
                 }
 
-                // Filter out bot messages and empty content, convert to issues
+                // Filter out bot messages, our own notifications, and empty content
                 let issues: Vec<Issue> = messages
                     .iter()
                     .filter(|msg| !Self::is_bot_message(msg))
+                    .filter(|msg| !Self::is_own_notification(msg))
                     .filter(|msg| !msg.content.trim().is_empty())
                     .map(|msg| self.message_to_issue(msg))
                     .collect();
@@ -192,8 +233,83 @@ impl IssueSource for DiscordSource {
         Ok(context)
     }
 
+    async fn create_issue(
+        &self,
+        title: &str,
+        description: &str,
+        _labels: &[String],
+    ) -> Result<Issue> {
+        let channel_id = self
+            .listen_channel_id()
+            .ok_or_else(|| Error::config("Discord channel_id is required to create an issue"))?
+            .to_string();
+
+        let content = if description.is_empty() {
+            title.to_string()
+        } else {
+            format!("{}\n\n{}", title, description)
+        };
+
+        // Prefer webhook URL: messages posted via webhook have webhook_id set,
+        // which bypasses the is_bot_message filter. This makes them appear as
+        // user-posted messages to the daemon's poll_issues.
+        if let Some(ref webhook_url) = self.config.webhook_url {
+            let url = format!("{}?wait=true", webhook_url);
+            let http = reqwest::Client::new();
+            let resp = http
+                .post(&url)
+                .json(&serde_json::json!({ "content": content }))
+                .send()
+                .await
+                .map_err(|e| Error::Other(format!("Failed to post Discord webhook: {}", e)))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Error::Other(format!(
+                    "Discord webhook returned {}: {}",
+                    status, body
+                )));
+            }
+
+            let msg: crate::discord::DiscordMessage = resp.json().await.map_err(|e| {
+                Error::Other(format!("Failed to parse Discord webhook response: {}", e))
+            })?;
+
+            return Ok(self.message_to_issue(&msg));
+        }
+
+        // Fallback: use bot token to send message directly.
+        let client = self.client.as_ref().ok_or_else(|| {
+            Error::config("Discord bot_token or webhook_url is required to create an issue")
+        })?;
+
+        let params = crate::discord::CreateMessageParams::text(content);
+        let msg = client
+            .send_message(&channel_id, params)
+            .await
+            .map_err(|e| Error::Other(format!("Failed to create Discord issue: {}", e)))?;
+
+        Ok(self.message_to_issue(&msg))
+    }
+
     async fn get_issue(&self, issue_id: &str) -> Result<Issue> {
-        Err(Error::issue_not_found("discord", issue_id))
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| Error::config("Discord bot_token is required to fetch an issue"))?;
+
+        let channel_id = self
+            .listen_channel_id()
+            .ok_or_else(|| Error::config("Discord channel_id is required to fetch an issue"))?
+            .to_string();
+
+        let msg = client
+            .get_message(&channel_id, issue_id)
+            .await
+            .map_err(|_| Error::issue_not_found("discord", issue_id))?;
+
+        Ok(self.message_to_issue(&msg))
     }
 }
 
@@ -228,6 +344,8 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_reference: None,
             thread: None,
+            webhook_id: None,
+            embeds: vec![],
         }
     }
 
@@ -264,11 +382,17 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             message_reference: None,
             thread: None,
+            webhook_id: None,
+            embeds: vec![],
         };
+        // Webhook messages have author.bot=true but should NOT be filtered
+        let mut webhook_msg = make_message("4", "hello", true);
+        webhook_msg.webhook_id = Some("wh-123".to_string());
 
         assert!(DiscordSource::is_bot_message(&bot_msg));
         assert!(!DiscordSource::is_bot_message(&human_msg));
         assert!(!DiscordSource::is_bot_message(&no_author));
+        assert!(!DiscordSource::is_bot_message(&webhook_msg));
     }
 
     #[test]
@@ -368,8 +492,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_issue_returns_not_found() {
-        let source = DiscordSource::new(make_config());
+    async fn test_get_issue_no_client_returns_error() {
+        let mut config = make_config();
+        config.bot_token = None;
+        let source = DiscordSource::new(config);
         let result = source.get_issue("123").await;
         assert!(result.is_err());
     }

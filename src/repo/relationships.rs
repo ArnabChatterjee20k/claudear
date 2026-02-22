@@ -49,7 +49,7 @@ pub struct Repository {
     /// Local filesystem path (if available).
     pub path: Option<String>,
     /// GitHub URL (owner/repo format or full URL).
-    pub github_url: Option<String>,
+    pub scm_url: Option<String>,
     /// When this repository was added.
     pub created_at: DateTime<Utc>,
 }
@@ -60,7 +60,7 @@ impl Repository {
         Self {
             name: name.into(),
             path: None,
-            github_url: None,
+            scm_url: None,
             created_at: Utc::now(),
         }
     }
@@ -72,8 +72,8 @@ impl Repository {
     }
 
     /// Set the GitHub URL.
-    pub fn with_github_url(mut self, url: impl Into<String>) -> Self {
-        self.github_url = Some(url.into());
+    pub fn with_scm_url(mut self, url: impl Into<String>) -> Self {
+        self.scm_url = Some(url.into());
         self
     }
 }
@@ -388,18 +388,17 @@ impl RepoRelationships {
     pub fn seed_appwrite_defaults(&mut self) {
         // Add repositories
         self.graph
-            .add_repository(Repository::new("cloud").with_github_url("appwrite/cloud"));
+            .add_repository(Repository::new("cloud").with_scm_url("appwrite/cloud"));
         self.graph
-            .add_repository(Repository::new("appwrite").with_github_url("appwrite/appwrite"));
+            .add_repository(Repository::new("appwrite").with_scm_url("appwrite/appwrite"));
         self.graph
-            .add_repository(Repository::new("utopia-php").with_github_url("utopia-php/utopia-php"));
-        self.graph.add_repository(
-            Repository::new("utopia-database").with_github_url("utopia-php/database"),
-        );
+            .add_repository(Repository::new("utopia-php").with_scm_url("utopia-php/utopia-php"));
         self.graph
-            .add_repository(Repository::new("utopia-http").with_github_url("utopia-php/http"));
+            .add_repository(Repository::new("utopia-database").with_scm_url("utopia-php/database"));
         self.graph
-            .add_repository(Repository::new("utopia-cache").with_github_url("utopia-php/cache"));
+            .add_repository(Repository::new("utopia-http").with_scm_url("utopia-php/http"));
+        self.graph
+            .add_repository(Repository::new("utopia-cache").with_scm_url("utopia-php/cache"));
 
         // Add dependencies: upstream -> downstream (upstream is depended upon)
         // cloud depends on appwrite (appwrite is upstream, cloud is downstream)
@@ -449,11 +448,11 @@ impl RepoRelationships {
         // Ensure both repos exist in the graph
         if self.graph.get_repository(upstream).is_none() {
             self.graph
-                .add_repository(Repository::new(upstream).with_github_url(upstream));
+                .add_repository(Repository::new(upstream).with_scm_url(upstream));
         }
         if self.graph.get_repository(downstream).is_none() {
             self.graph
-                .add_repository(Repository::new(downstream).with_github_url(downstream));
+                .add_repository(Repository::new(downstream).with_scm_url(downstream));
         }
 
         let dep = Dependency {
@@ -698,10 +697,10 @@ mod tests {
     }
 
     #[test]
-    fn test_repository_with_github_url() {
-        let repo = Repository::new("my-repo").with_github_url("https://github.com/org/repo");
+    fn test_repository_with_scm_url() {
+        let repo = Repository::new("my-repo").with_scm_url("https://github.com/org/repo");
         assert_eq!(
-            repo.github_url,
+            repo.scm_url,
             Some("https://github.com/org/repo".to_string())
         );
     }
@@ -882,7 +881,7 @@ mod tests {
     fn test_repository_serialization() {
         let repo = Repository::new("my-repo")
             .with_path("/path")
-            .with_github_url("https://github.com/org/repo");
+            .with_scm_url("https://github.com/org/repo");
 
         let json = serde_json::to_string(&repo).unwrap();
         assert!(json.contains("my-repo"));
@@ -1062,5 +1061,675 @@ mod tests {
             defaults.list_repositories().len(),
             appwrite.list_repositories().len()
         );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  DependencyType::parse - case insensitivity
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_dependency_type_parse_case_insensitive() {
+        assert_eq!(DependencyType::parse("NPM"), Some(DependencyType::Npm));
+        assert_eq!(DependencyType::parse("Npm"), Some(DependencyType::Npm));
+        assert_eq!(
+            DependencyType::parse("COMPOSER"),
+            Some(DependencyType::Composer)
+        );
+        assert_eq!(
+            DependencyType::parse("Composer"),
+            Some(DependencyType::Composer)
+        );
+        assert_eq!(
+            DependencyType::parse("MANUAL"),
+            Some(DependencyType::Manual)
+        );
+        assert_eq!(
+            DependencyType::parse("GIT_SUBMODULE"),
+            Some(DependencyType::GitSubmodule)
+        );
+        assert_eq!(
+            DependencyType::parse("SUBMODULE"),
+            Some(DependencyType::GitSubmodule)
+        );
+        assert_eq!(
+            DependencyType::parse("Submodule"),
+            Some(DependencyType::GitSubmodule)
+        );
+    }
+
+    #[test]
+    fn test_dependency_type_parse_empty_string() {
+        assert_eq!(DependencyType::parse(""), None);
+    }
+
+    #[test]
+    fn test_dependency_type_parse_whitespace() {
+        // Whitespace is not trimmed, so it should not match
+        assert_eq!(DependencyType::parse(" npm "), None);
+        assert_eq!(DependencyType::parse(" npm"), None);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  DependencyType round-trip: parse(as_str()) == identity
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_dependency_type_round_trip() {
+        let variants = [
+            DependencyType::Npm,
+            DependencyType::Composer,
+            DependencyType::GitSubmodule,
+            DependencyType::Manual,
+        ];
+        for variant in variants {
+            let s = variant.as_str();
+            let parsed = DependencyType::parse(s);
+            assert_eq!(parsed, Some(variant), "round-trip failed for {:?}", variant);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  get_first_hop_dependency_type - with actual deps
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_first_hop_dependency_type_with_deps() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("lib"));
+        graph.add_repository(Repository::new("app"));
+
+        graph.add_dependency(Dependency {
+            upstream: "lib".to_string(),
+            downstream: "app".to_string(),
+            dep_type: DependencyType::Composer,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+
+        assert_eq!(
+            graph.get_first_hop_dependency_type("lib"),
+            Some(DependencyType::Composer)
+        );
+        // "app" has no downstream deps
+        assert_eq!(graph.get_first_hop_dependency_type("app"), None);
+    }
+
+    #[test]
+    fn test_get_first_hop_dependency_type_multiple_deps_returns_first() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("lib"));
+        graph.add_repository(Repository::new("app1"));
+        graph.add_repository(Repository::new("app2"));
+
+        graph.add_dependency(Dependency {
+            upstream: "lib".to_string(),
+            downstream: "app1".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+        graph.add_dependency(Dependency {
+            upstream: "lib".to_string(),
+            downstream: "app2".to_string(),
+            dep_type: DependencyType::Composer,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+
+        // Should return the first dependency's type
+        assert_eq!(
+            graph.get_first_hop_dependency_type("lib"),
+            Some(DependencyType::Npm)
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  get_first_hop_dependency_type_to_target - edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_first_hop_dependency_type_to_target_same_repo() {
+        let graph = DependencyGraph::new();
+        assert_eq!(
+            graph.get_first_hop_dependency_type_to_target("a", "a"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_get_first_hop_dependency_type_to_target_direct_dep() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("lib"));
+        graph.add_repository(Repository::new("app"));
+
+        graph.add_dependency(Dependency {
+            upstream: "lib".to_string(),
+            downstream: "app".to_string(),
+            dep_type: DependencyType::GitSubmodule,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+
+        assert_eq!(
+            graph.get_first_hop_dependency_type_to_target("lib", "app"),
+            Some(DependencyType::GitSubmodule)
+        );
+    }
+
+    #[test]
+    fn test_get_first_hop_dependency_type_to_target_no_path() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("a"));
+        graph.add_repository(Repository::new("b"));
+        // No dependency between them
+        assert_eq!(
+            graph.get_first_hop_dependency_type_to_target("a", "b"),
+            None
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  to_string_tree - indentation and formatting
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_to_string_tree_indentation() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("root"));
+        graph.add_repository(Repository::new("child"));
+        graph.add_repository(Repository::new("grandchild"));
+
+        graph.add_dependency(Dependency {
+            upstream: "root".to_string(),
+            downstream: "child".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+        graph.add_dependency(Dependency {
+            upstream: "child".to_string(),
+            downstream: "grandchild".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+
+        let tree = graph.to_string_tree(Some("root"));
+        let lines: Vec<&str> = tree.lines().collect();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "root");
+        assert_eq!(lines[1], "  child");
+        assert_eq!(lines[2], "    grandchild");
+    }
+
+    #[test]
+    fn test_to_string_tree_no_root_empty_graph() {
+        let graph = DependencyGraph::new();
+        let tree = graph.to_string_tree(None);
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_to_string_tree_nonexistent_root() {
+        let graph = DependencyGraph::new();
+        let tree = graph.to_string_tree(Some("nonexistent"));
+        // Should still print the name even if the repo isn't in the graph
+        assert!(tree.contains("nonexistent"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  depends_on - more edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_depends_on_nonexistent_repos() {
+        let graph = DependencyGraph::new();
+        assert!(!graph.depends_on("a", "b"));
+    }
+
+    #[test]
+    fn test_depends_on_cycle_does_not_loop_forever() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("a"));
+        graph.add_repository(Repository::new("b"));
+        graph.add_repository(Repository::new("c"));
+
+        // Create a cycle: a -> b -> c -> a
+        graph.add_dependency(Dependency {
+            upstream: "a".to_string(),
+            downstream: "b".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+        graph.add_dependency(Dependency {
+            upstream: "b".to_string(),
+            downstream: "c".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+        graph.add_dependency(Dependency {
+            upstream: "c".to_string(),
+            downstream: "a".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+
+        // c depends on a via cycle: c depends on a directly
+        assert!(graph.depends_on("c", "a"));
+        // b depends on a transitively
+        assert!(graph.depends_on("b", "a"));
+        // a depends on c transitively (through the cycle)
+        assert!(graph.depends_on("a", "c"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  get_all_dependants - edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_all_dependants_no_dependants() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("standalone"));
+        let result = graph.get_all_dependants("standalone");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_dependants_nonexistent_repo() {
+        let graph = DependencyGraph::new();
+        let result = graph.get_all_dependants("nonexistent");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_dependants_with_cycle() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("a"));
+        graph.add_repository(Repository::new("b"));
+        graph.add_repository(Repository::new("c"));
+
+        graph.add_dependency(Dependency {
+            upstream: "a".to_string(),
+            downstream: "b".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+        graph.add_dependency(Dependency {
+            upstream: "b".to_string(),
+            downstream: "c".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+        graph.add_dependency(Dependency {
+            upstream: "c".to_string(),
+            downstream: "a".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+
+        // Should not loop forever and should collect b and c
+        let result = graph.get_all_dependants("a");
+        let names: Vec<_> = result.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  CascadingChange - more field coverage
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cascading_change_with_pr_url_and_completed() {
+        let change = CascadingChange {
+            trigger_repo: "lib".to_string(),
+            target_repo: "app".to_string(),
+            change_type: CascadeChangeType::CodeChange,
+            status: CascadeStatus::Completed,
+            pr_url: Some("https://github.com/org/repo/pull/42".to_string()),
+            created_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+        };
+
+        assert_eq!(change.change_type, CascadeChangeType::CodeChange);
+        assert_eq!(change.status, CascadeStatus::Completed);
+        assert!(change.pr_url.is_some());
+        assert!(change.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_cascading_change_serialization() {
+        let change = CascadingChange {
+            trigger_repo: "lib".to_string(),
+            target_repo: "app".to_string(),
+            change_type: CascadeChangeType::TestUpdate,
+            status: CascadeStatus::InProgress,
+            pr_url: None,
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let json = serde_json::to_string(&change).unwrap();
+        assert!(json.contains("TestUpdate"));
+        assert!(json.contains("InProgress"));
+        assert!(json.contains("lib"));
+        assert!(json.contains("app"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Repository builder chaining
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_repository_chaining_all_fields() {
+        let repo = Repository::new("my-repo")
+            .with_path("/local/path")
+            .with_scm_url("https://github.com/org/repo");
+
+        assert_eq!(repo.name, "my-repo");
+        assert_eq!(repo.path, Some("/local/path".to_string()));
+        assert_eq!(
+            repo.scm_url,
+            Some("https://github.com/org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_repository_default_fields() {
+        let repo = Repository::new("bare-repo");
+        assert_eq!(repo.name, "bare-repo");
+        assert!(repo.path.is_none());
+        assert!(repo.scm_url.is_none());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  DependencyGraph::repositories iterator
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_dependency_graph_repositories_iterator() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("a"));
+        graph.add_repository(Repository::new("b"));
+        graph.add_repository(Repository::new("c"));
+
+        let mut names: Vec<_> = graph.repositories().map(|r| r.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_dependency_graph_add_repository_overwrites() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("repo").with_path("/old"));
+        graph.add_repository(Repository::new("repo").with_path("/new"));
+
+        let repo = graph.get_repository("repo").unwrap();
+        assert_eq!(repo.path, Some("/new".to_string()));
+        assert_eq!(graph.repositories().count(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  RepoRelationships::get_cascade_changes status and type
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cascade_changes_all_pending_version_bump() {
+        let mut manager = RepoRelationships::new();
+        manager.add_repository(Repository::new("core"));
+        manager.add_repository(Repository::new("svc1"));
+        manager.add_repository(Repository::new("svc2"));
+        manager.add_repository(Repository::new("svc3"));
+
+        for svc in &["svc1", "svc2", "svc3"] {
+            manager
+                .add_dependency("core", svc, DependencyType::Npm, None)
+                .unwrap();
+        }
+
+        let changes = manager.get_cascade_changes("core");
+        assert_eq!(changes.len(), 3);
+        for change in &changes {
+            assert_eq!(change.trigger_repo, "core");
+            assert_eq!(change.change_type, CascadeChangeType::VersionBump);
+            assert_eq!(change.status, CascadeStatus::Pending);
+            assert!(change.pr_url.is_none());
+            assert!(change.completed_at.is_none());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Dependency deserialization
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_dependency_deserialization_roundtrip() {
+        let dep = Dependency {
+            upstream: "lib".to_string(),
+            downstream: "app".to_string(),
+            dep_type: DependencyType::GitSubmodule,
+            version_pattern: Some("~2.0".to_string()),
+            created_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&dep).unwrap();
+        let deserialized: Dependency = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.upstream, "lib");
+        assert_eq!(deserialized.downstream, "app");
+        assert_eq!(deserialized.dep_type, DependencyType::GitSubmodule);
+        assert_eq!(deserialized.version_pattern, Some("~2.0".to_string()));
+    }
+
+    #[test]
+    fn test_repository_deserialization_roundtrip() {
+        let repo = Repository::new("test-repo")
+            .with_path("/some/path")
+            .with_scm_url("https://github.com/org/repo");
+
+        let json = serde_json::to_string(&repo).unwrap();
+        let deserialized: Repository = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.name, "test-repo");
+        assert_eq!(deserialized.path, Some("/some/path".to_string()));
+        assert_eq!(
+            deserialized.scm_url,
+            Some("https://github.com/org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cascading_change_deserialization_roundtrip() {
+        let change = CascadingChange {
+            trigger_repo: "upstream".to_string(),
+            target_repo: "downstream".to_string(),
+            change_type: CascadeChangeType::TestUpdate,
+            status: CascadeStatus::Failed,
+            pr_url: Some("https://github.com/org/repo/pull/1".to_string()),
+            created_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+        };
+
+        let json = serde_json::to_string(&change).unwrap();
+        let deserialized: CascadingChange = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.trigger_repo, "upstream");
+        assert_eq!(deserialized.target_repo, "downstream");
+        assert_eq!(deserialized.change_type, CascadeChangeType::TestUpdate);
+        assert_eq!(deserialized.status, CascadeStatus::Failed);
+        assert!(deserialized.pr_url.is_some());
+        assert!(deserialized.completed_at.is_some());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Enum serialization roundtrips
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_dependency_type_serde_roundtrip_all_variants() {
+        let variants = [
+            DependencyType::Npm,
+            DependencyType::Composer,
+            DependencyType::GitSubmodule,
+            DependencyType::Manual,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let deserialized: DependencyType = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, variant);
+        }
+    }
+
+    #[test]
+    fn test_cascade_change_type_serde_roundtrip() {
+        let variants = [
+            CascadeChangeType::VersionBump,
+            CascadeChangeType::CodeChange,
+            CascadeChangeType::TestUpdate,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let deserialized: CascadeChangeType = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, variant);
+        }
+    }
+
+    #[test]
+    fn test_cascade_status_serde_roundtrip() {
+        let variants = [
+            CascadeStatus::Pending,
+            CascadeStatus::InProgress,
+            CascadeStatus::Completed,
+            CascadeStatus::Failed,
+            CascadeStatus::Skipped,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let deserialized: CascadeStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, variant);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Appwrite defaults - transitive dependants
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_appwrite_defaults_transitive_dependants() {
+        let manager = RepoRelationships::with_appwrite_defaults();
+
+        // utopia-php -> appwrite -> cloud (transitive)
+        let all = manager.get_all_dependants("utopia-php");
+        let names: Vec<_> = all.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"appwrite"));
+        assert!(names.contains(&"cloud"));
+    }
+
+    #[test]
+    fn test_appwrite_defaults_depends_on() {
+        let manager = RepoRelationships::with_appwrite_defaults();
+        let graph = manager.get_graph();
+
+        // cloud depends on appwrite
+        assert!(graph.depends_on("cloud", "appwrite"));
+        // cloud depends on utopia-php transitively
+        assert!(graph.depends_on("cloud", "utopia-php"));
+        // appwrite does not depend on cloud
+        assert!(!graph.depends_on("appwrite", "cloud"));
+    }
+
+    #[test]
+    fn test_appwrite_defaults_cascade_changes() {
+        let manager = RepoRelationships::with_appwrite_defaults();
+
+        // Merging a PR in utopia-database should cascade to appwrite
+        let changes = manager.get_cascade_changes("utopia-database");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].target_repo, "appwrite");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  DependencyGraph - get_dependants / get_dependencies
+    //  with unregistered downstream/upstream repos
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_dependants_downstream_not_in_repos() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("lib"));
+        // Add a dependency but do NOT add "app" as a repository
+        graph.add_dependency(Dependency {
+            upstream: "lib".to_string(),
+            downstream: "app".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+
+        // get_dependants should filter out repos not in the repositories map
+        let dependants = graph.get_dependants("lib");
+        assert!(dependants.is_empty());
+    }
+
+    #[test]
+    fn test_get_dependencies_upstream_not_in_repos() {
+        let mut graph = DependencyGraph::new();
+        graph.add_repository(Repository::new("app"));
+        // Add a dependency but do NOT add "lib" as a repository
+        graph.add_dependency(Dependency {
+            upstream: "lib".to_string(),
+            downstream: "app".to_string(),
+            dep_type: DependencyType::Npm,
+            version_pattern: None,
+            created_at: Utc::now(),
+        });
+
+        // get_dependencies should filter out repos not in the repositories map
+        let dependencies = graph.get_dependencies("app");
+        assert!(dependencies.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  print_tree with deeply nested tree
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_print_tree_deep_nesting() {
+        let mut manager = RepoRelationships::new();
+        // Build a chain: r0 -> r1 -> r2 -> r3 -> r4
+        for i in 0..5 {
+            manager.add_repository(Repository::new(format!("r{}", i)));
+        }
+        for i in 0..4 {
+            manager
+                .add_dependency(
+                    &format!("r{}", i),
+                    &format!("r{}", i + 1),
+                    DependencyType::Npm,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let tree = manager.print_tree(Some("r0"));
+        let lines: Vec<&str> = tree.lines().collect();
+        assert_eq!(lines.len(), 5);
+        // Verify increasing indentation
+        for (i, line) in lines.iter().enumerate() {
+            let expected_prefix = "  ".repeat(i);
+            assert!(
+                line.starts_with(&expected_prefix),
+                "line {} should start with {} spaces: {:?}",
+                i,
+                i * 2,
+                line
+            );
+        }
     }
 }

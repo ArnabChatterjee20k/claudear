@@ -19,6 +19,7 @@ pub trait DiscordHttpClient: Send + Sync {
     async fn get(&self, url: &str) -> Result<HttpResponse>;
     async fn post(&self, url: &str, body: serde_json::Value) -> Result<HttpResponse>;
     async fn patch(&self, url: &str, body: serde_json::Value) -> Result<HttpResponse>;
+    async fn put_empty(&self, url: &str) -> Result<HttpResponse>;
 }
 
 /// Default HTTP client using reqwest.
@@ -64,6 +65,13 @@ impl DiscordHttpClient for ReqwestDiscordClient {
 
     async fn patch(&self, url: &str, body: serde_json::Value) -> Result<HttpResponse> {
         let response = self.client.patch(url).json(&body).send().await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(HttpResponse { status, body })
+    }
+
+    async fn put_empty(&self, url: &str) -> Result<HttpResponse> {
+        let response = self.client.put(url).send().await?;
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
         Ok(HttpResponse { status, body })
@@ -219,6 +227,27 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         response.json()
     }
 
+    /// Fetch a single message by ID from a channel.
+    pub async fn get_message(&self, channel_id: &str, message_id: &str) -> Result<DiscordMessage> {
+        let url = format!(
+            "{}/channels/{}/messages/{}",
+            DISCORD_API_BASE, channel_id, message_id
+        );
+        let response = self.http.get(&url).await?;
+
+        if !response.is_success() {
+            return Err(Error::notifier(
+                "discord",
+                format!(
+                    "Failed to get message {} ({}): {}",
+                    message_id, response.status, response.body
+                ),
+            ));
+        }
+
+        response.json()
+    }
+
     /// List recent messages from a channel.
     pub async fn list_channel_messages(
         &self,
@@ -274,6 +303,31 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         let mut messages: Vec<DiscordMessage> = response.json()?;
         messages.reverse();
         Ok(messages)
+    }
+
+    /// Add a reaction emoji to a message.
+    pub async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<()> {
+        let encoded_emoji = urlencoding::encode(emoji);
+        let url = format!(
+            "{}/channels/{}/messages/{}/reactions/{}/@me",
+            DISCORD_API_BASE, channel_id, message_id, encoded_emoji
+        );
+        let response = self.http.put_empty(&url).await?;
+        if !response.is_success() {
+            tracing::warn!(
+                channel_id,
+                message_id,
+                emoji,
+                status = response.status,
+                "Failed to add reaction to message"
+            );
+        }
+        Ok(())
     }
 
     /// Archive a thread.
@@ -442,6 +496,13 @@ pub mod mock {
                     body: "Not found".to_string(),
                 })
             }
+        }
+
+        async fn put_empty(&self, _url: &str) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: 204,
+                body: String::new(),
+            })
         }
     }
 }

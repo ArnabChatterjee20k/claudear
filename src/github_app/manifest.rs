@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn test_app_manifest_github_url() {
+    fn test_app_manifest_scm_url() {
         let manifest = AppManifest::generate("https://example.com", None);
         let url = manifest.github_manifest_url("test_state").unwrap();
 

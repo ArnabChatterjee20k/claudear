@@ -4,7 +4,8 @@ use crate::config::GitLabConfig;
 use crate::error::{Error, Result};
 use crate::http::HttpClient;
 use crate::scm::{
-    CodeReview, PrInfo, PrStatus, RemoteRepo, ReviewComment, ReviewUser, ScmProvider,
+    CodeReview, PostReviewAction, PrInfo, PrStatus, PrSummary, RemoteRepo, ReviewComment,
+    ReviewUser, ScmProvider,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -146,6 +147,7 @@ impl<H: HttpClient> GitLabClient<H> {
         vec![
             ("PRIVATE-TOKEN", token.to_string()),
             ("Accept", "application/json".to_string()),
+            ("Content-Type", "application/json".to_string()),
             ("User-Agent", "claudear".to_string()),
         ]
     }
@@ -662,6 +664,228 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
         tracing::info!(group = %group, count = all_repos.len(), "Fetched group projects");
         Ok(all_repos)
     }
+
+    async fn merge_pr(&self, project: &str, number: i64) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitLab token not configured"))?;
+
+        let encoded = Self::encode_project_path(project);
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{}/merge",
+            self.api_base(),
+            encoded,
+            number
+        );
+        let headers = self.build_headers(token);
+        let body = serde_json::json!({"squash": true}).to_string();
+
+        let response = self.http.put(&url, headers, &body).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to merge MR {}!{}: {}",
+                project, number, response.body
+            )));
+        }
+        Ok(())
+    }
+
+    async fn close_pr(&self, project: &str, number: i64) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitLab token not configured"))?;
+
+        let encoded = Self::encode_project_path(project);
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{}",
+            self.api_base(),
+            encoded,
+            number
+        );
+        let headers = self.build_headers(token);
+        let body = serde_json::json!({"state_event": "close"}).to_string();
+
+        let response = self.http.put(&url, headers, &body).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to close MR {}!{}: {}",
+                project, number, response.body
+            )));
+        }
+        Ok(())
+    }
+
+    async fn delete_branch(&self, project: &str, branch: &str) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitLab token not configured"))?;
+
+        let encoded = Self::encode_project_path(project);
+        let branch_encoded = urlencoding::encode(branch);
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/branches/{}",
+            self.api_base(),
+            encoded,
+            branch_encoded
+        );
+        let headers = self.build_headers(token);
+
+        let response = self.http.delete(&url, headers).await?;
+        if !response.is_success() && !response.is_not_found() {
+            return Err(Error::Other(format!(
+                "Failed to delete branch {} in {}: {}",
+                branch, project, response.body
+            )));
+        }
+        Ok(())
+    }
+
+    async fn post_review(
+        &self,
+        project: &str,
+        number: i64,
+        action: PostReviewAction,
+        body_text: &str,
+    ) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitLab token not configured"))?;
+
+        let encoded = Self::encode_project_path(project);
+
+        match action {
+            PostReviewAction::Comment => {
+                let url = format!(
+                    "{}/api/v4/projects/{}/merge_requests/{}/notes",
+                    self.api_base(),
+                    encoded,
+                    number
+                );
+                let headers = self.build_headers(token);
+                let body = serde_json::json!({"body": body_text}).to_string();
+
+                let response = self.http.post(&url, headers, &body).await?;
+                if !response.is_success() {
+                    return Err(Error::Other(format!(
+                        "Failed to post comment on MR {}!{}: {}",
+                        project, number, response.body
+                    )));
+                }
+            }
+            PostReviewAction::Approve => {
+                let url = format!(
+                    "{}/api/v4/projects/{}/merge_requests/{}/approve",
+                    self.api_base(),
+                    encoded,
+                    number
+                );
+                let headers = self.build_headers(token);
+
+                let response = self.http.post(&url, headers, "{}").await?;
+                if !response.is_success() {
+                    return Err(Error::Other(format!(
+                        "Failed to approve MR {}!{}: {}",
+                        project, number, response.body
+                    )));
+                }
+            }
+            PostReviewAction::RequestChanges => {
+                // GitLab doesn't have a direct "request changes" action.
+                // Unapprove + post a note indicating changes are requested.
+                let unapprove_url = format!(
+                    "{}/api/v4/projects/{}/merge_requests/{}/unapprove",
+                    self.api_base(),
+                    encoded,
+                    number
+                );
+                let headers = self.build_headers(token);
+                // Unapprove may fail if not previously approved -- ignore errors
+                let _ = self.http.post(&unapprove_url, headers.clone(), "{}").await;
+
+                let note_url = format!(
+                    "{}/api/v4/projects/{}/merge_requests/{}/notes",
+                    self.api_base(),
+                    encoded,
+                    number
+                );
+                let body = serde_json::json!({"body": body_text}).to_string();
+                let response = self.http.post(&note_url, headers, &body).await?;
+                if !response.is_success() {
+                    return Err(Error::Other(format!(
+                        "Failed to post changes-requested note on MR {}!{}: {}",
+                        project, number, response.body
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_open_prs(&self, project: &str) -> Result<Vec<PrSummary>> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitLab token not configured"))?;
+
+        let encoded = Self::encode_project_path(project);
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests?state=opened&per_page=100",
+            self.api_base(),
+            encoded
+        );
+        let headers = self.build_headers(token);
+        let response = self.http.get(&url, headers).await?;
+
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to list open MRs for {}: {}",
+                project, response.body
+            )));
+        }
+
+        let mrs: Vec<serde_json::Value> = response.json()?;
+        Ok(mrs
+            .into_iter()
+            .filter_map(|mr| {
+                Some(PrSummary {
+                    number: mr.get("iid")?.as_i64()?,
+                    title: mr.get("title")?.as_str()?.to_string(),
+                    branch: mr.get("source_branch")?.as_str()?.to_string(),
+                    url: mr.get("web_url")?.as_str()?.to_string(),
+                })
+            })
+            .collect())
+    }
+
+    async fn get_pr_branch(&self, project: &str, number: i64) -> Result<String> {
+        let info = self.get_pr_info(project, number).await?;
+        info.head_branch.ok_or_else(|| {
+            Error::Other(format!(
+                "No source branch found for MR {} in {}",
+                number, project
+            ))
+        })
+    }
+
+    fn pr_url_pattern(&self) -> &str {
+        // GitLab MR URLs contain /-/merge_requests/
+        "%-/merge_requests/%"
+    }
+
+    fn parse_pr_number(&self, url: &str) -> Option<i64> {
+        let re = regex_lite::Regex::new(r"/merge_requests/(\d+)").ok()?;
+        let caps = re.captures(url)?;
+        caps.get(1)?.as_str().parse().ok()
+    }
 }
 
 #[cfg(test)]
@@ -864,8 +1088,6 @@ mod tests {
         assert!(!client.is_enabled());
     }
 
-    // ── Token-missing error path tests ──────────────────────────────────────
-
     fn no_token_config() -> GitLabConfig {
         GitLabConfig {
             token: None,
@@ -945,8 +1167,6 @@ mod tests {
         );
     }
 
-    // ── API error response tests ────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_get_pr_status_500() {
         let mock = MockHttpClient::new();
@@ -1022,8 +1242,6 @@ mod tests {
             "error should mention not found: {err_msg}"
         );
     }
-
-    // ── get_reviews with notes and approvals ────────────────────────────────
 
     #[tokio::test]
     async fn test_get_reviews_with_notes_and_approvals() {
@@ -1123,8 +1341,6 @@ mod tests {
         );
     }
 
-    // ── get_review_comments with diff notes ─────────────────────────────────
-
     #[tokio::test]
     async fn test_get_review_comments_with_diff_notes() {
         let mock = MockHttpClient::new();
@@ -1217,8 +1433,6 @@ mod tests {
         assert_eq!(comments[1].user.login, "reviewer_c");
     }
 
-    // ── get_pr_diff success path ────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_get_pr_diff_success() {
         let mock = MockHttpClient::new();
@@ -1275,8 +1489,6 @@ mod tests {
         );
     }
 
-    // ── encode_project_path additional tests ──────────────────────────────
-
     #[test]
     fn test_encode_project_path_no_slashes() {
         assert_eq!(
@@ -1329,8 +1541,6 @@ mod tests {
             "my-group%2Fmy.project"
         );
     }
-
-    // ── get_pr_status additional tests ────────────────────────────────────
 
     #[tokio::test]
     async fn test_get_pr_status_unknown_state_maps_to_open() {
@@ -1392,8 +1602,6 @@ mod tests {
         let result = client.get_pr_status("group/repo", 1).await;
         assert!(result.is_err());
     }
-
-    // ── get_pr_info additional tests ──────────────────────────────────────
 
     #[tokio::test]
     async fn test_get_pr_info_optional_fields_missing() {
@@ -1461,8 +1669,6 @@ mod tests {
         let result = client.get_pr_info("group/repo", 1).await;
         assert!(result.is_err());
     }
-
-    // ── get_pr_diff additional tests ──────────────────────────────────────
 
     #[tokio::test]
     async fn test_get_pr_diff_empty_changes() {
@@ -1542,8 +1748,6 @@ mod tests {
         assert!(diff.contains("--- a/old_name.rs"));
         assert!(diff.contains("+++ b/new_name.rs"));
     }
-
-    // ── get_reviews additional tests ──────────────────────────────────────
 
     #[tokio::test]
     async fn test_get_reviews_empty_notes_and_no_approvals() {
@@ -1704,8 +1908,6 @@ mod tests {
         assert!(reviews[0].submitted_at.is_none());
     }
 
-    // ── get_review_comments additional tests ──────────────────────────────
-
     #[tokio::test]
     async fn test_get_review_comments_empty() {
         let mock = MockHttpClient::new();
@@ -1801,8 +2003,6 @@ mod tests {
             "system notes should be excluded even if they have a position"
         );
     }
-
-    // ── get_new_reviews / get_new_review_comments tests ───────────────────
 
     #[tokio::test]
     async fn test_get_new_reviews_no_since_returns_all() {
@@ -1976,8 +2176,6 @@ mod tests {
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].id, 2);
     }
-
-    // ── list_repos additional tests ───────────────────────────────────────
 
     #[tokio::test]
     async fn test_list_repos_empty_group() {
@@ -2201,8 +2399,6 @@ mod tests {
         assert!(repos.is_empty());
     }
 
-    // ── Issue operations tests ────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_get_project_issues_success() {
         let mock = MockHttpClient::new();
@@ -2389,8 +2585,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── Authentication header tests ───────────────────────────────────────
-
     #[tokio::test]
     async fn test_auth_headers_private_token_format() {
         let mock = MockHttpClient::new();
@@ -2461,8 +2655,6 @@ mod tests {
         assert_eq!(token_header.1, "my-custom-gl-token");
     }
 
-    // ── Custom base URL tests ─────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_custom_base_url() {
         let mut config = test_config();
@@ -2480,13 +2672,11 @@ mod tests {
         assert_eq!(status, PrStatus::Merged);
     }
 
-    // ── Helper method tests ───────────────────────────────────────────────
-
     #[test]
     fn test_review_trigger() {
         let config = test_config();
         let client = GitLabClient::new(config);
-        assert_eq!(client.review_trigger(), "/claudear");
+        assert_eq!(client.review_trigger(), "@claudear");
     }
 
     #[test]
@@ -2532,8 +2722,6 @@ mod tests {
         let client = GitLabClient::new(config);
         assert_eq!(ScmProvider::name(&client), "gitlab");
     }
-
-    // ── note_to_review / note_to_comment unit tests ───────────────────────
 
     #[test]
     fn test_note_to_review_mapping() {
@@ -2674,8 +2862,6 @@ mod tests {
         assert!(comment.line.is_none());
     }
 
-    // ── MR notes pagination test ──────────────────────────────────────────
-
     #[tokio::test]
     async fn test_get_reviews_notes_pagination() {
         let mock = MockHttpClient::new();
@@ -2740,8 +2926,6 @@ mod tests {
         );
     }
 
-    // ── list_repos pagination test ────────────────────────────────────────
-
     #[tokio::test]
     async fn test_list_repos_pagination() {
         let mock = MockHttpClient::new();
@@ -2803,8 +2987,6 @@ mod tests {
         assert_eq!(repos.len(), 101);
     }
 
-    // ── MR notes API error test ───────────────────────────────────────────
-
     #[tokio::test]
     async fn test_get_reviews_notes_api_error() {
         let mock = MockHttpClient::new();
@@ -2832,8 +3014,6 @@ mod tests {
         let result = client.get_review_comments("group/repo", 1).await;
         assert!(result.is_err());
     }
-
-    // ── Missing fields / invalid JSON tests ───────────────────────────────
 
     #[tokio::test]
     async fn test_get_pr_status_missing_state_field() {
@@ -2891,8 +3071,6 @@ mod tests {
         let result = client.get_project_issues("group/repo", &[], None).await;
         assert!(result.is_err());
     }
-
-    // ── Deserialization tests for internal API types ─────────────────────
 
     #[test]
     fn test_deserialize_gitlab_user() {
@@ -3147,8 +3325,6 @@ mod tests {
         assert!(issue.labels.is_empty());
     }
 
-    // ── URL construction with labels containing special chars ────────────
-
     #[tokio::test]
     async fn test_get_project_issues_labels_with_special_chars() {
         let mock = MockHttpClient::new();
@@ -3185,8 +3361,6 @@ mod tests {
             .unwrap();
         assert!(issues.is_empty());
     }
-
-    // ── Custom base URL for issue endpoints ─────────────────────────────
 
     #[tokio::test]
     async fn test_get_project_issues_custom_base_url() {
@@ -3246,8 +3420,6 @@ mod tests {
         assert_eq!(issue.iid, 1);
     }
 
-    // ── ScmProvider trait delegation tests ───────────────────────────────
-
     #[test]
     fn test_scm_provider_is_enabled_delegates() {
         let config = test_config();
@@ -3264,15 +3436,13 @@ mod tests {
         assert_eq!(ScmProvider::review_trigger(&client), "@custom-bot");
     }
 
-    // ── build_headers tests ─────────────────────────────────────────────
-
     #[test]
     fn test_build_headers_contains_expected_entries() {
         let config = test_config();
         let client =
             GitLabClient::<MockHttpClient>::with_http_client(config, MockHttpClient::new());
         let headers = client.build_headers("my_token");
-        assert_eq!(headers.len(), 3);
+        assert_eq!(headers.len(), 4);
 
         let token_val = headers.iter().find(|(k, _)| *k == "PRIVATE-TOKEN").unwrap();
         assert_eq!(token_val.1, "my_token");
@@ -3284,8 +3454,6 @@ mod tests {
         assert_eq!(ua_val.1, "claudear");
     }
 
-    // ── api_base tests ──────────────────────────────────────────────────
-
     #[test]
     fn test_api_base_returns_config_base_url() {
         let mut config = test_config();
@@ -3294,8 +3462,6 @@ mod tests {
             GitLabClient::<MockHttpClient>::with_http_client(config, MockHttpClient::new());
         assert_eq!(client.api_base(), "https://custom.gitlab.io");
     }
-
-    // ── get_group_issues pagination / no labels / no state ──────────────
 
     #[tokio::test]
     async fn test_get_group_issues_no_labels_no_state() {
@@ -3310,8 +3476,6 @@ mod tests {
         let issues = client.get_group_issues("mygroup", &[], None).await.unwrap();
         assert!(issues.is_empty());
     }
-
-    // ── get_issue API error ─────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_get_issue_api_error_500() {
@@ -3332,8 +3496,6 @@ mod tests {
         );
     }
 
-    // ── with_http_client constructor test ────────────────────────────────
-
     #[test]
     fn test_with_http_client_constructor() {
         let config = test_config();
@@ -3343,11 +3505,9 @@ mod tests {
         assert!(client.is_enabled());
         assert_eq!(client.token(), Some("test_token"));
         assert_eq!(client.webhook_secret(), Some("test_secret"));
-        assert_eq!(client.review_trigger(), "/claudear");
+        assert_eq!(client.review_trigger(), "@claudear");
         assert_eq!(client.api_base(), "https://gitlab.com");
     }
-
-    // ── Encode project path with unicode ────────────────────────────────
 
     #[test]
     fn test_encode_project_path_with_spaces() {
@@ -3362,8 +3522,6 @@ mod tests {
         let encoded = GitLabClient::<MockHttpClient>::encode_project_path("org/repo-\u{00e9}");
         assert!(encoded.contains("%C3%A9") || encoded.contains("repo-"));
     }
-
-    // ── get_pr_diff with multiple changes assembles correct output ──────
 
     #[tokio::test]
     async fn test_get_pr_diff_multiple_changes_order() {
@@ -3391,8 +3549,6 @@ mod tests {
         assert!(diff.contains("diff2"));
         assert!(diff.contains("diff3"));
     }
-
-    // ── get_new_review_comments with since equal timestamp is inclusive ──
 
     #[tokio::test]
     async fn test_get_new_review_comments_since_equal_timestamp_included() {
@@ -3424,8 +3580,6 @@ mod tests {
         );
     }
 
-    // ── get_group_issues with only state, no labels ─────────────────────
-
     #[tokio::test]
     async fn test_get_group_issues_only_state_filter() {
         let mock = MockHttpClient::new();
@@ -3442,8 +3596,6 @@ mod tests {
             .unwrap();
         assert!(issues.is_empty());
     }
-
-    // ── get_project_issues with only labels, no state ───────────────────
 
     #[tokio::test]
     async fn test_get_project_issues_only_labels_no_state() {
@@ -3463,8 +3615,6 @@ mod tests {
         assert!(issues.is_empty());
     }
 
-    // ── get_group_issues API error ──────────────────────────────────────
-
     #[tokio::test]
     async fn test_get_group_issues_invalid_json() {
         let mock = MockHttpClient::new();
@@ -3479,8 +3629,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── get_issue invalid JSON ──────────────────────────────────────────
-
     #[tokio::test]
     async fn test_get_issue_invalid_json() {
         let mock = MockHttpClient::new();
@@ -3494,8 +3642,6 @@ mod tests {
         let result = client.get_issue("group/repo", 1).await;
         assert!(result.is_err());
     }
-
-    // ── get_reviews with approvals where created_at varies ──────────────
 
     #[tokio::test]
     async fn test_get_reviews_approval_id_is_negated_user_id() {
@@ -3519,5 +3665,1600 @@ mod tests {
         // Approval ID should be -(user.id) to avoid collision with note IDs
         assert_eq!(reviews[0].id, -77);
         assert_eq!(reviews[0].user.id, 77);
+    }
+
+    #[tokio::test]
+    async fn test_get_reviews_notes_pagination_error_on_page2() {
+        let mock = MockHttpClient::new();
+
+        // Build a full page of 100 notes for page 1
+        let mut page1_notes = String::from("[");
+        for i in 0..100 {
+            if i > 0 {
+                page1_notes.push(',');
+            }
+            page1_notes.push_str(&format!(
+                r#"{{
+                    "id": {},
+                    "body": "note {}",
+                    "author": {{"id": 1, "username": "dev"}},
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "type": null,
+                    "system": false,
+                    "position": null
+                }}"#,
+                i + 1,
+                i + 1
+            ));
+        }
+        page1_notes.push(']');
+
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=1&sort=asc",
+            200,
+            &page1_notes,
+        );
+        // Page 2 returns a server error
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=2&sort=asc",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.get_reviews("group/repo", 1).await;
+        assert!(
+            result.is_err(),
+            "should propagate error from page 2 of notes"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Internal Server Error") || err_msg.contains("500"),
+            "error should mention the API failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_reviews_notes_pagination_exact_page_boundary() {
+        let mock = MockHttpClient::new();
+
+        // Build a full page of 100 notes for page 1
+        let mut page1_notes = String::from("[");
+        for i in 0..100 {
+            if i > 0 {
+                page1_notes.push(',');
+            }
+            page1_notes.push_str(&format!(
+                r#"{{
+                    "id": {},
+                    "body": "note {}",
+                    "author": {{"id": 1, "username": "dev"}},
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "type": null,
+                    "system": false,
+                    "position": null
+                }}"#,
+                i + 1,
+                i + 1
+            ));
+        }
+        page1_notes.push(']');
+
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=1&sort=asc",
+            200,
+            &page1_notes,
+        );
+        // Page 2 returns empty array (exact boundary)
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=2&sort=asc",
+            200,
+            "[]",
+        );
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/approvals",
+            200,
+            r#"{"approved_by": []}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let reviews = client.get_reviews("group/repo", 1).await.unwrap();
+        assert_eq!(
+            reviews.len(),
+            100,
+            "should get exactly 100 notes, page 2 empty stops pagination"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_repos_pagination_error_on_page2() {
+        let mock = MockHttpClient::new();
+
+        // Build a full page of 100 projects for page 1
+        let mut page1 = String::from("[");
+        for i in 0..100 {
+            if i > 0 {
+                page1.push(',');
+            }
+            page1.push_str(&format!(
+                r#"{{
+                    "id": {},
+                    "path_with_namespace": "mygroup/repo-{}",
+                    "name": "repo-{}",
+                    "default_branch": "main",
+                    "http_url_to_repo": "https://gitlab.com/mygroup/repo-{}.git",
+                    "ssh_url_to_repo": "git@gitlab.com:mygroup/repo-{}.git",
+                    "web_url": "https://gitlab.com/mygroup/repo-{}",
+                    "visibility": "private",
+                    "archived": false
+                }}"#,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1
+            ));
+        }
+        page1.push(']');
+
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/projects?per_page=100&page=1&include_subgroups=true",
+            200,
+            &page1,
+        );
+        // Page 2 returns error
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/projects?per_page=100&page=2&include_subgroups=true",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.list_repos("mygroup").await;
+        assert!(
+            result.is_err(),
+            "should propagate error from page 2 of repos"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_repos_all_archived() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/projects?per_page=100&page=1&include_subgroups=true",
+            200,
+            r#"[
+                {
+                    "id": 1,
+                    "path_with_namespace": "mygroup/old1",
+                    "name": "old1",
+                    "default_branch": "main",
+                    "http_url_to_repo": "https://gitlab.com/mygroup/old1.git",
+                    "ssh_url_to_repo": "git@gitlab.com:mygroup/old1.git",
+                    "web_url": "https://gitlab.com/mygroup/old1",
+                    "visibility": "private",
+                    "archived": true
+                },
+                {
+                    "id": 2,
+                    "path_with_namespace": "mygroup/old2",
+                    "name": "old2",
+                    "default_branch": "main",
+                    "http_url_to_repo": "https://gitlab.com/mygroup/old2.git",
+                    "ssh_url_to_repo": "git@gitlab.com:mygroup/old2.git",
+                    "web_url": "https://gitlab.com/mygroup/old2",
+                    "visibility": "private",
+                    "archived": true
+                }
+            ]"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let repos = client.list_repos("mygroup").await.unwrap();
+        assert!(
+            repos.is_empty(),
+            "all archived projects should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_note_to_comment_new_file_no_old_path() {
+        let note = GitLabNote {
+            id: 600,
+            body: "new file comment".to_string(),
+            author: GitLabUser {
+                id: 1,
+                username: "user".to_string(),
+            },
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            note_type: Some("DiffNote".to_string()),
+            system: false,
+            position: Some(GitLabNotePosition {
+                new_path: Some("brand_new.rs".to_string()),
+                old_path: None,
+                new_line: Some(1),
+                old_line: None,
+            }),
+        };
+
+        let comment = GitLabClient::<MockHttpClient>::note_to_comment(&note);
+        assert_eq!(comment.path, "brand_new.rs");
+        assert_eq!(comment.line, Some(1));
+    }
+
+    #[test]
+    fn test_note_to_comment_new_path_but_old_line() {
+        let note = GitLabNote {
+            id: 601,
+            body: "comment on old line".to_string(),
+            author: GitLabUser {
+                id: 2,
+                username: "reviewer".to_string(),
+            },
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            note_type: Some("DiffNote".to_string()),
+            system: false,
+            position: Some(GitLabNotePosition {
+                new_path: Some("file.rs".to_string()),
+                old_path: Some("file.rs".to_string()),
+                new_line: None,
+                old_line: Some(25),
+            }),
+        };
+
+        let comment = GitLabClient::<MockHttpClient>::note_to_comment(&note);
+        assert_eq!(comment.path, "file.rs");
+        // new_line is None so it should fall back to old_line
+        assert_eq!(comment.line, Some(25));
+    }
+
+    #[tokio::test]
+    async fn test_get_reviews_complex_mix() {
+        let mock = MockHttpClient::new();
+
+        let notes_json = r#"[
+            {
+                "id": 1,
+                "body": "General note 1",
+                "author": {"id": 10, "username": "alice"},
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z",
+                "type": null,
+                "system": false,
+                "position": null
+            },
+            {
+                "id": 2,
+                "body": "System: assigned to bob",
+                "author": {"id": 0, "username": "system"},
+                "created_at": "2025-01-01T01:00:00Z",
+                "updated_at": "2025-01-01T01:00:00Z",
+                "type": null,
+                "system": true,
+                "position": null
+            },
+            {
+                "id": 3,
+                "body": "Diff comment on line 5",
+                "author": {"id": 20, "username": "bob"},
+                "created_at": "2025-01-02T00:00:00Z",
+                "updated_at": "2025-01-02T00:00:00Z",
+                "type": "DiffNote",
+                "system": false,
+                "position": {"new_path": "src/lib.rs", "old_path": "src/lib.rs", "new_line": 5, "old_line": null}
+            },
+            {
+                "id": 4,
+                "body": "General note 2",
+                "author": {"id": 30, "username": "charlie"},
+                "created_at": "2025-01-03T00:00:00Z",
+                "updated_at": "2025-01-03T00:00:00Z",
+                "type": null,
+                "system": false,
+                "position": null
+            },
+            {
+                "id": 5,
+                "body": "System: merged MR",
+                "author": {"id": 0, "username": "system"},
+                "created_at": "2025-01-04T00:00:00Z",
+                "updated_at": "2025-01-04T00:00:00Z",
+                "type": null,
+                "system": true,
+                "position": null
+            }
+        ]"#;
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/2/notes?per_page=100&page=1&sort=asc",
+            200,
+            notes_json,
+        );
+
+        let approvals_json = r#"{"approved_by": [
+            {"user": {"id": 10, "username": "alice"}, "created_at": "2025-01-05T00:00:00Z"},
+            {"user": {"id": 30, "username": "charlie"}, "created_at": "2025-01-06T00:00:00Z"}
+        ]}"#;
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/2/approvals",
+            200,
+            approvals_json,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let reviews = client.get_reviews("group/repo", 2).await.unwrap();
+
+        // Expected: note 1 (general), note 4 (general), approval alice, approval charlie = 4
+        // Excluded: note 2 (system), note 3 (diff), note 5 (system)
+        assert_eq!(
+            reviews.len(),
+            4,
+            "expected 2 general notes + 2 approvals = 4, got {}",
+            reviews.len()
+        );
+
+        // General notes
+        assert_eq!(reviews[0].id, 1);
+        assert_eq!(reviews[0].state, "COMMENTED");
+        assert_eq!(reviews[0].user.login, "alice");
+
+        assert_eq!(reviews[1].id, 4);
+        assert_eq!(reviews[1].state, "COMMENTED");
+        assert_eq!(reviews[1].user.login, "charlie");
+
+        // Approvals
+        assert_eq!(reviews[2].id, -10);
+        assert_eq!(reviews[2].state, "APPROVED");
+        assert_eq!(reviews[2].user.login, "alice");
+
+        assert_eq!(reviews[3].id, -30);
+        assert_eq!(reviews[3].state, "APPROVED");
+        assert_eq!(reviews[3].user.login, "charlie");
+    }
+
+    #[tokio::test]
+    async fn test_get_review_comments_multiple_diff_notes() {
+        let mock = MockHttpClient::new();
+        let notes_json = r#"[
+            {
+                "id": 1,
+                "body": "First diff comment",
+                "author": {"id": 10, "username": "alice"},
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z",
+                "type": "DiffNote",
+                "system": false,
+                "position": {"new_path": "a.rs", "old_path": "a.rs", "new_line": 1, "old_line": null}
+            },
+            {
+                "id": 2,
+                "body": "Second diff comment",
+                "author": {"id": 20, "username": "bob"},
+                "created_at": "2025-01-02T00:00:00Z",
+                "updated_at": "2025-01-02T00:00:00Z",
+                "type": "DiffNote",
+                "system": false,
+                "position": {"new_path": "b.rs", "old_path": "b.rs", "new_line": 10, "old_line": 9}
+            },
+            {
+                "id": 3,
+                "body": "Third diff comment",
+                "author": {"id": 30, "username": "charlie"},
+                "created_at": "2025-01-03T00:00:00Z",
+                "updated_at": "2025-01-03T00:00:00Z",
+                "type": "DiffNote",
+                "system": false,
+                "position": {"new_path": "c.rs", "old_path": null, "new_line": 5, "old_line": null}
+            }
+        ]"#;
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/3/notes?per_page=100&page=1&sort=asc",
+            200,
+            notes_json,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let comments = client.get_review_comments("group/repo", 3).await.unwrap();
+        assert_eq!(comments.len(), 3);
+        assert_eq!(comments[0].path, "a.rs");
+        assert_eq!(comments[1].path, "b.rs");
+        assert_eq!(comments[2].path, "c.rs");
+        assert_eq!(comments[0].line, Some(1));
+        assert_eq!(comments[1].line, Some(10));
+        assert_eq!(comments[2].line, Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_get_new_reviews_with_since_excludes_approval_without_timestamp() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=1&sort=asc",
+            200,
+            "[]",
+        );
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/approvals",
+            200,
+            r#"{"approved_by": [
+                {"user": {"id": 10, "username": "alice"}, "created_at": null},
+                {"user": {"id": 20, "username": "bob"}, "created_at": "2025-06-01T00:00:00Z"}
+            ]}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let reviews = client
+            .get_new_reviews("group/repo", 1, Some("2025-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        // Alice's approval has no created_at, so submitted_at is None; should be excluded by default filter
+        // Bob's approval is after since, so should be included
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].user.login, "bob");
+    }
+
+    #[tokio::test]
+    async fn test_get_group_issues_only_labels_no_state() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/issues?per_page=100&labels=feature",
+            200,
+            "[]",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let labels = vec!["feature".to_string()];
+        let issues = client
+            .get_group_issues("mygroup", &labels, None)
+            .await
+            .unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_diff_custom_base_url() {
+        let mut config = test_config();
+        config.base_url = "https://git.corp.io".to_string();
+
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://git.corp.io/api/v4/projects/team%2Frepo/merge_requests/5/changes",
+            200,
+            r#"{"changes": [{"old_path": "x.rs", "new_path": "x.rs", "diff": "+new line"}]}"#,
+        );
+
+        let client = GitLabClient::with_http_client(config, mock);
+        let diff = client.get_pr_diff("team/repo", 5).await.unwrap();
+        assert!(diff.contains("--- a/x.rs"));
+        assert!(diff.contains("+++ b/x.rs"));
+        assert!(diff.contains("+new line"));
+    }
+
+    #[tokio::test]
+    async fn test_get_reviews_custom_base_url() {
+        let mut config = test_config();
+        config.base_url = "https://git.corp.io".to_string();
+
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://git.corp.io/api/v4/projects/team%2Frepo/merge_requests/5/notes?per_page=100&page=1&sort=asc",
+            200,
+            r#"[{
+                "id": 1,
+                "body": "LGTM",
+                "author": {"id": 1, "username": "dev"},
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z",
+                "type": null,
+                "system": false,
+                "position": null
+            }]"#,
+        );
+        mock.mock_response(
+            "https://git.corp.io/api/v4/projects/team%2Frepo/merge_requests/5/approvals",
+            200,
+            r#"{"approved_by": []}"#,
+        );
+
+        let client = GitLabClient::with_http_client(config, mock);
+        let reviews = client.get_reviews("team/repo", 5).await.unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].body.as_deref(), Some("LGTM"));
+    }
+
+    #[tokio::test]
+    async fn test_get_review_comments_custom_base_url() {
+        let mut config = test_config();
+        config.base_url = "https://git.corp.io".to_string();
+
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://git.corp.io/api/v4/projects/team%2Frepo/merge_requests/5/notes?per_page=100&page=1&sort=asc",
+            200,
+            r#"[{
+                "id": 1,
+                "body": "inline note",
+                "author": {"id": 1, "username": "dev"},
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z",
+                "type": "DiffNote",
+                "system": false,
+                "position": {"new_path": "f.rs", "old_path": "f.rs", "new_line": 10, "old_line": null}
+            }]"#,
+        );
+
+        let client = GitLabClient::with_http_client(config, mock);
+        let comments = client.get_review_comments("team/repo", 5).await.unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].path, "f.rs");
+    }
+
+    #[tokio::test]
+    async fn test_list_repos_pagination_with_archived_filter() {
+        let mock = MockHttpClient::new();
+
+        // Build a full page of 100 projects, half archived
+        let mut page1 = String::from("[");
+        for i in 0..100 {
+            if i > 0 {
+                page1.push(',');
+            }
+            let archived = i % 2 == 0; // even indices are archived
+            page1.push_str(&format!(
+                r#"{{
+                    "id": {},
+                    "path_with_namespace": "mygroup/repo-{}",
+                    "name": "repo-{}",
+                    "default_branch": "main",
+                    "http_url_to_repo": "https://gitlab.com/mygroup/repo-{}.git",
+                    "ssh_url_to_repo": "git@gitlab.com:mygroup/repo-{}.git",
+                    "web_url": "https://gitlab.com/mygroup/repo-{}",
+                    "visibility": "private",
+                    "archived": {}
+                }}"#,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                archived
+            ));
+        }
+        page1.push(']');
+
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/projects?per_page=100&page=1&include_subgroups=true",
+            200,
+            &page1,
+        );
+        // Page 2: 2 non-archived projects
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/projects?per_page=100&page=2&include_subgroups=true",
+            200,
+            r#"[
+                {
+                    "id": 201,
+                    "path_with_namespace": "mygroup/repo-201",
+                    "name": "repo-201",
+                    "default_branch": "main",
+                    "http_url_to_repo": "https://gitlab.com/mygroup/repo-201.git",
+                    "ssh_url_to_repo": "git@gitlab.com:mygroup/repo-201.git",
+                    "web_url": "https://gitlab.com/mygroup/repo-201",
+                    "visibility": "private",
+                    "archived": false
+                },
+                {
+                    "id": 202,
+                    "path_with_namespace": "mygroup/repo-202",
+                    "name": "repo-202",
+                    "default_branch": "main",
+                    "http_url_to_repo": "https://gitlab.com/mygroup/repo-202.git",
+                    "ssh_url_to_repo": "git@gitlab.com:mygroup/repo-202.git",
+                    "web_url": "https://gitlab.com/mygroup/repo-202",
+                    "visibility": "private",
+                    "archived": false
+                }
+            ]"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let repos = client.list_repos("mygroup").await.unwrap();
+        // Page 1: 50 non-archived (odd indices 1,3,5,...99) + page 2: 2 = 52
+        assert_eq!(
+            repos.len(),
+            52,
+            "should have 50 non-archived from page 1 + 2 from page 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_mr_approvals_no_token() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        // get_mr_approvals is private but we can test it indirectly -- since
+        // get_reviews calls get_mr_notes first (which also fails on no token),
+        // we verify the error propagates from the notes call.
+        let result = client.get_reviews("group/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("token"));
+    }
+
+    #[tokio::test]
+    async fn test_get_reviews_approvals_404_gracefully_handled() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=1&sort=asc",
+            200,
+            "[]",
+        );
+        // Approvals endpoint returns 404 (e.g. feature not enabled)
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/approvals",
+            404,
+            "Not found",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let reviews = client.get_reviews("group/repo", 1).await.unwrap();
+        // Should gracefully handle the failure with empty approvals
+        assert!(
+            reviews.is_empty(),
+            "should return empty reviews when both notes empty and approvals fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_project_issues_multiple() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/issues?per_page=100",
+            200,
+            r#"[
+                {
+                    "iid": 1,
+                    "title": "Issue 1",
+                    "description": "Desc 1",
+                    "state": "opened",
+                    "web_url": "https://gitlab.com/group/repo/-/issues/1",
+                    "labels": ["bug"],
+                    "author": {"id": 1, "username": "alice"},
+                    "assignees": []
+                },
+                {
+                    "iid": 2,
+                    "title": "Issue 2",
+                    "description": null,
+                    "state": "closed",
+                    "web_url": "https://gitlab.com/group/repo/-/issues/2",
+                    "labels": [],
+                    "author": null,
+                    "assignees": [{"id": 2, "username": "bob"}]
+                },
+                {
+                    "iid": 3,
+                    "title": "Issue 3",
+                    "description": "Desc 3",
+                    "state": "opened",
+                    "web_url": "https://gitlab.com/group/repo/-/issues/3",
+                    "labels": ["bug", "critical"],
+                    "author": {"id": 3, "username": "charlie"},
+                    "assignees": [{"id": 1, "username": "alice"}, {"id": 2, "username": "bob"}]
+                }
+            ]"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let issues = client
+            .get_project_issues("group/repo", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(issues.len(), 3);
+        assert_eq!(issues[0].iid, 1);
+        assert_eq!(issues[1].iid, 2);
+        assert_eq!(issues[2].iid, 3);
+        assert!(issues[1].description.is_none());
+        assert!(issues[1].author.is_none());
+        assert_eq!(issues[2].assignees.len(), 2);
+        assert_eq!(issues[2].labels, vec!["bug", "critical"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_group_issues_multiple() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/issues?per_page=100",
+            200,
+            r#"[
+                {
+                    "iid": 10,
+                    "title": "Group issue A",
+                    "description": "Desc A",
+                    "state": "opened",
+                    "web_url": "https://gitlab.com/mygroup/repo1/-/issues/10",
+                    "labels": ["enhancement"],
+                    "author": {"id": 1, "username": "user1"},
+                    "assignees": []
+                },
+                {
+                    "iid": 20,
+                    "title": "Group issue B",
+                    "description": "Desc B",
+                    "state": "closed",
+                    "web_url": "https://gitlab.com/mygroup/repo2/-/issues/20",
+                    "labels": [],
+                    "author": {"id": 2, "username": "user2"},
+                    "assignees": [{"id": 3, "username": "user3"}]
+                }
+            ]"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let issues = client.get_group_issues("mygroup", &[], None).await.unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].title, "Group issue A");
+        assert_eq!(issues[1].title, "Group issue B");
+        assert_eq!(issues[0].state, "opened");
+        assert_eq!(issues[1].state, "closed");
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_full_field_mapping() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/issues/10",
+            200,
+            r#"{
+                "iid": 10,
+                "title": "Detailed issue",
+                "description": "Full description with details",
+                "state": "closed",
+                "web_url": "https://gitlab.com/group/repo/-/issues/10",
+                "labels": ["bug", "P1", "backend"],
+                "author": {"id": 42, "username": "reporter"},
+                "assignees": [
+                    {"id": 100, "username": "dev1"},
+                    {"id": 200, "username": "dev2"}
+                ]
+            }"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let issue = client.get_issue("group/repo", 10).await.unwrap();
+        assert_eq!(issue.iid, 10);
+        assert_eq!(issue.title, "Detailed issue");
+        assert_eq!(
+            issue.description.as_deref(),
+            Some("Full description with details")
+        );
+        assert_eq!(issue.state, "closed");
+        assert_eq!(issue.web_url, "https://gitlab.com/group/repo/-/issues/10");
+        assert_eq!(issue.labels, vec!["bug", "P1", "backend"]);
+        assert_eq!(issue.author.as_ref().unwrap().id, 42);
+        assert_eq!(issue.author.as_ref().unwrap().username, "reporter");
+        assert_eq!(issue.assignees.len(), 2);
+        assert_eq!(issue.assignees[0].id, 100);
+        assert_eq!(issue.assignees[0].username, "dev1");
+        assert_eq!(issue.assignees[1].id, 200);
+        assert_eq!(issue.assignees[1].username, "dev2");
+    }
+
+    #[test]
+    fn test_note_to_review_verifies_all_default_fields() {
+        let note = GitLabNote {
+            id: 999,
+            body: "".to_string(),
+            author: GitLabUser {
+                id: 0,
+                username: "empty_user".to_string(),
+            },
+            created_at: "".to_string(),
+            updated_at: "some_date".to_string(),
+            note_type: Some("SomeType".to_string()),
+            system: true,
+            position: None,
+        };
+
+        let review = GitLabClient::<MockHttpClient>::note_to_review(&note);
+        // note_to_review always maps state to "COMMENTED"
+        assert_eq!(review.state, "COMMENTED");
+        // body is set from note.body even if empty
+        assert_eq!(review.body.as_deref(), Some(""));
+        // submitted_at uses created_at, not updated_at
+        assert_eq!(review.submitted_at.as_deref(), Some(""));
+        // html_url is always None
+        assert!(review.html_url.is_none());
+        // user_type is always None
+        assert!(review.user.user_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_repos_pagination_exact_boundary() {
+        let mock = MockHttpClient::new();
+
+        // Build exactly 100 projects for page 1
+        let mut page1 = String::from("[");
+        for i in 0..100 {
+            if i > 0 {
+                page1.push(',');
+            }
+            page1.push_str(&format!(
+                r#"{{
+                    "id": {},
+                    "path_with_namespace": "mygroup/repo-{}",
+                    "name": "repo-{}",
+                    "default_branch": "main",
+                    "http_url_to_repo": "https://gitlab.com/mygroup/repo-{}.git",
+                    "ssh_url_to_repo": "git@gitlab.com:mygroup/repo-{}.git",
+                    "web_url": "https://gitlab.com/mygroup/repo-{}",
+                    "visibility": "private",
+                    "archived": false
+                }}"#,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1
+            ));
+        }
+        page1.push(']');
+
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/projects?per_page=100&page=1&include_subgroups=true",
+            200,
+            &page1,
+        );
+        // Page 2 returns empty
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/projects?per_page=100&page=2&include_subgroups=true",
+            200,
+            "[]",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let repos = client.list_repos("mygroup").await.unwrap();
+        assert_eq!(
+            repos.len(),
+            100,
+            "should get exactly 100 repos; page 2 empty stops pagination"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_get_pr_status_via_trait() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1",
+            200,
+            r#"{"iid": 1, "state": "opened"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        // Call through the trait reference
+        let provider: &dyn ScmProvider = &client;
+        let status = provider.get_pr_status("group/repo", 1).await.unwrap();
+        assert_eq!(status, PrStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_get_pr_info_via_trait() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1",
+            200,
+            r#"{"iid": 1, "state": "opened", "source_branch": "feat", "target_branch": "main", "title": "Feat", "author": {"id": 1, "username": "dev"}}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let provider: &dyn ScmProvider = &client;
+        let info = provider.get_pr_info("group/repo", 1).await.unwrap();
+        assert_eq!(info.head_branch.as_deref(), Some("feat"));
+        assert_eq!(info.title.as_deref(), Some("Feat"));
+    }
+
+    #[test]
+    fn test_is_enabled_requires_both_enabled_and_token() {
+        // enabled=false, token=Some => false
+        let mut config = test_config();
+        config.enabled = false;
+        config.token = Some("tk".to_string());
+        let client = GitLabClient::new(config);
+        assert!(!client.is_enabled());
+
+        // enabled=true, token=None => false
+        let mut config2 = test_config();
+        config2.enabled = true;
+        config2.token = None;
+        let client2 = GitLabClient::new(config2);
+        assert!(!client2.is_enabled());
+
+        // enabled=false, token=None => false
+        let mut config3 = test_config();
+        config3.enabled = false;
+        config3.token = None;
+        let client3 = GitLabClient::new(config3);
+        assert!(!client3.is_enabled());
+
+        // enabled=true, token=Some => true
+        let config4 = test_config();
+        let client4 = GitLabClient::new(config4);
+        assert!(client4.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_get_new_review_comments_uses_updated_at_for_filter() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=1&sort=asc",
+            200,
+            r#"[
+                {
+                    "id": 1,
+                    "body": "old created but recently updated",
+                    "author": {"id": 1, "username": "dev"},
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "updated_at": "2025-09-01T00:00:00Z",
+                    "type": "DiffNote",
+                    "system": false,
+                    "position": {"new_path": "f.rs", "old_path": "f.rs", "new_line": 1, "old_line": null}
+                },
+                {
+                    "id": 2,
+                    "body": "recent created but old updated",
+                    "author": {"id": 2, "username": "dev2"},
+                    "created_at": "2025-08-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "type": "DiffNote",
+                    "system": false,
+                    "position": {"new_path": "g.rs", "old_path": "g.rs", "new_line": 5, "old_line": null}
+                }
+            ]"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let comments = client
+            .get_new_review_comments("group/repo", 1, Some("2025-06-01T00:00:00Z"))
+            .await
+            .unwrap();
+        // Only comment 1 should pass: updated_at "2025-09-01" >= since "2025-06-01"
+        // Comment 2 has updated_at "2025-01-01" < since "2025-06-01"
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_status_403_forbidden() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1",
+            403,
+            r#"{"message":"403 Forbidden"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.get_pr_status("group/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Forbidden") || err_msg.contains("API error"),
+            "error should indicate forbidden: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_info_404() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/999",
+            404,
+            "Not found",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.get_pr_info("group/repo", 999).await;
+        // get_pr_info does not have special 404 handling like get_pr_status
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Not found") || err_msg.contains("API error"),
+            "error should indicate not found: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_project_issues_only_state_no_labels() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/issues?per_page=100&state=closed",
+            200,
+            "[]",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let issues = client
+            .get_project_issues("group/repo", &[], Some("closed"))
+            .await
+            .unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_diff_many_changes() {
+        let mock = MockHttpClient::new();
+
+        let mut changes = String::from(r#"{"changes": ["#);
+        for i in 0..50 {
+            if i > 0 {
+                changes.push(',');
+            }
+            changes.push_str(&format!(
+                r#"{{"old_path": "file{}.rs", "new_path": "file{}.rs", "diff": "@@ -1 +1 @@\n-old{}\n+new{}\n"}}"#,
+                i, i, i, i
+            ));
+        }
+        changes.push_str("]}");
+
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/50/changes",
+            200,
+            &changes,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let diff = client.get_pr_diff("group/repo", 50).await.unwrap();
+
+        // Verify first and last changes are present
+        assert!(diff.contains("--- a/file0.rs"));
+        assert!(diff.contains("+++ b/file0.rs"));
+        assert!(diff.contains("--- a/file49.rs"));
+        assert!(diff.contains("+++ b/file49.rs"));
+        assert!(diff.contains("+new0"));
+        assert!(diff.contains("+new49"));
+    }
+
+    #[test]
+    fn test_deserialize_gitlab_note_position_all_null() {
+        let json = r#"{
+            "new_path": null,
+            "old_path": null,
+            "new_line": null,
+            "old_line": null
+        }"#;
+        let pos: GitLabNotePosition = serde_json::from_str(json).unwrap();
+        assert!(pos.new_path.is_none());
+        assert!(pos.old_path.is_none());
+        assert!(pos.new_line.is_none());
+        assert!(pos.old_line.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_gitlab_note_position_all_set() {
+        let json = r#"{
+            "new_path": "new.rs",
+            "old_path": "old.rs",
+            "new_line": 100,
+            "old_line": 50
+        }"#;
+        let pos: GitLabNotePosition = serde_json::from_str(json).unwrap();
+        assert_eq!(pos.new_path.as_deref(), Some("new.rs"));
+        assert_eq!(pos.old_path.as_deref(), Some("old.rs"));
+        assert_eq!(pos.new_line, Some(100));
+        assert_eq!(pos.old_line, Some(50));
+    }
+
+    #[tokio::test]
+    async fn test_list_repos_invalid_json_on_page2() {
+        let mock = MockHttpClient::new();
+
+        // Build a full page of 100 projects for page 1
+        let mut page1 = String::from("[");
+        for i in 0..100 {
+            if i > 0 {
+                page1.push(',');
+            }
+            page1.push_str(&format!(
+                r#"{{
+                    "id": {},
+                    "path_with_namespace": "mygroup/repo-{}",
+                    "name": "repo-{}",
+                    "default_branch": "main",
+                    "http_url_to_repo": "https://gitlab.com/mygroup/repo-{}.git",
+                    "ssh_url_to_repo": "git@gitlab.com:mygroup/repo-{}.git",
+                    "web_url": "https://gitlab.com/mygroup/repo-{}",
+                    "visibility": "private",
+                    "archived": false
+                }}"#,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1
+            ));
+        }
+        page1.push(']');
+
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/projects?per_page=100&page=1&include_subgroups=true",
+            200,
+            &page1,
+        );
+        // Page 2 returns invalid JSON
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/mygroup/projects?per_page=100&page=2&include_subgroups=true",
+            200,
+            "not json",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.list_repos("mygroup").await;
+        assert!(
+            result.is_err(),
+            "should fail when page 2 returns invalid JSON"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_reviews_notes_invalid_json_on_page2() {
+        let mock = MockHttpClient::new();
+
+        // Build a full page of 100 notes for page 1
+        let mut page1_notes = String::from("[");
+        for i in 0..100 {
+            if i > 0 {
+                page1_notes.push(',');
+            }
+            page1_notes.push_str(&format!(
+                r#"{{
+                    "id": {},
+                    "body": "note {}",
+                    "author": {{"id": 1, "username": "dev"}},
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "type": null,
+                    "system": false,
+                    "position": null
+                }}"#,
+                i + 1,
+                i + 1
+            ));
+        }
+        page1_notes.push(']');
+
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=1&sort=asc",
+            200,
+            &page1_notes,
+        );
+        // Page 2 returns invalid JSON
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=2&sort=asc",
+            200,
+            "not valid json",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.get_reviews("group/repo", 1).await;
+        assert!(
+            result.is_err(),
+            "should fail when page 2 of notes returns invalid JSON"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_new_reviews_only_approval_after_since() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes?per_page=100&page=1&sort=asc",
+            200,
+            r#"[{
+                "id": 1,
+                "body": "old comment",
+                "author": {"id": 1, "username": "dev"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "type": null,
+                "system": false,
+                "position": null
+            }]"#,
+        );
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/approvals",
+            200,
+            r#"{"approved_by": [
+                {"user": {"id": 10, "username": "alice"}, "created_at": "2025-09-01T00:00:00Z"}
+            ]}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let reviews = client
+            .get_new_reviews("group/repo", 1, Some("2025-06-01T00:00:00Z"))
+            .await
+            .unwrap();
+        // The general note has submitted_at (created_at) "2024-01-01" < since "2025-06-01"
+        // The approval has submitted_at (created_at) "2025-09-01" >= since "2025-06-01"
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].state, "APPROVED");
+        assert_eq!(reviews[0].user.login, "alice");
+    }
+
+    #[tokio::test]
+    async fn test_get_review_comments_pagination() {
+        let mock = MockHttpClient::new();
+
+        // Build a full page of 100 diff notes for page 1
+        let mut page1_notes = String::from("[");
+        for i in 0..100 {
+            if i > 0 {
+                page1_notes.push(',');
+            }
+            page1_notes.push_str(&format!(
+                r#"{{
+                    "id": {},
+                    "body": "diff note {}",
+                    "author": {{"id": 1, "username": "dev"}},
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "type": "DiffNote",
+                    "system": false,
+                    "position": {{"new_path": "file{}.rs", "old_path": "file{}.rs", "new_line": {}, "old_line": null}}
+                }}"#,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1,
+                i + 1
+            ));
+        }
+        page1_notes.push(']');
+
+        // Page 2 has 1 diff note
+        let page2_notes = r#"[{
+            "id": 101,
+            "body": "last diff note",
+            "author": {"id": 1, "username": "dev"},
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "type": "DiffNote",
+            "system": false,
+            "position": {"new_path": "last.rs", "old_path": "last.rs", "new_line": 1, "old_line": null}
+        }]"#;
+
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/7/notes?per_page=100&page=1&sort=asc",
+            200,
+            &page1_notes,
+        );
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/7/notes?per_page=100&page=2&sort=asc",
+            200,
+            page2_notes,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let comments = client.get_review_comments("group/repo", 7).await.unwrap();
+        assert_eq!(
+            comments.len(),
+            101,
+            "should get 100 from page 1 + 1 from page 2"
+        );
+        assert_eq!(comments[100].body, "last diff note");
+    }
+
+    #[test]
+    fn test_encode_project_path_simple() {
+        // Simple path with no slashes -- should remain unchanged
+        assert_eq!(
+            GitLabClient::<MockHttpClient>::encode_project_path("my-project"),
+            "my-project"
+        );
+    }
+
+    #[test]
+    fn test_encode_project_path_nested() {
+        // Nested path with multiple slashes
+        assert_eq!(
+            GitLabClient::<MockHttpClient>::encode_project_path("org/subgroup/project"),
+            "org%2Fsubgroup%2Fproject"
+        );
+    }
+
+    #[test]
+    fn test_encode_project_path_special_chars() {
+        // Path with special characters: @, +, ~
+        let encoded = GitLabClient::<MockHttpClient>::encode_project_path("org/my+project@v2~beta");
+        assert!(encoded.contains("org%2F"));
+        // + and @ and ~ should be percent-encoded
+        assert!(
+            encoded.contains("%40") || encoded.contains("%2B") || encoded.contains("%7E"),
+            "special chars should be encoded: {encoded}"
+        );
+    }
+
+    #[test]
+    fn test_note_to_review_basic() {
+        let note = GitLabNote {
+            id: 42,
+            body: "Looks good to me".to_string(),
+            author: GitLabUser {
+                id: 7,
+                username: "tester".to_string(),
+            },
+            created_at: "2025-06-15T12:00:00Z".to_string(),
+            updated_at: "2025-06-15T13:00:00Z".to_string(),
+            note_type: None,
+            system: false,
+            position: None,
+        };
+
+        let review = GitLabClient::<MockHttpClient>::note_to_review(&note);
+        assert_eq!(review.id, 42);
+        assert_eq!(review.state, "COMMENTED");
+        assert_eq!(review.body.as_deref(), Some("Looks good to me"));
+        assert_eq!(review.user.id, 7);
+        assert_eq!(review.user.login, "tester");
+        assert!(review.user.user_type.is_none());
+        assert_eq!(review.submitted_at.as_deref(), Some("2025-06-15T12:00:00Z"));
+        assert!(review.html_url.is_none());
+    }
+
+    #[test]
+    fn test_note_to_comment_with_position_fields() {
+        let note = GitLabNote {
+            id: 55,
+            body: "Please fix this".to_string(),
+            author: GitLabUser {
+                id: 3,
+                username: "reviewer_x".to_string(),
+            },
+            created_at: "2025-04-01T00:00:00Z".to_string(),
+            updated_at: "2025-04-01T01:00:00Z".to_string(),
+            note_type: Some("DiffNote".to_string()),
+            system: false,
+            position: Some(GitLabNotePosition {
+                new_path: Some("src/app.rs".to_string()),
+                old_path: Some("src/app.rs".to_string()),
+                new_line: Some(77),
+                old_line: Some(75),
+            }),
+        };
+
+        let comment = GitLabClient::<MockHttpClient>::note_to_comment(&note);
+        assert_eq!(comment.id, 55);
+        assert_eq!(comment.body, "Please fix this");
+        assert_eq!(comment.path, "src/app.rs");
+        assert_eq!(comment.line, Some(77)); // new_line preferred over old_line
+        assert!(comment.start_line.is_none());
+        assert_eq!(comment.user.id, 3);
+        assert_eq!(comment.user.login, "reviewer_x");
+        assert_eq!(comment.created_at, "2025-04-01T00:00:00Z");
+        assert_eq!(comment.updated_at, "2025-04-01T01:00:00Z");
+        assert!(comment.html_url.is_empty());
+        assert!(comment.position.is_none());
+        assert!(comment.original_position.is_none());
+        assert!(comment.pull_request_review_id.is_none());
+        assert!(comment.side.is_none());
+    }
+
+    #[test]
+    fn test_note_to_comment_no_position_maps_empty() {
+        let note = GitLabNote {
+            id: 66,
+            body: "general note".to_string(),
+            author: GitLabUser {
+                id: 9,
+                username: "commenter".to_string(),
+            },
+            created_at: "2025-05-01T00:00:00Z".to_string(),
+            updated_at: "2025-05-01T00:00:00Z".to_string(),
+            note_type: None,
+            system: false,
+            position: None,
+        };
+
+        let comment = GitLabClient::<MockHttpClient>::note_to_comment(&note);
+        assert_eq!(comment.id, 66);
+        assert!(
+            comment.path.is_empty(),
+            "path should be empty when no position"
+        );
+        assert!(
+            comment.line.is_none(),
+            "line should be None when no position"
+        );
+        assert!(comment.start_line.is_none());
+    }
+
+    #[test]
+    fn test_build_headers_returns_correct_headers() {
+        let config = test_config();
+        let client =
+            GitLabClient::<MockHttpClient>::with_http_client(config, MockHttpClient::new());
+        let headers = client.build_headers("gl-pat-12345");
+        assert_eq!(headers.len(), 4);
+
+        let private_token = headers
+            .iter()
+            .find(|(k, _)| *k == "PRIVATE-TOKEN")
+            .expect("should contain PRIVATE-TOKEN");
+        assert_eq!(private_token.1, "gl-pat-12345");
+
+        let accept = headers
+            .iter()
+            .find(|(k, _)| *k == "Accept")
+            .expect("should contain Accept");
+        assert_eq!(accept.1, "application/json");
+
+        let ua = headers
+            .iter()
+            .find(|(k, _)| *k == "User-Agent")
+            .expect("should contain User-Agent");
+        assert_eq!(ua.1, "claudear");
+    }
+
+    #[tokio::test]
+    async fn test_get_project_issues_with_labels() {
+        let mock = MockHttpClient::new();
+        // Labels only, no state filter
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/issues?per_page=100&labels=feature-request,enhancement",
+            200,
+            r#"[{
+                "iid": 10,
+                "title": "Labeled issue",
+                "description": null,
+                "state": "opened",
+                "web_url": "https://gitlab.com/group/repo/-/issues/10",
+                "labels": ["feature-request", "enhancement"],
+                "author": null,
+                "assignees": []
+            }]"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let labels = vec!["feature-request".to_string(), "enhancement".to_string()];
+        let issues = client
+            .get_project_issues("group/repo", &labels, None)
+            .await
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].iid, 10);
+        assert_eq!(issues[0].labels, vec!["feature-request", "enhancement"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_project_issues_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/issues?per_page=100",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.get_project_issues("group/repo", &[], None).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("500") || err_msg.contains("Internal Server Error"),
+            "expected error message to contain status info: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_diff_assembles_unified_diff() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/org%2Frepo/merge_requests/99/changes",
+            200,
+            r#"{"changes": [
+                {
+                    "old_path": "lib.rs",
+                    "new_path": "lib.rs",
+                    "diff": "@@ -10,3 +10,4 @@\n fn hello() {\n+    println!(\"world\");\n }\n"
+                }
+            ]}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let diff = client.get_pr_diff("org/repo", 99).await.unwrap();
+        assert!(diff.contains("--- a/lib.rs"));
+        assert!(diff.contains("+++ b/lib.rs"));
+        assert!(diff.contains("println!"));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_info_full_fields() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/org%2Frepo/merge_requests/7",
+            200,
+            r#"{
+                "iid": 7,
+                "state": "opened",
+                "source_branch": "feat/new-api",
+                "target_branch": "develop",
+                "title": "Implement new API endpoints",
+                "author": {"id": 42, "username": "engineer"}
+            }"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let info = client.get_pr_info("org/repo", 7).await.unwrap();
+        assert_eq!(info.head_branch, Some("feat/new-api".to_string()));
+        assert_eq!(info.base_branch, Some("develop".to_string()));
+        assert_eq!(info.title, Some("Implement new API endpoints".to_string()));
+        assert_eq!(info.author, Some("engineer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_repos_success_with_field_mapping() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/test-org/projects?per_page=100&page=1&include_subgroups=true",
+            200,
+            r#"[
+                {
+                    "id": 10,
+                    "path_with_namespace": "test-org/service-a",
+                    "name": "service-a",
+                    "default_branch": "main",
+                    "http_url_to_repo": "https://gitlab.com/test-org/service-a.git",
+                    "ssh_url_to_repo": "git@gitlab.com:test-org/service-a.git",
+                    "web_url": "https://gitlab.com/test-org/service-a",
+                    "visibility": "private",
+                    "archived": false
+                },
+                {
+                    "id": 11,
+                    "path_with_namespace": "test-org/service-b",
+                    "name": "service-b",
+                    "default_branch": "develop",
+                    "http_url_to_repo": "https://gitlab.com/test-org/service-b.git",
+                    "ssh_url_to_repo": "git@gitlab.com:test-org/service-b.git",
+                    "web_url": "https://gitlab.com/test-org/service-b",
+                    "visibility": "public",
+                    "archived": false
+                }
+            ]"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let repos = client.list_repos("test-org").await.unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].id, 10);
+        assert_eq!(repos[0].full_name, "test-org/service-a");
+        assert_eq!(repos[0].name, "service-a");
+        assert!(repos[0].private);
+        assert_eq!(repos[1].id, 11);
+        assert!(
+            !repos[1].private,
+            "public visibility should be private=false"
+        );
+        assert_eq!(repos[1].default_branch, "develop");
+    }
+
+    #[tokio::test]
+    async fn test_list_repos_not_found() {
+        let mock = MockHttpClient::new();
+        // Group returns 404
+        mock.mock_response(
+            "https://gitlab.com/api/v4/groups/does-not-exist/projects?per_page=100&page=1&include_subgroups=true",
+            404,
+            "Group not found",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.list_repos("does-not-exist").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.to_lowercase().contains("not found"),
+            "error should mention not found: {err_msg}"
+        );
     }
 }

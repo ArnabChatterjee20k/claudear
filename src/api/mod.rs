@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::storage::{FixAttemptTracker, SqliteTracker};
 use axum::http;
+use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_cookies::CookieManagerLayer;
@@ -113,9 +114,12 @@ impl ApiServer {
             self.dashboard_dir.clone(),
         )
         .layer(cors)
-        .layer(CookieManagerLayer::new());
+        .layer(CookieManagerLayer::new())
+        // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
+        .layer(SentryHttpLayer::new().enable_transaction())
+        .layer(NewSentryLayer::new_from_top());
 
-        let addr = format!("127.0.0.1:{}", self.port);
+        let addr = format!("{}:{}", self.config.bind_address, self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied && self.port < 1024 {
                 std::io::Error::new(

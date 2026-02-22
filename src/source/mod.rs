@@ -78,6 +78,33 @@ pub trait IssueSource: Send + Sync {
             || s == "closed"
             || s == "done"
     }
+
+    /// Create a new issue on the remote source.
+    async fn create_issue(
+        &self,
+        _title: &str,
+        _description: &str,
+        _labels: &[String],
+    ) -> Result<Issue> {
+        Err(crate::error::Error::Other(
+            "create_issue not supported by this source".into(),
+        ))
+    }
+
+    /// Find an existing label by name, or create it if it doesn't exist.
+    /// Returns the label ID.
+    async fn find_or_create_label(&self, _name: &str) -> Result<String> {
+        Err(crate::error::Error::Other(
+            "find_or_create_label not supported by this source".into(),
+        ))
+    }
+
+    /// List open issues, optionally filtering by title substring.
+    async fn list_open_issues(&self, _title_filter: &str) -> Result<Vec<Issue>> {
+        Err(crate::error::Error::Other(
+            "list_open_issues not supported by this source".into(),
+        ))
+    }
 }
 
 /// Registry for available sources.

@@ -18,7 +18,7 @@ pub struct IndexedRepo {
     /// Local filesystem path.
     pub path: PathBuf,
     /// GitHub URL inferred from org + name.
-    pub github_url: String,
+    pub scm_url: String,
     /// Relative file paths within the repository.
     pub files: Vec<String>,
     /// Default branch name.
@@ -29,11 +29,11 @@ impl IndexedRepo {
     /// Create a new indexed repository.
     pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         let name = name.into();
-        let github_url = format!("https://github.com/{}", name);
+        let scm_url = format!("https://github.com/{}", name);
         Self {
             name,
             path: path.into(),
-            github_url,
+            scm_url,
             files: Vec::new(),
             default_branch: "main".to_string(),
         }
@@ -44,7 +44,7 @@ impl IndexedRepo {
     /// The path is set to `work_dir/{repo_name}` where repos will be cloned.
     pub fn from_api(
         name: impl Into<String>,
-        github_url: impl Into<String>,
+        scm_url: impl Into<String>,
         default_branch: impl Into<String>,
         work_dir: &Path,
     ) -> Self {
@@ -55,15 +55,15 @@ impl IndexedRepo {
         Self {
             name,
             path,
-            github_url: github_url.into(),
+            scm_url: scm_url.into(),
             files: Vec::new(),
             default_branch: default_branch.into(),
         }
     }
 
     /// Set the GitHub URL.
-    pub fn with_github_url(mut self, url: impl Into<String>) -> Self {
-        self.github_url = url.into();
+    pub fn with_scm_url(mut self, url: impl Into<String>) -> Self {
+        self.scm_url = url.into();
         self
     }
 
@@ -587,15 +587,15 @@ mod tests {
     fn test_indexed_repo_new() {
         let repo = IndexedRepo::new("appwrite/cloud", "/path/to/cloud");
         assert_eq!(repo.name, "appwrite/cloud");
-        assert_eq!(repo.github_url, "https://github.com/appwrite/cloud");
+        assert_eq!(repo.scm_url, "https://github.com/appwrite/cloud");
         assert_eq!(repo.default_branch, "main");
     }
 
     #[test]
-    fn test_indexed_repo_with_github_url() {
+    fn test_indexed_repo_with_scm_url() {
         let repo =
-            IndexedRepo::new("test/repo", "/path").with_github_url("https://gitlab.com/test/repo");
-        assert_eq!(repo.github_url, "https://gitlab.com/test/repo");
+            IndexedRepo::new("test/repo", "/path").with_scm_url("https://gitlab.com/test/repo");
+        assert_eq!(repo.scm_url, "https://gitlab.com/test/repo");
     }
 
     #[test]
@@ -812,7 +812,7 @@ mod tests {
         );
 
         assert_eq!(repo.name, "test-org/my-repo");
-        assert_eq!(repo.github_url, "https://github.com/test-org/my-repo.git");
+        assert_eq!(repo.scm_url, "https://github.com/test-org/my-repo.git");
         assert_eq!(repo.default_branch, "develop");
         assert_eq!(repo.path, work_dir.join("my-repo"));
         assert!(repo.files.is_empty());
@@ -856,10 +856,7 @@ mod tests {
 
         assert_eq!(index.len(), 1);
         let found = index.get("test-org/test-repo").unwrap();
-        assert_eq!(
-            found.github_url,
-            "https://github.com/test-org/test-repo.git"
-        );
+        assert_eq!(found.scm_url, "https://github.com/test-org/test-repo.git");
     }
 
     #[test]
@@ -1141,7 +1138,7 @@ mod tests {
         }
 
         fn review_trigger(&self) -> &str {
-            "/claudear"
+            "@claudear"
         }
 
         async fn get_pr_status(&self, _project: &str, _number: i64) -> CrateResult<PrStatus> {
@@ -1294,7 +1291,7 @@ mod tests {
             .unwrap();
 
         let repo = index.get("team/service").unwrap();
-        assert_eq!(repo.github_url, "git@gitlab.com:team/service.git");
+        assert_eq!(repo.scm_url, "git@gitlab.com:team/service.git");
     }
 
     #[tokio::test]
@@ -1314,6 +1311,773 @@ mod tests {
             .unwrap();
 
         let repo = index.get("team/service").unwrap();
-        assert_eq!(repo.github_url, "https://gitlab.com/team/service.git");
+        assert_eq!(repo.scm_url, "https://gitlab.com/team/service.git");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  RepoIndex::merge
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_repo_index_merge() {
+        let mut index1 = RepoIndex::new();
+        let mut repo1 = IndexedRepo::new("org/repo1", "/path1");
+        repo1.files = vec!["a.rs".to_string()];
+        index1.add_repo(repo1);
+
+        let mut index2 = RepoIndex::new();
+        let mut repo2 = IndexedRepo::new("org/repo2", "/path2");
+        repo2.files = vec!["b.rs".to_string()];
+        index2.add_repo(repo2);
+
+        index1.merge(index2);
+
+        assert_eq!(index1.len(), 2);
+        assert!(index1.get("org/repo1").is_some());
+        assert!(index1.get("org/repo2").is_some());
+        assert_eq!(index1.total_files(), 2);
+    }
+
+    #[test]
+    fn test_repo_index_merge_overwrites_duplicate() {
+        let mut index1 = RepoIndex::new();
+        let mut repo1 = IndexedRepo::new("org/repo", "/path1");
+        repo1.files = vec!["old.rs".to_string()];
+        index1.add_repo(repo1);
+
+        let mut index2 = RepoIndex::new();
+        let mut repo2 = IndexedRepo::new("org/repo", "/path2");
+        repo2.files = vec!["new.rs".to_string()];
+        index2.add_repo(repo2);
+
+        index1.merge(index2);
+
+        assert_eq!(index1.len(), 1);
+        let repo = index1.get("org/repo").unwrap();
+        assert_eq!(repo.path, PathBuf::from("/path2"));
+        assert_eq!(repo.files, vec!["new.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_repo_index_merge_empty_into_populated() {
+        let mut index1 = RepoIndex::new();
+        let repo = IndexedRepo::new("org/repo", "/path");
+        index1.add_repo(repo);
+
+        let index2 = RepoIndex::new();
+        index1.merge(index2);
+
+        assert_eq!(index1.len(), 1);
+    }
+
+    #[test]
+    fn test_repo_index_merge_populated_into_empty() {
+        let mut index1 = RepoIndex::new();
+
+        let mut index2 = RepoIndex::new();
+        let mut repo = IndexedRepo::new("org/repo", "/path");
+        repo.files = vec!["x.rs".to_string()];
+        index2.add_repo(repo);
+
+        index1.merge(index2);
+
+        assert_eq!(index1.len(), 1);
+        assert!(index1.get("org/repo").is_some());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  RepoIndex::Default trait
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_repo_index_default() {
+        let index = RepoIndex::default();
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.total_files(), 0);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  index_files - various excluded directories
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_index_files_skips_vendor_dir() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+
+        std::fs::write(repo_dir.join("src.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir(repo_dir.join("vendor")).unwrap();
+        std::fs::write(repo_dir.join("vendor/pkg.rs"), "// vendor").unwrap();
+
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        let indexed = index_files(repo);
+
+        assert_eq!(indexed.files.len(), 1);
+        assert!(indexed.files[0].contains("src.rs"));
+    }
+
+    #[test]
+    fn test_index_files_skips_target_dir() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+
+        std::fs::write(repo_dir.join("main.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir(repo_dir.join("target")).unwrap();
+        std::fs::write(repo_dir.join("target/debug.rs"), "// target").unwrap();
+
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        let indexed = index_files(repo);
+
+        assert_eq!(indexed.files.len(), 1);
+        assert!(indexed.files[0].contains("main.rs"));
+    }
+
+    #[test]
+    fn test_index_files_skips_build_dir() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+
+        std::fs::write(repo_dir.join("app.js"), "// app").unwrap();
+        std::fs::create_dir(repo_dir.join("build")).unwrap();
+        std::fs::write(repo_dir.join("build/output.js"), "// build").unwrap();
+
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        let indexed = index_files(repo);
+
+        assert_eq!(indexed.files.len(), 1);
+        assert!(indexed.files[0].contains("app.js"));
+    }
+
+    #[test]
+    fn test_index_files_skips_dist_dir() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+
+        std::fs::write(repo_dir.join("index.ts"), "// src").unwrap();
+        std::fs::create_dir(repo_dir.join("dist")).unwrap();
+        std::fs::write(repo_dir.join("dist/bundle.js"), "// dist").unwrap();
+
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        let indexed = index_files(repo);
+
+        assert_eq!(indexed.files.len(), 1);
+        assert!(indexed.files[0].contains("index.ts"));
+    }
+
+    #[test]
+    fn test_index_files_skips_pycache_dir() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+
+        std::fs::write(repo_dir.join("app.py"), "# app").unwrap();
+        std::fs::create_dir(repo_dir.join("__pycache__")).unwrap();
+        std::fs::write(repo_dir.join("__pycache__/app.pyc"), "# cache").unwrap();
+
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        let indexed = index_files(repo);
+
+        assert_eq!(indexed.files.len(), 1);
+        assert!(indexed.files[0].contains("app.py"));
+    }
+
+    #[test]
+    fn test_index_files_includes_nested_visible_dirs() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir_all(repo_dir.join("src/nested/deep")).unwrap();
+
+        std::fs::write(repo_dir.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(repo_dir.join("src/nested/mod.rs"), "mod inner;").unwrap();
+        std::fs::write(repo_dir.join("src/nested/deep/inner.rs"), "// inner").unwrap();
+
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        let indexed = index_files(repo);
+
+        assert_eq!(indexed.files.len(), 3);
+        let file_strs: Vec<&str> = indexed.files.iter().map(|s| s.as_str()).collect();
+        assert!(file_strs.iter().any(|f| f.contains("main.rs")));
+        assert!(file_strs.iter().any(|f| f.contains("mod.rs")));
+        assert!(file_strs.iter().any(|f| f.contains("inner.rs")));
+    }
+
+    #[test]
+    fn test_index_files_empty_directory() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        let indexed = index_files(repo);
+
+        assert!(indexed.files.is_empty());
+    }
+
+    #[test]
+    fn test_index_files_nonexistent_directory() {
+        let repo = IndexedRepo::new("test/repo", "/nonexistent/path/xyz");
+        let indexed = index_files(repo);
+        assert!(indexed.files.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  parse_repo_name_from_url - additional edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_parse_repo_name_ssh_gitlab() {
+        let name = parse_repo_name_from_url("git@gitlab.com:group/project.git");
+        assert_eq!(name, Some("group/project".to_string()));
+    }
+
+    #[test]
+    fn test_parse_repo_name_https_nested_path() {
+        // A URL with a deeper path should still return the last two components
+        let name = parse_repo_name_from_url("https://gitlab.com/group/subgroup/repo.git");
+        assert_eq!(name, Some("subgroup/repo".to_string()));
+    }
+
+    #[test]
+    fn test_parse_repo_name_just_slash() {
+        let name = parse_repo_name_from_url("/");
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn test_parse_repo_name_single_component() {
+        // URL with only one path component
+        let name = parse_repo_name_from_url("https://github.com/onlyrepo");
+        // parts.len() >= 2 but the second-to-last is "github.com" and last is "onlyrepo"
+        assert_eq!(name, Some("github.com/onlyrepo".to_string()));
+    }
+
+    #[test]
+    fn test_parse_repo_name_ssh_with_port_like_format() {
+        // Some SSH URLs have unusual formats
+        let name = parse_repo_name_from_url("git@github.com:org/repo.git");
+        assert_eq!(name, Some("org/repo".to_string()));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  find_by_file - various path formats
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_find_by_file_full_path_match_takes_priority() {
+        let mut index = RepoIndex::new();
+
+        let mut repo1 = IndexedRepo::new("org/repo1", "/path1");
+        repo1.files = vec!["src/utils.rs".to_string()];
+        index.add_repo(repo1);
+
+        let mut repo2 = IndexedRepo::new("org/repo2", "/path2");
+        repo2.files = vec!["lib/utils.rs".to_string()];
+        index.add_repo(repo2);
+
+        // Full path match should find exact repo
+        let found = index.find_by_file("src/utils.rs");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "org/repo1");
+
+        let found = index.find_by_file("lib/utils.rs");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "org/repo2");
+    }
+
+    #[test]
+    fn test_find_by_file_vendor_path_with_deep_nesting() {
+        let mut index = RepoIndex::new();
+
+        let repo = IndexedRepo::new("myorg/mylib", "/path");
+        index.add_repo(repo);
+
+        let found = index.find_by_file("/app/vendor/myorg/mylib/src/deep/nested/File.php");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "myorg/mylib");
+    }
+
+    #[test]
+    fn test_find_by_file_vendor_path_no_match_in_index() {
+        let index = RepoIndex::new();
+
+        // Vendor path but repo not in index
+        let found = index.find_by_file("/app/vendor/unknown/lib/src/File.php");
+        assert!(found.is_none());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  search_files - additional scenarios
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_search_files_across_multiple_repos() {
+        let mut index = RepoIndex::new();
+
+        let mut repo1 = IndexedRepo::new("org/frontend", "/path1");
+        repo1.files = vec![
+            "src/components/Button.tsx".to_string(),
+            "src/components/Modal.tsx".to_string(),
+        ];
+        index.add_repo(repo1);
+
+        let mut repo2 = IndexedRepo::new("org/backend", "/path2");
+        repo2.files = vec!["src/api/routes.rs".to_string()];
+        index.add_repo(repo2);
+
+        let results = index.search_files(".tsx");
+        assert_eq!(results.len(), 2);
+
+        let results = index.search_files("routes");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.name, "org/backend");
+    }
+
+    #[test]
+    fn test_search_files_case_insensitive() {
+        let mut index = RepoIndex::new();
+
+        let mut repo = IndexedRepo::new("org/repo", "/path");
+        repo.files = vec!["src/MyComponent.tsx".to_string()];
+        index.add_repo(repo);
+
+        let results = index.search_files("mycomponent");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_files_empty_query() {
+        let mut index = RepoIndex::new();
+
+        let mut repo = IndexedRepo::new("org/repo", "/path");
+        repo.files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        index.add_repo(repo);
+
+        // Empty query should match everything
+        let results = index.search_files("");
+        assert_eq!(results.len(), 2);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  IndexedRepo::from_api - edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_indexed_repo_from_api_deep_org_path() {
+        let work_dir = PathBuf::from("/repos");
+        let repo = IndexedRepo::from_api(
+            "org/subgroup/project",
+            "https://gitlab.com/org/subgroup/project.git",
+            "main",
+            &work_dir,
+        );
+
+        // next_back() on "org/subgroup/project" gives "project"
+        assert_eq!(repo.path, work_dir.join("project"));
+        assert_eq!(repo.name, "org/subgroup/project");
+    }
+
+    #[test]
+    fn test_indexed_repo_from_api_no_slash_in_name() {
+        let work_dir = PathBuf::from("/repos");
+        let repo = IndexedRepo::from_api(
+            "standalone",
+            "https://github.com/org/standalone.git",
+            "develop",
+            &work_dir,
+        );
+
+        assert_eq!(repo.path, work_dir.join("standalone"));
+        assert_eq!(repo.default_branch, "develop");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  expand_path - additional cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_expand_path_tilde_with_nested() {
+        let expanded = expand_path("~/a/b/c");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expanded, home.join("a/b/c"));
+        }
+    }
+
+    #[test]
+    fn test_expand_path_no_tilde_prefix() {
+        // A path that contains ~ but not at the start
+        let expanded = expand_path("/home/user~backup/data");
+        assert_eq!(expanded, PathBuf::from("/home/user~backup/data"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  RepoIndex::index_repo_files - edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_index_repo_files_updates_file_index() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("newly_created.rs"), "fn test() {}").unwrap();
+
+        let mut index = RepoIndex::new();
+        // Add repo initially with no files
+        let repo = IndexedRepo::new("test/repo", &repo_dir);
+        index.add_repo(repo);
+
+        assert_eq!(index.total_files(), 0);
+
+        // Index files - should pick up the file
+        let count = index.index_repo_files("test/repo");
+        assert_eq!(count, Some(1));
+
+        // Now the file should be findable
+        let found = index.find_by_file("newly_created.rs");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "test/repo");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  RepoIndex::build - with temp directory
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_build_nonexistent_path_returns_empty() {
+        let result = RepoIndex::build(
+            &["someorg".to_string()],
+            &["/nonexistent/path/xyz/abc".to_string()],
+        );
+        assert!(result.is_ok());
+        let index = result.unwrap();
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_build_empty_orgs_and_paths() {
+        let result = RepoIndex::build(&[], &[]);
+        assert!(result.is_ok());
+        let index = result.unwrap();
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_build_with_empty_dir() {
+        let temp = TempDir::new().unwrap();
+        let result = RepoIndex::build(
+            &["someorg".to_string()],
+            &[temp.path().to_string_lossy().to_string()],
+        );
+        assert!(result.is_ok());
+        let index = result.unwrap();
+        // No git repos inside, so should be empty
+        assert!(index.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  IndexedRepo::has_file / find_files - edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_has_file_partial_match() {
+        let mut repo = IndexedRepo::new("test/repo", "/path");
+        repo.files = vec!["src/controllers/UserController.php".to_string()];
+
+        // "Controller" appears as a substring
+        assert!(repo.has_file("Controller"));
+        // "User" appears as a substring
+        assert!(repo.has_file("User"));
+        // Full path works
+        assert!(repo.has_file("src/controllers/UserController.php"));
+    }
+
+    #[test]
+    fn test_find_files_returns_full_relative_paths() {
+        let mut repo = IndexedRepo::new("test/repo", "/path");
+        repo.files = vec!["src/a/file1.rs".to_string(), "src/b/file2.rs".to_string()];
+
+        let results = repo.find_files("src");
+        assert_eq!(results.len(), 2);
+        // Results should be full relative paths
+        assert!(results.contains(&"src/a/file1.rs"));
+        assert!(results.contains(&"src/b/file2.rs"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  build_from_gitlab - no groups
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_build_from_gitlab_no_groups() {
+        let provider = MockScmProvider::with_repos(vec![]);
+        let work_dir = PathBuf::from("/tmp/repos");
+        let groups: Vec<String> = vec![];
+
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+            .await
+            .unwrap();
+
+        assert!(index.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  File index - basename collision
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_file_index_basename_collision() {
+        let mut index = RepoIndex::new();
+
+        // Two repos with files that share a basename
+        let mut repo1 = IndexedRepo::new("org/repo1", "/path1");
+        repo1.files = vec!["src/utils.rs".to_string()];
+        index.add_repo(repo1);
+
+        let mut repo2 = IndexedRepo::new("org/repo2", "/path2");
+        repo2.files = vec!["lib/utils.rs".to_string()];
+        index.add_repo(repo2);
+
+        // Basename "utils.rs" will be overwritten by the second add_repo call
+        // The exact behavior depends on insertion order
+        let found = index.find_by_file("utils.rs");
+        assert!(found.is_some());
+        // Should be one of the repos (last one wins)
+        let name = &found.unwrap().name;
+        assert!(name == "org/repo1" || name == "org/repo2");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Multiple merge operations
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_repo_index_multiple_merges() {
+        let mut base = RepoIndex::new();
+
+        for i in 0..3 {
+            let mut idx = RepoIndex::new();
+            let repo = IndexedRepo::new(format!("org/repo{}", i), format!("/path{}", i));
+            idx.add_repo(repo);
+            base.merge(idx);
+        }
+
+        assert_eq!(base.len(), 3);
+        for i in 0..3 {
+            assert!(base.get(&format!("org/repo{}", i)).is_some());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  build_with_fallback - various strategies
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_build_with_fallback_local_paths_preferred() {
+        let temp = TempDir::new().unwrap();
+        // No repos in temp, but this tests that strategy 1 is chosen
+        let paths = vec![temp.path().to_string_lossy().to_string()];
+        let orgs: Vec<String> = vec!["test-org".to_string()];
+        let work_dir = PathBuf::from("/tmp/repos");
+
+        let index = RepoIndex::build_with_fallback(
+            &orgs,
+            &paths,
+            None, // no github
+            None, // no gitlab
+            &[],  // no groups
+            &work_dir,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // No actual repos in temp dir, but the function returned without error
+        assert!(index.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_with_fallback_gitlab_strategy() {
+        let repos = vec![make_remote_repo(
+            "group/repo-a",
+            "https://gitlab.com/group/repo-a.git",
+            "git@gitlab.com:group/repo-a.git",
+            "main",
+        )];
+        let provider = MockScmProvider::with_repos(repos);
+        let work_dir = PathBuf::from("/tmp/repos");
+        let groups = vec!["group".to_string()];
+
+        let index = RepoIndex::build_with_fallback(
+            &[],             // no orgs
+            &[],             // no local paths
+            None,            // no github
+            Some(&provider), // gitlab available
+            &groups,
+            &work_dir,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(index.len(), 1);
+        assert!(index.get("group/repo-a").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_build_with_fallback_empty_returns_empty() {
+        let work_dir = PathBuf::from("/tmp/repos");
+
+        let index = RepoIndex::build_with_fallback(
+            &[],  // no orgs
+            &[],  // no local paths
+            None, // no github
+            None, // no gitlab
+            &[],  // no groups
+            &work_dir,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(index.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_with_fallback_disabled_gitlab_returns_empty() {
+        // Provider with repos but not enabled (no groups)
+        let provider = MockScmProvider::with_repos(vec![make_remote_repo(
+            "group/repo",
+            "https://gitlab.com/group/repo.git",
+            "git@gitlab.com:group/repo.git",
+            "main",
+        )]);
+        let work_dir = PathBuf::from("/tmp/repos");
+
+        let index = RepoIndex::build_with_fallback(
+            &[],             // no orgs
+            &[],             // no local paths
+            None,            // no github
+            Some(&provider), // gitlab available but...
+            &[],             // no groups => won't use gitlab
+            &work_dir,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(index.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  index_repo_files - not found repo
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_index_repo_files_nonexistent_repo() {
+        let mut index = RepoIndex::new();
+        let result = index.index_repo_files("nonexistent/repo");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_index_repo_files_after_adding_files() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("myrepo");
+        std::fs::create_dir(&repo_dir).unwrap();
+
+        let mut index = RepoIndex::new();
+        let repo = IndexedRepo::new("org/myrepo", &repo_dir);
+        index.add_repo(repo);
+
+        // Initially no files
+        assert_eq!(index.total_files(), 0);
+
+        // Create a file
+        std::fs::write(repo_dir.join("main.rs"), "fn main() {}").unwrap();
+
+        // Re-index
+        let count = index.index_repo_files("org/myrepo");
+        assert_eq!(count, Some(1));
+        assert_eq!(index.total_files(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  IndexedRepo::new edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_indexed_repo_default_branch() {
+        let repo = IndexedRepo::new("org/repo", "/path");
+        assert_eq!(repo.default_branch, "main");
+        assert!(repo.files.is_empty());
+        assert_eq!(repo.name, "org/repo");
+    }
+
+    #[test]
+    fn test_indexed_repo_from_api_sets_branch() {
+        let work_dir = PathBuf::from("/repos");
+        let repo = IndexedRepo::from_api(
+            "org/myrepo",
+            "https://github.com/org/myrepo.git",
+            "develop",
+            &work_dir,
+        );
+
+        assert_eq!(repo.default_branch, "develop");
+        assert_eq!(repo.scm_url, "https://github.com/org/myrepo.git");
+        assert_eq!(repo.path, work_dir.join("myrepo"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  RepoIndex::list
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_list_empty() {
+        let index = RepoIndex::new();
+        let repos = index.list();
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn test_list_multiple() {
+        let mut index = RepoIndex::new();
+        index.add_repo(IndexedRepo::new("org/a", "/a"));
+        index.add_repo(IndexedRepo::new("org/b", "/b"));
+        index.add_repo(IndexedRepo::new("org/c", "/c"));
+
+        let repos = index.list();
+        assert_eq!(repos.len(), 3);
+
+        let names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"org/a"));
+        assert!(names.contains(&"org/b"));
+        assert!(names.contains(&"org/c"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  search_files - additional scenarios
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_search_files_empty_index() {
+        let index = RepoIndex::new();
+        let results = index.search_files("something");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_files_finds_by_keyword() {
+        let mut index = RepoIndex::new();
+        let mut repo = IndexedRepo::new("org/auth-service", "/path");
+        repo.files = vec!["src/auth.rs".to_string()];
+        index.add_repo(repo);
+
+        let results = index.search_files("auth");
+        assert!(!results.is_empty());
     }
 }

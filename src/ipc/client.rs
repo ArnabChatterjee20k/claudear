@@ -398,4 +398,161 @@ mod tests {
         let result = client.trigger("linear", "LIN-1").await;
         assert!(result.is_err());
     }
+
+    // === print_response tests ===
+
+    use super::super::protocol::{ActivityEntry, ActivityType, WatcherState};
+    use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
+
+    #[test]
+    fn test_print_response_ok_none() {
+        let response = IpcResponse::Ok(IpcData::None);
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_pong() {
+        let response = IpcResponse::Ok(IpcData::Pong);
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_message() {
+        let response = IpcResponse::Ok(IpcData::Message("hello".to_string()));
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_error() {
+        let response = IpcResponse::Error {
+            message: "something went wrong".to_string(),
+        };
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_state() {
+        let state = WatcherState {
+            running: true,
+            paused: false,
+            mode: "poll".to_string(),
+            uptime_secs: 3600,
+            issues_processed: 42,
+            prs_created: 7,
+            processing: vec!["LIN-1".to_string(), "LIN-2".to_string()],
+            sources: vec!["linear".to_string(), "sentry".to_string()],
+            poll_interval_ms: Some(60_000),
+        };
+        let response = IpcResponse::Ok(IpcData::State(state));
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_stats() {
+        let stats = FixAttemptStats {
+            total: 10,
+            pending: 2,
+            success: 5,
+            failed: 2,
+            merged: 1,
+            closed: 0,
+            cannot_fix: 0,
+            by_source: std::collections::HashMap::new(),
+        };
+        let response = IpcResponse::Ok(IpcData::Stats(stats));
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_attempts_empty() {
+        let response = IpcResponse::Ok(IpcData::Attempts(vec![]));
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_attempts() {
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "abc123".to_string(),
+            short_id: "LIN-1".to_string(),
+            source: "linear".to_string(),
+            attempted_at: chrono::Utc::now(),
+            pr_url: Some("https://github.com/org/repo/pull/42".to_string()),
+            scm_repo: None,
+            scm_pr_number: None,
+            status: FixAttemptStatus::Success,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        let response = IpcResponse::Ok(IpcData::Attempts(vec![attempt]));
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_triggered() {
+        // With pr_url
+        let response = IpcResponse::Ok(IpcData::Triggered {
+            source: "linear".to_string(),
+            issue_id: "LIN-1".to_string(),
+            pr_url: Some("https://github.com/org/repo/pull/99".to_string()),
+        });
+        print_response(&response);
+
+        // Without pr_url
+        let response = IpcResponse::Ok(IpcData::Triggered {
+            source: "sentry".to_string(),
+            issue_id: "SENTRY-42".to_string(),
+            pr_url: None,
+        });
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_reset() {
+        let response = IpcResponse::Ok(IpcData::Reset {
+            source: "linear".to_string(),
+            issue_id: "LIN-5".to_string(),
+        });
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_retries() {
+        let response = IpcResponse::Ok(IpcData::RetriesProcessed { count: 3 });
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_activity_empty() {
+        let response = IpcResponse::Ok(IpcData::Activity(vec![]));
+        print_response(&response);
+    }
+
+    #[test]
+    fn test_print_response_activity() {
+        let entries = vec![
+            ActivityEntry {
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                activity_type: ActivityType::IssueDetected,
+                message: "Detected new issue".to_string(),
+                issue_id: Some("LIN-1".to_string()),
+                source: Some("linear".to_string()),
+            },
+            ActivityEntry {
+                timestamp: "2025-01-01T00:01:00Z".to_string(),
+                activity_type: ActivityType::PrCreated,
+                message: "PR created".to_string(),
+                issue_id: None,
+                source: None,
+            },
+        ];
+        let response = IpcResponse::Ok(IpcData::Activity(entries));
+        print_response(&response);
+    }
 }

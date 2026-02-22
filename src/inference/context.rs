@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 /// These are compiled once at first use and reused for all subsequent calls.
 static PATH_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(
-        r#"(?:^|[\s"'`(;])([a-zA-Z0-9_./\\-]+\.(rs|js|ts|tsx|jsx|py|php|go|java|rb|swift|kt|c|cpp|h|hpp|cs|vue|svelte|html|css|scss|sass|yaml|yml|json|xml|md))\b"#
+        r#"(?:^|[\s"'`(;\[])([a-zA-Z0-9_./\\-]+\.(rs|js|ts|tsx|jsx|py|php|go|java|rb|swift|kt|c|cpp|h|hpp|cs|vue|svelte|html|css|scss|sass|yaml|yml|json|xml|md))\b"#
     ).ok()
 });
 

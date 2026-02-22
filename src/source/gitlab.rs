@@ -509,8 +509,6 @@ mod tests {
         assert!(!context.contains("## Description"));
     }
 
-    // ── Async integration tests for IssueSource methods ──────────────────
-
     #[tokio::test]
     async fn test_get_issue_invalid_id_no_colon() {
         let source = GitLabSource::new(test_config());
@@ -737,8 +735,6 @@ mod tests {
         assert!(context.contains("**Title:** No description issue"));
         assert!(!context.contains("## Description"));
     }
-
-    // ── fetch_issues deduplication test via mock HTTP client ──────────────
 
     /// Mock HTTP client for testing fetch_issues deduplication logic.
     /// Reuses the same pattern as the GitLabClient test module.

@@ -334,8 +334,6 @@ mod tests {
         assert_eq!(result[0].blast_radius, crate::types::BlastRadius::Critical);
     }
 
-    // ── New integration tests ──────────────────────────────────────────
-
     #[test]
     fn test_empty_candidates() {
         let config = PrioritisationConfig::default();
@@ -785,8 +783,6 @@ mod tests {
         assert!(stored[0].cluster_key.contains("TypeError"));
         assert!(stored[0].cluster_key.contains("payment.handler"));
     }
-
-    // ── Comprehensive bug-hunting tests ─────────────────────────────────
 
     // --- Edge cases for the `prioritise` orchestrator ---
 

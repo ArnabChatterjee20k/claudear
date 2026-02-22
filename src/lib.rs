@@ -73,8 +73,9 @@ pub use feedback::{
 pub use github::GitHubClient;
 pub use gitlab::GitLabClient;
 pub use scm::{
-    CodeReview, OrgRepo, PrInfo, PrMonitor, PrReview, PrReviewComment, PrReviewState, PrStatus,
-    PrStatusUpdate, RemoteRepo, ReviewComment, ReviewEvent, ReviewUser, ReviewWatcher, ScmProvider,
+    CodeReview, OrgRepo, PostReviewAction, PrInfo, PrMonitor, PrReview, PrReviewComment,
+    PrReviewState, PrStatus, PrStatusUpdate, PrSummary, RemoteRepo, ReviewComment, ReviewEvent,
+    ReviewUser, ReviewWatcher, ScmProvider,
 };
 // Backward-compat alias
 pub use github_app::{

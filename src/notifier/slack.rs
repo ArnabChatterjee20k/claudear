@@ -414,15 +414,6 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
             Some(answer.to_string())
         }
     }
-
-    fn extract_reply_text_with_token(content: &str, correlation_id: &str) -> Option<String> {
-        let token = format!("[CLAUDEAR-Q:{}]", correlation_id);
-        if !content.contains(&token) {
-            return None;
-        }
-        let cleaned = content.replace(&token, "");
-        Self::extract_reply_text(&cleaned)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -490,14 +481,24 @@ pub(crate) fn build_success_message(
     let pr_url_truncated = truncate_string(pr_url, MAX_URL_LENGTH);
     let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
 
-    let mut fallback = format!("\u{2705} PR Created: {} - {}", short_id, pr_url_truncated);
+    let is_update = issue.get_metadata::<bool>("is_pr_update").unwrap_or(false);
+    let header_label = if is_update {
+        "PR Updated"
+    } else {
+        "PR Created"
+    };
+
+    let mut fallback = format!(
+        "\u{2705} {}: {} - {}",
+        header_label, short_id, pr_url_truncated
+    );
     if let Some(ref m) = mention {
         fallback = format!("{} {}", m, fallback);
     }
 
     let mut blocks = vec![
         SlackBlock::Header {
-            text: SlackText::plain_text(format!("\u{2705} PR Created: {}", short_id)),
+            text: SlackText::plain_text(format!("\u{2705} {}: {}", header_label, short_id)),
         },
         SlackBlock::Section {
             text: SlackText::mrkdwn(format!("*<{}|{}>*", pr_url_truncated, title)),
@@ -511,6 +512,12 @@ pub(crate) fn build_success_message(
             fields: None,
         },
     ];
+    if let Some(changelog) = issue.get_metadata::<String>("changelog") {
+        blocks.push(SlackBlock::Section {
+            text: SlackText::mrkdwn(format!("*Changes:*\n{}", truncate_string(&changelog, 1000))),
+            fields: None,
+        });
+    }
     if let Some(ref m) = mention {
         blocks.push(SlackBlock::Context {
             elements: vec![SlackText::mrkdwn(m.clone())],
@@ -760,6 +767,253 @@ pub(crate) fn build_merged_message(
     }
 }
 
+/// Build the Slack message for a "PR closed" notification.
+pub(crate) fn build_closed_message(
+    issue: &Issue,
+    pr_url: &str,
+    mention: Option<String>,
+) -> SlackMessage {
+    let emoji = get_source_emoji(&issue.source);
+    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+    let pr_url_truncated = truncate_string(pr_url, MAX_URL_LENGTH);
+
+    let header = format!("{} PR Closed: {}", emoji, short_id);
+    let mut blocks = vec![
+        SlackBlock::Header {
+            text: SlackText::plain_text(&header),
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn(format!(
+                "*{}*\nPR was closed without merging",
+                truncate_string(&issue.title, MAX_DESCRIPTION_LENGTH)
+            )),
+            fields: None,
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn(format!("<{}|View PR>", pr_url_truncated)),
+            fields: None,
+        },
+    ];
+    if let Some(ref m) = mention {
+        blocks.insert(
+            0,
+            SlackBlock::Section {
+                text: SlackText::mrkdwn(m.clone()),
+                fields: None,
+            },
+        );
+    }
+
+    SlackMessage {
+        channel: None,
+        text: header,
+        blocks: Some(blocks),
+        thread_ts: None,
+    }
+}
+
+/// Build the Slack message for a cascade PR success notification.
+pub(crate) fn build_cascade_success_message(
+    issue: &Issue,
+    pr_url: &str,
+    mention: Option<String>,
+) -> SlackMessage {
+    let upstream = issue
+        .get_metadata::<String>("cascade_upstream_repo")
+        .unwrap_or_default();
+    let downstream = issue
+        .get_metadata::<String>("cascade_downstream_repo")
+        .unwrap_or_default();
+    let pr_url_truncated = truncate_string(pr_url, MAX_URL_LENGTH);
+
+    let header = format!(
+        "\u{1F517} Cascade PR: {}",
+        truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH)
+    );
+    let mut blocks = vec![
+        SlackBlock::Header {
+            text: SlackText::plain_text(&header),
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn(format!("Downstream adaptation for *{}*", downstream)),
+            fields: Some(vec![
+                SlackText::mrkdwn(format!("*Upstream*\n{}", upstream)),
+                SlackText::mrkdwn(format!("*Downstream*\n{}", downstream)),
+            ]),
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn(format!("<{}|View PR>", pr_url_truncated)),
+            fields: None,
+        },
+    ];
+    if let Some(ref m) = mention {
+        blocks.insert(
+            0,
+            SlackBlock::Section {
+                text: SlackText::mrkdwn(m.clone()),
+                fields: None,
+            },
+        );
+    }
+
+    SlackMessage {
+        channel: None,
+        text: header,
+        blocks: Some(blocks),
+        thread_ts: None,
+    }
+}
+
+/// Build the Slack message for a cascade PR failure notification.
+pub(crate) fn build_cascade_failed_message(
+    issue: &Issue,
+    error: &str,
+    mention: Option<String>,
+) -> SlackMessage {
+    let upstream = issue
+        .get_metadata::<String>("cascade_upstream_repo")
+        .unwrap_or_default();
+    let downstream = issue
+        .get_metadata::<String>("cascade_downstream_repo")
+        .unwrap_or_default();
+
+    let header = format!(
+        "\u{26A0}\u{FE0F} Cascade Failed: {}",
+        truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH)
+    );
+    let error_truncated = if error.len() > 500 {
+        format!("{}...", &error[..error.floor_char_boundary(497)])
+    } else {
+        error.to_string()
+    };
+    let mut blocks = vec![
+        SlackBlock::Header {
+            text: SlackText::plain_text(&header),
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn(format!("Failed to adapt *{}*", downstream)),
+            fields: Some(vec![
+                SlackText::mrkdwn(format!("*Upstream*\n{}", upstream)),
+                SlackText::mrkdwn(format!("*Downstream*\n{}", downstream)),
+            ]),
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn(format!("*Error*\n```{}```", error_truncated)),
+            fields: None,
+        },
+    ];
+    if let Some(ref m) = mention {
+        blocks.insert(
+            0,
+            SlackBlock::Section {
+                text: SlackText::mrkdwn(m.clone()),
+                fields: None,
+            },
+        );
+    }
+
+    SlackMessage {
+        channel: None,
+        text: header,
+        blocks: Some(blocks),
+        thread_ts: None,
+    }
+}
+
+/// Build the Slack message for a regression detected notification.
+pub(crate) fn build_regression_detected_message(
+    issue: &Issue,
+    error: &str,
+    mention: Option<String>,
+) -> SlackMessage {
+    let emoji = get_source_emoji(&issue.source);
+    let header = format!(
+        "{} Regression Detected: {}",
+        emoji,
+        truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH)
+    );
+    let error_truncated = if error.len() > 500 {
+        format!("{}...", &error[..error.floor_char_boundary(497)])
+    } else {
+        error.to_string()
+    };
+    let mut blocks = vec![
+        SlackBlock::Header {
+            text: SlackText::plain_text(&header),
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn("A previously fixed issue has regressed".to_string()),
+            fields: None,
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn(format!("*Details*\n{}", error_truncated)),
+            fields: None,
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn("_Retry has been scheduled_".to_string()),
+            fields: None,
+        },
+    ];
+    if let Some(ref m) = mention {
+        blocks.insert(
+            0,
+            SlackBlock::Section {
+                text: SlackText::mrkdwn(m.clone()),
+                fields: None,
+            },
+        );
+    }
+
+    SlackMessage {
+        channel: None,
+        text: header,
+        blocks: Some(blocks),
+        thread_ts: None,
+    }
+}
+
+/// Build the Slack message for a regression resolved notification.
+pub(crate) fn build_regression_resolved_message(
+    issue: &Issue,
+    mention: Option<String>,
+) -> SlackMessage {
+    let emoji = get_source_emoji(&issue.source);
+    let header = format!(
+        "{} Regression Resolved: {}",
+        emoji,
+        truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH)
+    );
+    let mut blocks = vec![
+        SlackBlock::Header {
+            text: SlackText::plain_text(&header),
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn("No regression detected after monitoring period".to_string()),
+            fields: None,
+        },
+        SlackBlock::Section {
+            text: SlackText::mrkdwn("_Issue resolved after final check_".to_string()),
+            fields: None,
+        },
+    ];
+    if let Some(ref m) = mention {
+        blocks.insert(
+            0,
+            SlackBlock::Section {
+                text: SlackText::mrkdwn(m.clone()),
+                fields: None,
+            },
+        );
+    }
+
+    SlackMessage {
+        channel: None,
+        text: header,
+        blocks: Some(blocks),
+        thread_ts: None,
+    }
+}
+
 /// Build the Slack message for a scheduled report.
 pub(crate) fn build_report_message(report: &Report) -> SlackMessage {
     let text = report.format_text();
@@ -801,7 +1055,6 @@ pub(crate) fn build_ask_question_message(
     request: &AskRequest,
     mention: Option<String>,
 ) -> SlackMessage {
-    let token = format!("[CLAUDEAR-Q:{}]", request.correlation_id);
     let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
 
     let mut text = String::new();
@@ -810,8 +1063,8 @@ pub(crate) fn build_ask_question_message(
         text.push(' ');
     }
     text.push_str(&format!(
-        "{} Human input needed for {}:\n{}",
-        token, short_id, request.question.question
+        "Human input needed for {}:\n{}",
+        short_id, request.question.question
     ));
     if let Some(ref why) = request.question.why {
         text.push_str(&format!("\nWhy: {}", why));
@@ -856,18 +1109,48 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_success_message(issue, pr_url, mention))
-            .await
+        if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            self.send(build_cascade_success_message(issue, pr_url, mention))
+                .await
+        } else {
+            self.send(build_success_message(issue, pr_url, mention))
+                .await
+        }
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_completed_message(issue, mention)).await
+        if issue
+            .get_metadata::<bool>("regression_resolved")
+            .unwrap_or(false)
+        {
+            self.send(build_regression_resolved_message(issue, mention))
+                .await
+        } else {
+            self.send(build_completed_message(issue, mention)).await
+        }
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_failed_message(issue, error, mention)).await
+        if issue
+            .get_metadata::<bool>("regression_detected")
+            .unwrap_or(false)
+        {
+            self.send(build_regression_detected_message(issue, error, mention))
+                .await
+        } else if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            self.send(build_cascade_failed_message(issue, error, mention))
+                .await
+        } else {
+            self.send(build_failed_message(issue, error, mention)).await
+        }
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
@@ -885,6 +1168,12 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
     async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
         self.send(build_merged_message(issue, pr_url, mention))
+            .await
+    }
+
+    async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let mention = self.get_user_mention_for_issue(issue);
+        self.send(build_closed_message(issue, pr_url, mention))
             .await
     }
 
@@ -925,7 +1214,10 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
         };
 
         let expected_user = self.expected_reply_user_id(request);
-        let correlation_token = format!("[CLAUDEAR-Q:{}]", request.correlation_id);
+
+        // Identify question messages by "Human input needed for {short_id}" text + bot_id,
+        // matching Discord's approach of using message content patterns instead of correlation tokens.
+        let ask_prefix = format!("Human input needed for {}", request.short_id);
 
         // Step 1: Fetch recent channel history to find our question messages.
         let since_ts = format!("{}.000000", since.timestamp());
@@ -951,10 +1243,10 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
 
         let messages = history.messages.unwrap_or_default();
 
-        // Find question messages with our correlation token.
+        // Find question messages by text pattern (bot messages containing our ask prefix).
         let question_messages: Vec<&SlackApiMessage> = messages
             .iter()
-            .filter(|m| m.text.contains(&correlation_token))
+            .filter(|m| m.text.contains(&ask_prefix) && m.bot_id.is_some())
             .collect();
 
         let mut replies: Vec<AskReply> = Vec::new();
@@ -988,19 +1280,24 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
                 if tm.ts == qm.ts {
                     continue;
                 }
-                // Skip bot messages.
-                if tm.bot_id.is_some() {
-                    continue;
-                }
+
                 let user_id = match tm.user {
                     Some(ref u) => u.clone(),
                     None => continue,
                 };
 
-                // Filter by expected user if configured.
-                if let Some(ref expected) = expected_user {
-                    if &user_id != expected {
-                        continue;
+                // Filter by expected user if configured; otherwise skip bot messages
+                // to avoid processing our own notifications as replies.
+                match expected_user {
+                    Some(ref expected) => {
+                        if &user_id != expected {
+                            continue;
+                        }
+                    }
+                    None => {
+                        if tm.bot_id.is_some() {
+                            continue;
+                        }
                     }
                 }
 
@@ -1018,46 +1315,6 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
                     None => continue,
                 };
 
-                replies.push(AskReply {
-                    correlation_id: request.correlation_id.clone(),
-                    channel: "slack".to_string(),
-                    responder: Some(user_id),
-                    answer,
-                    replied_at: parsed_time,
-                });
-            }
-        }
-
-        // Also check for top-level messages containing the token (non-threaded replies).
-        for msg in &messages {
-            // Skip our own question messages.
-            if msg.text.contains(&correlation_token) && msg.bot_id.is_some() {
-                continue;
-            }
-            if msg.bot_id.is_some() {
-                continue;
-            }
-            let user_id = match msg.user {
-                Some(ref u) => u.clone(),
-                None => continue,
-            };
-            if let Some(ref expected) = expected_user {
-                if &user_id != expected {
-                    continue;
-                }
-            }
-            let parsed_time = match slack_ts_to_datetime(&msg.ts) {
-                Some(dt) => dt,
-                None => continue,
-            };
-            if parsed_time < since {
-                continue;
-            }
-
-            // Must contain our token (non-threaded reply convention).
-            if let Some(answer) =
-                Self::extract_reply_text_with_token(&msg.text, &request.correlation_id)
-            {
                 replies.push(AskReply {
                     correlation_id: request.correlation_id.clone(),
                     channel: "slack".to_string(),
@@ -1803,7 +2060,8 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
         let (_, body, _) = notifier.http.get_last_post_call().unwrap();
         let text = body["text"].as_str().unwrap();
-        assert!(text.contains("[CLAUDEAR-Q:tok-abc]"));
+        assert!(!text.contains("[CLAUDEAR-Q:"));
+        assert!(text.contains("Human input needed for"));
         assert!(text.contains("Pick a branch"));
         assert!(text.contains("main | develop"));
     }
@@ -1824,7 +2082,8 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
         let (_, body, _) = notifier.http.get_last_post_call().unwrap();
         let text = body["text"].as_str().unwrap();
-        assert!(text.contains("[CLAUDEAR-Q:tok-opts]"));
+        assert!(!text.contains("[CLAUDEAR-Q:"));
+        assert!(text.contains("Human input needed for"));
         assert!(text.contains("Pick a branch"));
         assert!(text.contains("Why: Multiple branches available"));
         assert!(text.contains("Context: We need a target for the PR"));
@@ -1892,7 +2151,7 @@ mod tests {
             "messages": [
                 {
                     "ts": "1709123456.000000",
-                    "text": "[CLAUDEAR-Q:corr-1] Human input needed for PROJ-123:\nPick a branch",
+                    "text": "Human input needed for LIN-1:\nPick a branch",
                     "bot_id": "B12345",
                     "user": null
                 }
@@ -1906,7 +2165,7 @@ mod tests {
             "messages": [
                 {
                     "ts": "1709123456.000000",
-                    "text": "[CLAUDEAR-Q:corr-1] Human input needed",
+                    "text": "Human input needed for LIN-1",
                     "bot_id": "B12345"
                 },
                 {
@@ -1944,7 +2203,7 @@ mod tests {
             "messages": [
                 {
                     "ts": "1709123456.000000",
-                    "text": "[CLAUDEAR-Q:corr-2] Question",
+                    "text": "Human input needed for LIN-1:\nQuestion",
                     "bot_id": "B12345"
                 }
             ]
@@ -1956,7 +2215,7 @@ mod tests {
             "messages": [
                 {
                     "ts": "1709123456.000000",
-                    "text": "[CLAUDEAR-Q:corr-2] Question",
+                    "text": "Human input needed for LIN-1:\nQuestion",
                     "bot_id": "B12345"
                 },
                 {
@@ -2098,43 +2357,6 @@ mod tests {
         let result =
             SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text("  yes  ").unwrap();
         assert_eq!(result, "yes");
-    }
-
-    #[test]
-    fn test_extract_reply_text_with_token() {
-        let parsed = SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text_with_token(
-            "[CLAUDEAR-Q:abc123] Use main branch",
-            "abc123",
-        )
-        .unwrap();
-        assert_eq!(parsed, "Use main branch");
-    }
-
-    #[test]
-    fn test_extract_reply_text_with_token_wrong_id_returns_none() {
-        let result = SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text_with_token(
-            "[CLAUDEAR-Q:abc123] Use main branch",
-            "wrong-id",
-        );
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_reply_text_with_token_only_token_returns_none() {
-        let result = SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text_with_token(
-            "[CLAUDEAR-Q:abc123]",
-            "abc123",
-        );
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_reply_text_with_token_no_token_at_all() {
-        let result = SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text_with_token(
-            "just a regular message",
-            "abc123",
-        );
-        assert!(result.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -2601,9 +2823,9 @@ mod tests {
         let request = make_ask_request("corr-1", "Choose branch?", None, vec![], None, None);
         let msg = build_ask_question_message(&issue, &request, None);
 
-        assert!(msg.text.contains("[CLAUDEAR-Q:corr-1]"));
+        assert!(!msg.text.contains("[CLAUDEAR-Q:"));
+        assert!(msg.text.contains("Human input needed for PROJ-123"));
         assert!(msg.text.contains("Choose branch?"));
-        assert!(msg.text.contains("PROJ-123"));
         assert!(msg.text.contains("Reply in this thread"));
         assert!(msg.blocks.is_none());
     }
@@ -2681,7 +2903,8 @@ mod tests {
         let msg = build_ask_question_message(&issue, &request, Some("<@U_ALL>".to_string()));
 
         assert!(msg.text.contains("<@U_ALL>"));
-        assert!(msg.text.contains("[CLAUDEAR-Q:corr-all]"));
+        assert!(!msg.text.contains("[CLAUDEAR-Q:"));
+        assert!(msg.text.contains("Human input needed for PROJ-123"));
         assert!(msg.text.contains("Pick branch?"));
         assert!(msg.text.contains("Why: Because there are multiple"));
         assert!(msg.text.contains("Context: Context about branches"));
@@ -3041,7 +3264,7 @@ mod tests {
             "ok": true,
             "messages": [{
                 "ts": "1709123456.000000",
-                "text": "[CLAUDEAR-Q:corr-bot] Question",
+                "text": "Human input needed for LIN-1:\nQuestion",
                 "bot_id": "B12345"
             }]
         });
@@ -3052,7 +3275,7 @@ mod tests {
             "messages": [
                 {
                     "ts": "1709123456.000000",
-                    "text": "[CLAUDEAR-Q:corr-bot] Question",
+                    "text": "Human input needed for LIN-1:\nQuestion",
                     "bot_id": "B12345"
                 },
                 {
@@ -3084,7 +3307,7 @@ mod tests {
             "ok": true,
             "messages": [{
                 "ts": "1709123456.000000",
-                "text": "[CLAUDEAR-Q:corr-nouser] Question",
+                "text": "Human input needed for LIN-1:\nQuestion",
                 "bot_id": "B12345"
             }]
         });
@@ -3095,7 +3318,7 @@ mod tests {
             "messages": [
                 {
                     "ts": "1709123456.000000",
-                    "text": "[CLAUDEAR-Q:corr-nouser] Question",
+                    "text": "Human input needed for LIN-1:\nQuestion",
                     "bot_id": "B12345"
                 },
                 {
@@ -3118,52 +3341,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_poll_non_threaded_reply_with_token() {
-        let mock = MockSlackHttpClient::success_api();
-        let since = Utc::now() - chrono::Duration::minutes(5);
-
-        let reply_ts = format!("{:.6}", (Utc::now().timestamp() as f64) + 10.0);
-        let history_body = serde_json::json!({
-            "ok": true,
-            "messages": [
-                {
-                    "ts": "1709123456.000000",
-                    "text": "[CLAUDEAR-Q:corr-nt] Question",
-                    "bot_id": "B12345"
-                },
-                {
-                    "ts": reply_ts,
-                    "text": "[CLAUDEAR-Q:corr-nt] Use main",
-                    "user": "U987654321"
-                }
-            ]
-        });
-
-        // No thread replies for the question
-        let replies_body = serde_json::json!({
-            "ok": true,
-            "messages": [{
-                "ts": "1709123456.000000",
-                "text": "[CLAUDEAR-Q:corr-nt] Question",
-                "bot_id": "B12345"
-            }]
-        });
-
-        mock.add_get_response("conversations.history", &history_body.to_string());
-        mock.add_get_response("conversations.replies", &replies_body.to_string());
-
-        let notifier = SlackNotifier::with_http_client(bot_config_with_user(), mock);
-        let request = make_ask_request("corr-nt", "Q?", None, vec![], None, None);
-        let replies = notifier
-            .poll_question_replies(&request, since)
-            .await
-            .unwrap();
-
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].answer, "Use main");
-    }
-
-    #[tokio::test]
     async fn test_poll_thread_reply_with_failed_thread_api() {
         let mock = MockSlackHttpClient::success_api();
         let since = Utc::now() - chrono::Duration::minutes(5);
@@ -3172,7 +3349,7 @@ mod tests {
             "ok": true,
             "messages": [{
                 "ts": "1709123456.000000",
-                "text": "[CLAUDEAR-Q:corr-tf] Question",
+                "text": "Human input needed for LIN-1:\nQuestion",
                 "bot_id": "B12345"
             }]
         });
@@ -3315,5 +3492,981 @@ mod tests {
         let notifier = SlackNotifier::with_http_client(config, MockSlackHttpClient::success());
         let issue = test_issue();
         assert_eq!(notifier.get_target_slack_id_for_issue(&issue), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_closed_message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_closed_message_without_mention() {
+        let issue = test_issue();
+        let msg = build_closed_message(&issue, "https://github.com/org/repo/pull/10", None);
+
+        assert!(msg.text.contains("PR Closed"));
+        assert!(msg.text.contains("PROJ-123"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("closed without merging"));
+        assert!(block_json.contains("View PR"));
+    }
+
+    #[test]
+    fn test_build_closed_message_with_mention() {
+        let issue = test_issue();
+        let msg = build_closed_message(
+            &issue,
+            "https://github.com/org/repo/pull/10",
+            Some("<@U555>".to_string()),
+        );
+
+        let blocks = msg.blocks.unwrap();
+        // Mention should be inserted as first block
+        let first_block_json = serde_json::to_string(&blocks[0]).unwrap();
+        assert!(first_block_json.contains("<@U555>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_cascade_success_message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_cascade_success_message_without_mention() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+
+        let msg =
+            build_cascade_success_message(&issue, "https://github.com/org/downstream/pull/5", None);
+
+        assert!(msg.text.contains("Cascade PR"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("org/upstream"));
+        assert!(block_json.contains("org/downstream"));
+        assert!(block_json.contains("View PR"));
+    }
+
+    #[test]
+    fn test_build_cascade_success_message_with_mention() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+
+        let msg = build_cascade_success_message(
+            &issue,
+            "https://github.com/org/downstream/pull/5",
+            Some("<@U777>".to_string()),
+        );
+
+        let blocks = msg.blocks.unwrap();
+        let first_block_json = serde_json::to_string(&blocks[0]).unwrap();
+        assert!(first_block_json.contains("<@U777>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_cascade_failed_message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_cascade_failed_message_without_mention() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+
+        let msg = build_cascade_failed_message(&issue, "Build failed", None);
+
+        assert!(msg.text.contains("Cascade Failed"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("org/upstream"));
+        assert!(block_json.contains("org/downstream"));
+        assert!(block_json.contains("Build failed"));
+    }
+
+    #[test]
+    fn test_build_cascade_failed_message_with_mention() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+
+        let msg =
+            build_cascade_failed_message(&issue, "Error occurred", Some("<@U888>".to_string()));
+
+        let blocks = msg.blocks.unwrap();
+        let first_block_json = serde_json::to_string(&blocks[0]).unwrap();
+        assert!(first_block_json.contains("<@U888>"));
+    }
+
+    #[test]
+    fn test_build_cascade_failed_message_truncates_long_error() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+
+        let long_error = "e".repeat(1000);
+        let msg = build_cascade_failed_message(&issue, &long_error, None);
+
+        let blocks = msg.blocks.unwrap();
+        let error_block = blocks.iter().find(|b| match b {
+            SlackBlock::Section { text, .. } => text.text.contains("Error"),
+            _ => false,
+        });
+        assert!(error_block.is_some());
+        match error_block.unwrap() {
+            SlackBlock::Section { text, .. } => {
+                assert!(text.text.len() <= 600);
+                assert!(text.text.contains("..."));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_regression_detected_message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_regression_detected_message_without_mention() {
+        let issue = test_issue();
+        let msg = build_regression_detected_message(&issue, "Test failure detected", None);
+
+        assert!(msg.text.contains("Regression Detected"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("previously fixed issue has regressed"));
+        assert!(block_json.contains("Test failure detected"));
+        assert!(block_json.contains("Retry has been scheduled"));
+    }
+
+    #[test]
+    fn test_build_regression_detected_message_with_mention() {
+        let issue = test_issue();
+        let msg = build_regression_detected_message(
+            &issue,
+            "regression error",
+            Some("<@U111>".to_string()),
+        );
+
+        let blocks = msg.blocks.unwrap();
+        let first_block_json = serde_json::to_string(&blocks[0]).unwrap();
+        assert!(first_block_json.contains("<@U111>"));
+    }
+
+    #[test]
+    fn test_build_regression_detected_message_truncates_long_error() {
+        let issue = test_issue();
+        let long_error = "r".repeat(1000);
+        let msg = build_regression_detected_message(&issue, &long_error, None);
+
+        let blocks = msg.blocks.unwrap();
+        let details_block = blocks.iter().find(|b| match b {
+            SlackBlock::Section { text, .. } => text.text.contains("Details"),
+            _ => false,
+        });
+        assert!(details_block.is_some());
+        match details_block.unwrap() {
+            SlackBlock::Section { text, .. } => {
+                assert!(text.text.len() <= 600);
+                assert!(text.text.contains("..."));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_regression_resolved_message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_regression_resolved_message_without_mention() {
+        let issue = test_issue();
+        let msg = build_regression_resolved_message(&issue, None);
+
+        assert!(msg.text.contains("Regression Resolved"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("No regression detected after monitoring period"));
+        assert!(block_json.contains("Issue resolved after final check"));
+    }
+
+    #[test]
+    fn test_build_regression_resolved_message_with_mention() {
+        let issue = test_issue();
+        let msg = build_regression_resolved_message(&issue, Some("<@U222>".to_string()));
+
+        let blocks = msg.blocks.unwrap();
+        let first_block_json = serde_json::to_string(&blocks[0]).unwrap();
+        assert!(first_block_json.contains("<@U222>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifier trait dispatch: notify_success with cascade metadata
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_success_cascade_issue() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+
+        let result = notifier
+            .notify_success(&issue, "https://github.com/org/downstream/pull/5")
+            .await;
+        assert!(result.is_ok());
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("Cascade PR"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifier trait dispatch: notify_success with is_pr_update metadata
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_success_pr_update() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let mut issue = test_issue();
+        issue.set_metadata("is_pr_update", true);
+
+        let result = notifier
+            .notify_success(&issue, "https://github.com/org/repo/pull/42")
+            .await;
+        assert!(result.is_ok());
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("PR Updated"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifier trait dispatch: notify_completed with regression_resolved
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_completed_regression_resolved() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let mut issue = test_issue();
+        issue.set_metadata("regression_resolved", true);
+
+        let result = notifier.notify_completed(&issue).await;
+        assert!(result.is_ok());
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("Regression Resolved"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifier trait dispatch: notify_failed with regression_detected
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_failed_regression_detected() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let mut issue = test_issue();
+        issue.set_metadata("regression_detected", true);
+
+        let result = notifier.notify_failed(&issue, "Regression error").await;
+        assert!(result.is_ok());
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("Regression Detected"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifier trait dispatch: notify_failed with cascade metadata
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_failed_cascade() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+
+        let result = notifier.notify_failed(&issue, "Cascade error").await;
+        assert!(result.is_ok());
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("Cascade Failed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifier trait dispatch: notify_closed
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_closed_via_webhook() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+
+        let result = notifier
+            .notify_closed(&test_issue(), "https://github.com/org/repo/pull/99")
+            .await;
+        assert!(result.is_ok());
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("PR Closed"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_closed_via_bot_api() {
+        let mock = MockSlackHttpClient::success_api();
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+
+        let result = notifier
+            .notify_closed(&test_issue(), "https://github.com/org/repo/pull/99")
+            .await;
+        assert!(result.is_ok());
+        let (url, _, _) = notifier.http.get_last_post_call().unwrap();
+        assert!(url.contains("chat.postMessage"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_success_message with is_pr_update metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_success_message_pr_update() {
+        let mut issue = test_issue();
+        issue.set_metadata("is_pr_update", true);
+
+        let msg = build_success_message(&issue, "https://github.com/org/repo/pull/42", None);
+        assert!(msg.text.contains("PR Updated"));
+        assert!(!msg.text.contains("PR Created"));
+    }
+
+    #[test]
+    fn test_build_success_message_pr_update_with_mention() {
+        let mut issue = test_issue();
+        issue.set_metadata("is_pr_update", true);
+
+        let msg = build_success_message(
+            &issue,
+            "https://github.com/org/repo/pull/42",
+            Some("<@U_UPDATE>".to_string()),
+        );
+        assert!(msg.text.contains("PR Updated"));
+        assert!(msg.text.starts_with("<@U_UPDATE>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // send_to_channel with empty channel_id
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_to_channel_returns_none_with_empty_channel_id() {
+        let config = SlackConfig {
+            bot_token: Some("xoxb-token".to_string()),
+            channel_id: Some("".to_string()),
+            ..Default::default()
+        };
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(config, mock);
+        let issue = test_issue();
+        let request = make_ask_request("tok-ec", "Q?", None, vec![], None, None);
+        let delivery = notifier.ask_question(&issue, &request).await.unwrap();
+        assert!(delivery.is_some());
+        assert!(delivery.unwrap().message_id.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Webhook prefers over bot for send, but ask_question uses chat.postMessage
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ask_question_returns_none_ts_when_no_bot() {
+        let mock = MockSlackHttpClient::success();
+        let config = SlackConfig {
+            webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".to_string()),
+            ..Default::default()
+        };
+        let notifier = SlackNotifier::with_http_client(config, mock);
+        let issue = test_issue();
+        let request = make_ask_request("tok-nb", "Q?", None, vec![], None, None);
+        let delivery = notifier.ask_question(&issue, &request).await.unwrap();
+        assert!(delivery.is_some());
+        let d = delivery.unwrap();
+        assert!(d.message_id.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // SlackNotifier::new (production constructor)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_slack_notifier_new_production_constructor() {
+        let config = webhook_config();
+        let registry = empty_registry();
+        let notifier = SlackNotifier::new(config, registry);
+        assert_eq!(notifier.name(), "slack");
+        assert!(notifier.is_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // with_http_client_and_registry constructor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_with_http_client_and_registry() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "tester".to_string(),
+            crate::config::UserConfig {
+                slack_id: Some("U_TESTER".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = UserRegistry::new(users);
+        let notifier = SlackNotifier::with_http_client_and_registry(
+            bot_config(),
+            MockSlackHttpClient::success_api(),
+            registry,
+        );
+        assert_eq!(notifier.name(), "slack");
+        assert!(notifier.is_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // Poll question replies with non-threaded reply filtering
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_poll_non_threaded_reply_skips_bot_question_messages() {
+        let mock = MockSlackHttpClient::success_api();
+        let since = Utc::now() - chrono::Duration::minutes(5);
+
+        // History has a question message from bot and an unrelated bot message
+        let history_body = serde_json::json!({
+            "ok": true,
+            "messages": [
+                {
+                    "ts": "1709123456.000000",
+                    "text": "Human input needed for LIN-1:\nQuestion",
+                    "bot_id": "B12345"
+                },
+                {
+                    "ts": "1709123457.000000",
+                    "text": "Some other bot message",
+                    "bot_id": "B99999"
+                }
+            ]
+        });
+
+        let replies_body = serde_json::json!({
+            "ok": true,
+            "messages": [{
+                "ts": "1709123456.000000",
+                "text": "Human input needed for LIN-1:\nQuestion",
+                "bot_id": "B12345"
+            }]
+        });
+
+        mock.add_get_response("conversations.history", &history_body.to_string());
+        mock.add_get_response("conversations.replies", &replies_body.to_string());
+
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+        let request = make_ask_request("corr-skip", "Q?", None, vec![], None, None);
+        let replies = notifier
+            .poll_question_replies(&request, since)
+            .await
+            .unwrap();
+
+        // Both messages are from bots, so no replies
+        assert!(replies.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_merged with user mention via webhook
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_merged_with_mention_webhook() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config_with_user(), mock);
+
+        let result = notifier
+            .notify_merged(&test_issue(), "https://github.com/org/repo/pull/99")
+            .await;
+        assert!(result.is_ok());
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("<@U987654321>"));
+        assert!(text.contains("PR Merged"));
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_completed sends correct content via bot API
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_completed_via_bot_api() {
+        let mock = MockSlackHttpClient::success_api();
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+
+        let result = notifier.notify_completed(&test_issue()).await;
+        assert!(result.is_ok());
+        let (url, body, auth) = notifier.http.get_last_post_call().unwrap();
+        assert!(url.contains("chat.postMessage"));
+        assert!(auth.is_some());
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("Completed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_failed sends correct content via bot API
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_failed_via_bot_api() {
+        let mock = MockSlackHttpClient::success_api();
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+
+        let result = notifier
+            .notify_failed(&test_issue(), "something went wrong")
+            .await;
+        assert!(result.is_ok());
+        let (url, _, _) = notifier.http.get_last_post_call().unwrap();
+        assert!(url.contains("chat.postMessage"));
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_success sends correct content via bot API
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_success_via_bot_api() {
+        let mock = MockSlackHttpClient::success_api();
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+
+        let result = notifier
+            .notify_success(&test_issue(), "https://github.com/org/repo/pull/42")
+            .await;
+        assert!(result.is_ok());
+        let (url, body, _) = notifier.http.get_last_post_call().unwrap();
+        assert!(url.contains("chat.postMessage"));
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("PR Created"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_report_message edge case: zero values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_report_message_zero_values() {
+        let report = crate::reports::Report {
+            period: "Empty".to_string(),
+            from: chrono::Utc::now() - chrono::Duration::hours(1),
+            to: chrono::Utc::now(),
+            issues_attempted: 0,
+            issues_succeeded: 0,
+            issues_failed: 0,
+            issues_cannot_fix: 0,
+            success_rate: 0.0,
+            failure_rate: 0.0,
+            prs_created: 0,
+            prs_merged: 0,
+            prs_closed: 0,
+            by_source: std::collections::HashMap::new(),
+            pending_count: 0,
+            retryable_count: 0,
+        };
+        let msg = build_report_message(&report);
+
+        assert!(!msg.text.is_empty());
+        let blocks = msg.blocks.unwrap();
+        assert_eq!(blocks.len(), 3);
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("Empty"));
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_status via bot API
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_status_via_bot_api() {
+        let mock = MockSlackHttpClient::success_api();
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+
+        let result = notifier.notify_status("System healthy").await;
+        assert!(result.is_ok());
+        let (url, _, _) = notifier.http.get_last_post_call().unwrap();
+        assert!(url.contains("chat.postMessage"));
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_report via bot API
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_report_via_bot_api() {
+        let mock = MockSlackHttpClient::success_api();
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+        let report = crate::reports::Report {
+            period: "Daily".to_string(),
+            from: chrono::Utc::now() - chrono::Duration::days(1),
+            to: chrono::Utc::now(),
+            issues_attempted: 3,
+            issues_succeeded: 2,
+            issues_failed: 1,
+            issues_cannot_fix: 0,
+            success_rate: 66.7,
+            failure_rate: 33.3,
+            prs_created: 2,
+            prs_merged: 1,
+            prs_closed: 0,
+            by_source: std::collections::HashMap::new(),
+            pending_count: 0,
+            retryable_count: 0,
+        };
+        let result = notifier.notify_report(&report).await;
+        assert!(result.is_ok());
+        let (url, _, _) = notifier.http.get_last_post_call().unwrap();
+        assert!(url.contains("chat.postMessage"));
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_urgent_issues via bot API
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_urgent_issues_via_bot_api() {
+        let mock = MockSlackHttpClient::success_api();
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+        let issues = vec![Issue::new(
+            "1",
+            "PROJ-1",
+            "Urgent",
+            "https://example.com",
+            "linear",
+        )];
+
+        let result = notifier.notify_urgent_issues(&issues).await;
+        assert!(result.is_ok());
+        let (url, _, _) = notifier.http.get_last_post_call().unwrap();
+        assert!(url.contains("chat.postMessage"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Poll with empty channel_id returns empty
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_poll_returns_empty_with_empty_channel_id() {
+        let config = SlackConfig {
+            bot_token: Some("xoxb-token".to_string()),
+            channel_id: Some("".to_string()),
+            ..Default::default()
+        };
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(config, mock);
+        let request = make_ask_request("corr-empty-ch", "Q?", None, vec![], None, None);
+        let replies = notifier
+            .poll_question_replies(&request, Utc::now())
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Poll with no question messages in history returns empty
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_poll_no_question_messages() {
+        let mock = MockSlackHttpClient::success_api();
+        let since = Utc::now() - chrono::Duration::minutes(5);
+
+        let history_body = serde_json::json!({
+            "ok": true,
+            "messages": [
+                {
+                    "ts": "1709123456.000000",
+                    "text": "Regular message without token",
+                    "user": "U123"
+                }
+            ]
+        });
+
+        mock.add_get_response("conversations.history", &history_body.to_string());
+
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+        let request = make_ask_request("corr-nq", "Q?", None, vec![], None, None);
+        let replies = notifier
+            .poll_question_replies(&request, since)
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Poll with empty history messages returns empty
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_poll_empty_history() {
+        let mock = MockSlackHttpClient::success_api();
+        let since = Utc::now() - chrono::Duration::minutes(5);
+
+        let history_body = serde_json::json!({
+            "ok": true,
+            "messages": []
+        });
+
+        mock.add_get_response("conversations.history", &history_body.to_string());
+
+        let notifier = SlackNotifier::with_http_client(bot_config(), mock);
+        let request = make_ask_request("corr-empty-hist", "Q?", None, vec![], None, None);
+        let replies = notifier
+            .poll_question_replies(&request, since)
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional truncate_string tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_truncate_string_within_limit() {
+        let s = "short";
+        let result = truncate_string(s, 100);
+        assert_eq!(result, "short");
+    }
+
+    #[test]
+    fn test_truncate_string_at_limit() {
+        let s = "exactly10!";
+        assert_eq!(s.len(), 10);
+        let result = truncate_string(s, 10);
+        assert_eq!(result, "exactly10!");
+    }
+
+    #[test]
+    fn test_truncate_string_over_limit() {
+        let s = "this string is definitely over the limit";
+        let result = truncate_string(s, 15);
+        assert!(result.len() <= 15);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_string_very_small_limit() {
+        // Limit of 3 or less: no room for "..."
+        let r1 = truncate_string("abcdef", 3);
+        assert_eq!(r1.len(), 3);
+        assert!(!r1.contains("..."));
+
+        let r2 = truncate_string("abcdef", 2);
+        assert_eq!(r2.len(), 2);
+
+        let r3 = truncate_string("abcdef", 1);
+        assert_eq!(r3.len(), 1);
+    }
+
+    #[test]
+    fn test_truncate_string_empty() {
+        assert_eq!(truncate_string("", 0), "");
+        assert_eq!(truncate_string("", 5), "");
+        assert_eq!(truncate_string("", 100), "");
+    }
+
+    #[test]
+    fn test_truncate_string_multibyte() {
+        // Multi-byte UTF-8 chars near the boundary
+        let s = "Hello \u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}"; // e-acute is 2 bytes each
+        let result = truncate_string(s, 10);
+        assert!(result.len() <= 10);
+        // Should not panic on char boundary issues
+
+        // Emoji test (4-byte char)
+        let emoji_str = "Hi \u{1F600}\u{1F600}\u{1F600}"; // each emoji is 4 bytes
+        let result2 = truncate_string(emoji_str, 8);
+        assert!(result2.len() <= 8);
+
+        // CJK characters (3 bytes each)
+        let cjk = "\u{4E16}\u{754C}\u{4F60}\u{597D}\u{5417}"; // 5 CJK chars = 15 bytes
+        let result3 = truncate_string(cjk, 7);
+        assert!(result3.len() <= 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional slack_ts_to_datetime tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_slack_ts_to_datetime_valid_fractional() {
+        let dt = slack_ts_to_datetime("1709123456.789012").unwrap();
+        assert_eq!(dt.timestamp(), 1709123456);
+        assert!(dt.timestamp_subsec_nanos() > 0);
+    }
+
+    #[test]
+    fn test_slack_ts_to_datetime_invalid_strings() {
+        assert!(slack_ts_to_datetime("not_a_timestamp").is_none());
+        assert!(slack_ts_to_datetime("abc.def").is_none());
+        assert!(slack_ts_to_datetime("").is_none());
+        assert!(slack_ts_to_datetime("   ").is_none());
+    }
+
+    #[test]
+    fn test_slack_ts_to_datetime_integer() {
+        let dt = slack_ts_to_datetime("1709123456").unwrap();
+        assert_eq!(dt.timestamp(), 1709123456);
+        // No fractional part, so subsec nanos should be zero (or very close)
+        assert_eq!(dt.timestamp_subsec_nanos(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional extract_reply_text tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_reply_text_normal() {
+        let result = SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text("Use main branch");
+        assert_eq!(result.unwrap(), "Use main branch");
+    }
+
+    #[test]
+    fn test_extract_reply_text_empty() {
+        assert!(SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text("").is_none());
+        assert!(SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text("   \t\n  ").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional build message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_start_message() {
+        let issue = test_issue();
+        let msg = build_start_message(&issue, None);
+
+        // Fallback text includes Processing and issue ID
+        assert!(msg.text.contains("Processing"));
+        assert!(msg.text.contains("PROJ-123"));
+        // Blocks are present
+        assert!(msg.blocks.is_some());
+        let blocks = msg.blocks.unwrap();
+        assert!(blocks.len() >= 2);
+        // No channel set on builder-produced messages
+        assert!(msg.channel.is_none());
+        assert!(msg.thread_ts.is_none());
+    }
+
+    #[test]
+    fn test_build_success_message() {
+        let issue = test_issue();
+        let msg = build_success_message(&issue, "https://github.com/org/repo/pull/99", None);
+
+        assert!(msg.text.contains("PR Created"));
+        assert!(msg.text.contains("PROJ-123"));
+        assert!(msg.text.contains("https://github.com/org/repo/pull/99"));
+        let blocks = msg.blocks.unwrap();
+        // Header + Section(title) + Section(PR link) + Context(timestamp)
+        assert!(blocks.len() >= 3);
+        let json = serde_json::to_string(&blocks).unwrap();
+        assert!(json.contains("View PR"));
+    }
+
+    #[test]
+    fn test_build_failed_message() {
+        let issue = test_issue();
+        let msg = build_failed_message(&issue, "compilation error: missing semicolon", None);
+
+        assert!(msg.text.contains("Failed"));
+        assert!(msg.text.contains("PROJ-123"));
+        let blocks = msg.blocks.unwrap();
+        let json = serde_json::to_string(&blocks).unwrap();
+        assert!(json.contains("compilation error"));
+        assert!(json.contains("Error"));
+    }
+
+    // -----------------------------------------------------------------------
+    // get_source_emoji tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_source_emoji() {
+        // Known sources get specific emoji
+        assert_eq!(get_source_emoji("linear"), "\u{1F4CB}");
+        assert_eq!(get_source_emoji("sentry"), "\u{1F534}");
+        assert_eq!(get_source_emoji("github"), "\u{1F419}");
+        assert_eq!(get_source_emoji("jira"), "\u{1F3AB}");
+        assert_eq!(get_source_emoji("slack"), "\u{1F4AC}");
+        // Case insensitive
+        assert_eq!(get_source_emoji("Linear"), "\u{1F4CB}");
+        assert_eq!(get_source_emoji("SENTRY"), "\u{1F534}");
+        assert_eq!(get_source_emoji("GitHub"), "\u{1F419}");
+        // Unknown sources get default pushpin emoji
+        assert_eq!(get_source_emoji("unknown"), "\u{1F4CC}");
+        assert_eq!(get_source_emoji(""), "\u{1F4CC}");
+        assert_eq!(get_source_emoji("custom_source"), "\u{1F4CC}");
+    }
+
+    // -----------------------------------------------------------------------
+    // has_bot_channel tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_bot_channel() {
+        // Both token and channel present -> true
+        let notifier =
+            SlackNotifier::with_http_client(bot_config(), MockSlackHttpClient::success());
+        assert!(notifier.has_bot_channel());
+
+        // Only bot_token, no channel -> false
+        let config_no_channel = SlackConfig {
+            bot_token: Some("xoxb-test-token".to_string()),
+            channel_id: None,
+            ..Default::default()
+        };
+        let notifier2 =
+            SlackNotifier::with_http_client(config_no_channel, MockSlackHttpClient::success());
+        assert!(!notifier2.has_bot_channel());
+
+        // Only channel_id, no bot_token -> false
+        let config_no_token = SlackConfig {
+            bot_token: None,
+            channel_id: Some("C12345678".to_string()),
+            ..Default::default()
+        };
+        let notifier3 =
+            SlackNotifier::with_http_client(config_no_token, MockSlackHttpClient::success());
+        assert!(!notifier3.has_bot_channel());
+
+        // Both empty strings -> false
+        let config_empty = SlackConfig {
+            bot_token: Some("".to_string()),
+            channel_id: Some("".to_string()),
+            ..Default::default()
+        };
+        let notifier4 =
+            SlackNotifier::with_http_client(config_empty, MockSlackHttpClient::success());
+        assert!(!notifier4.has_bot_channel());
+
+        // Both None -> false
+        let config_none = SlackConfig::default();
+        let notifier5 =
+            SlackNotifier::with_http_client(config_none, MockSlackHttpClient::success());
+        assert!(!notifier5.has_bot_channel());
+
+        // Token non-empty, channel empty -> false
+        let config_mixed = SlackConfig {
+            bot_token: Some("xoxb-token".to_string()),
+            channel_id: Some("".to_string()),
+            ..Default::default()
+        };
+        let notifier6 =
+            SlackNotifier::with_http_client(config_mixed, MockSlackHttpClient::success());
+        assert!(!notifier6.has_bot_channel());
     }
 }

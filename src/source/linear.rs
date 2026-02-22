@@ -667,6 +667,239 @@ impl<H: LinearHttpClient + 'static> IssueSource for LinearSource<H> {
     fn is_terminal_status(&self, status: &str) -> bool {
         Self::is_issue_terminal(status)
     }
+
+    async fn create_issue(
+        &self,
+        title: &str,
+        description: &str,
+        labels: &[String],
+    ) -> Result<Issue> {
+        let team_id = self
+            .config
+            .team_id
+            .as_ref()
+            .ok_or_else(|| Error::source("linear", "team_id required for create_issue"))?;
+
+        // Resolve label IDs
+        let mut label_ids = Vec::new();
+        for label_name in labels {
+            let label_id = self.find_or_create_label(label_name).await?;
+            label_ids.push(label_id);
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct IssueCreateResponse {
+            #[serde(rename = "issueCreate")]
+            issue_create: Option<IssueCreatePayload>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct IssueCreatePayload {
+            success: bool,
+            issue: Option<CreatedIssue>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct CreatedIssue {
+            id: String,
+            identifier: String,
+            url: String,
+        }
+
+        const ISSUE_CREATE_MUTATION: &str = r#"
+            mutation CreateIssue($teamId: String!, $title: String!, $description: String, $labelIds: [String!]) {
+                issueCreate(input: { teamId: $teamId, title: $title, description: $description, labelIds: $labelIds }) {
+                    success
+                    issue {
+                        id
+                        identifier
+                        url
+                    }
+                }
+            }
+        "#;
+
+        let response: IssueCreateResponse = self
+            .graphql(
+                ISSUE_CREATE_MUTATION,
+                serde_json::json!({
+                    "teamId": team_id,
+                    "title": title,
+                    "description": description,
+                    "labelIds": label_ids,
+                }),
+            )
+            .await?;
+
+        let payload = response
+            .issue_create
+            .ok_or_else(|| Error::source("linear", "No response from issueCreate"))?;
+
+        if !payload.success {
+            return Err(Error::source(
+                "linear",
+                "issueCreate returned success=false",
+            ));
+        }
+
+        let created = payload
+            .issue
+            .ok_or_else(|| Error::source("linear", "issueCreate returned no issue"))?;
+
+        let issue = Issue::new(
+            &created.id,
+            &created.identifier,
+            title,
+            &created.url,
+            "linear",
+        );
+
+        tracing::info!(
+            source = "linear",
+            issue_id = %created.identifier,
+            "Created issue"
+        );
+        Ok(issue)
+    }
+
+    async fn find_or_create_label(&self, name: &str) -> Result<String> {
+        // Query existing labels
+        #[derive(Debug, Deserialize)]
+        struct LabelsResponse {
+            #[serde(rename = "issueLabels")]
+            issue_labels: LabelsQueryConnection,
+        }
+        #[derive(Debug, Deserialize)]
+        struct LabelsQueryConnection {
+            nodes: Vec<LabelNode>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct LabelNode {
+            id: String,
+            name: String,
+        }
+
+        const LABELS_QUERY: &str = r#"
+            query Labels($filter: IssueLabelFilter) {
+                issueLabels(filter: $filter) {
+                    nodes {
+                        id
+                        name
+                    }
+                }
+            }
+        "#;
+
+        let response: LabelsResponse = self
+            .graphql(
+                LABELS_QUERY,
+                serde_json::json!({
+                    "filter": { "name": { "containsIgnoreCase": name } }
+                }),
+            )
+            .await?;
+
+        // Case-insensitive match from results
+        if let Some(label) = response
+            .issue_labels
+            .nodes
+            .iter()
+            .find(|l| l.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(label.id.clone());
+        }
+
+        // Create label if not found
+        #[derive(Debug, Deserialize)]
+        struct LabelCreateResponse {
+            #[serde(rename = "issueLabelCreate")]
+            label_create: Option<LabelCreatePayload>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct LabelCreatePayload {
+            success: bool,
+            #[serde(rename = "issueLabel")]
+            issue_label: Option<LabelNode>,
+        }
+
+        let team_id = self.config.team_id.as_deref().unwrap_or("");
+
+        const LABEL_CREATE_MUTATION: &str = r#"
+            mutation CreateLabel($teamId: String, $name: String!) {
+                issueLabelCreate(input: { teamId: $teamId, name: $name }) {
+                    success
+                    issueLabel {
+                        id
+                        name
+                    }
+                }
+            }
+        "#;
+
+        let create_response: LabelCreateResponse = self
+            .graphql(
+                LABEL_CREATE_MUTATION,
+                serde_json::json!({
+                    "teamId": team_id,
+                    "name": name,
+                }),
+            )
+            .await?;
+
+        let payload = create_response
+            .label_create
+            .ok_or_else(|| Error::source("linear", "No response from issueLabelCreate"))?;
+
+        if !payload.success {
+            return Err(Error::source(
+                "linear",
+                "issueLabelCreate returned success=false",
+            ));
+        }
+
+        payload
+            .issue_label
+            .map(|l| l.id)
+            .ok_or_else(|| Error::source("linear", "issueLabelCreate returned no label"))
+    }
+
+    async fn list_open_issues(&self, title_filter: &str) -> Result<Vec<Issue>> {
+        let mut filter = serde_json::Map::new();
+
+        if let Some(ref team_id) = self.config.team_id {
+            if !team_id.is_empty() {
+                filter.insert(
+                    "team".to_string(),
+                    serde_json::json!({ "id": { "eq": team_id } }),
+                );
+            }
+        }
+
+        // Filter to active states only (not completed/cancelled)
+        filter.insert(
+            "state".to_string(),
+            serde_json::json!({ "type": { "nin": ["completed", "canceled"] } }),
+        );
+
+        if !title_filter.is_empty() {
+            filter.insert(
+                "title".to_string(),
+                serde_json::json!({ "containsIgnoreCase": title_filter }),
+            );
+        }
+
+        let variables = serde_json::json!({
+            "filter": filter,
+            "first": 50
+        });
+
+        let response: IssuesResponse = self.graphql(ISSUES_QUERY, variables).await?;
+
+        Ok(response
+            .issues
+            .nodes
+            .into_iter()
+            .map(|i| self.map_issue(i))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -3332,5 +3565,877 @@ mod tests {
         // Both assignee and labels filters should be present
         assert!(filter.get("assignee").is_some());
         assert!(filter.get("labels").is_some());
+    }
+
+    #[test]
+    fn test_source_name_and_display_name() {
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, MockLinearClient::new());
+        assert_eq!(source.name(), "linear");
+        assert_eq!(source.display_name(), "Linear");
+    }
+
+    #[test]
+    fn test_is_terminal_status_completed() {
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, MockLinearClient::new());
+        assert!(source.is_terminal_status("completed"));
+    }
+
+    #[test]
+    fn test_is_terminal_status_canceled() {
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, MockLinearClient::new());
+        assert!(source.is_terminal_status("canceled"));
+    }
+
+    #[test]
+    fn test_is_terminal_status_cancelled_british() {
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, MockLinearClient::new());
+        assert!(source.is_terminal_status("cancelled"));
+    }
+
+    #[test]
+    fn test_is_terminal_status_started_is_not_terminal() {
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, MockLinearClient::new());
+        assert!(!source.is_terminal_status("started"));
+        assert!(!source.is_terminal_status("backlog"));
+        assert!(!source.is_terminal_status("triage"));
+    }
+
+    #[test]
+    fn test_is_terminal_status_case_insensitive() {
+        assert!(LinearSource::<MockLinearClient>::is_issue_terminal(
+            "Completed"
+        ));
+        assert!(LinearSource::<MockLinearClient>::is_issue_terminal(
+            "CANCELED"
+        ));
+        assert!(LinearSource::<MockLinearClient>::is_issue_terminal(
+            "Cancelled"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_returns_started_type() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{
+                "data": {
+                    "issue": {
+                        "id": "abc-123",
+                        "identifier": "LIN-1",
+                        "title": "Test",
+                        "description": null,
+                        "url": "https://linear.app/team/LIN-1",
+                        "priority": 2,
+                        "createdAt": "2025-01-01T00:00:00Z",
+                        "updatedAt": "2025-01-02T00:00:00Z",
+                        "state": {
+                            "name": "In Progress",
+                            "type": "started"
+                        },
+                        "labels": { "nodes": [] },
+                        "team": { "id": "team-1", "name": "Team" },
+                        "project": null,
+                        "assignee": null
+                    }
+                }
+            }"#,
+        );
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let status = source.get_issue_status("abc-123").await.unwrap();
+        assert_eq!(status, "started");
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_no_state_returns_unknown() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{
+                "data": {
+                    "issue": {
+                        "id": "abc-456",
+                        "identifier": "LIN-2",
+                        "title": "Test No State",
+                        "description": null,
+                        "url": "https://linear.app/team/LIN-2",
+                        "priority": 0,
+                        "createdAt": "2025-01-01T00:00:00Z",
+                        "updatedAt": "2025-01-02T00:00:00Z",
+                        "state": null,
+                        "labels": { "nodes": [] },
+                        "team": null,
+                        "project": null,
+                        "assignee": null
+                    }
+                }
+            }"#,
+        );
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let status = source.get_issue_status("abc-456").await.unwrap();
+        assert_eq!(status, "unknown");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_empty_team_id_skipped() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{"data":{"issues":{"nodes":[]}}}"#,
+        );
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test_key".to_string(),
+            trigger_labels: vec![],
+            trigger_assignee: None,
+            trigger_states: vec![],
+            team_id: Some("".to_string()), // empty team_id should be skipped
+            project_id: None,
+            webhook_secret: None,
+            ..Default::default()
+        };
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+        assert!(issues.is_empty());
+
+        // Verify the filter does NOT include team
+        let requests = source.http.get_requests();
+        let body = &requests[0].1;
+        let filter = &body["variables"]["filter"];
+        assert!(
+            filter.get("team").is_none(),
+            "Empty team_id should not produce a team filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_empty_project_id_skipped() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{"data":{"issues":{"nodes":[]}}}"#,
+        );
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test_key".to_string(),
+            trigger_labels: vec![],
+            trigger_assignee: None,
+            trigger_states: vec![],
+            team_id: None,
+            project_id: Some("".to_string()), // empty project_id should be skipped
+            webhook_secret: None,
+            ..Default::default()
+        };
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+        assert!(issues.is_empty());
+
+        let requests = source.http.get_requests();
+        let body = &requests[0].1;
+        let filter = &body["variables"]["filter"];
+        assert!(
+            filter.get("project").is_none(),
+            "Empty project_id should not produce a project filter"
+        );
+    }
+
+    #[test]
+    fn test_matches_criteria_low_priority_mapping() {
+        let mut config = test_config();
+        config.trigger_states = vec![];
+        config.trigger_labels = vec![];
+        config.trigger_assignee = None;
+        let source = LinearSource::with_http_client(config, MockLinearClient::new());
+
+        let mut issue = Issue::new("1", "LIN-1", "Test", "url", "linear");
+        issue.set_metadata("state_name", "Backlog");
+        issue.set_metadata("state_type", "backlog");
+        issue.priority = IssuePriority::Low;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Low);
+    }
+
+    #[test]
+    fn test_matches_criteria_assignee_set_labels_empty_skips_label_check() {
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test".to_string(),
+            trigger_labels: vec![], // empty labels
+            trigger_assignee: Some("Jane Smith".to_string()),
+            trigger_states: vec![],
+            team_id: None,
+            project_id: None,
+            webhook_secret: None,
+            ..Default::default()
+        };
+        let source = LinearSource::with_http_client(config, MockLinearClient::new());
+
+        let mut issue = Issue::new("1", "LIN-1", "Test", "url", "linear");
+        issue.set_metadata("state_name", "Backlog");
+        issue.set_metadata("state_type", "backlog");
+        issue.set_metadata("assignee", "Jane Smith");
+        issue.set_metadata("labels", Vec::<String>::new());
+
+        let result = source.matches_criteria(&issue);
+        assert!(
+            result.matches,
+            "Should match because assignee matches and label check is skipped"
+        );
+    }
+
+    #[test]
+    fn test_format_linear_context_all_metadata() {
+        let mut issue = Issue::new(
+            "1",
+            "LIN-1",
+            "Test Issue",
+            "https://linear.app/team/LIN-1",
+            "linear",
+        );
+        issue.description = Some("A description".to_string());
+        issue.priority = IssuePriority::High;
+        issue.status = IssueStatus::InProgress;
+        issue.set_metadata("team", "Engineering");
+        issue.set_metadata("project", "Backend");
+        issue.set_metadata("assignee", "Alice");
+
+        let context = format_linear_context(&issue);
+        assert!(context.contains("# Linear Issue: LIN-1"));
+        assert!(context.contains("**Title:** Test Issue"));
+        assert!(context.contains("## Description"));
+        assert!(context.contains("A description"));
+        assert!(context.contains("**Team:** Engineering"));
+        assert!(context.contains("**Project:** Backend"));
+        assert!(context.contains("**Assignee:** Alice"));
+    }
+
+    #[test]
+    fn test_format_linear_context_without_description() {
+        let issue = Issue::new("1", "LIN-1", "No Desc", "url", "linear");
+        let context = format_linear_context(&issue);
+        assert!(!context.contains("## Description"));
+    }
+
+    #[test]
+    fn test_format_linear_context_no_metadata() {
+        let issue = Issue::new("1", "LIN-1", "Minimal", "url", "linear");
+        let context = format_linear_context(&issue);
+        assert!(!context.contains("**Team:**"));
+        assert!(!context.contains("**Project:**"));
+        assert!(!context.contains("**Assignee:**"));
+    }
+
+    #[test]
+    fn test_map_issue_with_all_optional_fields() {
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, MockLinearClient::new());
+
+        let issue = LinearIssue {
+            id: "uuid-1".to_string(),
+            identifier: "LIN-99".to_string(),
+            title: "Full Issue".to_string(),
+            description: Some("Detailed description".to_string()),
+            url: "https://linear.app/team/LIN-99".to_string(),
+            priority: 1,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-02-01T00:00:00Z".to_string(),
+            state: Some(LinearState {
+                name: "In Progress".to_string(),
+                state_type: "started".to_string(),
+            }),
+            labels: LabelsConnection {
+                nodes: vec![
+                    LinearLabel {
+                        name: "bug".to_string(),
+                    },
+                    LinearLabel {
+                        name: "priority".to_string(),
+                    },
+                ],
+            },
+            team: Some(LinearTeam {
+                id: "team-1".to_string(),
+                name: "Engineering".to_string(),
+            }),
+            project: Some(LinearProject {
+                id: "proj-1".to_string(),
+                name: "Backend".to_string(),
+            }),
+            assignee: Some(LinearUser {
+                name: "Alice".to_string(),
+            }),
+        };
+
+        let mapped = source.map_issue(issue);
+        assert_eq!(mapped.id, "uuid-1");
+        assert_eq!(mapped.short_id, "LIN-99");
+        assert_eq!(mapped.description, Some("Detailed description".to_string()));
+        assert_eq!(mapped.priority, IssuePriority::Critical);
+        assert_eq!(mapped.status, IssueStatus::InProgress);
+        assert!(mapped.created_at.is_some());
+        assert!(mapped.updated_at.is_some());
+        assert_eq!(
+            mapped.get_metadata::<String>("state_name"),
+            Some("In Progress".to_string())
+        );
+        assert_eq!(
+            mapped.get_metadata::<String>("team"),
+            Some("Engineering".to_string())
+        );
+        assert_eq!(
+            mapped.get_metadata::<String>("project"),
+            Some("Backend".to_string())
+        );
+        assert_eq!(
+            mapped.get_metadata::<String>("assignee"),
+            Some("Alice".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_priority_zero_and_five() {
+        assert_eq!(
+            LinearSource::<MockLinearClient>::map_priority(0),
+            IssuePriority::None
+        );
+        assert_eq!(
+            LinearSource::<MockLinearClient>::map_priority(5),
+            IssuePriority::None
+        );
+        assert_eq!(
+            LinearSource::<MockLinearClient>::map_priority(-1),
+            IssuePriority::None
+        );
+    }
+
+    #[test]
+    fn test_map_status_none() {
+        assert_eq!(
+            LinearSource::<MockLinearClient>::map_status(None),
+            IssueStatus::Open
+        );
+    }
+
+    #[test]
+    fn test_map_status_canceled() {
+        assert_eq!(
+            LinearSource::<MockLinearClient>::map_status(Some("canceled")),
+            IssueStatus::Resolved
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_assignee_only_no_labels() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{"data":{"issues":{"nodes":[]}}}"#,
+        );
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test_key".to_string(),
+            trigger_labels: vec![],
+            trigger_assignee: Some("John".to_string()),
+            trigger_states: vec![],
+            team_id: None,
+            project_id: None,
+            webhook_secret: None,
+            ..Default::default()
+        };
+        let source = LinearSource::with_http_client(config, mock);
+        let _issues = source.fetch_issues().await.unwrap();
+
+        let requests = source.http.get_requests();
+        let body = &requests[0].1;
+        let filter = &body["variables"]["filter"];
+        assert!(filter.get("assignee").is_some());
+        assert!(
+            filter.get("labels").is_none(),
+            "No labels configured, should not include labels filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_empty_assignee_skipped() {
+        let mock = MockLinearClient::new();
+        mock.mock_response(
+            "https://api.linear.app/graphql",
+            200,
+            r#"{"data":{"issues":{"nodes":[]}}}"#,
+        );
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test_key".to_string(),
+            trigger_labels: vec![],
+            trigger_assignee: Some("".to_string()), // empty assignee
+            trigger_states: vec![],
+            team_id: None,
+            project_id: None,
+            webhook_secret: None,
+            ..Default::default()
+        };
+        let source = LinearSource::with_http_client(config, mock);
+        let _issues = source.fetch_issues().await.unwrap();
+
+        let requests = source.http.get_requests();
+        let body = &requests[0].1;
+        let filter = &body["variables"]["filter"];
+        assert!(
+            filter.get("assignee").is_none(),
+            "Empty assignee should not produce filter"
+        );
+    }
+
+    #[test]
+    fn test_reqwest_linear_client_default() {
+        let client = ReqwestLinearClient::default();
+        assert!(std::mem::size_of_val(&client) > 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Additional coverage: deserialization edge cases and pure functions
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_graphql_response_data_only_no_errors_key() {
+        let json = r#"{"data": {"value": 42}}"#;
+        let response: GraphQLResponse<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert!(response.data.is_some());
+        assert!(response.errors.is_none());
+    }
+
+    #[test]
+    fn test_graphql_response_empty_errors_list() {
+        let json = r#"{"data": null, "errors": []}"#;
+        let response: GraphQLResponse<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert!(response.data.is_none());
+        assert!(response.errors.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_graphql_error_message_access() {
+        let json = r#"{"message": "Something went wrong with the query"}"#;
+        let error: GraphQLError = serde_json::from_str(json).unwrap();
+        assert_eq!(error.message, "Something went wrong with the query");
+    }
+
+    #[test]
+    fn test_linear_issue_deserialization_null_optional_fields() {
+        let json = r#"{
+            "id": "abc",
+            "identifier": "TEST-99",
+            "title": "Null optionals",
+            "description": null,
+            "url": "https://linear.app/abc",
+            "priority": 0,
+            "createdAt": "2024-05-01T00:00:00Z",
+            "updatedAt": "2024-05-02T00:00:00Z",
+            "state": null,
+            "labels": {"nodes": []},
+            "team": null,
+            "project": null,
+            "assignee": null
+        }"#;
+        let issue: LinearIssue = serde_json::from_str(json).unwrap();
+        assert!(issue.description.is_none());
+        assert!(issue.state.is_none());
+        assert!(issue.team.is_none());
+        assert!(issue.project.is_none());
+        assert!(issue.assignee.is_none());
+        assert!(issue.labels.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_linear_issue_deserialization_many_labels() {
+        let json = r#"{
+            "id": "lbl",
+            "identifier": "LBL-1",
+            "title": "Many labels",
+            "description": "Has labels",
+            "url": "https://linear.app/lbl",
+            "priority": 2,
+            "createdAt": "2024-01-01T00:00:00Z",
+            "updatedAt": "2024-01-02T00:00:00Z",
+            "state": {"name": "Todo", "type": "unstarted"},
+            "labels": {"nodes": [{"name": "bug"}, {"name": "p0"}, {"name": "frontend"}, {"name": "regression"}]},
+            "team": null,
+            "project": null,
+            "assignee": null
+        }"#;
+        let issue: LinearIssue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.labels.nodes.len(), 4);
+        assert_eq!(issue.labels.nodes[0].name, "bug");
+        assert_eq!(issue.labels.nodes[3].name, "regression");
+    }
+
+    #[test]
+    fn test_labels_connection_empty_deserialization() {
+        let json = r#"{"nodes": []}"#;
+        let conn: LabelsConnection = serde_json::from_str(json).unwrap();
+        assert!(conn.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_issues_response_empty_nodes() {
+        let json = r#"{"issues": {"nodes": []}}"#;
+        let response: IssuesResponse = serde_json::from_str(json).unwrap();
+        assert!(response.issues.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_issues_connection_deserialization() {
+        let json = r#"{"nodes": []}"#;
+        let conn: IssuesConnection = serde_json::from_str(json).unwrap();
+        assert!(conn.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_issue_response_with_full_issue() {
+        let json = r#"{
+            "issue": {
+                "id": "ir1",
+                "identifier": "IR-1",
+                "title": "Response test",
+                "description": "desc",
+                "url": "https://linear.app/ir1",
+                "priority": 1,
+                "createdAt": "2024-01-01T00:00:00Z",
+                "updatedAt": "2024-01-02T00:00:00Z",
+                "state": {"name": "Backlog", "type": "backlog"},
+                "labels": {"nodes": []},
+                "team": {"id": "t", "name": "T"},
+                "project": {"id": "p", "name": "P"},
+                "assignee": {"name": "A"}
+            }
+        }"#;
+        let response: IssueResponse = serde_json::from_str(json).unwrap();
+        let issue = response.issue.unwrap();
+        assert_eq!(issue.id, "ir1");
+        assert_eq!(issue.identifier, "IR-1");
+        assert!(issue.team.is_some());
+        assert!(issue.project.is_some());
+        assert!(issue.assignee.is_some());
+    }
+
+    #[test]
+    fn test_graphql_request_variables_preserved() {
+        let vars = serde_json::json!({"filter": {"team": {"id": {"eq": "t1"}}}, "first": 50});
+        let request = GraphQLRequest {
+            query: "query Issues($filter: IssueFilter) { issues }",
+            variables: vars.clone(),
+        };
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized["variables"], vars);
+        assert_eq!(
+            serialized["query"],
+            "query Issues($filter: IssueFilter) { issues }"
+        );
+    }
+
+    #[test]
+    fn test_map_issue_labels_preserved_in_metadata() {
+        let source = LinearSource::new(test_config());
+        let linear_issue = create_linear_issue(
+            "labels-test",
+            "LT-1",
+            "Labels test",
+            2,
+            "backlog",
+            "Backlog",
+            vec!["alpha", "beta", "gamma"],
+        );
+        let issue = source.map_issue(linear_issue);
+        let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
+        assert_eq!(labels, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_map_issue_url_preserved() {
+        let source = LinearSource::new(test_config());
+        let linear_issue = create_linear_issue(
+            "url-test",
+            "UT-1",
+            "URL test",
+            3,
+            "backlog",
+            "Backlog",
+            vec![],
+        );
+        let issue = source.map_issue(linear_issue);
+        assert_eq!(issue.url, "https://linear.app/team/issue/UT-1");
+    }
+
+    #[test]
+    fn test_map_priority_boundary_values() {
+        assert_eq!(
+            LinearSource::<ReqwestLinearClient>::map_priority(i32::MAX),
+            IssuePriority::None
+        );
+        assert_eq!(
+            LinearSource::<ReqwestLinearClient>::map_priority(i32::MIN),
+            IssuePriority::None
+        );
+    }
+
+    #[test]
+    fn test_format_linear_context_priority_status_values() {
+        let mut issue = Issue::new(
+            "pri-1",
+            "PRI-1",
+            "Priority test",
+            "https://linear.app/pri",
+            "linear",
+        );
+        issue.priority = IssuePriority::Critical;
+        issue.status = IssueStatus::Resolved;
+
+        let context = format_linear_context(&issue);
+        assert!(context.contains("**Priority:** critical"));
+        assert!(context.contains("**Status:** resolved"));
+    }
+
+    #[test]
+    fn test_format_linear_context_url_included() {
+        let issue = Issue::new(
+            "url-1",
+            "URL-1",
+            "URL test",
+            "https://linear.app/my-org/issue/URL-1",
+            "linear",
+        );
+
+        let context = format_linear_context(&issue);
+        assert!(context.contains("**URL:** https://linear.app/my-org/issue/URL-1"));
+    }
+
+    #[test]
+    fn test_linear_state_various_types() {
+        for (state_type, expected_name) in [
+            ("unstarted", "Todo"),
+            ("backlog", "Backlog"),
+            ("started", "In Progress"),
+            ("completed", "Done"),
+            ("canceled", "Cancelled"),
+        ] {
+            let json = format!(
+                r#"{{"name": "{}", "type": "{}"}}"#,
+                expected_name, state_type
+            );
+            let state: LinearState = serde_json::from_str(&json).unwrap();
+            assert_eq!(state.state_type, state_type);
+            assert_eq!(state.name, expected_name);
+        }
+    }
+
+    #[test]
+    fn test_is_issue_terminal_not_exact_prefix() {
+        assert!(!LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "Complete"
+        ));
+        assert!(!LinearSource::<ReqwestLinearClient>::is_issue_terminal(
+            "cancel"
+        ));
+    }
+
+    #[test]
+    fn test_map_issue_invalid_created_valid_updated() {
+        let source = LinearSource::new(test_config());
+        let linear_issue = LinearIssue {
+            id: "mixed".to_string(),
+            identifier: "MX-1".to_string(),
+            title: "Mixed dates".to_string(),
+            description: None,
+            url: "https://linear.app/mixed".to_string(),
+            priority: 2,
+            created_at: "not-a-date".to_string(),
+            updated_at: "2024-06-15T10:30:00.000Z".to_string(),
+            state: None,
+            labels: LabelsConnection { nodes: vec![] },
+            team: None,
+            project: None,
+            assignee: None,
+        };
+        let issue = source.map_issue(linear_issue);
+        assert!(issue.created_at.is_none());
+        assert!(issue.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_map_issue_valid_created_invalid_updated() {
+        let source = LinearSource::new(test_config());
+        let linear_issue = LinearIssue {
+            id: "mixed2".to_string(),
+            identifier: "MX-2".to_string(),
+            title: "Mixed dates 2".to_string(),
+            description: None,
+            url: "https://linear.app/mixed2".to_string(),
+            priority: 3,
+            created_at: "2024-06-15T10:30:00.000Z".to_string(),
+            updated_at: "bad-date".to_string(),
+            state: None,
+            labels: LabelsConnection { nodes: vec![] },
+            team: None,
+            project: None,
+            assignee: None,
+        };
+        let issue = source.map_issue(linear_issue);
+        assert!(issue.created_at.is_some());
+        assert!(issue.updated_at.is_none());
+    }
+
+    #[test]
+    fn test_map_issue_source_field() {
+        let source = LinearSource::new(test_config());
+        let linear_issue = create_linear_issue(
+            "src-test",
+            "SRC-1",
+            "Source check",
+            2,
+            "backlog",
+            "Backlog",
+            vec![],
+        );
+        let issue = source.map_issue(linear_issue);
+        assert_eq!(issue.source, "linear");
+    }
+
+    #[test]
+    fn test_matches_criteria_trigger_assignee_skip_label_check() {
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test_key".to_string(),
+            trigger_labels: vec![],
+            trigger_assignee: Some("Alice".to_string()),
+            trigger_states: vec![],
+            team_id: None,
+            project_id: None,
+            webhook_secret: None,
+            ..Default::default()
+        };
+        let source = LinearSource::new(config);
+
+        let mut issue = Issue::new(
+            "skip-lbl",
+            "SL-1",
+            "Skip label",
+            "https://example.com",
+            "linear",
+        );
+        issue.set_metadata("assignee", "Alice");
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+    }
+
+    #[test]
+    fn test_matches_criteria_multiple_trigger_states_one_matches() {
+        let config = LinearConfig {
+            enabled: true,
+            api_key: "test_key".to_string(),
+            trigger_labels: vec![],
+            trigger_assignee: None,
+            trigger_states: vec![
+                "backlog".to_string(),
+                "todo".to_string(),
+                "triage".to_string(),
+            ],
+            team_id: None,
+            project_id: None,
+            webhook_secret: None,
+            ..Default::default()
+        };
+        let source = LinearSource::new(config);
+
+        let mut issue = Issue::new(
+            "multi-state",
+            "MS-1",
+            "Multi state",
+            "https://example.com",
+            "linear",
+        );
+        issue.set_metadata("state_type", "triage");
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+    }
+
+    #[test]
+    fn test_linear_issue_description_with_special_chars() {
+        let json = r#"{
+            "id": "special",
+            "identifier": "SP-1",
+            "title": "Special chars",
+            "description": "Line 1\nLine 2\tTabbed\n\"Quoted\"",
+            "url": "https://linear.app/special",
+            "priority": 2,
+            "createdAt": "2024-01-01T00:00:00Z",
+            "updatedAt": "2024-01-02T00:00:00Z",
+            "state": null,
+            "labels": {"nodes": []},
+            "team": null,
+            "project": null,
+            "assignee": null
+        }"#;
+        let issue: LinearIssue = serde_json::from_str(json).unwrap();
+        assert!(issue.description.as_ref().unwrap().contains('\n'));
+        assert!(issue.description.as_ref().unwrap().contains('\t'));
+        assert!(issue.description.as_ref().unwrap().contains('"'));
+    }
+
+    #[test]
+    fn test_graphql_response_with_both_data_and_errors() {
+        let json = r#"{
+            "data": {"partial": "value"},
+            "errors": [{"message": "Partial failure"}]
+        }"#;
+        let response: GraphQLResponse<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert!(response.data.is_some());
+        assert!(response.errors.is_some());
+        assert_eq!(
+            response.errors.as_ref().unwrap()[0].message,
+            "Partial failure"
+        );
+    }
+
+    #[test]
+    fn test_with_http_client_constructor() {
+        let mock = MockLinearClient::new();
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        assert_eq!(source.name(), "linear");
+        assert_eq!(source.display_name(), "Linear");
+    }
+
+    #[test]
+    fn test_linear_config_default() {
+        let config = LinearConfig::default();
+        assert!(config.enabled);
+        assert!(config.api_key.is_empty());
+        assert_eq!(
+            config.trigger_labels,
+            vec!["auto-implement".to_string(), "claude".to_string()]
+        );
+        assert_eq!(
+            config.trigger_states,
+            vec!["backlog".to_string(), "todo".to_string()]
+        );
+        assert!(config.team_id.is_none());
+        assert!(config.project_id.is_none());
+        assert!(config.webhook_secret.is_none());
+        assert!(config.trigger_assignee.is_none());
     }
 }

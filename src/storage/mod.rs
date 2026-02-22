@@ -211,8 +211,6 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(())
     }
 
-    // ─── Dashboard extension methods (default no-ops) ───
-
     /// Get recent activities with optional source filter.
     fn get_recent_activities_filtered(
         &self,
@@ -261,8 +259,6 @@ pub trait FixAttemptTracker: Send + Sync {
     fn get_pr_analytics(&self) -> Result<PrAnalytics> {
         Ok(PrAnalytics::default())
     }
-
-    // ─── Dashboard metrics extension methods (default no-ops) ───
 
     /// Average time from issue attempt to PR creation in minutes.
     fn get_avg_time_to_pr(&self) -> Result<Option<f64>> {
@@ -402,8 +398,6 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(Vec::new())
     }
 
-    // ─── Continuous Learning extension methods (default no-ops) ───
-
     /// System 1: Update learnings text on a feedback outcome.
     fn update_feedback_learnings(&self, _outcome_id: i64, _learnings: &str) -> Result<()> {
         Ok(())
@@ -532,8 +526,6 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(Vec::new())
     }
 
-    // ── Prioritisation engine storage ──────────────────────────────────
-
     /// Store a content cluster detected by the prioritisation engine.
     fn store_content_cluster(&self, _cluster: &crate::types::ContentCluster) -> Result<i64> {
         Ok(0)
@@ -573,8 +565,6 @@ pub trait FixAttemptTracker: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
-
-    // ─── Cross-repo correlation methods (default no-ops) ───
 
     /// Get recent fix attempts since a cutoff time.
     fn get_recent_attempts_since(&self, _since: &DateTime<Utc>) -> Result<Vec<FixAttempt>> {
@@ -698,8 +688,6 @@ mod tests {
             Ok(())
         }
     }
-
-    // ── Default method return value tests ──
 
     #[test]
     fn test_default_record_activity_returns_zero() {
@@ -903,5 +891,385 @@ mod tests {
         let stats = t.get_inference_stats().unwrap();
         assert_eq!(stats.total_attempts, 0);
         assert_eq!(stats.accuracy, 0.0);
+    }
+
+    #[test]
+    fn test_default_record_pr_review_returns_zero() {
+        let t = NoOpTracker;
+        let review = PrReviewRecord::new("https://github.com/org/repo/pull/1");
+        assert_eq!(t.record_pr_review(&review).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_record_error_pattern_returns_zero() {
+        let t = NoOpTracker;
+        let pattern = ErrorPattern::new("hash123");
+        assert_eq!(t.record_error_pattern(&pattern).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_record_metric_returns_zero() {
+        let t = NoOpTracker;
+        let metric = ProcessingMetric::new("queue_depth", 42.0);
+        assert_eq!(t.record_metric(&metric).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_record_qa_usage_returns_zero() {
+        let t = NoOpTracker;
+        assert_eq!(t.record_qa_usage(1, 2, "direct", 0.95).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_update_qa_outcome_stats_succeeds() {
+        let t = NoOpTracker;
+        assert!(t.update_qa_outcome_stats(1, true).is_ok());
+        assert!(t.update_qa_outcome_stats(2, false).is_ok());
+    }
+
+    #[test]
+    fn test_default_update_qa_outcome_stats_for_attempt_succeeds() {
+        let t = NoOpTracker;
+        assert!(t.update_qa_outcome_stats_for_attempt(1, true).is_ok());
+        assert!(t.update_qa_outcome_stats_for_attempt(2, false).is_ok());
+    }
+
+    #[test]
+    fn test_default_get_recent_activities_filtered_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t
+            .get_recent_activities_filtered(50, None)
+            .unwrap()
+            .is_empty());
+        assert!(t
+            .get_recent_activities_filtered(50, Some("linear"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_default_get_attempt_by_id_returns_none() {
+        let t = NoOpTracker;
+        assert!(t.get_attempt_by_id(1).unwrap().is_none());
+        assert!(t.get_attempt_by_id(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_default_get_executions_for_attempt_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_executions_for_attempt(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_get_reviews_for_attempt_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_reviews_for_attempt(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_get_error_patterns_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_error_patterns(100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_get_metrics_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_metrics("queue_depth", None, 100).unwrap().is_empty());
+        assert!(t
+            .get_metrics("processing_time", Some(Utc::now()), 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_default_get_avg_time_to_pr_returns_none() {
+        let t = NoOpTracker;
+        assert!(t.get_avg_time_to_pr().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_default_get_rejection_reasons_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_rejection_reasons(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_get_agent_spawn_count_returns_zero() {
+        let t = NoOpTracker;
+        assert_eq!(t.get_agent_spawn_count("2024-01-01T00:00:00Z").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_get_cost_estimate_returns_default() {
+        let t = NoOpTracker;
+        let est = t
+            .get_cost_estimate("2024-01-01T00:00:00Z", 100.0, "month")
+            .unwrap();
+        assert_eq!(est.total_cost, 0.0);
+        assert_eq!(est.avg_cost_per_fix, 0.0);
+        assert_eq!(est.fix_count, 0);
+    }
+
+    #[test]
+    fn test_default_get_mttr_trend_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_mttr_trend(4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_get_repo_leaderboard_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_repo_leaderboard().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_get_complexity_time_savings_returns_default() {
+        let t = NoOpTracker;
+        let savings = t
+            .get_complexity_time_savings("2024-01-01T00:00:00Z", 150.0, "month")
+            .unwrap();
+        assert_eq!(savings.merged_count, 0);
+        assert_eq!(savings.hours_saved, 0.0);
+        assert_eq!(savings.cost_saved, 0.0);
+    }
+
+    #[test]
+    fn test_default_get_regression_checks_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_regression_checks(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_list_indexed_repos_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.list_indexed_repos().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_get_indexing_progress_returns_idle_defaults() {
+        let t = NoOpTracker;
+        let progress = t.get_indexing_progress().unwrap();
+        assert_eq!(progress.status, "idle");
+        assert_eq!(progress.total_repos, 0);
+        assert_eq!(progress.indexed_repos, 0);
+        assert!(progress.current_repo.is_none());
+        assert_eq!(progress.current_repo_files, 0);
+        assert_eq!(progress.total_files_indexed, 0);
+        assert!(progress.started_at.is_none());
+        assert!(progress.updated_at.is_none());
+    }
+
+    #[test]
+    fn test_default_subscribe_indexing_progress_returns_valid_receiver() {
+        let t = NoOpTracker;
+        let rx = t.subscribe_indexing_progress();
+        let val = rx.borrow();
+        assert_eq!(val.status, "idle");
+        assert_eq!(val.total_repos, 0);
+        assert_eq!(val.indexed_repos, 0);
+    }
+
+    #[test]
+    fn test_default_list_all_dependencies_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.list_all_dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_get_inference_history_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_inference_history(50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_list_prs_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.list_prs(None, 50).unwrap().is_empty());
+        assert!(t.list_prs(Some("open"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_store_diff_analysis_returns_zero() {
+        let t = NoOpTracker;
+        let analysis = crate::types::DiffAnalysis {
+            id: 0,
+            attempt_id: 1,
+            pr_url: "https://github.com/org/repo/pull/1".into(),
+            scm_repo: "org/repo".into(),
+            pr_number: 1,
+            files_changed: vec!["src/main.rs".into()],
+            file_types: std::collections::HashMap::new(),
+            change_categories: vec![],
+            diff_summary: "Fixed a bug".into(),
+            created_at: Utc::now(),
+        };
+        assert_eq!(t.store_diff_analysis(&analysis).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_upsert_promoted_instruction_returns_zero() {
+        let t = NoOpTracker;
+        let instruction = crate::types::PromotedInstruction {
+            id: 0,
+            repo: "org/repo".into(),
+            source_type: "qa".into(),
+            instruction_text: "Always add tests".into(),
+            occurrence_count: 5,
+            confidence: 0.9,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(t.upsert_promoted_instruction(&instruction).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_upsert_repo_knowledge_returns_zero() {
+        let t = NoOpTracker;
+        let entry = crate::types::RepoKnowledge {
+            id: 0,
+            repo: "org/repo".into(),
+            knowledge_key: "test_framework".into(),
+            knowledge_value: "pytest".into(),
+            source_type: "review".into(),
+            confidence: 0.8,
+            occurrence_count: 3,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(t.upsert_repo_knowledge(&entry).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_upsert_review_pattern_returns_zero() {
+        let t = NoOpTracker;
+        let pattern = crate::types::ReviewPattern {
+            id: 0,
+            scm_repo: "org/repo".into(),
+            category: crate::types::ReviewCategory::MissingTests,
+            pattern_text: "Add unit tests for new functions".into(),
+            example_comments: vec!["Please add tests".into()],
+            occurrence_count: 4,
+            promoted_to_instruction: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(t.upsert_review_pattern(&pattern).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_store_strategy_fingerprint_returns_zero() {
+        let t = NoOpTracker;
+        let fp = crate::types::StrategyFingerprint {
+            id: 0,
+            attempt_id: 1,
+            files_explored: vec!["src/lib.rs".into()],
+            tests_run: 5,
+            tools_used: std::collections::HashMap::new(),
+            fix_approach: "direct_edit".into(),
+            strategy_summary: "Edited source directly".into(),
+            fix_quality_score: None,
+            created_at: Utc::now(),
+        };
+        assert_eq!(t.store_strategy_fingerprint(&fp).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_store_issue_cluster_returns_zero() {
+        let t = NoOpTracker;
+        let cluster = crate::types::IssueCluster {
+            id: 0,
+            cluster_key: "TypeError::main".into(),
+            source: "sentry".into(),
+            issue_ids: vec!["SENTRY-1".into(), "SENTRY-2".into()],
+            window_start: Utc::now(),
+            window_end: Utc::now(),
+            resolved_by_issue_id: None,
+            resolved_by_attempt_id: None,
+            status: "active".into(),
+            created_at: Utc::now(),
+        };
+        assert_eq!(t.store_issue_cluster(&cluster).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_store_content_cluster_returns_zero() {
+        let t = NoOpTracker;
+        let cluster = crate::types::ContentCluster {
+            id: 0,
+            cluster_key: "TypeError::app.main".into(),
+            source: "sentry".into(),
+            representative_issue_id: "SENTRY-1".into(),
+            issue_ids: vec!["SENTRY-1".into(), "SENTRY-2".into()],
+            error_type: Some("TypeError".into()),
+            culprit: Some("app.main".into()),
+            avg_similarity: 0.85,
+            status: "active".into(),
+            created_at: Utc::now(),
+        };
+        assert_eq!(t.store_content_cluster(&cluster).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_default_get_active_content_clusters_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_active_content_clusters("sentry").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_resolve_content_cluster_succeeds() {
+        let t = NoOpTracker;
+        assert!(t.resolve_content_cluster(1).is_ok());
+    }
+
+    #[test]
+    fn test_default_store_severity_score_succeeds() {
+        let t = NoOpTracker;
+        let score = crate::types::SeverityScore::default();
+        let blast = crate::types::BlastRadius::default();
+        assert!(t
+            .store_severity_score("sentry", "SENTRY-1", &score, blast)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_default_record_suppression_succeeds() {
+        let t = NoOpTracker;
+        assert!(t
+            .record_suppression("sentry", "SENTRY-1", "flaky_test_rule", "Flaky test noise")
+            .is_ok());
+    }
+
+    #[test]
+    fn test_default_get_recent_attempts_since_returns_empty() {
+        let t = NoOpTracker;
+        let cutoff = Utc::now();
+        assert!(t.get_recent_attempts_since(&cutoff).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_has_dependency_returns_false() {
+        let t = NoOpTracker;
+        assert!(!t.has_dependency("repo_a", "repo_b").unwrap());
+    }
+
+    #[test]
+    fn test_default_upsert_cross_repo_correlation_returns_valid_struct() {
+        let t = NoOpTracker;
+        let corr = t
+            .upsert_cross_repo_correlation("org/repo-a", "org/repo-b", 24)
+            .unwrap();
+        assert_eq!(corr.id, 0);
+        assert_eq!(corr.repo_a, "org/repo-a");
+        assert_eq!(corr.repo_b, "org/repo-b");
+        assert_eq!(corr.correlation_count, 0);
+        assert_eq!(corr.window_hours, 24);
+    }
+
+    #[test]
+    fn test_default_get_cross_repo_correlations_returns_empty() {
+        let t = NoOpTracker;
+        assert!(t.get_cross_repo_correlations(2, 168).unwrap().is_empty());
     }
 }

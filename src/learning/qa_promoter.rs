@@ -282,8 +282,6 @@ mod tests {
         );
     }
 
-    // ── Integration tests with SqliteTracker ──
-
     #[test]
     fn test_scan_and_promote_no_data() {
         let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
@@ -395,8 +393,6 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    // ── compute_confidence edge cases ──
-
     fn make_qa_match(success_rate: f64) -> crate::types::QaMatch {
         crate::types::QaMatch {
             entry: crate::types::QaKnowledgeEntry {
@@ -495,8 +491,6 @@ mod tests {
         );
     }
 
-    // ── check_embedding_similarity ──
-
     #[test]
     fn test_check_embedding_similarity_less_than_2_embeddings() {
         // Only one entry with an embedding — falls back to true
@@ -553,8 +547,6 @@ mod tests {
             "empty entries should return true (fallback)"
         );
     }
-
-    // ── format_promoted_context edge cases ──
 
     #[test]
     fn test_format_promoted_context_zero_confidence() {
@@ -647,5 +639,174 @@ mod tests {
         assert!(ctx.contains("Use `cargo test` Not **pytest** - bullet > quote"));
         assert!(ctx.contains("75%"));
         assert!(ctx.contains("3 times"));
+    }
+
+    #[test]
+    fn test_scan_and_promote_multiple_repos_multiple_answers() {
+        let tracker = crate::storage::SqliteTracker::in_memory().unwrap();
+
+        // Store 3 entries for repo-a with same answer
+        for i in 0..3 {
+            let entry = crate::types::QaKnowledgeEntry {
+                id: 0,
+                source: "linear".to_string(),
+                repo: Some("org/repo-a".to_string()),
+                issue_id: format!("a-{}", i),
+                short_id: format!("A-{}", i),
+                question_text: format!("How to deploy? (variant {})", i),
+                question_norm: "how to deploy".to_string(),
+                question_embedding: None,
+                answer_text: "Use the deploy script".to_string(),
+                answer_norm: "use the deploy script".to_string(),
+                answer_embedding: None,
+                channel: "slack".to_string(),
+                responder: Some("user".to_string()),
+                correlation_id: format!("ca-{}", i),
+                asked_at: Utc::now(),
+                answered_at: Utc::now(),
+                success_count: 1,
+                failure_count: 0,
+                last_used_at: None,
+                metadata: None,
+            };
+            tracker.store_qa_knowledge(&entry).unwrap();
+        }
+
+        // Store 2 entries for repo-b (below threshold of 3)
+        for i in 0..2 {
+            let entry = crate::types::QaKnowledgeEntry {
+                id: 0,
+                source: "linear".to_string(),
+                repo: Some("org/repo-b".to_string()),
+                issue_id: format!("b-{}", i),
+                short_id: format!("B-{}", i),
+                question_text: "How to test?".to_string(),
+                question_norm: "how to test".to_string(),
+                question_embedding: None,
+                answer_text: "Run cargo test".to_string(),
+                answer_norm: "run cargo test".to_string(),
+                answer_embedding: None,
+                channel: "discord".to_string(),
+                responder: Some("user".to_string()),
+                correlation_id: format!("cb-{}", i),
+                asked_at: Utc::now(),
+                answered_at: Utc::now(),
+                success_count: 0,
+                failure_count: 0,
+                last_used_at: None,
+                metadata: None,
+            };
+            tracker.store_qa_knowledge(&entry).unwrap();
+        }
+
+        // min_occurrences=3: only repo-a should be promoted
+        let count = QaPromoter::scan_and_promote(&tracker, None, 3, 0.8).unwrap();
+        // repo-a has 3 entries, repo-b has 2 -> only repo-a promoted
+        assert!(count >= 1);
+    }
+
+    #[test]
+    fn test_check_embedding_similarity_dissimilar_below_threshold() {
+        // Two entries with orthogonal embeddings -> similarity ~0.0 < threshold
+        let entries = vec![
+            make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0])),
+            make_qa_match_with_embedding(0.9, Some(vec![0.0, 1.0, 0.0])),
+        ];
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        // threshold=0.5, similarity ~0.0 -> false
+        assert!(
+            !QaPromoter::check_embedding_similarity(&refs, 0.5),
+            "orthogonal embeddings should not meet threshold 0.5"
+        );
+    }
+
+    #[test]
+    fn test_check_embedding_similarity_similar_above_threshold() {
+        // Two very similar embeddings
+        let entries = vec![
+            make_qa_match_with_embedding(0.9, Some(vec![0.9, 0.1, 0.0])),
+            make_qa_match_with_embedding(0.9, Some(vec![0.85, 0.15, 0.0])),
+        ];
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        // High similarity, threshold=0.5 -> true
+        assert!(
+            QaPromoter::check_embedding_similarity(&refs, 0.5),
+            "similar embeddings should meet threshold 0.5"
+        );
+    }
+
+    #[test]
+    fn test_compute_confidence_mixed_success_rates() {
+        // 4 entries with different success rates
+        // count_confidence = min(4/5, 1.0) = 0.8
+        // avg success = (0.0 + 0.5 + 1.0 + 0.75) / 4 = 0.5625
+        // total = 0.8 * 0.6 + 0.5625 * 0.4 = 0.48 + 0.225 = 0.705
+        let entries: Vec<crate::types::QaMatch> = vec![
+            make_qa_match(0.0),
+            make_qa_match(0.5),
+            make_qa_match(1.0),
+            make_qa_match(0.75),
+        ];
+        let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
+        let confidence = QaPromoter::compute_confidence(&refs);
+        assert!(
+            (confidence - 0.705).abs() < 0.01,
+            "expected ~0.705, got {}",
+            confidence
+        );
+    }
+
+    #[test]
+    fn test_format_promoted_context_ends_with_newline() {
+        let instructions = vec![PromotedInstruction {
+            id: 1,
+            repo: "r".to_string(),
+            source_type: "qa".to_string(),
+            instruction_text: "test".to_string(),
+            occurrence_count: 1,
+            confidence: 0.5,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let ctx = QaPromoter::format_promoted_context(&instructions);
+        assert!(
+            ctx.ends_with('\n'),
+            "context should end with trailing newline"
+        );
+    }
+
+    #[test]
+    fn test_format_promoted_context_bullet_list_format() {
+        let instructions = vec![
+            PromotedInstruction {
+                id: 1,
+                repo: "r".to_string(),
+                source_type: "qa".to_string(),
+                instruction_text: "First".to_string(),
+                occurrence_count: 2,
+                confidence: 0.6,
+                is_active: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            PromotedInstruction {
+                id: 2,
+                repo: "r".to_string(),
+                source_type: "qa".to_string(),
+                instruction_text: "Second".to_string(),
+                occurrence_count: 4,
+                confidence: 0.8,
+                is_active: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ];
+        let ctx = QaPromoter::format_promoted_context(&instructions);
+        // Each instruction should be a bullet point
+        let lines: Vec<&str> = ctx.lines().collect();
+        // Line 0: header, line 1: empty, line 2: "- First ...", line 3: "- Second ..."
+        let bullet_lines: Vec<&&str> = lines.iter().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(bullet_lines.len(), 2, "should have 2 bullet points");
     }
 }

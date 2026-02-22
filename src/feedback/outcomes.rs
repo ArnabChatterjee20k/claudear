@@ -464,8 +464,8 @@ mod tests {
             short_id: "TEST-1".to_string(),
             status: crate::types::FixAttemptStatus::Success,
             pr_url: Some("https://github.com/test/pr/1".to_string()),
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             error_message: None,
             attempted_at: Utc::now(),
             resolved_at: None,
@@ -1111,8 +1111,6 @@ mod tests {
         assert!(parsed.embedding.is_none());
     }
 
-    // ── Edge case tests ──
-
     #[test]
     fn test_outcome_parse_empty_string() {
         assert_eq!(Outcome::parse(""), None);
@@ -1524,8 +1522,6 @@ mod tests {
         assert!(!is_common_word("Error"));
     }
 
-    // ── Semantic error categorization tests (using mock embeddings) ──
-
     #[test]
     fn test_categorize_error_semantic_best_match() {
         // We test categorize_error_semantic with mock data by calling the
@@ -1762,5 +1758,717 @@ mod tests {
         } else {
             assert_eq!(best_category, "unknown");
         }
+    }
+
+    #[test]
+    fn test_get_by_outcome_cannot_fix() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::CannotFix,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::CannotFix,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+
+        let cannot_fix = tracker.get_by_outcome(Outcome::CannotFix);
+        assert_eq!(cannot_fix.len(), 2);
+
+        let merged = tracker.get_by_outcome(Outcome::Merged);
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn test_get_by_outcome_all_variants_empty() {
+        let tracker = OutcomeTracker::new();
+        assert!(tracker.get_by_outcome(Outcome::Merged).is_empty());
+        assert!(tracker.get_by_outcome(Outcome::Closed).is_empty());
+        assert!(tracker.get_by_outcome(Outcome::Failed).is_empty());
+        assert!(tracker.get_by_outcome(Outcome::CannotFix).is_empty());
+    }
+
+    #[test]
+    fn test_outcome_serde_closed() {
+        let outcome = Outcome::Closed;
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(json, "\"closed\"");
+        let parsed: Outcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, Outcome::Closed);
+    }
+
+    #[test]
+    fn test_outcome_serde_failed() {
+        let outcome = Outcome::Failed;
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(json, "\"failed\"");
+        let parsed: Outcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, Outcome::Failed);
+    }
+
+    #[test]
+    fn test_from_attempt_error_message_with_merged_outcome() {
+        // Edge case: attempt has error_message but outcome is Merged
+        let mut attempt = create_test_attempt();
+        attempt.error_message = Some("Connection timed out".to_string());
+        let issue = create_test_issue("Test", "Test");
+
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        // error_type is derived from attempt.error_message regardless of outcome
+        assert_eq!(outcome.error_type, Some("timeout".to_string()));
+        assert!(outcome.outcome.is_success());
+    }
+
+    #[test]
+    fn test_from_attempt_empty_prompt() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "", Outcome::Merged);
+        assert_eq!(outcome.prompt_used, "");
+    }
+
+    #[test]
+    fn test_from_attempt_preserves_attempt_id() {
+        let mut attempt = create_test_attempt();
+        attempt.id = 42;
+        let issue = create_test_issue("Test", "Test");
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        assert_eq!(outcome.attempt_id, 42);
+    }
+
+    #[test]
+    fn test_from_attempt_issue_text_format() {
+        let issue = create_test_issue("My Title", "My Description");
+        let attempt = create_test_attempt();
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        // issue_text should be "title\n\ndescription"
+        assert_eq!(outcome.issue_text, "My Title\n\nMy Description");
+    }
+
+    #[test]
+    fn test_from_attempt_issue_text_no_description() {
+        let issue = Issue {
+            id: "1".to_string(),
+            short_id: "1".to_string(),
+            title: "Title Only".to_string(),
+            description: None,
+            url: "u".to_string(),
+            source: "t".to_string(),
+            priority: IssuePriority::Medium,
+            status: IssueStatus::Open,
+            metadata: Default::default(),
+            created_at: None,
+            updated_at: None,
+        };
+        let attempt = create_test_attempt();
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        // With no description, it should use empty string
+        assert_eq!(outcome.issue_text, "Title Only\n\n");
+    }
+
+    #[test]
+    fn test_load_non_contiguous_ids() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        let mut o1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        o1.id = 5;
+        let mut o2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Failed);
+        o2.id = 100;
+        let mut o3 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Closed);
+        o3.id = 50;
+
+        tracker.load(vec![o1, o2, o3]);
+        assert_eq!(tracker.all().len(), 3);
+
+        // next_id should be max(5, 100, 50) + 1 = 101
+        let new_id = tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+        assert_eq!(new_id, 101);
+    }
+
+    #[test]
+    fn test_set_embedding_overwrites_existing() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let id = tracker.record(outcome).unwrap();
+
+        tracker.set_embedding(id, vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            tracker.all()[0].embedding.as_ref().unwrap(),
+            &vec![1.0, 2.0, 3.0]
+        );
+
+        // Overwrite with a new embedding
+        tracker.set_embedding(id, vec![4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            tracker.all()[0].embedding.as_ref().unwrap(),
+            &vec![4.0, 5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn test_similarity_only_second_has_embedding() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        let outcome1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let mut outcome2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        outcome2.set_embedding(vec![1.0, 0.0, 0.0]);
+
+        // Only outcome2 has embedding; should return 0.0
+        assert_eq!(outcome1.similarity(&outcome2), 0.0);
+    }
+
+    #[test]
+    fn test_add_learnings_overwrites_existing() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        let id = tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+
+        tracker.add_learnings(id, "First learning").unwrap();
+        assert_eq!(
+            tracker.all()[0].learnings.as_ref().unwrap(),
+            "First learning"
+        );
+
+        tracker.add_learnings(id, "Updated learning").unwrap();
+        assert_eq!(
+            tracker.all()[0].learnings.as_ref().unwrap(),
+            "Updated learning"
+        );
+    }
+
+    #[test]
+    fn test_common_errors_single_type() {
+        let mut tracker = OutcomeTracker::new();
+        let issue = create_test_issue("Test", "Test");
+        let mut attempt = create_test_attempt();
+        attempt.error_message = Some("Permission denied".to_string());
+
+        for _ in 0..3 {
+            tracker
+                .record(FixOutcome::from_attempt(
+                    &attempt,
+                    &issue,
+                    "p",
+                    Outcome::Failed,
+                ))
+                .unwrap();
+        }
+
+        let errors = tracker.common_errors(10);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "permission");
+        assert_eq!(errors[0].1, 3);
+    }
+
+    #[test]
+    fn test_success_rate_mixed_outcomes() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        // Merged = success; Closed, Failed, CannotFix = not success
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Closed,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Failed,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::CannotFix,
+            ))
+            .unwrap();
+
+        let rate = tracker.success_rate(None);
+        // 1 out of 4 = 0.25
+        assert!((rate - 0.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_fix_outcome_initial_id_is_zero() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        // from_attempt sets id = 0 (to be assigned by storage)
+        assert_eq!(outcome.id, 0);
+    }
+
+    #[test]
+    fn test_fix_outcome_initial_learnings_is_none() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        assert!(outcome.learnings.is_none());
+    }
+
+    #[test]
+    fn test_fix_outcome_initial_embedding_is_none() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+        let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        assert!(outcome.embedding.is_none());
+    }
+
+    #[test]
+    fn test_extract_keywords_preserves_underscored_words() {
+        // Underscore should not split words
+        let keywords =
+            FixOutcome::extract_keywords("null_pointer_exception occurred", "stack trace follows");
+        assert!(
+            keywords.contains(&"null_pointer_exception".to_string()),
+            "should keep underscored compound words intact, got: {:?}",
+            keywords
+        );
+    }
+
+    #[test]
+    fn test_extract_keywords_deduplication_not_guaranteed() {
+        // Duplicate words in input appear as many times as they pass the filter
+        let keywords =
+            FixOutcome::extract_keywords("database database database", "database database");
+        // All should be "database" - verify they exist
+        assert!(keywords.iter().all(|k| k == "database"));
+    }
+
+    #[test]
+    fn test_common_errors_ordering_is_descending() {
+        let mut tracker = OutcomeTracker::new();
+        let issue = create_test_issue("Test", "Test");
+        let mut attempt = create_test_attempt();
+
+        // 1x syntax
+        attempt.error_message = Some("Syntax error".to_string());
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Failed,
+            ))
+            .unwrap();
+
+        // 3x timeout
+        attempt.error_message = Some("Connection timed out".to_string());
+        for _ in 0..3 {
+            tracker
+                .record(FixOutcome::from_attempt(
+                    &attempt,
+                    &issue,
+                    "p",
+                    Outcome::Failed,
+                ))
+                .unwrap();
+        }
+
+        // 2x permission
+        attempt.error_message = Some("Permission denied".to_string());
+        for _ in 0..2 {
+            tracker
+                .record(FixOutcome::from_attempt(
+                    &attempt,
+                    &issue,
+                    "p",
+                    Outcome::Failed,
+                ))
+                .unwrap();
+        }
+
+        let errors = tracker.common_errors(10);
+        assert_eq!(errors.len(), 3);
+        // Should be sorted descending by count
+        assert!(errors[0].1 >= errors[1].1);
+        assert!(errors[1].1 >= errors[2].1);
+        assert_eq!(errors[0].0, "timeout");
+        assert_eq!(errors[0].1, 3);
+    }
+
+    #[test]
+    fn test_fix_outcome_clone() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Clone test", "Testing clone");
+        let mut outcome = FixOutcome::from_attempt(&attempt, &issue, "prompt", Outcome::Merged);
+        outcome.set_embedding(vec![1.0, 2.0]);
+        outcome.learnings = Some("learned something".to_string());
+
+        let cloned = outcome.clone();
+        assert_eq!(cloned.source, outcome.source);
+        assert_eq!(cloned.issue_id, outcome.issue_id);
+        assert_eq!(cloned.prompt_used, outcome.prompt_used);
+        assert_eq!(cloned.outcome, outcome.outcome);
+        assert_eq!(cloned.embedding, outcome.embedding);
+        assert_eq!(cloned.learnings, outcome.learnings);
+        assert_eq!(cloned.keywords, outcome.keywords);
+    }
+
+    #[test]
+    fn test_outcome_copy() {
+        let outcome = Outcome::Merged;
+        let copied = outcome;
+        // Both should still be usable since Outcome is Copy
+        assert_eq!(outcome, copied);
+    }
+
+    #[test]
+    fn test_load_then_record_then_load_again() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        // Load initial data
+        let mut o1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        o1.id = 10;
+        tracker.load(vec![o1]);
+        assert_eq!(tracker.all().len(), 1);
+
+        // Record a new one
+        let id = tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Failed,
+            ))
+            .unwrap();
+        assert_eq!(id, 11);
+        assert_eq!(tracker.all().len(), 2);
+
+        // Load again should replace everything
+        let mut o2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Closed);
+        o2.id = 50;
+        tracker.load(vec![o2]);
+        assert_eq!(tracker.all().len(), 1);
+        assert_eq!(tracker.all()[0].id, 50);
+
+        // Next record should be 51
+        let id2 = tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+        assert_eq!(id2, 51);
+    }
+
+    #[test]
+    fn test_set_embedding_then_check_similarity() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        let mut o1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        let mut o2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+
+        // Initially no embeddings -> 0.0
+        assert_eq!(o1.similarity(&o2), 0.0);
+
+        // Set embeddings
+        o1.set_embedding(vec![1.0, 0.0, 0.0]);
+        o2.set_embedding(vec![0.0, 1.0, 0.0]);
+
+        // Orthogonal -> near 0.0
+        let sim = o1.similarity(&o2);
+        assert!(
+            sim.abs() < 0.01,
+            "orthogonal vectors should be near 0, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_categorize_error_test_without_fail() {
+        // "test" alone (without "fail") should not match test_failure
+        assert_eq!(
+            FixOutcome::categorize_error("running test suite"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn test_categorize_error_build_without_fail() {
+        // "build" alone (without "fail") should not match build_failure
+        assert_eq!(FixOutcome::categorize_error("build started"), "unknown");
+    }
+
+    #[test]
+    fn test_categorize_error_conflict_detection() {
+        assert_eq!(
+            FixOutcome::categorize_error("merge conflict in file.rs"),
+            "conflict"
+        );
+        assert_eq!(
+            FixOutcome::categorize_error("CONFLICT detected"),
+            "conflict"
+        );
+    }
+
+    #[test]
+    fn test_extract_keywords_with_underscores() {
+        let keywords =
+            FixOutcome::extract_keywords("null_pointer_exception", "stack_overflow_error");
+        // Underscores should be kept (split on non-alphanumeric except _)
+        assert!(keywords
+            .iter()
+            .any(|k| k.contains("null") || k.contains("pointer")));
+    }
+
+    #[test]
+    fn test_extract_keywords_numbers_included() {
+        let keywords = FixOutcome::extract_keywords("error404 response", "http500 status");
+        // Words with numbers should be included if > 3 chars
+        assert!(keywords.iter().any(|k| k.contains("error404")
+            || k.contains("http500")
+            || k.contains("response")
+            || k.contains("status")));
+    }
+
+    #[test]
+    fn test_get_by_outcome_after_load() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        let mut o1 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Merged);
+        o1.id = 10;
+        let mut o2 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Failed);
+        o2.id = 20;
+        let mut o3 = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::CannotFix);
+        o3.id = 30;
+
+        tracker.load(vec![o1, o2, o3]);
+
+        assert_eq!(tracker.get_by_outcome(Outcome::Merged).len(), 1);
+        assert_eq!(tracker.get_by_outcome(Outcome::Failed).len(), 1);
+        assert_eq!(tracker.get_by_outcome(Outcome::CannotFix).len(), 1);
+        assert_eq!(tracker.get_by_outcome(Outcome::Closed).len(), 0);
+    }
+
+    #[test]
+    fn test_common_errors_limit_less_than_total() {
+        let mut tracker = OutcomeTracker::new();
+        let issue = create_test_issue("Test", "Test");
+        let mut attempt = create_test_attempt();
+
+        // Create 5 different error types
+        for (i, err) in [
+            "Timeout",
+            "Permission denied",
+            "Syntax error",
+            "Test failed",
+            "Build failed",
+        ]
+        .iter()
+        .enumerate()
+        {
+            attempt.error_message = Some(err.to_string());
+            for _ in 0..(5 - i) {
+                tracker
+                    .record(FixOutcome::from_attempt(
+                        &attempt,
+                        &issue,
+                        "p",
+                        Outcome::Failed,
+                    ))
+                    .unwrap();
+            }
+        }
+
+        // Request only top 2
+        let errors = tracker.common_errors(2);
+        assert_eq!(errors.len(), 2);
+        // First should be the most common
+        assert!(errors[0].1 >= errors[1].1);
+    }
+
+    #[test]
+    fn test_outcome_as_str_matches_parse() {
+        for outcome in [
+            Outcome::Merged,
+            Outcome::Closed,
+            Outcome::Failed,
+            Outcome::CannotFix,
+        ] {
+            let s = outcome.as_str();
+            let parsed = Outcome::parse(s).unwrap();
+            assert_eq!(parsed, outcome);
+        }
+    }
+
+    #[test]
+    fn test_from_attempt_with_various_error_messages() {
+        let issue = create_test_issue("Test", "Test");
+
+        let error_cases = vec![
+            ("Connection timed out after 30s", "timeout"),
+            ("Access denied for user root", "permission"),
+            ("Parse error: unexpected token", "syntax"),
+            ("2 tests failed in suite", "test_failure"),
+            ("Build failed: linker error", "build_failure"),
+            ("Module not found: foo_bar", "not_found"),
+            ("Merge conflict in src/main.rs", "conflict"),
+            ("Something completely unexpected", "unknown"),
+        ];
+
+        for (error_msg, expected_type) in error_cases {
+            let mut attempt = create_test_attempt();
+            attempt.error_message = Some(error_msg.to_string());
+            let outcome = FixOutcome::from_attempt(&attempt, &issue, "p", Outcome::Failed);
+            assert_eq!(
+                outcome.error_type.as_deref(),
+                Some(expected_type),
+                "error '{}' should be categorized as '{}'",
+                error_msg,
+                expected_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_fix_outcome_serde_full_roundtrip() {
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Serde Test", "Full roundtrip");
+        let mut outcome =
+            FixOutcome::from_attempt(&attempt, &issue, "prompt text", Outcome::Failed);
+        outcome.id = 42;
+        outcome.learnings = Some("Always check retries".to_string());
+        outcome.set_embedding(vec![0.1, 0.2, 0.3]);
+
+        let json = serde_json::to_string(&outcome).unwrap();
+        let parsed: FixOutcome = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.id, 42);
+        assert_eq!(parsed.source, outcome.source);
+        assert_eq!(parsed.issue_id, outcome.issue_id);
+        assert_eq!(parsed.prompt_used, "prompt text");
+        assert_eq!(parsed.outcome, Outcome::Failed);
+        assert_eq!(parsed.learnings, Some("Always check retries".to_string()));
+        assert_eq!(parsed.embedding, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(parsed.keywords, outcome.keywords);
+    }
+
+    #[test]
+    fn test_success_rate_closed_and_cannot_fix_not_success() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        // Only Closed and CannotFix, both should NOT count as success
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Closed,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::CannotFix,
+            ))
+            .unwrap();
+
+        assert_eq!(tracker.success_rate(None), 0.0);
+    }
+
+    #[test]
+    fn test_get_by_outcome_returns_correct_ids() {
+        let mut tracker = OutcomeTracker::new();
+        let attempt = create_test_attempt();
+        let issue = create_test_issue("Test", "Test");
+
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Failed,
+            ))
+            .unwrap();
+        tracker
+            .record(FixOutcome::from_attempt(
+                &attempt,
+                &issue,
+                "p",
+                Outcome::Merged,
+            ))
+            .unwrap();
+
+        let merged = tracker.get_by_outcome(Outcome::Merged);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, 1);
+        assert_eq!(merged[1].id, 3);
     }
 }

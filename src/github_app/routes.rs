@@ -178,13 +178,13 @@ pub async fn github_setup_handler(
     let setup_state = state_manager.create_state(base_url);
 
     // Generate the GitHub redirect URL
-    let github_url = if let Some(org) = query.org {
+    let scm_url = if let Some(org) = query.org {
         manifest.github_org_manifest_url(&org, &setup_state.csrf_token)
     } else {
         manifest.github_manifest_url(&setup_state.csrf_token)
     };
 
-    match github_url {
+    match scm_url {
         Ok(url) => Ok(Redirect::temporary(&url)),
         Err(e) => Err(Html(format!(
             "<h1>Error</h1><p>Failed to generate manifest: {}</p>",
@@ -559,8 +559,6 @@ mod tests {
         assert!(html.contains("Setup Error"));
     }
 
-    // ── html_escape tests ──────────────────────────────────────────
-
     #[test]
     fn test_html_escape_ampersand() {
         assert_eq!(html_escape("a&b"), "a&amp;b");
@@ -624,8 +622,6 @@ mod tests {
         assert_eq!(html_escape("&amp;"), "&amp;amp;");
     }
 
-    // ── SetupState tests ───────────────────────────────────────────
-
     #[test]
     fn test_setup_state_csrf_token_is_hex() {
         let state = SetupState::new("https://example.com".to_string());
@@ -679,8 +675,6 @@ mod tests {
             "State younger than 15 minutes should still be valid"
         );
     }
-
-    // ── SetupStateManager tests ────────────────────────────────────
 
     #[test]
     fn test_state_manager_create_returns_valid_state() {
@@ -796,8 +790,6 @@ mod tests {
         assert!(!state.csrf_token.is_empty());
     }
 
-    // ── generate_csrf_token tests ──────────────────────────────────
-
     #[test]
     fn test_generate_csrf_token_length() {
         let token = generate_csrf_token();
@@ -827,8 +819,6 @@ mod tests {
             "100 generated tokens should all be unique"
         );
     }
-
-    // ── SetupQuery deserialization tests ────────────────────────────
 
     #[test]
     fn test_setup_query_all_fields() {
@@ -862,8 +852,6 @@ mod tests {
         assert!(query.name.is_none());
     }
 
-    // ── CallbackQuery deserialization tests ─────────────────────────
-
     #[test]
     fn test_callback_query_deserialization() {
         let query: CallbackQuery = serde_json::from_str(
@@ -894,8 +882,6 @@ mod tests {
             "Missing 'state' should fail deserialization"
         );
     }
-
-    // ── ManifestConversionResponse deserialization tests ────────────
 
     #[test]
     fn test_manifest_conversion_response_deserialization() {
@@ -932,8 +918,6 @@ mod tests {
         let result = serde_json::from_str::<ManifestConversionResponse>(json);
         assert!(result.is_err(), "Missing required fields should fail");
     }
-
-    // ── HTML generation tests ──────────────────────────────────────
 
     #[test]
     fn test_setup_form_html_contains_form() {
@@ -1070,8 +1054,6 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
     }
 
-    // ── github_setup_handler tests ─────────────────────────────────
-
     #[tokio::test]
     async fn test_setup_handler_no_base_url_returns_form() {
         let state_manager = Arc::new(SetupStateManager::new());
@@ -1179,8 +1161,6 @@ mod tests {
         assert_eq!(states.len(), 1, "One CSRF state should have been created");
     }
 
-    // ── github_callback_handler tests ──────────────────────────────
-
     #[tokio::test]
     async fn test_callback_handler_invalid_state_returns_error() {
         let state_manager = Arc::new(SetupStateManager::new());
@@ -1271,8 +1251,6 @@ mod tests {
         );
     }
 
-    // ── State manager concurrent access tests ──────────────────────
-
     #[test]
     fn test_state_manager_concurrent_create_and_validate() {
         use std::sync::Arc;
@@ -1308,14 +1286,10 @@ mod tests {
         }
     }
 
-    // ── SETUP_STATE_EXPIRY_MINUTES constant tests ──────────────────
-
     #[test]
     fn test_setup_state_expiry_is_15_minutes() {
         assert_eq!(SETUP_STATE_EXPIRY_MINUTES, 15);
     }
-
-    // ── Edge case HTML tests ───────────────────────────────────────
 
     #[test]
     fn test_error_html_empty_strings() {

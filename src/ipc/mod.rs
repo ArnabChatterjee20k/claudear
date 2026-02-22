@@ -143,3 +143,141 @@ fn is_process_running(pid: u32) -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_socket_path_ends_with_claudear_sock() {
+        let path = default_socket_path();
+        assert!(
+            path.ends_with("claudear.sock"),
+            "Expected socket path to end with 'claudear.sock', got: {:?}",
+            path
+        );
+    }
+
+    #[test]
+    fn test_default_pid_path_ends_with_claudear_pid() {
+        let path = default_pid_path();
+        assert!(
+            path.ends_with("claudear.pid"),
+            "Expected pid path to end with 'claudear.pid', got: {:?}",
+            path
+        );
+    }
+
+    #[test]
+    fn test_ipc_runtime_dir_is_absolute() {
+        let dir = ipc_runtime_dir();
+        assert!(
+            dir.is_absolute(),
+            "Expected ipc_runtime_dir to return an absolute path, got: {:?}",
+            dir
+        );
+    }
+
+    #[test]
+    fn test_get_daemon_pid_returns_option() {
+        // This tests that get_daemon_pid does not panic and returns an Option<u32>.
+        // If no PID file exists, it returns None. If one does exist (from a running
+        // daemon), it returns Some(pid). Either outcome is acceptable.
+        let result = get_daemon_pid();
+        // Just verify the function completes without panicking.
+        // If a daemon happens to be running, the PID should be > 0.
+        if let Some(pid) = result {
+            assert!(pid > 0, "PID should be positive, got: {}", pid);
+        }
+    }
+
+    #[test]
+    fn test_write_and_remove_pid_file_does_not_panic() {
+        // We avoid actually writing the PID file if a daemon is running,
+        // as that could interfere with the running daemon. Instead, we test
+        // the functions only when no daemon is active.
+        if is_daemon_running() {
+            // A daemon is running; skip this test to avoid interfering.
+            return;
+        }
+
+        // Save any existing PID file content so we can restore it.
+        let pid_path = default_pid_path();
+        let existing_content = std::fs::read_to_string(&pid_path).ok();
+
+        // Write our PID file.
+        let write_result = write_pid_file();
+        assert!(write_result.is_ok(), "write_pid_file should succeed");
+
+        // Verify get_daemon_pid returns our PID.
+        let read_pid = get_daemon_pid();
+        assert_eq!(
+            read_pid,
+            Some(std::process::id()),
+            "get_daemon_pid should return our process PID after write_pid_file"
+        );
+
+        // Remove the PID file.
+        remove_pid_file();
+
+        // Verify the PID file is gone (or restore the original if there was one).
+        if let Some(content) = existing_content {
+            // Restore original content for the running daemon.
+            let _ = std::fs::write(&pid_path, content);
+        } else {
+            assert!(
+                !pid_path.exists(),
+                "PID file should be removed after remove_pid_file"
+            );
+        }
+    }
+
+    #[test]
+    fn test_remove_socket_file_does_not_panic_when_no_socket() {
+        // remove_socket_file should silently succeed even if no socket file exists.
+        // We cannot unconditionally call it because a daemon might be using the socket.
+        // Instead, we verify a remove on a non-existent path is safe by checking the
+        // implementation pattern (let _ = remove_file), or we call it only when no daemon
+        // is running.
+        if !is_daemon_running() {
+            // The socket file may or may not exist; either way this should not panic.
+            remove_socket_file();
+        }
+    }
+
+    #[test]
+    fn test_is_daemon_running_returns_bool() {
+        // When no daemon is running, this should return false.
+        // If a daemon happens to be running (e.g., in a dev environment), true is also valid.
+        let result = is_daemon_running();
+        // We simply verify the function completes and returns a bool.
+        let _: bool = result;
+    }
+
+    #[test]
+    fn test_is_process_running_with_own_pid() {
+        // Our own process is guaranteed to be running and we have permission to signal it.
+        let own_pid = std::process::id();
+        assert!(
+            is_process_running(own_pid),
+            "Our own PID ({}) should be reported as running",
+            own_pid
+        );
+    }
+
+    #[test]
+    fn test_is_process_running_with_invalid_pid() {
+        // u32::MAX is extremely unlikely to be a valid PID on any system.
+        assert!(
+            !is_process_running(u32::MAX),
+            "PID u32::MAX should not be reported as running"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_stale_files_does_not_panic() {
+        // cleanup_stale_files should handle all cases gracefully:
+        // no PID file, stale socket, running daemon, etc.
+        cleanup_stale_files();
+    }
+}

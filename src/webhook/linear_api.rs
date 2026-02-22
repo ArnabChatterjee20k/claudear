@@ -1617,6 +1617,56 @@ mod tests {
 
     // --- Delete webhook response simulation ---
 
+    /// Test webhook_exists logic returns true when a matching webhook URL is present.
+    #[test]
+    fn test_webhook_exists_true() {
+        // Simulate the webhook_exists logic: list_webhooks returns tuples, then
+        // we check if any URL matches.
+        let webhooks = vec![
+            (
+                "wh_1".to_string(),
+                "https://example.com/webhook/linear".to_string(),
+                true,
+            ),
+            (
+                "wh_2".to_string(),
+                "https://other.com/hook".to_string(),
+                true,
+            ),
+        ];
+        let target_url = "https://example.com/webhook/linear";
+        let exists = webhooks.iter().any(|(_, wh_url, _)| wh_url == target_url);
+        assert!(exists, "should find a webhook with matching URL");
+    }
+
+    /// Test webhook_exists logic returns false when no matching webhook URL is present.
+    #[test]
+    fn test_webhook_exists_false() {
+        let webhooks = vec![
+            (
+                "wh_1".to_string(),
+                "https://example.com/webhook/linear".to_string(),
+                true,
+            ),
+            (
+                "wh_2".to_string(),
+                "https://other.com/hook".to_string(),
+                false,
+            ),
+        ];
+        let target_url = "https://nonexistent.com/webhook";
+        let exists = webhooks.iter().any(|(_, wh_url, _)| wh_url == target_url);
+        assert!(
+            !exists,
+            "should not find a webhook when URL does not match any"
+        );
+
+        // Also test with empty list
+        let empty: Vec<(String, String, bool)> = vec![];
+        let exists_empty = empty.iter().any(|(_, wh_url, _)| wh_url == target_url);
+        assert!(!exists_empty, "should not find a webhook in an empty list");
+    }
+
     #[test]
     fn test_delete_webhook_success_response() {
         #[derive(Debug, Deserialize)]

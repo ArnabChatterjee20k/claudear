@@ -1,12 +1,24 @@
+ARG APP_VERSION=0.1.0
+ARG RUST_VERSION=1.93
+ARG BUN_VERSION=1.3
+ARG DEBIAN_VERSION=trixie
 ARG ONNXRUNTIME_VERSION=1.23.2
 ARG VECTORLITE_VERSION=16a01af79add
-ARG RUST_VERSION=1.93
-ARG DEBIAN_VERSION=trixie
+
 ARG GIT_USER_NAME="Claudear"
 ARG GIT_USER_EMAIL="claudear@noreply.local"
 
-# Dashboard build stage
-FROM oven/bun:1 AS dashboard
+ARG SENTRY_DSN=""
+ARG SENTRY_ENVIRONMENT="production"
+ARG SENTRY_RELEASE="claudear-dashboard@${APP_VERSION}"
+
+FROM oven/bun:${BUN_VERSION} AS dashboard
+ARG SENTRY_DSN
+ARG SENTRY_ENVIRONMENT
+ARG SENTRY_RELEASE
+ENV SENTRY_DSN=${SENTRY_DSN}
+ENV SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT}
+ENV SENTRY_RELEASE=${SENTRY_RELEASE}
 
 WORKDIR /app/dashboard
 COPY dashboard/package.json dashboard/bun.lock* ./
@@ -14,7 +26,6 @@ RUN bun install --frozen-lockfile
 COPY dashboard/ ./
 RUN bun run build
 
-# Vectorlite build stage (no prebuilt binaries for linux arm64)
 FROM debian:${DEBIAN_VERSION}-slim AS vectorlite
 ARG VECTORLITE_VERSION
 
@@ -41,7 +52,15 @@ RUN python3 bootstrap_vcpkg.py
 
 RUN cmake --preset release && cmake --build build/release -j$(nproc)
 
+FROM debian:${DEBIAN_VERSION}-slim AS claude
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 appuser
+USER appuser
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_VERSION} AS builder
+ARG APP_VERSION
 
 WORKDIR /app
 
@@ -53,25 +72,19 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock build.rs ./
+RUN if [ -n "${APP_VERSION}" ] && [ "${APP_VERSION}" != "0.1.0" ]; then \
+      sed -i "s/^version = .*/version = \"${APP_VERSION}\"/" Cargo.toml; \
+    fi
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
 RUN mkdir -p dashboard/dist
-RUN cargo build --release && rm -rf src
+RUN cargo build --release --bin claudear && rm -rf src
 
 COPY src ./src
 
-# Copy dashboard for embedding
 COPY --from=dashboard /app/dashboard/dist ./dashboard/dist
-RUN touch src/main.rs src/lib.rs && cargo build --release
+RUN touch src/main.rs src/lib.rs && cargo build --release --bin claudear
 
-# Install Claude Code native binary in a throwaway stage
-FROM debian:${DEBIAN_VERSION}-slim AS claude-code
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
-RUN useradd -m -u 1000 appuser
-USER appuser
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
-FROM debian:${DEBIAN_VERSION}-slim
+FROM debian:${DEBIAN_VERSION}-slim AS final
 ARG GIT_USER_NAME
 ARG GIT_USER_EMAIL
 
@@ -83,7 +96,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     jq \
     openssh-client \
-    && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/locale/*
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/locale/* \
+    && ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://cli.github.com/packages/githubcli-archive-keyring.gpg" \
+       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=${ARCH} signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=vectorlite /build/build/release/vectorlite/vectorlite.so /usr/local/lib/vectorlite.so
 COPY --from=builder /app/target/release/claudear /usr/local/bin/claudear
@@ -93,8 +114,7 @@ RUN adduser --disabled-password --uid 1000 --gecos "" appuser \
     && mkdir -p /app/data /app/repos /home/appuser/.cache/fastembed /home/appuser/.claude \
     && chown -R appuser:appuser /app /home/appuser/.cache /home/appuser/.claude
 
-# Copy only the Claude Code binary from the install stage
-COPY --from=claude-code --chown=appuser:appuser /home/appuser/.local /home/appuser/.local
+COPY --from=claude --chown=appuser:appuser /home/appuser/.local /home/appuser/.local
 
 USER appuser
 

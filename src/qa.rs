@@ -399,8 +399,6 @@ mod tests {
         assert!(out.contains("Score: 0.000\n"));
     }
 
-    // ── Edge case tests ──
-
     #[test]
     fn test_normalize_text_very_long_string() {
         let long = "word ".repeat(10_000);

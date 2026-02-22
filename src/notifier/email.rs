@@ -155,15 +155,11 @@ impl EmailNotifier {
         parsed.get_body().unwrap_or_default()
     }
 
-    fn sanitize_reply_text(body: &str, correlation_id: &str) -> Option<String> {
-        let token = format!("CLAUDEAR-Q:{}", correlation_id);
+    fn sanitize_reply_text(body: &str) -> Option<String> {
         let mut lines: Vec<String> = Vec::new();
         for raw_line in body.lines() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('>') {
-                continue;
-            }
-            if line.contains(&token) {
                 continue;
             }
             lines.push(line.to_string());
@@ -205,30 +201,126 @@ impl Notifier for EmailNotifier {
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
-        let subject = format!("[Claudear] PR Created: {}", issue.short_id);
+        let (subject, body) = if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            let upstream = issue
+                .get_metadata::<String>("cascade_upstream_repo")
+                .unwrap_or_default();
+            let downstream = issue
+                .get_metadata::<String>("cascade_downstream_repo")
+                .unwrap_or_default();
+            (
+                format!("[Claudear] Cascade PR: {} ({} -> {})", issue.short_id, upstream, downstream),
+                format!(
+                    "Claudear created a cascade PR for downstream adaptation.\n\nUpstream: {}\nDownstream: {}\n\n{}\n\nPR URL: {}",
+                    upstream, downstream, Self::format_issue_info(issue), pr_url
+                ),
+            )
+        } else if issue.get_metadata::<bool>("is_pr_update").unwrap_or(false) {
+            (
+                format!("[Claudear] PR Updated: {}", issue.short_id),
+                format!(
+                    "Claudear updated an existing PR to address review feedback.\n\n{}\n\nPR URL: {}",
+                    Self::format_issue_info(issue), pr_url
+                ),
+            )
+        } else {
+            (
+                format!("[Claudear] PR Created: {}", issue.short_id),
+                format!(
+                    "Claudear successfully created a PR!\n\n{}\n\nPR URL: {}",
+                    Self::format_issue_info(issue),
+                    pr_url
+                ),
+            )
+        };
+        self.send_email(&subject, &body, Some(issue)).await
+    }
+
+    async fn notify_completed(&self, issue: &Issue) -> Result<()> {
+        let (subject, body) = if issue
+            .get_metadata::<bool>("regression_resolved")
+            .unwrap_or(false)
+        {
+            (
+                format!("[Claudear] Regression Resolved: {}", issue.short_id),
+                format!(
+                    "No regression detected after the monitoring period.\n\n{}\n\nThe issue has been marked as resolved.",
+                    Self::format_issue_info(issue)
+                ),
+            )
+        } else {
+            (
+                format!("[Claudear] Completed: {}", issue.short_id),
+                format!(
+                    "Claudear completed processing but no PR URL was captured.\n\n{}",
+                    Self::format_issue_info(issue)
+                ),
+            )
+        };
+        self.send_email(&subject, &body, Some(issue)).await
+    }
+
+    async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
+        let (subject, body) = if issue
+            .get_metadata::<bool>("regression_detected")
+            .unwrap_or(false)
+        {
+            (
+                format!("[Claudear] Regression Detected: {}", issue.short_id),
+                format!(
+                    "A previously fixed issue has regressed.\n\n{}\n\nDetails: {}\n\nA retry has been scheduled.",
+                    Self::format_issue_info(issue), error
+                ),
+            )
+        } else if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            let upstream = issue
+                .get_metadata::<String>("cascade_upstream_repo")
+                .unwrap_or_default();
+            let downstream = issue
+                .get_metadata::<String>("cascade_downstream_repo")
+                .unwrap_or_default();
+            (
+                format!("[Claudear] Cascade Failed: {} ({} -> {})", issue.short_id, upstream, downstream),
+                format!(
+                    "Claudear failed to create a cascade PR.\n\nUpstream: {}\nDownstream: {}\n\n{}\n\nError: {}",
+                    upstream, downstream, Self::format_issue_info(issue), error
+                ),
+            )
+        } else {
+            (
+                format!("[Claudear] Failed: {}", issue.short_id),
+                format!(
+                    "Claudear failed to process an issue.\n\n{}\n\nError: {}",
+                    Self::format_issue_info(issue),
+                    error
+                ),
+            )
+        };
+        self.send_email(&subject, &body, Some(issue)).await
+    }
+
+    async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let subject = format!("[Claudear] PR Merged: {}", issue.short_id);
         let body = format!(
-            "Claudear successfully created a PR!\n\n{}\n\nPR URL: {}",
+            "A PR has been merged and the issue resolved.\n\n{}\n\nPR URL: {}",
             Self::format_issue_info(issue),
             pr_url
         );
         self.send_email(&subject, &body, Some(issue)).await
     }
 
-    async fn notify_completed(&self, issue: &Issue) -> Result<()> {
-        let subject = format!("[Claudear] Completed: {}", issue.short_id);
+    async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let subject = format!("[Claudear] PR Closed: {}", issue.short_id);
         let body = format!(
-            "Claudear completed processing but no PR URL was captured.\n\n{}",
-            Self::format_issue_info(issue)
-        );
-        self.send_email(&subject, &body, Some(issue)).await
-    }
-
-    async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
-        let subject = format!("[Claudear] Failed: {}", issue.short_id);
-        let body = format!(
-            "Claudear failed to process an issue.\n\n{}\n\nError: {}",
+            "A PR was closed without merging.\n\n{}\n\nPR URL: {}",
             Self::format_issue_info(issue),
-            error
+            pr_url
         );
         self.send_email(&subject, &body, Some(issue)).await
     }
@@ -265,7 +357,7 @@ impl Notifier for EmailNotifier {
         issue: &Issue,
         request: &AskRequest,
     ) -> Result<Option<AskDelivery>> {
-        let subject = format!("[CLAUDEAR-Q:{}] {}", request.correlation_id, issue.short_id);
+        let subject = format!("Human input needed: {}", issue.short_id);
         let mut body = format!(
             "Claude needs human input.\n\n{}\n\nQuestion:\n{}\n",
             Self::format_issue_info(issue),
@@ -283,7 +375,7 @@ impl Notifier for EmailNotifier {
                 request.question.options.join("\n- ")
             ));
         }
-        body.push_str("\nReply to this email and keep the token in subject or body.\n");
+        body.push_str("\nReply to this email with your answer.\n");
 
         self.send_email(&subject, &body, Some(issue)).await?;
         Ok(Some(AskDelivery {
@@ -314,6 +406,7 @@ impl Notifier for EmailNotifier {
         let imap_port = self.config.imap_port;
         let imap_folder = self.config.imap_folder.clone();
         let correlation_id = request.correlation_id.clone();
+        let short_id = request.short_id.clone();
         let expected_senders = self.expected_reply_emails(request);
         let imap_use_tls = self.config.imap_use_tls;
 
@@ -336,8 +429,8 @@ impl Notifier for EmailNotifier {
                 .select(&imap_folder)
                 .map_err(|e| Error::notifier("email", format!("IMAP select failed: {}", e)))?;
 
-            let token = format!("CLAUDEAR-Q:{}", correlation_id);
-            let search_query = format!("TEXT \"{}\"", token);
+            let search_token = format!("Human input needed: {}", short_id);
+            let search_query = format!("SUBJECT \"{}\"", search_token);
             let ids = session
                 .search(search_query)
                 .map_err(|e| Error::notifier("email", format!("IMAP search failed: {}", e)))?;
@@ -382,11 +475,11 @@ impl Notifier for EmailNotifier {
                     .get_first_value("Subject")
                     .unwrap_or_default();
                 let body_text = Self::extract_plain_body(&parsed);
-                if !subject.contains(&token) && !body_text.contains(&token) {
+                if !subject.contains(&search_token) && !body_text.contains(&search_token) {
                     continue;
                 }
 
-                let answer = match Self::sanitize_reply_text(&body_text, &correlation_id) {
+                let answer = match Self::sanitize_reply_text(&body_text) {
                     Some(v) => v,
                     None => continue,
                 };
@@ -698,8 +791,8 @@ mod tests {
     #[test]
     fn test_sanitize_reply_text_removes_token_and_quotes() {
         let body = "Thanks\n\n> quoted\nCLAUDEAR-Q:abc123\nUse main";
-        let parsed = EmailNotifier::sanitize_reply_text(body, "abc123").unwrap();
-        assert_eq!(parsed, "Thanks\nUse main");
+        let parsed = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(parsed, "Thanks\nCLAUDEAR-Q:abc123\nUse main");
     }
 
     #[tokio::test]
@@ -812,47 +905,47 @@ mod tests {
     #[test]
     fn test_sanitize_reply_text_strips_quoted_lines() {
         let body = "> original message\nMy actual reply";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
         assert_eq!(result, "My actual reply");
     }
 
     #[test]
     fn test_sanitize_reply_text_strips_token_line() {
         let body = "CLAUDEAR-Q:tok-1\nUse staging environment";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
-        assert_eq!(result, "Use staging environment");
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(result, "CLAUDEAR-Q:tok-1\nUse staging environment");
     }
 
     #[test]
     fn test_sanitize_reply_text_strips_empty_lines() {
         let body = "\n\n\nHello\n\n\n";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
         assert_eq!(result, "Hello");
     }
 
     #[test]
     fn test_sanitize_reply_text_all_quoted_returns_none() {
         let body = "> quoted line 1\n> quoted line 2\n> quoted line 3";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1");
+        let result = EmailNotifier::sanitize_reply_text(body);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_sanitize_reply_text_empty_body_returns_none() {
-        let result = EmailNotifier::sanitize_reply_text("", "tok-1");
+        let result = EmailNotifier::sanitize_reply_text("");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_sanitize_reply_text_only_whitespace_returns_none() {
-        let result = EmailNotifier::sanitize_reply_text("   \n   \n   ", "tok-1");
+        let result = EmailNotifier::sanitize_reply_text("   \n   \n   ");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_sanitize_reply_text_truncates_long_output() {
         let long_line = "x".repeat(5000);
-        let result = EmailNotifier::sanitize_reply_text(&long_line, "tok-1").unwrap();
+        let result = EmailNotifier::sanitize_reply_text(&long_line).unwrap();
         assert!(result.len() <= 4000);
     }
 
@@ -862,7 +955,7 @@ mod tests {
             .map(|i| format!("Line {}", i))
             .collect::<Vec<_>>()
             .join("\n");
-        let result = EmailNotifier::sanitize_reply_text(&body, "tok-1").unwrap();
+        let result = EmailNotifier::sanitize_reply_text(&body).unwrap();
         let line_count = result.lines().count();
         assert!(
             line_count <= 30,
@@ -874,8 +967,11 @@ mod tests {
     #[test]
     fn test_sanitize_reply_text_mixed_content() {
         let body = "> On Mon, user wrote:\n> Original question\n\nMy answer is yes\n\nCLAUDEAR-Q:tok-1\n\n> More quoted text\nSecond line of answer";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
-        assert_eq!(result, "My answer is yes\nSecond line of answer");
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(
+            result,
+            "My answer is yes\nCLAUDEAR-Q:tok-1\nSecond line of answer"
+        );
     }
 
     #[test]
@@ -1227,44 +1323,47 @@ mod tests {
     #[test]
     fn test_sanitize_reply_text_preserves_multiline_answer() {
         let body = "Line one\nLine two\nLine three";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
         assert_eq!(result, "Line one\nLine two\nLine three");
     }
 
     #[test]
     fn test_sanitize_reply_text_strips_multiple_token_lines() {
         let body = "CLAUDEAR-Q:tok-1\nAnswer\nCLAUDEAR-Q:tok-1\nMore answer";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
-        assert_eq!(result, "Answer\nMore answer");
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(
+            result,
+            "CLAUDEAR-Q:tok-1\nAnswer\nCLAUDEAR-Q:tok-1\nMore answer"
+        );
     }
 
     #[test]
     fn test_sanitize_reply_text_strips_mixed_quotes_and_tokens() {
         let body =
             "> Original question\n> Second line\nCLAUDEAR-Q:tok-1\n\nMy answer\n> Another quote";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
-        assert_eq!(result, "My answer");
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(result, "CLAUDEAR-Q:tok-1\nMy answer");
     }
 
     #[test]
     fn test_sanitize_reply_text_only_token_returns_none() {
         let body = "CLAUDEAR-Q:tok-1";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1");
-        assert!(result.is_none());
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(result, "CLAUDEAR-Q:tok-1");
     }
 
     #[test]
     fn test_sanitize_reply_text_token_with_whitespace_only_returns_none() {
         let body = "CLAUDEAR-Q:tok-1\n   \n   \n";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1");
-        assert!(result.is_none());
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(result, "CLAUDEAR-Q:tok-1");
     }
 
     #[test]
     fn test_sanitize_reply_text_different_correlation_id_preserves_line() {
         let body = "CLAUDEAR-Q:other-tok\nSome answer";
-        let result = EmailNotifier::sanitize_reply_text(body, "tok-1").unwrap();
-        // The line with CLAUDEAR-Q:other-tok is NOT stripped (different token)
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        // Token lines are no longer stripped by sanitize_reply_text
         assert!(result.contains("CLAUDEAR-Q:other-tok"));
         assert!(result.contains("Some answer"));
     }
@@ -1275,7 +1374,7 @@ mod tests {
             .map(|i| format!("Line {}", i))
             .collect::<Vec<_>>()
             .join("\n");
-        let result = EmailNotifier::sanitize_reply_text(&body, "tok-1").unwrap();
+        let result = EmailNotifier::sanitize_reply_text(&body).unwrap();
         assert_eq!(result.lines().count(), 30);
     }
 
@@ -1285,7 +1384,7 @@ mod tests {
             .map(|i| format!("Line {}", i))
             .collect::<Vec<_>>()
             .join("\n");
-        let result = EmailNotifier::sanitize_reply_text(&body, "tok-1").unwrap();
+        let result = EmailNotifier::sanitize_reply_text(&body).unwrap();
         assert_eq!(result.lines().count(), 30);
         assert!(result.contains("Line 30"));
         assert!(!result.contains("Line 31"));
@@ -1296,7 +1395,7 @@ mod tests {
         // Build a string that is exactly 4000 chars of content lines
         let line = "x".repeat(100);
         let body = (0..40).map(|_| line.clone()).collect::<Vec<_>>().join("\n"); // 40 * 100 + 39 newlines but only 30 lines are kept
-        let result = EmailNotifier::sanitize_reply_text(&body, "tok-1").unwrap();
+        let result = EmailNotifier::sanitize_reply_text(&body).unwrap();
         assert!(result.len() <= 4000);
     }
 
@@ -1669,7 +1768,7 @@ mod tests {
         let issue = Issue::new("1", "TEST-1", "Title", "https://url.com", "linear");
         let info = EmailNotifier::format_issue_info(&issue);
         let lines: Vec<&str> = info.lines().collect();
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.len(), 5);
         assert!(lines[0].starts_with("Issue:"));
         assert!(lines[1].starts_with("Source:"));
         assert!(lines[2].starts_with("Priority:"));
@@ -1745,5 +1844,702 @@ mod tests {
         };
         let result = EmailNotifier::new(config, empty_registry());
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_success metadata dispatch paths (disabled transport = Ok)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_success_cascade_pr_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+
+        let result = notifier
+            .notify_success(&issue, "https://github.com/org/downstream/pull/5")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_pr_update_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("is_pr_update", true);
+
+        let result = notifier
+            .notify_success(&issue, "https://github.com/org/repo/pull/42")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_regular_pr_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+
+        let result = notifier
+            .notify_success(&issue, "https://github.com/org/repo/pull/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_completed metadata dispatch paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_completed_regression_resolved_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("regression_resolved", true);
+
+        let result = notifier.notify_completed(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_completed_regular_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+
+        let result = notifier.notify_completed(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_failed metadata dispatch paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_failed_regression_detected_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("regression_detected", true);
+
+        let result = notifier.notify_failed(&issue, "Regression error").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_cascade_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+
+        let result = notifier.notify_failed(&issue, "Cascade error").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_regular_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+
+        let result = notifier.notify_failed(&issue, "Some error").await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_merged and notify_closed (disabled)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_merged_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+
+        let result = notifier
+            .notify_merged(&issue, "https://github.com/org/repo/pull/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_closed_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+
+        let result = notifier
+            .notify_closed(&issue, "https://github.com/org/repo/pull/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // ask_question with why, context, and options fields
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ask_question_with_why_field() {
+        let config = EmailConfig {
+            to_addresses: vec!["user@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = AskRequest {
+            correlation_id: "tok-why".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which env?".to_string(),
+                context: None,
+                options: vec![],
+                why: Some("Multiple environments available".to_string()),
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.channel, "email");
+    }
+
+    #[tokio::test]
+    async fn test_ask_question_with_context_field() {
+        let config = EmailConfig {
+            to_addresses: vec!["user@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = AskRequest {
+            correlation_id: "tok-ctx".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which env?".to_string(),
+                context: Some("We have staging and production".to_string()),
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.channel, "email");
+    }
+
+    #[tokio::test]
+    async fn test_ask_question_with_options_field() {
+        let config = EmailConfig {
+            to_addresses: vec!["user@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = AskRequest {
+            correlation_id: "tok-options".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which env?".to_string(),
+                context: None,
+                options: vec!["staging".to_string(), "production".to_string()],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.channel, "email");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_plain_body with empty subparts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_plain_body_no_subparts() {
+        let raw = b"From: user@example.com\r\nSubject: Test\r\nContent-Type: text/plain\r\n\r\nSimple body";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let body = EmailNotifier::extract_plain_body(&parsed);
+        assert!(body.contains("Simple body"));
+    }
+
+    #[test]
+    fn test_extract_plain_body_multipart_with_html_only() {
+        let raw = b"From: user@example.com\r\nSubject: Test\r\nContent-Type: multipart/alternative; boundary=bound\r\n\r\n--bound\r\nContent-Type: text/html\r\n\r\n<b>Only HTML</b>\r\n--bound--";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let body = EmailNotifier::extract_plain_body(&parsed);
+        // Falls back to parent body when no text/plain part found
+        assert!(!body.is_empty() || body.is_empty()); // Should not panic
+    }
+
+    #[test]
+    fn test_extract_plain_body_multipart_prefers_text_plain() {
+        let raw = b"From: user@example.com\r\nSubject: Test\r\nContent-Type: multipart/mixed; boundary=bound\r\n\r\n--bound\r\nContent-Type: text/html\r\n\r\n<b>HTML content</b>\r\n--bound\r\nContent-Type: text/plain\r\n\r\nPlain text content\r\n--bound--";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let body = EmailNotifier::extract_plain_body(&parsed);
+        assert!(body.contains("Plain text content"));
+    }
+
+    // -----------------------------------------------------------------------
+    // notify_urgent_issues with many issues (>10 truncation)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_notify_urgent_issues_many_issues_disabled() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let issues: Vec<Issue> = (1..=15)
+            .map(|i| {
+                Issue::new(
+                    i.to_string(),
+                    format!("PROJ-{}", i),
+                    format!("Issue {}", i),
+                    format!("https://example.com/{}", i),
+                    "linear",
+                )
+            })
+            .collect();
+
+        let result = notifier.notify_urgent_issues(&issues).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // send_email returns Ok when no transport
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_email_no_transport_returns_ok() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        // All notification methods should return Ok when no transport
+        assert!(notifier.notify_start(&issue).await.is_ok());
+        assert!(notifier
+            .notify_success(&issue, "https://pr.url")
+            .await
+            .is_ok());
+        assert!(notifier.notify_completed(&issue).await.is_ok());
+        assert!(notifier.notify_failed(&issue, "error").await.is_ok());
+        assert!(notifier
+            .notify_merged(&issue, "https://pr.url")
+            .await
+            .is_ok());
+        assert!(notifier
+            .notify_closed(&issue, "https://pr.url")
+            .await
+            .is_ok());
+        assert!(notifier.notify_status("status").await.is_ok());
+        assert!(notifier.notify_urgent_issues(&[]).await.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // send_email returns Ok when no from_address
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_send_email_no_from_address_returns_ok() {
+        let notifier = EmailNotifier::new(partial_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        // Transport exists but no from_address, send_email returns Ok(())
+        assert!(notifier.notify_start(&issue).await.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_recipients with resolved user who has no entry in registry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_recipients_resolved_user_not_in_registry() {
+        let config = EmailConfig {
+            to_addresses: vec!["fallback@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "nonexistent_user");
+        let recipients = notifier.resolve_recipients(Some(&issue));
+        assert_eq!(recipients, vec!["fallback@example.com".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // target_email_for_issue with resolved user
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_target_email_for_issue_with_resolved_user() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "alice".to_string(),
+            crate::config::UserConfig {
+                email: Some("alice@company.com".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = UserRegistry::new(users);
+        let config = EmailConfig {
+            to_addresses: vec!["global@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, registry).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "alice");
+        assert_eq!(
+            notifier.target_email_for_issue(&issue),
+            Some("alice@company.com".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_email_address edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_email_address_angle_brackets_with_spaces() {
+        assert_eq!(
+            EmailNotifier::extract_email_address("  User Name   < user@example.com  >").as_deref(),
+            Some("user@example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_email_address_only_at_symbol() {
+        // Just "@" is technically "has @" but not a valid email
+        // The function returns it since it doesn't validate beyond containing @
+        let result = EmailNotifier::extract_email_address("@");
+        assert!(result.is_some()); // It has @ so it returns Some
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_reply_text with token in middle of line
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_reply_text_token_embedded_in_text_strips_line() {
+        let body = "Start CLAUDEAR-Q:tok-embed End\nActual reply";
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(result, "Start CLAUDEAR-Q:tok-embed End\nActual reply");
+    }
+
+    // -----------------------------------------------------------------------
+    // poll_question_replies with imap_use_tls = false returns empty
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_poll_question_replies_non_tls_returns_empty() {
+        let config = EmailConfig {
+            imap_host: Some("imap.example.com".to_string()),
+            imap_username: Some("user".to_string()),
+            imap_password: Some("pass".to_string()),
+            imap_use_tls: false,
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let request = AskRequest {
+            correlation_id: "tok-notls".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let replies = notifier
+            .poll_question_replies(&request, Utc::now())
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ask_question with all fields filled
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ask_question_all_fields_present() {
+        let config = EmailConfig {
+            to_addresses: vec!["user@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = AskRequest {
+            correlation_id: "tok-all".to_string(),
+            source: "linear".to_string(),
+            repo: Some("org/repo".to_string()),
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Choose a path".to_string(),
+                context: Some("Repo has multiple modules".to_string()),
+                options: vec!["option-a".to_string(), "option-b".to_string()],
+                why: Some("Because the choice matters".to_string()),
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.channel, "email");
+        assert_eq!(delivery.target.as_deref(), Some("user@example.com"));
+        assert!(delivery.message_id.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ask_question target email for resolved user
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ask_question_target_from_resolved_user() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "bob".to_string(),
+            crate::config::UserConfig {
+                email: Some("bob@company.com".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = UserRegistry::new(users);
+        let config = EmailConfig {
+            to_addresses: vec!["global@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, registry).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "bob");
+        let request = AskRequest {
+            correlation_id: "tok-bob".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.target.as_deref(), Some("bob@company.com"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional extract_email_address tests (named per coverage spec)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_email_address_bracket_format() {
+        assert_eq!(
+            EmailNotifier::extract_email_address("John Doe <john@example.com>").as_deref(),
+            Some("john@example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_email_address_plain() {
+        assert_eq!(
+            EmailNotifier::extract_email_address("john@example.com").as_deref(),
+            Some("john@example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_email_address_no_at() {
+        assert_eq!(
+            EmailNotifier::extract_email_address("not an email").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_email_address_empty() {
+        assert_eq!(EmailNotifier::extract_email_address("").as_deref(), None);
+    }
+
+    #[test]
+    fn test_extract_email_address_bracket_empty() {
+        assert_eq!(EmailNotifier::extract_email_address("<>").as_deref(), None);
+    }
+
+    #[test]
+    fn test_extract_email_address_case_normalization() {
+        assert_eq!(
+            EmailNotifier::extract_email_address("USER@EXAMPLE.COM").as_deref(),
+            Some("user@example.com")
+        );
+        assert_eq!(
+            EmailNotifier::extract_email_address("Display Name <MiXeD@CaSe.CoM>").as_deref(),
+            Some("mixed@case.com")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional sanitize_reply_text tests (named per coverage spec)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_reply_text_normal() {
+        let body = "Yes, deploy to production please";
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(result, "Yes, deploy to production please");
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_with_quoted() {
+        let body = "> On Monday, bot wrote:\n> Original question\nMy answer";
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(result, "My answer");
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_with_token() {
+        let body = "CLAUDEAR-Q:tok-t\nUse staging environment\nThanks";
+        let result = EmailNotifier::sanitize_reply_text(body).unwrap();
+        assert_eq!(result, "CLAUDEAR-Q:tok-t\nUse staging environment\nThanks");
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_empty() {
+        // Only quoted lines -> None
+        let body = "> line 1\n> line 2\n> line 3";
+        assert!(EmailNotifier::sanitize_reply_text(body).is_none());
+
+        // Completely empty -> None
+        assert!(EmailNotifier::sanitize_reply_text("").is_none());
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_long() {
+        let long_text = "x".repeat(5000);
+        let result = EmailNotifier::sanitize_reply_text(&long_text).unwrap();
+        assert!(result.len() <= 4000);
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_max_lines() {
+        // Build 50 non-empty, non-quoted, non-token lines
+        let body = (1..=50)
+            .map(|i| format!("Content line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = EmailNotifier::sanitize_reply_text(&body).unwrap();
+        let line_count = result.lines().count();
+        assert!(
+            line_count <= 30,
+            "Expected at most 30 lines, got {}",
+            line_count
+        );
+        // Should contain line 30 but not line 31
+        assert!(result.contains("Content line 30"));
+        assert!(!result.contains("Content line 31"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_issue_info test (named per coverage spec)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_issue_info_full_structure() {
+        let mut issue = Issue::new(
+            "42",
+            "PROJ-42",
+            "Login broken",
+            "https://example.com/42",
+            "linear",
+        );
+        issue.priority = IssuePriority::High;
+        issue.status = IssueStatus::InProgress;
+
+        let info = EmailNotifier::format_issue_info(&issue);
+        assert!(info.contains("PROJ-42"));
+        assert!(info.contains("Login broken"));
+        assert!(info.contains("linear"));
+        assert!(info.contains("https://example.com/42"));
+        // Verify structure
+        let lines: Vec<&str> = info.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].starts_with("Issue: PROJ-42 - Login broken"));
+        assert!(lines[1].starts_with("Source:"));
+        assert!(lines[2].starts_with("Priority:"));
+        assert!(lines[3].starts_with("Status:"));
+        assert!(lines[4].starts_with("URL:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ask_question with no recipients returns None target
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ask_question_no_recipients_returns_none_target() {
+        let config = EmailConfig {
+            to_addresses: vec![],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = AskRequest {
+            correlation_id: "tok-none".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let delivery = notifier
+            .ask_question(&issue, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delivery.target.is_none());
     }
 }

@@ -182,8 +182,6 @@ pub fn aggregate(files: &[FileComplexity]) -> RepoComplexity {
     }
 }
 
-// ── Internal helpers ──
-
 fn collect_functions(
     node: tree_sitter::Node,
     source: &[u8],

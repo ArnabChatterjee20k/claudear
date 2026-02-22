@@ -3,6 +3,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-0.1.0}
+        # Dashboard Sentry config (baked into static JS assets at build time)
+        SENTRY_DSN: ${SENTRY_DSN:-}
+        SENTRY_RELEASE: ${SENTRY_RELEASE:-}
+        SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
     container_name: claudear-app
     restart: unless-stopped
     environment:
@@ -29,6 +35,11 @@ services:
       SENTRY_ORG_SLUG: ${SENTRY_ORG_SLUG:-}
       SENTRY_ENABLED: ${SENTRY_ENABLED:-true}
       SENTRY_CLIENT_SECRET: ${SENTRY_CLIENT_SECRET:-}
+
+      # Backend Sentry error monitoring (read at runtime by the Rust process)
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+      SENTRY_RELEASE: ${SENTRY_RELEASE:-}
 
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_AUTO_RESOLVE_ON_MERGE: ${GITHUB_AUTO_RESOLVE_ON_MERGE:-true}

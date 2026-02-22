@@ -6,6 +6,5 @@ node_modules/
 dashboard/node_modules/
 *.swp
 *.swo
-.env
-.env.*
+*.env.local
 cobertura.xml

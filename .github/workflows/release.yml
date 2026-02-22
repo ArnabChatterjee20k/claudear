@@ -29,10 +29,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set version from tag
+        id: version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           VERSION="${RELEASE_TAG#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
           sed -i.bak "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml && rm -f Cargo.toml.bak
 
       - name: Install Rust toolchain
@@ -45,6 +47,8 @@ jobs:
 
       - name: Build dashboard
         run: cd dashboard && bun install --frozen-lockfile && bun run build
+        env:
+          SENTRY_RELEASE: "claudear-dashboard@${{ steps.version.outputs.version }}"
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -79,10 +83,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set version from tag
+        id: version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           VERSION="${RELEASE_TAG#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
           sed -i.bak "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml && rm -f Cargo.toml.bak
 
       - name: Set up Docker Buildx
@@ -113,6 +119,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+            SENTRY_DSN=${{ secrets.SENTRY_DASHBOARD_DSN }}
+            SENTRY_ENVIRONMENT=production
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -181,10 +191,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set version from tag
+        id: version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           VERSION="${RELEASE_TAG#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
           sed -i.bak "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml && rm -f Cargo.toml.bak
 
       - name: Install Rust toolchain
@@ -203,6 +215,8 @@ jobs:
 
       - name: Build dashboard
         run: cd dashboard && bun install --frozen-lockfile && bun run build
+        env:
+          SENTRY_RELEASE: "claudear-dashboard@${{ steps.version.outputs.version }}"
 
       - name: Install cargo-deb
         run: cargo install cargo-deb

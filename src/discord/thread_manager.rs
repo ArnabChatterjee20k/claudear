@@ -1656,6 +1656,13 @@ mod tests {
             }
         }
 
+        async fn put_empty(&self, _url: &str) -> crate::error::Result<crate::http::HttpResponse> {
+            Ok(crate::http::HttpResponse {
+                status: 204,
+                body: String::new(),
+            })
+        }
+
         async fn patch(
             &self,
             url: &str,

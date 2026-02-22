@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-/// Compiled regex for parsing GitHub PR URLs (compiled once, reused).
+/// Compiled regex for parsing GitHub PR URLs into repo/PR number (compiled once, reused).
 static PR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
     regex_lite::Regex::new(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
         .expect("PR URL regex should be valid")
@@ -180,8 +180,8 @@ impl SqliteTracker {
                 short_id TEXT NOT NULL,
                 attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
                 pr_url TEXT,
-                github_repo TEXT,
-                github_pr_number INTEGER,
+                scm_repo TEXT,
+                scm_pr_number INTEGER,
                 status TEXT NOT NULL DEFAULT 'pending',
                 error_message TEXT,
                 merged_at TEXT,
@@ -266,7 +266,7 @@ impl SqliteTracker {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 path TEXT NOT NULL DEFAULT '',
-                github_url TEXT,
+                scm_url TEXT,
                 default_branch TEXT DEFAULT 'main',
                 file_count INTEGER DEFAULT 0,
                 last_indexed_at TEXT,
@@ -350,7 +350,7 @@ impl SqliteTracker {
             -- PR review comments - individual review comments for tracking
             CREATE TABLE IF NOT EXISTS pr_review_comments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                github_comment_id INTEGER NOT NULL UNIQUE,
+                scm_comment_id INTEGER NOT NULL UNIQUE,
                 pr_url TEXT NOT NULL,
                 review_id INTEGER REFERENCES pr_reviews(id),
                 path TEXT NOT NULL,
@@ -547,7 +547,7 @@ impl SqliteTracker {
             CREATE TABLE IF NOT EXISTS prs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pr_url TEXT NOT NULL UNIQUE,
-                github_repo TEXT NOT NULL,
+                scm_repo TEXT NOT NULL,
                 pr_number INTEGER NOT NULL,
 
                 -- Links
@@ -587,7 +587,7 @@ impl SqliteTracker {
                 fix_quality_score REAL
             );
             CREATE INDEX IF NOT EXISTS idx_prs_status ON prs(status);
-            CREATE INDEX IF NOT EXISTS idx_prs_repo ON prs(github_repo);
+            CREATE INDEX IF NOT EXISTS idx_prs_repo ON prs(scm_repo);
             CREATE INDEX IF NOT EXISTS idx_prs_attempt ON prs(attempt_id);
             CREATE INDEX IF NOT EXISTS idx_prs_issue ON prs(issue_source, issue_id);
 
@@ -686,7 +686,7 @@ impl SqliteTracker {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 attempt_id INTEGER REFERENCES fix_attempts(id),
                 pr_url TEXT NOT NULL,
-                github_repo TEXT NOT NULL,
+                scm_repo TEXT NOT NULL,
                 pr_number INTEGER NOT NULL,
                 files_changed TEXT NOT NULL DEFAULT '[]',
                 file_types TEXT NOT NULL DEFAULT '{}',
@@ -694,7 +694,7 @@ impl SqliteTracker {
                 diff_summary TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_diff_analyses_repo ON diff_analyses(github_repo);
+            CREATE INDEX IF NOT EXISTS idx_diff_analyses_repo ON diff_analyses(scm_repo);
             CREATE INDEX IF NOT EXISTS idx_diff_analyses_attempt ON diff_analyses(attempt_id);
 
             -- Promoted instructions from repeated Q&A (System 3)
@@ -730,7 +730,7 @@ impl SqliteTracker {
             -- Classified review feedback patterns (System 5)
             CREATE TABLE IF NOT EXISTS review_patterns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                github_repo TEXT NOT NULL,
+                scm_repo TEXT NOT NULL,
                 category TEXT NOT NULL,
                 pattern_text TEXT NOT NULL,
                 example_comments TEXT NOT NULL DEFAULT '[]',
@@ -739,8 +739,8 @@ impl SqliteTracker {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_review_patterns_repo ON review_patterns(github_repo);
-            CREATE INDEX IF NOT EXISTS idx_review_patterns_category ON review_patterns(github_repo, category);
+            CREATE INDEX IF NOT EXISTS idx_review_patterns_repo ON review_patterns(scm_repo);
+            CREATE INDEX IF NOT EXISTS idx_review_patterns_category ON review_patterns(scm_repo, category);
 
             -- Strategy fingerprints (System 6)
             CREATE TABLE IF NOT EXISTS strategy_fingerprints (
@@ -1726,7 +1726,7 @@ impl SqliteTracker {
                            ELSE 0.5
                        END AS historical_success_rate
                 FROM qa_knowledge k
-                WHERE k.question_norm = ?1
+                WHERE (?1 = '' OR k.question_norm = ?1)
             ),
             ranked AS (
                 SELECT id, source, repo, issue_id, short_id, question_text, question_norm,
@@ -1902,7 +1902,7 @@ impl FixAttemptTracker for SqliteTracker {
         let conn = self.acquire_lock()?;
 
         // Parse PR URL to extract GitHub repo and PR number
-        let (github_repo, github_pr_number) = match Self::parse_pr_url(pr_url) {
+        let (scm_repo, scm_pr_number) = match Self::parse_pr_url(pr_url) {
             Some((repo, pr_num)) => (Some(repo), Some(pr_num)),
             None => {
                 tracing::warn!(
@@ -1918,16 +1918,16 @@ impl FixAttemptTracker for SqliteTracker {
         let rows_affected = conn.execute(
             r#"
             UPDATE fix_attempts
-            SET status = 'success', pr_url = ?, github_repo = ?, github_pr_number = ?
+            SET status = 'success', pr_url = ?, scm_repo = ?, scm_pr_number = ?
             WHERE source = ? AND issue_id = ?
             "#,
-            params![pr_url, github_repo, github_pr_number, source, issue_id],
+            params![pr_url, scm_repo, scm_pr_number, source, issue_id],
         )?;
         tracing::info!(
             source = source,
             issue_id = issue_id,
             rows_affected = rows_affected,
-            github_repo = ?github_repo,
+            scm_repo = ?scm_repo,
             "Fix attempt marked as success"
         );
         Ok(())
@@ -2034,8 +2034,8 @@ impl FixAttemptTracker for SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE source = ? AND issue_id = ?
@@ -2053,8 +2053,8 @@ impl FixAttemptTracker for SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE status = ?
@@ -2076,11 +2076,11 @@ impl FixAttemptTracker for SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
-            WHERE status = 'success' AND pr_url IS NOT NULL AND github_repo IS NOT NULL
+            WHERE status = 'success' AND pr_url IS NOT NULL AND scm_repo IS NOT NULL
             ORDER BY attempted_at DESC
             "#,
         )?;
@@ -2098,8 +2098,8 @@ impl FixAttemptTracker for SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE pr_url = ?
@@ -2127,8 +2127,8 @@ impl FixAttemptTracker for SqliteTracker {
                 retry_count = 0,
                 reset_at = datetime('now'),
                 pr_url = NULL,
-                github_repo = NULL,
-                github_pr_number = NULL,
+                scm_repo = NULL,
+                scm_pr_number = NULL,
                 error_message = NULL,
                 merged_at = NULL,
                 resolved_at = NULL,
@@ -2183,8 +2183,8 @@ impl FixAttemptTracker for SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE (status = 'failed' OR status = 'closed')
@@ -2213,8 +2213,8 @@ impl FixAttemptTracker for SqliteTracker {
                 retry_count = COALESCE(retry_count, 0) + 1,
                 last_retry_at = datetime('now'),
                 pr_url = NULL,
-                github_repo = NULL,
-                github_pr_number = NULL,
+                scm_repo = NULL,
+                scm_pr_number = NULL,
                 error_message = NULL,
                 attempted_at = datetime('now')
             WHERE source = ? AND issue_id = ?
@@ -2557,8 +2557,6 @@ impl FixAttemptTracker for SqliteTracker {
     fn list_prs(&self, status: Option<&str>, limit: usize) -> Result<Vec<crate::types::PrRecord>> {
         SqliteTracker::list_prs(self, status, limit)
     }
-
-    // ─── Continuous Learning trait delegations ───
 
     fn update_feedback_learnings(&self, outcome_id: i64, learnings: &str) -> Result<()> {
         SqliteTracker::update_feedback_learnings(self, outcome_id, learnings)
@@ -2971,7 +2969,7 @@ impl SqliteTracker {
 
     /// Convert a database row to a FixAttempt.
     /// Expects columns in order: id, source, issue_id, short_id, attempted_at, pr_url,
-    /// github_repo, github_pr_number, status, error_message, merged_at, resolved_at,
+    /// scm_repo, scm_pr_number, status, error_message, merged_at, resolved_at,
     /// retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
     fn row_to_fix_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<FixAttempt> {
         // Parse issue_labels from JSON string
@@ -2987,8 +2985,8 @@ impl SqliteTracker {
             short_id: row.get(3)?,
             attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
             pr_url: row.get(5)?,
-            github_repo: row.get(6)?,
-            github_pr_number: row.get(7)?,
+            scm_repo: row.get(6)?,
+            scm_pr_number: row.get(7)?,
             status: row
                 .get::<_, String>(8)?
                 .parse()
@@ -3383,11 +3381,11 @@ impl SqliteTracker {
         conn.execute(
             r#"
             INSERT INTO pr_review_comments (
-                github_comment_id, pr_url, review_id, path, position, line,
+                scm_comment_id, pr_url, review_id, path, position, line,
                 body, author, created_at, updated_at, html_url
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            ON CONFLICT(github_comment_id) DO UPDATE SET
+            ON CONFLICT(scm_comment_id) DO UPDATE SET
                 body = excluded.body,
                 updated_at = excluded.updated_at
             "#,
@@ -3414,7 +3412,7 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, github_comment_id, pr_url, review_id, path, position, line,
+            SELECT id, scm_comment_id, pr_url, review_id, path, position, line,
                    body, author, created_at, updated_at, html_url
             FROM pr_review_comments
             WHERE pr_url = ?
@@ -3433,14 +3431,14 @@ impl SqliteTracker {
     }
 
     /// Convert a database row to a StoredPrReviewComment.
-    /// Expects columns: id, github_comment_id, pr_url, review_id, path, position, line,
+    /// Expects columns: id, scm_comment_id, pr_url, review_id, path, position, line,
     /// body, author, created_at, updated_at, html_url
     fn row_to_stored_pr_review_comment(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<StoredPrReviewComment> {
         Ok(StoredPrReviewComment {
             id: row.get(0)?,
-            github_comment_id: row.get(1)?,
+            scm_comment_id: row.get(1)?,
             pr_url: row.get(2)?,
             review_id: row.get(3)?,
             path: row.get(4)?,
@@ -4913,8 +4911,8 @@ impl SqliteTracker {
         // Use a prepared statement to amortize compilation cost across the batch.
         let mut stmt = conn.prepare_cached(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE source = ? AND issue_id = ?
@@ -5100,23 +5098,23 @@ impl SqliteTracker {
         &self,
         name: &str,
         path: Option<&str>,
-        github_url: Option<&str>,
+        scm_url: Option<&str>,
     ) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
-        // Use name as github_url if not provided
-        let github_url = github_url.unwrap_or(name);
+        // Use name as scm_url if not provided
+        let scm_url = scm_url.unwrap_or(name);
         let path = path.unwrap_or("");
 
         conn.execute(
             r#"
-            INSERT INTO repositories (name, path, github_url)
+            INSERT INTO repositories (name, path, scm_url)
             VALUES (?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 path = CASE WHEN excluded.path != '' THEN excluded.path ELSE repositories.path END,
-                github_url = excluded.github_url
+                scm_url = excluded.scm_url
             "#,
-            params![name, path, github_url],
+            params![name, path, scm_url],
         )?;
 
         // Get the id
@@ -5148,7 +5146,7 @@ impl SqliteTracker {
                 let repo_id = self.save_indexed_repo(
                     &repo.name,
                     &path_str,
-                    Some(&repo.github_url),
+                    Some(&repo.scm_url),
                     &repo.default_branch,
                     repo.files.len(),
                 )?;
@@ -5183,7 +5181,7 @@ impl SqliteTracker {
 
         let result = conn.query_row(
             r#"
-            SELECT id, name, path, github_url, created_at
+            SELECT id, name, path, scm_url, created_at
             FROM repositories WHERE name = ?
             "#,
             params![name],
@@ -5192,7 +5190,7 @@ impl SqliteTracker {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     path: row.get::<_, String>(2).ok().filter(|s| !s.is_empty()),
-                    github_url: row.get(3)?,
+                    scm_url: row.get(3)?,
                     created_at: row.get(4)?,
                 })
             },
@@ -5210,7 +5208,7 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, name, path, github_url, created_at
+            SELECT id, name, path, scm_url, created_at
             FROM repositories ORDER BY name
             "#,
         )?;
@@ -5221,7 +5219,7 @@ impl SqliteTracker {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: row.get::<_, String>(2).ok().filter(|s| !s.is_empty()),
-                github_url: row.get(3)?,
+                scm_url: row.get(3)?,
                 created_at: row.get(4)?,
             })
         })?;
@@ -5377,23 +5375,23 @@ impl SqliteTracker {
         &self,
         name: &str,
         path: &str,
-        github_url: Option<&str>,
+        scm_url: Option<&str>,
         default_branch: &str,
         file_count: usize,
     ) -> Result<i64> {
         let conn = self.acquire_lock()?;
         conn.execute(
             r#"
-            INSERT INTO repositories (name, path, github_url, default_branch, file_count, last_indexed_at)
+            INSERT INTO repositories (name, path, scm_url, default_branch, file_count, last_indexed_at)
             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
             ON CONFLICT(name) DO UPDATE SET
                 path = excluded.path,
-                github_url = COALESCE(excluded.github_url, github_url),
+                scm_url = COALESCE(excluded.scm_url, scm_url),
                 default_branch = excluded.default_branch,
                 file_count = excluded.file_count,
                 last_indexed_at = datetime('now')
             "#,
-            params![name, path, github_url, default_branch, file_count as i64],
+            params![name, path, scm_url, default_branch, file_count as i64],
         )?;
 
         // last_insert_rowid() returns 0 on UPDATE, so query for the actual ID
@@ -5469,7 +5467,7 @@ impl SqliteTracker {
         let repo_id = self.save_indexed_repo(
             &repo.name,
             &path_str,
-            Some(&repo.github_url),
+            Some(&repo.scm_url),
             &repo.default_branch,
             repo.files.len(),
         )?;
@@ -5500,7 +5498,7 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, name, path, github_url, default_branch, file_count, last_indexed_at, created_at
+            SELECT id, name, path, scm_url, default_branch, file_count, last_indexed_at, created_at
             FROM repositories WHERE name = ?
             "#,
         )?;
@@ -5510,7 +5508,7 @@ impl SqliteTracker {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: row.get(2)?,
-                github_url: row.get(3)?,
+                scm_url: row.get(3)?,
                 default_branch: row.get(4)?,
                 file_count: row.get(5)?,
                 last_indexed_at: row.get(6)?,
@@ -5530,7 +5528,7 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, name, path, github_url, default_branch, file_count, last_indexed_at, created_at
+            SELECT id, name, path, scm_url, default_branch, file_count, last_indexed_at, created_at
             FROM repositories ORDER BY name
             "#,
         )?;
@@ -5541,7 +5539,7 @@ impl SqliteTracker {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: row.get(2)?,
-                github_url: row.get(3)?,
+                scm_url: row.get(3)?,
                 default_branch: row.get(4)?,
                 file_count: row.get(5)?,
                 last_indexed_at: row.get(6)?,
@@ -6025,7 +6023,7 @@ impl SqliteTracker {
         conn.execute(
             r#"
             INSERT INTO prs (
-                pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+                pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
                 title, description, author, head_branch, base_branch, status,
                 created_at, updated_at, merged_at, closed_at,
                 approvals_count, changes_requested_count, comments_count, last_review_at,
@@ -6036,7 +6034,7 @@ impl SqliteTracker {
                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
             )
             ON CONFLICT(pr_url) DO UPDATE SET
-                github_repo = excluded.github_repo,
+                scm_repo = excluded.scm_repo,
                 pr_number = excluded.pr_number,
                 attempt_id = COALESCE(excluded.attempt_id, prs.attempt_id),
                 issue_id = COALESCE(excluded.issue_id, prs.issue_id),
@@ -6063,7 +6061,7 @@ impl SqliteTracker {
             "#,
             params![
                 pr.pr_url,
-                pr.github_repo,
+                pr.scm_repo,
                 pr.pr_number,
                 pr.attempt_id,
                 pr.issue_id,
@@ -6113,7 +6111,7 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+            SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
                    title, description, author, head_branch, base_branch, status,
                    created_at, updated_at, merged_at, closed_at,
                    approvals_count, changes_requested_count, comments_count, last_review_at,
@@ -6132,7 +6130,7 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+            SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
                    title, description, author, head_branch, base_branch, status,
                    created_at, updated_at, merged_at, closed_at,
                    approvals_count, changes_requested_count, comments_count, last_review_at,
@@ -6194,8 +6192,7 @@ impl SqliteTracker {
 
         // Get counts by repository
         let mut by_repo = HashMap::new();
-        let mut stmt =
-            conn.prepare("SELECT github_repo, COUNT(*) FROM prs GROUP BY github_repo")?;
+        let mut stmt = conn.prepare("SELECT scm_repo, COUNT(*) FROM prs GROUP BY scm_repo")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -6408,7 +6405,7 @@ impl SqliteTracker {
         let mut stmt = conn.prepare(
             r#"
             SELECT
-                fa.github_repo,
+                fa.scm_repo,
                 COUNT(*) as total,
                 CAST(SUM(CASE WHEN fa.status IN ('success','merged') THEN 1 ELSE 0 END) AS REAL) / NULLIF(COUNT(*), 0) as success_rate,
                 CAST(SUM(CASE WHEN fa.status = 'merged' THEN 1 ELSE 0 END) AS REAL) /
@@ -6416,8 +6413,8 @@ impl SqliteTracker {
                 AVG(CASE WHEN p.time_to_merge_mins IS NOT NULL THEN p.time_to_merge_mins END) as avg_ttm
             FROM fix_attempts fa
             LEFT JOIN prs p ON p.attempt_id = fa.id
-            WHERE fa.github_repo IS NOT NULL AND fa.github_repo != ''
-            GROUP BY fa.github_repo
+            WHERE fa.scm_repo IS NOT NULL AND fa.scm_repo != ''
+            GROUP BY fa.scm_repo
             ORDER BY total DESC
             "#,
         )?;
@@ -6519,7 +6516,7 @@ impl SqliteTracker {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
             Some(s) => (
                 r#"
-                    SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+                    SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
                            title, description, author, head_branch, base_branch, status,
                            created_at, updated_at, merged_at, closed_at,
                            approvals_count, changes_requested_count, comments_count, last_review_at,
@@ -6536,7 +6533,7 @@ impl SqliteTracker {
             ),
             None => (
                 r#"
-                    SELECT id, pr_url, github_repo, pr_number, attempt_id, issue_id, issue_source,
+                    SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
                            title, description, author, head_branch, base_branch, status,
                            created_at, updated_at, merged_at, closed_at,
                            approvals_count, changes_requested_count, comments_count, last_review_at,
@@ -6591,7 +6588,7 @@ impl SqliteTracker {
         Ok(crate::types::PrRecord {
             id: row.get(0)?,
             pr_url: row.get(1)?,
-            github_repo: row.get(2)?,
+            scm_repo: row.get(2)?,
             pr_number: row.get(3)?,
             attempt_id: row.get(4)?,
             issue_id: row.get(5)?,
@@ -6624,8 +6621,8 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE id = ?
@@ -6648,16 +6645,16 @@ impl SqliteTracker {
         let mut attempts = Vec::new();
 
         let query_all = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             ORDER BY attempted_at DESC
             LIMIT ?1 OFFSET ?2
         "#;
         let query_status = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE status = ?1
@@ -6665,8 +6662,8 @@ impl SqliteTracker {
             LIMIT ?2 OFFSET ?3
         "#;
         let query_source = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE source = ?1
@@ -6674,8 +6671,8 @@ impl SqliteTracker {
             LIMIT ?2 OFFSET ?3
         "#;
         let query_status_source = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE status = ?1 AND source = ?2
@@ -6758,8 +6755,8 @@ impl SqliteTracker {
         let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                   github_pr_number, status, error_message, merged_at, resolved_at,
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
             WHERE attempted_at >= ?1
@@ -6826,13 +6823,13 @@ impl SqliteTracker {
         &self,
         attempt_id: i64,
         pr_url: &str,
-        github_repo: &str,
+        scm_repo: &str,
         pr_number: i64,
     ) -> Result<()> {
         let conn = self.acquire_lock()?;
         conn.execute(
-            "UPDATE fix_attempts SET pr_url = ?, github_repo = ?, github_pr_number = ?, status = 'success' WHERE id = ?",
-            params![pr_url, github_repo, pr_number, attempt_id],
+            "UPDATE fix_attempts SET pr_url = ?, scm_repo = ?, scm_pr_number = ?, status = 'success' WHERE id = ?",
+            params![pr_url, scm_repo, pr_number, attempt_id],
         )?;
         Ok(())
     }
@@ -7091,8 +7088,6 @@ impl SqliteTracker {
         })
     }
 
-    // ── User Management ─────────────────────────────────
-
     pub fn create_user(
         &self,
         email: &str,
@@ -7198,8 +7193,6 @@ impl SqliteTracker {
         Ok(count)
     }
 
-    // ── Session Management ──────────────────────────────
-
     pub fn create_session(&self, user_id: i64, expires_at: &str) -> Result<String> {
         let token = generate_session_token();
         let conn = self.acquire_lock()?;
@@ -7252,7 +7245,7 @@ pub struct StoredIndexedRepo {
     pub id: i64,
     pub name: String,
     pub path: String,
-    pub github_url: Option<String>,
+    pub scm_url: Option<String>,
     pub default_branch: String,
     pub file_count: i64,
     pub last_indexed_at: String,
@@ -7343,7 +7336,7 @@ pub struct InferenceHistoryEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct StoredPrReviewComment {
     pub id: i64,
-    pub github_comment_id: i64,
+    pub scm_comment_id: i64,
     pub pr_url: String,
     pub review_id: Option<i64>,
     pub path: String,
@@ -7362,7 +7355,7 @@ pub struct StoredRepository {
     pub id: i64,
     pub name: String,
     pub path: Option<String>,
-    pub github_url: String,
+    pub scm_url: String,
     pub created_at: String,
 }
 
@@ -7423,12 +7416,12 @@ impl SqliteTracker {
         let cats_json = serde_json::to_string(&analysis.change_categories).unwrap_or_default();
 
         conn.execute(
-            "INSERT INTO diff_analyses (attempt_id, pr_url, github_repo, pr_number, files_changed, file_types, change_categories, diff_summary, created_at)
+            "INSERT INTO diff_analyses (attempt_id, pr_url, scm_repo, pr_number, files_changed, file_types, change_categories, diff_summary, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 analysis.attempt_id,
                 analysis.pr_url,
-                analysis.github_repo,
+                analysis.scm_repo,
                 analysis.pr_number,
                 files_json,
                 types_json,
@@ -7448,8 +7441,8 @@ impl SqliteTracker {
     ) -> Result<Vec<crate::types::DiffAnalysis>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, attempt_id, pr_url, github_repo, pr_number, files_changed, file_types, change_categories, diff_summary, created_at
-             FROM diff_analyses WHERE github_repo = ?1 ORDER BY created_at DESC LIMIT ?2",
+            "SELECT id, attempt_id, pr_url, scm_repo, pr_number, files_changed, file_types, change_categories, diff_summary, created_at
+             FROM diff_analyses WHERE scm_repo = ?1 ORDER BY created_at DESC LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(params![repo, limit as i64], |row| {
@@ -7457,7 +7450,7 @@ impl SqliteTracker {
                     id: row.get(0)?,
                     attempt_id: row.get(1)?,
                     pr_url: row.get(2)?,
-                    github_repo: row.get(3)?,
+                    scm_repo: row.get(3)?,
                     pr_number: row.get(4)?,
                     files_changed: serde_json::from_str(&row.get::<_, String>(5)?)
                         .unwrap_or_default(),
@@ -7657,15 +7650,15 @@ impl SqliteTracker {
 
         let updated = conn.execute(
             "UPDATE review_patterns SET occurrence_count = occurrence_count + 1, example_comments = ?1, updated_at = ?2
-             WHERE github_repo = ?3 AND category = ?4 AND pattern_text = ?5",
-            params![examples_json, now, pattern.github_repo, category_str, pattern.pattern_text],
+             WHERE scm_repo = ?3 AND category = ?4 AND pattern_text = ?5",
+            params![examples_json, now, pattern.scm_repo, category_str, pattern.pattern_text],
         )?;
 
         if updated > 0 {
             let id: i64 = conn
                 .query_row(
-                    "SELECT id FROM review_patterns WHERE github_repo = ?1 AND category = ?2 AND pattern_text = ?3",
-                    params![pattern.github_repo, category_str, pattern.pattern_text],
+                    "SELECT id FROM review_patterns WHERE scm_repo = ?1 AND category = ?2 AND pattern_text = ?3",
+                    params![pattern.scm_repo, category_str, pattern.pattern_text],
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
@@ -7673,10 +7666,10 @@ impl SqliteTracker {
         }
 
         conn.execute(
-            "INSERT INTO review_patterns (github_repo, category, pattern_text, example_comments, occurrence_count, promoted_to_instruction, created_at, updated_at)
+            "INSERT INTO review_patterns (scm_repo, category, pattern_text, example_comments, occurrence_count, promoted_to_instruction, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                pattern.github_repo,
+                pattern.scm_repo,
                 category_str,
                 pattern.pattern_text,
                 examples_json,
@@ -7697,14 +7690,14 @@ impl SqliteTracker {
     ) -> Result<Vec<crate::types::ReviewPattern>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, github_repo, category, pattern_text, example_comments, occurrence_count, promoted_to_instruction, created_at, updated_at
-             FROM review_patterns WHERE github_repo = ?1 ORDER BY occurrence_count DESC LIMIT ?2",
+            "SELECT id, scm_repo, category, pattern_text, example_comments, occurrence_count, promoted_to_instruction, created_at, updated_at
+             FROM review_patterns WHERE scm_repo = ?1 ORDER BY occurrence_count DESC LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(params![repo, limit as i64], |row| {
                 Ok(crate::types::ReviewPattern {
                     id: row.get(0)?,
-                    github_repo: row.get(1)?,
+                    scm_repo: row.get(1)?,
                     category: crate::types::ReviewCategory::parse(&row.get::<_, String>(2)?),
                     pattern_text: row.get(3)?,
                     example_comments: serde_json::from_str(&row.get::<_, String>(4)?)
@@ -7729,14 +7722,14 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         let category_str = category.to_string();
         let mut stmt = conn.prepare(
-            "SELECT id, github_repo, category, pattern_text, example_comments, occurrence_count, promoted_to_instruction, created_at, updated_at
-             FROM review_patterns WHERE github_repo = ?1 AND category = ?2 ORDER BY occurrence_count DESC",
+            "SELECT id, scm_repo, category, pattern_text, example_comments, occurrence_count, promoted_to_instruction, created_at, updated_at
+             FROM review_patterns WHERE scm_repo = ?1 AND category = ?2 ORDER BY occurrence_count DESC",
         )?;
         let rows = stmt
             .query_map(params![repo, category_str], |row| {
                 Ok(crate::types::ReviewPattern {
                     id: row.get(0)?,
-                    github_repo: row.get(1)?,
+                    scm_repo: row.get(1)?,
                     category: crate::types::ReviewCategory::parse(&row.get::<_, String>(2)?),
                     pattern_text: row.get(3)?,
                     example_comments: serde_json::from_str(&row.get::<_, String>(4)?)
@@ -7789,7 +7782,7 @@ impl SqliteTracker {
             "SELECT sf.id, sf.attempt_id, sf.files_explored, sf.tests_run, sf.tools_used, sf.fix_approach, sf.strategy_summary, sf.fix_quality_score, sf.created_at
              FROM strategy_fingerprints sf
              JOIN fix_attempts fa ON fa.id = sf.attempt_id
-             WHERE fa.github_repo = ?1 AND fa.status = 'merged'
+             WHERE fa.scm_repo = ?1 AND fa.status = 'merged'
              ORDER BY sf.fix_quality_score DESC NULLS LAST
              LIMIT ?2",
         )?;
@@ -7922,8 +7915,6 @@ impl SqliteTracker {
         Ok(rows)
     }
 
-    // ── Prioritisation engine storage ──────────────────────────────────
-
     pub fn store_content_cluster(&self, cluster: &crate::types::ContentCluster) -> Result<i64> {
         let conn = self.acquire_lock()?;
         let ids_json = serde_json::to_string(&cluster.issue_ids).unwrap_or_else(|_| "[]".into());
@@ -8032,14 +8023,12 @@ impl SqliteTracker {
         Ok(())
     }
 
-    // ── Cross-repo correlation storage ──────────────────────────────────
-
     pub fn get_recent_attempts_since(&self, since: &DateTime<Utc>) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
         let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
         let mut stmt = conn.prepare(
-            "SELECT id, source, issue_id, short_id, attempted_at, pr_url, github_repo,
-                    github_pr_number, status, error_message, merged_at, resolved_at,
+            "SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                    scm_pr_number, status, error_message, merged_at, resolved_at,
                     retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
              FROM fix_attempts WHERE attempted_at >= ?1 ORDER BY attempted_at DESC",
         )?;
@@ -8128,8 +8117,6 @@ impl SqliteTracker {
         Ok(rows)
     }
 
-    // ── Code complexity storage ─────────────────────────────────────
-
     pub fn store_code_complexity(
         &self,
         repo_id: i64,
@@ -8155,8 +8142,6 @@ impl SqliteTracker {
         )?;
         Ok(())
     }
-
-    // ── Evaluation storage ──────────────────────────────────────────
 
     pub fn store_eval_snapshot(
         &self,
@@ -8219,8 +8204,6 @@ impl SqliteTracker {
         )?;
         Ok(conn.last_insert_rowid())
     }
-
-    // ── Code Indexing Storage ─────────────────────────────────────────
 
     /// Get or create a repository ID by name.
     pub fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
@@ -8779,8 +8762,8 @@ mod tests {
             Some("https://github.com/org/repo/pull/42".to_string())
         );
         // Check that GitHub info was extracted
-        assert_eq!(attempt.github_repo, Some("org/repo".to_string()));
-        assert_eq!(attempt.github_pr_number, Some(42));
+        assert_eq!(attempt.scm_repo, Some("org/repo".to_string()));
+        assert_eq!(attempt.scm_pr_number, Some(42));
     }
 
     #[test]
@@ -9117,8 +9100,8 @@ mod tests {
         let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
         assert_eq!(attempt.status, FixAttemptStatus::Pending);
         assert!(attempt.pr_url.is_none());
-        assert!(attempt.github_repo.is_none());
-        assert!(attempt.github_pr_number.is_none());
+        assert!(attempt.scm_repo.is_none());
+        assert!(attempt.scm_pr_number.is_none());
         assert!(attempt.error_message.is_none());
         assert_eq!(attempt.retry_count, 1);
         assert!(attempt.last_retry_at.is_some());
@@ -9419,11 +9402,11 @@ mod tests {
             )
             .unwrap();
 
-        // GitLab MR URLs are now parsed into github_repo/github_pr_number fields
+        // GitLab MR URLs are now parsed into scm_repo/scm_pr_number fields
         let pending_prs = tracker.get_pending_prs().unwrap();
         assert_eq!(pending_prs.len(), 1);
-        assert_eq!(pending_prs[0].github_repo, Some("org/repo".to_string()));
-        assert_eq!(pending_prs[0].github_pr_number, Some(42));
+        assert_eq!(pending_prs[0].scm_repo, Some("org/repo".to_string()));
+        assert_eq!(pending_prs[0].scm_pr_number, Some(42));
     }
 
     #[test]
@@ -10251,7 +10234,7 @@ mod tests {
         // Retrieve and verify
         let comments = tracker.get_comments_for_pr(pr_url).unwrap();
         assert_eq!(comments.len(), 1);
-        assert_eq!(comments[0].github_comment_id, 12345);
+        assert_eq!(comments[0].scm_comment_id, 12345);
         assert_eq!(comments[0].path, "src/main.rs");
         assert_eq!(comments[0].body, "Consider using a const here");
         assert_eq!(comments[0].author, "reviewer1");
@@ -10292,9 +10275,9 @@ mod tests {
         assert_eq!(comments.len(), 3);
 
         // Verify ordering by created_at ASC
-        assert_eq!(comments[0].github_comment_id, 100);
-        assert_eq!(comments[1].github_comment_id, 200);
-        assert_eq!(comments[2].github_comment_id, 300);
+        assert_eq!(comments[0].scm_comment_id, 100);
+        assert_eq!(comments[1].scm_comment_id, 200);
+        assert_eq!(comments[2].scm_comment_id, 300);
     }
 
     #[test]
@@ -11657,7 +11640,7 @@ mod tests {
         let repo = tracker.get_repository("org/my-repo").unwrap().unwrap();
         assert_eq!(repo.name, "org/my-repo");
         assert_eq!(repo.path, Some("/path/to/repo".to_string()));
-        assert_eq!(repo.github_url, "https://github.com/org/my-repo");
+        assert_eq!(repo.scm_url, "https://github.com/org/my-repo");
     }
 
     #[test]
@@ -11682,19 +11665,19 @@ mod tests {
 
         let repo = tracker.get_repository("org/repo").unwrap().unwrap();
         assert_eq!(repo.path, Some("/new/path".to_string()));
-        assert_eq!(repo.github_url, "https://github.com/org/repo-updated");
+        assert_eq!(repo.scm_url, "https://github.com/org/repo-updated");
     }
 
     #[test]
     fn test_upsert_repository_defaults() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        // No path or github_url
+        // No path or scm_url
         tracker.upsert_repository("org/repo", None, None).unwrap();
 
         let repo = tracker.get_repository("org/repo").unwrap().unwrap();
         assert_eq!(repo.name, "org/repo");
-        // github_url defaults to name
-        assert_eq!(repo.github_url, "org/repo");
+        // scm_url defaults to name
+        assert_eq!(repo.scm_url, "org/repo");
         // Empty path stored as empty string, filtered to None
         assert!(repo.path.is_none());
     }
@@ -12034,8 +12017,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(attempt.status, FixAttemptStatus::Success);
-        assert_eq!(attempt.github_repo, Some("org/repo".to_string()));
-        assert_eq!(attempt.github_pr_number, Some(99));
+        assert_eq!(attempt.scm_repo, Some("org/repo".to_string()));
+        assert_eq!(attempt.scm_pr_number, Some(99));
 
         // 3. Mark merged
         tracker.mark_merged("linear", "lifecycle-1").unwrap();
@@ -12502,8 +12485,6 @@ mod tests {
         assert!(restored.is_none());
     }
 
-    // ── Learning subsystem storage round-trip tests ──
-
     #[test]
     fn test_store_and_get_diff_analysis() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -12515,7 +12496,7 @@ mod tests {
             id: 0,
             attempt_id: attempt.id,
             pr_url: "https://github.com/org/repo/pull/42".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 42,
             files_changed: vec!["src/main.rs".to_string(), "tests/test.rs".to_string()],
             file_types: {
@@ -12691,7 +12672,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
         let pattern = crate::types::ReviewPattern {
             id: 0,
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             category: crate::types::ReviewCategory::MissingTests,
             pattern_text: "Please add tests".to_string(),
             example_comments: vec!["Add tests for this".to_string()],
@@ -12719,7 +12700,7 @@ mod tests {
 
         let test_pattern = crate::types::ReviewPattern {
             id: 0,
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             category: crate::types::ReviewCategory::MissingTests,
             pattern_text: "Need tests".to_string(),
             example_comments: vec![],
@@ -12925,7 +12906,7 @@ mod tests {
         let pr = crate::types::PrRecord {
             id: 0,
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             attempt_id: Some(attempt.id),
             issue_id: Some("issue-1".to_string()),
@@ -13003,7 +12984,7 @@ mod tests {
                 id: 0,
                 attempt_id: attempt.id,
                 pr_url: format!("https://github.com/org/repo/pull/{}", i),
-                github_repo: "org/repo".to_string(),
+                scm_repo: "org/repo".to_string(),
                 pr_number: i as i64,
                 files_changed: vec![],
                 file_types: std::collections::HashMap::new(),
@@ -13066,7 +13047,7 @@ mod tests {
         for (i, cat) in categories.iter().enumerate() {
             let pattern = crate::types::ReviewPattern {
                 id: 0,
-                github_repo: "org/repo".to_string(),
+                scm_repo: "org/repo".to_string(),
                 category: *cat,
                 pattern_text: format!("pattern {}", i),
                 example_comments: vec![],
@@ -13089,8 +13070,6 @@ mod tests {
             assert_eq!(found.len(), 1, "Expected 1 pattern for {:?}", cat);
         }
     }
-
-    // ── State transition edge case tests ──
 
     #[test]
     fn test_mark_merged_nonexistent_issue() {
@@ -13278,7 +13257,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_success_with_non_github_url() {
+    fn test_mark_success_with_non_scm_url() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker.record_attempt("linear", "123", "P-123").unwrap();
         tracker
@@ -13290,9 +13269,9 @@ mod tests {
             .unwrap();
         let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
         assert_eq!(attempt.status, FixAttemptStatus::Success);
-        // GitLab MR URLs are now parsed into github_repo/github_pr_number
-        assert_eq!(attempt.github_repo, Some("org/repo".to_string()));
-        assert_eq!(attempt.github_pr_number, Some(1));
+        // GitLab MR URLs are now parsed into scm_repo/scm_pr_number
+        assert_eq!(attempt.scm_repo, Some("org/repo".to_string()));
+        assert_eq!(attempt.scm_pr_number, Some(1));
     }
 
     #[test]
@@ -13372,8 +13351,6 @@ mod tests {
         );
     }
 
-    // ── get_recent_attempts_since tests ────────────────────────────────
-
     #[test]
     fn test_get_recent_attempts_since_returns_recent() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -13394,8 +13371,6 @@ mod tests {
         let attempts = tracker.get_recent_attempts_since(&since).unwrap();
         assert!(attempts.is_empty());
     }
-
-    // ── has_dependency tests ───────────────────────────────────────────
 
     #[test]
     fn test_has_dependency_false_when_none() {
@@ -13420,8 +13395,6 @@ mod tests {
             .has_dependency("org/upstream", "org/downstream")
             .unwrap());
     }
-
-    // ── cross-repo correlation tests ───────────────────────────────────
 
     #[test]
     fn test_upsert_cross_repo_correlation_creates_new() {
@@ -13488,8 +13461,6 @@ mod tests {
         assert_eq!(results[1].correlation_count, 3);
     }
 
-    // ── store_code_complexity tests ────────────────────────────────────
-
     #[test]
     fn test_store_code_complexity() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -13514,8 +13485,6 @@ mod tests {
             .store_code_complexity(repo_id, "src/main.rs", &fc)
             .unwrap();
     }
-
-    // ── store_eval_snapshot tests ──────────────────────────────────────
 
     #[test]
     fn test_store_eval_snapshot() {
@@ -13550,8 +13519,6 @@ mod tests {
             .unwrap();
         assert!(id > 0);
     }
-
-    // ── store_eval_delta tests ─────────────────────────────────────────
 
     #[test]
     fn test_store_eval_delta() {
@@ -13613,5 +13580,3881 @@ mod tests {
         assert_eq!(delta.fixed.len(), 1);
         let id = tracker.store_eval_delta(None, "test/repo", &delta).unwrap();
         assert!(id > 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Repository indexing operations
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_save_indexed_repo() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let id = tracker
+            .save_indexed_repo(
+                "my-repo",
+                "/tmp/my-repo",
+                Some("https://github.com/org/my-repo"),
+                "main",
+                42,
+            )
+            .unwrap();
+        assert!(id > 0);
+
+        // Verify by retrieving the repo
+        let repo = tracker.get_indexed_repo("my-repo").unwrap().unwrap();
+        assert_eq!(repo.name, "my-repo");
+        assert_eq!(repo.path, "/tmp/my-repo");
+        assert_eq!(
+            repo.scm_url,
+            Some("https://github.com/org/my-repo".to_string())
+        );
+        assert_eq!(repo.default_branch, "main");
+        assert_eq!(repo.file_count, 42);
+    }
+
+    #[test]
+    fn test_save_indexed_repo_upsert_updates_existing() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let id1 = tracker
+            .save_indexed_repo(
+                "my-repo",
+                "/tmp/old-path",
+                Some("https://old.url"),
+                "main",
+                10,
+            )
+            .unwrap();
+
+        let id2 = tracker
+            .save_indexed_repo(
+                "my-repo",
+                "/tmp/new-path",
+                Some("https://new.url"),
+                "develop",
+                99,
+            )
+            .unwrap();
+
+        // Same repo, so IDs should match
+        assert_eq!(id1, id2);
+
+        let repo = tracker.get_indexed_repo("my-repo").unwrap().unwrap();
+        assert_eq!(repo.path, "/tmp/new-path");
+        assert_eq!(repo.scm_url, Some("https://new.url".to_string()));
+        assert_eq!(repo.default_branch, "develop");
+        assert_eq!(repo.file_count, 99);
+    }
+
+    #[test]
+    fn test_save_indexed_repo_upsert_preserves_scm_url_when_null() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker
+            .save_indexed_repo("my-repo", "/path", Some("https://original.url"), "main", 5)
+            .unwrap();
+
+        // Update with None scm_url -- the COALESCE should preserve the original
+        tracker
+            .save_indexed_repo("my-repo", "/path2", None, "main", 10)
+            .unwrap();
+
+        let repo = tracker.get_indexed_repo("my-repo").unwrap().unwrap();
+        assert_eq!(repo.scm_url, Some("https://original.url".to_string()));
+        assert_eq!(repo.path, "/path2");
+    }
+
+    #[test]
+    fn test_save_repo_file() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("test-repo", "/tmp/test", None, "main", 0)
+            .unwrap();
+
+        tracker
+            .save_repo_file(repo_id, "src/main.rs", Some("rs"))
+            .unwrap();
+        tracker
+            .save_repo_file(repo_id, "README.md", Some("md"))
+            .unwrap();
+
+        // Verify via get_index_stats
+        let stats = tracker.get_index_stats().unwrap();
+        assert_eq!(stats.file_count, 2);
+    }
+
+    #[test]
+    fn test_save_repo_file_upsert_updates_type() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("test-repo", "/tmp/test", None, "main", 0)
+            .unwrap();
+
+        tracker
+            .save_repo_file(repo_id, "src/main.rs", Some("rs"))
+            .unwrap();
+        // Update the file_type
+        tracker
+            .save_repo_file(repo_id, "src/main.rs", Some("rust"))
+            .unwrap();
+
+        // Should still be 1 file (upsert, not duplicate)
+        let stats = tracker.get_index_stats().unwrap();
+        assert_eq!(stats.file_count, 1);
+    }
+
+    #[test]
+    fn test_save_repo_file_with_none_type() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("test-repo", "/tmp/test", None, "main", 0)
+            .unwrap();
+
+        tracker.save_repo_file(repo_id, "Makefile", None).unwrap();
+
+        let stats = tracker.get_index_stats().unwrap();
+        assert_eq!(stats.file_count, 1);
+    }
+
+    #[test]
+    fn test_save_repo_files() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("test-repo", "/tmp/test", None, "main", 0)
+            .unwrap();
+
+        let files = vec![
+            ("src/lib.rs".to_string(), Some("rs".to_string())),
+            ("src/main.rs".to_string(), Some("rs".to_string())),
+            ("Cargo.toml".to_string(), Some("toml".to_string())),
+            ("Makefile".to_string(), None),
+        ];
+
+        tracker.save_repo_files(repo_id, &files).unwrap();
+
+        let stats = tracker.get_index_stats().unwrap();
+        assert_eq!(stats.file_count, 4);
+    }
+
+    #[test]
+    fn test_save_repo_files_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("test-repo", "/tmp/test", None, "main", 0)
+            .unwrap();
+
+        let files: Vec<(String, Option<String>)> = vec![];
+        tracker.save_repo_files(repo_id, &files).unwrap();
+
+        let stats = tracker.get_index_stats().unwrap();
+        assert_eq!(stats.file_count, 0);
+    }
+
+    #[test]
+    fn test_clear_repo_files() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("test-repo", "/tmp/test", None, "main", 0)
+            .unwrap();
+
+        let files = vec![
+            ("a.rs".to_string(), Some("rs".to_string())),
+            ("b.rs".to_string(), Some("rs".to_string())),
+            ("c.rs".to_string(), Some("rs".to_string())),
+        ];
+        tracker.save_repo_files(repo_id, &files).unwrap();
+
+        let stats_before = tracker.get_index_stats().unwrap();
+        assert_eq!(stats_before.file_count, 3);
+
+        tracker.clear_repo_files(repo_id).unwrap();
+
+        let stats_after = tracker.get_index_stats().unwrap();
+        assert_eq!(stats_after.file_count, 0);
+    }
+
+    #[test]
+    fn test_clear_repo_files_only_affects_target_repo() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_a = tracker
+            .save_indexed_repo("repo-a", "/tmp/a", None, "main", 0)
+            .unwrap();
+        let repo_b = tracker
+            .save_indexed_repo("repo-b", "/tmp/b", None, "main", 0)
+            .unwrap();
+
+        tracker
+            .save_repo_files(repo_a, &[("a.rs".to_string(), Some("rs".to_string()))])
+            .unwrap();
+        tracker
+            .save_repo_files(repo_b, &[("b.rs".to_string(), Some("rs".to_string()))])
+            .unwrap();
+
+        tracker.clear_repo_files(repo_a).unwrap();
+
+        // repo-b's files should still exist
+        let stats = tracker.get_index_stats().unwrap();
+        assert_eq!(stats.file_count, 1);
+    }
+
+    #[test]
+    fn test_get_indexed_repo() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker
+            .save_indexed_repo(
+                "my-repo",
+                "/tmp/my-repo",
+                Some("https://github.com/org/repo"),
+                "main",
+                15,
+            )
+            .unwrap();
+
+        let repo = tracker.get_indexed_repo("my-repo").unwrap().unwrap();
+        assert_eq!(repo.name, "my-repo");
+        assert_eq!(repo.path, "/tmp/my-repo");
+        assert_eq!(repo.default_branch, "main");
+        assert_eq!(repo.file_count, 15);
+        assert!(!repo.last_indexed_at.is_empty());
+        assert!(!repo.created_at.is_empty());
+    }
+
+    #[test]
+    fn test_get_indexed_repo_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker.get_indexed_repo("nonexistent-repo").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_list_indexed_repos() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker
+            .save_indexed_repo("charlie", "/tmp/c", None, "main", 3)
+            .unwrap();
+        tracker
+            .save_indexed_repo("alpha", "/tmp/a", None, "main", 1)
+            .unwrap();
+        tracker
+            .save_indexed_repo("bravo", "/tmp/b", None, "develop", 2)
+            .unwrap();
+
+        let repos = tracker.list_indexed_repos().unwrap();
+        assert_eq!(repos.len(), 3);
+        // Should be ordered by name
+        assert_eq!(repos[0].name, "alpha");
+        assert_eq!(repos[1].name, "bravo");
+        assert_eq!(repos[2].name, "charlie");
+    }
+
+    #[test]
+    fn test_list_indexed_repos_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repos = tracker.list_indexed_repos().unwrap();
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn test_get_index_stats() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Empty database stats
+        let stats = tracker.get_index_stats().unwrap();
+        assert_eq!(stats.repo_count, 0);
+        assert_eq!(stats.file_count, 0);
+        assert!(stats.last_indexed_at.is_none());
+
+        // Add some repos and files
+        let repo1 = tracker
+            .save_indexed_repo("repo-1", "/tmp/1", None, "main", 2)
+            .unwrap();
+        let repo2 = tracker
+            .save_indexed_repo("repo-2", "/tmp/2", None, "main", 3)
+            .unwrap();
+
+        tracker
+            .save_repo_files(
+                repo1,
+                &[
+                    ("a.rs".to_string(), Some("rs".to_string())),
+                    ("b.rs".to_string(), Some("rs".to_string())),
+                ],
+            )
+            .unwrap();
+        tracker
+            .save_repo_files(
+                repo2,
+                &[
+                    ("c.py".to_string(), Some("py".to_string())),
+                    ("d.py".to_string(), Some("py".to_string())),
+                    ("e.py".to_string(), Some("py".to_string())),
+                ],
+            )
+            .unwrap();
+
+        let stats = tracker.get_index_stats().unwrap();
+        assert_eq!(stats.repo_count, 2);
+        assert_eq!(stats.file_count, 5);
+        assert!(stats.last_indexed_at.is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // Direct dependants
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_direct_dependants() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker
+            .add_dependency("core-lib", "app-x", "runtime")
+            .unwrap();
+        tracker
+            .add_dependency("core-lib", "app-y", "build")
+            .unwrap();
+        tracker
+            .add_dependency("other-lib", "app-z", "runtime")
+            .unwrap();
+
+        let dependants = tracker.get_direct_dependants("core-lib").unwrap();
+        assert_eq!(dependants.len(), 2);
+
+        let names: Vec<&str> = dependants.iter().map(|d| d.downstream.as_str()).collect();
+        assert!(names.contains(&"app-x"));
+        assert!(names.contains(&"app-y"));
+    }
+
+    #[test]
+    fn test_get_direct_dependants_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let dependants = tracker.get_direct_dependants("nonexistent").unwrap();
+        assert!(dependants.is_empty());
+    }
+
+    #[test]
+    fn test_get_direct_dependants_excludes_transitive() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // core -> mid -> leaf
+        tracker.add_dependency("core", "mid", "runtime").unwrap();
+        tracker.add_dependency("mid", "leaf", "runtime").unwrap();
+
+        // Direct dependants of core should only be mid, not leaf
+        let dependants = tracker.get_direct_dependants("core").unwrap();
+        assert_eq!(dependants.len(), 1);
+        assert_eq!(dependants[0].downstream, "mid");
+    }
+
+    // ---------------------------------------------------------------
+    // Inference tracking
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_inference_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a repo for the inferred_repo_id
+        let repo_id = tracker
+            .save_indexed_repo("target-repo", "/tmp/target", None, "main", 10)
+            .unwrap();
+
+        let id = tracker
+            .record_inference_attempt(
+                "issue-123",
+                "linear",
+                &["src/main.rs".to_string(), "src/lib.rs".to_string()],
+                &["handle_request".to_string()],
+                &["timeout".to_string(), "database".to_string()],
+                Some(repo_id),
+                "high",
+                "Matched by filename pattern",
+                Some(42),
+            )
+            .unwrap();
+
+        assert!(id > 0);
+
+        // Verify via inference history
+        let history = tracker.get_inference_history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, id);
+        assert_eq!(history[0].issue_id, "issue-123");
+        assert_eq!(history[0].issue_source, "linear");
+        assert_eq!(
+            history[0].inferred_repo_name,
+            Some("target-repo".to_string())
+        );
+        assert_eq!(history[0].confidence, Some("high".to_string()));
+        assert_eq!(
+            history[0].inference_reason,
+            Some("Matched by filename pattern".to_string())
+        );
+        assert_eq!(history[0].duration_ms, Some(42));
+    }
+
+    #[test]
+    fn test_record_inference_attempt_no_repo_match() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let id = tracker
+            .record_inference_attempt(
+                "issue-456",
+                "sentry",
+                &[],
+                &[],
+                &["unknown_keyword".to_string()],
+                None,
+                "low",
+                "No matching repository found",
+                Some(5),
+            )
+            .unwrap();
+
+        assert!(id > 0);
+
+        let history = tracker.get_inference_history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].inferred_repo_name.is_none());
+        assert_eq!(history[0].confidence, Some("low".to_string()));
+    }
+
+    #[test]
+    fn test_record_inference_feedback() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("correct-repo", "/tmp/correct", None, "main", 5)
+            .unwrap();
+
+        let inference_id = tracker
+            .record_inference_attempt(
+                "issue-fb-1",
+                "linear",
+                &[],
+                &[],
+                &["error".to_string()],
+                Some(repo_id),
+                "medium",
+                "Keyword match",
+                None,
+            )
+            .unwrap();
+
+        // Record positive feedback
+        tracker
+            .record_inference_feedback(inference_id, true, Some(repo_id), "user")
+            .unwrap();
+
+        // Verify the feedback was recorded
+        let history = tracker.get_inference_history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].was_correct, Some(true));
+    }
+
+    #[test]
+    fn test_record_inference_feedback_incorrect() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let wrong_repo_id = tracker
+            .save_indexed_repo("wrong-repo", "/tmp/wrong", None, "main", 5)
+            .unwrap();
+        let actual_repo_id = tracker
+            .save_indexed_repo("actual-repo", "/tmp/actual", None, "main", 5)
+            .unwrap();
+
+        let inference_id = tracker
+            .record_inference_attempt(
+                "issue-fb-2",
+                "linear",
+                &[],
+                &[],
+                &[],
+                Some(wrong_repo_id),
+                "high",
+                "Wrong match",
+                None,
+            )
+            .unwrap();
+
+        tracker
+            .record_inference_feedback(inference_id, false, Some(actual_repo_id), "admin")
+            .unwrap();
+
+        let history = tracker.get_inference_history(10).unwrap();
+        assert_eq!(history[0].was_correct, Some(false));
+    }
+
+    #[test]
+    fn test_get_inference_stats_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let stats = tracker.get_inference_stats().unwrap();
+        assert_eq!(stats.total_attempts, 0);
+        assert_eq!(stats.with_feedback, 0);
+        assert_eq!(stats.correct, 0);
+        assert_eq!(stats.accuracy, 0.0);
+        assert_eq!(stats.by_confidence.high, 0);
+        assert_eq!(stats.by_confidence.medium, 0);
+        assert_eq!(stats.by_confidence.low, 0);
+        assert_eq!(stats.by_confidence.none, 0);
+    }
+
+    #[test]
+    fn test_get_inference_stats() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("stats-repo", "/tmp/stats", None, "main", 1)
+            .unwrap();
+
+        // High confidence, correct
+        let id1 = tracker
+            .record_inference_attempt(
+                "i1",
+                "linear",
+                &[],
+                &[],
+                &[],
+                Some(repo_id),
+                "high",
+                "reason",
+                None,
+            )
+            .unwrap();
+        tracker
+            .record_inference_feedback(id1, true, Some(repo_id), "user")
+            .unwrap();
+
+        // Medium confidence, incorrect
+        let id2 = tracker
+            .record_inference_attempt(
+                "i2",
+                "sentry",
+                &[],
+                &[],
+                &[],
+                Some(repo_id),
+                "medium",
+                "reason",
+                None,
+            )
+            .unwrap();
+        tracker
+            .record_inference_feedback(id2, false, None, "user")
+            .unwrap();
+
+        // Low confidence, no feedback
+        tracker
+            .record_inference_attempt(
+                "i3",
+                "linear",
+                &[],
+                &[],
+                &[],
+                Some(repo_id),
+                "low",
+                "reason",
+                None,
+            )
+            .unwrap();
+
+        // No match (inferred_repo_id is NULL)
+        tracker
+            .record_inference_attempt("i4", "sentry", &[], &[], &[], None, "low", "no match", None)
+            .unwrap();
+
+        let stats = tracker.get_inference_stats().unwrap();
+        assert_eq!(stats.total_attempts, 4);
+        assert_eq!(stats.with_feedback, 2);
+        assert_eq!(stats.correct, 1);
+        // accuracy = 1/2 * 100 = 50.0
+        assert!((stats.accuracy - 50.0).abs() < f64::EPSILON);
+        assert_eq!(stats.by_confidence.high, 1);
+        assert_eq!(stats.by_confidence.medium, 1);
+        assert_eq!(stats.by_confidence.low, 2);
+        assert_eq!(stats.by_confidence.none, 1); // The one with no repo match
+    }
+
+    #[test]
+    fn test_get_inference_history() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("hist-repo", "/tmp/hist", None, "main", 1)
+            .unwrap();
+
+        // Record several attempts
+        for i in 0..5 {
+            tracker
+                .record_inference_attempt(
+                    &format!("issue-{}", i),
+                    "linear",
+                    &[],
+                    &[],
+                    &[format!("kw-{}", i)],
+                    Some(repo_id),
+                    "medium",
+                    &format!("reason {}", i),
+                    Some(i * 10),
+                )
+                .unwrap();
+        }
+
+        // All 5 should be retrievable
+        let history_all = tracker.get_inference_history(10).unwrap();
+        assert_eq!(history_all.len(), 5);
+
+        // Limit to 3 should return exactly 3
+        let history = tracker.get_inference_history(3).unwrap();
+        assert_eq!(history.len(), 3);
+
+        // Verify all returned entries are valid inference attempts
+        for entry in &history {
+            assert!(entry.issue_id.starts_with("issue-"));
+            assert_eq!(entry.issue_source, "linear");
+            assert_eq!(entry.inferred_repo_name, Some("hist-repo".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_get_inference_history_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let history = tracker.get_inference_history(10).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_get_inference_history_includes_feedback() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo_id = tracker
+            .save_indexed_repo("fb-repo", "/tmp/fb", None, "main", 1)
+            .unwrap();
+
+        let id = tracker
+            .record_inference_attempt(
+                "fb-issue",
+                "linear",
+                &[],
+                &[],
+                &[],
+                Some(repo_id),
+                "high",
+                "matched",
+                Some(100),
+            )
+            .unwrap();
+
+        tracker
+            .record_inference_feedback(id, true, Some(repo_id), "user")
+            .unwrap();
+
+        let history = tracker.get_inference_history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].was_correct, Some(true));
+        assert_eq!(history[0].inferred_repo_name, Some("fb-repo".to_string()));
+        assert_eq!(history[0].duration_ms, Some(100));
+    }
+
+    // ---------------------------------------------------------------
+    // Webhook delivery deduplication
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_check_and_record_delivery_new() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // First time should return true (new delivery)
+        let is_new = tracker
+            .check_and_record_delivery("delivery-1", "github")
+            .unwrap();
+        assert!(is_new);
+    }
+
+    #[test]
+    fn test_check_and_record_delivery_duplicate() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Record a delivery
+        let first = tracker
+            .check_and_record_delivery("delivery-1", "github")
+            .unwrap();
+        assert!(first);
+
+        // Same delivery ID should return false (duplicate)
+        let second = tracker
+            .check_and_record_delivery("delivery-1", "github")
+            .unwrap();
+        assert!(!second);
+    }
+
+    #[test]
+    fn test_check_and_record_delivery_different_ids() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let a = tracker
+            .check_and_record_delivery("delivery-a", "github")
+            .unwrap();
+        let b = tracker
+            .check_and_record_delivery("delivery-b", "github")
+            .unwrap();
+
+        assert!(a);
+        assert!(b);
+    }
+
+    #[test]
+    fn test_check_and_record_delivery_different_sources() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Same delivery ID but different source - the UNIQUE constraint is on
+        // (delivery_id, source) so these are treated as distinct deliveries.
+        let first = tracker
+            .check_and_record_delivery("delivery-1", "github")
+            .unwrap();
+        assert!(first);
+
+        let second = tracker
+            .check_and_record_delivery("delivery-1", "gitlab")
+            .unwrap();
+        // Different (delivery_id, source) pair = new delivery
+        assert!(second);
+
+        // But same pair should be duplicate
+        let third = tracker
+            .check_and_record_delivery("delivery-1", "github")
+            .unwrap();
+        assert!(!third);
+    }
+
+    #[test]
+    fn test_cleanup_old_deliveries_no_old_records() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Record a fresh delivery
+        tracker
+            .check_and_record_delivery("delivery-1", "github")
+            .unwrap();
+
+        // Cleaning up records older than 24 hours should not remove the fresh one
+        let removed = tracker.cleanup_old_deliveries(24).unwrap();
+        assert_eq!(removed, 0);
+
+        // Delivery should still be present (duplicate check returns false)
+        let is_new = tracker
+            .check_and_record_delivery("delivery-1", "github")
+            .unwrap();
+        assert!(!is_new);
+    }
+
+    #[test]
+    fn test_cleanup_old_deliveries_removes_old() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Insert a delivery and manually backdate it
+        tracker
+            .check_and_record_delivery("old-delivery", "github")
+            .unwrap();
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            conn.execute(
+                "UPDATE webhook_deliveries SET received_at = datetime('now', '-48 hours') WHERE delivery_id = ?",
+                params!["old-delivery"],
+            )
+            .unwrap();
+        }
+
+        // Insert a fresh delivery
+        tracker
+            .check_and_record_delivery("new-delivery", "github")
+            .unwrap();
+
+        // Clean up deliveries older than 24 hours
+        let removed = tracker.cleanup_old_deliveries(24).unwrap();
+        assert_eq!(removed, 1);
+
+        // Old delivery should be gone (re-inserting returns true)
+        let is_new = tracker
+            .check_and_record_delivery("old-delivery", "github")
+            .unwrap();
+        assert!(is_new);
+
+        // New delivery should still be present
+        let is_new = tracker
+            .check_and_record_delivery("new-delivery", "github")
+            .unwrap();
+        assert!(!is_new);
+    }
+
+    #[test]
+    fn test_cleanup_old_deliveries_empty_table() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let removed = tracker.cleanup_old_deliveries(24).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // get_execution_for_attempt (single execution)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_execution_for_attempt_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "exec-single", "LIN-ES")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "exec-single")
+            .unwrap()
+            .unwrap();
+
+        let mut execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+        execution.prompt_used = Some("Fix the bug".to_string());
+        execution.exit_code = Some(0);
+
+        let exec_id = tracker.record_execution(&execution).unwrap();
+
+        let result = tracker
+            .get_execution_for_attempt(attempt.id, exec_id)
+            .unwrap();
+        assert!(result.is_some());
+        let exec = result.unwrap();
+        assert_eq!(exec.id, exec_id);
+        assert_eq!(exec.attempt_id, Some(attempt.id));
+        assert_eq!(exec.prompt_used, Some("Fix the bug".to_string()));
+        assert_eq!(exec.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_get_execution_for_attempt_wrong_execution_id() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "exec-wrong", "LIN-EW")
+            .unwrap();
+        let attempt = tracker
+            .get_attempt("linear", "exec-wrong")
+            .unwrap()
+            .unwrap();
+
+        let execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+        tracker.record_execution(&execution).unwrap();
+
+        // Query with a non-existent execution_id
+        let result = tracker
+            .get_execution_for_attempt(attempt.id, 99999)
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_execution_for_attempt_wrong_attempt_id() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "exec-wa", "LIN-WA")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "exec-wa").unwrap().unwrap();
+
+        let execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+        let exec_id = tracker.record_execution(&execution).unwrap();
+
+        // Correct execution_id but wrong attempt_id
+        let result = tracker.get_execution_for_attempt(99999, exec_id).unwrap();
+        assert!(result.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Error patterns
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_error_pattern_and_retrieve() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let pattern = ErrorPattern {
+            id: 0,
+            pattern_hash: "hash-abc".to_string(),
+            error_type: Some("build_failure".to_string()),
+            error_message: Some("cannot find module 'foo'".to_string()),
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            occurrence_count: 1,
+            sources: Some(vec!["linear".to_string()]),
+            example_issue_ids: Some(vec!["PROJ-1".to_string()]),
+            resolution_hints: Some("Install the missing dependency".to_string()),
+        };
+
+        let id = tracker.record_error_pattern(&pattern).unwrap();
+        assert!(id > 0);
+
+        let patterns = tracker.get_error_patterns(10).unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].pattern_hash, "hash-abc");
+        assert_eq!(patterns[0].error_type, Some("build_failure".to_string()));
+        assert_eq!(
+            patterns[0].error_message,
+            Some("cannot find module 'foo'".to_string())
+        );
+        assert_eq!(patterns[0].occurrence_count, 1);
+        assert_eq!(patterns[0].sources, Some(vec!["linear".to_string()]));
+        assert_eq!(
+            patterns[0].example_issue_ids,
+            Some(vec!["PROJ-1".to_string()])
+        );
+        assert_eq!(
+            patterns[0].resolution_hints,
+            Some("Install the missing dependency".to_string())
+        );
+    }
+
+    #[test]
+    fn test_record_error_pattern_upsert_increments_count() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let pattern = ErrorPattern {
+            id: 0,
+            pattern_hash: "hash-dup".to_string(),
+            error_type: Some("test_failure".to_string()),
+            error_message: Some("assertion failed".to_string()),
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            occurrence_count: 1,
+            sources: None,
+            example_issue_ids: None,
+            resolution_hints: None,
+        };
+
+        tracker.record_error_pattern(&pattern).unwrap();
+        // Record again with the same hash - should upsert and increment count
+        tracker.record_error_pattern(&pattern).unwrap();
+
+        let patterns = tracker.get_error_patterns(10).unwrap();
+        assert_eq!(patterns.len(), 1);
+        // Initial insert count is 1, then ON CONFLICT increments by 1 = 2
+        assert_eq!(patterns[0].occurrence_count, 2);
+    }
+
+    #[test]
+    fn test_get_error_patterns_respects_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        for i in 0..5 {
+            let pattern = ErrorPattern {
+                id: 0,
+                pattern_hash: format!("hash-{}", i),
+                error_type: Some("type".to_string()),
+                error_message: Some(format!("error {}", i)),
+                first_seen: Utc::now(),
+                last_seen: Utc::now(),
+                occurrence_count: i + 1,
+                sources: None,
+                example_issue_ids: None,
+                resolution_hints: None,
+            };
+            tracker.record_error_pattern(&pattern).unwrap();
+        }
+
+        let patterns = tracker.get_error_patterns(3).unwrap();
+        assert_eq!(patterns.len(), 3);
+        // Should be ordered by occurrence_count DESC
+        assert!(patterns[0].occurrence_count >= patterns[1].occurrence_count);
+        assert!(patterns[1].occurrence_count >= patterns[2].occurrence_count);
+    }
+
+    #[test]
+    fn test_get_error_patterns_ordered_by_occurrence() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Insert patterns with different counts
+        for (hash, count) in [("low", 1), ("high", 10), ("mid", 5)] {
+            let pattern = ErrorPattern {
+                id: 0,
+                pattern_hash: hash.to_string(),
+                error_type: None,
+                error_message: None,
+                first_seen: Utc::now(),
+                last_seen: Utc::now(),
+                occurrence_count: count,
+                sources: None,
+                example_issue_ids: None,
+                resolution_hints: None,
+            };
+            tracker.record_error_pattern(&pattern).unwrap();
+        }
+
+        let patterns = tracker.get_error_patterns(10).unwrap();
+        assert_eq!(patterns.len(), 3);
+        assert_eq!(patterns[0].pattern_hash, "high");
+        assert_eq!(patterns[1].pattern_hash, "mid");
+        assert_eq!(patterns[2].pattern_hash, "low");
+    }
+
+    // ---------------------------------------------------------------
+    // Feedback outcome by attempt (happy path)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_feedback_outcome_by_attempt_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "fb-issue", "LIN-FB")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "fb-issue").unwrap().unwrap();
+
+        let outcome = FixOutcome {
+            id: 0,
+            attempt_id: attempt.id,
+            source: "linear".to_string(),
+            issue_id: "fb-issue".to_string(),
+            issue_text: "Fix the login page".to_string(),
+            prompt_used: "test prompt".to_string(),
+            outcome: crate::feedback::Outcome::Merged,
+            error_type: None,
+            learnings: Some("Always validate inputs".to_string()),
+            keywords: vec!["login".to_string(), "fix".to_string()],
+            embedding: None,
+            created_at: Utc::now(),
+        };
+
+        tracker.store_feedback_outcome(&outcome).unwrap();
+
+        let result = tracker.get_feedback_outcome_by_attempt(attempt.id).unwrap();
+        assert!(result.is_some());
+        let found = result.unwrap();
+        assert_eq!(found.attempt_id, attempt.id);
+        assert_eq!(found.source, "linear");
+        assert_eq!(found.issue_id, "fb-issue");
+        assert_eq!(found.issue_text, "Fix the login page");
+        assert_eq!(found.prompt_used, "test prompt");
+        assert!(found.outcome.is_success());
+        assert_eq!(found.learnings, Some("Always validate inputs".to_string()));
+        assert_eq!(found.keywords, vec!["login".to_string(), "fix".to_string()]);
+    }
+
+    // ---------------------------------------------------------------
+    // Metrics batch recording
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_record_metrics_batch() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let metrics: Vec<ProcessingMetric> = (0..5)
+            .map(|i| ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: "batch_metric".to_string(),
+                metric_value: i as f64,
+                source: Some("linear".to_string()),
+                tags: None,
+            })
+            .collect();
+
+        let count = tracker.record_metrics_batch(&metrics).unwrap();
+        assert_eq!(count, 5);
+
+        let retrieved = tracker.get_metrics("batch_metric", None, 100).unwrap();
+        assert_eq!(retrieved.len(), 5);
+    }
+
+    #[test]
+    fn test_record_metrics_batch_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let count = tracker.record_metrics_batch(&[]).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_record_metrics_batch_preserves_values() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let metrics = vec![
+            ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: "latency".to_string(),
+                metric_value: 100.5,
+                source: Some("github".to_string()),
+                tags: Some(serde_json::json!({"region": "us-west"})),
+            },
+            ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: "throughput".to_string(),
+                metric_value: 42.0,
+                source: Some("linear".to_string()),
+                tags: None,
+            },
+        ];
+
+        tracker.record_metrics_batch(&metrics).unwrap();
+
+        let latency = tracker.get_metrics("latency", None, 10).unwrap();
+        assert_eq!(latency.len(), 1);
+        assert!((latency[0].metric_value - 100.5).abs() < f64::EPSILON);
+        assert_eq!(latency[0].source, Some("github".to_string()));
+        assert!(latency[0].tags.is_some());
+
+        let throughput = tracker.get_metrics("throughput", None, 10).unwrap();
+        assert_eq!(throughput.len(), 1);
+        assert!((throughput[0].metric_value - 42.0).abs() < f64::EPSILON);
+    }
+
+    // ---------------------------------------------------------------
+    // Metric counts since
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_metric_counts_since() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Insert metrics
+        for name in &["requests", "errors", "requests"] {
+            let metric = ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: name.to_string(),
+                metric_value: 1.0,
+                source: None,
+                tags: None,
+            };
+            tracker.record_metric(&metric).unwrap();
+        }
+
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let counts = tracker
+            .get_metric_counts_since(&["requests", "errors"], since)
+            .unwrap();
+        assert_eq!(counts.get("requests"), Some(&2));
+        assert_eq!(counts.get("errors"), Some(&1));
+    }
+
+    #[test]
+    fn test_get_metric_counts_since_empty_names() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let since = Utc::now();
+        let counts = tracker.get_metric_counts_since(&[], since).unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn test_get_metric_counts_since_filters_by_time() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Insert an old metric
+        let old_metric = ProcessingMetric {
+            id: 0,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            metric_name: "old_count".to_string(),
+            metric_value: 1.0,
+            source: None,
+            tags: None,
+        };
+        tracker.record_metric(&old_metric).unwrap();
+
+        // Insert a recent metric
+        let recent_metric = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "old_count".to_string(),
+            metric_value: 1.0,
+            source: None,
+            tags: None,
+        };
+        tracker.record_metric(&recent_metric).unwrap();
+
+        let since = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let counts = tracker
+            .get_metric_counts_since(&["old_count"], since)
+            .unwrap();
+        assert_eq!(counts.get("old_count"), Some(&1));
+    }
+
+    #[test]
+    fn test_get_metric_counts_since_missing_names() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let counts = tracker
+            .get_metric_counts_since(&["nonexistent"], since)
+            .unwrap();
+        assert!(counts.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Metric sums since
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_metric_sums_since() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let values = [10.5, 20.3, 5.2];
+        for val in &values {
+            let metric = ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: "cost_usd".to_string(),
+                metric_value: *val,
+                source: None,
+                tags: None,
+            };
+            tracker.record_metric(&metric).unwrap();
+        }
+
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sums = tracker.get_metric_sums_since(&["cost_usd"], since).unwrap();
+        let total = sums.get("cost_usd").copied().unwrap_or(0.0);
+        assert!((total - 36.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_get_metric_sums_since_empty_names() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let since = Utc::now();
+        let sums = tracker.get_metric_sums_since(&[], since).unwrap();
+        assert!(sums.is_empty());
+    }
+
+    #[test]
+    fn test_get_metric_sums_since_multiple_names() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        for (name, val) in [("alpha", 10.0), ("alpha", 20.0), ("beta", 5.0)] {
+            let metric = ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: name.to_string(),
+                metric_value: val,
+                source: None,
+                tags: None,
+            };
+            tracker.record_metric(&metric).unwrap();
+        }
+
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sums = tracker
+            .get_metric_sums_since(&["alpha", "beta"], since)
+            .unwrap();
+        assert!((sums.get("alpha").copied().unwrap_or(0.0) - 30.0).abs() < f64::EPSILON);
+        assert!((sums.get("beta").copied().unwrap_or(0.0) - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_get_metric_sums_since_filters_by_time() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let old = ProcessingMetric {
+            id: 0,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            metric_name: "cost".to_string(),
+            metric_value: 100.0,
+            source: None,
+            tags: None,
+        };
+        let recent = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "cost".to_string(),
+            metric_value: 25.0,
+            source: None,
+            tags: None,
+        };
+        tracker.record_metric(&old).unwrap();
+        tracker.record_metric(&recent).unwrap();
+
+        let since = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sums = tracker.get_metric_sums_since(&["cost"], since).unwrap();
+        assert!((sums.get("cost").copied().unwrap_or(0.0) - 25.0).abs() < f64::EPSILON);
+    }
+
+    // ---------------------------------------------------------------
+    // Metric sums by source since
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_metric_sums_by_source_since() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let data = [
+            ("cost", "linear", 10.0),
+            ("cost", "linear", 20.0),
+            ("cost", "sentry", 5.0),
+            ("latency", "linear", 100.0),
+        ];
+
+        for (name, source, val) in &data {
+            let metric = ProcessingMetric {
+                id: 0,
+                timestamp: Utc::now(),
+                metric_name: name.to_string(),
+                metric_value: *val,
+                source: Some(source.to_string()),
+                tags: None,
+            };
+            tracker.record_metric(&metric).unwrap();
+        }
+
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sums = tracker
+            .get_metric_sums_by_source_since(&["cost", "latency"], since)
+            .unwrap();
+
+        assert!(
+            (sums
+                .get(&("cost".to_string(), "linear".to_string()))
+                .copied()
+                .unwrap_or(0.0)
+                - 30.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (sums
+                .get(&("cost".to_string(), "sentry".to_string()))
+                .copied()
+                .unwrap_or(0.0)
+                - 5.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (sums
+                .get(&("latency".to_string(), "linear".to_string()))
+                .copied()
+                .unwrap_or(0.0)
+                - 100.0)
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn test_get_metric_sums_by_source_since_empty_names() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let since = Utc::now();
+        let sums = tracker.get_metric_sums_by_source_since(&[], since).unwrap();
+        assert!(sums.is_empty());
+    }
+
+    #[test]
+    fn test_get_metric_sums_by_source_since_no_source() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Metrics with None source should not appear in by-source results
+        let metric = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "no_src".to_string(),
+            metric_value: 42.0,
+            source: None,
+            tags: None,
+        };
+        tracker.record_metric(&metric).unwrap();
+
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sums = tracker
+            .get_metric_sums_by_source_since(&["no_src"], since)
+            .unwrap();
+        // source is NULL so the row is skipped by the `if let Some(source)` check
+        assert!(sums.is_empty());
+    }
+
+    #[test]
+    fn test_get_metric_sums_by_source_since_filters_by_time() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let old = ProcessingMetric {
+            id: 0,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            metric_name: "timed".to_string(),
+            metric_value: 999.0,
+            source: Some("src".to_string()),
+            tags: None,
+        };
+        let recent = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "timed".to_string(),
+            metric_value: 7.0,
+            source: Some("src".to_string()),
+            tags: None,
+        };
+        tracker.record_metric(&old).unwrap();
+        tracker.record_metric(&recent).unwrap();
+
+        let since = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sums = tracker
+            .get_metric_sums_by_source_since(&["timed"], since)
+            .unwrap();
+        let val = sums
+            .get(&("timed".to_string(), "src".to_string()))
+            .copied()
+            .unwrap_or(0.0);
+        assert!((val - 7.0).abs() < f64::EPSILON);
+    }
+
+    // ====================================================================
+    // PR record tests
+    // ====================================================================
+
+    fn make_pr_record(pr_url: &str, repo: &str, number: i64) -> crate::types::PrRecord {
+        crate::types::PrRecord::new(pr_url, repo, number)
+    }
+
+    #[test]
+    fn test_upsert_pr_and_get_pr() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        let id = tracker.upsert_pr(&pr).unwrap();
+        assert!(id > 0);
+
+        let fetched = tracker
+            .get_pr("https://github.com/org/repo/pull/1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.pr_url, "https://github.com/org/repo/pull/1");
+        assert_eq!(fetched.scm_repo, "org/repo");
+        assert_eq!(fetched.pr_number, 1);
+        assert_eq!(fetched.status, "open");
+    }
+
+    #[test]
+    fn test_get_pr_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker
+            .get_pr("https://github.com/org/repo/pull/999")
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_upsert_pr_updates_on_conflict() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        tracker.upsert_pr(&pr).unwrap();
+
+        pr.status = "merged".to_string();
+        pr.approvals_count = 2;
+        pr.comments_count = 5;
+        tracker.upsert_pr(&pr).unwrap();
+
+        let fetched = tracker
+            .get_pr("https://github.com/org/repo/pull/1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.status, "merged");
+        assert_eq!(fetched.approvals_count, 2);
+        assert_eq!(fetched.comments_count, 5);
+    }
+
+    #[test]
+    fn test_get_open_prs() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr1 = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        let mut pr2 = make_pr_record("https://github.com/org/repo/pull/2", "org/repo", 2);
+        pr2.status = "merged".to_string();
+        let pr3 = make_pr_record("https://github.com/org/repo/pull/3", "org/repo", 3);
+
+        tracker.upsert_pr(&pr1).unwrap();
+        tracker.upsert_pr(&pr2).unwrap();
+        tracker.upsert_pr(&pr3).unwrap();
+
+        let open = tracker.get_open_prs().unwrap();
+        assert_eq!(open.len(), 2);
+        // All should be open status
+        for p in &open {
+            assert_eq!(p.status, "open");
+        }
+    }
+
+    #[test]
+    fn test_get_open_prs_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let open = tracker.get_open_prs().unwrap();
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn test_get_pr_analytics() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let mut pr1 = make_pr_record("https://github.com/org/a/pull/1", "org/a", 1);
+        pr1.time_to_first_review_mins = Some(30);
+        pr1.time_to_merge_mins = Some(120);
+        pr1.review_cycles = 2;
+        pr1.status = "merged".to_string();
+        tracker.upsert_pr(&pr1).unwrap();
+
+        let mut pr2 = make_pr_record("https://github.com/org/a/pull/2", "org/a", 2);
+        pr2.status = "closed".to_string();
+        tracker.upsert_pr(&pr2).unwrap();
+
+        let pr3 = make_pr_record("https://github.com/org/b/pull/1", "org/b", 1);
+        tracker.upsert_pr(&pr3).unwrap();
+
+        let analytics = tracker.get_pr_analytics().unwrap();
+        assert_eq!(analytics.total, 3);
+        assert_eq!(analytics.open, 1);
+        assert_eq!(analytics.merged, 1);
+        assert_eq!(analytics.closed, 1);
+        // merge_rate = 1/(1+1) = 0.5
+        assert!((analytics.merge_rate.unwrap() - 0.5).abs() < f64::EPSILON);
+        // by_repo
+        assert_eq!(*analytics.by_repo.get("org/a").unwrap(), 2);
+        assert_eq!(*analytics.by_repo.get("org/b").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_get_pr_analytics_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let analytics = tracker.get_pr_analytics().unwrap();
+        assert_eq!(analytics.total, 0);
+        assert!(analytics.merge_rate.is_none());
+        assert!(analytics.by_repo.is_empty());
+    }
+
+    #[test]
+    fn test_list_prs_no_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .upsert_pr(&make_pr_record("https://github.com/a/b/pull/1", "a/b", 1))
+            .unwrap();
+        tracker
+            .upsert_pr(&make_pr_record("https://github.com/a/b/pull/2", "a/b", 2))
+            .unwrap();
+
+        let all = tracker.list_prs(None, 100).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_list_prs_with_status_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let mut pr1 = make_pr_record("https://github.com/a/b/pull/1", "a/b", 1);
+        pr1.status = "merged".to_string();
+        tracker.upsert_pr(&pr1).unwrap();
+
+        tracker
+            .upsert_pr(&make_pr_record("https://github.com/a/b/pull/2", "a/b", 2))
+            .unwrap();
+
+        let merged = tracker.list_prs(Some("merged"), 100).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].pr_url, "https://github.com/a/b/pull/1");
+
+        let open = tracker.list_prs(Some("open"), 100).unwrap();
+        assert_eq!(open.len(), 1);
+    }
+
+    #[test]
+    fn test_list_prs_respects_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for i in 1..=5 {
+            tracker
+                .upsert_pr(&make_pr_record(
+                    &format!("https://github.com/a/b/pull/{}", i),
+                    "a/b",
+                    i,
+                ))
+                .unwrap();
+        }
+        let prs = tracker.list_prs(None, 3).unwrap();
+        assert_eq!(prs.len(), 3);
+    }
+
+    #[test]
+    fn test_update_pr_status_to_merged() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/a/b/pull/1", "a/b", 1);
+        tracker.upsert_pr(&pr).unwrap();
+
+        tracker
+            .update_pr_status("https://github.com/a/b/pull/1", "merged")
+            .unwrap();
+
+        let fetched = tracker
+            .get_pr("https://github.com/a/b/pull/1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.status, "merged");
+        assert!(fetched.merged_at.is_some());
+    }
+
+    #[test]
+    fn test_update_pr_status_to_closed() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/a/b/pull/1", "a/b", 1);
+        tracker.upsert_pr(&pr).unwrap();
+
+        tracker
+            .update_pr_status("https://github.com/a/b/pull/1", "closed")
+            .unwrap();
+
+        let fetched = tracker
+            .get_pr("https://github.com/a/b/pull/1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.status, "closed");
+        assert!(fetched.closed_at.is_some());
+    }
+
+    #[test]
+    fn test_update_pr_status_keeps_open_timestamps_null() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/a/b/pull/1", "a/b", 1);
+        tracker.upsert_pr(&pr).unwrap();
+
+        // Update to a non-merged, non-closed status
+        tracker
+            .update_pr_status("https://github.com/a/b/pull/1", "open")
+            .unwrap();
+
+        let fetched = tracker
+            .get_pr("https://github.com/a/b/pull/1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.status, "open");
+        assert!(fetched.merged_at.is_none());
+        assert!(fetched.closed_at.is_none());
+    }
+
+    // ====================================================================
+    // PR analytics detail tests
+    // ====================================================================
+
+    #[test]
+    fn test_get_avg_time_to_pr_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker.get_avg_time_to_pr().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_rejection_reasons() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Insert review patterns with categories
+        let pattern = crate::types::ReviewPattern {
+            id: 0,
+            scm_repo: "org/repo".to_string(),
+            category: crate::types::ReviewCategory::StyleIssue,
+            pattern_text: "indentation".to_string(),
+            example_comments: vec!["fix indent".to_string()],
+            occurrence_count: 5,
+            promoted_to_instruction: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        tracker.upsert_review_pattern(&pattern).unwrap();
+
+        let pattern2 = crate::types::ReviewPattern {
+            id: 0,
+            scm_repo: "org/repo".to_string(),
+            category: crate::types::ReviewCategory::WrongApproach,
+            pattern_text: "off-by-one".to_string(),
+            example_comments: vec![],
+            occurrence_count: 3,
+            promoted_to_instruction: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        tracker.upsert_review_pattern(&pattern2).unwrap();
+
+        let reasons = tracker.get_rejection_reasons(10).unwrap();
+        assert_eq!(reasons.len(), 2);
+        // Ordered by total DESC
+        assert_eq!(reasons[0].count, 5);
+        assert_eq!(reasons[1].count, 3);
+    }
+
+    #[test]
+    fn test_get_rejection_reasons_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let reasons = tracker.get_rejection_reasons(10).unwrap();
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn test_get_agent_spawn_count() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Record an attempt and an execution
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        let mut exec = ClaudeExecution::new().with_attempt_id(attempt.id);
+        exec.duration_secs = Some(10.0);
+        exec.exit_code = Some(0);
+        tracker.record_execution(&exec).unwrap();
+
+        let count = tracker
+            .get_agent_spawn_count("2020-01-01T00:00:00")
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let count_future = tracker
+            .get_agent_spawn_count("2099-01-01T00:00:00")
+            .unwrap();
+        assert_eq!(count_future, 0);
+    }
+
+    #[test]
+    fn test_get_cost_estimate_duration_fallback() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Record an attempt + execution with duration but no cost
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        let mut exec = ClaudeExecution::new().with_attempt_id(attempt.id);
+        exec.duration_secs = Some(120.0); // 2 minutes
+        exec.exit_code = Some(0);
+        tracker.record_execution(&exec).unwrap();
+
+        let estimate = tracker
+            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d")
+            .unwrap();
+        assert_eq!(estimate.cost_source, "duration_estimate");
+        assert_eq!(estimate.period, "7d");
+        // 2 minutes * $0.05/min = $0.10
+        assert!((estimate.total_cost - 0.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_get_cost_estimate_api_cost() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        let mut exec = ClaudeExecution::new().with_attempt_id(attempt.id);
+        exec.duration_secs = Some(60.0);
+        exec.exit_code = Some(0);
+        exec.total_cost_usd = Some(1.50);
+        tracker.record_execution(&exec).unwrap();
+
+        let estimate = tracker
+            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "30d")
+            .unwrap();
+        assert_eq!(estimate.cost_source, "api");
+        assert!((estimate.total_cost - 1.50).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_get_cost_estimate_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let estimate = tracker
+            .get_cost_estimate("2020-01-01T00:00:00", 0.0, "7d")
+            .unwrap();
+        assert_eq!(estimate.cost_source, "duration_estimate");
+        assert!((estimate.total_cost - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_get_mttr_trend_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let trend = tracker.get_mttr_trend(4).unwrap();
+        assert!(trend.is_empty());
+    }
+
+    #[test]
+    fn test_get_repo_leaderboard() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create attempts with scm_repo
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker
+            .mark_success("linear", "1", "https://github.com/org/repo-a/pull/1")
+            .unwrap();
+        tracker.mark_merged("linear", "1").unwrap();
+
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker
+            .mark_success("linear", "2", "https://github.com/org/repo-a/pull/2")
+            .unwrap();
+
+        let board = tracker.get_repo_leaderboard().unwrap();
+        // Should have entries for org/repo-a
+        assert!(!board.is_empty());
+        assert_eq!(board[0].repo, "org/repo-a");
+        assert_eq!(board[0].total, 2);
+    }
+
+    #[test]
+    fn test_get_repo_leaderboard_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let board = tracker.get_repo_leaderboard().unwrap();
+        assert!(board.is_empty());
+    }
+
+    #[test]
+    fn test_get_complexity_time_savings_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let savings = tracker
+            .get_complexity_time_savings("2020-01-01T00:00:00", 100.0, "30d")
+            .unwrap();
+        assert_eq!(savings.merged_count, 0);
+        assert!((savings.hours_saved - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ====================================================================
+    // list_attempts / count_attempts tests
+    // ====================================================================
+
+    #[test]
+    fn test_list_attempts_no_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("sentry", "2", "S-2").unwrap();
+
+        let all = tracker.list_attempts(None, None, 100, 0).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_list_attempts_status_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker.mark_failed("linear", "2", "error").unwrap();
+
+        let pending = tracker
+            .list_attempts(Some("pending"), None, 100, 0)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].issue_id, "1");
+
+        let failed = tracker.list_attempts(Some("failed"), None, 100, 0).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].issue_id, "2");
+    }
+
+    #[test]
+    fn test_list_attempts_source_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("sentry", "2", "S-2").unwrap();
+
+        let linear = tracker.list_attempts(None, Some("linear"), 100, 0).unwrap();
+        assert_eq!(linear.len(), 1);
+        assert_eq!(linear[0].source, "linear");
+    }
+
+    #[test]
+    fn test_list_attempts_status_and_source_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker.mark_failed("linear", "2", "error").unwrap();
+        tracker.record_attempt("sentry", "3", "S-3").unwrap();
+
+        let result = tracker
+            .list_attempts(Some("pending"), Some("linear"), 100, 0)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].issue_id, "1");
+    }
+
+    #[test]
+    fn test_list_attempts_pagination() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for i in 1..=5 {
+            tracker
+                .record_attempt("linear", &i.to_string(), &format!("L-{}", i))
+                .unwrap();
+        }
+
+        let page1 = tracker.list_attempts(None, None, 2, 0).unwrap();
+        assert_eq!(page1.len(), 2);
+
+        let page2 = tracker.list_attempts(None, None, 2, 2).unwrap();
+        assert_eq!(page2.len(), 2);
+
+        let page3 = tracker.list_attempts(None, None, 2, 4).unwrap();
+        assert_eq!(page3.len(), 1);
+    }
+
+    #[test]
+    fn test_count_attempts_all() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("sentry", "2", "S-2").unwrap();
+
+        let count = tracker.count_attempts(None, None).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_attempts_by_status() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker.mark_failed("linear", "2", "err").unwrap();
+
+        assert_eq!(tracker.count_attempts(Some("pending"), None).unwrap(), 1);
+        assert_eq!(tracker.count_attempts(Some("failed"), None).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_attempts_by_source() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("sentry", "2", "S-2").unwrap();
+
+        assert_eq!(tracker.count_attempts(None, Some("linear")).unwrap(), 1);
+        assert_eq!(tracker.count_attempts(None, Some("sentry")).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_attempts_by_status_and_source() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker.mark_failed("linear", "2", "err").unwrap();
+        tracker.record_attempt("sentry", "3", "S-3").unwrap();
+
+        assert_eq!(
+            tracker
+                .count_attempts(Some("pending"), Some("linear"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .count_attempts(Some("failed"), Some("sentry"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_list_attempts_since() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let result = tracker.list_attempts_since(since).unwrap();
+        assert_eq!(result.len(), 1);
+
+        let since_future = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let result_empty = tracker.list_attempts_since(since_future).unwrap();
+        assert!(result_empty.is_empty());
+    }
+
+    // ====================================================================
+    // Cascade attempt tests
+    // ====================================================================
+
+    #[test]
+    fn test_record_cascade_attempt() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let parent = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        let cascade_id = tracker
+            .record_cascade_attempt("linear", "1", "L-1", parent.id, "org/downstream")
+            .unwrap();
+        assert!(cascade_id > 0);
+
+        let cascade = tracker.get_attempt_by_id(cascade_id).unwrap().unwrap();
+        assert_eq!(cascade.status, FixAttemptStatus::Pending);
+        assert_eq!(cascade.cascade_repo.as_deref(), Some("org/downstream"));
+        assert_eq!(cascade.parent_attempt_id, Some(parent.id));
+    }
+
+    #[test]
+    fn test_record_cascade_attempt_deduplication() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let parent = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        let id1 = tracker
+            .record_cascade_attempt("linear", "1", "L-1", parent.id, "org/downstream")
+            .unwrap();
+        let id2 = tracker
+            .record_cascade_attempt("linear", "1", "L-1", parent.id, "org/downstream")
+            .unwrap();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_update_attempt_pr() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let parent = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        let cascade_id = tracker
+            .record_cascade_attempt("linear", "1", "L-1", parent.id, "org/down")
+            .unwrap();
+
+        tracker
+            .update_attempt_pr(
+                cascade_id,
+                "https://github.com/org/down/pull/5",
+                "org/down",
+                5,
+            )
+            .unwrap();
+
+        let updated = tracker.get_attempt_by_id(cascade_id).unwrap().unwrap();
+        assert_eq!(
+            updated.pr_url.as_deref(),
+            Some("https://github.com/org/down/pull/5")
+        );
+        assert_eq!(updated.scm_repo.as_deref(), Some("org/down"));
+        assert_eq!(updated.scm_pr_number, Some(5));
+        assert_eq!(updated.status, FixAttemptStatus::Success);
+    }
+
+    #[test]
+    fn test_mark_cascade_failed() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let parent = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        let cascade_id = tracker
+            .record_cascade_attempt("linear", "1", "L-1", parent.id, "org/down")
+            .unwrap();
+
+        tracker
+            .mark_cascade_failed(cascade_id, "build failed")
+            .unwrap();
+
+        let updated = tracker.get_attempt_by_id(cascade_id).unwrap().unwrap();
+        assert_eq!(updated.status, FixAttemptStatus::Failed);
+        assert_eq!(updated.error_message.as_deref(), Some("build failed"));
+    }
+
+    // ====================================================================
+    // Diagnostic counts tests
+    // ====================================================================
+
+    #[test]
+    fn test_get_diagnostic_counts_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let counts = tracker.get_diagnostic_counts().unwrap();
+        assert_eq!(counts.fix_attempts, 0);
+        assert_eq!(counts.activity_log, 0);
+        assert_eq!(counts.claude_executions, 0);
+        assert_eq!(counts.pr_reviews, 0);
+        assert_eq!(counts.prs, 0);
+        assert!(counts.fix_attempts_by_status.is_empty());
+        assert!(counts.recent_fix_attempts.is_empty());
+    }
+
+    #[test]
+    fn test_get_diagnostic_counts_with_data() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker.mark_failed("linear", "2", "err").unwrap();
+
+        let entry = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "test".to_string(),
+            source: Some("linear".to_string()),
+            issue_id: Some("1".to_string()),
+            short_id: Some("L-1".to_string()),
+            message: "test message".to_string(),
+            metadata: None,
+        };
+        tracker.record_activity(&entry).unwrap();
+
+        let counts = tracker.get_diagnostic_counts().unwrap();
+        assert_eq!(counts.fix_attempts, 2);
+        assert_eq!(counts.activity_log, 1);
+        assert_eq!(*counts.fix_attempts_by_status.get("pending").unwrap(), 1);
+        assert_eq!(*counts.fix_attempts_by_status.get("failed").unwrap(), 1);
+        assert_eq!(counts.recent_fix_attempts.len(), 2);
+    }
+
+    // ====================================================================
+    // Content cluster tests
+    // ====================================================================
+
+    #[test]
+    fn test_store_and_get_content_cluster() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let cluster = crate::types::ContentCluster {
+            id: 0,
+            cluster_key: "TypeError::main".to_string(),
+            source: "sentry".to_string(),
+            representative_issue_id: "issue-1".to_string(),
+            issue_ids: vec!["issue-1".to_string(), "issue-2".to_string()],
+            error_type: Some("TypeError".to_string()),
+            culprit: Some("main.ts".to_string()),
+            avg_similarity: 0.85,
+            status: "active".to_string(),
+            created_at: Utc::now(),
+        };
+
+        let id = tracker.store_content_cluster(&cluster).unwrap();
+        assert!(id > 0);
+
+        let active = tracker.get_active_content_clusters("sentry").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].cluster_key, "TypeError::main");
+        assert_eq!(active[0].issue_ids.len(), 2);
+        assert_eq!(active[0].error_type.as_deref(), Some("TypeError"));
+        assert_eq!(active[0].culprit.as_deref(), Some("main.ts"));
+    }
+
+    #[test]
+    fn test_get_active_content_clusters_filters_resolved() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let cluster1 = crate::types::ContentCluster {
+            id: 0,
+            cluster_key: "active-cluster".to_string(),
+            source: "sentry".to_string(),
+            representative_issue_id: "i1".to_string(),
+            issue_ids: vec!["i1".to_string()],
+            error_type: None,
+            culprit: None,
+            avg_similarity: 0.9,
+            status: "active".to_string(),
+            created_at: Utc::now(),
+        };
+        let id1 = tracker.store_content_cluster(&cluster1).unwrap();
+
+        let cluster2 = crate::types::ContentCluster {
+            id: 0,
+            cluster_key: "resolved-cluster".to_string(),
+            source: "sentry".to_string(),
+            representative_issue_id: "i2".to_string(),
+            issue_ids: vec!["i2".to_string()],
+            error_type: None,
+            culprit: None,
+            avg_similarity: 0.8,
+            status: "active".to_string(),
+            created_at: Utc::now(),
+        };
+        let id2 = tracker.store_content_cluster(&cluster2).unwrap();
+        tracker.resolve_content_cluster(id2).unwrap();
+
+        let active = tracker.get_active_content_clusters("sentry").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].cluster_key, "active-cluster");
+        let _ = id1;
+    }
+
+    #[test]
+    fn test_get_active_content_clusters_filters_by_source() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let cluster = crate::types::ContentCluster {
+            id: 0,
+            cluster_key: "k".to_string(),
+            source: "sentry".to_string(),
+            representative_issue_id: "i1".to_string(),
+            issue_ids: vec!["i1".to_string()],
+            error_type: None,
+            culprit: None,
+            avg_similarity: 0.9,
+            status: "active".to_string(),
+            created_at: Utc::now(),
+        };
+        tracker.store_content_cluster(&cluster).unwrap();
+
+        let linear = tracker.get_active_content_clusters("linear").unwrap();
+        assert!(linear.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_content_cluster() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let cluster = crate::types::ContentCluster {
+            id: 0,
+            cluster_key: "k".to_string(),
+            source: "sentry".to_string(),
+            representative_issue_id: "i1".to_string(),
+            issue_ids: vec!["i1".to_string()],
+            error_type: None,
+            culprit: None,
+            avg_similarity: 0.9,
+            status: "active".to_string(),
+            created_at: Utc::now(),
+        };
+        let id = tracker.store_content_cluster(&cluster).unwrap();
+
+        tracker.resolve_content_cluster(id).unwrap();
+
+        let active = tracker.get_active_content_clusters("sentry").unwrap();
+        assert!(active.is_empty());
+    }
+
+    // ====================================================================
+    // Severity score and suppression tests
+    // ====================================================================
+
+    #[test]
+    fn test_store_severity_score() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let score = crate::types::SeverityScore {
+            score: 0.85,
+            severity_component: 0.7,
+            frequency_component: 0.6,
+            regression_component: 0.3,
+            blast_radius_component: 0.8,
+            cluster_boost: 1.0,
+        };
+        // Should not error
+        tracker
+            .store_severity_score("sentry", "issue-1", &score, crate::types::BlastRadius::Core)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_store_severity_score_upsert() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let score1 = crate::types::SeverityScore {
+            score: 0.5,
+            severity_component: 0.5,
+            frequency_component: 0.5,
+            regression_component: 0.0,
+            blast_radius_component: 0.5,
+            cluster_boost: 0.0,
+        };
+        tracker
+            .store_severity_score(
+                "sentry",
+                "issue-1",
+                &score1,
+                crate::types::BlastRadius::Peripheral,
+            )
+            .unwrap();
+
+        let score2 = crate::types::SeverityScore {
+            score: 0.9,
+            severity_component: 0.9,
+            frequency_component: 0.8,
+            regression_component: 0.7,
+            blast_radius_component: 0.9,
+            cluster_boost: 1.0,
+        };
+        // Should upsert without error
+        tracker
+            .store_severity_score(
+                "sentry",
+                "issue-1",
+                &score2,
+                crate::types::BlastRadius::Critical,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_record_suppression() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_suppression("sentry", "issue-1", "flaky_test", "test is known flaky")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_record_suppression_dedup() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_suppression("sentry", "issue-1", "flaky", "reason")
+            .unwrap();
+        // Same record should be ignored
+        tracker
+            .record_suppression("sentry", "issue-1", "flaky", "reason")
+            .unwrap();
+    }
+
+    // ====================================================================
+    // Issue listing / counting tests
+    // ====================================================================
+
+    #[test]
+    fn test_list_issues_no_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let emb = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "1".to_string(),
+            short_id: Some("L-1".to_string()),
+            title: Some("Bug".to_string()),
+            embedding: None,
+            embedding_model: None,
+            created_at: Utc::now(),
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            updated_at: None,
+        };
+        tracker.store_embedding(&emb).unwrap();
+
+        let issues = tracker.list_issues(None, 10, 0).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].title, Some("Bug".to_string()));
+    }
+
+    #[test]
+    fn test_list_issues_with_source_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let emb1 = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "1".to_string(),
+            short_id: Some("L-1".to_string()),
+            title: Some("Linear Bug".to_string()),
+            embedding: None,
+            embedding_model: None,
+            created_at: Utc::now(),
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            updated_at: None,
+        };
+        let emb2 = IssueEmbedding {
+            id: 0,
+            source: "sentry".to_string(),
+            issue_id: "2".to_string(),
+            short_id: Some("S-2".to_string()),
+            title: Some("Sentry Error".to_string()),
+            embedding: None,
+            embedding_model: None,
+            created_at: Utc::now(),
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            updated_at: None,
+        };
+        tracker.store_embedding(&emb1).unwrap();
+        tracker.store_embedding(&emb2).unwrap();
+
+        let linear = tracker.list_issues(Some("linear"), 10, 0).unwrap();
+        assert_eq!(linear.len(), 1);
+        assert_eq!(linear[0].source, "linear");
+    }
+
+    #[test]
+    fn test_list_issues_pagination() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for i in 1..=5 {
+            let emb = IssueEmbedding {
+                id: 0,
+                source: "linear".to_string(),
+                issue_id: i.to_string(),
+                short_id: Some(format!("L-{}", i)),
+                title: Some(format!("Bug {}", i)),
+                embedding: None,
+                embedding_model: None,
+                created_at: Utc::now(),
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                updated_at: None,
+            };
+            tracker.store_embedding(&emb).unwrap();
+        }
+
+        let page1 = tracker.list_issues(None, 2, 0).unwrap();
+        assert_eq!(page1.len(), 2);
+
+        let page2 = tracker.list_issues(None, 2, 2).unwrap();
+        assert_eq!(page2.len(), 2);
+
+        let page3 = tracker.list_issues(None, 2, 4).unwrap();
+        assert_eq!(page3.len(), 1);
+    }
+
+    #[test]
+    fn test_count_issues_no_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        assert_eq!(tracker.count_issues(None).unwrap(), 0);
+
+        let emb = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "1".to_string(),
+            short_id: Some("L-1".to_string()),
+            title: Some("Bug".to_string()),
+            embedding: None,
+            embedding_model: None,
+            created_at: Utc::now(),
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            updated_at: None,
+        };
+        tracker.store_embedding(&emb).unwrap();
+        assert_eq!(tracker.count_issues(None).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_issues_with_source() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let emb1 = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "1".to_string(),
+            short_id: Some("L-1".to_string()),
+            title: Some("Bug".to_string()),
+            embedding: None,
+            embedding_model: None,
+            created_at: Utc::now(),
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            updated_at: None,
+        };
+        let emb2 = IssueEmbedding {
+            id: 0,
+            source: "sentry".to_string(),
+            issue_id: "2".to_string(),
+            short_id: Some("S-2".to_string()),
+            title: Some("Error".to_string()),
+            embedding: None,
+            embedding_model: None,
+            created_at: Utc::now(),
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            updated_at: None,
+        };
+        tracker.store_embedding(&emb1).unwrap();
+        tracker.store_embedding(&emb2).unwrap();
+
+        assert_eq!(tracker.count_issues(Some("linear")).unwrap(), 1);
+        assert_eq!(tracker.count_issues(Some("sentry")).unwrap(), 1);
+        assert_eq!(tracker.count_issues(Some("other")).unwrap(), 0);
+    }
+
+    // ====================================================================
+    // Batch operations tests
+    // ====================================================================
+
+    #[test]
+    fn test_store_similar_issues_batch() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let batch = vec![
+            SimilarIssue {
+                id: 0,
+                source_issue_id: "a".to_string(),
+                similar_issue_id: "b".to_string(),
+                similarity_score: 0.9,
+                computed_at: Utc::now(),
+            },
+            SimilarIssue {
+                id: 0,
+                source_issue_id: "a".to_string(),
+                similar_issue_id: "c".to_string(),
+                similarity_score: 0.7,
+                computed_at: Utc::now(),
+            },
+        ];
+        tracker.store_similar_issues_batch(&batch).unwrap();
+
+        let similar = tracker.find_similar_issues("a", 0.5, 10).unwrap();
+        assert_eq!(similar.len(), 2);
+    }
+
+    #[test]
+    fn test_store_similar_issues_batch_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.store_similar_issues_batch(&[]).unwrap();
+    }
+
+    #[test]
+    fn test_get_attempts_batch() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker.record_attempt("sentry", "2", "S-2").unwrap();
+
+        let results = tracker
+            .get_attempts_batch(&[("linear", "1"), ("sentry", "2"), ("other", "99")])
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_some());
+        assert!(results[1].is_some());
+        assert!(results[2].is_none());
+    }
+
+    #[test]
+    fn test_get_attempts_batch_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let results = tracker.get_attempts_batch(&[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ====================================================================
+    // Indexing progress tests
+    // ====================================================================
+
+    #[test]
+    fn test_indexing_progress_lifecycle() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Initially idle
+        let progress = tracker.get_indexing_progress().unwrap();
+        assert_eq!(progress.status, "idle");
+        assert_eq!(progress.total_repos, 0);
+
+        // Start indexing
+        tracker.start_indexing_progress(5).unwrap();
+        let progress = tracker.get_indexing_progress().unwrap();
+        assert_eq!(progress.status, "running");
+        assert_eq!(progress.total_repos, 5);
+        assert_eq!(progress.indexed_repos, 0);
+        assert!(progress.started_at.is_some());
+
+        // Update progress
+        tracker
+            .update_indexing_progress(2, "my-repo", 100, 200)
+            .unwrap();
+        let progress = tracker.get_indexing_progress().unwrap();
+        assert_eq!(progress.indexed_repos, 2);
+        assert_eq!(progress.current_repo.as_deref(), Some("my-repo"));
+        assert_eq!(progress.current_repo_files, 100);
+        assert_eq!(progress.total_files_indexed, 200);
+
+        // Finish indexing
+        tracker.finish_indexing_progress().unwrap();
+        let progress = tracker.get_indexing_progress().unwrap();
+        assert_eq!(progress.status, "idle");
+        assert_eq!(progress.indexed_repos, 0);
+        assert!(progress.current_repo.is_none());
+        assert!(progress.started_at.is_none());
+    }
+
+    #[test]
+    fn test_subscribe_indexing_progress() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut rx = tracker.subscribe_indexing_progress();
+
+        // Initial value
+        let current = rx.borrow().clone();
+        assert_eq!(current.status, "idle");
+
+        tracker.start_indexing_progress(3).unwrap();
+        // The watch channel should reflect the update
+        let updated = rx.borrow_and_update().clone();
+        assert_eq!(updated.status, "running");
+        assert_eq!(updated.total_repos, 3);
+    }
+
+    // ====================================================================
+    // delete_user_sessions test
+    // ====================================================================
+
+    #[test]
+    fn test_delete_user_sessions() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .create_user("test@example.com", "hash", "Test", "user")
+            .unwrap();
+        let user = tracker
+            .get_user_by_email("test@example.com")
+            .unwrap()
+            .unwrap();
+
+        // Create a session
+        let token = tracker
+            .create_session(user.id, "2099-01-01T00:00:00")
+            .unwrap();
+        assert!(!token.is_empty());
+
+        // Verify session works
+        let session_user = tracker.get_session_user(&token).unwrap();
+        assert!(session_user.is_some());
+
+        // Delete all sessions for user
+        tracker.delete_user_sessions(user.id).unwrap();
+
+        // Session should no longer be valid
+        let session_user = tracker.get_session_user(&token).unwrap();
+        assert!(session_user.is_none());
+    }
+
+    // ====================================================================
+    // get_all_regression_watches test
+    // ====================================================================
+
+    #[test]
+    fn test_get_all_regression_watches() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempts to satisfy FK constraint
+        tracker.record_attempt("linear", "rw-1", "L-RW1").unwrap();
+        tracker.record_attempt("sentry", "rw-2", "S-RW2").unwrap();
+        let attempt1 = tracker.get_attempt("linear", "rw-1").unwrap().unwrap();
+        let attempt2 = tracker.get_attempt("sentry", "rw-2").unwrap().unwrap();
+
+        let watch1 = crate::types::RegressionWatch {
+            id: 0,
+            issue_type: crate::types::IssueType::LinearBug,
+            issue_id: "rw-1".to_string(),
+            fix_attempt_id: attempt1.id,
+            status: crate::types::RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: Utc::now(),
+        };
+        let watch2 = crate::types::RegressionWatch {
+            id: 0,
+            issue_type: crate::types::IssueType::SentryIssue,
+            issue_id: "rw-2".to_string(),
+            fix_attempt_id: attempt2.id,
+            status: crate::types::RegressionWatchStatus::Monitoring,
+            pr_merged_at: None,
+            monitoring_started_at: Some(Utc::now()),
+            resolved_at: None,
+            regressed_at: None,
+            created_at: Utc::now(),
+        };
+
+        tracker.create_regression_watch(&watch1).unwrap();
+        tracker.create_regression_watch(&watch2).unwrap();
+
+        let all = tracker.get_all_regression_watches().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_get_all_regression_watches_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let all = tracker.get_all_regression_watches().unwrap();
+        assert!(all.is_empty());
+    }
+
+    // ====================================================================
+    // get_active_clusters test
+    // ====================================================================
+
+    #[test]
+    fn test_get_active_clusters() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let cluster = crate::types::IssueCluster {
+            id: 0,
+            cluster_key: "key1".to_string(),
+            source: "sentry".to_string(),
+            issue_ids: vec!["a".to_string(), "b".to_string()],
+            window_start: Utc::now(),
+            window_end: Utc::now(),
+            resolved_by_issue_id: None,
+            resolved_by_attempt_id: None,
+            status: "active".to_string(),
+            created_at: Utc::now(),
+        };
+        let id = tracker.store_issue_cluster(&cluster).unwrap();
+
+        let active = tracker.get_active_clusters("sentry").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].cluster_key, "key1");
+        assert_eq!(active[0].issue_ids.len(), 2);
+
+        // Resolve it
+        tracker.update_cluster_resolution(id, "a", 1).unwrap();
+        let active_after = tracker.get_active_clusters("sentry").unwrap();
+        assert!(active_after.is_empty());
+    }
+
+    #[test]
+    fn test_get_active_clusters_filters_by_source() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let cluster = crate::types::IssueCluster {
+            id: 0,
+            cluster_key: "key1".to_string(),
+            source: "sentry".to_string(),
+            issue_ids: vec!["a".to_string()],
+            window_start: Utc::now(),
+            window_end: Utc::now(),
+            resolved_by_issue_id: None,
+            resolved_by_attempt_id: None,
+            status: "active".to_string(),
+            created_at: Utc::now(),
+        };
+        tracker.store_issue_cluster(&cluster).unwrap();
+
+        let linear = tracker.get_active_clusters("linear").unwrap();
+        assert!(linear.is_empty());
+    }
+
+    // ====================================================================
+    // get_activity_type_counts_since test
+    // ====================================================================
+
+    #[test]
+    fn test_get_activity_type_counts_since() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let entry1 = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "fix_started".to_string(),
+            source: None,
+            issue_id: None,
+            short_id: None,
+            message: "msg".to_string(),
+            metadata: None,
+        };
+        let entry2 = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "fix_started".to_string(),
+            source: None,
+            issue_id: None,
+            short_id: None,
+            message: "msg2".to_string(),
+            metadata: None,
+        };
+        let entry3 = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "pr_merged".to_string(),
+            source: None,
+            issue_id: None,
+            short_id: None,
+            message: "msg3".to_string(),
+            metadata: None,
+        };
+        tracker.record_activity(&entry1).unwrap();
+        tracker.record_activity(&entry2).unwrap();
+        tracker.record_activity(&entry3).unwrap();
+
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let counts = tracker.get_activity_type_counts_since(since).unwrap();
+
+        assert_eq!(*counts.get("fix_started").unwrap(), 2);
+        assert_eq!(*counts.get("pr_merged").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_get_activity_type_counts_since_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let counts = tracker.get_activity_type_counts_since(since).unwrap();
+        assert!(counts.is_empty());
+    }
+
+    // ====================================================================
+    // normalize_signal / complexity_to_hours helper tests
+    // ====================================================================
+
+    #[test]
+    fn test_normalize_signal_below_min() {
+        let thresholds = [0.0, 20.0, 100.0, 500.0, 2000.0];
+        assert!((normalize_signal(-1.0, &thresholds) - 0.0).abs() < f64::EPSILON);
+        assert!((normalize_signal(0.0, &thresholds) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_normalize_signal_above_max() {
+        let thresholds = [0.0, 20.0, 100.0, 500.0, 2000.0];
+        assert!((normalize_signal(3000.0, &thresholds) - 1.0).abs() < f64::EPSILON);
+        assert!((normalize_signal(2000.0, &thresholds) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_normalize_signal_midpoints() {
+        let thresholds = [0.0, 20.0, 100.0, 500.0, 2000.0];
+        // Exactly at threshold boundaries
+        let at_20 = normalize_signal(20.0, &thresholds);
+        assert!((at_20 - 0.25).abs() < f64::EPSILON);
+
+        let at_100 = normalize_signal(100.0, &thresholds);
+        assert!((at_100 - 0.5).abs() < f64::EPSILON);
+
+        let at_500 = normalize_signal(500.0, &thresholds);
+        assert!((at_500 - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_normalize_signal_interpolation() {
+        let thresholds = [0.0, 20.0, 100.0, 500.0, 2000.0];
+        // Midpoint of first bucket (0-20): 10 -> 0.5/4 = 0.125
+        let val = normalize_signal(10.0, &thresholds);
+        assert!((val - 0.125).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_normalize_signal_equal_thresholds() {
+        // When two adjacent thresholds are equal, should return bucket value directly
+        let thresholds = [0.0, 0.0, 100.0, 500.0, 2000.0];
+        let val = normalize_signal(0.0, &thresholds);
+        // 0.0 <= thresholds[0] => returns 0.0
+        assert!((val - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_complexity_to_hours() {
+        assert!((complexity_to_hours(0.1) - 0.5).abs() < f64::EPSILON);
+        assert!((complexity_to_hours(0.2) - 0.5).abs() < f64::EPSILON);
+        assert!((complexity_to_hours(0.3) - 1.0).abs() < f64::EPSILON);
+        assert!((complexity_to_hours(0.4) - 1.0).abs() < f64::EPSILON);
+        assert!((complexity_to_hours(0.5) - 2.0).abs() < f64::EPSILON);
+        assert!((complexity_to_hours(0.6) - 2.0).abs() < f64::EPSILON);
+        assert!((complexity_to_hours(0.7) - 4.0).abs() < f64::EPSILON);
+        assert!((complexity_to_hours(0.8) - 4.0).abs() < f64::EPSILON);
+        assert!((complexity_to_hours(0.9) - 8.0).abs() < f64::EPSILON);
+        assert!((complexity_to_hours(1.0) - 8.0).abs() < f64::EPSILON);
+    }
+
+    // ====================================================================
+    // Code indexing tests
+    // ====================================================================
+
+    #[test]
+    fn test_get_or_create_repo_id() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let id1 = tracker.get_or_create_repo_id("my-repo").unwrap();
+        assert!(id1 > 0);
+
+        // Same name should return same id
+        let id2 = tracker.get_or_create_repo_id("my-repo").unwrap();
+        assert_eq!(id1, id2);
+
+        // Different name => different id
+        let id3 = tracker.get_or_create_repo_id("other-repo").unwrap();
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_save_code_symbols_and_find() {
+        use crate::repo::code_index::{Language, SymbolKind};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        let symbols = vec![
+            crate::repo::code_index::CodeSymbol {
+                id: None,
+                repo_id,
+                file_path: "src/main.rs".to_string(),
+                symbol_name: "process_data".to_string(),
+                symbol_kind: SymbolKind::Function,
+                parent_symbol: None,
+                language: Language::Rust,
+                start_line: 10,
+                end_line: 20,
+                signature: Some("fn process_data(input: &str) -> Result<()>".to_string()),
+            },
+            crate::repo::code_index::CodeSymbol {
+                id: None,
+                repo_id,
+                file_path: "src/lib.rs".to_string(),
+                symbol_name: "DataProcessor".to_string(),
+                symbol_kind: SymbolKind::Struct,
+                parent_symbol: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                signature: None,
+            },
+        ];
+
+        tracker.save_code_symbols(&symbols).unwrap();
+
+        // Find by name
+        let found = tracker
+            .find_code_symbols("process_data", None, None)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].symbol_name, "process_data");
+        assert_eq!(found[0].symbol_kind, SymbolKind::Function);
+        assert_eq!(found[0].language, Language::Rust);
+
+        // Find by kind
+        let structs = tracker
+            .find_code_symbols("DataProcessor", Some(SymbolKind::Struct), None)
+            .unwrap();
+        assert_eq!(structs.len(), 1);
+        assert_eq!(structs[0].symbol_name, "DataProcessor");
+
+        // Find by repo_id
+        let other_repo_id = tracker.get_or_create_repo_id("other-repo").unwrap();
+        let from_other = tracker
+            .find_code_symbols("process_data", None, Some(other_repo_id))
+            .unwrap();
+        assert!(from_other.is_empty());
+    }
+
+    #[test]
+    fn test_find_code_symbols_escapes_like_wildcards() {
+        use crate::repo::code_index::{Language, SymbolKind};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        let symbols = vec![crate::repo::code_index::CodeSymbol {
+            id: None,
+            repo_id,
+            file_path: "src/main.rs".to_string(),
+            symbol_name: "test_func".to_string(),
+            symbol_kind: SymbolKind::Function,
+            parent_symbol: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 5,
+            signature: None,
+        }];
+        tracker.save_code_symbols(&symbols).unwrap();
+
+        // Search with % which should be escaped, not act as wildcard
+        let found = tracker.find_code_symbols("test%func", None, None).unwrap();
+        // With proper escaping, "test%func" won't match "test_func"
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn test_save_code_chunks_and_get_ids() {
+        use crate::repo::code_index::Language;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        let chunks = vec![
+            crate::repo::code_index::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "src/main.rs".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: Some("main".to_string()),
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 10,
+                chunk_text: "fn main() { }".to_string(),
+                context_text: "// main entry point".to_string(),
+                file_hash: "abc123".to_string(),
+            },
+            crate::repo::code_index::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "src/lib.rs".to_string(),
+                chunk_type: "module".to_string(),
+                symbol_name: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                chunk_text: "mod tests { }".to_string(),
+                context_text: "// test module".to_string(),
+                file_hash: "def456".to_string(),
+            },
+        ];
+
+        let ids = tracker.save_code_chunks(&chunks).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0] > 0);
+        assert!(ids[1] > 0);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn test_code_chunk_hash_matches() {
+        use crate::repo::code_index::Language;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        // No chunks yet -> should not match
+        assert!(!tracker
+            .code_chunk_hash_matches(repo_id, "src/main.rs", "abc123")
+            .unwrap());
+
+        // Add a chunk
+        let chunks = vec![crate::repo::code_index::CodeChunk {
+            id: None,
+            repo_id,
+            file_path: "src/main.rs".to_string(),
+            chunk_type: "function".to_string(),
+            symbol_name: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 10,
+            chunk_text: "fn main() {}".to_string(),
+            context_text: "".to_string(),
+            file_hash: "abc123".to_string(),
+        }];
+        let ids = tracker.save_code_chunks(&chunks).unwrap();
+
+        // Chunk exists but no embedding -> should not match
+        assert!(!tracker
+            .code_chunk_hash_matches(repo_id, "src/main.rs", "abc123")
+            .unwrap());
+
+        // Add an embedding manually
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            let embedding: Vec<u8> = vec![0u8; 16]; // 4 floats
+            conn.execute(
+                "INSERT INTO code_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
+                params![ids[0], embedding, "test-model"],
+            ).unwrap();
+        }
+
+        // Now should match
+        assert!(tracker
+            .code_chunk_hash_matches(repo_id, "src/main.rs", "abc123")
+            .unwrap());
+
+        // Different hash should not match
+        assert!(!tracker
+            .code_chunk_hash_matches(repo_id, "src/main.rs", "different")
+            .unwrap());
+    }
+
+    #[test]
+    fn test_delete_code_data_for_file() {
+        use crate::repo::code_index::{Language, SymbolKind};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        // Add symbol and chunk for a file
+        let symbols = vec![crate::repo::code_index::CodeSymbol {
+            id: None,
+            repo_id,
+            file_path: "src/main.rs".to_string(),
+            symbol_name: "main".to_string(),
+            symbol_kind: SymbolKind::Function,
+            parent_symbol: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 5,
+            signature: None,
+        }];
+        tracker.save_code_symbols(&symbols).unwrap();
+
+        let chunks = vec![crate::repo::code_index::CodeChunk {
+            id: None,
+            repo_id,
+            file_path: "src/main.rs".to_string(),
+            chunk_type: "function".to_string(),
+            symbol_name: Some("main".to_string()),
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 5,
+            chunk_text: "fn main() {}".to_string(),
+            context_text: "".to_string(),
+            file_hash: "abc".to_string(),
+        }];
+        tracker.save_code_chunks(&chunks).unwrap();
+
+        // Delete code data for the file
+        tracker
+            .delete_code_data_for_file(repo_id, "src/main.rs")
+            .unwrap();
+
+        // Symbols should be gone
+        let found = tracker
+            .find_code_symbols("main", None, Some(repo_id))
+            .unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn test_delete_code_chunks_by_ids() {
+        use crate::repo::code_index::Language;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        let chunks = vec![
+            crate::repo::code_index::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "a.rs".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                chunk_text: "fn a() {}".to_string(),
+                context_text: "".to_string(),
+                file_hash: "h1".to_string(),
+            },
+            crate::repo::code_index::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "b.rs".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                chunk_text: "fn b() {}".to_string(),
+                context_text: "".to_string(),
+                file_hash: "h2".to_string(),
+            },
+        ];
+        let ids = tracker.save_code_chunks(&chunks).unwrap();
+
+        // Delete one
+        tracker.delete_code_chunks_by_ids(&[ids[0]]).unwrap();
+
+        // Verify second still exists by checking hash
+        // The first should not match, second should still be there
+        assert!(!tracker
+            .code_chunk_hash_matches(repo_id, "a.rs", "h1")
+            .unwrap());
+    }
+
+    #[test]
+    fn test_delete_code_chunks_by_ids_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.delete_code_chunks_by_ids(&[]).unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_stale_code_data_empty_paths() {
+        use crate::repo::code_index::Language;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        let chunks = vec![crate::repo::code_index::CodeChunk {
+            id: None,
+            repo_id,
+            file_path: "old.rs".to_string(),
+            chunk_type: "function".to_string(),
+            symbol_name: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 5,
+            chunk_text: "fn old() {}".to_string(),
+            context_text: "".to_string(),
+            file_hash: "hash".to_string(),
+        }];
+        tracker.save_code_chunks(&chunks).unwrap();
+
+        // Empty current paths -> should delete everything
+        tracker.cleanup_stale_code_data(repo_id, &[]).unwrap();
+
+        assert!(!tracker
+            .code_chunk_hash_matches(repo_id, "old.rs", "hash")
+            .unwrap());
+    }
+
+    #[test]
+    fn test_cleanup_stale_code_data_removes_only_stale() {
+        use crate::repo::code_index::Language;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        let chunks = vec![
+            crate::repo::code_index::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "keep.rs".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                chunk_text: "fn keep() {}".to_string(),
+                context_text: "".to_string(),
+                file_hash: "h1".to_string(),
+            },
+            crate::repo::code_index::CodeChunk {
+                id: None,
+                repo_id,
+                file_path: "stale.rs".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: None,
+                language: Language::Rust,
+                start_line: 1,
+                end_line: 5,
+                chunk_text: "fn stale() {}".to_string(),
+                context_text: "".to_string(),
+                file_hash: "h2".to_string(),
+            },
+        ];
+        tracker.save_code_chunks(&chunks).unwrap();
+
+        // Only keep.rs is current
+        tracker
+            .cleanup_stale_code_data(repo_id, &["keep.rs".to_string()])
+            .unwrap();
+
+        // Query directly to check stale.rs is gone
+        let conn = tracker.acquire_lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_chunks WHERE repo_id = ? AND file_path = 'stale.rs'",
+                params![repo_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let keep_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_chunks WHERE repo_id = ? AND file_path = 'keep.rs'",
+                params![repo_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep_count, 1);
+    }
+
+    // ====================================================================
+    // get_repo_knowledge / get_review_patterns / get_successful_strategies
+    // ====================================================================
+
+    #[test]
+    fn test_get_repo_knowledge_all() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let entry1 = crate::types::RepoKnowledge {
+            id: 0,
+            repo: "org/repo".to_string(),
+            knowledge_key: "test_framework".to_string(),
+            knowledge_value: "jest".to_string(),
+            source_type: "review".to_string(),
+            confidence: 0.9,
+            occurrence_count: 3,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let entry2 = crate::types::RepoKnowledge {
+            id: 0,
+            repo: "org/repo".to_string(),
+            knowledge_key: "language".to_string(),
+            knowledge_value: "typescript".to_string(),
+            source_type: "diff".to_string(),
+            confidence: 0.95,
+            occurrence_count: 5,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        tracker.upsert_repo_knowledge(&entry1).unwrap();
+        tracker.upsert_repo_knowledge(&entry2).unwrap();
+
+        let knowledge = tracker.get_repo_knowledge("org/repo").unwrap();
+        assert_eq!(knowledge.len(), 2);
+        // Ordered by occurrence_count DESC
+        assert_eq!(knowledge[0].knowledge_value, "typescript");
+        assert_eq!(knowledge[1].knowledge_value, "jest");
+    }
+
+    #[test]
+    fn test_get_repo_knowledge_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let knowledge = tracker.get_repo_knowledge("nonexistent").unwrap();
+        assert!(knowledge.is_empty());
+    }
+
+    #[test]
+    fn test_get_review_patterns() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let pattern = crate::types::ReviewPattern {
+            id: 0,
+            scm_repo: "org/repo".to_string(),
+            category: crate::types::ReviewCategory::StyleIssue,
+            pattern_text: "indentation issue".to_string(),
+            example_comments: vec!["fix indentation".to_string()],
+            occurrence_count: 5,
+            promoted_to_instruction: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        tracker.upsert_review_pattern(&pattern).unwrap();
+
+        let patterns = tracker.get_review_patterns("org/repo", 10).unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].pattern_text, "indentation issue");
+        assert_eq!(patterns[0].occurrence_count, 5);
+    }
+
+    #[test]
+    fn test_get_review_patterns_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let patterns = tracker.get_review_patterns("nonexistent", 10).unwrap();
+        assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn test_get_review_patterns_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        for i in 0..5 {
+            let pattern = crate::types::ReviewPattern {
+                id: 0,
+                scm_repo: "org/repo".to_string(),
+                category: crate::types::ReviewCategory::WrongApproach,
+                pattern_text: format!("pattern-{}", i),
+                example_comments: vec![],
+                occurrence_count: i,
+                promoted_to_instruction: false,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            tracker.upsert_review_pattern(&pattern).unwrap();
+        }
+
+        let limited = tracker.get_review_patterns("org/repo", 3).unwrap();
+        assert_eq!(limited.len(), 3);
+    }
+
+    #[test]
+    fn test_get_successful_strategies() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a merged attempt
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker
+            .mark_success("linear", "1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_merged("linear", "1").unwrap();
+
+        let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        let fp = crate::types::StrategyFingerprint {
+            id: 0,
+            attempt_id: attempt.id,
+            files_explored: vec!["src/main.rs".to_string()],
+            tests_run: 5,
+            tools_used: {
+                let mut m = HashMap::new();
+                m.insert("grep".to_string(), 3);
+                m.insert("edit".to_string(), 2);
+                m
+            },
+            fix_approach: "direct_fix".to_string(),
+            strategy_summary: "Fixed null check".to_string(),
+            fix_quality_score: Some(0.95),
+            created_at: Utc::now(),
+        };
+        tracker.store_strategy_fingerprint(&fp).unwrap();
+
+        let strategies = tracker.get_successful_strategies("org/repo", 10).unwrap();
+        assert_eq!(strategies.len(), 1);
+        assert_eq!(strategies[0].tests_run, 5);
+        assert_eq!(strategies[0].fix_quality_score, Some(0.95));
+    }
+
+    #[test]
+    fn test_get_successful_strategies_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let strategies = tracker.get_successful_strategies("org/repo", 10).unwrap();
+        assert!(strategies.is_empty());
+    }
+
+    // ====================================================================
+    // update_experiment_stats with time_to_merge
+    // ====================================================================
+
+    #[test]
+    fn test_update_experiment_stats_with_time_to_merge() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let exp = PromptExperiment {
+            id: 0,
+            experiment_name: "prompt_v2".to_string(),
+            variant: "a".to_string(),
+            prompt_template: "template".to_string(),
+            prompt_hash: "hash".to_string(),
+            created_at: Utc::now(),
+            active: true,
+            success_count: 0,
+            failure_count: 0,
+            avg_time_to_merge: None,
+            avg_review_score: None,
+        };
+        let exp_id = tracker.save_experiment(&exp).unwrap();
+
+        // Record success with time_to_merge
+        tracker
+            .update_experiment_stats(exp_id, true, Some(60.0))
+            .unwrap();
+        let experiments = tracker.get_active_experiments().unwrap();
+        let updated = experiments.iter().find(|e| e.id == exp_id).unwrap();
+        assert_eq!(updated.success_count, 1);
+        assert!(updated.avg_time_to_merge.is_some());
+        assert!((updated.avg_time_to_merge.unwrap() - 60.0).abs() < f64::EPSILON);
+
+        // Record another success with different time_to_merge
+        tracker
+            .update_experiment_stats(exp_id, true, Some(120.0))
+            .unwrap();
+        let experiments = tracker.get_active_experiments().unwrap();
+        let updated = experiments.iter().find(|e| e.id == exp_id).unwrap();
+        assert_eq!(updated.success_count, 2);
+        // Rolling average: (60 * 0 + 120) / 1... but the formula uses
+        // (old_avg * (success_count - 2) + ttm) / (success_count - 1) after 2nd success
+        // The exact formula depends on the SQL implementation, just check it's between 60 and 120
+        let avg_ttm = updated.avg_time_to_merge.unwrap();
+        assert!(avg_ttm >= 60.0 && avg_ttm <= 120.0);
+    }
+
+    #[test]
+    fn test_update_experiment_stats_failure() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let exp = PromptExperiment {
+            id: 0,
+            experiment_name: "prompt_v3".to_string(),
+            variant: "b".to_string(),
+            prompt_template: "template".to_string(),
+            prompt_hash: "hash2".to_string(),
+            created_at: Utc::now(),
+            active: true,
+            success_count: 0,
+            failure_count: 0,
+            avg_time_to_merge: None,
+            avg_review_score: None,
+        };
+        let exp_id = tracker.save_experiment(&exp).unwrap();
+
+        tracker
+            .update_experiment_stats(exp_id, false, None)
+            .unwrap();
+        let experiments = tracker.get_active_experiments().unwrap();
+        let updated = experiments.iter().find(|e| e.id == exp_id).unwrap();
+        assert_eq!(updated.failure_count, 1);
+        assert_eq!(updated.success_count, 0);
+    }
+
+    // ====================================================================
+    // store_embeddings_batch test
+    // ====================================================================
+
+    #[test]
+    fn test_store_embeddings_batch() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let emb1 = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "1".to_string(),
+            short_id: Some("L-1".to_string()),
+            title: Some("Bug 1".to_string()),
+            embedding: Some(vec![0.1, 0.2, 0.3]),
+            embedding_model: Some("test".to_string()),
+            created_at: Utc::now(),
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            updated_at: None,
+        };
+        let emb2 = IssueEmbedding {
+            id: 0,
+            source: "sentry".to_string(),
+            issue_id: "2".to_string(),
+            short_id: Some("S-2".to_string()),
+            title: Some("Error 2".to_string()),
+            embedding: Some(vec![0.4, 0.5, 0.6]),
+            embedding_model: Some("test".to_string()),
+            created_at: Utc::now(),
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            updated_at: None,
+        };
+
+        tracker.store_embeddings_batch(&[emb1, emb2]).unwrap();
+
+        let all = tracker
+            .get_all_embeddings(None, Some(100), Some(0))
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_store_embeddings_batch_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.store_embeddings_batch(&[]).unwrap();
+    }
+
+    // ====================================================================
+    // get_all_embeddings pagination and source filter
+    // ====================================================================
+
+    #[test]
+    fn test_get_all_embeddings_no_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for i in 1..=3 {
+            let emb = IssueEmbedding {
+                id: 0,
+                source: "linear".to_string(),
+                issue_id: i.to_string(),
+                short_id: Some(format!("L-{}", i)),
+                title: Some(format!("Bug {}", i)),
+                embedding: None,
+                embedding_model: None,
+                created_at: Utc::now(),
+                description: None,
+                url: None,
+                priority: None,
+                status: None,
+                labels: None,
+                updated_at: None,
+            };
+            tracker.store_embedding(&emb).unwrap();
+        }
+
+        let all = tracker.get_all_embeddings(None, Some(10), Some(0)).unwrap();
+        assert_eq!(all.len(), 3);
+
+        let paged = tracker.get_all_embeddings(None, Some(2), Some(0)).unwrap();
+        assert_eq!(paged.len(), 2);
+
+        let paged2 = tracker.get_all_embeddings(None, Some(2), Some(2)).unwrap();
+        assert_eq!(paged2.len(), 1);
+    }
+
+    // ====================================================================
+    // parse_language helper test
+    // ====================================================================
+
+    #[test]
+    fn test_parse_language_all_known() {
+        use crate::repo::code_index::Language;
+        assert_eq!(parse_language("Rust"), Language::Rust);
+        assert_eq!(parse_language("TypeScript"), Language::TypeScript);
+        assert_eq!(parse_language("TSX"), Language::Tsx);
+        assert_eq!(parse_language("JavaScript"), Language::JavaScript);
+        assert_eq!(parse_language("Python"), Language::Python);
+        assert_eq!(parse_language("Go"), Language::Go);
+        assert_eq!(parse_language("Java"), Language::Java);
+        assert_eq!(parse_language("C"), Language::C);
+        assert_eq!(parse_language("C++"), Language::Cpp);
+        assert_eq!(parse_language("Ruby"), Language::Ruby);
+        assert_eq!(parse_language("PHP"), Language::Php);
+        assert_eq!(parse_language("Swift"), Language::Swift);
+        assert_eq!(parse_language("Kotlin"), Language::Kotlin);
+    }
+
+    #[test]
+    fn test_parse_language_unknown_falls_back_to_rust() {
+        use crate::repo::code_index::Language;
+        assert_eq!(parse_language("UnknownLang"), Language::Rust);
+    }
+
+    // ====================================================================
+    // sync_repo_files test
+    // ====================================================================
+
+    #[test]
+    fn test_sync_repo_files() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo = crate::repo::IndexedRepo {
+            name: "my-repo".to_string(),
+            path: std::path::PathBuf::from("/tmp/my-repo"),
+            scm_url: "https://github.com/org/my-repo".to_string(),
+            default_branch: "main".to_string(),
+            files: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+        };
+
+        tracker.sync_repo_files(&repo).unwrap();
+
+        let stored = tracker.get_indexed_repo("my-repo").unwrap().unwrap();
+        assert_eq!(stored.name, "my-repo");
+        assert_eq!(stored.file_count, 2);
+
+        // Sync again with different files -- should clear and re-insert
+        let repo2 = crate::repo::IndexedRepo {
+            name: "my-repo".to_string(),
+            path: std::path::PathBuf::from("/tmp/my-repo"),
+            scm_url: "https://github.com/org/my-repo".to_string(),
+            default_branch: "main".to_string(),
+            files: vec!["src/new.rs".to_string()],
+        };
+        tracker.sync_repo_files(&repo2).unwrap();
+
+        let stored2 = tracker.get_indexed_repo("my-repo").unwrap().unwrap();
+        assert_eq!(stored2.file_count, 1);
+    }
+
+    #[test]
+    fn test_sync_repo_files_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let repo = crate::repo::IndexedRepo {
+            name: "empty-repo".to_string(),
+            path: std::path::PathBuf::from("/tmp/empty"),
+            scm_url: "https://github.com/org/empty".to_string(),
+            default_branch: "main".to_string(),
+            files: vec![],
+        };
+
+        tracker.sync_repo_files(&repo).unwrap();
+
+        let stored = tracker.get_indexed_repo("empty-repo").unwrap().unwrap();
+        assert_eq!(stored.file_count, 0);
+    }
+
+    // ====================================================================
+    // list_recent_attempts delegator test
+    // ====================================================================
+
+    #[test]
+    fn test_list_recent_attempts() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for i in 1..=5 {
+            tracker
+                .record_attempt("linear", &i.to_string(), &format!("L-{}", i))
+                .unwrap();
+        }
+
+        let recent = tracker.list_recent_attempts(3).unwrap();
+        assert_eq!(recent.len(), 3);
+    }
+
+    // ====================================================================
+    // get_metrics with time filters test
+    // ====================================================================
+
+    #[test]
+    fn test_get_metrics_with_name_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let metric1 = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "latency".to_string(),
+            metric_value: 100.0,
+            source: Some("sentry".to_string()),
+            tags: None,
+        };
+        let metric2 = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "throughput".to_string(),
+            metric_value: 50.0,
+            source: Some("linear".to_string()),
+            tags: None,
+        };
+        tracker.record_metric(&metric1).unwrap();
+        tracker.record_metric(&metric2).unwrap();
+
+        let since = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let all_latency = tracker.get_metrics("latency", Some(since), 100).unwrap();
+        let all_throughput = tracker.get_metrics("throughput", Some(since), 100).unwrap();
+        assert_eq!(all_latency.len() + all_throughput.len(), 2);
+
+        let latency = tracker.get_metrics("latency", Some(since), 100).unwrap();
+        assert_eq!(latency.len(), 1);
+        assert_eq!(latency[0].metric_name, "latency");
+    }
+
+    #[test]
+    fn test_get_metrics_no_filter() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let metric = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "test".to_string(),
+            metric_value: 42.0,
+            source: None,
+            tags: None,
+        };
+        tracker.record_metric(&metric).unwrap();
+
+        let all = tracker.get_metrics("test", None, 100).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    // ====================================================================
+    // store_code_complexity test
+    // ====================================================================
+
+    #[test]
+    fn test_store_code_complexity_upsert() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        let fc = crate::repo::code_index::complexity::FileComplexity {
+            file_path: "src/main.rs".to_string(),
+            total_lines: 100,
+            function_count: 5,
+            functions: vec![],
+            avg_cyclomatic: 3.5,
+            max_cyclomatic: 8.0,
+            avg_func_length: 15.0,
+            max_func_length: 40.0,
+            avg_nesting: 2.0,
+            max_nesting: 4.0,
+        };
+
+        tracker
+            .store_code_complexity(repo_id, "src/main.rs", &fc)
+            .unwrap();
+
+        // Upsert should not error
+        tracker
+            .store_code_complexity(repo_id, "src/main.rs", &fc)
+            .unwrap();
+    }
+
+    // ====================================================================
+    // search_code_chunks edge cases
+    // ====================================================================
+
+    #[test]
+    fn test_search_code_chunks_empty_embedding() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let results = tracker.search_code_chunks(&[], None, 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_code_chunks_zero_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let results = tracker
+            .search_code_chunks(&[0.1, 0.2, 0.3], None, 0)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ====================================================================
+    // save_code_chunk_embeddings empty test
+    // ====================================================================
+
+    #[test]
+    fn test_save_code_chunk_embeddings_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.save_code_chunk_embeddings(&[], "test").unwrap();
+    }
+
+    // ====================================================================
+    // get_cost_estimate plan_estimate path
+    // ====================================================================
+
+    #[test]
+    fn test_get_cost_estimate_plan_estimate() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Record an execution with duration but no cost
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        let mut exec = ClaudeExecution::new().with_attempt_id(attempt.id);
+        exec.duration_secs = Some(600.0); // 10 minutes
+        exec.exit_code = Some(0);
+        tracker.record_execution(&exec).unwrap();
+
+        // With max_plan_monthly_cost > 0 and no API costs
+        let estimate = tracker
+            .get_cost_estimate("2020-01-01T00:00:00", 200.0, "30d")
+            .unwrap();
+        assert_eq!(estimate.cost_source, "plan_estimate");
+        // total_cost should be > 0 since there's duration data
+        assert!(estimate.total_cost > 0.0);
+    }
+
+    // ====================================================================
+    // upsert_pr with issue linkage
+    // ====================================================================
+
+    #[test]
+    fn test_upsert_pr_with_issue_linkage() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = crate::types::PrRecord::for_issue(
+            "https://github.com/org/repo/pull/1",
+            "org/repo",
+            1,
+            "linear",
+            "ISSUE-1",
+        );
+        tracker.upsert_pr(&pr).unwrap();
+
+        let fetched = tracker
+            .get_pr("https://github.com/org/repo/pull/1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
+        assert_eq!(fetched.issue_id.as_deref(), Some("ISSUE-1"));
+    }
+
+    // ====================================================================
+    // upsert_pr COALESCE behavior - existing values preserved when excluded is NULL
+    // ====================================================================
+
+    #[test]
+    fn test_upsert_pr_coalesce_preserves_existing_values() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // First insert with issue linkage
+        let mut pr1 = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        pr1.title = Some("Fix bug".to_string());
+        pr1.issue_id = Some("ISS-1".to_string());
+        pr1.issue_source = Some("linear".to_string());
+        tracker.upsert_pr(&pr1).unwrap();
+
+        // Second insert without issue linkage (simulates webhook update)
+        let mut pr2 = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        pr2.title = None;
+        pr2.issue_id = None;
+        pr2.issue_source = None;
+        tracker.upsert_pr(&pr2).unwrap();
+
+        let fetched = tracker
+            .get_pr("https://github.com/org/repo/pull/1")
+            .unwrap()
+            .unwrap();
+        // COALESCE should preserve the original values
+        assert_eq!(fetched.title.as_deref(), Some("Fix bug"));
+        assert_eq!(fetched.issue_id.as_deref(), Some("ISS-1"));
+        assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
     }
 }

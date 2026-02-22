@@ -156,10 +156,10 @@ auto_resolve_on_merge = false
 # Set via GITHUB_WEBHOOK_SECRET env var for security
 webhook_secret = ""
 
-# Trigger tag for GitHub review comments (default: /claudear)
+# Trigger tag for GitHub review comments (default: @claudear)
 # Comments must include this tag to trigger Claude.
 # Set to empty string to respond to all comments.
-review_trigger = "/claudear"
+review_trigger = "@claudear"
 
 # Use SSH URLs for cloning instead of HTTPS (default: false)
 # Set to true if SSH keys are configured for GitHub.
@@ -226,8 +226,8 @@ auto_resolve_on_merge = false
 # Set via GITLAB_WEBHOOK_SECRET env var for security
 webhook_secret = ""
 
-# Trigger tag for MR review comments (default: /claudear)
-review_trigger = "/claudear"
+# Trigger tag for MR review comments (default: @claudear)
+review_trigger = "@claudear"
 
 # Use SSH URLs for cloning instead of HTTPS (default: false)
 use_ssh = false
@@ -488,6 +488,10 @@ priority = 0
 # ============================================
 # Monitoring
 # ============================================
+# Sentry error monitoring (set via environment variables):
+#   SENTRY_DSN          - Sentry DSN for backend error reporting (disabled when empty/unset)
+#   SENTRY_ENVIRONMENT  - Environment name (e.g. "production", "staging")
+#
 # Tracks post-fix regressions after releases.
 
 [regression]
@@ -528,6 +532,18 @@ enabled = false
 
 # Maximum cascade depth (default: 0 = unlimited)
 max_depth = 0
+
+# Per-dependency cascade rules (optional).
+# Each rule controls how a specific upstream->downstream pair is cascaded.
+# If no rule matches, default behavior applies (trigger on merge, update version).
+
+# [[cascade.rules]]
+# upstream = "org/library"
+# downstream = "org/application"
+# trigger = "merge"           # "merge" (default) or "release"
+# target_branch = "develop"   # Override downstream branch (default: repo default)
+# version_update = true       # Update dependency version in downstream (default: true)
+# instructions = "Run composer install after updating the dependency"
 
 # ============================================
 # Continuous Learning

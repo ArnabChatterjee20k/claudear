@@ -465,7 +465,7 @@ mod tests {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: false,
             webhook_secret: webhook_secret.map(|s| s.to_string()),
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         }
     }
@@ -629,9 +629,7 @@ mod tests {
         assert_eq!(comment.pull_request_review_id, Some(12345));
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // Async test infrastructure: MockScmProvider + helpers
-    // ──────────────────────────────────────────────────────────────────────
 
     use crate::scm::{PrInfo, PrReviewState, PrStatus, RemoteRepo, ScmProvider};
     use async_trait::async_trait;
@@ -678,7 +676,7 @@ mod tests {
         }
 
         fn review_trigger(&self) -> &str {
-            "/claudear"
+            "@claudear"
         }
 
         async fn get_pr_status(
@@ -795,9 +793,7 @@ mod tests {
         })
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // process_webhook integration tests (8 tests)
-    // ──────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_process_webhook_invalid_signature() {
@@ -1001,9 +997,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // handle_review_submitted tests (5 tests)
-    // ──────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_handle_review_non_submitted_action() {
@@ -1108,9 +1102,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // handle_review_comment tests (3 tests)
-    // ──────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_handle_comment_non_created_action() {
@@ -1175,9 +1167,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // parse edge case tests (2 tests)
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_parse_review_missing_fields() {
@@ -1269,9 +1259,7 @@ mod tests {
         assert!(comment.side.is_none(), "Missing side should be None");
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // HMAC signature verification — extended edge cases
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_signature_empty_payload() {
@@ -1482,9 +1470,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // Event type routing — additional cases
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_get_event_type_various_events() {
@@ -1539,9 +1525,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // is_enabled — additional cases
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_is_enabled_with_watcher_and_secret() {
@@ -1568,9 +1552,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // source_name
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_source_name() {
@@ -1579,9 +1561,7 @@ mod tests {
         assert_eq!(handler.source_name(), "github");
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // parse_review — extended edge cases
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_parse_review_all_states() {
@@ -1826,9 +1806,7 @@ mod tests {
         assert_eq!(review.body, Some(body.to_string()));
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // parse_comment — extended edge cases
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_parse_comment_all_fields_populated() {
@@ -2031,9 +2009,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // process_webhook — additional event routing tests
-    // ──────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_process_webhook_ping_event_ignored() {
@@ -2134,9 +2110,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // handle_review_submitted — additional cases
-    // ──────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_handle_review_missing_action() {
@@ -2299,9 +2273,7 @@ mod tests {
         assert_eq!(result.unwrap(), false);
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // handle_review_comment — additional cases
-    // ──────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_handle_comment_edited_action() {
@@ -2387,9 +2359,7 @@ mod tests {
         assert_eq!(result.unwrap(), false, "No watcher should return Ok(false)");
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // constructor and handler struct tests
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_new_handler_stores_config() {
@@ -2421,9 +2391,7 @@ mod tests {
         assert!(handler.review_watcher.is_none());
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // Full round-trip integration tests
-    // ──────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_full_roundtrip_review_approved() {
@@ -2551,9 +2519,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // JSON payload edge cases
-    // ──────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_process_webhook_with_json_array_payload() {
@@ -2605,9 +2571,7 @@ mod tests {
         assert_eq!(result.unwrap(), false);
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // Header validation edge cases
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_verify_signature_with_only_unrelated_headers() {
@@ -2686,9 +2650,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
     // Helper function tests
-    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_make_valid_signature_produces_correct_format() {
@@ -2724,7 +2686,7 @@ mod tests {
         let config = create_test_config(Some("my_secret"));
         assert_eq!(config.webhook_secret, Some("my_secret".to_string()));
         assert_eq!(config.token, Some("test_token".to_string()));
-        assert_eq!(config.review_trigger, "/claudear");
+        assert_eq!(config.review_trigger, "@claudear");
     }
 
     #[test]

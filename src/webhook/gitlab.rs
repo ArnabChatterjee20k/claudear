@@ -42,8 +42,6 @@ fn verify_gitlab_token(secret: Option<&str>, headers: &HashMap<String, String>) 
     token.as_bytes().ct_eq(secret.as_bytes()).into()
 }
 
-// ── GitLab MR Webhook Handler ────────────────────────────────────────
-
 /// GitLab webhook handler for MR review events.
 ///
 /// Unlike other webhook handlers, this one does not implement the `WebhookHandler` trait
@@ -312,8 +310,6 @@ impl GitLabMrWebhookHandler {
     }
 }
 
-// ── GitLab Issue Webhook Handler ─────────────────────────────────────
-
 /// GitLab webhook handler for issue events.
 ///
 /// Implements the `WebhookHandler` trait to process `Issue Hook` events
@@ -439,8 +435,6 @@ mod tests {
     fn test_config() -> GitLabConfig {
         GitLabConfig::test_default()
     }
-
-    // ── MR webhook handler tests ─────────────────────────────────────
 
     #[test]
     fn test_mr_handler_source_name() {
@@ -597,8 +591,6 @@ mod tests {
             "https://gitlab.com/mygroup/myproject/-/merge_requests/42"
         );
     }
-
-    // ── Issue webhook handler tests ──────────────────────────────────
 
     #[test]
     fn test_issue_handler_source_name() {
@@ -798,5 +790,375 @@ mod tests {
         assert!(context.contains("**Project:** mygroup/proj"));
         assert!(context.contains("## Description"));
         assert!(context.contains("Detailed description"));
+    }
+
+    #[tokio::test]
+    async fn test_process_webhook_invalid_token_returns_error() {
+        let handler = GitLabMrWebhookHandler::new(
+            None,
+            Some("correct-token".to_string()),
+            "https://gitlab.com".to_string(),
+        );
+
+        let payload = serde_json::json!({});
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let mut headers = HashMap::new();
+        headers.insert("x-gitlab-token".to_string(), "wrong-token".to_string());
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid webhook token"));
+    }
+
+    #[tokio::test]
+    async fn test_process_webhook_missing_event_type_returns_false() {
+        // No secret => verification passes
+        let handler = GitLabMrWebhookHandler::new(
+            None,
+            Some("test-secret".to_string()),
+            "https://gitlab.com".to_string(),
+        );
+
+        let payload = serde_json::json!({});
+        let raw = serde_json::to_vec(&payload).unwrap();
+        // Include token but no x-gitlab-event header
+        let mut headers = HashMap::new();
+        headers.insert("x-gitlab-token".to_string(), "test-secret".to_string());
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_process_webhook_unknown_event_type_returns_false() {
+        let handler = GitLabMrWebhookHandler::new(
+            None,
+            Some("test-secret".to_string()),
+            "https://gitlab.com".to_string(),
+        );
+
+        let payload = serde_json::json!({});
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let mut headers = HashMap::new();
+        headers.insert("x-gitlab-token".to_string(), "test-secret".to_string());
+        headers.insert("x-gitlab-event".to_string(), "Push Hook".to_string());
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    fn make_test_handler() -> GitLabMrWebhookHandler {
+        GitLabMrWebhookHandler::new(
+            None,
+            Some("test-secret".to_string()),
+            "https://gitlab.com".to_string(),
+        )
+    }
+
+    fn authed_headers(event: &str) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        headers.insert("x-gitlab-token".to_string(), "test-secret".to_string());
+        headers.insert("x-gitlab-event".to_string(), event.to_string());
+        headers
+    }
+
+    #[tokio::test]
+    async fn test_handle_merge_request_ignores_non_review_action() {
+        let handler = make_test_handler();
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "action": "open",
+                "url": "https://gitlab.com/test/project/-/merge_requests/1"
+            }
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let headers = authed_headers("Merge Request Hook");
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_handle_merge_request_no_review_watcher_returns_false() {
+        let handler = make_test_handler();
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "action": "update",
+                "url": "https://gitlab.com/test/project/-/merge_requests/1"
+            }
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let headers = authed_headers("Merge Request Hook");
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_handle_merge_request_approved_action_no_watcher() {
+        let handler = make_test_handler();
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "action": "approved",
+                "url": "https://gitlab.com/test/project/-/merge_requests/5"
+            }
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let headers = authed_headers("Merge Request Hook");
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_handle_merge_request_unapproved_action_no_watcher() {
+        let handler = make_test_handler();
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "action": "unapproved",
+                "url": "https://gitlab.com/test/project/-/merge_requests/5"
+            }
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let headers = authed_headers("Merge Request Hook");
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_handle_note_non_mr_returns_false() {
+        let handler = make_test_handler();
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "noteable_type": "Issue",
+                "note": "Some comment on an issue"
+            }
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let headers = authed_headers("Note Hook");
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_handle_note_mr_no_review_watcher_returns_false() {
+        let handler = make_test_handler();
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "noteable_type": "MergeRequest",
+                "note": "Looks good",
+                "author_id": 42
+            },
+            "merge_request": {
+                "url": "https://gitlab.com/test/project/-/merge_requests/1"
+            }
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let headers = authed_headers("Note Hook");
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_handle_note_missing_noteable_type_returns_false() {
+        let handler = make_test_handler();
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "note": "A comment with no noteable_type"
+            }
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let headers = authed_headers("Note Hook");
+
+        let result = handler.process_webhook(&raw, &payload, &headers).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_extract_mr_url_from_note_payload() {
+        let handler = GitLabMrWebhookHandler::new(None, None, "https://gitlab.com".to_string());
+
+        let payload = serde_json::json!({
+            "merge_request": {
+                "url": "https://gitlab.com/group/project/-/merge_requests/99"
+            }
+        });
+
+        let url = handler.extract_mr_url(&payload);
+        assert_eq!(url, "https://gitlab.com/group/project/-/merge_requests/99");
+    }
+
+    #[test]
+    fn test_extract_mr_url_fallback_to_project_and_iid() {
+        let handler = GitLabMrWebhookHandler::new(None, None, "https://gitlab.com".to_string());
+
+        let payload = serde_json::json!({
+            "project": {
+                "web_url": "https://gitlab.com/myorg/myproject"
+            },
+            "object_attributes": {
+                "iid": 7
+            }
+        });
+
+        let url = handler.extract_mr_url(&payload);
+        assert_eq!(url, "https://gitlab.com/myorg/myproject/-/merge_requests/7");
+    }
+
+    #[test]
+    fn test_extract_mr_url_fallback_to_merge_request_iid() {
+        let handler = GitLabMrWebhookHandler::new(None, None, "https://gitlab.com".to_string());
+
+        // No object_attributes.iid, but merge_request.iid exists
+        let payload = serde_json::json!({
+            "project": {
+                "web_url": "https://gitlab.com/team/service"
+            },
+            "merge_request": {
+                "iid": 12
+            }
+        });
+
+        let url = handler.extract_mr_url(&payload);
+        assert_eq!(url, "https://gitlab.com/team/service/-/merge_requests/12");
+    }
+
+    #[test]
+    fn test_extract_mr_url_complete_fallback() {
+        let handler = GitLabMrWebhookHandler::new(None, None, "https://gitlab.com".to_string());
+
+        // No URLs, no project, no IID
+        let payload = serde_json::json!({});
+
+        let url = handler.extract_mr_url(&payload);
+        // Falls back to gitlab_base_url and iid=0
+        assert!(url.contains("/-/merge_requests/0"));
+    }
+
+    #[tokio::test]
+    async fn test_issue_parse_payload_non_issue_event() {
+        let config = test_config();
+        let handler = GitLabIssueWebhookHandler::new(config);
+
+        let payload = serde_json::json!({
+            "event_type": "merge_request"
+        });
+
+        let result = handler.parse_payload(&payload).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_issue_parse_payload_missing_object_attributes() {
+        let config = test_config();
+        let handler = GitLabIssueWebhookHandler::new(config);
+
+        let payload = serde_json::json!({
+            "event_type": "issue"
+        });
+
+        let result = handler.parse_payload(&payload).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_issue_parse_payload_closed_state() {
+        let config = test_config();
+        let handler = GitLabIssueWebhookHandler::new(config);
+
+        let payload = serde_json::json!({
+            "event_type": "issue",
+            "object_attributes": {
+                "iid": 10,
+                "title": "Closed issue",
+                "description": "Already resolved",
+                "state": "closed",
+                "url": "https://gitlab.com/group/project/-/issues/10"
+            },
+            "project": {
+                "path_with_namespace": "group/project"
+            },
+            "labels": []
+        });
+
+        let result = handler.parse_payload(&payload).await.unwrap();
+        assert!(result.is_some());
+        let issue = result.unwrap();
+        assert_eq!(issue.status, crate::types::IssueStatus::Resolved);
+        assert_eq!(issue.id, "group/project:10");
+    }
+
+    #[tokio::test]
+    async fn test_issue_parse_payload_no_labels() {
+        let config = test_config();
+        let handler = GitLabIssueWebhookHandler::new(config);
+
+        let payload = serde_json::json!({
+            "event_type": "issue",
+            "object_attributes": {
+                "iid": 15,
+                "title": "No labels issue",
+                "state": "opened",
+                "url": "https://gitlab.com/group/project/-/issues/15"
+            },
+            "project": {
+                "path_with_namespace": "group/project"
+            }
+        });
+
+        let result = handler.parse_payload(&payload).await.unwrap();
+        assert!(result.is_some());
+        let issue = result.unwrap();
+        assert_eq!(issue.title, "No labels issue");
+        // labels metadata should be empty string
+        let labels = issue.metadata.get("labels").and_then(|v| v.as_str());
+        assert_eq!(labels, Some(""));
+    }
+
+    #[tokio::test]
+    async fn test_issue_parse_payload_with_description() {
+        let config = test_config();
+        let handler = GitLabIssueWebhookHandler::new(config);
+
+        let payload = serde_json::json!({
+            "event_type": "issue",
+            "object_attributes": {
+                "iid": 20,
+                "title": "Detailed bug",
+                "description": "Steps to reproduce: ...",
+                "state": "opened",
+                "url": "https://gitlab.com/group/project/-/issues/20"
+            },
+            "project": {
+                "path_with_namespace": "group/project"
+            },
+            "labels": [
+                {"title": "bug"},
+                {"title": "priority::high"}
+            ]
+        });
+
+        let result = handler.parse_payload(&payload).await.unwrap();
+        assert!(result.is_some());
+        let issue = result.unwrap();
+        assert_eq!(
+            issue.description,
+            Some("Steps to reproduce: ...".to_string())
+        );
+        let labels = issue.metadata.get("labels").and_then(|v| v.as_str());
+        assert_eq!(labels, Some("bug, priority::high"));
     }
 }

@@ -495,8 +495,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         }
     }
 
-    // ── JWT generation tests ───────────────────────────────────────
-
     #[test]
     fn test_jwt_generation_produces_valid_three_part_token() {
         let config = create_test_config();
@@ -632,8 +630,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
             err_msg
         );
     }
-
-    // ── Token caching and expiry tests ─────────────────────────────
 
     #[test]
     fn test_cached_token_that_is_about_to_expire_is_invalid() {
@@ -782,8 +778,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         assert!(client.auth().get_cached_token(3).is_some());
     }
 
-    // ── get_or_find_installation tests ─────────────────────────────
-
     #[tokio::test]
     async fn test_get_or_find_installation_returns_configured_id() {
         let config = create_test_config(); // has installation_id = Some(67890)
@@ -812,8 +806,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
             "Should fail because no real API is available"
         );
     }
-
-    // ── Installation serialization edge cases ──────────────────────
 
     #[test]
     fn test_installation_without_html_url() {
@@ -954,8 +946,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         assert!(response.repositories.is_empty());
     }
 
-    // ── JWT headers and token headers tests ────────────────────────
-
     #[test]
     fn test_jwt_headers_have_correct_structure() {
         let config = create_test_config();
@@ -1001,8 +991,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         assert_eq!(headers[0].1, "token ");
     }
 
-    // ── Installation token URL tests ───────────────────────────────
-
     #[test]
     fn test_installation_token_url_format() {
         let config = create_test_config();
@@ -1026,8 +1014,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
             "https://api.github.com/app/installations/999999999/access_tokens"
         );
     }
-
-    // ── parse_token_response tests ─────────────────────────────────
 
     #[test]
     fn test_parse_token_response_valid() {
@@ -1107,8 +1093,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         );
     }
 
-    // ── Client with no app_id configured ───────────────────────────
-
     #[test]
     fn test_client_with_no_app_id() {
         let mut config = create_test_config();
@@ -1128,8 +1112,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         assert_eq!(auth.app_id(), Some(12345));
         assert_eq!(auth.installation_id(), Some(67890));
     }
-
-    // ── API failure paths (network errors) ─────────────────────────
 
     #[tokio::test]
     async fn test_list_installations_fails_on_network_error() {
@@ -1304,8 +1286,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         );
     }
 
-    // ── Concurrency safety of token cache ──────────────────────────
-
     #[test]
     fn test_token_cache_concurrent_access() {
         use std::sync::Arc;
@@ -1348,8 +1328,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         }
     }
 
-    // ── Installation deserialization with extra fields ──────────────
-
     #[test]
     fn test_installation_ignores_unknown_fields() {
         let json = r#"{
@@ -1390,8 +1368,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         assert_eq!(account.account_type, "Bot");
     }
 
-    // ── Client default timeout configuration ───────────────────────
-
     #[test]
     fn test_client_new_does_not_panic() {
         // Ensure that creating a client with default HTTP settings does not panic
@@ -1410,8 +1386,6 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         let client = GitHubAppClient::with_http_client(config, http_client);
         assert_eq!(client.app_id(), Some(12345));
     }
-
-    // ── find_installation_for_repo without network ─────────────────
 
     #[tokio::test]
     async fn test_find_installation_for_repo_fails_without_network() {

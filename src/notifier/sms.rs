@@ -191,24 +191,76 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
-        let body = format!("[Claudear] PR Created for {}: {}", issue.short_id, pr_url);
+        let body = if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            let downstream = issue
+                .get_metadata::<String>("cascade_downstream_repo")
+                .unwrap_or_default();
+            format!(
+                "[Claudear] Cascade PR for {} ({}): {}",
+                issue.short_id, downstream, pr_url
+            )
+        } else if issue.get_metadata::<bool>("is_pr_update").unwrap_or(false) {
+            format!("[Claudear] PR Updated for {}: {}", issue.short_id, pr_url)
+        } else {
+            format!("[Claudear] PR Created for {}: {}", issue.short_id, pr_url)
+        };
         self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
-        let body = format!("[Claudear] Completed {} (no PR URL)", issue.short_id);
+        let body = if issue
+            .get_metadata::<bool>("regression_resolved")
+            .unwrap_or(false)
+        {
+            format!(
+                "[Claudear] Regression Resolved: {} (no regression after monitoring)",
+                issue.short_id
+            )
+        } else {
+            format!("[Claudear] Completed {} (no PR URL)", issue.short_id)
+        };
         self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
-        // Truncate error for SMS
         let short_error = if error.len() > 100 {
             format!("{}...", &error[..error.floor_char_boundary(97)])
         } else {
             error.to_string()
         };
 
-        let body = format!("[Claudear] FAILED {}: {}", issue.short_id, short_error);
+        let body = if issue
+            .get_metadata::<bool>("regression_detected")
+            .unwrap_or(false)
+        {
+            format!("[Claudear] REGRESSION {}: {}", issue.short_id, short_error)
+        } else if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            let downstream = issue
+                .get_metadata::<String>("cascade_downstream_repo")
+                .unwrap_or_default();
+            format!(
+                "[Claudear] CASCADE FAILED {} ({}): {}",
+                issue.short_id, downstream, short_error
+            )
+        } else {
+            format!("[Claudear] FAILED {}: {}", issue.short_id, short_error)
+        };
+        self.send_sms(&body, Some(issue)).await
+    }
+
+    async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let body = format!("[Claudear] PR Merged for {}: {}", issue.short_id, pr_url);
+        self.send_sms(&body, Some(issue)).await
+    }
+
+    async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let body = format!("[Claudear] PR Closed for {}: {}", issue.short_id, pr_url);
         self.send_sms(&body, Some(issue)).await
     }
 
@@ -241,8 +293,8 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
         request: &AskRequest,
     ) -> Result<Option<AskDelivery>> {
         let body = format!(
-            "[Claudear][CLAUDEAR-Q:{}] {} needs input: {}",
-            request.correlation_id, issue.short_id, request.question.question
+            "[Claudear] Human input needed for {}: {}",
+            issue.short_id, request.question.question
         );
         self.send_sms(&body, Some(issue)).await?;
         Ok(Some(AskDelivery {
@@ -984,8 +1036,8 @@ mod tests {
 
         let calls = notifier.http.get_last_calls();
         let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
-        assert!(body.contains("[CLAUDEAR-Q:tok-sms-1]"));
-        assert!(body.contains("LIN-1"));
+        assert!(!body.contains("[CLAUDEAR-Q:"));
+        assert!(body.contains("Human input needed for LIN-1"));
         assert!(body.contains("Which branch?"));
     }
 
@@ -1104,5 +1156,180 @@ mod tests {
         let calls = notifier.http.get_last_calls();
         let to_param = calls[0].3.iter().find(|(k, _)| k == "To").unwrap();
         assert_eq!(to_param.1, "+15550009999");
+    }
+
+    // --- Tests for cascade success message ---
+
+    #[tokio::test]
+    async fn test_notify_success_cascade_message_format() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+
+        notifier
+            .notify_success(&issue, "https://github.com/downstream/repo/pull/5")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("Cascade PR"));
+        assert!(body.contains("LIN-1"));
+        assert!(body.contains("downstream/repo"));
+        assert!(body.contains("https://github.com/downstream/repo/pull/5"));
+    }
+
+    // --- Tests for PR update success message ---
+
+    #[tokio::test]
+    async fn test_notify_success_pr_update_message_format() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("is_pr_update", true);
+
+        notifier
+            .notify_success(&issue, "https://github.com/org/repo/pull/77")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("PR Updated"));
+        assert!(body.contains("LIN-1"));
+        assert!(body.contains("https://github.com/org/repo/pull/77"));
+    }
+
+    // --- Tests for regression resolved completed message ---
+
+    #[tokio::test]
+    async fn test_notify_completed_regression_resolved_message_format() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "SEN-1", "Error", "https://sentry.io/1", "sentry");
+        issue.set_metadata("regression_resolved", true);
+
+        notifier.notify_completed(&issue).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("Regression Resolved"));
+        assert!(body.contains("SEN-1"));
+        assert!(body.contains("no regression"));
+    }
+
+    // --- Tests for regression detected failed message ---
+
+    #[tokio::test]
+    async fn test_notify_failed_regression_detected_message_format() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "SEN-1", "Error", "https://sentry.io/1", "sentry");
+        issue.set_metadata("regression_detected", true);
+
+        notifier
+            .notify_failed(&issue, "Tests failing again")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("REGRESSION"));
+        assert!(body.contains("SEN-1"));
+        assert!(body.contains("Tests failing again"));
+    }
+
+    // --- Tests for cascade failed message ---
+
+    #[tokio::test]
+    async fn test_notify_failed_cascade_message_format() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+
+        notifier.notify_failed(&issue, "Build error").await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("CASCADE FAILED"));
+        assert!(body.contains("LIN-1"));
+        assert!(body.contains("downstream/repo"));
+        assert!(body.contains("Build error"));
+    }
+
+    // --- Tests for notify_merged and notify_closed ---
+
+    #[tokio::test]
+    async fn test_notify_merged_message_format() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "PROJ-1", "Fix", "https://example.com", "linear");
+
+        notifier
+            .notify_merged(&issue, "https://github.com/org/repo/pull/42")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("PR Merged"));
+        assert!(body.contains("PROJ-1"));
+        assert!(body.contains("https://github.com/org/repo/pull/42"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_closed_message_format() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "PROJ-1", "Fix", "https://example.com", "linear");
+
+        notifier
+            .notify_closed(&issue, "https://github.com/org/repo/pull/43")
+            .await
+            .unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("PR Closed"));
+        assert!(body.contains("PROJ-1"));
+        assert!(body.contains("https://github.com/org/repo/pull/43"));
+    }
+
+    // --- Test failed cascade with long error truncation ---
+
+    #[tokio::test]
+    async fn test_notify_failed_cascade_truncates_long_error() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+
+        let long_error = "e".repeat(200);
+        notifier.notify_failed(&issue, &long_error).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("CASCADE FAILED"));
+        assert!(body.contains("..."));
+    }
+
+    // --- Test regression with long error truncation ---
+
+    #[tokio::test]
+    async fn test_notify_failed_regression_truncates_long_error() {
+        let mock = MockSmsClient::success();
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "SEN-1", "Error", "https://sentry.io/1", "sentry");
+        issue.set_metadata("regression_detected", true);
+
+        let long_error = "r".repeat(200);
+        notifier.notify_failed(&issue, &long_error).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("REGRESSION"));
+        assert!(body.contains("..."));
     }
 }

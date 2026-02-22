@@ -283,13 +283,6 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         self.config.user_id.clone()
     }
 
-    fn expected_reply_user_id(&self, request: &AskRequest) -> Option<String> {
-        request
-            .target_discord_id
-            .clone()
-            .or_else(|| self.config.user_id.clone())
-    }
-
     fn extract_reply_text(content: &str) -> Option<String> {
         let answer = content.trim();
         if answer.is_empty() {
@@ -297,15 +290,6 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         } else {
             Some(answer.to_string())
         }
-    }
-
-    fn extract_reply_text_with_token(content: &str, correlation_id: &str) -> Option<String> {
-        let token = format!("[CLAUDEAR-Q:{}]", correlation_id);
-        if !content.contains(&token) {
-            return None;
-        }
-        let cleaned = content.replace(&token, "");
-        Self::extract_reply_text(&cleaned)
     }
 }
 
@@ -370,30 +354,50 @@ pub(crate) fn build_success_message(
     let pr_url_truncated = truncate_string(pr_url, MAX_URL_LENGTH);
     let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
 
+    let mut fields = vec![
+        DiscordField {
+            name: "Source".to_string(),
+            value: format!("{} {}", emoji, source),
+            inline: Some(true),
+        },
+        DiscordField {
+            name: "Issue".to_string(),
+            value: format!("[{}]({})", short_id, issue_url),
+            inline: Some(true),
+        },
+        DiscordField {
+            name: if issue.get_metadata::<bool>("is_pr_update").unwrap_or(false) {
+                "Updated PR".to_string()
+            } else {
+                "PR Link".to_string()
+            },
+            value: format!("[View PR]({})", pr_url_truncated),
+            inline: Some(false),
+        },
+    ];
+
+    if let Some(changelog) = issue.get_metadata::<String>("changelog") {
+        fields.push(DiscordField {
+            name: "Changes".to_string(),
+            value: truncate_string(&changelog, 1000),
+            inline: Some(false),
+        });
+    }
+
     DiscordMessage {
         content: mention.map(|m| m.to_string()),
         embeds: Some(vec![DiscordEmbed {
-            title: Some(format!("\u{2705} PR Created: {}", short_id)),
+            title: Some(
+                if issue.get_metadata::<bool>("is_pr_update").unwrap_or(false) {
+                    format!("\u{270F}\u{FE0F} PR Updated: {}", short_id)
+                } else {
+                    format!("\u{2705} PR Created: {}", short_id)
+                },
+            ),
             description: Some(title),
             url: Some(pr_url_truncated.clone()),
             color: Some(0x2ecc71), // Green
-            fields: Some(vec![
-                DiscordField {
-                    name: "Source".to_string(),
-                    value: format!("{} {}", emoji, source),
-                    inline: Some(true),
-                },
-                DiscordField {
-                    name: "Issue".to_string(),
-                    value: format!("[{}]({})", short_id, issue_url),
-                    inline: Some(true),
-                },
-                DiscordField {
-                    name: "PR Link".to_string(),
-                    value: format!("[View PR]({})", pr_url_truncated),
-                    inline: Some(false),
-                },
-            ]),
+            fields: Some(fields),
             footer: Some(DiscordFooter {
                 text: "Claudear".to_string(),
             }),
@@ -497,6 +501,326 @@ pub(crate) fn build_status_message(message: &str) -> DiscordMessage {
     }
 }
 
+/// Build the Discord message for a "PR merged" notification.
+pub(crate) fn build_merged_message(
+    issue: &Issue,
+    pr_url: &str,
+    mention: Option<String>,
+) -> DiscordMessage {
+    let emoji = get_source_emoji(&issue.source);
+    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+    let title = truncate_string(&issue.title, MAX_DESCRIPTION_LENGTH);
+    let issue_url = truncate_string(&issue.url, MAX_URL_LENGTH);
+    let pr_url_truncated = truncate_string(pr_url, MAX_URL_LENGTH);
+    let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
+
+    DiscordMessage {
+        content: mention.map(|m| m.to_string()),
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!("\u{1F389} PR Merged: {}", short_id)),
+            description: Some(title),
+            url: Some(pr_url_truncated.clone()),
+            color: Some(0x1abc9c), // Teal
+            fields: Some(vec![
+                DiscordField {
+                    name: "Source".to_string(),
+                    value: format!("{} {}", emoji, source),
+                    inline: Some(true),
+                },
+                DiscordField {
+                    name: "Issue".to_string(),
+                    value: format!("[{}]({})", short_id, issue_url),
+                    inline: Some(true),
+                },
+                DiscordField {
+                    name: "PR Link".to_string(),
+                    value: format!("[View PR]({})", pr_url_truncated),
+                    inline: Some(false),
+                },
+            ]),
+            footer: Some(DiscordFooter {
+                text: "Claudear".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
+    }
+}
+
+/// Build the Discord message for a "PR closed" notification.
+pub(crate) fn build_closed_message(
+    issue: &Issue,
+    pr_url: &str,
+    mention: Option<String>,
+) -> DiscordMessage {
+    let emoji = get_source_emoji(&issue.source);
+    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+    let title = truncate_string(&issue.title, MAX_DESCRIPTION_LENGTH);
+    let pr_url_truncated = truncate_string(pr_url, MAX_URL_LENGTH);
+    let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
+
+    DiscordMessage {
+        content: mention.map(|m| m.to_string()),
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!("\u{1F6AB} PR Closed: {}", short_id)),
+            description: Some(title),
+            url: Some(pr_url_truncated.clone()),
+            color: Some(0x95a5a6), // Grey
+            fields: Some(vec![
+                DiscordField {
+                    name: "Source".to_string(),
+                    value: format!("{} {}", emoji, source),
+                    inline: Some(true),
+                },
+                DiscordField {
+                    name: "PR Link".to_string(),
+                    value: format!("[View PR]({})", pr_url_truncated),
+                    inline: Some(true),
+                },
+                DiscordField {
+                    name: "Note".to_string(),
+                    value: "PR was closed without merging".to_string(),
+                    inline: Some(false),
+                },
+            ]),
+            footer: Some(DiscordFooter {
+                text: "Claudear".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
+    }
+}
+
+/// Build the Discord message for a cascade PR creation.
+pub(crate) fn build_cascade_success_message(
+    issue: &Issue,
+    pr_url: &str,
+    mention: Option<String>,
+) -> DiscordMessage {
+    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+    let pr_url_truncated = truncate_string(pr_url, MAX_URL_LENGTH);
+    let upstream = issue
+        .get_metadata::<String>("cascade_upstream_repo")
+        .unwrap_or_default();
+    let downstream = issue
+        .get_metadata::<String>("cascade_downstream_repo")
+        .unwrap_or_default();
+    let upstream_pr_url = issue
+        .get_metadata::<String>("cascade_upstream_pr_url")
+        .unwrap_or_default();
+    let original_issue_short_id = issue
+        .get_metadata::<String>("cascade_original_issue_short_id")
+        .unwrap_or_default();
+
+    let mut fields = vec![
+        DiscordField {
+            name: "Upstream".to_string(),
+            value: upstream,
+            inline: Some(true),
+        },
+        DiscordField {
+            name: "Downstream".to_string(),
+            value: downstream.clone(),
+            inline: Some(true),
+        },
+    ];
+
+    if !original_issue_short_id.is_empty() {
+        fields.push(DiscordField {
+            name: "Original Issue".to_string(),
+            value: original_issue_short_id,
+            inline: Some(true),
+        });
+    }
+
+    if !upstream_pr_url.is_empty() {
+        fields.push(DiscordField {
+            name: "Upstream PR".to_string(),
+            value: format!(
+                "[View PR]({})",
+                truncate_string(&upstream_pr_url, MAX_URL_LENGTH)
+            ),
+            inline: Some(false),
+        });
+    }
+
+    fields.push(DiscordField {
+        name: "Cascade PR".to_string(),
+        value: format!("[View PR]({})", pr_url_truncated),
+        inline: Some(false),
+    });
+
+    DiscordMessage {
+        content: mention.map(|m| m.to_string()),
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!("\u{1F517} Cascade PR: {}", short_id)),
+            description: Some(format!("Downstream adaptation for {}", downstream)),
+            url: Some(pr_url_truncated),
+            color: Some(0x3498db), // Blue
+            fields: Some(fields),
+            footer: Some(DiscordFooter {
+                text: "Claudear \u{2014} Cascade".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
+    }
+}
+
+/// Build the Discord message for a cascade failure.
+pub(crate) fn build_cascade_failed_message(
+    issue: &Issue,
+    error: &str,
+    mention: Option<String>,
+) -> DiscordMessage {
+    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+    let error_display = truncate_string(error, 1000);
+    let upstream = issue
+        .get_metadata::<String>("cascade_upstream_repo")
+        .unwrap_or_default();
+    let downstream = issue
+        .get_metadata::<String>("cascade_downstream_repo")
+        .unwrap_or_default();
+    let upstream_pr_url = issue
+        .get_metadata::<String>("cascade_upstream_pr_url")
+        .unwrap_or_default();
+    let original_issue_short_id = issue
+        .get_metadata::<String>("cascade_original_issue_short_id")
+        .unwrap_or_default();
+
+    let mut fields = vec![
+        DiscordField {
+            name: "Upstream".to_string(),
+            value: upstream,
+            inline: Some(true),
+        },
+        DiscordField {
+            name: "Downstream".to_string(),
+            value: downstream.clone(),
+            inline: Some(true),
+        },
+    ];
+
+    if !original_issue_short_id.is_empty() {
+        fields.push(DiscordField {
+            name: "Original Issue".to_string(),
+            value: original_issue_short_id,
+            inline: Some(true),
+        });
+    }
+
+    if !upstream_pr_url.is_empty() {
+        fields.push(DiscordField {
+            name: "Upstream PR".to_string(),
+            value: format!(
+                "[View PR]({})",
+                truncate_string(&upstream_pr_url, MAX_URL_LENGTH)
+            ),
+            inline: Some(false),
+        });
+    }
+
+    fields.push(DiscordField {
+        name: "Error".to_string(),
+        value: error_display,
+        inline: Some(false),
+    });
+
+    DiscordMessage {
+        content: mention.map(|m| m.to_string()),
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!("\u{26A0}\u{FE0F} Cascade Failed: {}", short_id)),
+            description: Some(format!("Failed to adapt {}", downstream)),
+            url: None,
+            color: Some(0xe67e22), // Dark Orange
+            fields: Some(fields),
+            footer: Some(DiscordFooter {
+                text: "Claudear \u{2014} Cascade".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
+    }
+}
+
+/// Build the Discord message for a regression detection.
+pub(crate) fn build_regression_detected_message(
+    issue: &Issue,
+    error: &str,
+    mention: Option<String>,
+) -> DiscordMessage {
+    let emoji = get_source_emoji(&issue.source);
+    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+    let url = truncate_string(&issue.url, MAX_URL_LENGTH);
+    let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
+    let error_display = truncate_string(error, 1000);
+
+    DiscordMessage {
+        content: mention.map(|m| m.to_string()),
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!("\u{1F4C9} Regression Detected: {}", short_id)),
+            description: Some("A previously fixed issue has regressed".to_string()),
+            url: if url.is_empty() { None } else { Some(url) },
+            color: Some(0xe74c3c), // Red
+            fields: Some(vec![
+                DiscordField {
+                    name: "Source".to_string(),
+                    value: format!("{} {}", emoji, source),
+                    inline: Some(true),
+                },
+                DiscordField {
+                    name: "Details".to_string(),
+                    value: error_display,
+                    inline: Some(false),
+                },
+                DiscordField {
+                    name: "Action".to_string(),
+                    value: "Retry has been scheduled".to_string(),
+                    inline: Some(false),
+                },
+            ]),
+            footer: Some(DiscordFooter {
+                text: "Claudear \u{2014} Regression Monitor".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
+    }
+}
+
+/// Build the Discord message for a regression resolved (final check passed).
+pub(crate) fn build_regression_resolved_message(
+    issue: &Issue,
+    mention: Option<String>,
+) -> DiscordMessage {
+    let emoji = get_source_emoji(&issue.source);
+    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+    let url = truncate_string(&issue.url, MAX_URL_LENGTH);
+    let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
+
+    DiscordMessage {
+        content: mention.map(|m| m.to_string()),
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!("\u{2705} Regression Resolved: {}", short_id)),
+            description: Some("No regression detected after monitoring period".to_string()),
+            url: if url.is_empty() { None } else { Some(url) },
+            color: Some(0x2ecc71), // Green
+            fields: Some(vec![
+                DiscordField {
+                    name: "Source".to_string(),
+                    value: format!("{} {}", emoji, source),
+                    inline: Some(true),
+                },
+                DiscordField {
+                    name: "Status".to_string(),
+                    value: "Issue resolved after final check".to_string(),
+                    inline: Some(false),
+                },
+            ]),
+            footer: Some(DiscordFooter {
+                text: "Claudear \u{2014} Regression Monitor".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
+    }
+}
+
 /// Build the Discord message for an "urgent issues" notification.
 ///
 /// Returns `None` when the issue list is empty (nothing to send).
@@ -550,33 +874,61 @@ pub(crate) fn build_ask_question_message(
     request: &AskRequest,
     mention: Option<String>,
 ) -> DiscordMessage {
-    let token = format!("[CLAUDEAR-Q:{}]", request.correlation_id);
-    let mut content = String::new();
-    if let Some(m) = mention {
-        content.push_str(&m);
-        content.push(' ');
-    }
-    content.push_str(&format!(
-        "{} Human input needed for {}:\n{}",
-        token, issue.short_id, request.question.question
-    ));
+    // Mention in content (outside embed so it pings the user).
+    // Reply detection uses Discord's native reply feature (message_reference).
+    let content = mention;
+
+    let mut fields = Vec::new();
+
     if let Some(ref why) = request.question.why {
-        content.push_str(&format!("\nWhy: {}", why));
+        fields.push(DiscordField {
+            name: "Why".to_string(),
+            value: why.clone(),
+            inline: Some(false),
+        });
     }
+
     if let Some(ref ctx) = request.question.context {
-        content.push_str(&format!("\nContext: {}", truncate_string(ctx, 400)));
+        fields.push(DiscordField {
+            name: "Context".to_string(),
+            value: truncate_string(ctx, 400).to_string(),
+            inline: Some(false),
+        });
     }
+
     if !request.question.options.is_empty() {
-        content.push_str(&format!(
-            "\nOptions: {}",
-            request.question.options.join(" | ")
-        ));
+        let options_text = request
+            .question
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, opt)| format!("**{}**. {}", i + 1, opt))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fields.push(DiscordField {
+            name: "Options".to_string(),
+            value: options_text,
+            inline: Some(false),
+        });
     }
-    content.push_str("\nReply to this message in Discord with your answer.");
 
     DiscordMessage {
-        content: Some(content),
-        embeds: None,
+        content,
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!("\u{2753} Input needed: {}", issue.short_id)),
+            description: Some(request.question.question.clone()),
+            url: None,
+            color: Some(0xf59e0b), // Amber
+            fields: if fields.is_empty() {
+                None
+            } else {
+                Some(fields)
+            },
+            footer: Some(DiscordFooter {
+                text: "Claudear".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
     }
 }
 
@@ -597,18 +949,60 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_success_message(issue, pr_url, mention))
-            .await
+        if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            self.send(build_cascade_success_message(issue, pr_url, mention))
+                .await
+        } else {
+            self.send(build_success_message(issue, pr_url, mention))
+                .await
+        }
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_completed_message(issue, mention)).await
+        if issue
+            .get_metadata::<bool>("regression_resolved")
+            .unwrap_or(false)
+        {
+            self.send(build_regression_resolved_message(issue, mention))
+                .await
+        } else {
+            self.send(build_completed_message(issue, mention)).await
+        }
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_failed_message(issue, error, mention)).await
+        if issue
+            .get_metadata::<bool>("regression_detected")
+            .unwrap_or(false)
+        {
+            self.send(build_regression_detected_message(issue, error, mention))
+                .await
+        } else if issue
+            .get_metadata::<String>("cascade_downstream_repo")
+            .is_some()
+        {
+            self.send(build_cascade_failed_message(issue, error, mention))
+                .await
+        } else {
+            self.send(build_failed_message(issue, error, mention)).await
+        }
+    }
+
+    async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let mention = self.get_user_mention_for_issue(issue);
+        self.send(build_merged_message(issue, pr_url, mention))
+            .await
+    }
+
+    async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let mention = self.get_user_mention_for_issue(issue);
+        self.send(build_closed_message(issue, pr_url, mention))
+            .await
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
@@ -654,28 +1048,28 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         };
 
         let messages = client.list_channel_messages(channel_id, 50).await?;
-        let expected_user = self.expected_reply_user_id(request);
-        let token = format!("[CLAUDEAR-Q:{}]", request.correlation_id);
 
+        // Identify ask messages by their embed title ("❓ Input needed: ...").
+        let ask_prefix = format!("\u{2753} Input needed: {}", request.short_id);
         let ask_message_ids: std::collections::HashSet<String> = messages
             .iter()
-            .filter(|m| m.content.contains(&token))
+            .filter(|m| {
+                m.embeds
+                    .iter()
+                    .any(|e| e.title.as_ref().is_some_and(|t| t.starts_with(&ask_prefix)))
+            })
             .map(|m| m.id.clone())
             .collect();
 
-        let mut replies: Vec<AskReply> = messages
+        let reply_pairs: Vec<(String, AskReply)> = messages
             .into_iter()
             .filter_map(|message| {
-                let author = message.author?;
-                if author.bot {
+                // Skip the ask messages themselves.
+                if ask_message_ids.contains(&message.id) {
                     return None;
                 }
 
-                if let Some(ref expected) = expected_user {
-                    if &author.id != expected {
-                        return None;
-                    }
-                }
+                let author = message.author?;
 
                 let parsed = DateTime::parse_from_rfc3339(&message.timestamp)
                     .ok()
@@ -684,6 +1078,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
                     return None;
                 }
 
+                // Only accept Discord replies (message_reference) to an ask message.
                 let is_reply_to_ask = message
                     .message_reference
                     .as_ref()
@@ -691,22 +1086,37 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
                     .map(|message_id| ask_message_ids.contains(message_id))
                     .unwrap_or(false);
 
-                let answer = if is_reply_to_ask {
-                    Self::extract_reply_text(&message.content)
-                } else {
-                    // Backward-compatible fallback for manual token replies.
-                    Self::extract_reply_text_with_token(&message.content, &request.correlation_id)
-                }?;
-                Some(AskReply {
-                    correlation_id: request.correlation_id.clone(),
-                    channel: "discord".to_string(),
-                    responder: Some(author.id),
-                    answer,
-                    replied_at: parsed,
-                })
+                if !is_reply_to_ask {
+                    return None;
+                }
+
+                let answer = Self::extract_reply_text(&message.content)?;
+                Some((
+                    message.id.clone(),
+                    AskReply {
+                        correlation_id: request.correlation_id.clone(),
+                        channel: "discord".to_string(),
+                        responder: Some(author.id),
+                        answer,
+                        replied_at: parsed,
+                    },
+                ))
             })
             .collect();
 
+        // React to reply messages with an emoji
+        for (msg_id, _) in &reply_pairs {
+            let emojis = ["🎉", "💜", "✨", "🌟", "🙌", "💪", "🔥", "🚀", "🤩", "💖"];
+            let hash: usize = msg_id
+                .bytes()
+                .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
+            let idx = hash % emojis.len();
+            if let Err(e) = client.add_reaction(channel_id, msg_id, emojis[idx]).await {
+                tracing::debug!(error = %e, "Failed to react to reply message");
+            }
+        }
+
+        let mut replies: Vec<AskReply> = reply_pairs.into_iter().map(|(_, r)| r).collect();
         replies.sort_by_key(|r| r.replied_at);
         Ok(replies)
     }
@@ -1650,16 +2060,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_reply_text_with_token() {
-        let content = "[CLAUDEAR-Q:abc123] Use main branch";
-        let parsed = DiscordNotifier::<ReqwestDiscordWebhookClient>::extract_reply_text_with_token(
-            content, "abc123",
-        )
-        .unwrap();
-        assert_eq!(parsed, "Use main branch");
-    }
-
-    #[test]
     fn test_truncate_string_short_unchanged() {
         assert_eq!(truncate_string("hello", 10), "hello");
     }
@@ -1745,53 +2145,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_reply_text_with_token_wrong_id_returns_none() {
-        let content = "[CLAUDEAR-Q:abc123] Use main branch";
-        let result = DiscordNotifier::<ReqwestDiscordWebhookClient>::extract_reply_text_with_token(
-            content, "wrong-id",
-        );
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_reply_text_with_token_only_token_returns_none() {
-        // Token present but no actual text after removing it
-        let content = "[CLAUDEAR-Q:abc123]";
-        let result = DiscordNotifier::<ReqwestDiscordWebhookClient>::extract_reply_text_with_token(
-            content, "abc123",
-        );
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_reply_text_with_token_whitespace_after_token_returns_none() {
-        let content = "[CLAUDEAR-Q:abc123]   ";
-        let result = DiscordNotifier::<ReqwestDiscordWebhookClient>::extract_reply_text_with_token(
-            content, "abc123",
-        );
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_reply_text_with_token_no_token_at_all() {
-        let content = "just a regular message";
-        let result = DiscordNotifier::<ReqwestDiscordWebhookClient>::extract_reply_text_with_token(
-            content, "abc123",
-        );
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_reply_text_with_token_token_in_middle() {
-        let content = "Before [CLAUDEAR-Q:abc123] After";
-        let result = DiscordNotifier::<ReqwestDiscordWebhookClient>::extract_reply_text_with_token(
-            content, "abc123",
-        )
-        .unwrap();
-        assert_eq!(result, "Before  After");
-    }
-
-    #[test]
     fn test_supports_replies_true_when_both_set() {
         let config = DiscordConfig {
             webhook_url: Some("https://example.com".to_string()),
@@ -1854,96 +2207,6 @@ mod tests {
         };
         let notifier = DiscordNotifier::new(config, empty_registry());
         assert!(!notifier.supports_replies());
-    }
-
-    #[test]
-    fn test_expected_reply_user_id_prefers_request_target() {
-        let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
-            user_id: Some("global-user".to_string()),
-            ..Default::default()
-        };
-        let notifier = DiscordNotifier::new(config, empty_registry());
-        let request = AskRequest {
-            correlation_id: "tok-1".to_string(),
-            source: "linear".to_string(),
-            repo: None,
-            issue_id: "1".to_string(),
-            short_id: "LIN-1".to_string(),
-            question: crate::types::BlockingQuestion {
-                question: "Which branch?".to_string(),
-                context: None,
-                options: vec![],
-                why: None,
-            },
-            asked_at: chrono::Utc::now(),
-            target_discord_id: Some("request-target".to_string()),
-            target_email: None,
-            target_slack_id: None,
-        };
-        assert_eq!(
-            notifier.expected_reply_user_id(&request),
-            Some("request-target".to_string())
-        );
-    }
-
-    #[test]
-    fn test_expected_reply_user_id_falls_back_to_config() {
-        let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
-            user_id: Some("global-user".to_string()),
-            ..Default::default()
-        };
-        let notifier = DiscordNotifier::new(config, empty_registry());
-        let request = AskRequest {
-            correlation_id: "tok-2".to_string(),
-            source: "linear".to_string(),
-            repo: None,
-            issue_id: "1".to_string(),
-            short_id: "LIN-1".to_string(),
-            question: crate::types::BlockingQuestion {
-                question: "Which branch?".to_string(),
-                context: None,
-                options: vec![],
-                why: None,
-            },
-            asked_at: chrono::Utc::now(),
-            target_discord_id: None,
-            target_email: None,
-            target_slack_id: None,
-        };
-        assert_eq!(
-            notifier.expected_reply_user_id(&request),
-            Some("global-user".to_string())
-        );
-    }
-
-    #[test]
-    fn test_expected_reply_user_id_none_when_both_absent() {
-        let config = DiscordConfig {
-            webhook_url: Some("https://example.com".to_string()),
-            user_id: None,
-            ..Default::default()
-        };
-        let notifier = DiscordNotifier::new(config, empty_registry());
-        let request = AskRequest {
-            correlation_id: "tok-3".to_string(),
-            source: "linear".to_string(),
-            repo: None,
-            issue_id: "1".to_string(),
-            short_id: "LIN-1".to_string(),
-            question: crate::types::BlockingQuestion {
-                question: "Which branch?".to_string(),
-                context: None,
-                options: vec![],
-                why: None,
-            },
-            asked_at: chrono::Utc::now(),
-            target_discord_id: None,
-            target_email: None,
-            target_slack_id: None,
-        };
-        assert_eq!(notifier.expected_reply_user_id(&request), None);
     }
 
     #[test]
@@ -2013,12 +2276,24 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
 
         let (_, body) = notifier.http.get_last_call().unwrap();
-        let content = body["content"].as_str().unwrap();
-        assert!(content.contains("[CLAUDEAR-Q:tok-opts]"));
-        assert!(content.contains("Pick a branch"));
-        assert!(content.contains("Why: Multiple branches available"));
-        assert!(content.contains("Context: We need a target for the PR"));
-        assert!(content.contains("main | develop"));
+        // No mention and no correlation tag => content field is absent
+        assert!(body.get("content").is_none() || body["content"].is_null());
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["description"].as_str().unwrap(), "Pick a branch");
+        let fields = embed["fields"].as_array().unwrap();
+        assert!(fields.iter().any(|f| f["name"] == "Why"
+            && f["value"]
+                .as_str()
+                .unwrap()
+                .contains("Multiple branches available")));
+        assert!(fields.iter().any(|f| f["name"] == "Context"
+            && f["value"]
+                .as_str()
+                .unwrap()
+                .contains("We need a target for the PR")));
+        assert!(fields
+            .iter()
+            .any(|f| f["name"] == "Options" && f["value"].as_str().unwrap().contains("main")));
     }
 
     #[tokio::test]
@@ -2465,10 +2740,10 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
 
         let (_, body) = notifier.http.get_last_call().unwrap();
-        let content = body["content"].as_str().unwrap();
-        assert!(!content.contains("<@"));
-        assert!(content.contains("[CLAUDEAR-Q:tok-1]"));
-        assert!(content.contains("Which branch?"));
+        // No mention and no correlation tag => content field is absent
+        assert!(body.get("content").is_none() || body["content"].is_null());
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["description"].as_str().unwrap(), "Which branch?");
     }
 
     #[tokio::test]
@@ -2502,8 +2777,11 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
 
         let (_, body) = notifier.http.get_last_call().unwrap();
-        let content = body["content"].as_str().unwrap();
-        assert!(content.contains("Why: Multiple databases found"));
+        let embed = &body["embeds"][0];
+        let fields = embed["fields"].as_array().unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f["name"] == "Why" && f["value"] == "Multiple databases found"));
     }
 
     #[tokio::test]
@@ -2523,8 +2801,11 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
 
         let (_, body) = notifier.http.get_last_call().unwrap();
-        let content = body["content"].as_str().unwrap();
-        assert!(content.contains("Context: The repo has multiple deploy targets"));
+        let embed = &body["embeds"][0];
+        let fields = embed["fields"].as_array().unwrap();
+        assert!(fields.iter().any(
+            |f| f["name"] == "Context" && f["value"] == "The repo has multiple deploy targets"
+        ));
     }
 
     #[tokio::test]
@@ -2545,9 +2826,12 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
 
         let (_, body) = notifier.http.get_last_call().unwrap();
-        let content = body["content"].as_str().unwrap();
-        assert!(content.contains("Context:"));
-        assert!(content.contains("..."));
+        let embed = &body["embeds"][0];
+        let fields = embed["fields"].as_array().unwrap();
+        let ctx_field = fields.iter().find(|f| f["name"] == "Context").unwrap();
+        let ctx_value = ctx_field["value"].as_str().unwrap();
+        assert!(ctx_value.contains("..."));
+        assert!(ctx_value.len() <= 403); // 400 chars + "..."
     }
 
     #[tokio::test]
@@ -2567,8 +2851,13 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
 
         let (_, body) = notifier.http.get_last_call().unwrap();
-        let content = body["content"].as_str().unwrap();
-        assert!(content.contains("Options: alpha | beta | gamma"));
+        let embed = &body["embeds"][0];
+        let fields = embed["fields"].as_array().unwrap();
+        let opts_field = fields.iter().find(|f| f["name"] == "Options").unwrap();
+        let opts_value = opts_field["value"].as_str().unwrap();
+        assert!(opts_value.contains("alpha"));
+        assert!(opts_value.contains("beta"));
+        assert!(opts_value.contains("gamma"));
     }
 
     #[tokio::test]
@@ -2581,12 +2870,14 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
 
         let (_, body) = notifier.http.get_last_call().unwrap();
-        let content = body["content"].as_str().unwrap();
-        assert!(!content.contains("Options:"));
+        let embeds = body["embeds"].as_array().unwrap();
+        let embed = &embeds[0];
+        // No fields when no options/why/context
+        assert!(embed.get("fields").is_none() || embed["fields"].is_null());
     }
 
     #[tokio::test]
-    async fn test_ask_question_includes_reply_instruction() {
+    async fn test_ask_question_uses_embed_format() {
         let mock = MockDiscordWebhookClient::success();
         let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
         let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
@@ -2595,8 +2886,12 @@ mod tests {
         notifier.ask_question(&issue, &request).await.unwrap();
 
         let (_, body) = notifier.http.get_last_call().unwrap();
-        let content = body["content"].as_str().unwrap();
-        assert!(content.contains("Reply to this message in Discord with your answer."));
+        // No mention and no correlation tag => content field is absent
+        assert!(body.get("content").is_none() || body["content"].is_null());
+        let embeds = body["embeds"].as_array().unwrap();
+        assert_eq!(embeds.len(), 1);
+        assert!(embeds[0]["title"].as_str().unwrap().contains("LIN-1"));
+        assert_eq!(embeds[0]["description"].as_str().unwrap(), "Confirm?");
     }
 
     #[tokio::test]
@@ -2839,12 +3134,22 @@ mod tests {
         let (_, body) = notifier.http.get_last_call().unwrap();
         let content = body["content"].as_str().unwrap();
         assert!(content.contains("<@987654321>"));
-        assert!(content.contains("[CLAUDEAR-Q:tok-all]"));
-        assert!(content.contains("Select deployment target"));
-        assert!(content.contains("Why: Need to know before PR"));
-        assert!(content.contains("Context: Found staging and prod"));
-        assert!(content.contains("Options: staging | production"));
-        assert!(content.contains("Reply to this message"));
+        assert!(!content.contains("[CLAUDEAR-Q:"));
+        let embed = &body["embeds"][0];
+        assert_eq!(
+            embed["description"].as_str().unwrap(),
+            "Select deployment target"
+        );
+        let fields = embed["fields"].as_array().unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f["name"] == "Why" && f["value"] == "Need to know before PR"));
+        assert!(fields
+            .iter()
+            .any(|f| f["name"] == "Context" && f["value"] == "Found staging and prod"));
+        assert!(fields
+            .iter()
+            .any(|f| f["name"] == "Options" && f["value"].as_str().unwrap().contains("staging")));
         assert_eq!(delivery.channel, "discord");
     }
 
@@ -3107,16 +3412,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ask_question_embeds_is_null() {
+    async fn test_ask_question_minimal_has_embed_with_no_fields() {
         let mock = MockDiscordWebhookClient::success();
         let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
         let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
-        let request = make_ask_request("tok-no-embed", "Confirm?", None, vec![], None, None);
+        let request = make_ask_request("tok-no-fields", "Confirm?", None, vec![], None, None);
 
         notifier.ask_question(&issue, &request).await.unwrap();
 
         let (_, body) = notifier.http.get_last_call().unwrap();
-        assert!(body["embeds"].is_null());
+        let embed = &body["embeds"][0];
+        assert_eq!(embed["description"].as_str().unwrap(), "Confirm?");
+        // No why/context/options → fields should be null or empty
+        assert!(embed["fields"].is_null() || embed["fields"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3390,15 +3698,15 @@ mod tests {
         let request = make_ask_request("tok-1", "Which branch?", None, vec![], None, None);
         let msg = build_ask_question_message(&issue, &request, None);
 
-        assert!(msg.embeds.is_none());
-        let content = msg.content.as_ref().unwrap();
-        assert!(content.contains("[CLAUDEAR-Q:tok-1]"));
-        assert!(content.contains("Human input needed for PROJ-42"));
-        assert!(content.contains("Which branch?"));
-        assert!(content.contains("Reply to this message in Discord with your answer."));
-        assert!(!content.contains("Why:"));
-        assert!(!content.contains("Context:"));
-        assert!(!content.contains("Options:"));
+        // Content should be empty (no mention, no correlation tag)
+        assert!(msg.content.is_none() || msg.content.as_ref().unwrap().is_empty());
+
+        let embeds = msg.embeds.as_ref().unwrap();
+        assert_eq!(embeds.len(), 1);
+        let embed = &embeds[0];
+        assert!(embed.title.as_ref().unwrap().contains("PROJ-42"));
+        assert_eq!(embed.description.as_ref().unwrap(), "Which branch?");
+        assert!(embed.fields.is_none());
     }
 
     #[test]
@@ -3416,11 +3724,21 @@ mod tests {
 
         let content = msg.content.as_ref().unwrap();
         assert!(content.starts_with("<@987654321>"));
-        assert!(content.contains("[CLAUDEAR-Q:tok-all]"));
-        assert!(content.contains("Select target"));
-        assert!(content.contains("Why: Need to know before PR"));
-        assert!(content.contains("Context: Found staging and prod"));
-        assert!(content.contains("Options: staging | production"));
+        assert!(!content.contains("[CLAUDEAR-Q:"));
+
+        let embeds = msg.embeds.as_ref().unwrap();
+        let embed = &embeds[0];
+        assert_eq!(embed.description.as_ref().unwrap(), "Select target");
+
+        let fields = embed.fields.as_ref().unwrap();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "Why");
+        assert_eq!(fields[0].value, "Need to know before PR");
+        assert_eq!(fields[1].name, "Context");
+        assert!(fields[1].value.contains("Found staging and prod"));
+        assert_eq!(fields[2].name, "Options");
+        assert!(fields[2].value.contains("staging"));
+        assert!(fields[2].value.contains("production"));
     }
 
     #[test]
@@ -3437,9 +3755,10 @@ mod tests {
         );
         let msg = build_ask_question_message(&issue, &request, None);
 
-        let content = msg.content.as_ref().unwrap();
-        assert!(content.contains("Context:"));
-        assert!(content.contains("..."));
+        let embeds = msg.embeds.as_ref().unwrap();
+        let fields = embeds[0].fields.as_ref().unwrap();
+        let ctx_field = fields.iter().find(|f| f.name == "Context").unwrap();
+        assert!(ctx_field.value.contains("..."));
     }
 
     #[test]
@@ -3521,5 +3840,729 @@ mod tests {
         assert_eq!(notifier.http.get_call_count(), 1);
         let (url, _) = notifier.http.get_last_call().unwrap();
         assert_eq!(url, "https://discord.com/api/webhooks/123/abc");
+    }
+
+    #[test]
+    fn test_build_merged_message_basic() {
+        let issue = Issue::new(
+            "1",
+            "BUG-123",
+            "Fix login bug",
+            "https://example.com/1",
+            "github",
+        );
+        let msg = build_merged_message(&issue, "https://github.com/org/repo/pull/42", None);
+        assert!(msg.content.is_none());
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("PR Merged"));
+        assert!(embed.title.as_ref().unwrap().contains("BUG-123"));
+        assert_eq!(embed.color, Some(0x1abc9c));
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields.iter().any(|f| f.name == "PR Link"));
+        assert!(fields.iter().any(|f| f.name == "Source"));
+        assert!(fields.iter().any(|f| f.name == "Issue"));
+    }
+
+    #[test]
+    fn test_build_merged_message_with_mention() {
+        let issue = Issue::new("1", "BUG-123", "Test", "https://example.com/1", "linear");
+        let msg = build_merged_message(&issue, "https://pr.url", Some("<@user>".to_string()));
+        assert_eq!(msg.content, Some("<@user>".to_string()));
+    }
+
+    #[test]
+    fn test_build_closed_message_basic() {
+        let issue = Issue::new(
+            "1",
+            "BUG-456",
+            "Broken feature",
+            "https://example.com/1",
+            "sentry",
+        );
+        let msg = build_closed_message(&issue, "https://github.com/org/repo/pull/99", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("PR Closed"));
+        assert!(embed.title.as_ref().unwrap().contains("BUG-456"));
+        assert_eq!(embed.color, Some(0x95a5a6));
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Note" && f.value.contains("closed without merging")));
+    }
+
+    #[test]
+    fn test_build_closed_message_with_mention() {
+        let issue = Issue::new("1", "BUG-456", "Test", "https://example.com/1", "github");
+        let msg = build_closed_message(&issue, "https://pr.url", Some("<@admin>".to_string()));
+        assert_eq!(msg.content, Some("<@admin>".to_string()));
+    }
+
+    #[test]
+    fn test_build_cascade_success_message_basic() {
+        let mut issue = Issue::new(
+            "1",
+            "CASCADE-1",
+            "Fix cascade",
+            "https://example.com/1",
+            "github",
+        );
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+        issue.set_metadata(
+            "cascade_upstream_pr_url",
+            "https://github.com/org/upstream/pull/5",
+        );
+        issue.set_metadata("cascade_original_issue_short_id", "LIN-42");
+        let msg =
+            build_cascade_success_message(&issue, "https://github.com/org/downstream/pull/1", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("Cascade PR"));
+        assert_eq!(embed.color, Some(0x3498db));
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Upstream" && f.value == "org/upstream"));
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Downstream" && f.value == "org/downstream"));
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Original Issue" && f.value == "LIN-42"));
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Upstream PR" && f.value.contains("org/upstream/pull/5")));
+        assert!(fields.iter().any(|f| f.name == "Cascade PR"));
+        assert!(embed.footer.as_ref().unwrap().text.contains("Cascade"));
+    }
+
+    #[test]
+    fn test_build_cascade_success_message_no_metadata() {
+        let issue = Issue::new(
+            "1",
+            "CASCADE-1",
+            "Fix cascade",
+            "https://example.com/1",
+            "github",
+        );
+        let msg = build_cascade_success_message(&issue, "https://pr.url", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        // Should not panic, upstream/downstream default to empty strings
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields.iter().any(|f| f.name == "Upstream"));
+        // No Original Issue or Upstream PR fields when metadata is missing
+        assert!(!fields.iter().any(|f| f.name == "Original Issue"));
+        assert!(!fields.iter().any(|f| f.name == "Upstream PR"));
+    }
+
+    #[test]
+    fn test_build_cascade_failed_message_basic() {
+        let mut issue = Issue::new(
+            "1",
+            "CASCADE-2",
+            "Fail cascade",
+            "https://example.com/1",
+            "github",
+        );
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+        issue.set_metadata(
+            "cascade_upstream_pr_url",
+            "https://github.com/org/upstream/pull/5",
+        );
+        issue.set_metadata("cascade_original_issue_short_id", "LIN-42");
+        let msg = build_cascade_failed_message(&issue, "build compilation failed", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("Cascade Failed"));
+        assert_eq!(embed.color, Some(0xe67e22));
+        assert!(embed.url.is_none());
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Error" && f.value.contains("build compilation failed")));
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Original Issue" && f.value == "LIN-42"));
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Upstream PR" && f.value.contains("org/upstream/pull/5")));
+    }
+
+    #[test]
+    fn test_build_cascade_failed_message_with_mention() {
+        let issue = Issue::new("1", "CASCADE-2", "Test", "https://example.com/1", "github");
+        let msg = build_cascade_failed_message(&issue, "error", Some("<@dev>".to_string()));
+        assert_eq!(msg.content, Some("<@dev>".to_string()));
+    }
+
+    #[test]
+    fn test_build_regression_detected_message_basic() {
+        let issue = Issue::new(
+            "1",
+            "REG-1",
+            "Login broken",
+            "https://example.com/1",
+            "sentry",
+        );
+        let msg = build_regression_detected_message(&issue, "Login endpoint returns 500", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed
+            .title
+            .as_ref()
+            .unwrap()
+            .contains("Regression Detected"));
+        assert!(embed.title.as_ref().unwrap().contains("REG-1"));
+        assert_eq!(embed.color, Some(0xe74c3c));
+        assert!(embed.description.as_ref().unwrap().contains("regressed"));
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Details" && f.value.contains("Login endpoint")));
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Action" && f.value.contains("scheduled")));
+        assert!(embed
+            .footer
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("Regression Monitor"));
+    }
+
+    #[test]
+    fn test_build_regression_detected_message_empty_url() {
+        let issue = Issue::new("1", "REG-1", "Test", "", "sentry");
+        let msg = build_regression_detected_message(&issue, "error", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.url.is_none());
+    }
+
+    #[test]
+    fn test_build_regression_detected_message_with_url() {
+        let issue = Issue::new("1", "REG-1", "Test", "https://example.com/issue", "sentry");
+        let msg = build_regression_detected_message(&issue, "error", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.url.is_some());
+    }
+
+    #[test]
+    fn test_build_regression_resolved_message_basic() {
+        let issue = Issue::new(
+            "1",
+            "REG-2",
+            "Login fixed",
+            "https://example.com/2",
+            "github",
+        );
+        let msg = build_regression_resolved_message(&issue, None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed
+            .title
+            .as_ref()
+            .unwrap()
+            .contains("Regression Resolved"));
+        assert!(embed.title.as_ref().unwrap().contains("REG-2"));
+        assert_eq!(embed.color, Some(0x2ecc71));
+        assert!(embed
+            .description
+            .as_ref()
+            .unwrap()
+            .contains("No regression detected"));
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields.iter().any(|f| f.name == "Status"));
+        assert!(embed
+            .footer
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("Regression Monitor"));
+    }
+
+    #[test]
+    fn test_build_regression_resolved_message_with_mention() {
+        let issue = Issue::new("1", "REG-2", "Test", "https://example.com/2", "github");
+        let msg = build_regression_resolved_message(&issue, Some("<@user>".to_string()));
+        assert_eq!(msg.content, Some("<@user>".to_string()));
+    }
+
+    #[test]
+    fn test_build_regression_resolved_message_empty_url() {
+        let issue = Issue::new("1", "REG-2", "Test", "", "github");
+        let msg = build_regression_resolved_message(&issue, None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.url.is_none());
+    }
+
+    #[test]
+    fn test_build_urgent_issues_message_description_content() {
+        let issues = vec![Issue::new(
+            "1",
+            "URG-1",
+            "Critical",
+            "https://example.com/1",
+            "sentry",
+        )];
+        let msg = build_urgent_issues_message(&issues, None).unwrap();
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed
+            .description
+            .as_ref()
+            .unwrap()
+            .contains("require attention"));
+    }
+
+    // --- Tests for notify_merged message building ---
+
+    #[tokio::test]
+    async fn test_notify_merged_sends_correct_embed() {
+        let mock = MockDiscordWebhookClient::success();
+        let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "PROJ-1", "Fix bug", "https://example.com/1", "linear");
+
+        notifier
+            .notify_merged(&issue, "https://github.com/org/repo/pull/55")
+            .await
+            .unwrap();
+
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let embed = &body["embeds"][0];
+        assert!(embed["title"].as_str().unwrap().contains("PR Merged"));
+        assert!(embed["title"].as_str().unwrap().contains("PROJ-1"));
+        assert_eq!(embed["color"], 0x1abc9c); // Teal
+        assert_eq!(embed["url"], "https://github.com/org/repo/pull/55");
+        let fields = embed["fields"].as_array().unwrap();
+        let pr_field = fields.iter().find(|f| f["name"] == "PR Link").unwrap();
+        assert!(pr_field["value"].as_str().unwrap().contains("View PR"));
+        let issue_field = fields.iter().find(|f| f["name"] == "Issue").unwrap();
+        assert!(issue_field["value"].as_str().unwrap().contains("PROJ-1"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_merged_with_user_mention() {
+        let mock = MockDiscordWebhookClient::success();
+        let notifier = DiscordNotifier::with_http_client(enabled_config_with_user(), mock);
+        let issue = Issue::new("1", "P-1", "Test", "https://example.com", "linear");
+
+        notifier
+            .notify_merged(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("<@987654321>"));
+    }
+
+    // --- Tests for notify_closed message building ---
+
+    #[tokio::test]
+    async fn test_notify_closed_sends_correct_embed() {
+        let mock = MockDiscordWebhookClient::success();
+        let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "PROJ-1", "Fix bug", "https://example.com/1", "linear");
+
+        notifier
+            .notify_closed(&issue, "https://github.com/org/repo/pull/56")
+            .await
+            .unwrap();
+
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let embed = &body["embeds"][0];
+        assert!(embed["title"].as_str().unwrap().contains("PR Closed"));
+        assert!(embed["title"].as_str().unwrap().contains("PROJ-1"));
+        assert_eq!(embed["color"], 0x95a5a6); // Grey
+        assert_eq!(embed["url"], "https://github.com/org/repo/pull/56");
+        let fields = embed["fields"].as_array().unwrap();
+        let note_field = fields.iter().find(|f| f["name"] == "Note").unwrap();
+        assert!(note_field["value"]
+            .as_str()
+            .unwrap()
+            .contains("closed without merging"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_closed_with_user_mention() {
+        let mock = MockDiscordWebhookClient::success();
+        let notifier = DiscordNotifier::with_http_client(enabled_config_with_user(), mock);
+        let issue = Issue::new("1", "P-1", "Test", "https://example.com", "linear");
+
+        notifier
+            .notify_closed(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("<@987654321>"));
+    }
+
+    // --- Tests for cascade success message ---
+
+    #[tokio::test]
+    async fn test_notify_success_cascade_sends_cascade_embed() {
+        let mock = MockDiscordWebhookClient::success();
+        let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+        issue.set_metadata("cascade_upstream_repo", "upstream/repo");
+        issue.set_metadata(
+            "cascade_upstream_pr_url",
+            "https://github.com/upstream/pr/1",
+        );
+        issue.set_metadata("cascade_original_issue_short_id", "ORIG-1");
+
+        notifier
+            .notify_success(&issue, "https://github.com/downstream/repo/pull/10")
+            .await
+            .unwrap();
+
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let embed = &body["embeds"][0];
+        assert!(embed["title"].as_str().unwrap().contains("Cascade PR"));
+        assert_eq!(embed["color"], 0x3498db); // Blue
+        let fields = embed["fields"].as_array().unwrap();
+        let upstream_field = fields.iter().find(|f| f["name"] == "Upstream").unwrap();
+        assert_eq!(upstream_field["value"], "upstream/repo");
+        let downstream_field = fields.iter().find(|f| f["name"] == "Downstream").unwrap();
+        assert_eq!(downstream_field["value"], "downstream/repo");
+        let orig_field = fields
+            .iter()
+            .find(|f| f["name"] == "Original Issue")
+            .unwrap();
+        assert_eq!(orig_field["value"], "ORIG-1");
+        let upstream_pr = fields.iter().find(|f| f["name"] == "Upstream PR").unwrap();
+        assert!(upstream_pr["value"]
+            .as_str()
+            .unwrap()
+            .contains("https://github.com/upstream/pr/1"));
+        let cascade_pr = fields.iter().find(|f| f["name"] == "Cascade PR").unwrap();
+        assert!(cascade_pr["value"]
+            .as_str()
+            .unwrap()
+            .contains("downstream/repo/pull/10"));
+        let footer = embed["footer"]["text"].as_str().unwrap();
+        assert!(footer.contains("Cascade"));
+    }
+
+    // --- Tests for cascade failed message ---
+
+    #[tokio::test]
+    async fn test_notify_failed_cascade_sends_cascade_failed_embed() {
+        let mock = MockDiscordWebhookClient::success();
+        let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+        issue.set_metadata("cascade_upstream_repo", "upstream/repo");
+        issue.set_metadata(
+            "cascade_upstream_pr_url",
+            "https://github.com/upstream/pr/2",
+        );
+        issue.set_metadata("cascade_original_issue_short_id", "ORIG-2");
+
+        notifier
+            .notify_failed(&issue, "Adaptation failed")
+            .await
+            .unwrap();
+
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let embed = &body["embeds"][0];
+        assert!(embed["title"].as_str().unwrap().contains("Cascade Failed"));
+        assert_eq!(embed["color"], 0xe67e22); // Dark Orange
+        let desc = embed["description"].as_str().unwrap();
+        assert!(desc.contains("Failed to adapt"));
+        assert!(desc.contains("downstream/repo"));
+        let fields = embed["fields"].as_array().unwrap();
+        let error_field = fields.iter().find(|f| f["name"] == "Error").unwrap();
+        assert!(error_field["value"]
+            .as_str()
+            .unwrap()
+            .contains("Adaptation failed"));
+        let footer = embed["footer"]["text"].as_str().unwrap();
+        assert!(footer.contains("Cascade"));
+    }
+
+    // --- Tests for regression detected message ---
+
+    #[tokio::test]
+    async fn test_notify_failed_regression_sends_regression_embed() {
+        let mock = MockDiscordWebhookClient::success();
+        let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "SEN-1", "Error", "https://sentry.io/1", "sentry");
+        issue.set_metadata("regression_detected", true);
+
+        notifier
+            .notify_failed(&issue, "Tests failing again")
+            .await
+            .unwrap();
+
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let embed = &body["embeds"][0];
+        assert!(embed["title"]
+            .as_str()
+            .unwrap()
+            .contains("Regression Detected"));
+        assert_eq!(embed["color"], 0xe74c3c); // Red
+        let desc = embed["description"].as_str().unwrap();
+        assert!(desc.contains("previously fixed issue has regressed"));
+        let fields = embed["fields"].as_array().unwrap();
+        let details = fields.iter().find(|f| f["name"] == "Details").unwrap();
+        assert!(details["value"]
+            .as_str()
+            .unwrap()
+            .contains("Tests failing again"));
+        let action = fields.iter().find(|f| f["name"] == "Action").unwrap();
+        assert!(action["value"]
+            .as_str()
+            .unwrap()
+            .contains("Retry has been scheduled"));
+        let footer = embed["footer"]["text"].as_str().unwrap();
+        assert!(footer.contains("Regression Monitor"));
+    }
+
+    // --- Tests for regression resolved message ---
+
+    #[tokio::test]
+    async fn test_notify_completed_regression_resolved_sends_resolved_embed() {
+        let mock = MockDiscordWebhookClient::success();
+        let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "SEN-1", "Error", "https://sentry.io/1", "sentry");
+        issue.set_metadata("regression_resolved", true);
+
+        notifier.notify_completed(&issue).await.unwrap();
+
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let embed = &body["embeds"][0];
+        assert!(embed["title"]
+            .as_str()
+            .unwrap()
+            .contains("Regression Resolved"));
+        assert_eq!(embed["color"], 0x2ecc71); // Green
+        let desc = embed["description"].as_str().unwrap();
+        assert!(desc.contains("No regression detected"));
+        let footer = embed["footer"]["text"].as_str().unwrap();
+        assert!(footer.contains("Regression Monitor"));
+    }
+
+    // --- Tests for is_pr_update path in success message ---
+
+    #[tokio::test]
+    async fn test_notify_success_pr_update_sends_updated_title() {
+        let mock = MockDiscordWebhookClient::success();
+        let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("is_pr_update", true);
+
+        notifier
+            .notify_success(&issue, "https://github.com/org/repo/pull/77")
+            .await
+            .unwrap();
+
+        let (_, body) = notifier.http.get_last_call().unwrap();
+        let embed = &body["embeds"][0];
+        assert!(embed["title"].as_str().unwrap().contains("PR Updated"));
+        let fields = embed["fields"].as_array().unwrap();
+        let pr_field = fields.iter().find(|f| f["name"] == "Updated PR").unwrap();
+        assert!(pr_field["value"].as_str().unwrap().contains("View PR"));
+    }
+
+    // --- Test to_create_message_params content truncation ---
+
+    #[test]
+    fn test_to_create_message_params_truncates_long_content() {
+        let long_content = "x".repeat(2500);
+        let msg = DiscordMessage {
+            content: Some(long_content.clone()),
+            embeds: None,
+        };
+        let params = DiscordNotifier::<MockDiscordWebhookClient>::to_create_message_params(&msg);
+        assert!(params.content.len() <= 2000);
+        assert!(params.content.ends_with("..."));
+    }
+
+    #[test]
+    fn test_to_create_message_params_short_content_unchanged() {
+        let msg = DiscordMessage {
+            content: Some("short message".to_string()),
+            embeds: None,
+        };
+        let params = DiscordNotifier::<MockDiscordWebhookClient>::to_create_message_params(&msg);
+        assert_eq!(params.content, "short message");
+    }
+
+    #[test]
+    fn test_to_create_message_params_none_content_is_empty() {
+        let msg = DiscordMessage {
+            content: None,
+            embeds: None,
+        };
+        let params = DiscordNotifier::<MockDiscordWebhookClient>::to_create_message_params(&msg);
+        assert_eq!(params.content, "");
+    }
+
+    #[test]
+    fn test_to_create_message_params_with_embeds() {
+        let msg = DiscordMessage {
+            content: Some("hello".to_string()),
+            embeds: Some(vec![DiscordEmbed {
+                title: Some("Title".to_string()),
+                description: Some("Desc".to_string()),
+                url: Some("https://example.com".to_string()),
+                color: Some(0xFF0000),
+                fields: Some(vec![DiscordField {
+                    name: "F1".to_string(),
+                    value: "V1".to_string(),
+                    inline: Some(true),
+                }]),
+                footer: Some(DiscordFooter {
+                    text: "Footer".to_string(),
+                }),
+                timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            }]),
+        };
+        let params = DiscordNotifier::<MockDiscordWebhookClient>::to_create_message_params(&msg);
+        assert_eq!(params.content, "hello");
+        assert!(params.embeds.is_some());
+        let embeds = params.embeds.unwrap();
+        assert_eq!(embeds.len(), 1);
+    }
+
+    #[test]
+    fn test_to_create_message_params_embed_without_optional_fields() {
+        let msg = DiscordMessage {
+            content: None,
+            embeds: Some(vec![DiscordEmbed {
+                title: None,
+                description: None,
+                url: None,
+                color: None,
+                fields: None,
+                footer: None,
+                timestamp: None,
+            }]),
+        };
+        let params = DiscordNotifier::<MockDiscordWebhookClient>::to_create_message_params(&msg);
+        assert!(params.embeds.is_some());
+    }
+
+    // --- Test cascade success without optional fields ---
+
+    #[test]
+    fn test_build_cascade_success_message_without_optional_metadata() {
+        let issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        let msg = build_cascade_success_message(
+            &issue,
+            "https://github.com/repo/pull/1",
+            Some("<@user>".to_string()),
+        );
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("Cascade PR"));
+        // Without original_issue_short_id set, it should be empty string
+        let fields = embed.fields.as_ref().unwrap();
+        // No "Original Issue" field when the value is empty
+        let orig = fields.iter().find(|f| f.name == "Original Issue");
+        assert!(orig.is_none());
+    }
+
+    #[test]
+    fn test_build_cascade_failed_message_without_optional_metadata() {
+        let issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        let msg = build_cascade_failed_message(&issue, "Some error", Some("<@user>".to_string()));
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("Cascade Failed"));
+        assert_eq!(embed.color, Some(0xe67e22));
+        let fields = embed.fields.as_ref().unwrap();
+        let error_field = fields.iter().find(|f| f.name == "Error").unwrap();
+        assert_eq!(error_field.value, "Some error");
+    }
+
+    // --- Test build functions directly ---
+
+    #[test]
+    fn test_build_start_message_fields() {
+        let issue = Issue::new("1", "LIN-1", "Test Issue", "https://linear.app/1", "linear");
+        let msg = build_start_message(&issue, Some("<@user>".to_string()));
+        assert_eq!(msg.content, Some("<@user>".to_string()));
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("Processing"));
+        assert_eq!(embed.color, Some(0x3498db));
+        let fields = embed.fields.as_ref().unwrap();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "Source");
+        assert_eq!(fields[1].name, "Priority");
+        assert_eq!(fields[2].name, "Status");
+    }
+
+    #[test]
+    fn test_build_merged_message_fields() {
+        let issue = Issue::new("1", "LIN-1", "Fix", "https://linear.app/1", "linear");
+        let msg = build_merged_message(&issue, "https://github.com/org/repo/pull/1", None);
+        assert!(msg.content.is_none());
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("PR Merged"));
+        assert_eq!(embed.color, Some(0x1abc9c)); // Teal
+        let fields = embed.fields.as_ref().unwrap();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "Source");
+        assert_eq!(fields[1].name, "Issue");
+        assert_eq!(fields[2].name, "PR Link");
+    }
+
+    #[test]
+    fn test_build_closed_message_fields() {
+        let issue = Issue::new("1", "LIN-1", "Fix", "https://linear.app/1", "linear");
+        let msg = build_closed_message(&issue, "https://github.com/org/repo/pull/1", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("PR Closed"));
+        assert_eq!(embed.color, Some(0x95a5a6)); // Grey
+        let fields = embed.fields.as_ref().unwrap();
+        assert_eq!(fields.len(), 3);
+        let note = fields.iter().find(|f| f.name == "Note").unwrap();
+        assert!(note.value.contains("closed without merging"));
+    }
+
+    #[test]
+    fn test_build_status_message_truncation() {
+        let long_msg = "z".repeat(3000);
+        let msg = build_status_message(&long_msg);
+        assert!(msg.content.is_none());
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.description.as_ref().unwrap().len() <= MAX_DESCRIPTION_LENGTH);
+        assert!(embed.description.as_ref().unwrap().ends_with("..."));
+        assert_eq!(embed.color, Some(0x9b59b6));
+    }
+
+    #[test]
+    fn test_build_regression_detected_message_empty_url_becomes_none() {
+        let mut issue = Issue::new("1", "SEN-1", "Error", "", "sentry");
+        issue.set_metadata("regression_detected", true);
+        let msg = build_regression_detected_message(&issue, "fail", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed.url.is_none()); // empty URL should become None
+    }
+
+    #[test]
+    fn test_build_regression_resolved_message_empty_url_becomes_none() {
+        let issue = Issue::new("1", "SEN-1", "Error", "", "sentry");
+        let msg = build_regression_resolved_message(&issue, None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        // Empty URL becomes None
+        assert!(embed.url.is_none());
+    }
+
+    #[test]
+    fn test_build_regression_resolved_message_with_url() {
+        let issue = Issue::new("1", "SEN-1", "Error", "https://sentry.io/1", "sentry");
+        let msg = build_regression_resolved_message(&issue, Some("<@user>".to_string()));
+        assert_eq!(msg.content, Some("<@user>".to_string()));
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed
+            .title
+            .as_ref()
+            .unwrap()
+            .contains("Regression Resolved"));
+        assert_eq!(embed.color, Some(0x2ecc71));
+        assert_eq!(embed.url, Some("https://sentry.io/1".to_string()));
+        let fields = embed.fields.as_ref().unwrap();
+        let status_field = fields.iter().find(|f| f.name == "Status").unwrap();
+        assert!(status_field.value.contains("resolved after final check"));
     }
 }

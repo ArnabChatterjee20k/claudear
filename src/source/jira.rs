@@ -87,13 +87,9 @@ impl JiraHttpClient for ReqwestJiraClient {
     }
 }
 
-// ── Jira API response types ──────────────────────────────────────────
-
 #[derive(Debug, Deserialize)]
 struct JiraSearchResponse {
     issues: Vec<JiraApiIssue>,
-    #[allow(dead_code)]
-    total: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,8 +188,6 @@ struct JiraTransitionTarget {
     #[serde(rename = "statusCategory")]
     status_category: JiraStatusCategory,
 }
-
-// ── JiraSource ───────────────────────────────────────────────────────
 
 /// Jira REST API client.
 pub struct JiraSource<H: JiraHttpClient = ReqwestJiraClient> {
@@ -342,7 +336,7 @@ impl<H: JiraHttpClient> JiraSource<H> {
         let fields = "summary,description,status,priority,issuetype,labels,assignee,reporter,project,created,updated,resolution,comment";
 
         let url = format!(
-            "{}/rest/api/3/search?jql={}&maxResults={}&fields={}",
+            "{}/rest/api/3/search/jql?jql={}&maxResults={}&fields={}",
             self.config.base_url.trim_end_matches('/'),
             urlencoding::encode(&jql),
             max_results,
@@ -385,12 +379,12 @@ impl<H: JiraHttpClient> JiraSource<H> {
         issue.status = map_status(&api_issue.fields.status.status_category.key);
 
         if let Some(ref created) = api_issue.fields.created {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created) {
+            if let Some(dt) = parse_jira_datetime(created) {
                 issue.created_at = Some(dt.with_timezone(&chrono::Utc));
             }
         }
         if let Some(ref updated) = api_issue.fields.updated {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(updated) {
+            if let Some(dt) = parse_jira_datetime(updated) {
                 issue.updated_at = Some(dt.with_timezone(&chrono::Utc));
             }
         }
@@ -415,7 +409,7 @@ impl<H: JiraHttpClient> JiraSource<H> {
         }
 
         if let Some(ref labels) = api_issue.fields.labels {
-            issue.set_metadata("labels", labels.join(", "));
+            issue.set_metadata("labels", labels.clone());
         }
 
         if let Some(ref assignee) = api_issue.fields.assignee {
@@ -435,6 +429,19 @@ impl<H: JiraHttpClient> JiraSource<H> {
 
         issue
     }
+}
+
+/// Parse a Jira datetime string into a `chrono::DateTime<chrono::FixedOffset>`.
+///
+/// Jira returns timestamps like `"2024-03-15T10:00:00.000+0000"` where the
+/// timezone offset lacks the colon required by RFC 3339 (`+00:00`).  This
+/// helper tries strict RFC 3339 first and, on failure, falls back to
+/// `chrono`'s `DateTime::parse_from_str` with the `%Y-%m-%dT%H:%M:%S%.3f%z`
+/// format which accepts both `+0000` and `+00:00` offsets.
+fn parse_jira_datetime(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f%z"))
+        .ok()
 }
 
 /// Build the Authorization header value from config.
@@ -580,9 +587,9 @@ fn format_jira_context(issue: &Issue) -> String {
         context.push_str(&format!("**Reporter:** {}\n", reporter));
     }
 
-    if let Some(labels) = issue.get_metadata::<String>("labels") {
+    if let Some(labels) = issue.get_metadata::<Vec<String>>("labels") {
         if !labels.is_empty() {
-            context.push_str(&format!("**Labels:** {}\n", labels));
+            context.push_str(&format!("**Labels:** {}\n", labels.join(", ")));
         }
     }
 
@@ -664,12 +671,7 @@ impl<H: JiraHttpClient + 'static> IssueSource for JiraSource<H> {
 
         // Check trigger_labels
         if !self.config.trigger_labels.is_empty() {
-            let labels: String = issue.get_metadata("labels").unwrap_or_default();
-            let issue_labels: Vec<&str> = if labels.is_empty() {
-                vec![]
-            } else {
-                labels.split(", ").collect()
-            };
+            let issue_labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
             let has_label = self
                 .config
                 .trigger_labels
@@ -841,6 +843,137 @@ impl<H: JiraHttpClient + 'static> IssueSource for JiraSource<H> {
 
     fn is_terminal_status(&self, status: &str) -> bool {
         status == "done"
+    }
+
+    async fn create_issue(
+        &self,
+        title: &str,
+        description: &str,
+        labels: &[String],
+    ) -> Result<Issue> {
+        let project_key =
+            self.config.project_keys.first().ok_or_else(|| {
+                Error::source("jira", "No project_keys configured for create_issue")
+            })?;
+
+        let url = format!(
+            "{}/rest/api/3/issue",
+            self.config.base_url.trim_end_matches('/')
+        );
+
+        let body = serde_json::json!({
+            "fields": {
+                "project": { "key": project_key },
+                "summary": title,
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": description
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "issuetype": { "name": "Bug" },
+                "labels": labels,
+            }
+        });
+
+        let response = self.http.post(&url, &self.auth_header, body).await?;
+
+        if !response.is_success() {
+            return Err(Error::source(
+                "jira",
+                format!(
+                    "Failed to create issue ({}): {}",
+                    response.status, response.body
+                ),
+            ));
+        }
+
+        // Parse created issue response
+        #[derive(Deserialize)]
+        struct CreatedIssue {
+            id: String,
+            key: String,
+            #[serde(rename = "self")]
+            self_url: String,
+        }
+        let created: CreatedIssue = response.json()?;
+
+        let issue_url = format!(
+            "{}/browse/{}",
+            self.config.base_url.trim_end_matches('/'),
+            created.key
+        );
+
+        let issue = Issue::new(&created.id, &created.key, title, &issue_url, "jira");
+
+        tracing::info!(
+            source = "jira",
+            issue_key = %created.key,
+            "Created issue"
+        );
+        let _ = created.self_url; // suppress unused warning
+        Ok(issue)
+    }
+
+    async fn find_or_create_label(&self, name: &str) -> Result<String> {
+        // Jira labels are plain strings -- no ID resolution needed.
+        // They are auto-created when used on an issue.
+        Ok(name.to_string())
+    }
+
+    async fn list_open_issues(&self, title_filter: &str) -> Result<Vec<Issue>> {
+        let project_key = self.config.project_keys.first().ok_or_else(|| {
+            Error::source("jira", "No project_keys configured for list_open_issues")
+        })?;
+
+        let jql = if title_filter.is_empty() {
+            format!(
+                "project = \"{}\" AND resolution = Unresolved ORDER BY updated DESC",
+                Self::escape_jql_value(project_key)
+            )
+        } else {
+            format!(
+                "project = \"{}\" AND resolution = Unresolved AND summary ~ \"{}\" ORDER BY updated DESC",
+                Self::escape_jql_value(project_key),
+                Self::escape_jql_value(title_filter)
+            )
+        };
+
+        let fields = "summary,description,status,priority,issuetype,labels,assignee,reporter,project,created,updated,resolution";
+        let url = format!(
+            "{}/rest/api/3/search/jql?jql={}&maxResults=50&fields={}",
+            self.config.base_url.trim_end_matches('/'),
+            urlencoding::encode(&jql),
+            fields
+        );
+
+        let response = self.http.get(&url, &self.auth_header).await?;
+
+        if !response.is_success() {
+            return Err(Error::source(
+                "jira",
+                format!(
+                    "Failed to search issues ({}): {}",
+                    response.status, response.body
+                ),
+            ));
+        }
+
+        let search_response: JiraSearchResponse = response.json()?;
+        Ok(search_response
+            .issues
+            .into_iter()
+            .map(|i| self.map_issue(i))
+            .collect())
     }
 }
 
@@ -1026,8 +1159,6 @@ mod tests {
         .to_string()
     }
 
-    // ── Auth header tests ────────────────────────────────────────────
-
     #[test]
     fn test_basic_auth_header() {
         let config = test_config();
@@ -1046,8 +1177,6 @@ mod tests {
         let header = build_auth_header(&config);
         assert_eq!(header, "Bearer test-token");
     }
-
-    // ── JQL building tests ───────────────────────────────────────────
 
     #[test]
     fn test_build_jql_basic() {
@@ -1145,8 +1274,6 @@ mod tests {
         assert!(jql.contains("project in (\"PROJ\", \"BACKEND\")"));
     }
 
-    // ── Priority mapping tests ───────────────────────────────────────
-
     #[test]
     fn test_priority_mapping() {
         assert_eq!(map_priority(Some("Highest")), IssuePriority::Critical);
@@ -1162,8 +1289,6 @@ mod tests {
         assert_eq!(map_priority(Some("Unknown")), IssuePriority::None);
     }
 
-    // ── Status mapping tests ─────────────────────────────────────────
-
     #[test]
     fn test_status_mapping() {
         assert_eq!(map_status("new"), IssueStatus::Open);
@@ -1171,8 +1296,6 @@ mod tests {
         assert_eq!(map_status("done"), IssueStatus::Resolved);
         assert_eq!(map_status("unknown"), IssueStatus::Open);
     }
-
-    // ── ADF extraction tests ─────────────────────────────────────────
 
     #[test]
     fn test_extract_adf_text_string() {
@@ -1261,8 +1384,6 @@ mod tests {
         assert_eq!(extract_adf_text(&value), "");
     }
 
-    // ── matches_criteria tests ───────────────────────────────────────
-
     #[test]
     fn test_matches_criteria_basic_match() {
         let config = test_config();
@@ -1271,7 +1392,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
         issue.priority = IssuePriority::Medium;
 
         let result = source.matches_criteria(&issue);
@@ -1286,7 +1407,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "done");
         issue.set_metadata("status_name", "Done");
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
 
         let result = source.matches_criteria(&issue);
         assert!(!result.matches);
@@ -1300,7 +1421,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "indeterminate");
         issue.set_metadata("status_name", "In Progress");
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
 
         let result = source.matches_criteria(&issue);
         assert!(!result.matches);
@@ -1315,7 +1436,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
-        issue.set_metadata("labels", "other-label");
+        issue.set_metadata("labels", vec!["other-label".to_string()]);
 
         let result = source.matches_criteria(&issue);
         assert!(!result.matches);
@@ -1332,7 +1453,7 @@ mod tests {
         issue.set_metadata("status_name", "To Do");
         issue.set_metadata("assignee", "Test User");
         // No matching labels, but assignee matches
-        issue.set_metadata("labels", "unrelated");
+        issue.set_metadata("labels", vec!["unrelated".to_string()]);
 
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
@@ -1348,7 +1469,7 @@ mod tests {
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
         issue.set_metadata("assignee", "Test User");
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
 
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
@@ -1362,7 +1483,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
         issue.priority = IssuePriority::Critical;
 
         let result = source.matches_criteria(&issue);
@@ -1379,7 +1500,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
-        issue.set_metadata("labels", "");
+        issue.set_metadata("labels", Vec::<String>::new());
 
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
@@ -1393,13 +1514,11 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "to do"); // lowercase
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
 
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
     }
-
-    // ── fetch / get / resolve / comment tests ────────────────────────
 
     #[tokio::test]
     async fn test_fetch_issues_success() {
@@ -1414,7 +1533,7 @@ mod tests {
         let jql = source.build_jql();
         let fields = "summary,description,status,priority,issuetype,labels,assignee,reporter,project,created,updated,resolution,comment";
         let expected_url = format!(
-            "https://test.atlassian.net/rest/api/3/search?jql={}&maxResults=50&fields={}",
+            "https://test.atlassian.net/rest/api/3/search/jql?jql={}&maxResults=50&fields={}",
             urlencoding::encode(&jql),
             fields
         );
@@ -1558,8 +1677,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── Context formatting tests ─────────────────────────────────────
-
     #[test]
     fn test_format_jira_context() {
         let mut issue = Issue::new(
@@ -1577,7 +1694,10 @@ mod tests {
         issue.set_metadata("project_key", "PROJ");
         issue.set_metadata("assignee", "Jane Smith");
         issue.set_metadata("reporter", "John Doe");
-        issue.set_metadata("labels", "auto-implement, bug");
+        issue.set_metadata(
+            "labels",
+            vec!["auto-implement".to_string(), "bug".to_string()],
+        );
 
         let context = format_jira_context(&issue);
         assert!(context.contains("# Jira Issue: PROJ-1"));
@@ -1607,8 +1727,6 @@ mod tests {
         assert!(context.contains("**Title:** Fix the bug"));
         assert!(!context.contains("## Description"));
     }
-
-    // ── Issue mapping tests ──────────────────────────────────────────
 
     #[test]
     fn test_map_issue_basic() {
@@ -1661,8 +1779,6 @@ mod tests {
         assert_eq!(issue.description, Some("Test description".to_string()));
     }
 
-    // ── Terminal status tests ────────────────────────────────────────
-
     #[test]
     fn test_is_terminal_status() {
         let config = test_config();
@@ -1671,8 +1787,6 @@ mod tests {
         assert!(!source.is_terminal_status("new"));
         assert!(!source.is_terminal_status("indeterminate"));
     }
-
-    // ── Source name tests ────────────────────────────────────────────
 
     #[test]
     fn test_source_name_display() {
@@ -1699,8 +1813,6 @@ mod tests {
         let status = source.get_issue_status("PROJ-1").await.unwrap();
         assert_eq!(status, "new");
     }
-
-    // ── JQL escaping tests ────────────────────────────────────────────
 
     #[test]
     fn test_escape_jql_value_no_special_chars() {
@@ -1731,8 +1843,6 @@ mod tests {
         type JS = JiraSource<MockJiraClient>;
         assert_eq!(JS::escape_jql_value(""), "");
     }
-
-    // ── Additional JQL building tests ─────────────────────────────────
 
     #[test]
     fn test_build_jql_no_statuses() {
@@ -1824,8 +1934,6 @@ mod tests {
         assert_eq!(jql, "resolution = Unresolved ORDER BY updated DESC");
     }
 
-    // ── validate_custom_jql additional tests ──────────────────────────
-
     #[test]
     fn test_validate_custom_jql_deeply_nested() {
         type JS = JiraSource<MockJiraClient>;
@@ -1843,8 +1951,6 @@ mod tests {
         type JS = JiraSource<MockJiraClient>;
         assert!(JS::validate_custom_jql("(a) AND (b) AND (c)"));
     }
-
-    // ── Priority mapping edge cases ───────────────────────────────────
 
     #[test]
     fn test_priority_mapping_case_insensitive() {
@@ -1877,8 +1983,6 @@ mod tests {
         assert_eq!(map_priority(Some("custom-priority")), IssuePriority::None);
     }
 
-    // ── Status mapping edge cases ─────────────────────────────────────
-
     #[test]
     fn test_status_mapping_empty_string() {
         assert_eq!(map_status(""), IssueStatus::Open);
@@ -1890,8 +1994,6 @@ mod tests {
         assert_eq!(map_status("New"), IssueStatus::Open); // Not "new"
         assert_eq!(map_status("Done"), IssueStatus::Open); // Not "done"
     }
-
-    // ── ADF extraction edge cases ─────────────────────────────────────
 
     #[test]
     fn test_extract_adf_text_number() {
@@ -2076,8 +2178,6 @@ mod tests {
         assert!(text.contains("italic text"));
     }
 
-    // ── matches_criteria edge cases ───────────────────────────────────
-
     #[test]
     fn test_matches_criteria_high_priority() {
         let config = test_config();
@@ -2086,7 +2186,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
         issue.priority = IssuePriority::High;
 
         let result = source.matches_criteria(&issue);
@@ -2102,7 +2202,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
         issue.priority = IssuePriority::Low;
 
         let result = source.matches_criteria(&issue);
@@ -2118,7 +2218,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
         issue.priority = IssuePriority::None;
 
         let result = source.matches_criteria(&issue);
@@ -2167,7 +2267,7 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
-        issue.set_metadata("labels", ""); // Empty labels
+        issue.set_metadata("labels", Vec::<String>::new()); // Empty labels
 
         let result = source.matches_criteria(&issue);
         assert!(!result.matches);
@@ -2181,7 +2281,10 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "new");
         issue.set_metadata("status_name", "To Do");
-        issue.set_metadata("labels", "unrelated, claude"); // "claude" matches
+        issue.set_metadata(
+            "labels",
+            vec!["unrelated".to_string(), "claude".to_string()],
+        ); // "claude" matches
 
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
@@ -2196,13 +2299,11 @@ mod tests {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
         issue.set_metadata("status_category", "indeterminate");
         issue.set_metadata("status_name", "Any Status");
-        issue.set_metadata("labels", "auto-implement");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
 
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
     }
-
-    // ── Issue mapping edge cases ──────────────────────────────────────
 
     #[test]
     fn test_map_issue_no_priority() {
@@ -2292,8 +2393,8 @@ mod tests {
             Some("Story".to_string())
         );
         assert_eq!(
-            issue.get_metadata::<String>("labels"),
-            Some("feature, release".to_string())
+            issue.get_metadata::<Vec<String>>("labels"),
+            Some(vec!["feature".to_string(), "release".to_string()])
         );
         assert!(issue.created_at.is_some());
         assert!(issue.updated_at.is_some());
@@ -2311,8 +2412,6 @@ mod tests {
 
         assert_eq!(issue.url, "https://test.atlassian.net/browse/PROJ-1");
     }
-
-    // ── Context formatting edge cases ─────────────────────────────────
 
     #[test]
     fn test_format_jira_context_no_description() {
@@ -2354,12 +2453,10 @@ mod tests {
     #[test]
     fn test_format_jira_context_empty_labels() {
         let mut issue = Issue::new("1", "PROJ-1", "Test", "https://jira/browse/PROJ-1", "jira");
-        issue.set_metadata("labels", "");
+        issue.set_metadata("labels", Vec::<String>::new());
         let context = format_jira_context(&issue);
         assert!(!context.contains("**Labels:**"));
     }
-
-    // ── Deserialization tests ─────────────────────────────────────────
 
     #[test]
     fn test_jira_search_response_deserialization() {
@@ -2369,7 +2466,6 @@ mod tests {
         }"#;
         let resp: JiraSearchResponse = serde_json::from_str(json).unwrap();
         assert!(resp.issues.is_empty());
-        assert_eq!(resp.total, 0);
     }
 
     #[test]
@@ -2378,7 +2474,15 @@ mod tests {
         let json = format!(r#"{{"issues": [{}], "total": 1}}"#, issue_json);
         let resp: JiraSearchResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp.issues.len(), 1);
-        assert_eq!(resp.total, 1);
+    }
+
+    #[test]
+    fn test_jira_search_jql_response_without_total() {
+        // The /rest/api/3/search/jql endpoint omits the `total` field
+        let issue_json = make_jira_issue_json("10001", "PROJ-1", "Bug", "To Do", "new");
+        let json = format!(r#"{{"issues": [{}], "isLast": true}}"#, issue_json);
+        let resp: JiraSearchResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp.issues.len(), 1);
     }
 
     #[test]
@@ -2470,8 +2574,6 @@ mod tests {
         assert!(issue.fields.assignee.is_none());
     }
 
-    // ── Auth header tests ────────────────────────────────────────────
-
     #[test]
     fn test_auth_header_default_is_basic() {
         let mut config = test_config();
@@ -2492,8 +2594,6 @@ mod tests {
         let encoded = BASE64.encode("test@example.com:my-secret-token".as_bytes());
         assert_eq!(header, format!("Basic {}", encoded));
     }
-
-    // ── Resolve issue transition failure ──────────────────────────────
 
     #[tokio::test]
     async fn test_resolve_issue_transition_post_failure() {
@@ -2545,8 +2645,6 @@ mod tests {
         assert!(err.contains("Failed to fetch transitions"));
     }
 
-    // ── max_results capping ──────────────────────────────────────────
-
     #[test]
     fn test_max_results_capped_at_100() {
         let mut config = test_config();
@@ -2557,11 +2655,415 @@ mod tests {
         assert!(jql.contains("ORDER BY updated DESC"));
     }
 
-    // ── ReqwestJiraClient default ────────────────────────────────────
-
     #[test]
     fn test_reqwest_jira_client_default() {
         let client = ReqwestJiraClient::default();
         assert!(std::mem::size_of_val(&client) > 0);
+    }
+
+    #[test]
+    fn test_is_terminal_status_done() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        assert!(source.is_terminal_status("done"));
+    }
+
+    #[test]
+    fn test_is_terminal_status_not_done() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        assert!(!source.is_terminal_status("new"));
+        assert!(!source.is_terminal_status("indeterminate"));
+        assert!(!source.is_terminal_status(""));
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_returns_category() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+        let issue_json = make_jira_issue_json(
+            "101",
+            "PROJ-101",
+            "Status test",
+            "In Progress",
+            "indeterminate",
+        );
+        mock.mock_get(
+            "https://test.atlassian.net/rest/api/3/issue/PROJ-101?fields=summary,description,status,priority,issuetype,labels,assignee,reporter,project,created,updated,resolution,comment",
+            200,
+            issue_json,
+        );
+        let source = JiraSource::with_http_client(config, mock);
+        let status = source.get_issue_status("PROJ-101").await.unwrap();
+        assert_eq!(status, "indeterminate");
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_status_done_category() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+        let json = serde_json::json!({
+            "id": "200",
+            "key": "PROJ-200",
+            "self": "https://test.atlassian.net/rest/api/3/issue/200",
+            "fields": {
+                "summary": "Test",
+                "description": null,
+                "status": {
+                    "name": "Done",
+                    "statusCategory": {
+                        "key": "done",
+                        "name": "Done"
+                    }
+                },
+                "priority": null,
+                "issuetype": null,
+                "labels": null,
+                "assignee": null,
+                "reporter": null,
+                "project": {
+                    "key": "PROJ",
+                    "name": "Project"
+                },
+                "created": null,
+                "updated": null,
+                "resolution": null,
+                "comment": null
+            }
+        });
+        mock.mock_get(
+            "https://test.atlassian.net/rest/api/3/issue/PROJ-200?fields=summary,description,status,priority,issuetype,labels,assignee,reporter,project,created,updated,resolution,comment",
+            200,
+            json.to_string(),
+        );
+        let source = JiraSource::with_http_client(config, mock);
+        let status = source.get_issue_status("PROJ-200").await.unwrap();
+        assert_eq!(status, "done");
+    }
+
+    #[test]
+    fn test_jira_source_name_and_display_name() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        assert_eq!(source.name(), "jira");
+        assert_eq!(source.display_name(), "Jira");
+    }
+
+    #[tokio::test]
+    async fn test_add_comment_forbidden_error() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+        mock.mock_post(
+            "https://test.atlassian.net/rest/api/3/issue/PROJ-1/comment",
+            403,
+            r#"{"errorMessages":["Forbidden"]}"#,
+        );
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.add_comment("PROJ-1", "Test comment").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Forbidden"));
+    }
+
+    #[test]
+    fn test_format_jira_context_project_name_without_key() {
+        let mut issue = Issue::new(
+            "1",
+            "PROJ-1",
+            "Test Issue",
+            "https://test.atlassian.net/browse/PROJ-1",
+            "jira",
+        );
+        issue.set_metadata("priority_name", "High");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("issue_type", "Bug");
+        issue.set_metadata("project_name", "My Project");
+        // No project_key set
+        issue.set_metadata("assignee", "John Doe");
+        issue.set_metadata("reporter", "Jane Smith");
+        issue.set_metadata("labels", vec!["bug".to_string(), "critical".to_string()]);
+        issue.description = Some("A test description".to_string());
+
+        let context = format_jira_context(&issue);
+        assert!(context.contains("**Project:** My Project\n"));
+        assert!(context.contains("**Assignee:** John Doe"));
+        assert!(context.contains("**Reporter:** Jane Smith"));
+        assert!(context.contains("**Labels:** bug, critical"));
+        assert!(context.contains("## Description"));
+        assert!(context.contains("A test description"));
+    }
+
+    #[test]
+    fn test_format_jira_context_project_with_key() {
+        let mut issue = Issue::new(
+            "1",
+            "PROJ-1",
+            "Test Issue",
+            "https://test.atlassian.net/browse/PROJ-1",
+            "jira",
+        );
+        issue.set_metadata("project_name", "My Project");
+        issue.set_metadata("project_key", "PROJ");
+
+        let context = format_jira_context(&issue);
+        assert!(context.contains("**Project:** My Project (PROJ)"));
+    }
+
+    #[test]
+    fn test_matches_criteria_assignee_mismatch_falls_through_to_labels() {
+        let mut config = test_config();
+        config.trigger_assignee = Some("John Doe".to_string());
+        config.trigger_labels = vec!["auto-implement".to_string()];
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "url", "jira");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
+        issue.set_metadata("assignee", "Other Person");
+
+        let result = source.matches_criteria(&issue);
+        assert!(
+            result.matches,
+            "Should match because label matches even though assignee doesn't"
+        );
+    }
+
+    #[test]
+    fn test_matches_criteria_assignee_mismatch_no_labels_configured() {
+        let mut config = test_config();
+        config.trigger_assignee = Some("John Doe".to_string());
+        config.trigger_labels = vec![];
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "url", "jira");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("assignee", "Other Person");
+
+        let result = source.matches_criteria(&issue);
+        assert!(
+            !result.matches,
+            "Should not match because assignee doesn't match and no labels configured"
+        );
+    }
+
+    #[test]
+    fn test_matches_criteria_no_assignee_with_trigger_assignee() {
+        let mut config = test_config();
+        config.trigger_assignee = Some("John Doe".to_string());
+        config.trigger_labels = vec![];
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "url", "jira");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("status_category", "new");
+
+        let result = source.matches_criteria(&issue);
+        assert!(
+            !result.matches,
+            "No assignee should not match trigger_assignee"
+        );
+    }
+
+    #[test]
+    fn test_build_jql_with_issue_types_filter() {
+        let mut config = test_config();
+        config.issue_types = vec!["Bug".to_string(), "Story".to_string()];
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        assert!(jql.contains(r#"issuetype in ("Bug", "Story")"#));
+    }
+
+    #[test]
+    fn test_build_jql_with_invalid_custom_jql_ignored() {
+        let mut config = test_config();
+        config.custom_jql = Some("priority = High AND (status = Open".to_string());
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+        let jql = source.build_jql();
+        assert!(!jql.contains("priority = High"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_issue_transition_execution_error() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+        mock.mock_get(
+            "https://test.atlassian.net/rest/api/3/issue/PROJ-1/transitions",
+            200,
+            r#"{"transitions":[{"id":"31","name":"Done","to":{"statusCategory":{"key":"done","name":"Done"}}}]}"#,
+        );
+        mock.mock_post(
+            "https://test.atlassian.net/rest/api/3/issue/PROJ-1/transitions",
+            400,
+            r#"{"errorMessages":["Transition not allowed"]}"#,
+        );
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.resolve_issue("PROJ-1").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to resolve issue"));
+    }
+
+    #[test]
+    fn test_map_issue_all_optional_fields_null() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let json = serde_json::json!({
+            "id": "300",
+            "key": "PROJ-300",
+            "self": "https://test.atlassian.net/rest/api/3/issue/300",
+            "fields": {
+                "summary": "Minimal",
+                "description": null,
+                "status": {
+                    "name": "Open",
+                    "statusCategory": { "key": "new", "name": "To Do" }
+                },
+                "priority": null,
+                "issuetype": null,
+                "labels": null,
+                "assignee": null,
+                "reporter": null,
+                "project": { "key": "PROJ", "name": "Project" },
+                "created": null,
+                "updated": null,
+                "resolution": null,
+                "comment": null
+            }
+        });
+        let api_issue: JiraApiIssue = serde_json::from_value(json).unwrap();
+        let issue = source.map_issue(api_issue);
+
+        assert_eq!(issue.id, "300");
+        assert_eq!(issue.short_id, "PROJ-300");
+        assert!(issue.description.is_none());
+        assert_eq!(issue.priority, IssuePriority::None);
+        assert_eq!(issue.status, IssueStatus::Open);
+        assert!(issue.created_at.is_none());
+        assert!(issue.updated_at.is_none());
+    }
+
+    #[test]
+    fn test_map_issue_with_resolution_and_all_metadata() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let json = serde_json::json!({
+            "id": "400",
+            "key": "PROJ-400",
+            "self": "https://test.atlassian.net/rest/api/3/issue/400",
+            "fields": {
+                "summary": "Resolved Issue",
+                "description": null,
+                "status": {
+                    "name": "Done",
+                    "statusCategory": { "key": "done", "name": "Done" }
+                },
+                "priority": { "name": "High", "id": "2" },
+                "issuetype": { "name": "Task" },
+                "labels": ["feature", "backend"],
+                "assignee": {
+                    "displayName": "Jane Doe",
+                    "accountId": "abc123"
+                },
+                "reporter": { "displayName": "Bob Smith", "accountId": null },
+                "project": { "key": "PROJ", "name": "Project" },
+                "created": "2024-03-15T10:00:00.000+0000",
+                "updated": "2024-03-16T10:00:00.000+0000",
+                "resolution": { "name": "Fixed" },
+                "comment": null
+            }
+        });
+        let api_issue: JiraApiIssue = serde_json::from_value(json).unwrap();
+        let issue = source.map_issue(api_issue);
+
+        assert_eq!(issue.id, "400");
+        assert_eq!(issue.priority, IssuePriority::High);
+        assert_eq!(issue.status, IssueStatus::Resolved);
+        assert!(issue.created_at.is_some());
+        assert!(issue.updated_at.is_some());
+        assert_eq!(
+            issue.get_metadata::<String>("resolution"),
+            Some("Fixed".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("assignee"),
+            Some("Jane Doe".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("assignee_account_id"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("reporter"),
+            Some("Bob Smith".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("issue_type"),
+            Some("Task".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<Vec<String>>("labels"),
+            Some(vec!["feature".to_string(), "backend".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_jira_datetime_rfc3339_format() {
+        let dt = parse_jira_datetime("2024-03-15T10:30:00Z");
+        assert!(dt.is_some());
+    }
+
+    #[test]
+    fn test_parse_jira_datetime_offset_without_colon() {
+        let dt = parse_jira_datetime("2024-03-15T10:30:00.000+0000");
+        assert!(dt.is_some());
+    }
+
+    #[test]
+    fn test_parse_jira_datetime_invalid_string() {
+        let dt = parse_jira_datetime("not a date");
+        assert!(dt.is_none());
+    }
+
+    #[test]
+    fn test_parse_jira_datetime_empty_string() {
+        let dt = parse_jira_datetime("");
+        assert!(dt.is_none());
+    }
+
+    #[test]
+    fn test_matches_criteria_done_status_always_rejected() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "url", "jira");
+        issue.set_metadata("status_category", "done");
+        issue.set_metadata("status_name", "Done");
+
+        let result = source.matches_criteria(&issue);
+        assert!(!result.matches);
+        assert!(result.reason.contains("done status category"));
+    }
+
+    #[test]
+    fn test_matches_criteria_no_filters_matches_any_non_done() {
+        let mut config = test_config();
+        config.trigger_statuses = vec![];
+        config.trigger_labels = vec![];
+        config.trigger_assignee = None;
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "url", "jira");
+        issue.set_metadata("status_category", "new");
+
+        let result = source.matches_criteria(&issue);
+        assert!(
+            result.matches,
+            "With no filters, any non-done issue should match"
+        );
     }
 }

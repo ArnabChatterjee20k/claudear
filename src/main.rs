@@ -23,7 +23,7 @@ use claudear::{
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
     source::{DiscordSource, IssueSource, JiraSource, LinearSource, SentrySource, SlackSource},
     storage::{FixAttemptTracker, SqliteTracker},
-    types::{ActivityLogEntry, FixAttemptStatus},
+    types::{ActivityLogEntry, FixAttemptStatus, Issue},
     users::UserRegistry,
     watcher::{Watcher, WatcherOptions},
     webhook::{
@@ -274,7 +274,7 @@ enum ReposCommands {
 
         /// GitHub URL (owner/repo format)
         #[arg(long)]
-        github_url: Option<String>,
+        scm_url: Option<String>,
     },
 
     /// Sync repository index to database (paths and files)
@@ -438,6 +438,7 @@ fn init_logging(
             tracing_subscriber::registry()
                 .with(filter)
                 .with(console_layer)
+                .with(sentry::integrations::tracing::layer())
                 .init();
             return None;
         }
@@ -455,6 +456,7 @@ fn init_logging(
             .with(filter)
             .with(console_layer)
             .with(file_layer)
+            .with(sentry::integrations::tracing::layer())
             .init();
 
         tracing::info!("Logging to file: {}/claudear.log", dir.display());
@@ -464,6 +466,7 @@ fn init_logging(
         tracing_subscriber::registry()
             .with(filter)
             .with(console_layer)
+            .with(sentry::integrations::tracing::layer())
             .init();
         None
     }
@@ -753,7 +756,7 @@ fn start_regression_monitoring(
     let linear_checker: Box<dyn claudear::regression::RegressionChecker> = {
         let linear_regression_config = LinearRegressionConfig {
             github_token: github_token.clone(),
-            github_repos: config.regression.github_search_repos.clone(),
+            scm_repos: config.regression.github_search_repos.clone(),
             similarity_threshold: config.regression.similarity_threshold,
         };
         tracing::warn!(
@@ -859,6 +862,20 @@ fn start_regression_monitoring(
                                             );
                                         }
                                     }
+
+                                    // Notify regression detected
+                                    let mut regression_issue = Issue::new(
+                                        &result.issue_id,
+                                        &result.issue_id,
+                                        format!("Regression detected on check #{}", result.check_number),
+                                        "",
+                                        source,
+                                    );
+                                    regression_issue.set_metadata("regression_detected", true);
+                                    let _ = notifier.notify_failed(
+                                        &regression_issue,
+                                        &format!("Regression detected on check #{}", result.check_number),
+                                    ).await;
                                 } else if result.is_final_check {
                                     tracing::info!(
                                         component = "regression_monitor",
@@ -882,12 +899,16 @@ fn start_regression_monitoring(
                                                         "Failed to mark attempt as resolved after final regression check"
                                                     );
                                                 }
-                                                let _ = notifier
-                                                    .notify_status(&format!(
-                                                        "Regression monitoring complete: {}:{} resolved after final check",
-                                                        source_name, result.issue_id
-                                                    ))
-                                                    .await;
+                                                // Notify regression resolved
+                                                let mut resolved_issue = Issue::new(
+                                                    &result.issue_id,
+                                                    &result.issue_id,
+                                                    format!("Regression monitoring complete: {} resolved", result.issue_id),
+                                                    "",
+                                                    source_name,
+                                                );
+                                                resolved_issue.set_metadata("regression_resolved", true);
+                                                let _ = notifier.notify_completed(&resolved_issue).await;
                                             }
                                             Err(e) => {
                                                 tracing::warn!(
@@ -926,8 +947,29 @@ fn start_regression_monitoring(
     Some(handle)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
+    let _sentry_guard = sentry::init((
+        std::env::var("SENTRY_DSN").unwrap_or_default(),
+        sentry::ClientOptions {
+            release: std::env::var("SENTRY_RELEASE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(Into::into)
+                .or_else(|| sentry::release_name!()),
+            environment: std::env::var("SENTRY_ENVIRONMENT").ok().map(Into::into),
+            traces_sample_rate: 0.2,
+            ..Default::default()
+        },
+    ));
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging (must keep _guard alive for file logging to work)
@@ -1227,7 +1269,7 @@ async fn main() -> anyhow::Result<()> {
                     let repo_id = db_tracker.save_indexed_repo(
                         &repo.name,
                         &repo.path.to_string_lossy(),
-                        Some(repo.github_url.as_str()),
+                        Some(repo.scm_url.as_str()),
                         &repo.default_branch,
                         repo.files.len(),
                     )?;
@@ -1370,7 +1412,7 @@ async fn main() -> anyhow::Result<()> {
             ReposCommands::Add {
                 name,
                 path,
-                github_url,
+                scm_url,
             } => {
                 println!("\n=== Deprecated ===\n");
                 println!("The 'repos add' command is deprecated.");
@@ -1380,7 +1422,7 @@ async fn main() -> anyhow::Result<()> {
                     "\nIf you still want to manually track '{}', add the org to known_orgs",
                     name
                 );
-                let _ = (path, github_url); // Suppress unused warning
+                let _ = (path, scm_url); // Suppress unused warning
             }
 
             ReposCommands::Link {
@@ -1997,11 +2039,24 @@ async fn main() -> anyhow::Result<()> {
         // Build dependency graph for cascade support
         let relationships = if config.cascade.enabled {
             let mut rels = RepoRelationships::with_defaults();
-            let db_deps = sqlite_tracker.list_all_dependencies().unwrap_or_default();
-            for dep in db_deps {
-                if let Some(dep_type) = DependencyType::parse(&dep.dep_type) {
-                    rels.add_dependency(&dep.upstream, &dep.downstream, dep_type, None)
-                        .ok();
+            match sqlite_tracker.list_all_dependencies() {
+                Ok(db_deps) if !db_deps.is_empty() => {
+                    tracing::info!(count = db_deps.len(), "Loading dependencies from database");
+                    for dep in &db_deps {
+                        if let Some(dep_type) = DependencyType::parse(&dep.dep_type) {
+                            rels.add_dependency(&dep.upstream, &dep.downstream, dep_type, None)
+                                .ok();
+                        } else {
+                            tracing::warn!(
+                                dep_type = %dep.dep_type,
+                                "Unknown dependency type, skipping"
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to load dependencies from database");
                 }
             }
             Some(rels)
@@ -2020,6 +2075,20 @@ async fn main() -> anyhow::Result<()> {
         let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
 
         // Create watcher if polling is enabled
+        // Build generic SCM provider for PR merge detection (GitLab, etc.)
+        let scm_provider: Option<Arc<dyn ScmProvider>> =
+            if let Some(ref gitlab_config) = config.gitlab {
+                if gitlab_config.enabled && gitlab_config.token.is_some() {
+                    Some(Arc::new(claudear::gitlab::GitLabClient::new(
+                        gitlab_config.clone(),
+                    )))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         let watcher = if enable_polling {
             Some(Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
@@ -2033,6 +2102,7 @@ async fn main() -> anyhow::Result<()> {
                 issue_embedding_service: issue_embedding_service.clone(),
                 relationships,
                 github_client: github_client_for_watcher,
+                scm_provider,
                 user_registry: user_registry.clone(),
                 dry_run: false,
             })))
@@ -2507,6 +2577,7 @@ async fn main() -> anyhow::Result<()> {
             issue_embedding_service,
             relationships: None,
             github_client: None,
+            scm_provider: None,
             user_registry: user_registry.clone(),
             dry_run: false,
         });
@@ -2789,6 +2860,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     None
                 },
+                scm_provider: None,
                 user_registry: user_registry.clone(),
                 dry_run,
             });

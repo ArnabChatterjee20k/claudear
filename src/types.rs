@@ -228,6 +228,9 @@ pub struct ClaudeResult {
     /// Extracted PR URL if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    /// Succinct changelog of what was changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
     /// Error message if failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -379,10 +382,10 @@ pub struct FixAttempt {
     pub pr_url: Option<String>,
     /// GitHub repository (owner/repo format).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_repo: Option<String>,
+    pub scm_repo: Option<String>,
     /// GitHub PR number.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_pr_number: Option<i64>,
+    pub scm_pr_number: Option<i64>,
     /// Current status.
     pub status: FixAttemptStatus,
     /// Error message if failed.
@@ -741,7 +744,7 @@ pub struct PrRecord {
     /// Full PR URL.
     pub pr_url: String,
     /// GitHub repository (owner/repo).
-    pub github_repo: String,
+    pub scm_repo: String,
     /// PR number.
     pub pr_number: i64,
 
@@ -817,11 +820,11 @@ pub struct PrRecord {
 
 impl PrRecord {
     /// Create a new PR record.
-    pub fn new(pr_url: impl Into<String>, github_repo: impl Into<String>, pr_number: i64) -> Self {
+    pub fn new(pr_url: impl Into<String>, scm_repo: impl Into<String>, pr_number: i64) -> Self {
         Self {
             id: 0,
             pr_url: pr_url.into(),
-            github_repo: github_repo.into(),
+            scm_repo: scm_repo.into(),
             pr_number,
             attempt_id: None,
             issue_id: None,
@@ -852,12 +855,12 @@ impl PrRecord {
     /// Create a PR record with issue linkage.
     pub fn for_issue(
         pr_url: impl Into<String>,
-        github_repo: impl Into<String>,
+        scm_repo: impl Into<String>,
         pr_number: i64,
         issue_source: impl Into<String>,
         issue_id: impl Into<String>,
     ) -> Self {
-        let mut record = Self::new(pr_url, github_repo, pr_number);
+        let mut record = Self::new(pr_url, scm_repo, pr_number);
         record.issue_source = Some(issue_source.into());
         record.issue_id = Some(issue_id.into());
         record
@@ -1671,7 +1674,7 @@ pub struct DiffAnalysis {
     pub id: i64,
     pub attempt_id: i64,
     pub pr_url: String,
-    pub github_repo: String,
+    pub scm_repo: String,
     pub pr_number: i64,
     pub files_changed: Vec<String>,
     pub file_types: HashMap<String, usize>,
@@ -1769,7 +1772,7 @@ impl ReviewCategory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewPattern {
     pub id: i64,
-    pub github_repo: String,
+    pub scm_repo: String,
     pub category: ReviewCategory,
     pub pattern_text: String,
     pub example_comments: Vec<String>,
@@ -2038,6 +2041,7 @@ mod tests {
             success: true,
             output: "PR created".to_string(),
             pr_url: Some("https://github.com/test/pr/1".to_string()),
+            changelog: None,
             error: None,
             blocking_question: None,
             used_qa_ids: Vec::new(),
@@ -2053,6 +2057,7 @@ mod tests {
             success: false,
             output: "".to_string(),
             pr_url: None,
+            changelog: None,
             error: Some("Build failed".to_string()),
             blocking_question: None,
             used_qa_ids: Vec::new(),
@@ -2178,8 +2183,8 @@ mod tests {
             short_id: "LIN-123".to_string(),
             status: FixAttemptStatus::Pending,
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             error_message: None,
             attempted_at: chrono::Utc::now(),
             resolved_at: None,
@@ -2207,8 +2212,8 @@ mod tests {
             short_id: "LIN-123".to_string(),
             status: FixAttemptStatus::Success,
             pr_url: Some("https://github.com/org/repo/pull/42".to_string()),
-            github_repo: Some("org/repo".to_string()),
-            github_pr_number: Some(42),
+            scm_repo: Some("org/repo".to_string()),
+            scm_pr_number: Some(42),
             error_message: None,
             attempted_at: chrono::Utc::now(),
             resolved_at: None,
@@ -2224,8 +2229,8 @@ mod tests {
             attempt.pr_url,
             Some("https://github.com/org/repo/pull/42".to_string())
         );
-        assert_eq!(attempt.github_repo, Some("org/repo".to_string()));
-        assert_eq!(attempt.github_pr_number, Some(42));
+        assert_eq!(attempt.scm_repo, Some("org/repo".to_string()));
+        assert_eq!(attempt.scm_pr_number, Some(42));
     }
 
     #[test]
@@ -2387,6 +2392,7 @@ mod tests {
             success: false,
             output: "".to_string(),
             pr_url: None,
+            changelog: None,
             error: Some("No output".to_string()),
             blocking_question: None,
             used_qa_ids: Vec::new(),
@@ -2796,8 +2802,6 @@ mod tests {
         assert!(validate_issue_id("ID:with:colon").is_ok());
     }
 
-    // ── Learning types tests ──
-
     #[test]
     fn test_change_category_display() {
         assert_eq!(ChangeCategory::Tests.to_string(), "tests");
@@ -2871,7 +2875,7 @@ mod tests {
             id: 1,
             attempt_id: 42,
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
-            github_repo: "org/repo".to_string(),
+            scm_repo: "org/repo".to_string(),
             pr_number: 1,
             files_changed: vec!["src/main.rs".to_string()],
             file_types: {
@@ -2982,8 +2986,6 @@ mod tests {
         assert!(parsed.is_active);
     }
 
-    // ── Edge case tests ──
-
     #[test]
     fn test_validate_issue_id_exactly_max_length() {
         let id = "a".repeat(MAX_ISSUE_ID_LENGTH);
@@ -3040,8 +3042,8 @@ mod tests {
             source: "sentry".into(),
             attempted_at: Utc::now(),
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             status: FixAttemptStatus::Pending,
             error_message: None,
             merged_at: None,
@@ -3064,8 +3066,8 @@ mod tests {
             source: "linear".into(),
             attempted_at: Utc::now(),
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             status: FixAttemptStatus::Pending,
             error_message: None,
             merged_at: None,
@@ -3088,8 +3090,8 @@ mod tests {
             source: "linear".into(),
             attempted_at: Utc::now(),
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             status: FixAttemptStatus::Pending,
             error_message: None,
             merged_at: None,
@@ -3112,8 +3114,8 @@ mod tests {
             source: "linear".into(),
             attempted_at: Utc::now(),
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             status: FixAttemptStatus::Pending,
             error_message: None,
             merged_at: None,
@@ -3136,8 +3138,8 @@ mod tests {
             source: "linear".into(),
             attempted_at: Utc::now(),
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             status: FixAttemptStatus::Pending,
             error_message: None,
             merged_at: None,
@@ -3160,8 +3162,8 @@ mod tests {
             source: "linear".into(),
             attempted_at: Utc::now(),
             pr_url: None,
-            github_repo: None,
-            github_pr_number: None,
+            scm_repo: None,
+            scm_pr_number: None,
             status: FixAttemptStatus::Pending,
             error_message: None,
             merged_at: None,
@@ -3197,8 +3199,8 @@ mod tests {
                 source: "linear".into(),
                 attempted_at: Utc::now(),
                 pr_url: None,
-                github_repo: None,
-                github_pr_number: None,
+                scm_repo: None,
+                scm_pr_number: None,
                 status: FixAttemptStatus::Pending,
                 error_message: None,
                 merged_at: None,
@@ -3653,7 +3655,7 @@ mod tests {
     fn test_review_pattern_serde() {
         let p = ReviewPattern {
             id: 1,
-            github_repo: "org/repo".into(),
+            scm_repo: "org/repo".into(),
             category: ReviewCategory::MissingTests,
             pattern_text: "Add tests".into(),
             example_comments: vec!["please add tests".into()],
@@ -3700,5 +3702,1212 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         let parsed: QaMatch = serde_json::from_str(&json).unwrap();
         assert!((parsed.final_score - 0.97).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_blast_radius_display_all_variants() {
+        assert_eq!(BlastRadius::Cosmetic.to_string(), "cosmetic");
+        assert_eq!(BlastRadius::Test.to_string(), "test");
+        assert_eq!(BlastRadius::Peripheral.to_string(), "peripheral");
+        assert_eq!(BlastRadius::Core.to_string(), "core");
+        assert_eq!(BlastRadius::Infrastructure.to_string(), "infrastructure");
+        assert_eq!(BlastRadius::Critical.to_string(), "critical");
+    }
+
+    #[test]
+    fn test_blast_radius_default() {
+        assert_eq!(BlastRadius::default(), BlastRadius::Core);
+    }
+
+    #[test]
+    fn test_blast_radius_ordering() {
+        assert!(BlastRadius::Critical > BlastRadius::Infrastructure);
+        assert!(BlastRadius::Infrastructure > BlastRadius::Core);
+        assert!(BlastRadius::Core > BlastRadius::Peripheral);
+        assert!(BlastRadius::Peripheral > BlastRadius::Test);
+        assert!(BlastRadius::Test > BlastRadius::Cosmetic);
+    }
+
+    #[test]
+    fn test_blast_radius_serde_all_variants() {
+        for br in [
+            BlastRadius::Cosmetic,
+            BlastRadius::Test,
+            BlastRadius::Peripheral,
+            BlastRadius::Core,
+            BlastRadius::Infrastructure,
+            BlastRadius::Critical,
+        ] {
+            let json = serde_json::to_string(&br).unwrap();
+            let parsed: BlastRadius = serde_json::from_str(&json).unwrap();
+            assert_eq!(br, parsed);
+            // Verify snake_case serialization matches display
+            assert_eq!(json, format!("\"{}\"", br));
+        }
+    }
+
+    #[test]
+    fn test_blast_radius_equality_and_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(BlastRadius::Core);
+        set.insert(BlastRadius::Core);
+        assert_eq!(set.len(), 1);
+        set.insert(BlastRadius::Critical);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_severity_score_default() {
+        let s = SeverityScore::default();
+        assert_eq!(s.score, 0.0);
+        assert_eq!(s.severity_component, 0.0);
+        assert_eq!(s.frequency_component, 0.0);
+        assert_eq!(s.regression_component, 0.0);
+        assert_eq!(s.blast_radius_component, 0.0);
+        assert_eq!(s.cluster_boost, 0.0);
+    }
+
+    #[test]
+    fn test_severity_score_serde_roundtrip() {
+        let s = SeverityScore {
+            score: 0.95,
+            severity_component: 0.8,
+            frequency_component: 0.7,
+            regression_component: 0.6,
+            blast_radius_component: 0.5,
+            cluster_boost: 1.0,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: SeverityScore = serde_json::from_str(&json).unwrap();
+        assert!((parsed.score - 0.95).abs() < f64::EPSILON);
+        assert!((parsed.cluster_boost - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_suppression_field_serde_simple_variants() {
+        for field in [
+            SuppressionField::Title,
+            SuppressionField::Description,
+            SuppressionField::Source,
+            SuppressionField::Culprit,
+            SuppressionField::Filename,
+            SuppressionField::ErrorType,
+            SuppressionField::Project,
+            SuppressionField::Labels,
+        ] {
+            let json = serde_json::to_string(&field).unwrap();
+            let parsed: SuppressionField = serde_json::from_str(&json).unwrap();
+            assert_eq!(field, parsed);
+        }
+    }
+
+    #[test]
+    fn test_suppression_field_metadata_variant_serde() {
+        let field = SuppressionField::Metadata("custom_key".to_string());
+        let json = serde_json::to_string(&field).unwrap();
+        let parsed: SuppressionField = serde_json::from_str(&json).unwrap();
+        assert_eq!(field, parsed);
+        if let SuppressionField::Metadata(key) = parsed {
+            assert_eq!(key, "custom_key");
+        } else {
+            panic!("Expected Metadata variant");
+        }
+    }
+
+    #[test]
+    fn test_suppression_match_mode_default() {
+        assert_eq!(
+            SuppressionMatchMode::default(),
+            SuppressionMatchMode::Contains
+        );
+    }
+
+    #[test]
+    fn test_suppression_match_mode_serde_all_variants() {
+        for mode in [
+            SuppressionMatchMode::Contains,
+            SuppressionMatchMode::Exact,
+            SuppressionMatchMode::Regex,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: SuppressionMatchMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, parsed);
+        }
+    }
+
+    #[test]
+    fn test_suppression_rule_serde_roundtrip() {
+        let rule = SuppressionRule {
+            name: "ignore-flaky".to_string(),
+            field: SuppressionField::Title,
+            pattern: "flaky test".to_string(),
+            match_mode: SuppressionMatchMode::Contains,
+            sources: vec!["sentry".to_string()],
+            reason: "known flaky".to_string(),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let parsed: SuppressionRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "ignore-flaky");
+        assert_eq!(parsed.field, SuppressionField::Title);
+        assert_eq!(parsed.match_mode, SuppressionMatchMode::Contains);
+        assert_eq!(parsed.sources.len(), 1);
+    }
+
+    #[test]
+    fn test_suppression_rule_empty_sources() {
+        let rule = SuppressionRule {
+            name: "all-sources".to_string(),
+            field: SuppressionField::ErrorType,
+            pattern: "OutOfMemory".to_string(),
+            match_mode: SuppressionMatchMode::Exact,
+            sources: vec![],
+            reason: "OOM not fixable".to_string(),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let parsed: SuppressionRule = serde_json::from_str(&json).unwrap();
+        assert!(parsed.sources.is_empty());
+    }
+
+    #[test]
+    fn test_suppression_result_suppressed() {
+        let r = SuppressionResult {
+            suppressed: true,
+            matched_rule: Some("rule-1".to_string()),
+            reason: Some("known flaky".to_string()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: SuppressionResult = serde_json::from_str(&json).unwrap();
+        assert!(parsed.suppressed);
+        assert_eq!(parsed.matched_rule, Some("rule-1".to_string()));
+    }
+
+    #[test]
+    fn test_suppression_result_not_suppressed() {
+        let r = SuppressionResult {
+            suppressed: false,
+            matched_rule: None,
+            reason: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: SuppressionResult = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.suppressed);
+        assert!(parsed.matched_rule.is_none());
+    }
+
+    #[test]
+    fn test_content_cluster_serde_roundtrip() {
+        let c = ContentCluster {
+            id: 1,
+            cluster_key: "TypeError::main".to_string(),
+            source: "sentry".to_string(),
+            representative_issue_id: "issue-1".to_string(),
+            issue_ids: vec!["issue-1".into(), "issue-2".into()],
+            error_type: Some("TypeError".to_string()),
+            culprit: Some("app.main".to_string()),
+            avg_similarity: 0.92,
+            status: "active".to_string(),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let parsed: ContentCluster = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cluster_key, "TypeError::main");
+        assert_eq!(parsed.issue_ids.len(), 2);
+        assert!((parsed.avg_similarity - 0.92).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_prioritised_issue_serde_roundtrip() {
+        let pi = PrioritisedIssue {
+            issue: Issue::new("id", "short", "title", "url", "source"),
+            match_result: MatchResult::matched("reason", MatchPriority::High),
+            severity_score: SeverityScore::default(),
+            blast_radius: BlastRadius::Core,
+            cluster_key: Some("cluster-1".to_string()),
+        };
+        let json = serde_json::to_string(&pi).unwrap();
+        let parsed: PrioritisedIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.issue.id, "id");
+        assert!(parsed.match_result.matches);
+        assert_eq!(parsed.blast_radius, BlastRadius::Core);
+        assert_eq!(parsed.cluster_key, Some("cluster-1".to_string()));
+    }
+
+    #[test]
+    fn test_prioritised_issue_no_cluster_key() {
+        let pi = PrioritisedIssue {
+            issue: Issue::new("id", "short", "title", "url", "source"),
+            match_result: MatchResult::not_matched("no match"),
+            severity_score: SeverityScore::default(),
+            blast_radius: BlastRadius::Cosmetic,
+            cluster_key: None,
+        };
+        let json = serde_json::to_string(&pi).unwrap();
+        assert!(!json.contains("cluster_key"));
+    }
+
+    #[test]
+    fn test_issue_embedding_from_issue_basic() {
+        let issue = Issue::new("id-1", "SHORT-1", "A title", "https://url", "linear");
+        let emb = IssueEmbedding::from_issue(&issue);
+        assert_eq!(emb.source, "linear");
+        assert_eq!(emb.issue_id, "id-1");
+        assert_eq!(emb.short_id, Some("SHORT-1".to_string()));
+        assert_eq!(emb.title, Some("A title".to_string()));
+        assert_eq!(emb.url, Some("https://url".to_string()));
+        assert_eq!(emb.priority, Some("none".to_string()));
+        assert_eq!(emb.status, Some("open".to_string()));
+        assert!(emb.embedding.is_none());
+        assert!(emb.labels.is_none());
+    }
+
+    #[test]
+    fn test_issue_embedding_from_issue_with_labels() {
+        let mut issue = Issue::new("id-2", "SHORT-2", "Title", "url", "sentry");
+        issue.set_metadata("labels", vec!["bug", "urgent"]);
+        let emb = IssueEmbedding::from_issue(&issue);
+        assert!(emb.labels.is_some());
+        let labels_str = emb.labels.unwrap();
+        assert!(labels_str.contains("bug"));
+        assert!(labels_str.contains("urgent"));
+    }
+
+    #[test]
+    fn test_issue_embedding_from_issue_empty_labels() {
+        let mut issue = Issue::new("id-3", "SHORT-3", "Title", "url", "sentry");
+        issue.set_metadata("labels", Vec::<String>::new());
+        let emb = IssueEmbedding::from_issue(&issue);
+        assert!(emb.labels.is_none());
+    }
+
+    #[test]
+    fn test_issue_embedding_from_issue_with_description() {
+        let mut issue = Issue::new("id-4", "SHORT-4", "Title", "url", "linear");
+        issue.description = Some("Detailed description".to_string());
+        let emb = IssueEmbedding::from_issue(&issue);
+        assert_eq!(emb.description, Some("Detailed description".to_string()));
+    }
+
+    #[test]
+    fn test_issue_embedding_from_issue_with_priority_and_status() {
+        let mut issue = Issue::new("id-5", "SHORT-5", "Title", "url", "linear");
+        issue.priority = IssuePriority::Critical;
+        issue.status = IssueStatus::InProgress;
+        let emb = IssueEmbedding::from_issue(&issue);
+        assert_eq!(emb.priority, Some("critical".to_string()));
+        assert_eq!(emb.status, Some("in_progress".to_string()));
+    }
+
+    #[test]
+    fn test_issue_embedding_from_issue_with_timestamps() {
+        let now = Utc::now();
+        let mut issue = Issue::new("id-6", "SHORT-6", "Title", "url", "linear");
+        issue.created_at = Some(now);
+        issue.updated_at = Some(now);
+        let emb = IssueEmbedding::from_issue(&issue);
+        assert_eq!(emb.created_at, now);
+        assert_eq!(emb.updated_at, Some(now));
+    }
+
+    #[test]
+    fn test_issue_embedding_new_with_vector() {
+        let vec = vec![0.1, 0.2, 0.3, 0.4];
+        let emb = IssueEmbedding::new("sentry", "issue-1", vec.clone());
+        assert_eq!(emb.source, "sentry");
+        assert_eq!(emb.issue_id, "issue-1");
+        assert_eq!(emb.embedding, Some(vec));
+        assert_eq!(emb.id, 0);
+        assert!(emb.short_id.is_none());
+        assert!(emb.title.is_none());
+    }
+
+    #[test]
+    fn test_pr_review_record_new() {
+        let r = PrReviewRecord::new("https://github.com/org/repo/pull/1");
+        assert_eq!(r.id, 0);
+        assert_eq!(r.pr_url, "https://github.com/org/repo/pull/1");
+        assert!(r.attempt_id.is_none());
+        assert!(r.reviewer.is_none());
+        assert!(r.review_state.is_none());
+        assert!(r.submitted_at.is_none());
+        assert!(r.body.is_none());
+        assert!(r.sentiment.is_none());
+        assert!(r.actionable_feedback.is_none());
+    }
+
+    #[test]
+    fn test_pr_review_record_serde() {
+        let mut r = PrReviewRecord::new("https://github.com/org/repo/pull/1");
+        r.reviewer = Some("alice".to_string());
+        r.review_state = Some("approved".to_string());
+        r.body = Some("LGTM".to_string());
+        r.sentiment = Some("positive".to_string());
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: PrReviewRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.reviewer, Some("alice".to_string()));
+        assert_eq!(parsed.review_state, Some("approved".to_string()));
+    }
+
+    #[test]
+    fn test_ask_request_serde() {
+        let q = BlockingQuestion {
+            question: "Which API?".into(),
+            context: None,
+            options: vec!["REST".into()],
+            why: None,
+        };
+        let req = AskRequest {
+            correlation_id: "corr-1".into(),
+            source: "linear".into(),
+            repo: Some("org/repo".into()),
+            issue_id: "issue-1".into(),
+            short_id: "LIN-1".into(),
+            question: q,
+            asked_at: Utc::now(),
+            target_discord_id: Some("123".into()),
+            target_email: None,
+            target_slack_id: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: AskRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.correlation_id, "corr-1");
+        assert_eq!(parsed.question.options.len(), 1);
+    }
+
+    #[test]
+    fn test_ask_delivery_serde() {
+        let d = AskDelivery {
+            channel: "discord".into(),
+            target: Some("user-123".into()),
+            message_id: Some("msg-456".into()),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let parsed: AskDelivery = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.channel, "discord");
+        assert_eq!(parsed.target, Some("user-123".into()));
+    }
+
+    #[test]
+    fn test_ask_delivery_minimal() {
+        let d = AskDelivery {
+            channel: "email".into(),
+            target: None,
+            message_id: None,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("target"));
+        assert!(!json.contains("message_id"));
+    }
+
+    #[test]
+    fn test_ask_reply_serde() {
+        let r = AskReply {
+            correlation_id: "corr-1".into(),
+            channel: "discord".into(),
+            responder: Some("user-1".into()),
+            answer: "Use REST".into(),
+            replied_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: AskReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.answer, "Use REST");
+        assert_eq!(parsed.correlation_id, "corr-1");
+    }
+
+    #[test]
+    fn test_issue_type_display_all_variants() {
+        assert_eq!(IssueType::SentryIssue.to_string(), "sentry_issue");
+        assert_eq!(IssueType::LinearBug.to_string(), "linear_bug");
+        assert_eq!(IssueType::GitLabIssue.to_string(), "gitlab_issue");
+        assert_eq!(IssueType::JiraIssue.to_string(), "jira_issue");
+    }
+
+    #[test]
+    fn test_issue_type_from_str_all_variants() {
+        assert_eq!(
+            "sentry_issue".parse::<IssueType>().unwrap(),
+            IssueType::SentryIssue
+        );
+        assert_eq!(
+            "linear_bug".parse::<IssueType>().unwrap(),
+            IssueType::LinearBug
+        );
+        assert_eq!(
+            "gitlab_issue".parse::<IssueType>().unwrap(),
+            IssueType::GitLabIssue
+        );
+        assert_eq!(
+            "jira_issue".parse::<IssueType>().unwrap(),
+            IssueType::JiraIssue
+        );
+    }
+
+    #[test]
+    fn test_issue_type_source_name_all_variants() {
+        assert_eq!(IssueType::SentryIssue.source_name(), "sentry");
+        assert_eq!(IssueType::LinearBug.source_name(), "linear");
+        assert_eq!(IssueType::GitLabIssue.source_name(), "gitlab");
+        assert_eq!(IssueType::JiraIssue.source_name(), "jira");
+    }
+
+    #[test]
+    fn test_issue_type_serde_all_four_variants() {
+        for issue_type in [
+            IssueType::SentryIssue,
+            IssueType::LinearBug,
+            IssueType::GitLabIssue,
+            IssueType::JiraIssue,
+        ] {
+            let json = serde_json::to_string(&issue_type).unwrap();
+            let parsed: IssueType = serde_json::from_str(&json).unwrap();
+            assert_eq!(issue_type, parsed);
+        }
+    }
+
+    #[test]
+    fn test_issue_type_display_parse_roundtrip_all_variants() {
+        for issue_type in [
+            IssueType::SentryIssue,
+            IssueType::LinearBug,
+            IssueType::GitLabIssue,
+            IssueType::JiraIssue,
+        ] {
+            let parsed: IssueType = issue_type.to_string().parse().unwrap();
+            assert_eq!(issue_type, parsed);
+        }
+    }
+
+    #[test]
+    fn test_time_savings_default() {
+        let ts = TimeSavings::default();
+        assert_eq!(ts.merged_count, 0);
+        assert_eq!(ts.hours_saved, 0.0);
+        assert_eq!(ts.cost_saved, 0.0);
+        assert!(ts.period.is_empty());
+    }
+
+    #[test]
+    fn test_time_savings_serde() {
+        let ts = TimeSavings {
+            merged_count: 10,
+            hours_saved: 50.5,
+            cost_saved: 5050.0,
+            period: "2026-01".to_string(),
+        };
+        let json = serde_json::to_string(&ts).unwrap();
+        let parsed: TimeSavings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.merged_count, 10);
+        assert!((parsed.hours_saved - 50.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cost_estimate_default() {
+        let ce = CostEstimate::default();
+        assert_eq!(ce.total_cost, 0.0);
+        assert_eq!(ce.avg_cost_per_fix, 0.0);
+        assert_eq!(ce.fix_count, 0);
+        assert!(ce.cost_source.is_empty());
+        assert!(ce.period.is_empty());
+    }
+
+    #[test]
+    fn test_cost_estimate_serde() {
+        let ce = CostEstimate {
+            total_cost: 123.45,
+            avg_cost_per_fix: 12.34,
+            fix_count: 10,
+            cost_source: "claude_cli".to_string(),
+            period: "2026-01".to_string(),
+        };
+        let json = serde_json::to_string(&ce).unwrap();
+        let parsed: CostEstimate = serde_json::from_str(&json).unwrap();
+        assert!((parsed.total_cost - 123.45).abs() < f64::EPSILON);
+        assert_eq!(parsed.cost_source, "claude_cli");
+    }
+
+    #[test]
+    fn test_mttr_data_point_serde() {
+        let dp = MttrDataPoint {
+            period_start: "2026-01-01".to_string(),
+            mttr_minutes: 45.5,
+            sample_count: 12,
+        };
+        let json = serde_json::to_string(&dp).unwrap();
+        let parsed: MttrDataPoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.period_start, "2026-01-01");
+        assert!((parsed.mttr_minutes - 45.5).abs() < f64::EPSILON);
+        assert_eq!(parsed.sample_count, 12);
+    }
+
+    #[test]
+    fn test_repo_leaderboard_entry_serde() {
+        let entry = RepoLeaderboardEntry {
+            repo: "org/repo".to_string(),
+            total: 100,
+            success_rate: 0.85,
+            merge_rate: 0.72,
+            avg_time_to_merge_mins: Some(120.0),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: RepoLeaderboardEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.repo, "org/repo");
+        assert!((parsed.success_rate - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_rejection_reason_default() {
+        let rr = RejectionReason::default();
+        assert!(rr.category.is_empty());
+        assert_eq!(rr.count, 0);
+    }
+
+    #[test]
+    fn test_rejection_reason_serde() {
+        let rr = RejectionReason {
+            category: "missing_tests".to_string(),
+            count: 5,
+        };
+        let json = serde_json::to_string(&rr).unwrap();
+        let parsed: RejectionReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.category, "missing_tests");
+        assert_eq!(parsed.count, 5);
+    }
+
+    #[test]
+    fn test_issue_cluster_member_serde() {
+        let m = IssueClusterMember {
+            cluster_id: 42,
+            issue_id: "issue-99".to_string(),
+            arrived_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: IssueClusterMember = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cluster_id, 42);
+        assert_eq!(parsed.issue_id, "issue-99");
+    }
+
+    #[test]
+    fn test_review_category_classified_variants() {
+        let variants = ReviewCategory::classified_variants();
+        assert_eq!(variants.len(), 7);
+        assert!(!variants.contains(&ReviewCategory::Other));
+        assert!(variants.contains(&ReviewCategory::MissingTests));
+        assert!(variants.contains(&ReviewCategory::StyleIssue));
+        assert!(variants.contains(&ReviewCategory::WrongApproach));
+        assert!(variants.contains(&ReviewCategory::Incomplete));
+        assert!(variants.contains(&ReviewCategory::Security));
+        assert!(variants.contains(&ReviewCategory::Performance));
+        assert!(variants.contains(&ReviewCategory::Documentation));
+    }
+
+    #[test]
+    fn test_claude_execution_serde_roundtrip() {
+        let mut exec = ClaudeExecution::new();
+        exec.attempt_id = Some(42);
+        exec.model_version = Some("claude-3".to_string());
+        exec.total_cost_usd = Some(0.05);
+        exec.input_tokens = Some(1000);
+        exec.output_tokens = Some(500);
+        let json = serde_json::to_string(&exec).unwrap();
+        let parsed: ClaudeExecution = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.attempt_id, Some(42));
+        assert_eq!(parsed.model_version, Some("claude-3".to_string()));
+        assert!((parsed.total_cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_claude_execution_new_defaults() {
+        let exec = ClaudeExecution::new();
+        assert_eq!(exec.id, 0);
+        assert!(exec.attempt_id.is_none());
+        assert!(exec.completed_at.is_none());
+        assert!(exec.duration_secs.is_none());
+        assert!(exec.exit_code.is_none());
+        assert!(!exec.timed_out);
+        assert!(exec.stdout_preview.is_none());
+        assert!(exec.stderr_preview.is_none());
+        assert!(exec.stdout_log_path.is_none());
+        assert!(exec.stderr_log_path.is_none());
+        assert!(exec.event_log_path.is_none());
+        assert!(exec.prompt_used.is_none());
+        assert!(exec.prompt_hash.is_none());
+        assert!(exec.model_version.is_none());
+        assert!(exec.working_directory.is_none());
+        assert!(exec.git_branch.is_none());
+        assert!(exec.git_commit_before.is_none());
+        assert!(exec.git_commit_after.is_none());
+        assert!(exec.files_changed.is_none());
+        assert!(exec.lines_added.is_none());
+        assert!(exec.lines_removed.is_none());
+        assert!(exec.total_cost_usd.is_none());
+        assert!(exec.num_turns.is_none());
+        assert!(exec.session_id.is_none());
+        assert!(exec.duration_api_ms.is_none());
+        assert!(exec.input_tokens.is_none());
+        assert!(exec.output_tokens.is_none());
+        assert!(exec.cache_read_input_tokens.is_none());
+        assert!(exec.cache_creation_input_tokens.is_none());
+    }
+
+    #[test]
+    fn test_fix_attempt_serde_roundtrip() {
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "123".into(),
+            short_id: "LIN-123".into(),
+            source: "linear".into(),
+            attempted_at: Utc::now(),
+            pr_url: Some("https://github.com/org/repo/pull/42".into()),
+            scm_repo: Some("org/repo".into()),
+            scm_pr_number: Some(42),
+            status: FixAttemptStatus::Success,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 2,
+            last_retry_at: Some(Utc::now()),
+            issue_labels: vec!["bug".into(), "urgent".into()],
+            parent_attempt_id: Some(0),
+            cascade_repo: Some("org/other-repo".into()),
+        };
+        let json = serde_json::to_string(&attempt).unwrap();
+        let parsed: FixAttempt = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, 1);
+        assert_eq!(parsed.source, "linear");
+        assert_eq!(parsed.retry_count, 2);
+        assert_eq!(parsed.issue_labels.len(), 2);
+        assert_eq!(parsed.cascade_repo, Some("org/other-repo".into()));
+        assert_eq!(parsed.parent_attempt_id, Some(0));
+    }
+
+    #[test]
+    fn test_claude_result_with_blocking_question() {
+        let result = ClaudeResult {
+            success: false,
+            output: "Blocked".to_string(),
+            pr_url: None,
+            changelog: None,
+            error: None,
+            blocking_question: Some(BlockingQuestion {
+                question: "Which database?".into(),
+                context: Some("Need to choose".into()),
+                options: vec!["PostgreSQL".into(), "MySQL".into()],
+                why: Some("Architecture decision".into()),
+            }),
+            used_qa_ids: vec![1, 2, 3],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: ClaudeResult = serde_json::from_str(&json).unwrap();
+        assert!(parsed.blocking_question.is_some());
+        let bq = parsed.blocking_question.unwrap();
+        assert_eq!(bq.question, "Which database?");
+        assert_eq!(bq.options.len(), 2);
+        assert_eq!(parsed.used_qa_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_claude_result_serde_skip_none_fields() {
+        let result = ClaudeResult {
+            success: true,
+            output: "ok".to_string(),
+            pr_url: None,
+            changelog: None,
+            error: None,
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("pr_url"));
+        assert!(!json.contains("error"));
+        assert!(!json.contains("blocking_question"));
+    }
+
+    #[test]
+    fn test_pr_analytics_serde_with_data() {
+        let mut by_repo = HashMap::new();
+        by_repo.insert("org/repo".to_string(), 25i64);
+        let a = PrAnalytics {
+            total: 50,
+            open: 10,
+            merged: 30,
+            closed: 10,
+            avg_time_to_first_review_mins: Some(30.0),
+            avg_time_to_merge_mins: Some(120.0),
+            avg_review_cycles: Some(1.5),
+            merge_rate: Some(0.75),
+            by_repo,
+            avg_time_to_pr_mins: Some(15.0),
+            rejection_reasons: vec![RejectionReason {
+                category: "missing_tests".into(),
+                count: 3,
+            }],
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let parsed: PrAnalytics = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total, 50);
+        assert_eq!(parsed.by_repo.get("org/repo"), Some(&25));
+        assert_eq!(parsed.rejection_reasons.len(), 1);
+    }
+
+    #[test]
+    fn test_analytics_summary_serde_with_data() {
+        let mut sr_by_source = HashMap::new();
+        sr_by_source.insert("sentry".to_string(), 0.9);
+        let s = AnalyticsSummary {
+            success_rate: 0.85,
+            total_processed: 100,
+            total_successful: 85,
+            total_merged: 60,
+            avg_processing_time_secs: Some(120.0),
+            avg_time_to_merge_hours: Some(2.5),
+            most_common_error: Some("build_failure".to_string()),
+            success_rate_by_source: sr_by_source,
+            avg_time_to_pr_mins: Some(10.0),
+            cost_estimate: Some(CostEstimate {
+                total_cost: 100.0,
+                avg_cost_per_fix: 1.0,
+                fix_count: 100,
+                cost_source: "cli".into(),
+                period: "2026-01".into(),
+            }),
+            mttr_trend: vec![MttrDataPoint {
+                period_start: "2026-01-01".into(),
+                mttr_minutes: 30.0,
+                sample_count: 10,
+            }],
+            repo_leaderboard: vec![RepoLeaderboardEntry {
+                repo: "org/repo".into(),
+                total: 50,
+                success_rate: 0.9,
+                merge_rate: 0.8,
+                avg_time_to_merge_mins: Some(60.0),
+            }],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: AnalyticsSummary = serde_json::from_str(&json).unwrap();
+        assert!((parsed.success_rate - 0.85).abs() < f64::EPSILON);
+        assert_eq!(parsed.repo_leaderboard.len(), 1);
+        assert!(parsed.cost_estimate.is_some());
+    }
+
+    #[test]
+    fn test_extracted_learnings_populated() {
+        let learnings = ExtractedLearnings {
+            root_cause: Some("Null pointer dereference".to_string()),
+            files_modified: vec!["src/main.rs".into(), "src/lib.rs".into()],
+            strategy_used: Some("TDD approach".to_string()),
+            tests_added: true,
+            key_decisions: vec!["Used Option instead of unwrap".into()],
+        };
+        let json = serde_json::to_string(&learnings).unwrap();
+        let parsed: ExtractedLearnings = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.root_cause,
+            Some("Null pointer dereference".to_string())
+        );
+        assert_eq!(parsed.files_modified.len(), 2);
+        assert!(parsed.tests_added);
+        assert_eq!(parsed.key_decisions.len(), 1);
+    }
+
+    #[test]
+    fn test_qa_knowledge_entry_full_serde() {
+        let entry = QaKnowledgeEntry {
+            id: 42,
+            source: "linear".into(),
+            repo: Some("org/repo".into()),
+            issue_id: "issue-1".into(),
+            short_id: "LIN-1".into(),
+            question_text: "How to deploy?".into(),
+            question_norm: "how to deploy".into(),
+            question_embedding: Some(vec![0.1, 0.2, 0.3]),
+            answer_text: "Run deploy.sh".into(),
+            answer_norm: "run deploy.sh".into(),
+            answer_embedding: Some(vec![0.4, 0.5, 0.6]),
+            channel: "discord".into(),
+            responder: Some("alice".into()),
+            correlation_id: "corr-42".into(),
+            asked_at: Utc::now(),
+            answered_at: Utc::now(),
+            success_count: 10,
+            failure_count: 2,
+            last_used_at: Some(Utc::now()),
+            metadata: Some(serde_json::json!({"version": 2})),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: QaKnowledgeEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, 42);
+        assert_eq!(parsed.repo, Some("org/repo".into()));
+        assert!(parsed.question_embedding.is_some());
+        assert_eq!(parsed.success_count, 10);
+        assert!(parsed.metadata.is_some());
+    }
+
+    #[test]
+    fn test_error_pattern_serde_roundtrip() {
+        let mut pattern = ErrorPattern::new("hash123");
+        pattern.error_type = Some("build_failure".to_string());
+        pattern.error_message = Some("compilation error".to_string());
+        pattern.sources = Some(vec!["linear".into(), "sentry".into()]);
+        pattern.example_issue_ids = Some(vec!["issue-1".into()]);
+        pattern.resolution_hints = Some("Check Cargo.toml".to_string());
+        let json = serde_json::to_string(&pattern).unwrap();
+        let parsed: ErrorPattern = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pattern_hash, "hash123");
+        assert_eq!(parsed.error_type, Some("build_failure".to_string()));
+        assert_eq!(parsed.sources.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_pr_record_new_defaults() {
+        let pr = PrRecord::new("https://github.com/org/repo/pull/5", "org/repo", 5);
+        assert_eq!(pr.id, 0);
+        assert_eq!(pr.pr_number, 5);
+        assert_eq!(pr.status, "open");
+        assert_eq!(pr.approvals_count, 0);
+        assert_eq!(pr.changes_requested_count, 0);
+        assert_eq!(pr.comments_count, 0);
+        assert_eq!(pr.review_cycles, 0);
+        assert!(pr.attempt_id.is_none());
+        assert!(pr.issue_id.is_none());
+        assert!(pr.issue_source.is_none());
+        assert!(pr.title.is_none());
+        assert!(pr.description.is_none());
+        assert!(pr.author.is_none());
+        assert!(pr.head_branch.is_none());
+        assert!(pr.base_branch.is_none());
+        assert!(pr.updated_at.is_none());
+        assert!(pr.merged_at.is_none());
+        assert!(pr.closed_at.is_none());
+        assert!(pr.last_review_at.is_none());
+        assert!(pr.time_to_first_review_mins.is_none());
+        assert!(pr.time_to_merge_mins.is_none());
+        assert!(pr.files_changed.is_none());
+        assert!(pr.lines_added.is_none());
+        assert!(pr.lines_removed.is_none());
+    }
+
+    #[test]
+    fn test_pr_record_serde_roundtrip() {
+        let mut pr = PrRecord::for_issue(
+            "https://github.com/org/repo/pull/10",
+            "org/repo",
+            10,
+            "sentry",
+            "SENTRY-1",
+        );
+        pr.title = Some("Fix null pointer".to_string());
+        pr.author = Some("bot".to_string());
+        pr.head_branch = Some("fix/null-ptr".to_string());
+        pr.base_branch = Some("main".to_string());
+        pr.approvals_count = 2;
+        pr.comments_count = 5;
+        let json = serde_json::to_string(&pr).unwrap();
+        let parsed: PrRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pr_number, 10);
+        assert_eq!(parsed.issue_source, Some("sentry".to_string()));
+        assert_eq!(parsed.approvals_count, 2);
+    }
+
+    #[test]
+    fn test_prompt_experiment_serde_roundtrip() {
+        let mut exp = PromptExperiment::new("exp-1", "variant_a", "Fix: {{issue}}", "hash-abc");
+        exp.success_count = 10;
+        exp.failure_count = 2;
+        exp.avg_time_to_merge = Some(3.5);
+        exp.avg_review_score = Some(4.2);
+        let json = serde_json::to_string(&exp).unwrap();
+        let parsed: PromptExperiment = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.experiment_name, "exp-1");
+        assert_eq!(parsed.variant, "variant_a");
+        assert!(parsed.active);
+        assert_eq!(parsed.success_count, 10);
+        assert!((parsed.avg_time_to_merge.unwrap() - 3.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_similar_issue_serde_roundtrip() {
+        let si = SimilarIssue::new("issue-a", "issue-b", 0.87);
+        let json = serde_json::to_string(&si).unwrap();
+        let parsed: SimilarIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_issue_id, "issue-a");
+        assert_eq!(parsed.similar_issue_id, "issue-b");
+        assert!((parsed.similarity_score - 0.87).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_processing_metric_minimal() {
+        let m = ProcessingMetric::new("latency", 0.5);
+        assert_eq!(m.metric_name, "latency");
+        assert_eq!(m.id, 0);
+        assert!(m.source.is_none());
+        assert!(m.tags.is_none());
+    }
+
+    #[test]
+    fn test_processing_metric_serde_roundtrip() {
+        let m = ProcessingMetric::new("queue_depth", 42.0)
+            .with_source("linear")
+            .with_tags(serde_json::json!({"env": "prod"}));
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: ProcessingMetric = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.metric_name, "queue_depth");
+        assert_eq!(parsed.source, Some("linear".to_string()));
+        assert!(parsed.tags.is_some());
+    }
+
+    #[test]
+    fn test_fix_attempt_stats_serde_roundtrip() {
+        let mut stats = FixAttemptStats::default();
+        stats.total = 100;
+        stats.success = 50;
+        stats.by_source.insert(
+            "sentry".to_string(),
+            SourceStats {
+                total: 50,
+                success: 30,
+                failed: 10,
+                merged: 8,
+                closed: 2,
+                cannot_fix: 0,
+            },
+        );
+        let json = serde_json::to_string(&stats).unwrap();
+        let parsed: FixAttemptStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total, 100);
+        assert!(parsed.by_source.contains_key("sentry"));
+        assert_eq!(parsed.by_source["sentry"].success, 30);
+    }
+
+    #[test]
+    fn test_activity_log_entry_serde_roundtrip() {
+        let entry = ActivityLogEntry::new("pr_created", "PR #42 created")
+            .with_source("linear")
+            .with_issue("issue-1", "LIN-1")
+            .with_metadata(serde_json::json!({"pr_number": 42}));
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: ActivityLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.activity_type, "pr_created");
+        assert_eq!(parsed.message, "PR #42 created");
+        assert_eq!(parsed.source, Some("linear".to_string()));
+        assert_eq!(parsed.issue_id, Some("issue-1".to_string()));
+        assert_eq!(parsed.short_id, Some("LIN-1".to_string()));
+        assert!(parsed.metadata.is_some());
+    }
+
+    #[test]
+    fn test_issue_deserialize_minimal_json() {
+        let json = r#"{
+            "id": "1",
+            "short_id": "T-1",
+            "title": "Title",
+            "url": "https://example.com",
+            "source": "test",
+            "priority": "none",
+            "status": "open"
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.id, "1");
+        assert!(issue.description.is_none());
+        assert!(issue.metadata.is_empty());
+        assert!(issue.created_at.is_none());
+        assert!(issue.updated_at.is_none());
+    }
+
+    #[test]
+    fn test_issue_metadata_default_empty() {
+        let json = r#"{
+            "id": "1",
+            "short_id": "T-1",
+            "title": "Title",
+            "url": "url",
+            "source": "src",
+            "priority": "low",
+            "status": "resolved"
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert!(issue.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_fix_attempt_deserialize_with_defaults() {
+        let json = serde_json::json!({
+            "id": 1,
+            "issue_id": "123",
+            "short_id": "T-123",
+            "source": "linear",
+            "attempted_at": "2026-01-01T00:00:00Z",
+            "status": "pending"
+        });
+        let attempt: FixAttempt = serde_json::from_value(json).unwrap();
+        assert_eq!(attempt.retry_count, 0);
+        assert!(attempt.issue_labels.is_empty());
+        assert!(attempt.pr_url.is_none());
+    }
+
+    #[test]
+    fn test_claude_result_deserialize_with_defaults() {
+        let json = serde_json::json!({
+            "success": true,
+            "output": "done"
+        });
+        let result: ClaudeResult = serde_json::from_value(json).unwrap();
+        assert!(result.success);
+        assert!(result.used_qa_ids.is_empty());
+        assert!(result.blocking_question.is_none());
+    }
+
+    #[test]
+    fn test_blocking_question_deserialize_with_defaults() {
+        let json = serde_json::json!({
+            "question": "What API?"
+        });
+        let bq: BlockingQuestion = serde_json::from_value(json).unwrap();
+        assert_eq!(bq.question, "What API?");
+        assert!(bq.context.is_none());
+        assert!(bq.options.is_empty());
+        assert!(bq.why.is_none());
+    }
+
+    #[test]
+    fn test_change_category_equality_and_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ChangeCategory::Tests);
+        set.insert(ChangeCategory::Tests);
+        assert_eq!(set.len(), 1);
+        set.insert(ChangeCategory::Docs);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_review_category_equality_and_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ReviewCategory::Security);
+        set.insert(ReviewCategory::Security);
+        assert_eq!(set.len(), 1);
+        set.insert(ReviewCategory::Performance);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_match_priority_serde_snake_case() {
+        let json = serde_json::to_string(&MatchPriority::Low).unwrap();
+        assert_eq!(json, "\"low\"");
+        let json = serde_json::to_string(&MatchPriority::Normal).unwrap();
+        assert_eq!(json, "\"normal\"");
+        let json = serde_json::to_string(&MatchPriority::High).unwrap();
+        assert_eq!(json, "\"high\"");
+        let json = serde_json::to_string(&MatchPriority::Urgent).unwrap();
+        assert_eq!(json, "\"urgent\"");
+    }
+
+    #[test]
+    fn test_issue_priority_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&IssuePriority::None).unwrap(),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IssuePriority::Low).unwrap(),
+            "\"low\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IssuePriority::Medium).unwrap(),
+            "\"medium\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IssuePriority::High).unwrap(),
+            "\"high\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IssuePriority::Critical).unwrap(),
+            "\"critical\""
+        );
+    }
+
+    #[test]
+    fn test_issue_skip_serializing_none_fields() {
+        let issue = Issue::new("1", "T-1", "Title", "url", "src");
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(!json.contains("description"));
+        assert!(!json.contains("created_at"));
+        assert!(!json.contains("updated_at"));
+    }
+
+    #[test]
+    fn test_fix_attempt_skip_serializing_none_fields() {
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "1".into(),
+            short_id: "T-1".into(),
+            source: "linear".into(),
+            attempted_at: Utc::now(),
+            pr_url: None,
+            scm_repo: None,
+            scm_pr_number: None,
+            status: FixAttemptStatus::Pending,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        let json = serde_json::to_string(&attempt).unwrap();
+        assert!(!json.contains("pr_url"));
+        assert!(!json.contains("scm_repo"));
+        assert!(!json.contains("scm_pr_number"));
+        assert!(!json.contains("error_message"));
+        assert!(!json.contains("merged_at"));
+        assert!(!json.contains("resolved_at"));
+        assert!(!json.contains("last_retry_at"));
+        assert!(!json.contains("issue_labels"));
+        assert!(!json.contains("parent_attempt_id"));
+        assert!(!json.contains("cascade_repo"));
+    }
+
+    #[test]
+    fn test_validate_issue_id_error_messages() {
+        let err = validate_issue_id("").unwrap_err();
+        assert!(err.contains("empty"), "Expected 'empty' in: {}", err);
+
+        let err = validate_issue_id(&"x".repeat(101)).unwrap_err();
+        assert!(
+            err.contains("maximum length"),
+            "Expected 'maximum length' in: {}",
+            err
+        );
+
+        let err = validate_issue_id("a..b").unwrap_err();
+        assert!(
+            err.contains("path traversal"),
+            "Expected 'path traversal' in: {}",
+            err
+        );
+
+        let err = validate_issue_id("a/b").unwrap_err();
+        assert!(
+            err.contains("forward slashes"),
+            "Expected 'forward slashes' in: {}",
+            err
+        );
+
+        let err = validate_issue_id("a\\b").unwrap_err();
+        assert!(
+            err.contains("backslashes"),
+            "Expected 'backslashes' in: {}",
+            err
+        );
+
+        let err = validate_issue_id("a\0b").unwrap_err();
+        assert!(
+            err.contains("null bytes"),
+            "Expected 'null bytes' in: {}",
+            err
+        );
     }
 }

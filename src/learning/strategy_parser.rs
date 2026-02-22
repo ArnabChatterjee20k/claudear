@@ -397,8 +397,6 @@ Write src/new_helper.rs
         assert!(result.is_err());
     }
 
-    // ── Additional edge case tests ──
-
     #[test]
     fn test_tool_in_different_context_still_counted() {
         // "Read" as part of a sentence still gets counted

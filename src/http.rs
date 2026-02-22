@@ -36,6 +36,51 @@ impl HttpResponse {
 pub trait HttpClient: Send + Sync {
     /// Perform a GET request with headers.
     async fn get(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse>;
+
+    /// Perform a POST request with headers and a body.
+    async fn post(
+        &self,
+        url: &str,
+        headers: Vec<(&str, String)>,
+        body: &str,
+    ) -> Result<HttpResponse> {
+        let _ = (url, headers, body);
+        Err(Error::Other(
+            "POST not supported by this HTTP client".into(),
+        ))
+    }
+
+    /// Perform a PUT request with headers and a body.
+    async fn put(
+        &self,
+        url: &str,
+        headers: Vec<(&str, String)>,
+        body: &str,
+    ) -> Result<HttpResponse> {
+        let _ = (url, headers, body);
+        Err(Error::Other("PUT not supported by this HTTP client".into()))
+    }
+
+    /// Perform a PATCH request with headers and a body.
+    async fn patch(
+        &self,
+        url: &str,
+        headers: Vec<(&str, String)>,
+        body: &str,
+    ) -> Result<HttpResponse> {
+        let _ = (url, headers, body);
+        Err(Error::Other(
+            "PATCH not supported by this HTTP client".into(),
+        ))
+    }
+
+    /// Perform a DELETE request with headers.
+    async fn delete(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+        let _ = (url, headers);
+        Err(Error::Other(
+            "DELETE not supported by this HTTP client".into(),
+        ))
+    }
 }
 
 /// Default HTTP client using reqwest.
@@ -66,6 +111,65 @@ impl Default for ReqwestHttpClient {
 impl HttpClient for ReqwestHttpClient {
     async fn get(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
         let mut request = self.client.get(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(HttpResponse { status, body })
+    }
+
+    async fn post(
+        &self,
+        url: &str,
+        headers: Vec<(&str, String)>,
+        body: &str,
+    ) -> Result<HttpResponse> {
+        let mut request = self.client.post(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request.body(body.to_string()).send().await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(HttpResponse { status, body })
+    }
+
+    async fn put(
+        &self,
+        url: &str,
+        headers: Vec<(&str, String)>,
+        body: &str,
+    ) -> Result<HttpResponse> {
+        let mut request = self.client.put(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request.body(body.to_string()).send().await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(HttpResponse { status, body })
+    }
+
+    async fn patch(
+        &self,
+        url: &str,
+        headers: Vec<(&str, String)>,
+        body: &str,
+    ) -> Result<HttpResponse> {
+        let mut request = self.client.patch(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request.body(body.to_string()).send().await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(HttpResponse { status, body })
+    }
+
+    async fn delete(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+        let mut request = self.client.delete(url);
         for (name, value) in headers {
             request = request.header(name, value);
         }

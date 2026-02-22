@@ -117,6 +117,15 @@ pub trait Notifier: Send + Sync {
         .await
     }
 
+    /// Notify that a PR was closed without merging.
+    async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        self.notify_status(&format!(
+            "PR closed without merging: {} - {}",
+            issue.short_id, pr_url
+        ))
+        .await
+    }
+
     /// Send a scheduled report.
     async fn notify_report(&self, report: &Report) -> Result<()> {
         // Default implementation formats as text and uses notify_status
@@ -279,6 +288,18 @@ impl Notifier for CompositeNotifier {
             let issue = issue.clone();
             let pr_url = pr_url.clone();
             async move { n.notify_merged(&issue, &pr_url).await }
+        })
+        .await;
+        Ok(())
+    }
+
+    async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let issue = issue.clone();
+        let pr_url = pr_url.to_string();
+        self.broadcast(|n| {
+            let issue = issue.clone();
+            let pr_url = pr_url.clone();
+            async move { n.notify_closed(&issue, &pr_url).await }
         })
         .await;
         Ok(())
@@ -860,8 +881,6 @@ mod tests {
         assert!(text.contains("10") || text.contains("8") || text.contains("5"));
     }
 
-    // ── get_source_emoji tests ──
-
     #[test]
     fn test_get_source_emoji_linear() {
         assert_eq!(get_source_emoji("linear"), "\u{1F4CB}");
@@ -911,8 +930,6 @@ mod tests {
         assert_eq!(get_source_emoji("LiNeAr"), "\u{1F4CB}");
         assert_eq!(get_source_emoji("sEnTrY"), "\u{1F534}");
     }
-
-    // ── Default trait implementation tests ──
 
     #[tokio::test]
     async fn test_default_ask_question_returns_none() {
@@ -974,8 +991,6 @@ mod tests {
         let notifier = MockNotifier::new("test", true);
         assert!(!notifier.supports_replies());
     }
-
-    // ── Mock that supports ask/reply for CompositeNotifier ask_question tests ──
 
     struct AskMockNotifier {
         name: String,
@@ -1098,8 +1113,6 @@ mod tests {
         }
     }
 
-    // ── CompositeNotifier::ask_question tests ──
-
     #[tokio::test]
     async fn test_composite_ask_question_empty() {
         let composite = CompositeNotifier::new();
@@ -1207,8 +1220,6 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
-
-    // ── CompositeNotifier::poll_question_replies tests ──
 
     #[tokio::test]
     async fn test_composite_poll_replies_empty() {
@@ -1330,8 +1341,6 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // ── CompositeNotifier::supports_replies tests ──
-
     #[test]
     fn test_composite_supports_replies_empty() {
         let composite = CompositeNotifier::new();
@@ -1365,8 +1374,6 @@ mod tests {
         composite.add(Arc::new(AskMockNotifier::with_replies("r2", vec![])));
         assert!(composite.supports_replies());
     }
-
-    // ── Error handling across multiple broadcast methods ──
 
     #[tokio::test]
     async fn test_composite_broadcast_errors_do_not_affect_other_notifiers() {
@@ -1408,8 +1415,6 @@ mod tests {
         assert_eq!(working_clone.get_call_count(), 6);
     }
 
-    // ── Multiple sequential broadcasts accumulate call counts ──
-
     #[tokio::test]
     async fn test_composite_multiple_broadcasts_accumulate() {
         let mut composite = CompositeNotifier::new();
@@ -1423,8 +1428,6 @@ mod tests {
 
         assert_eq!(mock_clone.get_call_count(), 3);
     }
-
-    // ── Test that all failing notifiers still let composite return Ok ──
 
     #[tokio::test]
     async fn test_composite_all_fail_for_every_method() {
@@ -1441,8 +1444,6 @@ mod tests {
         assert!(composite.notify_merged(&test_issue(), "url").await.is_ok());
     }
 
-    // ── Test Notifier trait as dyn object ──
-
     #[tokio::test]
     async fn test_notifier_as_trait_object() {
         let mock: Arc<dyn Notifier> = Arc::new(MockNotifier::new("dyn_test", true));
@@ -1451,8 +1452,6 @@ mod tests {
         assert!(!mock.supports_replies());
         assert!(mock.notify_start(&test_issue()).await.is_ok());
     }
-
-    // ── Test CompositeNotifier as Notifier trait object ──
 
     #[tokio::test]
     async fn test_composite_as_trait_object() {
@@ -1465,8 +1464,6 @@ mod tests {
         assert!(notifier.notify_start(&test_issue()).await.is_ok());
     }
 
-    // ── Verify is_enabled mirrors notifier list state ──
-
     #[test]
     fn test_composite_is_enabled_reflects_internal_state() {
         let mut composite = CompositeNotifier::new();
@@ -1478,8 +1475,6 @@ mod tests {
         composite.add(Arc::new(MockNotifier::new("enabled", true)));
         assert!(composite.is_enabled());
     }
-
-    // ── Test with many notifiers (stress/fanout) ──
 
     #[tokio::test]
     async fn test_composite_broadcast_many_notifiers() {
@@ -1506,8 +1501,6 @@ mod tests {
             );
         }
     }
-
-    // ── Test poll_question_replies with multiple replies per notifier ──
 
     #[tokio::test]
     async fn test_composite_poll_replies_multiple_per_notifier() {
@@ -1545,8 +1538,6 @@ mod tests {
         assert_eq!(all_replies.len(), 3);
     }
 
-    // ── Test AskDelivery fields ──
-
     #[tokio::test]
     async fn test_composite_ask_question_delivery_with_no_target() {
         let mut composite = CompositeNotifier::new();
@@ -1566,8 +1557,6 @@ mod tests {
         assert!(d.target.is_none());
         assert!(d.message_id.is_none());
     }
-
-    // ── Test notify_merged default impl formats correctly ──
 
     #[tokio::test]
     async fn test_default_notify_merged_formats_message() {
@@ -1621,8 +1610,6 @@ mod tests {
         assert!(msg.contains("PR merged"));
     }
 
-    // ── Test empty urgent issues list via composite ──
-
     #[tokio::test]
     async fn test_composite_notify_urgent_issues_empty_list() {
         let mut composite = CompositeNotifier::new();
@@ -1634,8 +1621,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(mock_clone.get_call_count(), 1);
     }
-
-    // ── Test composite with single notifier for each method ──
 
     #[tokio::test]
     async fn test_composite_single_notifier_all_methods() {
@@ -1661,5 +1646,48 @@ mod tests {
         // notify_merged default calls notify_status, so 7 total calls
         // (start + success + completed + failed + status + urgent + merged->status)
         assert_eq!(mock_clone.get_call_count(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_default_notify_closed() {
+        let notifier = MockNotifier::new("test", true);
+        let issue = test_issue();
+        let result = notifier
+            .notify_closed(&issue, "https://github.com/org/repo/pull/1")
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(notifier.get_call_count(), 1); // notify_status was called
+    }
+
+    #[tokio::test]
+    async fn test_composite_notify_closed() {
+        let mut composite = CompositeNotifier::new();
+        let mock = Arc::new(MockNotifier::new("mock", true));
+        let mock_clone = Arc::clone(&mock);
+        composite.add(mock);
+
+        let result = composite
+            .notify_closed(&test_issue(), "https://github.com/org/repo/pull/1")
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(mock_clone.get_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_composite_notify_closed_broadcasts_to_all() {
+        let mut composite = CompositeNotifier::new();
+        let mock1 = Arc::new(MockNotifier::new("mock1", true));
+        let mock2 = Arc::new(MockNotifier::new("mock2", true));
+        let mock1_clone = Arc::clone(&mock1);
+        let mock2_clone = Arc::clone(&mock2);
+        composite.add(mock1);
+        composite.add(mock2);
+
+        composite
+            .notify_closed(&test_issue(), "https://pr.url")
+            .await
+            .unwrap();
+        assert_eq!(mock1_clone.get_call_count(), 1);
+        assert_eq!(mock2_clone.get_call_count(), 1);
     }
 }

@@ -405,8 +405,6 @@ mod tests {
         assert!(clusters.is_empty());
     }
 
-    // ── Integration tests with SqliteTracker ──
-
     #[test]
     fn test_detect_clusters_with_sqlite_tracker() {
         let tracker = crate::storage::SqliteTracker::in_memory().unwrap();

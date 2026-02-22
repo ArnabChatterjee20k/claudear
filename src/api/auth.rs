@@ -162,8 +162,6 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
     "unknown".to_string()
 }
 
-// ─── Extractors ──────────────────────────────────
-
 /// Authenticated user extracted from session cookie.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthUser {
@@ -229,8 +227,6 @@ impl FromRequestParts<ApiState> for AdminUser {
     }
 }
 
-// ─── Request/Response types ──────────────────────────────────
-
 #[derive(Deserialize)]
 pub struct LoginRequest {
     pub email: String,
@@ -294,8 +290,6 @@ pub struct UserResponse {
 pub struct MessageResponse {
     pub message: String,
 }
-
-// ─── Auth handlers ──────────────────────────────────
 
 /// POST /api/auth/login
 pub async fn login_handler(
@@ -419,8 +413,6 @@ pub async fn logout_handler(
 pub async fn me_handler(user: AuthUser) -> Json<AuthUserResponse> {
     Json(AuthUserResponse::from(&user))
 }
-
-// ─── Profile update handlers (authenticated user) ──────────────────────────
 
 #[derive(Deserialize)]
 pub struct UpdateProfileRequest {
@@ -610,8 +602,6 @@ pub async fn upload_avatar_handler(
 
     Err(StatusCode::BAD_REQUEST)
 }
-
-// ─── User CRUD handlers (admin only) ──────────────────────────────────
 
 /// GET /api/users
 pub async fn list_users_handler(
@@ -872,6 +862,7 @@ mod tests {
             auto_discover_paths: vec![],
             poll_interval_ms: 300_000,
             webhook_port: 3100,
+            bind_address: "127.0.0.1".to_string(),
             db_path: ":memory:".into(),
             max_issues_per_cycle: 5,
             max_concurrent: 1,
@@ -1152,8 +1143,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    // ─── Parameterized seed helpers for test isolation ─────────────────
-
     /// Seed an admin user with a custom email and return (user_id, session_token).
     fn seed_admin_with_email(
         tracker: &std::sync::Arc<dyn crate::storage::FixAttemptTracker>,
@@ -1167,8 +1156,6 @@ mod tests {
         let token = db.create_session(user_id, "2099-12-31 23:59:59").unwrap();
         (user_id, token)
     }
-
-    // ─── Rate limiting tests ──────────────────────────────────────────
 
     #[test]
     fn test_rate_limit_rejects_11th_attempt() {
@@ -1209,8 +1196,6 @@ mod tests {
             "key_b should NOT be rate-limited"
         );
     }
-
-    // ─── create_user_handler validation tests ─────────────────────────
 
     #[tokio::test]
     async fn test_create_user_invalid_role() {
@@ -1357,8 +1342,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
-    // ─── update_user_handler validation tests ─────────────────────────
-
     #[tokio::test]
     async fn test_update_user_invalid_role() {
         let (router, tracker) = create_test_app();
@@ -1407,8 +1390,6 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
-
-    // ─── delete_user_handler tests ────────────────────────────────────
 
     #[tokio::test]
     async fn test_delete_user_success() {
@@ -1461,8 +1442,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // ─── list_users_handler tests ─────────────────────────────────────
-
     #[tokio::test]
     async fn test_list_users_as_admin() {
         let (router, tracker) = create_test_app();
@@ -1497,8 +1476,6 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&body_str).unwrap();
         assert_eq!(parsed.len(), 2);
     }
-
-    // ─── get_user_handler tests ───────────────────────────────────────
 
     #[tokio::test]
     async fn test_get_user_by_id() {
@@ -1551,8 +1528,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // ─── logout_handler tests ─────────────────────────────────────────
-
     #[tokio::test]
     async fn test_logout_clears_session_cookie() {
         let (router, tracker) = create_test_app();
@@ -1578,8 +1553,6 @@ mod tests {
         assert!(body_str.contains("Logged out"));
     }
 
-    // ─── AuthUserResponse conversion test ─────────────────────────────
-
     #[test]
     fn test_auth_user_response_from_auth_user() {
         let user = AuthUser {
@@ -1596,5 +1569,1109 @@ mod tests {
         assert_eq!(response.email, "convert@test.com");
         assert_eq!(response.name, "Convert User");
         assert_eq!(response.role, "admin");
+    }
+
+    #[test]
+    fn test_extract_client_ip_from_x_forwarded_for() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
+        assert_eq!(extract_client_ip(&headers), "1.2.3.4");
+    }
+
+    #[test]
+    fn test_extract_client_ip_from_x_forwarded_for_single() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
+        assert_eq!(extract_client_ip(&headers), "10.0.0.1");
+    }
+
+    #[test]
+    fn test_extract_client_ip_from_x_forwarded_for_trims_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "  192.168.1.1  , 10.0.0.1".parse().unwrap(),
+        );
+        assert_eq!(extract_client_ip(&headers), "192.168.1.1");
+    }
+
+    #[test]
+    fn test_extract_client_ip_from_x_real_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "9.8.7.6".parse().unwrap());
+        assert_eq!(extract_client_ip(&headers), "9.8.7.6");
+    }
+
+    #[test]
+    fn test_extract_client_ip_from_x_real_ip_trims() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "  10.10.10.10  ".parse().unwrap());
+        assert_eq!(extract_client_ip(&headers), "10.10.10.10");
+    }
+
+    #[test]
+    fn test_extract_client_ip_prefers_x_forwarded_for() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.1.1.1".parse().unwrap());
+        headers.insert("x-real-ip", "2.2.2.2".parse().unwrap());
+        assert_eq!(extract_client_ip(&headers), "1.1.1.1");
+    }
+
+    #[test]
+    fn test_extract_client_ip_falls_back_to_unknown() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_client_ip(&headers), "unknown");
+    }
+
+    #[test]
+    fn test_extract_client_ip_empty_x_forwarded_for_falls_through() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "".parse().unwrap());
+        headers.insert("x-real-ip", "3.3.3.3".parse().unwrap());
+        assert_eq!(extract_client_ip(&headers), "3.3.3.3");
+    }
+
+    #[test]
+    fn test_extract_client_ip_empty_both_returns_unknown() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "".parse().unwrap());
+        headers.insert("x-real-ip", "".parse().unwrap());
+        assert_eq!(extract_client_ip(&headers), "unknown");
+    }
+
+    #[test]
+    fn test_extract_client_ip_whitespace_only_x_real_ip_returns_unknown() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "   ".parse().unwrap());
+        assert_eq!(extract_client_ip(&headers), "unknown");
+    }
+
+    #[test]
+    fn test_ip_rate_limit_allows_within_limit() {
+        let ip = "ip-rate-test-allow-10.0.0.1";
+        for i in 0..10 {
+            assert!(
+                check_ip_rate_limit(ip),
+                "Attempt {} should be allowed",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn test_ip_rate_limit_rejects_after_max() {
+        let ip = "ip-rate-test-reject-10.0.0.2";
+        for _ in 0..IP_RATE_LIMIT_MAX_ATTEMPTS {
+            check_ip_rate_limit(ip);
+        }
+        assert!(
+            !check_ip_rate_limit(ip),
+            "Should be rejected after max attempts"
+        );
+    }
+
+    #[test]
+    fn test_ip_rate_limit_independent_keys() {
+        let ip_a = "ip-rate-indep-a-10.0.0.3";
+        let ip_b = "ip-rate-indep-b-10.0.0.4";
+        for _ in 0..IP_RATE_LIMIT_MAX_ATTEMPTS {
+            check_ip_rate_limit(ip_a);
+        }
+        assert!(!check_ip_rate_limit(ip_a), "ip_a should be rate-limited");
+        assert!(check_ip_rate_limit(ip_b), "ip_b should NOT be rate-limited");
+    }
+
+    #[test]
+    fn test_auth_user_response_from_auth_user_with_avatar() {
+        let user = AuthUser {
+            id: 99,
+            email: "avatar@test.com".to_string(),
+            name: "Avatar User".to_string(),
+            role: "viewer".to_string(),
+            avatar_url: Some("/avatars/99_abc.png".to_string()),
+        };
+
+        let response = AuthUserResponse::from(&user);
+
+        assert_eq!(response.id, 99);
+        assert_eq!(response.email, "avatar@test.com");
+        assert_eq!(response.name, "Avatar User");
+        assert_eq!(response.role, "viewer");
+        assert_eq!(response.avatar_url.as_deref(), Some("/avatars/99_abc.png"));
+    }
+
+    #[tokio::test]
+    async fn test_logout_without_session_cookie() {
+        let (router, _tracker) = create_test_app();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/logout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Logout should still succeed even without a cookie
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_short_password() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-shortpw@test.com");
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        let target_id = db
+            .create_user("target-update-pw@test.com", &hash, "Target", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{}", target_id))
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"password":"short"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_password_too_long() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-longpw@test.com");
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        let target_id = db
+            .create_user("target-update-longpw@test.com", &hash, "Target", "viewer")
+            .unwrap();
+
+        let long_pw = "a".repeat(73);
+        let body = serde_json::json!({"password": long_pw});
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{}", target_id))
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_with_valid_password() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-validpw@test.com");
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        let target_id = db
+            .create_user("target-update-validpw@test.com", &hash, "Target", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{}", target_id))
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"password":"newlongpassword123"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_name() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-name@test.com");
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        let target_id = db
+            .create_user("target-name-upd@test.com", &hash, "Original Name", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{}", target_id))
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"name":"Updated Name"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("Updated Name"));
+    }
+
+    #[tokio::test]
+    async fn test_update_user_role_to_admin() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-role-to-admin@test.com");
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        let target_id = db
+            .create_user("target-role-upd@test.com", &hash, "Target", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{}", target_id))
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"role":"admin"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"role\":\"admin\""));
+    }
+
+    #[tokio::test]
+    async fn test_create_user_password_too_long() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-longpw@test.com");
+
+        let long_pw = "b".repeat(73);
+        let body = serde_json::json!({
+            "email": "longpw@test.com",
+            "password": long_pw,
+            "name": "Long PW User",
+            "role": "viewer"
+        });
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_whitespace_name() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-wsname@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"email":"x@test.com","password":"longpassword","name":"   ","role":"viewer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_login_sends_x_forwarded_for_ip() {
+        let (router, tracker) = create_test_app();
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("secret123", 4).unwrap();
+        db.create_user("iptest@test.com", &password_hash, "IP User", "admin")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "1.2.3.4")
+                    .body(Body::from(
+                        r#"{"email":"iptest@test.com","password":"secret123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_update_profile_name_only() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-profile-name@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/auth/profile")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"name":"New Profile Name"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("New Profile Name"));
+    }
+
+    #[tokio::test]
+    async fn test_update_profile_empty_name_rejected() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) =
+            seed_admin_with_email(&tracker, "admin-profile-emptyname@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/auth/profile")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"name":"  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_profile_password_too_short() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-profile-shortpw@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/auth/profile")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"password":"short","current_password":"password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_profile_password_too_long() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-profile-longpw@test.com");
+
+        let long_pw = "c".repeat(73);
+        let body = serde_json::json!({
+            "password": long_pw,
+            "current_password": "password"
+        });
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/auth/profile")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_profile_password_no_current_password() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-profile-nocurpw@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/auth/profile")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"password":"newpassword123"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_profile_password_wrong_current_password() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) =
+            seed_admin_with_email(&tracker, "admin-profile-wrongcurpw@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/auth/profile")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"password":"newpassword123","current_password":"wrongpassword"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_update_profile_password_success() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) =
+            seed_admin_with_email(&tracker, "admin-profile-pwsuccess@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/auth/profile")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"password":"newpassword123","current_password":"password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_update_profile_unauthenticated() {
+        let (router, _tracker) = create_test_app();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/auth/profile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Nope"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_viewer_cannot_list_users() {
+        let (router, tracker) = create_test_app();
+        let (_viewer_id, token) = seed_viewer(&tracker);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/users")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_viewer_cannot_get_user() {
+        let (router, tracker) = create_test_app();
+        let (_viewer_id, token) = seed_viewer(&tracker);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/users/1")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_viewer_cannot_update_user() {
+        let (router, tracker) = create_test_app();
+        let (_viewer_id, token) = seed_viewer(&tracker);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/users/1")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"name":"Hacked"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_viewer_cannot_delete_user() {
+        let (router, tracker) = create_test_app();
+        let (_viewer_id, token) = seed_viewer(&tracker);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/users/1")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_list_users() {
+        let (router, _tracker) = create_test_app();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_create_user() {
+        let (router, _tracker) = create_test_app();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"email":"x@test.com","password":"longpassword","name":"X","role":"viewer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_session_token() {
+        let (router, _tracker) = create_test_app();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("cookie", "claudear_session=invalid-token-12345")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_admin_role() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-create-adminrole@test.com");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(
+                        r#"{"email":"newadmin@test.com","password":"longpassword","name":"New Admin","role":"admin"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"role\":\"admin\""));
+    }
+
+    #[tokio::test]
+    async fn test_login_response_body_structure() {
+        let (router, tracker) = create_test_app();
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("testpass1", 4).unwrap();
+        db.create_user("struct@test.com", &password_hash, "Struct User", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"email":"struct@test.com","password":"testpass1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["user"].is_object());
+        assert_eq!(parsed["user"]["email"], "struct@test.com");
+        assert_eq!(parsed["user"]["name"], "Struct User");
+        assert_eq!(parsed["user"]["role"], "viewer");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_email() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, token) = seed_admin_with_email(&tracker, "admin-update-email@test.com");
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let hash = bcrypt::hash("password", 4).unwrap();
+        let target_id = db
+            .create_user("original-email@test.com", &hash, "Email User", "viewer")
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{}", target_id))
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .body(Body::from(r#"{"email":"new-email@test.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("new-email@test.com"));
+    }
+
+    #[tokio::test]
+    async fn test_upload_avatar_no_auth() {
+        let (router, _tracker) = create_test_app();
+
+        // No auth cookie -> should be rejected
+        let boundary = "---TestBoundary123";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"test.png\"\r\nContent-Type: image/png\r\n\r\nfakedata\r\n--{boundary}--\r\n"
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/avatar")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should be 401 (no auth)
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_upload_avatar_with_valid_png() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage_dir = temp_dir.path().to_path_buf();
+        let avatars_dir = storage_dir.join("avatars");
+        std::fs::create_dir_all(&avatars_dir).unwrap();
+
+        let tracker: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut config = test_config();
+        config.storage_dir = storage_dir;
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("password", 4).unwrap();
+        db.create_user("avatar@test.com", &password_hash, "Avatar User", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = tracker.subscribe_indexing_progress();
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            std::path::PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        // Build a valid PNG (minimal PNG header)
+        let mut png_data: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png_data.extend_from_slice(&[0u8; 100]); // Some padding
+
+        let boundary = "----TestBoundary456";
+        let mut body_bytes: Vec<u8> = Vec::new();
+        body_bytes.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"test.png\"\r\nContent-Type: image/png\r\n\r\n"
+            ).as_bytes()
+        );
+        body_bytes.extend_from_slice(&png_data);
+        body_bytes.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/avatar")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resp["avatar_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("/avatars/"));
+        assert!(resp["avatar_url"].as_str().unwrap().ends_with(".png"));
+    }
+
+    #[tokio::test]
+    async fn test_upload_avatar_invalid_content_type() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage_dir = temp_dir.path().to_path_buf();
+        let avatars_dir = storage_dir.join("avatars");
+        std::fs::create_dir_all(&avatars_dir).unwrap();
+
+        let tracker: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut config = test_config();
+        config.storage_dir = storage_dir;
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("password", 4).unwrap();
+        db.create_user("avatar2@test.com", &password_hash, "Avatar User", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = tracker.subscribe_indexing_progress();
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            std::path::PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        // Upload a text/plain file (not allowed)
+        let boundary = "----TestBoundary789";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"test.txt\"\r\nContent-Type: text/plain\r\n\r\nHello World\r\n--{boundary}--\r\n"
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/avatar")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_upload_avatar_wrong_magic_bytes() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage_dir = temp_dir.path().to_path_buf();
+        let avatars_dir = storage_dir.join("avatars");
+        std::fs::create_dir_all(&avatars_dir).unwrap();
+
+        let tracker: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut config = test_config();
+        config.storage_dir = storage_dir;
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("password", 4).unwrap();
+        db.create_user("avatar3@test.com", &password_hash, "Avatar User", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = tracker.subscribe_indexing_progress();
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            std::path::PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        // Claim image/png but provide wrong magic bytes
+        let fake_data = b"not a real png file at all";
+        let boundary = "----TestBoundaryMagic";
+        let mut body_bytes: Vec<u8> = Vec::new();
+        body_bytes.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"fake.png\"\r\nContent-Type: image/png\r\n\r\n"
+            ).as_bytes()
+        );
+        body_bytes.extend_from_slice(fake_data);
+        body_bytes.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/avatar")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_upload_avatar_no_avatar_field() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage_dir = temp_dir.path().to_path_buf();
+        let avatars_dir = storage_dir.join("avatars");
+        std::fs::create_dir_all(&avatars_dir).unwrap();
+
+        let tracker: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut config = test_config();
+        config.storage_dir = storage_dir;
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("password", 4).unwrap();
+        db.create_user("avatar4@test.com", &password_hash, "Avatar User", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = tracker.subscribe_indexing_progress();
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            std::path::PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        // Upload with wrong field name (not "avatar")
+        let boundary = "----TestBoundaryNoField";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"test.png\"\r\nContent-Type: image/png\r\n\r\nfakedata\r\n--{boundary}--\r\n"
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/avatar")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // No "avatar" field found => BAD_REQUEST
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_upload_avatar_valid_jpeg() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage_dir = temp_dir.path().to_path_buf();
+        let avatars_dir = storage_dir.join("avatars");
+        std::fs::create_dir_all(&avatars_dir).unwrap();
+
+        let tracker: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut config = test_config();
+        config.storage_dir = storage_dir;
+
+        let db = tracker.as_any().downcast_ref::<SqliteTracker>().unwrap();
+        let password_hash = bcrypt::hash("password", 4).unwrap();
+        db.create_user("avatar5@test.com", &password_hash, "Avatar User", "admin")
+            .unwrap();
+        let token = db.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = tracker.subscribe_indexing_progress();
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            std::path::PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        // Build minimal JPEG header
+        let mut jpeg_data: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpeg_data.extend_from_slice(&[0u8; 100]);
+
+        let boundary = "----TestBoundaryJpeg";
+        let mut body_bytes: Vec<u8> = Vec::new();
+        body_bytes.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n"
+            ).as_bytes()
+        );
+        body_bytes.extend_from_slice(&jpeg_data);
+        body_bytes.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/avatar")
+                    .header("cookie", format!("claudear_session={}", token))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resp["avatar_url"].as_str().unwrap().ends_with(".jpg"));
     }
 }

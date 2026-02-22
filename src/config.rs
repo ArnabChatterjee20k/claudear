@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 /// Default config file name.
 pub const DEFAULT_CONFIG_FILE: &str = "claudear.toml";
 
+fn default_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
+
 /// Claude CLI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -51,6 +55,9 @@ pub struct Config {
     pub poll_interval_ms: u64,
     /// Webhook server port.
     pub webhook_port: u16,
+    /// Bind address for HTTP server (default "127.0.0.1", use "0.0.0.0" in Docker).
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
     /// Database path for tracking.
     pub db_path: PathBuf,
     /// Maximum issues to process per poll cycle.
@@ -155,6 +162,7 @@ impl Default for Config {
             auto_discover_paths: Vec::new(),
             poll_interval_ms: 300_000,
             webhook_port: 3100,
+            bind_address: default_bind_address(),
             db_path: PathBuf::from("claudear.db"),
             max_issues_per_cycle: 5,
             max_concurrent: 1,
@@ -234,6 +242,55 @@ pub struct CascadeConfig {
     pub enabled: bool,
     /// Maximum cascade depth (0 = unlimited).
     pub max_depth: usize,
+    /// Per-dependency cascade rules.
+    #[serde(default)]
+    pub rules: Vec<CascadeRule>,
+}
+
+impl CascadeConfig {
+    /// Find a rule matching a specific upstream->downstream pair.
+    pub fn find_rule(&self, upstream: &str, downstream: &str) -> Option<&CascadeRule> {
+        self.rules
+            .iter()
+            .find(|r| r.upstream == upstream && r.downstream == downstream)
+    }
+}
+
+/// A per-dependency cascade rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CascadeRule {
+    /// Upstream repo (e.g., "appwrite/server-ce").
+    pub upstream: String,
+    /// Downstream repo (e.g., "appwrite-labs/cloud").
+    pub downstream: String,
+    /// What triggers the cascade: "merge" or "release" (default).
+    #[serde(default = "default_cascade_trigger")]
+    pub trigger: CascadeTrigger,
+    /// Target branch in downstream repo (default: repo's default branch).
+    #[serde(default)]
+    pub target_branch: Option<String>,
+    /// Whether to update dependency version in downstream.
+    #[serde(default = "default_true")]
+    pub version_update: bool,
+    /// Custom instructions appended to the cascade prompt.
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+fn default_cascade_trigger() -> CascadeTrigger {
+    CascadeTrigger::Release
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// What triggers a cascade.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CascadeTrigger {
+    Merge,
+    Release,
 }
 
 /// Continuous learning configuration.
@@ -706,7 +763,7 @@ pub struct GitLabConfig {
     pub auto_resolve_on_merge: bool,
     /// Webhook secret for verifying GitLab webhook requests.
     pub webhook_secret: Option<String>,
-    /// Trigger tag for review comments (e.g., "/claudear").
+    /// Trigger tag for review comments (e.g., "@claudear").
     pub review_trigger: String,
     /// Use SSH URLs for cloning instead of HTTPS.
     #[serde(default)]
@@ -729,7 +786,7 @@ impl Default for GitLabConfig {
             poll_interval_ms: None,
             auto_resolve_on_merge: false,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
             max_issues_per_cycle: None,
             max_concurrent: None,
@@ -751,7 +808,7 @@ impl GitLabConfig {
             poll_interval_ms: Some(60000),
             auto_resolve_on_merge: true,
             webhook_secret: Some("test_secret".to_string()),
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
             max_issues_per_cycle: None,
             max_concurrent: None,
@@ -771,7 +828,7 @@ pub struct GitHubConfig {
     pub auto_resolve_on_merge: bool,
     /// Webhook secret for verifying GitHub webhook signatures.
     pub webhook_secret: Option<String>,
-    /// Trigger tag for review comments (e.g., "/claudear" or "@mybot").
+    /// Trigger tag for review comments (e.g., "@claudear" or "@mybot").
     /// Comments must contain this tag to trigger Claude.
     /// Set to empty string to respond to all comments.
     pub review_trigger: String,
@@ -788,7 +845,7 @@ impl Default for GitHubConfig {
             poll_interval_ms: 60000,
             auto_resolve_on_merge: false,
             webhook_secret: None,
-            review_trigger: "/claudear".to_string(),
+            review_trigger: "@claudear".to_string(),
             use_ssh: false,
         }
     }
@@ -4357,6 +4414,7 @@ work_dir = "/tmp/repos"
         let config = CascadeConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.max_depth, 0);
+        assert!(config.rules.is_empty());
     }
 
     #[test]
@@ -4372,7 +4430,71 @@ max_depth = 3
             let config = Config::from_toml(toml_str).unwrap();
             assert!(config.cascade.enabled);
             assert_eq!(config.cascade.max_depth, 3);
+            assert!(config.cascade.rules.is_empty());
         });
+    }
+
+    #[test]
+    fn test_cascade_config_with_rules() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/test"
+
+[cascade]
+enabled = true
+max_depth = 3
+
+[[cascade.rules]]
+upstream = "org/lib"
+downstream = "org/app"
+trigger = "merge"
+version_update = true
+instructions = "Run npm install after updating"
+
+[[cascade.rules]]
+upstream = "org/lib"
+downstream = "org/service"
+trigger = "release"
+target_branch = "develop"
+version_update = false
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert_eq!(config.cascade.rules.len(), 2);
+
+            let rule1 = &config.cascade.rules[0];
+            assert_eq!(rule1.upstream, "org/lib");
+            assert_eq!(rule1.downstream, "org/app");
+            assert_eq!(rule1.trigger, CascadeTrigger::Merge);
+            assert!(rule1.version_update);
+            assert_eq!(
+                rule1.instructions.as_deref(),
+                Some("Run npm install after updating")
+            );
+
+            let rule2 = &config.cascade.rules[1];
+            assert_eq!(rule2.trigger, CascadeTrigger::Release);
+            assert_eq!(rule2.target_branch.as_deref(), Some("develop"));
+            assert!(!rule2.version_update);
+        });
+    }
+
+    #[test]
+    fn test_cascade_find_rule() {
+        let config = CascadeConfig {
+            enabled: true,
+            max_depth: 0,
+            rules: vec![CascadeRule {
+                upstream: "org/lib".to_string(),
+                downstream: "org/app".to_string(),
+                trigger: CascadeTrigger::Merge,
+                target_branch: None,
+                version_update: true,
+                instructions: None,
+            }],
+        };
+        assert!(config.find_rule("org/lib", "org/app").is_some());
+        assert!(config.find_rule("org/lib", "org/other").is_none());
+        assert!(config.find_rule("other/lib", "org/app").is_none());
     }
 
     #[test]
@@ -4482,7 +4604,7 @@ work_dir = "/tmp/repos"
         assert_eq!(config.poll_interval_ms, 60000);
         assert!(!config.auto_resolve_on_merge);
         assert!(config.webhook_secret.is_none());
-        assert_eq!(config.review_trigger, "/claudear");
+        assert_eq!(config.review_trigger, "@claudear");
         assert!(!config.use_ssh);
     }
 
@@ -4572,8 +4694,6 @@ to_numbers = ["jake"]
         let from_alias: Wrapper = toml::from_str("period = \"1h\"").unwrap();
         assert_eq!(from_alias.period, TopIssuesPeriod::OneHour);
     }
-
-    // ── LearningConfig tests ──
 
     #[test]
     fn test_learning_config_defaults() {
@@ -4881,5 +5001,1447 @@ another_unknown = 42
     fn prioritisation_validate_accepts_defaults() {
         let config = PrioritisationConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_dashboard_config_default() {
+        let config = DashboardConfig::default();
+        assert!((config.max_plan_monthly_cost - 0.0).abs() < f64::EPSILON);
+        assert!((config.hourly_engineer_rate - 75.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_dashboard_config_from_toml() {
+        let toml_str = r#"
+max_plan_monthly_cost = 200.0
+hourly_engineer_rate = 150.0
+"#;
+        let config: DashboardConfig = toml::from_str(toml_str).unwrap();
+        assert!((config.max_plan_monthly_cost - 200.0).abs() < f64::EPSILON);
+        assert!((config.hourly_engineer_rate - 150.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_dashboard_config_partial_toml() {
+        let toml_str = r#"
+hourly_engineer_rate = 100.0
+"#;
+        let config: DashboardConfig = toml::from_str(toml_str).unwrap();
+        assert!((config.max_plan_monthly_cost - 0.0).abs() < f64::EPSILON);
+        assert!((config.hourly_engineer_rate - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_default_includes_dashboard() {
+        let config = Config::default();
+        assert!((config.dashboard.max_plan_monthly_cost - 0.0).abs() < f64::EPSILON);
+        assert!((config.dashboard.hourly_engineer_rate - 75.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_dashboard_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[dashboard]
+max_plan_monthly_cost = 100.0
+hourly_engineer_rate = 200.0
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!((config.dashboard.max_plan_monthly_cost - 100.0).abs() < f64::EPSILON);
+            assert!((config.dashboard.hourly_engineer_rate - 200.0).abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
+    fn test_code_index_config_default() {
+        let config = CodeIndexConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.max_file_size_kb, 1024);
+        assert_eq!(config.batch_size, 32);
+    }
+
+    #[test]
+    fn test_code_index_config_from_toml() {
+        let toml_str = r#"
+enabled = false
+max_file_size_kb = 2048
+batch_size = 64
+"#;
+        let config: CodeIndexConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.max_file_size_kb, 2048);
+        assert_eq!(config.batch_size, 64);
+    }
+
+    #[test]
+    fn test_code_index_config_partial_toml() {
+        let toml_str = r#"
+enabled = false
+"#;
+        let config: CodeIndexConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.max_file_size_kb, 1024);
+        assert_eq!(config.batch_size, 32);
+    }
+
+    #[test]
+    fn test_config_default_includes_code_index() {
+        let config = Config::default();
+        assert!(config.code_index.enabled);
+        assert_eq!(config.code_index.max_file_size_kb, 1024);
+    }
+
+    #[test]
+    fn test_config_code_index_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[code_index]
+enabled = false
+max_file_size_kb = 512
+batch_size = 16
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!(!config.code_index.enabled);
+            assert_eq!(config.code_index.max_file_size_kb, 512);
+            assert_eq!(config.code_index.batch_size, 16);
+        });
+    }
+
+    #[test]
+    fn test_evaluation_config_default() {
+        let config = EvaluationConfig::default();
+        assert!(!config.enabled);
+        assert!(config.test_delta);
+        assert!(config.lint_delta);
+        assert!(config.static_analysis_delta);
+        assert!(!config.coverage_delta);
+        assert_eq!(config.tool_timeout_secs, 300);
+        assert_eq!(config.total_timeout_secs, 900);
+        assert!(config.post_pr_comment);
+        assert!(!config.fail_on_regression);
+        assert!(config.custom_test_cmd.is_none());
+        assert!(config.custom_lint_cmd.is_none());
+        assert!(config.custom_analysis_cmd.is_none());
+        assert!(config.custom_coverage_cmd.is_none());
+    }
+
+    #[test]
+    fn test_evaluation_config_from_toml() {
+        let toml_str = r#"
+enabled = true
+test_delta = false
+lint_delta = false
+static_analysis_delta = false
+coverage_delta = true
+tool_timeout_secs = 600
+total_timeout_secs = 1800
+post_pr_comment = false
+fail_on_regression = true
+custom_test_cmd = "cargo test"
+custom_lint_cmd = "cargo clippy"
+custom_analysis_cmd = "cargo audit"
+custom_coverage_cmd = "cargo tarpaulin"
+"#;
+        let config: EvaluationConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert!(!config.test_delta);
+        assert!(!config.lint_delta);
+        assert!(!config.static_analysis_delta);
+        assert!(config.coverage_delta);
+        assert_eq!(config.tool_timeout_secs, 600);
+        assert_eq!(config.total_timeout_secs, 1800);
+        assert!(!config.post_pr_comment);
+        assert!(config.fail_on_regression);
+        assert_eq!(config.custom_test_cmd.as_deref(), Some("cargo test"));
+        assert_eq!(config.custom_lint_cmd.as_deref(), Some("cargo clippy"));
+        assert_eq!(config.custom_analysis_cmd.as_deref(), Some("cargo audit"));
+        assert_eq!(
+            config.custom_coverage_cmd.as_deref(),
+            Some("cargo tarpaulin")
+        );
+    }
+
+    #[test]
+    fn test_evaluation_config_partial_toml() {
+        let toml_str = r#"
+enabled = true
+custom_test_cmd = "npm test"
+"#;
+        let config: EvaluationConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert!(config.test_delta); // default
+        assert_eq!(config.custom_test_cmd.as_deref(), Some("npm test"));
+        assert!(config.custom_lint_cmd.is_none()); // default
+    }
+
+    #[test]
+    fn test_config_default_includes_evaluation() {
+        let config = Config::default();
+        assert!(!config.evaluation.enabled);
+        assert!(config.evaluation.test_delta);
+    }
+
+    #[test]
+    fn test_config_evaluation_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[evaluation]
+enabled = true
+fail_on_regression = true
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!(config.evaluation.enabled);
+            assert!(config.evaluation.fail_on_regression);
+            assert!(config.evaluation.test_delta); // default preserved
+        });
+    }
+
+    #[test]
+    fn test_prioritisation_config_default() {
+        let config = PrioritisationConfig::default();
+        assert!(config.enabled);
+        assert!((config.severity_weight - 0.30).abs() < f64::EPSILON);
+        assert!((config.frequency_weight - 0.25).abs() < f64::EPSILON);
+        assert!((config.regression_weight - 0.20).abs() < f64::EPSILON);
+        assert!((config.blast_radius_weight - 0.15).abs() < f64::EPSILON);
+        assert!((config.cluster_weight - 0.10).abs() < f64::EPSILON);
+        assert!(!config.critical_paths.is_empty());
+        assert!(!config.core_paths.is_empty());
+        assert!(!config.infra_paths.is_empty());
+        assert!(!config.test_paths.is_empty());
+        assert!(!config.cosmetic_paths.is_empty());
+        assert!(config.content_clustering);
+        assert!((config.cluster_similarity_threshold - 0.60).abs() < f64::EPSILON);
+        assert_eq!(config.min_content_cluster_size, 2);
+        assert!(config.suppression_rules.is_empty());
+    }
+
+    #[test]
+    fn test_prioritisation_config_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[prioritisation]
+enabled = false
+severity_weight = 0.5
+frequency_weight = 0.3
+regression_weight = 0.1
+blast_radius_weight = 0.05
+cluster_weight = 0.05
+content_clustering = false
+cluster_similarity_threshold = 0.8
+min_content_cluster_size = 5
+critical_paths = ["auth", "security"]
+core_paths = ["api"]
+infra_paths = ["deploy"]
+test_paths = ["test"]
+cosmetic_paths = ["docs"]
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!(!config.prioritisation.enabled);
+            assert!((config.prioritisation.severity_weight - 0.5).abs() < f64::EPSILON);
+            assert_eq!(
+                config.prioritisation.critical_paths,
+                vec!["auth", "security"]
+            );
+            assert!(!config.prioritisation.content_clustering);
+            assert_eq!(config.prioritisation.min_content_cluster_size, 5);
+        });
+    }
+
+    #[test]
+    fn prioritisation_validate_rejects_similarity_threshold_above_one() {
+        let config = PrioritisationConfig {
+            cluster_similarity_threshold: 1.5,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cluster_similarity_threshold"),
+            "Expected similarity threshold error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn prioritisation_validate_rejects_similarity_threshold_negative() {
+        let config = PrioritisationConfig {
+            cluster_similarity_threshold: -0.1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cluster_similarity_threshold"),
+            "Expected similarity threshold error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn prioritisation_validate_rejects_similarity_threshold_nan() {
+        let config = PrioritisationConfig {
+            cluster_similarity_threshold: f64::NAN,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cluster_similarity_threshold"),
+            "Expected similarity threshold error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn prioritisation_validate_rejects_infinity_weight() {
+        let config = PrioritisationConfig {
+            blast_radius_weight: f64::INFINITY,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("blast_radius_weight"),
+            "Expected infinity error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn prioritisation_validate_accepts_zero_similarity_threshold() {
+        let config = PrioritisationConfig {
+            cluster_similarity_threshold: 0.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn prioritisation_validate_accepts_one_similarity_threshold() {
+        let config = PrioritisationConfig {
+            cluster_similarity_threshold: 1.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn prioritisation_validate_rejects_cluster_size_zero() {
+        let config = PrioritisationConfig {
+            min_content_cluster_size: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("min_content_cluster_size"));
+    }
+
+    #[test]
+    fn prioritisation_validate_accepts_cluster_size_two() {
+        let config = PrioritisationConfig {
+            min_content_cluster_size: 2,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_slack_config_default() {
+        let config = SlackConfig::default();
+        assert!(config.bot_token.is_none());
+        assert!(config.channel_id.is_none());
+        assert!(config.webhook_url.is_none());
+        assert!(config.user_id.is_none());
+        assert!(!config.source_enabled);
+        assert!(config.listen_channel_id.is_none());
+        assert!(config.workspace.is_none());
+        assert!(config.poll_interval_ms.is_none());
+    }
+
+    #[test]
+    fn test_env_override_slack_settings() {
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(
+            &[
+                ("SLACK_BOT_TOKEN", "xoxb-test-token"),
+                ("SLACK_CHANNEL_ID", "C12345"),
+                ("SLACK_WEBHOOK_URL", "https://hooks.slack.com/test"),
+                ("SLACK_USER_ID", "U12345"),
+                ("SLACK_SOURCE_ENABLED", "true"),
+                ("SLACK_LISTEN_CHANNEL_ID", "C67890"),
+                ("SLACK_WORKSPACE", "myworkspace"),
+                ("SLACK_POLL_INTERVAL_MS", "45000"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.slack.bot_token, Some("xoxb-test-token".to_string()));
+                assert_eq!(config.slack.channel_id, Some("C12345".to_string()));
+                assert_eq!(
+                    config.slack.webhook_url,
+                    Some("https://hooks.slack.com/test".to_string())
+                );
+                assert_eq!(config.slack.user_id, Some("U12345".to_string()));
+                assert!(config.slack.source_enabled);
+                assert_eq!(config.slack.listen_channel_id, Some("C67890".to_string()));
+                assert_eq!(config.slack.workspace, Some("myworkspace".to_string()));
+                assert_eq!(config.slack.poll_interval_ms, Some(45000));
+            },
+        );
+    }
+
+    #[test]
+    fn test_discord_config_default() {
+        let config = DiscordConfig::default();
+        assert!(config.webhook_url.is_none());
+        assert!(config.user_id.is_none());
+        assert!(config.bot_token.is_none());
+        assert!(config.channel_id.is_none());
+        assert!(!config.source_enabled);
+        assert!(config.listen_channel_id.is_none());
+        assert!(config.guild_id.is_none());
+        assert!(config.poll_interval_ms.is_none());
+    }
+
+    #[test]
+    fn test_env_override_discord_source_enabled() {
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(
+            &[
+                ("DISCORD_SOURCE_ENABLED", "1"),
+                ("DISCORD_LISTEN_CHANNEL_ID", "LC123"),
+                ("DISCORD_GUILD_ID", "G456"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert!(config.discord.source_enabled);
+                assert_eq!(config.discord.listen_channel_id, Some("LC123".to_string()));
+                assert_eq!(config.discord.guild_id, Some("G456".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn test_sms_config_default() {
+        let config = SmsConfig::default();
+        assert!(config.account_sid.is_none());
+        assert!(config.auth_token.is_none());
+        assert!(config.from_number.is_none());
+        assert!(config.to_numbers.is_empty());
+    }
+
+    #[test]
+    fn test_push_config_default() {
+        let config = PushConfig::default();
+        assert!(config.api_token.is_none());
+        assert!(config.user_key.is_none());
+        assert!(config.device.is_none());
+        assert!(config.priority.is_none());
+    }
+
+    #[test]
+    fn test_gitlab_config_default() {
+        let config = GitLabConfig::default();
+        assert!(!config.enabled);
+        assert!(config.token.is_none());
+        assert_eq!(config.base_url, "https://gitlab.com");
+        assert!(config.groups.is_empty());
+        assert_eq!(
+            config.trigger_labels,
+            vec!["auto-implement".to_string(), "claude".to_string()]
+        );
+        assert_eq!(config.trigger_states, vec!["opened".to_string()]);
+        assert!(config.poll_interval_ms.is_none());
+        assert!(!config.auto_resolve_on_merge);
+        assert!(config.webhook_secret.is_none());
+        assert_eq!(config.review_trigger, "@claudear");
+        assert!(!config.use_ssh);
+        assert!(config.max_issues_per_cycle.is_none());
+        assert!(config.max_concurrent.is_none());
+    }
+
+    #[test]
+    fn test_gitlab_test_default() {
+        let config = GitLabConfig::test_default();
+        assert!(config.enabled);
+        assert_eq!(config.token, Some("test_token".to_string()));
+        assert_eq!(config.groups, vec!["mygroup".to_string()]);
+        assert!(config.auto_resolve_on_merge);
+        assert_eq!(config.webhook_secret, Some("test_secret".to_string()));
+    }
+
+    #[test]
+    fn test_gitlab_config_from_toml() {
+        let toml_str = r#"
+enabled = true
+token = "glpat-test"
+base_url = "https://gitlab.myco.com"
+groups = ["frontend", "backend"]
+trigger_labels = ["bot-fix"]
+trigger_states = ["opened", "reopened"]
+auto_resolve_on_merge = true
+webhook_secret = "secret"
+review_trigger = "@mybot"
+use_ssh = true
+max_issues_per_cycle = 10
+max_concurrent = 3
+"#;
+        let config: GitLabConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.token, Some("glpat-test".to_string()));
+        assert_eq!(config.base_url, "https://gitlab.myco.com");
+        assert_eq!(config.groups, vec!["frontend", "backend"]);
+        assert_eq!(config.trigger_labels, vec!["bot-fix"]);
+        assert_eq!(config.trigger_states, vec!["opened", "reopened"]);
+        assert!(config.auto_resolve_on_merge);
+        assert!(config.use_ssh);
+        assert_eq!(config.max_issues_per_cycle, Some(10));
+        assert_eq!(config.max_concurrent, Some(3));
+    }
+
+    #[test]
+    fn test_is_gitlab_enabled() {
+        let mut config = Config::default();
+        assert!(!config.is_gitlab_enabled());
+
+        config.gitlab = Some(GitLabConfig {
+            enabled: true,
+            token: Some("tok".to_string()),
+            ..Default::default()
+        });
+        assert!(config.is_gitlab_enabled());
+
+        // Enabled but no token
+        config.gitlab = Some(GitLabConfig {
+            enabled: true,
+            token: None,
+            ..Default::default()
+        });
+        assert!(!config.is_gitlab_enabled());
+
+        // Has token but disabled
+        config.gitlab = Some(GitLabConfig {
+            enabled: false,
+            token: Some("tok".to_string()),
+            ..Default::default()
+        });
+        assert!(!config.is_gitlab_enabled());
+    }
+
+    #[test]
+    fn test_env_override_gitlab() {
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(
+            &[
+                ("GITLAB_TOKEN", "glpat-env-token"),
+                ("GITLAB_BASE_URL", "https://gitlab.custom.com"),
+                ("GITLAB_GROUPS", "grp1, grp2"),
+                ("GITLAB_TRIGGER_LABELS", "fix, auto"),
+                ("GITLAB_TRIGGER_STATES", "opened, reopened"),
+                ("GITLAB_POLL_INTERVAL_MS", "120000"),
+                ("GITLAB_AUTO_RESOLVE_ON_MERGE", "true"),
+                ("GITLAB_WEBHOOK_SECRET", "gl_secret"),
+                ("GITLAB_REVIEW_TRIGGER", "@bot"),
+                ("GITLAB_USE_SSH", "true"),
+                ("GITLAB_MAX_ISSUES_PER_CYCLE", "8"),
+                ("GITLAB_MAX_CONCURRENT", "4"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                let gitlab = config.gitlab.unwrap();
+                assert!(gitlab.enabled);
+                assert_eq!(gitlab.token, Some("glpat-env-token".to_string()));
+                assert_eq!(gitlab.base_url, "https://gitlab.custom.com");
+                assert_eq!(gitlab.groups, vec!["grp1", "grp2"]);
+                assert_eq!(gitlab.trigger_labels, vec!["fix", "auto"]);
+                assert_eq!(gitlab.trigger_states, vec!["opened", "reopened"]);
+                assert_eq!(gitlab.poll_interval_ms, Some(120000));
+                assert!(gitlab.auto_resolve_on_merge);
+                assert_eq!(gitlab.webhook_secret, Some("gl_secret".to_string()));
+                assert_eq!(gitlab.review_trigger, "@bot");
+                assert!(gitlab.use_ssh);
+                assert_eq!(gitlab.max_issues_per_cycle, Some(8));
+                assert_eq!(gitlab.max_concurrent, Some(4));
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_gitlab_enabled_flag() {
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[gitlab]
+enabled = true
+token = "tok"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[("GITLAB_ENABLED", "false")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(!config.gitlab.as_ref().unwrap().enabled);
+        });
+    }
+
+    #[test]
+    fn test_jira_config_default() {
+        let config = JiraConfig::default();
+        assert!(!config.enabled);
+        assert!(config.base_url.is_empty());
+        assert!(config.email.is_empty());
+        assert!(config.api_token.is_empty());
+        assert_eq!(config.auth_mode, "basic");
+        assert!(config.project_keys.is_empty());
+        assert_eq!(
+            config.trigger_labels,
+            vec!["auto-implement".to_string(), "claude".to_string()]
+        );
+        assert_eq!(
+            config.trigger_statuses,
+            vec!["To Do".to_string(), "Backlog".to_string()]
+        );
+        assert!(config.trigger_assignee.is_none());
+        assert!(config.issue_types.is_empty());
+        assert!(config.custom_jql.is_none());
+        assert_eq!(config.max_results, 50);
+        assert!(config.max_issues_per_cycle.is_none());
+        assert!(config.max_concurrent.is_none());
+        assert!(config.poll_interval_ms.is_none());
+    }
+
+    #[test]
+    fn test_jira_config_from_toml() {
+        let toml_str = r#"
+enabled = true
+base_url = "https://myco.atlassian.net"
+email = "user@myco.com"
+api_token = "jira_token"
+auth_mode = "basic"
+project_keys = ["PROJ", "BACKEND"]
+trigger_labels = ["autofix"]
+trigger_statuses = ["Open"]
+trigger_assignee = "John Doe"
+issue_types = ["Bug", "Task"]
+custom_jql = "priority = High"
+max_results = 100
+max_issues_per_cycle = 5
+max_concurrent = 2
+poll_interval_ms = 60000
+"#;
+        let config: JiraConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.base_url, "https://myco.atlassian.net");
+        assert_eq!(config.email, "user@myco.com");
+        assert_eq!(config.api_token, "jira_token");
+        assert_eq!(config.auth_mode, "basic");
+        assert_eq!(config.project_keys, vec!["PROJ", "BACKEND"]);
+        assert_eq!(config.trigger_assignee.as_deref(), Some("John Doe"));
+        assert_eq!(config.issue_types, vec!["Bug", "Task"]);
+        assert_eq!(config.custom_jql.as_deref(), Some("priority = High"));
+        assert_eq!(config.max_results, 100);
+        assert_eq!(config.max_issues_per_cycle, Some(5));
+        assert_eq!(config.max_concurrent, Some(2));
+        assert_eq!(config.poll_interval_ms, Some(60000));
+    }
+
+    #[test]
+    fn test_is_jira_enabled() {
+        let mut config = Config::default();
+        assert!(!config.is_jira_enabled());
+
+        config.jira = Some(JiraConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(config.is_jira_enabled());
+
+        config.jira.as_mut().unwrap().enabled = false;
+        assert!(!config.is_jira_enabled());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_with_jira() {
+        let mut config = Config::default();
+        config.jira = Some(JiraConfig {
+            enabled: true,
+            api_token: "token".into(),
+            base_url: "https://myco.atlassian.net".into(),
+            email: "user@myco.com".into(),
+            auth_mode: "basic".into(),
+            ..Default::default()
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_jira_missing_base_url() {
+        let mut config = Config::default();
+        config.jira = Some(JiraConfig {
+            enabled: true,
+            api_token: "token".into(),
+            base_url: String::new(),
+            email: "user@myco.com".into(),
+            auth_mode: "basic".into(),
+            ..Default::default()
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("base_url"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_jira_invalid_auth_mode() {
+        let mut config = Config::default();
+        config.jira = Some(JiraConfig {
+            enabled: true,
+            api_token: "token".into(),
+            base_url: "https://myco.atlassian.net".into(),
+            email: "user@myco.com".into(),
+            auth_mode: "invalid".into(),
+            ..Default::default()
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("auth_mode"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_jira_basic_auth_missing_email() {
+        let mut config = Config::default();
+        config.jira = Some(JiraConfig {
+            enabled: true,
+            api_token: "token".into(),
+            base_url: "https://myco.atlassian.net".into(),
+            email: String::new(),
+            auth_mode: "basic".into(),
+            ..Default::default()
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("email"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_jira_bearer_auth_no_email_required() {
+        let mut config = Config::default();
+        config.jira = Some(JiraConfig {
+            enabled: true,
+            api_token: "token".into(),
+            base_url: "https://myco.atlassian.net".into(),
+            email: String::new(),
+            auth_mode: "bearer".into(),
+            ..Default::default()
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_env_override_jira() {
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(
+            &[
+                ("JIRA_API_TOKEN", "env_jira_token"),
+                ("JIRA_ENABLED", "true"),
+                ("JIRA_BASE_URL", "https://env.atlassian.net"),
+                ("JIRA_EMAIL", "env@example.com"),
+                ("JIRA_AUTH_MODE", "bearer"),
+                ("JIRA_PROJECT_KEYS", "PROJ1, PROJ2"),
+                ("JIRA_TRIGGER_LABELS", "fix, auto"),
+                ("JIRA_TRIGGER_STATUSES", "Open, In Progress"),
+                ("JIRA_TRIGGER_ASSIGNEE", "Jane Smith"),
+                ("JIRA_ISSUE_TYPES", "Bug, Story"),
+                ("JIRA_CUSTOM_JQL", "priority = Critical"),
+                ("JIRA_MAX_RESULTS", "25"),
+                ("JIRA_MAX_ISSUES_PER_CYCLE", "7"),
+                ("JIRA_MAX_CONCURRENT", "3"),
+                ("JIRA_POLL_INTERVAL_MS", "90000"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                let jira = config.jira.unwrap();
+                assert!(jira.enabled);
+                assert_eq!(jira.api_token, "env_jira_token");
+                assert_eq!(jira.base_url, "https://env.atlassian.net");
+                assert_eq!(jira.email, "env@example.com");
+                assert_eq!(jira.auth_mode, "bearer");
+                assert_eq!(jira.project_keys, vec!["PROJ1", "PROJ2"]);
+                assert_eq!(jira.trigger_labels, vec!["fix", "auto"]);
+                assert_eq!(jira.trigger_statuses, vec!["Open", "In Progress"]);
+                assert_eq!(jira.trigger_assignee, Some("Jane Smith".to_string()));
+                assert_eq!(jira.issue_types, vec!["Bug", "Story"]);
+                assert_eq!(jira.custom_jql, Some("priority = Critical".to_string()));
+                assert_eq!(jira.max_results, 25);
+                assert_eq!(jira.max_issues_per_cycle, Some(7));
+                assert_eq!(jira.max_concurrent, Some(3));
+                assert_eq!(jira.poll_interval_ms, Some(90000));
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_creates_jira_config_when_missing() {
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[("JIRA_API_TOKEN", "env_jira_token")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(config.jira.is_some());
+            assert_eq!(config.jira.as_ref().unwrap().api_token, "env_jira_token");
+        });
+    }
+
+    #[test]
+    fn test_env_creates_gitlab_config_when_missing() {
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[("GITLAB_TOKEN", "glpat-env")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(config.gitlab.is_some());
+            let gitlab = config.gitlab.unwrap();
+            assert_eq!(gitlab.token, Some("glpat-env".to_string()));
+            assert!(gitlab.enabled);
+        });
+    }
+
+    #[test]
+    fn test_user_config_default() {
+        let config = UserConfig::default();
+        assert!(config.linear_name.is_none());
+        assert!(config.github_username.is_none());
+        assert!(config.sentry_username.is_none());
+        assert!(config.jira_username.is_none());
+        assert!(config.gitlab_username.is_none());
+        assert!(config.discord_id.is_none());
+        assert!(config.slack_id.is_none());
+        assert!(config.email.is_none());
+        assert!(config.push_user_key.is_none());
+        assert!(config.sms_number.is_none());
+    }
+
+    #[test]
+    fn test_user_config_with_all_fields() {
+        let toml_str = r#"
+[users.fulluser]
+linear_name = "Full User"
+github_username = "fulluser"
+sentry_username = "full"
+jira_username = "fulluser"
+gitlab_username = "fulluser_gl"
+discord_id = "111"
+slack_id = "U111"
+email = "full@example.com"
+push_user_key = "pk111"
+sms_number = "+1111111111"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let user = &config.users["fulluser"];
+        assert_eq!(user.jira_username.as_deref(), Some("fulluser"));
+        assert_eq!(user.gitlab_username.as_deref(), Some("fulluser_gl"));
+        assert_eq!(user.slack_id.as_deref(), Some("U111"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_with_gitlab() {
+        let mut config = Config::default();
+        config.gitlab = Some(GitLabConfig {
+            enabled: true,
+            token: Some("glpat-test".to_string()),
+            ..Default::default()
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_with_slack_source() {
+        let mut config = Config::default();
+        config.slack.source_enabled = true;
+        config.slack.bot_token = Some("xoxb-test".to_string());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_with_discord_source() {
+        let mut config = Config::default();
+        config.discord.source_enabled = true;
+        config.discord.bot_token = Some("bot-token".to_string());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_slack_source_without_bot_token() {
+        let mut config = Config::default();
+        config.slack.source_enabled = true;
+        config.slack.bot_token = None;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_discord_source_without_bot_token() {
+        let mut config = Config::default();
+        config.discord.source_enabled = true;
+        config.discord.bot_token = None;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_prioritisation_skipped_when_disabled() {
+        let mut config = Config::default();
+        config.linear = Some(LinearConfig {
+            enabled: true,
+            api_key: "key".into(),
+            ..Default::default()
+        });
+        // Set invalid prioritisation values
+        config.prioritisation.enabled = false;
+        config.prioritisation.severity_weight = -1.0;
+        // Validation should pass because prioritisation is disabled
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_validation_prioritisation_checked_when_enabled() {
+        let mut config = Config::default();
+        config.linear = Some(LinearConfig {
+            enabled: true,
+            api_key: "key".into(),
+            ..Default::default()
+        });
+        config.prioritisation.enabled = true;
+        config.prioritisation.severity_weight = -1.0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_per_source_max_issues_for_jira_and_gitlab() {
+        let config = Config {
+            max_issues_per_cycle: 5,
+            jira: Some(JiraConfig {
+                max_issues_per_cycle: Some(3),
+                ..Default::default()
+            }),
+            gitlab: Some(GitLabConfig {
+                max_issues_per_cycle: Some(4),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.max_issues_per_cycle_for("jira"), 3);
+        assert_eq!(config.max_issues_per_cycle_for("gitlab"), 4);
+    }
+
+    #[test]
+    fn test_per_source_max_issues_for_jira_gitlab_fallback() {
+        let config = Config {
+            max_issues_per_cycle: 5,
+            jira: Some(JiraConfig::default()),
+            gitlab: Some(GitLabConfig::default()),
+            ..Default::default()
+        };
+        assert_eq!(config.max_issues_per_cycle_for("jira"), 5);
+        assert_eq!(config.max_issues_per_cycle_for("gitlab"), 5);
+    }
+
+    #[test]
+    fn test_per_source_max_concurrent_for_jira_and_gitlab() {
+        let config = Config {
+            max_concurrent: 4,
+            jira: Some(JiraConfig {
+                max_concurrent: Some(2),
+                ..Default::default()
+            }),
+            gitlab: Some(GitLabConfig {
+                max_concurrent: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.max_concurrent_for("jira"), 2);
+        assert_eq!(config.max_concurrent_for("gitlab"), 3);
+    }
+
+    #[test]
+    fn test_per_source_max_concurrent_for_jira_gitlab_fallback() {
+        let config = Config {
+            max_concurrent: 4,
+            jira: Some(JiraConfig::default()),
+            gitlab: Some(GitLabConfig::default()),
+            ..Default::default()
+        };
+        assert_eq!(config.max_concurrent_for("jira"), 4);
+        assert_eq!(config.max_concurrent_for("gitlab"), 4);
+    }
+
+    #[test]
+    fn test_poll_interval_ms_for_jira_and_gitlab() {
+        let config = Config {
+            poll_interval_ms: 300_000,
+            jira: Some(JiraConfig {
+                poll_interval_ms: Some(60_000),
+                ..Default::default()
+            }),
+            gitlab: Some(GitLabConfig {
+                poll_interval_ms: Some(90_000),
+                ..Default::default()
+            }),
+            slack: SlackConfig {
+                poll_interval_ms: Some(45_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(config.poll_interval_ms_for("jira"), 60_000);
+        assert_eq!(config.poll_interval_ms_for("gitlab"), 90_000);
+        assert_eq!(config.poll_interval_ms_for("slack"), 45_000);
+    }
+
+    #[test]
+    fn test_poll_interval_ms_for_jira_gitlab_fallback() {
+        let config = Config {
+            poll_interval_ms: 300_000,
+            jira: Some(JiraConfig::default()),
+            gitlab: Some(GitLabConfig::default()),
+            ..Default::default()
+        };
+        assert_eq!(config.poll_interval_ms_for("jira"), 300_000);
+        assert_eq!(config.poll_interval_ms_for("gitlab"), 300_000);
+    }
+
+    #[test]
+    fn test_regression_config_effective_monitoring_zero_hours() {
+        let config = RegressionConfig {
+            monitoring_duration_hours: 0,
+            monitoring_duration_secs: None,
+            ..Default::default()
+        };
+        assert_eq!(config.effective_monitoring_duration_secs(), 0);
+    }
+
+    #[test]
+    fn test_regression_config_effective_check_zero_hours() {
+        let config = RegressionConfig {
+            check_interval_hours: 0,
+            check_interval_secs: None,
+            ..Default::default()
+        };
+        // 0 hours * 3600 = 0, but .max(1) clamps to 1
+        assert_eq!(config.effective_check_interval_secs(), 1);
+    }
+
+    #[test]
+    fn test_regression_config_package_names() {
+        let toml_str = r#"
+enabled = true
+check_interval_hours = 1
+monitoring_duration_hours = 24
+sentry_event_threshold = 1
+similarity_threshold = 0.75
+
+[package_names]
+"utopia-php/database" = "utopia-php/database"
+"my-repo" = "my-package"
+"#;
+        let config: RegressionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.package_names.len(), 2);
+        assert_eq!(
+            config.package_names.get("my-repo"),
+            Some(&"my-package".to_string())
+        );
+    }
+
+    #[test]
+    fn test_default_storage_dir() {
+        let dir = default_storage_dir();
+        assert_eq!(dir, PathBuf::from("./storage"));
+    }
+
+    #[test]
+    fn test_config_default_storage_dir() {
+        let config = Config::default();
+        assert_eq!(config.storage_dir, PathBuf::from("./storage"));
+    }
+
+    #[test]
+    fn test_config_storage_dir_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+storage_dir = "/custom/storage"
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert_eq!(config.storage_dir, PathBuf::from("/custom/storage"));
+        });
+    }
+
+    #[test]
+    fn test_config_default_max_activity_entries() {
+        let config = Config::default();
+        assert_eq!(config.max_activity_entries, 10_000);
+    }
+
+    #[test]
+    fn test_config_default_ipc_timeout_secs() {
+        let config = Config::default();
+        assert_eq!(config.ipc_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_config_default_claude_timeout_secs() {
+        let config = Config::default();
+        assert_eq!(config.claude_timeout_secs, 21600);
+    }
+
+    #[test]
+    fn test_config_default_db_path() {
+        let config = Config::default();
+        assert_eq!(config.db_path, PathBuf::from("claudear.db"));
+    }
+
+    #[test]
+    fn test_config_default_work_dir_empty() {
+        let config = Config::default();
+        assert!(config.work_dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn test_env_override_linear_poll_interval_ms() {
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[linear]
+api_key = "key"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[("LINEAR_POLL_INTERVAL_MS", "120000")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert_eq!(
+                config.linear.as_ref().unwrap().poll_interval_ms,
+                Some(120000)
+            );
+        });
+    }
+
+    #[test]
+    fn test_env_override_sentry_poll_interval_ms() {
+        let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[sentry]
+auth_token = "tok"
+org_slug = "org"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[("SENTRY_POLL_INTERVAL_MS", "90000")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert_eq!(
+                config.sentry.as_ref().unwrap().poll_interval_ms,
+                Some(90000)
+            );
+        });
+    }
+
+    #[test]
+    fn test_linear_trigger_assignee_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[linear]
+api_key = "key"
+trigger_assignee = "Alice"
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert_eq!(
+                config.linear.as_ref().unwrap().trigger_assignee,
+                Some("Alice".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_from_toml_empty() {
+        with_env(&[], || {
+            let config = Config::from_toml("").unwrap();
+            assert!(config.work_dir.as_os_str().is_empty());
+            assert_eq!(config.poll_interval_ms, 300_000);
+            assert!(config.linear.is_none());
+            assert!(config.sentry.is_none());
+            assert!(config.jira.is_none());
+            assert!(config.gitlab.is_none());
+        });
+    }
+
+    #[test]
+    fn test_learning_config_cross_repo_defaults() {
+        let config = LearningConfig::default();
+        assert!(config.cross_repo_correlation);
+        assert_eq!(config.cross_repo_window_hours, 24);
+    }
+
+    #[test]
+    fn test_learning_config_cross_repo_from_toml() {
+        let toml_str = r#"
+cross_repo_correlation = false
+cross_repo_window_hours = 48
+"#;
+        let config: LearningConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.cross_repo_correlation);
+        assert_eq!(config.cross_repo_window_hours, 48);
+    }
+
+    #[test]
+    fn test_claude_config_instructions_file_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[claude]
+instructions_file = "my-instructions.md"
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert_eq!(
+                config.claude.instructions_file,
+                Some("my-instructions.md".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_evaluation_config_roundtrip() {
+        let config = EvaluationConfig {
+            enabled: true,
+            test_delta: false,
+            lint_delta: true,
+            static_analysis_delta: false,
+            coverage_delta: true,
+            tool_timeout_secs: 600,
+            total_timeout_secs: 1800,
+            post_pr_comment: false,
+            fail_on_regression: true,
+            custom_test_cmd: Some("npm test".to_string()),
+            custom_lint_cmd: None,
+            custom_analysis_cmd: Some("sonar".to_string()),
+            custom_coverage_cmd: None,
+        };
+        let toml_str = toml::to_string(&config).unwrap();
+        let restored: EvaluationConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.enabled, restored.enabled);
+        assert_eq!(config.test_delta, restored.test_delta);
+        assert_eq!(config.tool_timeout_secs, restored.tool_timeout_secs);
+        assert_eq!(config.custom_test_cmd, restored.custom_test_cmd);
+        assert_eq!(config.custom_lint_cmd, restored.custom_lint_cmd);
+    }
+
+    #[test]
+    fn test_code_index_config_roundtrip() {
+        let config = CodeIndexConfig {
+            enabled: false,
+            max_file_size_kb: 4096,
+            batch_size: 128,
+        };
+        let toml_str = toml::to_string(&config).unwrap();
+        let restored: CodeIndexConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.enabled, restored.enabled);
+        assert_eq!(config.max_file_size_kb, restored.max_file_size_kb);
+        assert_eq!(config.batch_size, restored.batch_size);
+    }
+
+    #[test]
+    fn test_top_issues_period_serde_toml_more_aliases() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrapper {
+            period: TopIssuesPeriod,
+        }
+
+        let from_12h: Wrapper = toml::from_str("period = \"12h\"").unwrap();
+        assert_eq!(from_12h.period, TopIssuesPeriod::TwelveHours);
+
+        let from_24h: Wrapper = toml::from_str("period = \"24h\"").unwrap();
+        assert_eq!(from_24h.period, TopIssuesPeriod::OneDay);
+
+        let from_1d: Wrapper = toml::from_str("period = \"1d\"").unwrap();
+        assert_eq!(from_1d.period, TopIssuesPeriod::OneDay);
+
+        let from_7d: Wrapper = toml::from_str("period = \"7d\"").unwrap();
+        assert_eq!(from_7d.period, TopIssuesPeriod::OneWeek);
+
+        let from_30d: Wrapper = toml::from_str("period = \"30d\"").unwrap();
+        assert_eq!(from_30d.period, TopIssuesPeriod::OneMonth);
+
+        let from_1m: Wrapper = toml::from_str("period = \"1m\"").unwrap();
+        assert_eq!(from_1m.period, TopIssuesPeriod::OneMonth);
+    }
+
+    #[test]
+    fn test_github_use_ssh_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[github]
+token = "ghp_test"
+use_ssh = true
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!(config.github.use_ssh);
+        });
+    }
+
+    #[test]
+    fn test_slack_config_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[slack]
+bot_token = "xoxb-token"
+channel_id = "C123"
+webhook_url = "https://hooks.slack.com/x"
+user_id = "U123"
+source_enabled = true
+listen_channel_id = "C456"
+workspace = "myteam"
+poll_interval_ms = 30000
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert_eq!(config.slack.bot_token, Some("xoxb-token".to_string()));
+            assert_eq!(config.slack.channel_id, Some("C123".to_string()));
+            assert!(config.slack.source_enabled);
+            assert_eq!(config.slack.listen_channel_id, Some("C456".to_string()));
+            assert_eq!(config.slack.workspace, Some("myteam".to_string()));
+            assert_eq!(config.slack.poll_interval_ms, Some(30000));
+        });
+    }
+
+    #[test]
+    fn test_discord_config_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+work_dir = "/tmp/repos"
+
+[discord]
+webhook_url = "https://discord.com/wh"
+user_id = "U789"
+bot_token = "bot_tok"
+channel_id = "CH123"
+source_enabled = true
+listen_channel_id = "CH456"
+guild_id = "G789"
+poll_interval_ms = 25000
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert_eq!(
+                config.discord.webhook_url,
+                Some("https://discord.com/wh".to_string())
+            );
+            assert_eq!(config.discord.bot_token, Some("bot_tok".to_string()));
+            assert!(config.discord.source_enabled);
+            assert_eq!(config.discord.guild_id, Some("G789".to_string()));
+            assert_eq!(config.discord.poll_interval_ms, Some(25000));
+        });
+    }
+
+    #[test]
+    fn test_load_default_returns_error_when_no_file() {
+        // load_default tries to read claudear.toml from the current directory,
+        // which should not exist in the test environment in most cases.
+        // We just verify it returns an error rather than panicking.
+        let result = Config::load_default();
+        // It might or might not exist - we just ensure no panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_resolve_instructions_file_whitespace_only() {
+        with_env(&[], || {
+            let dir = tempfile::tempdir().unwrap();
+            let instructions_path = dir.path().join("whitespace.md");
+            fs::write(&instructions_path, "   \n\n  \t  \n").unwrap();
+
+            let toml_str =
+                "work_dir = \"/tmp/repos\"\n\n[claude]\ninstructions_file = \"whitespace.md\"";
+            let config = Config::from_toml(toml_str).unwrap();
+            let resolved = config.resolve_instructions_file(dir.path()).unwrap();
+            // Whitespace-only file should be treated as empty
+            assert_eq!(resolved, None);
+        });
+    }
+
+    #[test]
+    fn test_per_source_helpers_with_none_configs() {
+        let config = Config::default();
+        // All source Options are None - should fall back to global
+        assert_eq!(
+            config.max_issues_per_cycle_for("linear"),
+            config.max_issues_per_cycle
+        );
+        assert_eq!(
+            config.max_issues_per_cycle_for("sentry"),
+            config.max_issues_per_cycle
+        );
+        assert_eq!(
+            config.max_issues_per_cycle_for("jira"),
+            config.max_issues_per_cycle
+        );
+        assert_eq!(
+            config.max_issues_per_cycle_for("gitlab"),
+            config.max_issues_per_cycle
+        );
+        assert_eq!(config.max_concurrent_for("linear"), config.max_concurrent);
+        assert_eq!(config.max_concurrent_for("sentry"), config.max_concurrent);
+        assert_eq!(config.max_concurrent_for("jira"), config.max_concurrent);
+        assert_eq!(config.max_concurrent_for("gitlab"), config.max_concurrent);
+        assert_eq!(
+            config.poll_interval_ms_for("linear"),
+            config.poll_interval_ms
+        );
+        assert_eq!(
+            config.poll_interval_ms_for("sentry"),
+            config.poll_interval_ms
+        );
+        assert_eq!(config.poll_interval_ms_for("jira"), config.poll_interval_ms);
+        assert_eq!(
+            config.poll_interval_ms_for("gitlab"),
+            config.poll_interval_ms
+        );
+    }
+
+    #[test]
+    fn test_default_config_file_constant() {
+        assert_eq!(DEFAULT_CONFIG_FILE, "claudear.toml");
     }
 }

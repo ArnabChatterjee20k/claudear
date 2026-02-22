@@ -32,6 +32,10 @@ struct SlackMessage {
     user: Option<String>,
     /// Bot ID (present if sent by a bot).
     bot_id: Option<String>,
+    /// Message subtype (e.g. "bot_message" for incoming webhook posts).
+    /// Messages posted via `chat.postMessage` by a bot have no subtype,
+    /// while incoming webhook posts have `subtype: "bot_message"`.
+    subtype: Option<String>,
     /// Channel ID (may not be present in history responses).
     #[allow(dead_code)]
     #[serde(default)]
@@ -70,9 +74,14 @@ impl SlackSource {
             .or(self.config.channel_id.as_deref())
     }
 
-    /// Check if a message is from a bot.
+    /// Check if a message is from a bot (excludes incoming webhook messages).
+    ///
+    /// Incoming webhook posts have `subtype: "bot_message"` and `bot_id`, while
+    /// direct bot posts via `chat.postMessage` have `bot_id` but no `subtype`.
+    /// Webhook messages represent external/user-triggered actions and should be
+    /// treated as valid issues (analogous to Discord's `webhook_id` check).
     fn is_bot_message(msg: &SlackMessage) -> bool {
-        msg.bot_id.is_some()
+        msg.bot_id.is_some() && msg.subtype.is_none()
     }
 
     /// Extract a title from message content (first line, max 100 chars).
@@ -264,8 +273,191 @@ impl IssueSource for SlackSource {
         Ok(context)
     }
 
+    async fn create_issue(
+        &self,
+        title: &str,
+        description: &str,
+        _labels: &[String],
+    ) -> Result<Issue> {
+        let bot_token = self
+            .config
+            .bot_token
+            .as_deref()
+            .ok_or_else(|| Error::config("Slack bot_token is required to create an issue"))?;
+
+        let channel_id = self
+            .listen_channel_id()
+            .ok_or_else(|| Error::config("Slack channel_id is required to create an issue"))?
+            .to_string();
+
+        let content = if description.is_empty() {
+            title.to_string()
+        } else {
+            format!("{}\n\n{}", title, description)
+        };
+
+        // Prefer webhook URL: messages posted via webhook don't have bot_id,
+        // so they bypass the is_bot_message filter in poll_issues. We post via
+        // webhook then fetch the latest message from history to get its ts.
+        if let Some(ref webhook_url) = self.config.webhook_url {
+            let resp = self
+                .client
+                .post(webhook_url)
+                .json(&serde_json::json!({ "text": content }))
+                .send()
+                .await
+                .map_err(|e| {
+                    Error::notifier(
+                        "slack_source",
+                        format!("Failed to post Slack webhook: {}", e),
+                    )
+                })?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Error::notifier(
+                    "slack_source",
+                    format!("Slack webhook returned {}: {}", status, body),
+                ));
+            }
+
+            // Brief delay then fetch latest message to get its ts
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let url = format!(
+                "https://slack.com/api/conversations.history?channel={}&limit=1",
+                channel_id
+            );
+            let history_resp: serde_json::Value = self
+                .client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", bot_token))
+                .send()
+                .await
+                .map_err(|e| {
+                    Error::notifier(
+                        "slack_source",
+                        format!("Failed to fetch Slack history: {}", e),
+                    )
+                })?
+                .json()
+                .await
+                .map_err(|e| {
+                    Error::notifier(
+                        "slack_source",
+                        format!("Failed to parse Slack history response: {}", e),
+                    )
+                })?;
+
+            let ts = history_resp
+                .pointer("/messages/0/ts")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .ok_or_else(|| {
+                    Error::notifier("slack_source", "No ts in Slack history after webhook post")
+                })?;
+
+            let msg = SlackMessage {
+                ts: ts.to_string(),
+                text: content,
+                user: None,
+                bot_id: None,
+                subtype: None,
+                channel: Some(channel_id.clone()),
+            };
+
+            return Ok(self.message_to_issue(&msg, &channel_id));
+        }
+
+        // Fallback: use bot token to post (message will have bot_id set)
+        let response = self
+            .client
+            .post("https://slack.com/api/chat.postMessage")
+            .header("Authorization", format!("Bearer {}", bot_token))
+            .json(&serde_json::json!({
+                "channel": channel_id,
+                "text": content,
+            }))
+            .send()
+            .await?;
+
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            Error::notifier(
+                "slack_source",
+                format!("Failed to parse Slack response: {}", e),
+            )
+        })?;
+
+        if !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            return Err(Error::notifier(
+                "slack_source",
+                format!("Slack API error posting message: {}", error),
+            ));
+        }
+
+        let ts = body.get("ts").and_then(|v| v.as_str()).ok_or_else(|| {
+            Error::notifier("slack_source", "No ts in Slack postMessage response")
+        })?;
+
+        let msg = SlackMessage {
+            ts: ts.to_string(),
+            text: content,
+            user: None,
+            bot_id: None,
+            subtype: None,
+            channel: Some(channel_id.clone()),
+        };
+
+        Ok(self.message_to_issue(&msg, &channel_id))
+    }
+
     async fn get_issue(&self, issue_id: &str) -> Result<Issue> {
-        Err(Error::issue_not_found("slack", issue_id))
+        let channel_id = self
+            .listen_channel_id()
+            .ok_or_else(|| Error::config("Slack channel_id is required to fetch an issue"))?
+            .to_string();
+
+        let bot_token = self
+            .config
+            .bot_token
+            .as_deref()
+            .ok_or_else(|| Error::config("Slack bot_token is required to fetch an issue"))?;
+
+        // Use conversations.history with oldest=ts&latest=ts&inclusive=true to fetch
+        // exactly one message by its timestamp.
+        let url = format!(
+            "https://slack.com/api/conversations.history?channel={}&oldest={}&latest={}&inclusive=true&limit=1",
+            channel_id, issue_id, issue_id
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", bot_token))
+            .send()
+            .await?;
+
+        let body = response.text().await.unwrap_or_default();
+        let parsed: SlackHistoryResponse = serde_json::from_str(&body).map_err(|e| {
+            Error::notifier(
+                "slack_source",
+                format!("Failed to parse Slack response: {}", e),
+            )
+        })?;
+
+        if !parsed.ok {
+            return Err(Error::issue_not_found("slack", issue_id));
+        }
+
+        parsed
+            .messages
+            .first()
+            .map(|msg| self.message_to_issue(msg, &channel_id))
+            .ok_or_else(|| Error::issue_not_found("slack", issue_id))
     }
 }
 
@@ -298,6 +490,7 @@ mod tests {
             } else {
                 None
             },
+            subtype: None,
             channel: Some("C12345".to_string()),
         }
     }
@@ -789,6 +982,7 @@ mod tests {
             text: "ghost".to_string(),
             user: None,
             bot_id: None,
+            subtype: None,
             channel: None,
         };
         assert!(!SlackSource::is_bot_message(&msg));
@@ -796,16 +990,32 @@ mod tests {
 
     #[test]
     fn test_is_bot_message_both_user_and_bot_id() {
-        // A message with both user and bot_id (apps can do this)
+        // A message with both user and bot_id, no subtype (direct bot post)
         let msg = SlackMessage {
             ts: "1.0".to_string(),
             text: "app msg".to_string(),
             user: Some("U123".to_string()),
             bot_id: Some("B456".to_string()),
+            subtype: None,
             channel: None,
         };
-        // Should be classified as bot because bot_id is present
+        // Should be classified as bot because bot_id is present and no subtype
         assert!(SlackSource::is_bot_message(&msg));
+    }
+
+    #[test]
+    fn test_is_bot_message_webhook_message() {
+        // Incoming webhook messages have bot_id AND subtype "bot_message".
+        // These should NOT be classified as bot messages (they simulate users).
+        let msg = SlackMessage {
+            ts: "1.0".to_string(),
+            text: "webhook msg".to_string(),
+            user: None,
+            bot_id: Some("B456".to_string()),
+            subtype: Some("bot_message".to_string()),
+            channel: None,
+        };
+        assert!(!SlackSource::is_bot_message(&msg));
     }
 
     // ---------------------------------------------------------------
@@ -866,8 +1076,6 @@ mod tests {
     // message_to_issue with diverse inputs.
     // ================================================================
 
-    // ── SlackHistoryResponse deserialization edge cases ──────────────
-
     #[test]
     fn test_history_response_deserialize_multiple_messages() {
         let json = r#"{
@@ -904,8 +1112,6 @@ mod tests {
         assert!(resp.ok);
         assert!(resp.messages.is_empty());
     }
-
-    // ── SlackMessage deserialization edge cases ──────────────────────
 
     #[test]
     fn test_slack_message_deserialize_full_fields() {
@@ -946,8 +1152,6 @@ mod tests {
         assert_eq!(msg.text, "");
     }
 
-    // ── extract_title: boundary and content cases ────────────────────
-
     #[test]
     fn test_extract_title_exactly_97_chars_no_truncation() {
         let s = "a".repeat(97);
@@ -978,22 +1182,19 @@ mod tests {
         assert_eq!(title, input);
     }
 
-    // ── is_bot_message: systematic field combinations ────────────────
-
     #[test]
     fn test_is_bot_message_empty_bot_id_string() {
-        // bot_id = Some("") is still a Some, so is_bot_message returns true
+        // bot_id = Some("") with no subtype is still a bot message
         let msg = SlackMessage {
             ts: "1.0".to_string(),
             text: "test".to_string(),
             user: Some("U123".to_string()),
             bot_id: Some("".to_string()),
+            subtype: None,
             channel: None,
         };
         assert!(SlackSource::is_bot_message(&msg));
     }
-
-    // ── listen_channel_id: priority and edge cases ───────────────────
 
     #[test]
     fn test_listen_channel_id_empty_string_listen() {
@@ -1013,8 +1214,6 @@ mod tests {
         assert_eq!(source.listen_channel_id(), Some("C_ONLY"));
     }
 
-    // ── message_url: various timestamp formats ───────────────────────
-
     #[test]
     fn test_message_url_empty_timestamp() {
         let source = SlackSource::new(make_config());
@@ -1031,8 +1230,6 @@ mod tests {
             "https://myworkspace.slack.com/archives/C111/p1234567890123456"
         );
     }
-
-    // ── message_to_issue: comprehensive field mapping ────────────────
 
     #[test]
     fn test_message_to_issue_preserves_full_text_as_description() {
@@ -1077,8 +1274,6 @@ mod tests {
         assert_eq!(issue3.short_id, "SLACK-12345678");
     }
 
-    // ── Constructor: client creation ─────────────────────────────────
-
     #[test]
     fn test_new_creates_source_with_defaults() {
         let source = SlackSource::new(make_config());
@@ -1100,8 +1295,6 @@ mod tests {
         assert!(source.listen_channel_id().is_none());
     }
 
-    // ── IssueSource trait: name and display_name ─────────────────────
-
     #[test]
     fn test_name_is_slack() {
         let source = SlackSource::new(make_config());
@@ -1113,8 +1306,6 @@ mod tests {
         let source = SlackSource::new(make_config());
         assert_eq!(IssueSource::display_name(&source), "Slack Messages");
     }
-
-    // ── build_issue_context: all fields present ──────────────────────
 
     #[tokio::test]
     async fn test_build_issue_context_all_fields() {
@@ -1135,8 +1326,6 @@ mod tests {
         assert!(context.contains("Author ID: U99999"));
         assert!(context.contains("URL: https://myworkspace.slack.com/archives/C12345/p1709123"));
     }
-
-    // ── Deserialization: realistic Slack API payloads ─────────────────
 
     #[test]
     fn test_history_response_realistic_payload() {
@@ -1191,8 +1380,6 @@ mod tests {
         assert_eq!(resp.error.as_deref(), Some("invalid_auth"));
     }
 
-    // ── matches_criteria: ensure unconditional matching ───────────────
-
     #[test]
     fn test_matches_criteria_with_different_sources() {
         let source = SlackSource::new(make_config());
@@ -1204,5 +1391,240 @@ mod tests {
                 src
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Additional coverage: deserialization, config defaults, helper logic
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_slack_config_default() {
+        let config = SlackConfig::default();
+        assert!(config.bot_token.is_none());
+        assert!(config.channel_id.is_none());
+        assert!(!config.source_enabled);
+        assert!(config.listen_channel_id.is_none());
+        assert!(config.workspace.is_none());
+        assert!(config.poll_interval_ms.is_none());
+    }
+
+    #[test]
+    fn test_slack_config_field_access() {
+        let config = SlackConfig {
+            bot_token: Some("xoxb-abc-123".to_string()),
+            channel_id: Some("C_MAIN".to_string()),
+            source_enabled: true,
+            listen_channel_id: Some("C_LISTEN".to_string()),
+            workspace: Some("myteam".to_string()),
+            poll_interval_ms: Some(5000),
+            ..Default::default()
+        };
+        assert_eq!(config.bot_token.as_deref(), Some("xoxb-abc-123"));
+        assert_eq!(config.channel_id.as_deref(), Some("C_MAIN"));
+        assert!(config.source_enabled);
+        assert_eq!(config.listen_channel_id.as_deref(), Some("C_LISTEN"));
+        assert_eq!(config.workspace.as_deref(), Some("myteam"));
+        assert_eq!(config.poll_interval_ms, Some(5000));
+    }
+
+    #[test]
+    fn test_slack_history_response_ok_empty_messages() {
+        let json = r#"{"ok": true, "messages": []}"#;
+        let resp: SlackHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.messages.is_empty());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_slack_history_response_ok_false_with_unknown_error() {
+        let json = r#"{"ok": false, "error": "unknown_error_code"}"#;
+        let resp: SlackHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("unknown_error_code"));
+    }
+
+    #[test]
+    fn test_slack_message_deserialize_with_all_none_optional_fields() {
+        let json =
+            r#"{"ts": "999.0", "text": "msg", "user": null, "bot_id": null, "channel": null}"#;
+        let msg: SlackMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.ts, "999.0");
+        assert_eq!(msg.text, "msg");
+        assert!(msg.user.is_none());
+        assert!(msg.bot_id.is_none());
+        assert!(msg.channel.is_none());
+    }
+
+    #[test]
+    fn test_slack_message_deserialize_long_text() {
+        let long_text = "x".repeat(5000);
+        let json = format!(r#"{{"ts": "1.0", "text": "{}"}}"#, long_text);
+        let msg: SlackMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.text.len(), 5000);
+    }
+
+    #[test]
+    fn test_extract_title_tab_separated_first_line() {
+        let input = "Title\there\nNext line";
+        let title = SlackSource::extract_title(input);
+        assert_eq!(title, "Title\there");
+    }
+
+    #[test]
+    fn test_extract_title_with_leading_whitespace() {
+        let input = "  Indented title\nBody";
+        let title = SlackSource::extract_title(input);
+        assert_eq!(title, "  Indented title");
+    }
+
+    #[test]
+    fn test_message_to_issue_metadata_completeness() {
+        let source = SlackSource::new(make_config());
+        let msg = make_message("1709999999.123456", "Check this bug", false);
+        let issue = source.message_to_issue(&msg, "CTEST");
+
+        // Verify all expected metadata keys
+        assert_eq!(
+            issue.get_metadata::<String>("author_id"),
+            Some("U12345".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("channel_id"),
+            Some("CTEST".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("message_ts"),
+            Some("1709999999.123456".to_string())
+        );
+    }
+
+    #[test]
+    fn test_message_to_issue_with_multiline_text_title_is_first_line() {
+        let source = SlackSource::new(make_config());
+        let msg = make_message("1.0", "First\nSecond\nThird\nFourth", false);
+        let issue = source.message_to_issue(&msg, "C1");
+        assert_eq!(issue.title, "First");
+        assert_eq!(
+            issue.description.as_deref(),
+            Some("First\nSecond\nThird\nFourth")
+        );
+    }
+
+    #[test]
+    fn test_message_url_empty_channel() {
+        let source = SlackSource::new(make_config());
+        let url = source.message_url("", "1.0");
+        assert_eq!(url, "https://myworkspace.slack.com/archives//p10");
+    }
+
+    #[test]
+    fn test_is_bot_message_with_user_only() {
+        let msg = SlackMessage {
+            ts: "1.0".to_string(),
+            text: "human".to_string(),
+            user: Some("U999".to_string()),
+            bot_id: None,
+            subtype: None,
+            channel: None,
+        };
+        assert!(!SlackSource::is_bot_message(&msg));
+    }
+
+    #[test]
+    fn test_message_to_issue_long_text_truncates_title() {
+        let source = SlackSource::new(make_config());
+        let long_first_line = "a".repeat(200);
+        let msg = make_message("1.0", &long_first_line, false);
+        let issue = source.message_to_issue(&msg, "C1");
+
+        assert_eq!(issue.title.len(), 100);
+        assert!(issue.title.ends_with("..."));
+        // Full text preserved in description
+        assert_eq!(issue.description.as_deref(), Some(long_first_line.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_empty_description() {
+        let source = SlackSource::new(make_config());
+        let mut issue = Issue::new("1", "S-1", "Title", "http://example.com", "slack");
+        issue.description = Some("".to_string());
+        let context = source.build_issue_context(&issue).await.unwrap();
+        // Empty description is still Some(""), so "Message:" section appears
+        assert!(context.contains("Message:"));
+    }
+
+    #[test]
+    fn test_slack_history_response_deserialize_with_response_metadata() {
+        // Slack sometimes returns response_metadata with cursor info
+        let json = r#"{
+            "ok": true,
+            "messages": [
+                {"ts": "100.0", "text": "hello", "user": "U1"}
+            ],
+            "has_more": true,
+            "response_metadata": {
+                "next_cursor": "dXNlcjpXMDdMQ1RZTDE="
+            }
+        }"#;
+        let resp: SlackHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.messages.len(), 1);
+        assert_eq!(resp.messages[0].text, "hello");
+    }
+
+    #[test]
+    fn test_slack_message_with_subtype_field() {
+        // Slack messages can have extra fields like subtype which we don't model
+        let json = r#"{
+            "ts": "1.0",
+            "text": "joined the channel",
+            "user": "U1",
+            "subtype": "channel_join"
+        }"#;
+        let msg: SlackMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.text, "joined the channel");
+        assert_eq!(msg.user.as_deref(), Some("U1"));
+    }
+
+    #[test]
+    fn test_message_to_issue_with_special_chars_in_text() {
+        let source = SlackSource::new(make_config());
+        let msg = make_message(
+            "1.0",
+            "Bug: <@U123> the `code` is *broken* & \"bad\"",
+            false,
+        );
+        let issue = source.message_to_issue(&msg, "C1");
+        assert_eq!(issue.title, "Bug: <@U123> the `code` is *broken* & \"bad\"");
+        assert_eq!(
+            issue.description.as_deref(),
+            Some("Bug: <@U123> the `code` is *broken* & \"bad\"")
+        );
+    }
+
+    #[test]
+    fn test_matches_criteria_reason_is_slack_message() {
+        let source = SlackSource::new(make_config());
+        let issue = Issue::new("1", "S-1", "Test", "http://t.com", "slack");
+        let result = source.matches_criteria(&issue);
+        assert_eq!(result.reason, "slack_message");
+    }
+
+    #[test]
+    fn test_new_source_config_preserved() {
+        let config = SlackConfig {
+            bot_token: Some("xoxb-test-123".to_string()),
+            channel_id: Some("C_TEST".to_string()),
+            source_enabled: true,
+            listen_channel_id: Some("C_LISTEN".to_string()),
+            workspace: Some("testws".to_string()),
+            poll_interval_ms: Some(10000),
+            ..Default::default()
+        };
+        let source = SlackSource::new(config);
+        assert_eq!(source.config.bot_token.as_deref(), Some("xoxb-test-123"));
+        assert_eq!(source.config.workspace.as_deref(), Some("testws"));
+        assert_eq!(source.config.poll_interval_ms, Some(10000));
     }
 }

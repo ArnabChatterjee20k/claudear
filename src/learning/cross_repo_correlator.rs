@@ -54,7 +54,7 @@ impl CrossRepoCorrelator {
         let mut repo_issues: std::collections::HashMap<String, Vec<DateTime<Utc>>> =
             std::collections::HashMap::new();
         for attempt in &recent_attempts {
-            if let Some(ref repo) = attempt.github_repo {
+            if let Some(ref repo) = attempt.scm_repo {
                 repo_issues
                     .entry(repo.clone())
                     .or_default()
@@ -197,8 +197,6 @@ mod tests {
         assert_eq!(insight.repo_b, "b");
         assert_eq!(insight.correlation_count, 3);
     }
-
-    // ── detect_correlations tests ───────────────────────────────────
 
     #[test]
     fn test_detect_correlations_no_attempts() {
@@ -419,17 +417,15 @@ mod tests {
     fn test_detect_correlations_attempts_without_repo_ignored() {
         let tracker = SqliteTracker::in_memory().unwrap();
 
-        // Record attempt but don't mark success (so github_repo stays NULL)
+        // Record attempt but don't mark success (so scm_repo stays NULL)
         tracker.record_attempt("linear", "issue-1", "P-1").unwrap();
 
         let insights = CrossRepoCorrelator::detect_correlations(&tracker, 24).unwrap();
         assert!(
             insights.is_empty(),
-            "Attempts without github_repo should be ignored"
+            "Attempts without scm_repo should be ignored"
         );
     }
-
-    // ── get_active_insights tests ───────────────────────────────────
 
     #[test]
     fn test_get_active_insights_empty() {
@@ -508,8 +504,6 @@ mod tests {
         );
     }
 
-    // ── format_context integration tests ────────────────────────────
-
     #[test]
     fn test_format_context_from_detect_correlations() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -549,5 +543,300 @@ mod tests {
         assert!(ctx.contains("org/upstream"));
         assert!(ctx.contains("org/downstream"));
         assert!(ctx.contains("3 co-occurrences"));
+    }
+
+    #[test]
+    fn test_format_context_multiple_insights() {
+        let insights = vec![
+            CorrelationInsight {
+                repo_a: "org/core-lib".into(),
+                repo_b: "org/web-app".into(),
+                correlation_count: 5,
+                message: "Issues in org/web-app may be caused by changes in org/core-lib (5 co-occurrences)".into(),
+            },
+            CorrelationInsight {
+                repo_a: "org/auth-lib".into(),
+                repo_b: "org/api-svc".into(),
+                correlation_count: 3,
+                message: "Issues in org/api-svc may be caused by changes in org/auth-lib (3 co-occurrences)".into(),
+            },
+        ];
+        let ctx = CrossRepoCorrelator::format_context(&insights);
+        assert!(ctx.starts_with("## Cross-Repository Correlations\n\n"));
+        assert!(ctx.contains("- Issues in org/web-app"));
+        assert!(ctx.contains("- Issues in org/api-svc"));
+        // Verify each insight gets its own bullet line
+        let bullet_count = ctx.matches("\n- ").count();
+        assert_eq!(bullet_count, 2, "Should have 2 bullet lines for 2 insights");
+    }
+
+    #[test]
+    fn test_format_context_single_insight_line_format() {
+        let insights = vec![CorrelationInsight {
+            repo_a: "a".into(),
+            repo_b: "b".into(),
+            correlation_count: 7,
+            message: "test message".into(),
+        }];
+        let ctx = CrossRepoCorrelator::format_context(&insights);
+        // Should contain the header and the bullet
+        assert!(ctx.contains("## Cross-Repository Correlations\n\n- test message\n"));
+    }
+
+    #[test]
+    fn test_correlation_insight_clone() {
+        let insight = CorrelationInsight {
+            repo_a: "a".into(),
+            repo_b: "b".into(),
+            correlation_count: 4,
+            message: "msg".into(),
+        };
+        let cloned = insight.clone();
+        assert_eq!(cloned.repo_a, insight.repo_a);
+        assert_eq!(cloned.repo_b, insight.repo_b);
+        assert_eq!(cloned.correlation_count, insight.correlation_count);
+        assert_eq!(cloned.message, insight.message);
+    }
+
+    #[test]
+    fn test_cross_repo_correlation_struct_fields() {
+        let corr = CrossRepoCorrelation {
+            id: 42,
+            repo_a: "org/upstream".into(),
+            repo_b: "org/downstream".into(),
+            correlation_count: 10,
+            last_seen_at: Utc::now(),
+            window_hours: 24,
+        };
+        assert_eq!(corr.id, 42);
+        assert_eq!(corr.repo_a, "org/upstream");
+        assert_eq!(corr.repo_b, "org/downstream");
+        assert_eq!(corr.correlation_count, 10);
+        assert_eq!(corr.window_hours, 24);
+    }
+
+    #[test]
+    fn test_cross_repo_correlation_clone() {
+        let now = Utc::now();
+        let corr = CrossRepoCorrelation {
+            id: 1,
+            repo_a: "a".into(),
+            repo_b: "b".into(),
+            correlation_count: 5,
+            last_seen_at: now,
+            window_hours: 12,
+        };
+        let cloned = corr.clone();
+        assert_eq!(cloned.id, corr.id);
+        assert_eq!(cloned.repo_a, corr.repo_a);
+        assert_eq!(cloned.window_hours, corr.window_hours);
+    }
+
+    #[test]
+    fn test_cross_repo_correlation_serialization() {
+        let corr = CrossRepoCorrelation {
+            id: 1,
+            repo_a: "org/lib".into(),
+            repo_b: "org/app".into(),
+            correlation_count: 3,
+            last_seen_at: Utc::now(),
+            window_hours: 48,
+        };
+        let json = serde_json::to_string(&corr).unwrap();
+        assert!(json.contains("org/lib"));
+        assert!(json.contains("org/app"));
+        assert!(json.contains("48"));
+
+        let deserialized: CrossRepoCorrelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.repo_a, "org/lib");
+        assert_eq!(deserialized.repo_b, "org/app");
+        assert_eq!(deserialized.correlation_count, 3);
+        assert_eq!(deserialized.window_hours, 48);
+    }
+
+    #[test]
+    fn test_detect_correlations_window_hours_zero() {
+        // Window of 0 hours means only issues at exactly the same time correlate
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .add_dependency("org/upstream", "org/downstream", "runtime")
+            .unwrap();
+
+        // Pre-seed to 2
+        tracker
+            .upsert_cross_repo_correlation("org/upstream", "org/downstream", 0)
+            .unwrap();
+        tracker
+            .upsert_cross_repo_correlation("org/upstream", "org/downstream", 0)
+            .unwrap();
+
+        tracker.record_attempt("linear", "issue-1", "P-1").unwrap();
+        tracker
+            .mark_success(
+                "linear",
+                "issue-1",
+                "https://github.com/org/upstream/pull/1",
+            )
+            .unwrap();
+        tracker.record_attempt("linear", "issue-2", "P-2").unwrap();
+        tracker
+            .mark_success(
+                "linear",
+                "issue-2",
+                "https://github.com/org/downstream/pull/1",
+            )
+            .unwrap();
+
+        // With window_hours=0, overlap check uses |diff| <= 0, so only exact same time
+        let insights = CrossRepoCorrelator::detect_correlations(&tracker, 0).unwrap();
+        // The attempts are created nearly simultaneously, so diff should be 0 hours
+        assert_eq!(insights.len(), 1);
+    }
+
+    #[test]
+    fn test_detect_correlations_large_window() {
+        // A very large window should still work
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.add_dependency("org/a", "org/b", "runtime").unwrap();
+
+        for _ in 0..2 {
+            tracker
+                .upsert_cross_repo_correlation("org/a", "org/b", 10000)
+                .unwrap();
+        }
+
+        tracker.record_attempt("linear", "i1", "P-1").unwrap();
+        tracker
+            .mark_success("linear", "i1", "https://github.com/org/a/pull/1")
+            .unwrap();
+        tracker.record_attempt("linear", "i2", "P-2").unwrap();
+        tracker
+            .mark_success("linear", "i2", "https://github.com/org/b/pull/1")
+            .unwrap();
+
+        let insights = CrossRepoCorrelator::detect_correlations(&tracker, 10000).unwrap();
+        assert_eq!(insights.len(), 1);
+    }
+
+    #[test]
+    fn test_detect_correlations_message_format_includes_window() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .add_dependency("org/up", "org/down", "runtime")
+            .unwrap();
+        for _ in 0..2 {
+            tracker
+                .upsert_cross_repo_correlation("org/up", "org/down", 48)
+                .unwrap();
+        }
+
+        tracker.record_attempt("linear", "i1", "P1").unwrap();
+        tracker
+            .mark_success("linear", "i1", "https://github.com/org/up/pull/1")
+            .unwrap();
+        tracker.record_attempt("linear", "i2", "P2").unwrap();
+        tracker
+            .mark_success("linear", "i2", "https://github.com/org/down/pull/1")
+            .unwrap();
+
+        let insights = CrossRepoCorrelator::detect_correlations(&tracker, 48).unwrap();
+        assert_eq!(insights.len(), 1);
+        assert!(
+            insights[0].message.contains("48h windows"),
+            "Message should include window hours, got: {}",
+            insights[0].message
+        );
+    }
+
+    #[test]
+    fn test_get_active_insights_min_count_boundary() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Create correlation with count of exactly min_count (3)
+        for _ in 0..3 {
+            tracker
+                .upsert_cross_repo_correlation("org/a", "org/b", 24)
+                .unwrap();
+        }
+        let insights = CrossRepoCorrelator::get_active_insights(&tracker, 3, 48).unwrap();
+        assert_eq!(
+            insights.len(),
+            1,
+            "count=3 should be returned when min_count=3"
+        );
+    }
+
+    #[test]
+    fn test_get_active_insights_max_age_zero() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        for _ in 0..5 {
+            tracker
+                .upsert_cross_repo_correlation("org/a", "org/b", 24)
+                .unwrap();
+        }
+        // max_age_hours=0 means only correlations from the current instant;
+        // newly created should still qualify since last_seen_at is now
+        let insights = CrossRepoCorrelator::get_active_insights(&tracker, 1, 0).unwrap();
+        // Depending on storage precision, this might be 0 or 1. Just verify no panic.
+        assert!(insights.len() <= 1);
+    }
+
+    #[test]
+    fn test_format_context_preserves_message_verbatim() {
+        let msg = "Custom message with special chars: <>&\"'";
+        let insights = vec![CorrelationInsight {
+            repo_a: "a".into(),
+            repo_b: "b".into(),
+            correlation_count: 1,
+            message: msg.to_string(),
+        }];
+        let ctx = CrossRepoCorrelator::format_context(&insights);
+        assert!(
+            ctx.contains(msg),
+            "format_context should preserve message verbatim"
+        );
+    }
+
+    #[test]
+    fn test_detect_correlations_bidirectional_dependency() {
+        // When A depends on B AND B depends on A, should still produce insight.
+        // detect_correlations iterates repo pairs from a HashMap whose order is
+        // non-deterministic.  Depending on iteration order the upsert may target
+        // either (alpha, beta) or (beta, alpha).  Pre-seed BOTH directions so
+        // that whichever direction detect_correlations picks, the count reaches
+        // the >= 3 threshold after the internal upsert.
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .add_dependency("org/alpha", "org/beta", "runtime")
+            .unwrap();
+        tracker
+            .add_dependency("org/beta", "org/alpha", "dev")
+            .unwrap();
+
+        for _ in 0..2 {
+            tracker
+                .upsert_cross_repo_correlation("org/alpha", "org/beta", 24)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            tracker
+                .upsert_cross_repo_correlation("org/beta", "org/alpha", 24)
+                .unwrap();
+        }
+
+        tracker.record_attempt("linear", "i1", "P1").unwrap();
+        tracker
+            .mark_success("linear", "i1", "https://github.com/org/alpha/pull/1")
+            .unwrap();
+        tracker.record_attempt("linear", "i2", "P2").unwrap();
+        tracker
+            .mark_success("linear", "i2", "https://github.com/org/beta/pull/1")
+            .unwrap();
+
+        let insights = CrossRepoCorrelator::detect_correlations(&tracker, 24).unwrap();
+        // Should produce at least one insight
+        assert!(
+            !insights.is_empty(),
+            "Bidirectional dependency should still produce correlation insights"
+        );
     }
 }

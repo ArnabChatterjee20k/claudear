@@ -338,7 +338,7 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
 
     let mut index = RepoIndex::new();
     let mut repo = IndexedRepo::new("test-org/my-repo", &repo_path);
-    repo.github_url = remote_path.to_string_lossy().to_string();
+    repo.scm_url = remote_path.to_string_lossy().to_string();
     repo.default_branch = "main".to_string();
     repo.files = vec!["src/buggy.rs".to_string()];
     index.add_repo(repo);
@@ -362,6 +362,7 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
         issue_embedding_service: None,
         relationships: None,
         github_client: None,
+        scm_provider: None,
         user_registry: UserRegistry::new(HashMap::new()),
         dry_run: false,
     });
@@ -464,7 +465,7 @@ async fn e2e_multiple_mock_tasks_reset_repo_and_clear_task_state() {
         .error_message
         .as_deref()
         .unwrap_or_default()
-        .contains("No PR URL found in output"));
+        .contains("Claude completed without creating a PR"));
 
     let file_after_second_task =
         fs::read_to_string(harness.repo_path.join("src/buggy.rs")).unwrap();

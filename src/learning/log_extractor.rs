@@ -434,8 +434,6 @@ Created pull request #42
         let _ = std::fs::remove_file(&log_path);
     }
 
-    // ── Additional edge case tests ──
-
     #[test]
     fn test_root_cause_too_long_ignored() {
         // Root cause text >= 500 chars should be ignored

@@ -33,13 +33,13 @@ impl GitOps {
     /// If it exists, it will be pulled to update.
     pub async fn ensure_repo_at_path(
         repo_path: &Path,
-        github_url: &str,
+        scm_url: &str,
         default_branch: &str,
     ) -> Result<()> {
         if repo_path.exists() {
             Self::pull(repo_path, default_branch).await
         } else {
-            Self::clone(github_url, repo_path).await
+            Self::clone(scm_url, repo_path).await
         }
     }
 
@@ -47,11 +47,11 @@ impl GitOps {
     ///
     /// If the repository doesn't exist locally, it will be cloned.
     /// If it exists, only `git fetch origin` is run — the working tree is untouched.
-    pub async fn ensure_repo_fetched(repo_path: &Path, github_url: &str) -> Result<()> {
+    pub async fn ensure_repo_fetched(repo_path: &Path, scm_url: &str) -> Result<()> {
         if repo_path.exists() {
             Self::fetch_all(repo_path).await
         } else {
-            Self::clone(github_url, repo_path).await
+            Self::clone(scm_url, repo_path).await
         }
     }
 
@@ -421,8 +421,6 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
-
-    // ── Helper: create a real git repo with an initial commit ──
 
     /// Create a bare-minimum git repo in `path` with one commit on "main".
     fn init_git_repo(path: &Path) {
@@ -1917,5 +1915,359 @@ mod tests {
         // 6) Main repo is still on main
         let main_branch = GitOps::current_branch(&repo_path).await.unwrap();
         assert_eq!(main_branch, "main");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  validate_ref - unicode and additional characters
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_validate_ref_rejects_unicode_non_alphanumeric() {
+        assert!(validate_ref("branch\u{200B}name", "ref").is_err()); // zero-width space
+        assert!(validate_ref("\u{2026}", "ref").is_err()); // ellipsis
+    }
+
+    #[test]
+    fn test_validate_ref_accepts_unicode_alphanumeric() {
+        // char::is_alphanumeric() accepts unicode letters and digits
+        assert!(validate_ref("br\u{00e4}nch", "ref").is_ok()); // a-umlaut is alphanumeric
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_control_characters() {
+        assert!(validate_ref("branch\x01name", "ref").is_err());
+        assert!(validate_ref("branch\x7f", "ref").is_err()); // DEL
+        assert!(validate_ref("\x00branch", "ref").is_err()); // NULL
+    }
+
+    #[test]
+    fn test_validate_ref_allows_long_branch_name() {
+        let long_name = "a".repeat(256);
+        assert!(validate_ref(&long_name, "branch").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_rejects_triple_dot() {
+        // Contains ".." so it should be rejected
+        assert!(validate_ref("a...b", "ref").is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_allows_dot_separated_version() {
+        // Single dots are fine, no ".." present
+        assert!(validate_ref("v1.0.0", "tag").is_ok());
+        assert!(validate_ref("release.1.2.3", "tag").is_ok());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  worktree_path - additional edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_worktree_path_unicode_in_issue_id() {
+        // Unicode characters pass through sanitization (only /, \, ., \0 are replaced)
+        let p = worktree_path(Path::new("/work"), "owner/repo", "issue-\u{00e9}");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/issue-\u{00e9}"));
+    }
+
+    #[test]
+    fn test_worktree_path_all_dots_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "...");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/___"));
+    }
+
+    #[test]
+    fn test_worktree_path_all_slashes_in_issue_id() {
+        let p = worktree_path(Path::new("/work"), "owner/repo", "///");
+        assert_eq!(p, PathBuf::from("/work/repo-worktrees/___"));
+    }
+
+    #[test]
+    fn test_worktree_path_hyphen_in_repo_name_preserved() {
+        let p = worktree_path(Path::new("/work"), "org/my-cool-repo", "ID-1");
+        assert_eq!(p, PathBuf::from("/work/my-cool-repo-worktrees/ID-1"));
+    }
+
+    #[test]
+    fn test_worktree_path_underscore_in_repo_name_preserved() {
+        let p = worktree_path(Path::new("/work"), "org/my_repo", "ID-1");
+        assert_eq!(p, PathBuf::from("/work/my_repo-worktrees/ID-1"));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  is_git_repo - additional edge cases
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_is_git_repo_symlink_git_dir() {
+        let temp = TempDir::new().unwrap();
+        let real_git = temp.path().join("real_git");
+        std::fs::create_dir(&real_git).unwrap();
+
+        // Create a symlink .git -> real_git
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_git, temp.path().join(".git")).unwrap();
+            // symlink to a directory - is_dir() follows symlinks so should be true
+            assert!(GitOps::is_git_repo(temp.path()));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  ensure_repo_fetched with real local clone
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_ensure_repo_fetched_picks_up_new_commit() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+        let url = format!("file://{}", origin.path().display());
+
+        // Clone via ensure_repo_at_path
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        // Add a commit to origin
+        add_second_commit(origin.path());
+
+        // Fetch (does not checkout/reset)
+        GitOps::ensure_repo_fetched(&target, &url).await.unwrap();
+
+        // The fetch should have brought the new commit into the object store
+        // Verify via git log of origin/main
+        let output = StdCommand::new("git")
+            .args(["log", "--oneline", "origin/main"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            log.contains("second commit"),
+            "fetch did not bring second commit: {}",
+            log
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  create_worktree with parent directory creation
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_create_worktree_creates_parent_dirs() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        // Use a nested parent path that does NOT end in -worktrees
+        // (git worktree add will create the directory itself)
+        let wt_path = temp.path().join("deep-worktrees").join("nested").join("wt");
+
+        let result = GitOps::create_worktree(temp.path(), &wt_path, "main").await;
+        assert!(
+            result.is_ok(),
+            "create_worktree with deep nesting failed: {:?}",
+            result.unwrap_err()
+        );
+        assert!(wt_path.exists());
+        assert!(wt_path.join("README.md").exists());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  create_worktree_on_branch with parent dir creation
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_create_worktree_on_branch_creates_parent_dirs() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_path = temp.path().join("deep-worktrees").join("nested").join("wt");
+
+        let result =
+            GitOps::create_worktree_on_branch(temp.path(), &wt_path, "new-branch", "main").await;
+        assert!(
+            result.is_ok(),
+            "create_worktree_on_branch with deep nesting failed: {:?}",
+            result.unwrap_err()
+        );
+        assert!(wt_path.exists());
+
+        let branch = GitOps::current_branch(&wt_path).await.unwrap();
+        assert_eq!(branch, "new-branch");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  fetch_branch - success case with new commit on branch
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_fetch_branch_picks_up_new_commit() {
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+
+        // Create a feature branch in origin with a new commit
+        StdCommand::new("git")
+            .args(["checkout", "-b", "feature-y"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+        add_second_commit(origin.path());
+        StdCommand::new("git")
+            .args(["checkout", "main"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
+        // Clone
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("cloned");
+        let url = format!("file://{}", origin.path().display());
+        GitOps::ensure_repo_at_path(&target, &url, "main")
+            .await
+            .unwrap();
+
+        // Fetch just the feature branch
+        GitOps::fetch_branch(&target, "feature-y").await.unwrap();
+
+        // Verify the branch commit is available
+        let output = StdCommand::new("git")
+            .args(["log", "--oneline", "origin/feature-y"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            log.contains("second commit"),
+            "fetch_branch did not bring feature commit: {}",
+            log
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  remove_worktree - full lifecycle
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_remove_worktree_full_lifecycle() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+
+        let wt_parent = temp.path().join("lifecycle-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("wt1");
+
+        // Create
+        GitOps::create_worktree(temp.path(), &wt_path, "main")
+            .await
+            .unwrap();
+        assert!(wt_path.exists());
+
+        // Remove
+        GitOps::remove_worktree(temp.path(), &wt_path)
+            .await
+            .unwrap();
+
+        // Should be gone
+        assert!(!wt_path.exists());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Multiple worktrees from same repo
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_multiple_worktrees_from_same_repo() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        add_second_commit(temp.path());
+
+        let wt_parent = temp.path().join("multi-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+
+        let wt1 = wt_parent.join("wt1");
+        let wt2 = wt_parent.join("wt2");
+
+        // Create two worktrees on different branches
+        GitOps::create_worktree_on_branch(temp.path(), &wt1, "branch-1", "main")
+            .await
+            .unwrap();
+        GitOps::create_worktree_on_branch(temp.path(), &wt2, "branch-2", "main")
+            .await
+            .unwrap();
+
+        // Both should exist
+        assert!(wt1.exists());
+        assert!(wt2.exists());
+
+        // Both should be on their respective branches
+        let b1 = GitOps::current_branch(&wt1).await.unwrap();
+        let b2 = GitOps::current_branch(&wt2).await.unwrap();
+        assert_eq!(b1, "branch-1");
+        assert_eq!(b2, "branch-2");
+
+        // Main repo should still be on main
+        let main = GitOps::current_branch(temp.path()).await.unwrap();
+        assert_eq!(main, "main");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  create_worktree_on_branch resets existing branch
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_create_worktree_on_branch_resets_branch_to_start_point() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        add_second_commit(temp.path());
+
+        let wt_parent = temp.path().join("reset-worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_path = wt_parent.join("wt");
+
+        // Get the first commit hash
+        let output = StdCommand::new("git")
+            .args(["rev-parse", "HEAD~1"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        let first_commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Create worktree at the first commit
+        GitOps::create_worktree_on_branch(temp.path(), &wt_path, "test-branch", &first_commit)
+            .await
+            .unwrap();
+
+        // The worktree should be at the first commit (no file2.txt)
+        assert!(!wt_path.join("file2.txt").exists());
+        assert!(wt_path.join("README.md").exists());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  validate_ref - boundary between allowed/disallowed
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_validate_ref_at_in_middle_is_ok() {
+        assert!(validate_ref("user@host", "ref").is_ok());
+        assert!(validate_ref("a@b@c", "ref").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_leading_dot_is_ok() {
+        // Single leading dot is allowed (no ".." and doesn't start with '-')
+        assert!(validate_ref(".branch", "ref").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_dot_dot_at_start() {
+        assert!(validate_ref("..branch", "ref").is_err());
+    }
+
+    #[test]
+    fn test_validate_ref_dot_dot_at_end() {
+        assert!(validate_ref("branch..", "ref").is_err());
     }
 }

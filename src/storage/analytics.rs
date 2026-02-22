@@ -1238,8 +1238,6 @@ mod tests {
     // with specific period.
     // ================================================================
 
-    // ── classify_error: additional keyword combinations ──────────────
-
     #[test]
     fn test_classify_error_network_without_connection() {
         assert_eq!(classify_error("network unreachable"), "network_error");
@@ -1291,8 +1289,6 @@ mod tests {
     fn test_classify_error_unrecognized_punctuation() {
         assert_eq!(classify_error("!!!???..."), "unknown");
     }
-
-    // ── compute_error_hash: digit-run collapsing detail ──────────────
 
     #[test]
     fn test_compute_error_hash_mixed_digits_and_text() {
@@ -1351,8 +1347,6 @@ mod tests {
         );
     }
 
-    // ── TrendAnalysis: symmetry and edge cases ───────────────────────
-
     #[test]
     fn test_trend_analysis_equal_values_stable() {
         let trend = TrendAnalysis::new(50.0, 50.0);
@@ -1402,8 +1396,6 @@ mod tests {
         assert!((trend.change_percent - 100.0).abs() < 0.01);
     }
 
-    // ── TrendDirection: PartialEq ────────────────────────────────────
-
     #[test]
     fn test_trend_direction_partial_eq() {
         assert_eq!(TrendDirection::Up, TrendDirection::Up);
@@ -1427,8 +1419,6 @@ mod tests {
         let cloned = dir;
         assert_eq!(dir, cloned);
     }
-
-    // ── TimePeriod: ordering and exhaustiveness ──────────────────────
 
     #[test]
     fn test_time_period_duration_ordering() {
@@ -1465,8 +1455,6 @@ mod tests {
         let cloned = period;
         assert_eq!(cloned.duration().num_days(), 7);
     }
-
-    // ── AnalyticsService: metrics_by_source ──────────────────────────
 
     #[test]
     fn test_metrics_by_source_empty() {
@@ -1532,8 +1520,6 @@ mod tests {
         );
     }
 
-    // ── AnalyticsService: throughput with different periods ──────────
-
     #[test]
     fn test_calculate_throughput_day_period() {
         use crate::types::ActivityLogEntry;
@@ -1555,8 +1541,6 @@ mod tests {
         );
     }
 
-    // ── AnalyticsService: error rate with no errors ──────────────────
-
     #[test]
     fn test_calculate_error_rate_no_errors() {
         use crate::types::ActivityLogEntry;
@@ -1576,8 +1560,6 @@ mod tests {
         );
     }
 
-    // ── AnalyticsService: average_metric single value ────────────────
-
     #[test]
     fn test_average_metric_single_value() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -1588,8 +1570,6 @@ mod tests {
         let avg = service.average_metric("latency", TimePeriod::Day).unwrap();
         assert_eq!(avg, Some(42.5));
     }
-
-    // ── compute_error_hash: determinism ──────────────────────────────
 
     #[test]
     fn test_compute_error_hash_deterministic() {
@@ -1609,8 +1589,6 @@ mod tests {
             hash
         );
     }
-
-    // ── TrendAnalysis: debug format ──────────────────────────────────
 
     #[test]
     fn test_trend_analysis_debug_format() {

@@ -145,7 +145,7 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
         };
 
         // Get the repo and PR number
-        let (fix_repo, pr_number) = match (attempt.github_repo.as_ref(), attempt.github_pr_number) {
+        let (fix_repo, pr_number) = match (attempt.scm_repo.as_ref(), attempt.scm_pr_number) {
             (Some(r), Some(n)) => (r.clone(), n),
             _ => return Ok(false),
         };
@@ -3271,7 +3271,7 @@ mod tests {
     // --- check_watch_release: URL prefix stripping ---
 
     #[tokio::test]
-    async fn test_check_watch_release_strips_github_url_prefix() {
+    async fn test_check_watch_release_strips_scm_url_prefix() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         // PR URL with full github.com prefix

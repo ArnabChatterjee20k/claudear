@@ -72,3 +72,201 @@ Ensure all checks pass on the PR.
 
 Create a PR that fixes this error.
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- DEFAULT_FIX_TEMPLATE ----
+
+    #[test]
+    fn test_fix_template_is_not_empty() {
+        assert!(
+            !DEFAULT_FIX_TEMPLATE.is_empty(),
+            "DEFAULT_FIX_TEMPLATE should not be empty"
+        );
+    }
+
+    #[test]
+    fn test_fix_template_contains_context_placeholder() {
+        assert!(
+            DEFAULT_FIX_TEMPLATE.contains("{{context}}"),
+            "DEFAULT_FIX_TEMPLATE should contain '{{{{context}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_fix_template_contains_source_placeholder() {
+        assert!(
+            DEFAULT_FIX_TEMPLATE.contains("{{source}}"),
+            "DEFAULT_FIX_TEMPLATE should contain '{{{{source}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_fix_template_contains_short_id_placeholder() {
+        assert!(
+            DEFAULT_FIX_TEMPLATE.contains("{{short_id}}"),
+            "DEFAULT_FIX_TEMPLATE should contain '{{{{short_id}}}}'"
+        );
+    }
+
+    // ---- DEFAULT_LINEAR_TEMPLATE ----
+
+    #[test]
+    fn test_linear_template_is_not_empty() {
+        assert!(
+            !DEFAULT_LINEAR_TEMPLATE.is_empty(),
+            "DEFAULT_LINEAR_TEMPLATE should not be empty"
+        );
+    }
+
+    #[test]
+    fn test_linear_template_contains_short_id() {
+        assert!(
+            DEFAULT_LINEAR_TEMPLATE.contains("{{short_id}}"),
+            "DEFAULT_LINEAR_TEMPLATE should contain '{{{{short_id}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_linear_template_contains_title() {
+        assert!(
+            DEFAULT_LINEAR_TEMPLATE.contains("{{title}}"),
+            "DEFAULT_LINEAR_TEMPLATE should contain '{{{{title}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_linear_template_contains_url() {
+        assert!(
+            DEFAULT_LINEAR_TEMPLATE.contains("{{url}}"),
+            "DEFAULT_LINEAR_TEMPLATE should contain '{{{{url}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_linear_template_contains_priority() {
+        assert!(
+            DEFAULT_LINEAR_TEMPLATE.contains("{{priority}}"),
+            "DEFAULT_LINEAR_TEMPLATE should contain '{{{{priority}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_linear_template_contains_context() {
+        assert!(
+            DEFAULT_LINEAR_TEMPLATE.contains("{{context}}"),
+            "DEFAULT_LINEAR_TEMPLATE should contain '{{{{context}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_linear_template_contains_if_description() {
+        assert!(
+            DEFAULT_LINEAR_TEMPLATE.contains("{{#if description}}"),
+            "DEFAULT_LINEAR_TEMPLATE should contain '{{{{#if description}}}}'"
+        );
+    }
+
+    // ---- DEFAULT_SENTRY_TEMPLATE ----
+
+    #[test]
+    fn test_sentry_template_is_not_empty() {
+        assert!(
+            !DEFAULT_SENTRY_TEMPLATE.is_empty(),
+            "DEFAULT_SENTRY_TEMPLATE should not be empty"
+        );
+    }
+
+    #[test]
+    fn test_sentry_template_contains_title() {
+        assert!(
+            DEFAULT_SENTRY_TEMPLATE.contains("{{title}}"),
+            "DEFAULT_SENTRY_TEMPLATE should contain '{{{{title}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_sentry_template_contains_url() {
+        assert!(
+            DEFAULT_SENTRY_TEMPLATE.contains("{{url}}"),
+            "DEFAULT_SENTRY_TEMPLATE should contain '{{{{url}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_sentry_template_contains_context() {
+        assert!(
+            DEFAULT_SENTRY_TEMPLATE.contains("{{context}}"),
+            "DEFAULT_SENTRY_TEMPLATE should contain '{{{{context}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_sentry_template_contains_event_count() {
+        assert!(
+            DEFAULT_SENTRY_TEMPLATE.contains("{{event_count}}"),
+            "DEFAULT_SENTRY_TEMPLATE should contain '{{{{event_count}}}}'"
+        );
+    }
+
+    #[test]
+    fn test_sentry_template_contains_if_has_agent_md() {
+        assert!(
+            DEFAULT_SENTRY_TEMPLATE.contains("{{#if has_agent_md}}"),
+            "DEFAULT_SENTRY_TEMPLATE should contain '{{{{#if has_agent_md}}}}'"
+        );
+    }
+
+    // ---- Cross-template checks ----
+
+    #[test]
+    fn test_all_templates_mention_pr() {
+        assert!(
+            DEFAULT_FIX_TEMPLATE.contains("PR"),
+            "DEFAULT_FIX_TEMPLATE should mention 'PR'"
+        );
+        assert!(
+            DEFAULT_LINEAR_TEMPLATE.contains("PR"),
+            "DEFAULT_LINEAR_TEMPLATE should mention 'PR'"
+        );
+        assert!(
+            DEFAULT_SENTRY_TEMPLATE.contains("PR"),
+            "DEFAULT_SENTRY_TEMPLATE should mention 'PR'"
+        );
+    }
+
+    #[test]
+    fn test_fix_template_has_matched_conditionals() {
+        let if_count = DEFAULT_FIX_TEMPLATE.matches("{{#if").count();
+        let endif_count = DEFAULT_FIX_TEMPLATE.matches("{{/if}}").count();
+        assert_eq!(
+            if_count, endif_count,
+            "DEFAULT_FIX_TEMPLATE has {} '{{{{#if' but {} '{{{{/if}}}}' — unmatched conditionals",
+            if_count, endif_count
+        );
+    }
+
+    #[test]
+    fn test_linear_template_has_matched_conditionals() {
+        let if_count = DEFAULT_LINEAR_TEMPLATE.matches("{{#if").count();
+        let endif_count = DEFAULT_LINEAR_TEMPLATE.matches("{{/if}}").count();
+        assert_eq!(
+            if_count, endif_count,
+            "DEFAULT_LINEAR_TEMPLATE has {} '{{{{#if' but {} '{{{{/if}}}}' — unmatched conditionals",
+            if_count, endif_count
+        );
+    }
+
+    #[test]
+    fn test_sentry_template_has_matched_conditionals() {
+        let if_count = DEFAULT_SENTRY_TEMPLATE.matches("{{#if").count();
+        let endif_count = DEFAULT_SENTRY_TEMPLATE.matches("{{/if}}").count();
+        assert_eq!(
+            if_count, endif_count,
+            "DEFAULT_SENTRY_TEMPLATE has {} '{{{{#if' but {} '{{{{/if}}}}' — unmatched conditionals",
+            if_count, endif_count
+        );
+    }
+}

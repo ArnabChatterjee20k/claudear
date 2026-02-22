@@ -7,6 +7,10 @@ edition = "2021"
 name = "claudear"
 path = "src/main.rs"
 
+[[bin]]
+name = "claudear-e2e"
+path = "src/bin/e2e/main.rs"
+
 [lib]
 name = "claudear"
 path = "src/lib.rs"
@@ -48,6 +52,9 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+
+# Error monitoring
+sentry = { version = "0.46", features = ["tower-axum-matched-path", "tracing", "rustls"], default-features = false }
 
 # Error handling
 thiserror = "2"
@@ -120,12 +127,15 @@ mailparse = "0.16"
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
 
-# Process checking on Unix
-[target.'cfg(target_os = "macos")'.dependencies]
+# Process checking and IPC on Unix
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# tempfile is used by both dev tests and the claudear-e2e binary
+[dependencies.tempfile]
+version = "3"
+
 [dev-dependencies]
-tempfile = "3"
 mockall = "0.14"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
