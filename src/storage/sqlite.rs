@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::feedback::{FixOutcome, Outcome};
 use crate::learning::cross_repo_correlator::CrossRepoCorrelation;
 use crate::types::{
-    ActivityLogEntry, AnalyticsSummary, ClaudeExecution, ErrorPattern, ExperimentProviderStats,
+    ActivityLogEntry, AnalyticsSummary, AgentExecution, ErrorPattern, ExperimentProviderStats,
     FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, PrReviewRecord,
     ProcessingMetric, PromptExperiment, QaKnowledgeEntry, QaMatch, SimilarIssue, SourceStats,
 };
@@ -160,6 +160,30 @@ impl SqliteTracker {
             PRAGMA foreign_keys = ON;
             "#,
         )?;
+
+        // Run versioned SQL migrations (tracked in schema_migrations table).
+        super::migrator::run(&conn)
+            .map_err(|e| crate::error::Error::Database(e))?;
+
+        // Reset any stuck "running" indexing progress rows from a previous crash
+        conn.execute(
+            "UPDATE indexing_progress SET status = 'idle' WHERE status = 'running'",
+            [],
+        )?;
+
+        // Update query planner statistics after schema creation
+        conn.execute("ANALYZE", [])?;
+
+        Ok(())
+    }
+
+    // All schema DDL now lives in migrations/V1__initial_schema.sql.
+    // The legacy inline init is preserved below under #[cfg(any())] so it
+    // never compiles but can be referenced during review.
+    #[allow(dead_code)]
+    #[cfg(any())]
+    fn _init_legacy(&self) -> Result<()> {
+        let conn = self.acquire_lock()?;
 
         conn.execute_batch(
             r#"
@@ -1768,10 +1792,6 @@ impl SqliteTracker {
 }
 
 impl FixAttemptTracker for SqliteTracker {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn has_attempted(&self, source: &str, issue_id: &str) -> Result<bool> {
         let conn = self.acquire_lock()?;
         // Exclude soft-reset entries (reset_at IS NOT NULL) so they are treated as
@@ -2335,7 +2355,7 @@ impl FixAttemptTracker for SqliteTracker {
         SqliteTracker::get_recent_activities(self, limit, None)
     }
 
-    fn record_execution(&self, execution: &ClaudeExecution) -> Result<i64> {
+    fn record_execution(&self, execution: &AgentExecution) -> Result<i64> {
         SqliteTracker::record_execution(self, execution)
     }
 
@@ -2450,7 +2470,7 @@ impl FixAttemptTracker for SqliteTracker {
         SqliteTracker::get_attempt_by_id(self, id)
     }
 
-    fn get_executions_for_attempt(&self, attempt_id: i64) -> Result<Vec<ClaudeExecution>> {
+    fn get_executions_for_attempt(&self, attempt_id: i64) -> Result<Vec<AgentExecution>> {
         SqliteTracker::get_executions_for_attempt(self, attempt_id)
     }
 
@@ -2530,6 +2550,14 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn get_regression_checks(&self, watch_id: i64) -> Result<Vec<crate::types::RegressionCheck>> {
         SqliteTracker::get_regression_checks(self, watch_id)
+    }
+
+    fn get_regression_watch(&self, id: i64) -> Result<Option<crate::types::RegressionWatch>> {
+        SqliteTracker::get_regression_watch(self, id)
+    }
+
+    fn record_regression_check(&self, check: &crate::types::RegressionCheck) -> Result<i64> {
+        SqliteTracker::record_regression_check(self, check)
     }
 
     fn get_active_experiments(&self) -> Result<Vec<PromptExperiment>> {
@@ -4648,7 +4676,7 @@ impl FixAttemptTracker for SqliteTracker {
         &self,
         attempt_id: i64,
         execution_id: i64,
-    ) -> Result<Option<ClaudeExecution>> {
+    ) -> Result<Option<AgentExecution>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
@@ -4667,7 +4695,7 @@ impl FixAttemptTracker for SqliteTracker {
 
         let execution = stmt
             .query_row(params![attempt_id, execution_id], |row| {
-                Ok(ClaudeExecution {
+                Ok(AgentExecution {
                     id: row.get(0)?,
                     attempt_id: row.get(1)?,
                     started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
@@ -4813,6 +4841,79 @@ impl FixAttemptTracker for SqliteTracker {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    // --- Analytics ---
+
+    fn get_success_rate(&self) -> Result<f64> {
+        SqliteTracker::get_success_rate(self)
+    }
+
+    // --- Code Indexing ---
+
+    fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
+        SqliteTracker::get_or_create_repo_id(self, name)
+    }
+
+    fn code_chunk_hash_matches(
+        &self,
+        repo_id: i64,
+        file_path: &str,
+        file_hash: &str,
+    ) -> Result<bool> {
+        SqliteTracker::code_chunk_hash_matches(self, repo_id, file_path, file_hash)
+    }
+
+    fn delete_code_data_for_file(&self, repo_id: i64, file_path: &str) -> Result<()> {
+        SqliteTracker::delete_code_data_for_file(self, repo_id, file_path)
+    }
+
+    fn delete_code_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+        SqliteTracker::delete_code_chunks_by_ids(self, chunk_ids)
+    }
+
+    fn cleanup_stale_code_data(&self, repo_id: i64, current_paths: &[String]) -> Result<()> {
+        SqliteTracker::cleanup_stale_code_data(self, repo_id, current_paths)
+    }
+
+    fn save_code_symbols(
+        &self,
+        symbols: &[crate::repo::code_index::CodeSymbol],
+    ) -> Result<()> {
+        SqliteTracker::save_code_symbols(self, symbols)
+    }
+
+    fn save_code_chunks(
+        &self,
+        chunks: &[crate::repo::code_index::CodeChunk],
+    ) -> Result<Vec<i64>> {
+        SqliteTracker::save_code_chunks(self, chunks)
+    }
+
+    fn save_code_chunk_embeddings(
+        &self,
+        pairs: &[(i64, &[f32])],
+        model_name: &str,
+    ) -> Result<()> {
+        SqliteTracker::save_code_chunk_embeddings(self, pairs, model_name)
+    }
+
+    fn search_code_chunks(
+        &self,
+        query_embedding: &[f32],
+        repo_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::repo::code_index::CodeSearchResult>> {
+        SqliteTracker::search_code_chunks(self, query_embedding, repo_id, limit)
+    }
+
+    fn find_code_symbols(
+        &self,
+        name: &str,
+        kind: Option<crate::repo::code_index::SymbolKind>,
+        repo_id: Option<i64>,
+    ) -> Result<Vec<crate::repo::code_index::CodeSymbol>> {
+        SqliteTracker::find_code_symbols(self, name, kind, repo_id)
     }
 }
 
@@ -4989,7 +5090,7 @@ impl SqliteTracker {
     }
 
     /// Record a Claude execution.
-    pub fn record_execution(&self, execution: &ClaudeExecution) -> Result<i64> {
+    pub fn record_execution(&self, execution: &AgentExecution) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
         conn.execute(
@@ -5081,7 +5182,7 @@ impl SqliteTracker {
     }
 
     /// Get executions for a specific attempt.
-    pub fn get_executions_for_attempt(&self, attempt_id: i64) -> Result<Vec<ClaudeExecution>> {
+    pub fn get_executions_for_attempt(&self, attempt_id: i64) -> Result<Vec<AgentExecution>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
@@ -5100,7 +5201,7 @@ impl SqliteTracker {
 
         let mut executions = Vec::new();
         let rows = stmt.query_map(params![attempt_id], |row| {
-            Ok(ClaudeExecution {
+            Ok(AgentExecution {
                 id: row.get(0)?,
                 attempt_id: row.get(1)?,
                 started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
@@ -11743,7 +11844,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let mut execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+        let mut execution = AgentExecution::new().with_attempt_id(attempt.id);
         execution.prompt_used = Some("Fix the bug".to_string());
         execution.model_version = Some("claude-3.5-sonnet".to_string());
         execution.working_directory = Some("/home/user/repo".to_string());
@@ -11787,7 +11888,7 @@ mod tests {
             .unwrap();
 
         for i in 0..3 {
-            let mut execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+            let mut execution = AgentExecution::new().with_attempt_id(attempt.id);
             execution.exit_code = Some(i);
             tracker.record_execution(&execution).unwrap();
         }
@@ -11806,7 +11907,7 @@ mod tests {
     #[test]
     fn test_record_execution_with_timed_out() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let mut execution = ClaudeExecution::new();
+        let mut execution = AgentExecution::new();
         execution.timed_out = true;
         execution.exit_code = None;
 
@@ -14344,7 +14445,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let mut execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+        let mut execution = AgentExecution::new().with_attempt_id(attempt.id);
         execution.prompt_used = Some("Fix the bug".to_string());
         execution.exit_code = Some(0);
 
@@ -14372,7 +14473,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+        let execution = AgentExecution::new().with_attempt_id(attempt.id);
         tracker.record_execution(&execution).unwrap();
 
         // Query with a non-existent execution_id
@@ -14390,7 +14491,7 @@ mod tests {
             .unwrap();
         let attempt = tracker.get_attempt("linear", "exec-wa").unwrap().unwrap();
 
-        let execution = ClaudeExecution::new().with_attempt_id(attempt.id);
+        let execution = AgentExecution::new().with_attempt_id(attempt.id);
         let exec_id = tracker.record_execution(&execution).unwrap();
 
         // Correct execution_id but wrong attempt_id
@@ -15241,7 +15342,7 @@ mod tests {
         tracker.record_attempt("linear", "1", "L-1").unwrap();
         let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
 
-        let mut exec = ClaudeExecution::new().with_attempt_id(attempt.id);
+        let mut exec = AgentExecution::new().with_attempt_id(attempt.id);
         exec.duration_secs = Some(10.0);
         exec.exit_code = Some(0);
         tracker.record_execution(&exec).unwrap();
@@ -15264,7 +15365,7 @@ mod tests {
         tracker.record_attempt("linear", "1", "L-1").unwrap();
         let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
 
-        let mut exec = ClaudeExecution::new().with_attempt_id(attempt.id);
+        let mut exec = AgentExecution::new().with_attempt_id(attempt.id);
         exec.duration_secs = Some(120.0); // 2 minutes
         exec.exit_code = Some(0);
         tracker.record_execution(&exec).unwrap();
@@ -15284,7 +15385,7 @@ mod tests {
         tracker.record_attempt("linear", "1", "L-1").unwrap();
         let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
 
-        let mut exec = ClaudeExecution::new().with_attempt_id(attempt.id);
+        let mut exec = AgentExecution::new().with_attempt_id(attempt.id);
         exec.duration_secs = Some(60.0);
         exec.exit_code = Some(0);
         exec.total_cost_usd = Some(1.50);
@@ -17315,7 +17416,7 @@ mod tests {
         tracker.record_attempt("linear", "1", "L-1").unwrap();
         let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
 
-        let mut exec = ClaudeExecution::new().with_attempt_id(attempt.id);
+        let mut exec = AgentExecution::new().with_attempt_id(attempt.id);
         exec.duration_secs = Some(600.0); // 10 minutes
         exec.exit_code = Some(0);
         tracker.record_execution(&exec).unwrap();

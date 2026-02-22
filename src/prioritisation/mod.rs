@@ -124,9 +124,6 @@ mod tests {
     /// Minimal no-op tracker for tests.
     struct NoOpTracker;
     impl FixAttemptTracker for NoOpTracker {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
         fn has_attempted(&self, _: &str, _: &str) -> crate::error::Result<bool> {
             Ok(false)
         }
@@ -650,9 +647,6 @@ mod tests {
         }
 
         impl FixAttemptTracker for ClusterTrackingTracker {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
             fn has_attempted(&self, _: &str, _: &str) -> crate::error::Result<bool> {
                 Ok(false)
             }
@@ -2471,9 +2465,6 @@ mod tests {
             count: Arc<AtomicU32>,
         }
         impl FixAttemptTracker for CountingTracker {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
             fn has_attempted(&self, _: &str, _: &str) -> crate::error::Result<bool> {
                 Ok(false)
             }
@@ -2601,9 +2592,6 @@ mod tests {
     fn store_clusters_handles_error_gracefully() {
         struct FailingTracker;
         impl FixAttemptTracker for FailingTracker {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
             fn has_attempted(&self, _: &str, _: &str) -> crate::error::Result<bool> {
                 Ok(false)
             }

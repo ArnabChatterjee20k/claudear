@@ -62,7 +62,7 @@ impl WebhookConfigurator {
         let mut env_updates: HashMap<String, String> = HashMap::new();
 
         // Configure Linear webhook
-        if let Some(ref linear_config) = self.config.linear {
+        if let Some(linear_config) = self.config.linear() {
             if linear_config.enabled {
                 match self.configure_linear(linear_config, base_url).await {
                     Ok((webhook_id, secret)) => {
@@ -82,7 +82,7 @@ impl WebhookConfigurator {
         }
 
         // Configure Sentry webhooks
-        if let Some(ref sentry_config) = self.config.sentry {
+        if let Some(ref sentry_config) = self.config.issues.sentry {
             if sentry_config.enabled {
                 match self.configure_sentry(sentry_config, base_url).await {
                     Ok((count, secret)) => {
@@ -195,12 +195,12 @@ impl WebhookConfigurator {
     pub fn needs_configuration(&self) -> bool {
         let linear_needs = self
             .config
-            .linear
-            .as_ref()
+            .linear()
             .is_some_and(|c| c.enabled && c.webhook_secret.is_none());
 
         let sentry_needs = self
             .config
+            .issues
             .sentry
             .as_ref()
             .is_some_and(|c| c.enabled && c.client_secret.is_none());
@@ -280,19 +280,11 @@ mod tests {
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
             agent: crate::config::AgentConfig::default(),
-            discord: crate::config::DiscordConfig::default(),
-            slack: crate::config::SlackConfig::default(),
-            email: crate::config::EmailConfig::default(),
-            sms: crate::config::SmsConfig::default(),
-            push: crate::config::PushConfig::default(),
+            scm: crate::config::ScmConfig::default(),
+            issues: crate::config::IssuesConfig::default(),
+            notifiers: crate::config::NotifiersConfig::default(),
             ask: crate::config::AskConfig::default(),
-            github: crate::config::GitHubConfig::default(),
-            github_app: crate::config::GitHubAppConfig::default(),
             retry: crate::config::RetryConfig::default(),
-            linear: None,
-            sentry: None,
-            jira: None,
-            gitlab: None,
             regression: crate::config::RegressionConfig::default(),
             cascade: crate::config::CascadeConfig::default(),
             users: std::collections::HashMap::new(),
@@ -302,6 +294,7 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            tenant_id: None,
         }
     }
 
@@ -343,9 +336,9 @@ mod tests {
     #[test]
     fn test_needs_configuration_linear_no_secret() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            api_key: "test".to_string(),
+            api_key: "test".into(),
             trigger_labels: vec![],
             trigger_states: vec![],
             team_id: None,
@@ -360,14 +353,14 @@ mod tests {
     #[test]
     fn test_needs_configuration_linear_with_secret() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            api_key: "test".to_string(),
+            api_key: "test".into(),
             trigger_labels: vec![],
             trigger_states: vec![],
             team_id: None,
             project_id: None,
-            webhook_secret: Some("secret".to_string()), // Has secret
+            webhook_secret: Some("secret".into()), // Has secret
             ..Default::default()
         });
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
@@ -428,7 +421,7 @@ mod tests {
     #[test]
     fn test_needs_configuration_sentry_enabled_no_secret() {
         let mut config = test_config();
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
             client_secret: None,
             ..Default::default()
@@ -443,9 +436,9 @@ mod tests {
     #[test]
     fn test_needs_configuration_sentry_enabled_with_secret() {
         let mut config = test_config();
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
-            client_secret: Some("sentry-secret".to_string()),
+            client_secret: Some("sentry-secret".into()),
             ..Default::default()
         });
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
@@ -458,7 +451,7 @@ mod tests {
     #[test]
     fn test_needs_configuration_sentry_disabled() {
         let mut config = test_config();
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: false,
             client_secret: None,
             ..Default::default()
@@ -473,12 +466,12 @@ mod tests {
     #[test]
     fn test_needs_configuration_both_linear_and_sentry_need_config() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
             webhook_secret: None,
             ..Default::default()
         });
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
             client_secret: None,
             ..Default::default()
@@ -493,12 +486,12 @@ mod tests {
     #[test]
     fn test_needs_configuration_linear_has_secret_sentry_does_not() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            webhook_secret: Some("linear-secret".to_string()),
+            webhook_secret: Some("linear-secret".into()),
             ..Default::default()
         });
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
             client_secret: None,
             ..Default::default()
@@ -513,12 +506,12 @@ mod tests {
     #[test]
     fn test_needs_configuration_neither_enabled() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: false,
             webhook_secret: None,
             ..Default::default()
         });
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: false,
             client_secret: None,
             ..Default::default()
@@ -617,10 +610,10 @@ mod tests {
         let mut config = test_config();
         config.webhook_port = 5555;
         config.work_dir = "/custom/dir".into();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            api_key: "key-123".to_string(),
-            webhook_secret: Some("secret".to_string()),
+            api_key: "key-123".into(),
+            webhook_secret: Some("secret".into()),
             ..Default::default()
         });
 
@@ -631,9 +624,9 @@ mod tests {
             configurator.config.work_dir,
             std::path::PathBuf::from("/custom/dir")
         );
-        assert!(configurator.config.linear.is_some());
+        assert!(configurator.config.issues.linear.is_some());
         assert_eq!(
-            configurator.config.linear.as_ref().unwrap().api_key,
+            configurator.config.issues.linear.as_ref().unwrap().api_key.expose(),
             "key-123"
         );
     }
@@ -641,7 +634,7 @@ mod tests {
     #[test]
     fn test_needs_configuration_linear_disabled_no_secret() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: false,
             webhook_secret: None,
             ..Default::default()
@@ -656,9 +649,9 @@ mod tests {
     #[test]
     fn test_needs_configuration_linear_disabled_with_secret() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: false,
-            webhook_secret: Some("has-secret".to_string()),
+            webhook_secret: Some("has-secret".into()),
             ..Default::default()
         });
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
@@ -671,14 +664,14 @@ mod tests {
     #[test]
     fn test_needs_configuration_sentry_has_secret_linear_does_not() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
             webhook_secret: None,
             ..Default::default()
         });
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
-            client_secret: Some("sentry-secret".to_string()),
+            client_secret: Some("sentry-secret".into()),
             ..Default::default()
         });
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
@@ -691,14 +684,14 @@ mod tests {
     #[test]
     fn test_needs_configuration_both_have_secrets() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            webhook_secret: Some("lin-secret".to_string()),
+            webhook_secret: Some("lin-secret".into()),
             ..Default::default()
         });
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
-            client_secret: Some("sen-secret".to_string()),
+            client_secret: Some("sen-secret".into()),
             ..Default::default()
         });
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
@@ -711,13 +704,13 @@ mod tests {
     #[test]
     fn test_needs_configuration_only_linear_enabled_and_configured() {
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            webhook_secret: Some("secret".to_string()),
+            webhook_secret: Some("secret".into()),
             ..Default::default()
         });
         // No sentry at all
-        config.sentry = None;
+        config.issues.sentry = None;
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
         assert!(
             !configurator.needs_configuration(),
@@ -728,10 +721,10 @@ mod tests {
     #[test]
     fn test_needs_configuration_only_sentry_enabled_and_configured() {
         let mut config = test_config();
-        config.linear = None;
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.linear = None;
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
-            client_secret: Some("secret".to_string()),
+            client_secret: Some("secret".into()),
             ..Default::default()
         });
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
@@ -744,8 +737,8 @@ mod tests {
     #[test]
     fn test_needs_configuration_only_sentry_enabled_no_secret() {
         let mut config = test_config();
-        config.linear = None;
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.linear = None;
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
             client_secret: None,
             ..Default::default()
@@ -1089,12 +1082,12 @@ mod tests {
     fn test_needs_configuration_edge_cases() {
         // Edge case 1: Both sources enabled, both missing secrets
         let mut config1 = test_config();
-        config1.linear = Some(crate::config::LinearConfig {
+        config1.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
             webhook_secret: None,
             ..Default::default()
         });
-        config1.sentry = Some(crate::config::SentryConfig {
+        config1.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
             client_secret: None,
             ..Default::default()
@@ -1107,12 +1100,12 @@ mod tests {
 
         // Edge case 2: Both sources present but disabled
         let mut config2 = test_config();
-        config2.linear = Some(crate::config::LinearConfig {
+        config2.issues.linear = Some(crate::config::LinearConfig {
             enabled: false,
             webhook_secret: None,
             ..Default::default()
         });
-        config2.sentry = Some(crate::config::SentryConfig {
+        config2.issues.sentry = Some(crate::config::SentryConfig {
             enabled: false,
             client_secret: None,
             ..Default::default()
@@ -1125,12 +1118,12 @@ mod tests {
 
         // Edge case 3: One enabled with secret, one enabled without
         let mut config3 = test_config();
-        config3.linear = Some(crate::config::LinearConfig {
+        config3.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            webhook_secret: Some("secret".to_string()),
+            webhook_secret: Some("secret".into()),
             ..Default::default()
         });
-        config3.sentry = Some(crate::config::SentryConfig {
+        config3.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
             client_secret: None,
             ..Default::default()
@@ -1143,14 +1136,14 @@ mod tests {
 
         // Edge case 4: Both enabled, both have secrets
         let mut config4 = test_config();
-        config4.linear = Some(crate::config::LinearConfig {
+        config4.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            webhook_secret: Some("lin-secret".to_string()),
+            webhook_secret: Some("lin-secret".into()),
             ..Default::default()
         });
-        config4.sentry = Some(crate::config::SentryConfig {
+        config4.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
-            client_secret: Some("sen-secret".to_string()),
+            client_secret: Some("sen-secret".into()),
             ..Default::default()
         });
         let c4 = WebhookConfigurator::new(config4, "/tmp/.env");
@@ -1205,11 +1198,11 @@ mod tests {
     async fn test_configure_linear_disabled_sentry_disabled_returns_error() {
         // Both sources present but disabled => error about no sources enabled
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: false,
             ..Default::default()
         });
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: false,
             ..Default::default()
         });
@@ -1233,11 +1226,11 @@ mod tests {
     async fn test_configure_linear_disabled_sentry_none_returns_error() {
         // Linear present but disabled, sentry absent => error
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: false,
             ..Default::default()
         });
-        config.sentry = None;
+        config.issues.sentry = None;
         let configurator = WebhookConfigurator::new(config, "/tmp/test-lin-disabled.env");
 
         let result = configurator.configure("https://example.com").await;
@@ -1255,8 +1248,8 @@ mod tests {
     async fn test_configure_sentry_disabled_linear_none_returns_error() {
         // Sentry present but disabled, linear absent => error
         let mut config = test_config();
-        config.linear = None;
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.linear = None;
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: false,
             ..Default::default()
         });
@@ -1279,9 +1272,9 @@ mod tests {
         // This exercises the warning-accumulation path (lines 75-80) and then the
         // "Failed to configure any webhooks" error path (lines 117-122).
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            api_key: "invalid-api-key".to_string(),
+            api_key: "invalid-api-key".into(),
             trigger_labels: vec![],
             trigger_states: vec![],
             team_id: None,
@@ -1289,7 +1282,7 @@ mod tests {
             webhook_secret: None,
             ..Default::default()
         });
-        config.sentry = None;
+        config.issues.sentry = None;
         let configurator = WebhookConfigurator::new(config, "/tmp/test-lin-fail.env");
 
         let result = configurator.configure("https://example.com").await;
@@ -1312,10 +1305,10 @@ mod tests {
         // Exercises the sentry warning-accumulation path (lines 97-101) and then the
         // "Failed to configure any webhooks" error path (lines 117-122).
         let mut config = test_config();
-        config.linear = None;
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.linear = None;
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
-            auth_token: "invalid-token".to_string(),
+            auth_token: "invalid-token".into(),
             org_slug: "nonexistent-org".to_string(),
             project_slugs: vec!["fake-project".to_string()],
             client_secret: None,
@@ -1342,15 +1335,15 @@ mod tests {
         // Both sources enabled with invalid credentials -- both will fail,
         // and the error message should include warnings from both.
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            api_key: "invalid-linear-key".to_string(),
+            api_key: "invalid-linear-key".into(),
             webhook_secret: None,
             ..Default::default()
         });
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
-            auth_token: "invalid-sentry-token".to_string(),
+            auth_token: "invalid-sentry-token".into(),
             org_slug: "nonexistent-org".to_string(),
             project_slugs: vec!["fake-project".to_string()],
             client_secret: None,
@@ -1383,9 +1376,9 @@ mod tests {
         // Even though the API call will fail, this verifies configure()
         // does not panic with a trailing-slash base_url.
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            api_key: "test-key".to_string(),
+            api_key: "test-key".into(),
             webhook_secret: None,
             ..Default::default()
         });
@@ -1400,9 +1393,9 @@ mod tests {
     async fn test_configure_base_url_no_trailing_slash() {
         // Verifies configure() works without trailing slash
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            api_key: "test-key".to_string(),
+            api_key: "test-key".into(),
             webhook_secret: None,
             ..Default::default()
         });
@@ -1417,13 +1410,13 @@ mod tests {
         // Linear enabled but fails, Sentry present but disabled.
         // Only the Linear warning should appear.
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
-            api_key: "bad-key".to_string(),
+            api_key: "bad-key".into(),
             webhook_secret: None,
             ..Default::default()
         });
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: false,
             ..Default::default()
         });
@@ -1444,13 +1437,13 @@ mod tests {
     async fn test_configure_sentry_enabled_linear_disabled_sentry_fails() {
         // Sentry enabled but fails, Linear present but disabled.
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: false,
             ..Default::default()
         });
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
-            auth_token: "bad-token".to_string(),
+            auth_token: "bad-token".into(),
             org_slug: "fake-org".to_string(),
             project_slugs: vec!["fake".to_string()],
             client_secret: None,

@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use claudear::config::Config;
+use claudear::SecretValue;
 use std::path::{Path, PathBuf};
 
 /// Generate a TOML config for a scenario daemon.
@@ -70,17 +71,17 @@ impl ConfigBuilder {
     }
 
     pub fn github(mut self, token: &str, repo: &str) -> Self {
-        self.config.github.token = Some(token.to_string());
-        self.config.github.auto_resolve_on_merge = false;
-        self.config.github.review_trigger = "/claudear".to_string();
+        self.config.scm.github.token = Some(SecretValue::new(token));
+        self.config.scm.github.auto_resolve_on_merge = false;
+        self.config.scm.github.review_trigger = "/claudear".to_string();
         self.config.known_orgs = vec![repo.split('/').next().unwrap_or("unknown").to_string()];
         self
     }
 
     pub fn gitlab(mut self, token: &str, base_url: &str, group: &str) -> Self {
-        self.config.gitlab = Some(claudear::config::GitLabConfig {
+        self.config.scm.gitlab = Some(claudear::config::GitLabConfig {
             enabled: true,
-            token: Some(token.to_string()),
+            token: Some(SecretValue::new(token)),
             base_url: base_url.to_string(),
             groups: vec![group.to_string()],
             auto_resolve_on_merge: false,
@@ -92,9 +93,9 @@ impl ConfigBuilder {
     }
 
     pub fn linear(mut self, api_key: &str, team_id: &str) -> Self {
-        self.config.linear = Some(claudear::config::LinearConfig {
+        self.config.issues.linear = Some(claudear::config::LinearConfig {
             enabled: true,
-            api_key: api_key.to_string(),
+            api_key: SecretValue::new(api_key),
             team_id: Some(team_id.to_string()),
             trigger_labels: vec!["claudear-e2e".to_string()],
             trigger_states: vec!["backlog".to_string(), "todo".to_string()],
@@ -104,11 +105,11 @@ impl ConfigBuilder {
     }
 
     pub fn jira(mut self, base_url: &str, email: &str, api_token: &str, project_key: &str) -> Self {
-        self.config.jira = Some(claudear::config::JiraConfig {
+        self.config.issues.jira = Some(claudear::config::JiraConfig {
             enabled: true,
             base_url: base_url.to_string(),
             email: email.to_string(),
-            api_token: api_token.to_string(),
+            api_token: SecretValue::new(api_token),
             auth_mode: "basic".to_string(),
             project_keys: vec![project_key.to_string()],
             trigger_labels: vec!["claudear-e2e".to_string()],
@@ -119,34 +120,39 @@ impl ConfigBuilder {
     }
 
     pub fn discord_source(mut self, bot_token: &str, channel_id: &str) -> Self {
-        self.config.discord.bot_token = Some(bot_token.to_string());
-        self.config.discord.channel_id = Some(channel_id.to_string());
-        self.config.discord.source_enabled = true;
-        self.config.discord.listen_channel_id = Some(channel_id.to_string());
+        self.config.issues.discord = Some(claudear::config::DiscordSourceConfig {
+            bot_token: Some(SecretValue::new(bot_token)),
+            channel_id: Some(channel_id.to_string()),
+            listen_channel_id: Some(channel_id.to_string()),
+            ..Default::default()
+        });
         self
     }
 
     pub fn discord_notifier(mut self, webhook_url: &str) -> Self {
-        self.config.discord.webhook_url = Some(webhook_url.to_string());
+        self.config.notifiers.discord.webhook_url = Some(SecretValue::new(webhook_url));
         self
     }
 
     pub fn slack_source(mut self, bot_token: &str, channel_id: &str) -> Self {
-        self.config.slack.bot_token = Some(bot_token.to_string());
-        self.config.slack.channel_id = Some(channel_id.to_string());
-        self.config.slack.source_enabled = true;
-        self.config.slack.listen_channel_id = Some(channel_id.to_string());
+        self.config.issues.slack = Some(claudear::config::SlackSourceConfig {
+            bot_token: Some(SecretValue::new(bot_token)),
+            channel_id: Some(channel_id.to_string()),
+            listen_channel_id: Some(channel_id.to_string()),
+            ..Default::default()
+        });
         self
     }
 
     pub fn slack_user_id(mut self, user_id: &str) -> Self {
-        self.config.slack.user_id = Some(user_id.to_string());
+        let slack = self.config.issues.slack.get_or_insert_with(Default::default);
+        slack.user_id = Some(user_id.to_string());
         self
     }
 
     pub fn slack_notifier(mut self, bot_token: &str, channel_id: &str) -> Self {
-        self.config.slack.bot_token = Some(bot_token.to_string());
-        self.config.slack.channel_id = Some(channel_id.to_string());
+        self.config.notifiers.slack.bot_token = Some(SecretValue::new(bot_token));
+        self.config.notifiers.slack.channel_id = Some(channel_id.to_string());
         self
     }
 

@@ -34,17 +34,17 @@ impl UserRegistry {
 
     /// Resolve an issue's assignee to a user based on the source type.
     ///
-    /// For Linear: matches `assignee_value` against each user's `linear_name`
-    /// For GitHub: matches against `github_username`
-    /// For Sentry: matches against `sentry_username`
+    /// For Linear: matches `assignee_value` against each user's `linear_names`
+    /// For GitHub: matches against `github_usernames`
+    /// For Sentry: matches against `sentry_usernames`
     pub fn resolve(&self, source: &str, assignee_value: &str) -> Option<ResolvedUser> {
         for (slug, user) in &self.users {
             let matched = match source.to_lowercase().as_str() {
-                "linear" => user.linear_name.as_deref() == Some(assignee_value),
-                "github" => user.github_username.as_deref() == Some(assignee_value),
-                "sentry" => user.sentry_username.as_deref() == Some(assignee_value),
-                "jira" => user.jira_username.as_deref() == Some(assignee_value),
-                "gitlab" => user.gitlab_username.as_deref() == Some(assignee_value),
+                "linear" => user.linear_names.iter().any(|n| n == assignee_value),
+                "github" => user.github_usernames.iter().any(|n| n == assignee_value),
+                "sentry" => user.sentry_usernames.iter().any(|n| n == assignee_value),
+                "jira" => user.jira_usernames.iter().any(|n| n == assignee_value),
+                "gitlab" => user.gitlab_usernames.iter().any(|n| n == assignee_value),
                 _ => false,
             };
             if matched {
@@ -82,31 +82,35 @@ mod tests {
         users.insert(
             "jake".to_string(),
             UserConfig {
-                linear_name: Some("Jake Barnwell".to_string()),
-                github_username: Some("jakebarnby".to_string()),
-                sentry_username: Some("jake".to_string()),
-                jira_username: Some("jake.barnby".to_string()),
-                gitlab_username: Some("jakebarnby".to_string()),
+                linear_names: vec!["Jake Barnwell".to_string()],
+                github_usernames: vec!["jakebarnby".to_string()],
+                sentry_usernames: vec!["jake".to_string()],
+                jira_usernames: vec!["jake.barnby".to_string()],
+                gitlab_usernames: vec!["jakebarnby".to_string()],
                 discord_id: Some("123456789".to_string()),
                 slack_id: Some("U_JAKE_SLACK".to_string()),
                 email: Some("jake@example.com".to_string()),
                 push_user_key: Some("push_key_jake".to_string()),
                 sms_number: Some("+1234567890".to_string()),
+                whatsapp_number: None,
+                telegram_chat_id: None,
             },
         );
         users.insert(
             "alice".to_string(),
             UserConfig {
-                linear_name: Some("Alice Smith".to_string()),
-                github_username: Some("alicesmith".to_string()),
-                sentry_username: None,
-                jira_username: None,
-                gitlab_username: None,
+                linear_names: vec!["Alice Smith".to_string()],
+                github_usernames: vec!["alicesmith".to_string()],
+                sentry_usernames: vec![],
+                jira_usernames: vec![],
+                gitlab_usernames: vec![],
                 discord_id: Some("987654321".to_string()),
                 slack_id: None,
                 email: Some("alice@example.com".to_string()),
                 push_user_key: None,
                 sms_number: None,
+                whatsapp_number: None,
+                telegram_chat_id: None,
             },
         );
         users
@@ -179,7 +183,7 @@ mod tests {
         let registry = UserRegistry::new(test_users());
         let jake = registry.get_by_slug("jake");
         assert!(jake.is_some());
-        assert_eq!(jake.unwrap().linear_name.as_deref(), Some("Jake Barnwell"));
+        assert_eq!(jake.unwrap().linear_names, vec!["Jake Barnwell"]);
 
         assert!(registry.get_by_slug("unknown").is_none());
     }

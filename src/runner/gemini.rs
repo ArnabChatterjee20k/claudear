@@ -40,3 +40,42 @@ impl AgentRunner for GeminiAgentRunner {
         Err(Error::runner("Gemini provider not yet implemented"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gemini_name() {
+        let runner = GeminiAgentRunner;
+        assert_eq!(runner.name(), "gemini");
+    }
+
+    #[test]
+    fn test_gemini_capabilities_all_false() {
+        let runner = GeminiAgentRunner;
+        let caps = runner.capabilities();
+        assert!(!caps.structured_output);
+        assert!(!caps.tool_permissions);
+        assert!(!caps.custom_instructions);
+        assert!(!caps.streaming_events);
+        assert!(!caps.cost_reporting);
+    }
+
+    #[test]
+    fn test_gemini_build_prompt_returns_empty() {
+        let runner = GeminiAgentRunner;
+        let issue = Issue::new("1", "GEM-1", "Bug", "url", "test");
+        let prompt = runner.build_prompt_for_issue(&issue, "ctx", Path::new("/tmp"));
+        assert!(prompt.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_gemini_execute_returns_not_implemented() {
+        let runner = GeminiAgentRunner;
+        let result = runner.execute_with_attempt("test", None, None, Path::new("/tmp")).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not yet implemented"));
+    }
+}

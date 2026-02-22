@@ -480,12 +480,12 @@ fn init_logging(
 ///
 /// Returns `None` if the embedding model fails to load, allowing graceful degradation.
 fn build_issue_embedding_service(
-    sqlite_tracker: &Arc<SqliteTracker>,
+    tracker: &Arc<dyn FixAttemptTracker>,
 ) -> Option<Arc<IssueEmbeddingService>> {
     match EmbeddingClient::new(EmbeddingConfig::default()) {
         Ok(client) => Some(Arc::new(IssueEmbeddingService::with_defaults(
             Arc::new(client),
-            sqlite_tracker.clone(),
+            tracker.clone(),
         ))),
         Err(e) => {
             tracing::warn!(error = %e, "Issue embedding service unavailable");
@@ -498,14 +498,13 @@ fn build_issue_embedding_service(
 fn create_review_watcher(
     config: &Config,
     tracker: Arc<dyn FixAttemptTracker>,
-    sqlite_tracker: Arc<SqliteTracker>,
 ) -> Option<Arc<ReviewWatcher>> {
     if !config.is_github_enabled() {
         tracing::debug!("GitHub not configured, ReviewWatcher disabled");
         return None;
     }
 
-    let github_client = GitHubClient::new(config.github.clone());
+    let github_client = GitHubClient::new(config.github().clone());
     if !github_client.is_enabled() {
         tracing::debug!("GitHub client not enabled, ReviewWatcher disabled");
         return None;
@@ -513,10 +512,10 @@ fn create_review_watcher(
 
     let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
     let review_watcher =
-        ReviewWatcher::with_tracker(provider, tracker);
+        ReviewWatcher::with_tracker(provider, tracker.clone());
 
     // Restore states from database
-    match sqlite_tracker.get_active_pr_review_states() {
+    match tracker.get_active_pr_review_states() {
         Ok(states) => {
             let count = states.len();
             if count > 0 {
@@ -548,52 +547,54 @@ fn create_review_watcher(
 fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
     let mut sources: Vec<Arc<dyn IssueSource>> = Vec::new();
 
-    if let Some(ref linear_config) = config.linear {
+    if let Some(linear_config) = config.linear() {
         if linear_config.enabled {
             sources.push(Arc::new(LinearSource::new(linear_config.clone())));
             tracing::info!("Linear source initialized");
         }
     }
 
-    if let Some(ref sentry_config) = config.sentry {
+    if let Some(sentry_config) = config.sentry_config() {
         if sentry_config.enabled {
             sources.push(Arc::new(SentrySource::new(sentry_config.clone())));
             tracing::info!("Sentry source initialized");
         }
     }
 
-    if let Some(ref jira_config) = config.jira {
+    if let Some(jira_config) = config.jira() {
         if jira_config.enabled {
             sources.push(Arc::new(JiraSource::new(jira_config.clone())));
             tracing::info!("Jira source initialized");
         }
     }
 
-    if config.discord.source_enabled {
-        if config.discord.bot_token.is_some()
-            && (config.discord.listen_channel_id.is_some() || config.discord.channel_id.is_some())
+    let discord = config.discord_merged();
+    if discord.source_enabled {
+        if discord.bot_token.is_some()
+            && (discord.listen_channel_id.is_some() || discord.channel_id.is_some())
         {
-            sources.push(Arc::new(DiscordSource::new(config.discord.clone())));
+            sources.push(Arc::new(DiscordSource::new(discord)));
             tracing::info!("Discord source initialized");
         } else {
             tracing::warn!("Discord source_enabled but missing bot_token or channel_id; skipping");
         }
     }
 
-    if config.slack.source_enabled {
-        if config.slack.bot_token.is_some()
-            && (config.slack.listen_channel_id.is_some() || config.slack.channel_id.is_some())
+    let slack = config.slack_merged();
+    if slack.source_enabled {
+        if slack.bot_token.is_some()
+            && (slack.listen_channel_id.is_some() || slack.channel_id.is_some())
         {
-            sources.push(Arc::new(SlackSource::new(config.slack.clone())));
+            sources.push(Arc::new(SlackSource::new(slack)));
             tracing::info!("Slack source initialized");
         } else {
             tracing::warn!("Slack source_enabled but missing bot_token or channel_id; skipping");
         }
     }
 
-    if config.whatsapp.source_enabled {
-        if config.whatsapp.access_token.is_some() && config.whatsapp.phone_number_id.is_some() {
-            sources.push(Arc::new(WhatsAppSource::new(config.whatsapp.clone())));
+    if config.notifiers.whatsapp.source_enabled {
+        if config.notifiers.whatsapp.access_token.is_some() && config.notifiers.whatsapp.phone_number_id.is_some() {
+            sources.push(Arc::new(WhatsAppSource::new(config.notifiers.whatsapp.clone())));
             tracing::info!("WhatsApp source initialized");
         } else {
             tracing::warn!(
@@ -602,9 +603,9 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
         }
     }
 
-    if config.telegram.source_enabled {
-        if config.telegram.bot_token.is_some() {
-            sources.push(Arc::new(TelegramSource::new(config.telegram.clone())));
+    if config.notifiers.telegram.source_enabled {
+        if config.notifiers.telegram.bot_token.is_some() {
+            sources.push(Arc::new(TelegramSource::new(config.notifiers.telegram.clone())));
             tracing::info!("Telegram source initialized");
         } else {
             tracing::warn!("Telegram source_enabled but missing bot_token; skipping");
@@ -617,14 +618,14 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
 fn create_webhook_handlers(config: &Config) -> WebhookHandlerRegistry {
     let mut registry = WebhookHandlerRegistry::new();
 
-    if let Some(ref linear_config) = config.linear {
+    if let Some(linear_config) = config.linear() {
         if linear_config.enabled {
             registry.register(Arc::new(LinearWebhookHandler::new(linear_config.clone())));
             tracing::info!("Linear webhook handler registered");
         }
     }
 
-    if let Some(ref sentry_config) = config.sentry {
+    if let Some(sentry_config) = config.sentry_config() {
         if sentry_config.enabled {
             registry.register(Arc::new(SentryWebhookHandler::new(sentry_config.clone())));
             tracing::info!("Sentry webhook handler registered");
@@ -638,7 +639,7 @@ fn create_github_webhook_handler(
     config: &Config,
     review_watcher: Option<Arc<ReviewWatcher>>,
 ) -> Option<GitHubWebhookHandler> {
-    let handler = GitHubWebhookHandler::new(config.github.clone(), review_watcher);
+    let handler = GitHubWebhookHandler::new(config.github().clone(), review_watcher);
     if handler.is_enabled() {
         tracing::info!("GitHub webhook handler registered");
         Some(handler)
@@ -654,21 +655,21 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
     composite.add(Arc::new(ConsoleNotifier::new()));
 
     // Add Discord if configured
-    let discord_notifier = DiscordNotifier::new(config.discord.clone(), user_registry.clone());
+    let discord_notifier = DiscordNotifier::new(config.discord_merged(), user_registry.clone());
     if discord_notifier.is_enabled() {
         composite.add(Arc::new(discord_notifier));
         tracing::info!("Discord notifier enabled");
     }
 
     // Add Slack if configured
-    let slack_notifier = SlackNotifier::new(config.slack.clone(), user_registry.clone());
+    let slack_notifier = SlackNotifier::new(config.slack_merged(), user_registry.clone());
     if slack_notifier.is_enabled() {
         composite.add(Arc::new(slack_notifier));
         tracing::info!("Slack notifier enabled");
     }
 
     // Add Email if configured
-    if let Ok(email_notifier) = EmailNotifier::new(config.email.clone(), user_registry.clone()) {
+    if let Ok(email_notifier) = EmailNotifier::new(config.email().clone(), user_registry.clone()) {
         if email_notifier.is_enabled() {
             composite.add(Arc::new(email_notifier));
             tracing::info!("Email notifier enabled");
@@ -676,28 +677,28 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
     }
 
     // Add SMS if configured
-    let sms_notifier = SmsNotifier::new(config.sms.clone(), user_registry.clone());
+    let sms_notifier = SmsNotifier::new(config.sms().clone(), user_registry.clone());
     if sms_notifier.is_enabled() {
         composite.add(Arc::new(sms_notifier));
         tracing::info!("SMS notifier enabled");
     }
 
     // Add Push if configured
-    let push_notifier = PushNotifier::new(config.push.clone(), user_registry.clone());
+    let push_notifier = PushNotifier::new(config.push_config().clone(), user_registry.clone());
     if push_notifier.is_enabled() {
         composite.add(Arc::new(push_notifier));
         tracing::info!("Push notifier enabled");
     }
 
     // Add WhatsApp if configured
-    let whatsapp_notifier = WhatsAppNotifier::new(config.whatsapp.clone(), user_registry.clone());
+    let whatsapp_notifier = WhatsAppNotifier::new(config.notifiers.whatsapp.clone(), user_registry.clone());
     if whatsapp_notifier.is_enabled() {
         composite.add(Arc::new(whatsapp_notifier));
         tracing::info!("WhatsApp notifier enabled");
     }
 
     // Add Telegram if configured
-    let telegram_notifier = TelegramNotifier::new(config.telegram.clone(), user_registry);
+    let telegram_notifier = TelegramNotifier::new(config.notifiers.telegram.clone(), user_registry);
     if telegram_notifier.is_enabled() {
         composite.add(Arc::new(telegram_notifier));
         tracing::info!("Telegram notifier enabled");
@@ -706,10 +707,8 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
     Arc::new(composite)
 }
 
-fn create_tracker(config: &Config) -> (Arc<dyn FixAttemptTracker>, Arc<SqliteTracker>) {
-    let tracker =
-        Arc::new(SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker"));
-    (tracker.clone(), tracker)
+fn create_tracker(config: &Config) -> Arc<dyn FixAttemptTracker> {
+    Arc::new(SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker"))
 }
 
 /// Start the regression monitoring background tasks.
@@ -723,7 +722,6 @@ fn create_tracker(config: &Config) -> (Arc<dyn FixAttemptTracker>, Arc<SqliteTra
 /// Returns a join handle that can be used to stop the monitoring.
 fn start_regression_monitoring(
     config: &Config,
-    sqlite_tracker: Arc<SqliteTracker>,
     tracker: Arc<dyn FixAttemptTracker>,
     sources: Vec<Arc<dyn IssueSource>>,
     notifier: Arc<dyn Notifier>,
@@ -738,7 +736,7 @@ fn start_regression_monitoring(
         .regression
         .github_token
         .clone()
-        .or_else(|| config.github.token.clone());
+        .or_else(|| config.github().token.as_ref().map(|t| t.expose().to_string()));
 
     let github_token = match github_token {
         Some(token) if !token.is_empty() => token,
@@ -753,7 +751,7 @@ fn start_regression_monitoring(
     let release_config = ReleaseTrackerConfig {
         target_repos: config.regression.target_repos.clone(),
         poll_interval_ms: effective_check_secs * 1000,
-        ..Default::default()
+        package_names: config.regression.package_names.clone(),
     };
 
     // Create scheduler config
@@ -766,10 +764,10 @@ fn start_regression_monitoring(
 
     // Create the sentry regression checker if sentry is configured
     let sentry_checker: Box<dyn claudear::regression::RegressionChecker> =
-        if let Some(ref sentry_config) = config.sentry {
+        if let Some(sentry_config) = config.sentry_config() {
             if sentry_config.enabled && !sentry_config.auth_token.is_empty() {
                 let sentry_regression_config = SentryRegressionConfig {
-                    auth_token: sentry_config.auth_token.clone(),
+                    auth_token: sentry_config.auth_token.expose().to_string(),
                     org_slug: sentry_config.org_slug.clone(),
                     event_threshold: config.regression.sentry_event_threshold,
                 };
@@ -813,11 +811,11 @@ fn start_regression_monitoring(
 
     // Create release tracker and scheduler
     let release_tracker =
-        ReleaseTracker::with_config(github_token, sqlite_tracker.clone(), release_config);
+        ReleaseTracker::with_config(github_token, tracker.clone(), release_config);
 
     let scheduler = RegressionScheduler::new(
         composite_checker,
-        sqlite_tracker.clone(),
+        tracker.clone(),
         scheduler_config.clone(),
     );
 
@@ -1130,7 +1128,7 @@ async fn async_main() -> anyhow::Result<()> {
     if matches!(cli.command, Commands::Sources) {
         println!("\nConfigured Sources:");
         if config.is_linear_enabled() {
-            if let Some(ref linear) = config.linear {
+            if let Some(linear) = config.linear() {
                 println!("  Linear (labels: {})", linear.trigger_labels.join(", "));
                 if linear.webhook_secret.is_some() {
                     println!("    Webhook secret: configured");
@@ -1141,7 +1139,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
 
         if config.is_sentry_enabled() {
-            if let Some(ref sentry) = config.sentry {
+            if let Some(sentry) = config.sentry_config() {
                 println!("  Sentry (org: {})", sentry.org_slug);
                 if sentry.client_secret.is_some() {
                     println!("    Client secret: configured");
@@ -1158,16 +1156,16 @@ async fn async_main() -> anyhow::Result<()> {
 
         println!("\nNotifiers:");
         println!("  Console: enabled");
-        if config.discord.webhook_url.is_some() {
+        if config.notifiers.discord.webhook_url.is_some() {
             println!("  Discord: enabled");
         }
-        if config.email.smtp_host.is_some() {
+        if config.email().smtp_host.is_some() {
             println!("  Email: enabled");
         }
-        if config.sms.account_sid.is_some() {
+        if config.sms().account_sid.is_some() {
             println!("  SMS (Twilio): enabled");
         }
-        if config.push.api_token.is_some() {
+        if config.push_config().api_token.is_some() {
             println!("  Push (Pushover): enabled");
         }
 
@@ -1879,12 +1877,12 @@ async fn async_main() -> anyhow::Result<()> {
                 use claudear::release::ReleaseClient;
 
                 let github_token = config
-                    .github
+                    .github()
                     .token
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("GitHub token not configured"))?;
 
-                let client = ReleaseClient::new(github_token);
+                let client = ReleaseClient::new(github_token.expose());
 
                 println!("\n=== Release Check: {}/#{} ===\n", repo, pr);
 
@@ -2021,7 +2019,7 @@ async fn async_main() -> anyhow::Result<()> {
     tracing::info!("Initializing...");
     let user_registry = UserRegistry::new(config.users.clone());
     let notifier = create_notifier(&config, user_registry.clone());
-    let (tracker, sqlite_tracker) = create_tracker(&config);
+    let tracker = create_tracker(&config);
 
     // Handle Start command (daemon mode with IPC - runs all services concurrently)
     if let Commands::Start {
@@ -2064,7 +2062,7 @@ async fn async_main() -> anyhow::Result<()> {
         let mode_str = modes.join("+");
 
         // Create GitHub client for API-based repo discovery
-        let github_client = GitHubClient::new(config.github.clone());
+        let github_client = GitHubClient::new(config.github().clone());
 
         // Build repository inferrer for issue-to-repo mapping (with embeddings for semantic matching)
         let (inferrer, embedding_client) =
@@ -2075,13 +2073,13 @@ async fn async_main() -> anyhow::Result<()> {
 
         // Create ReviewWatcher for PR review tracking
         let review_watcher =
-            create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+            create_review_watcher(&config, tracker.clone());
         let github_webhook_handler = create_github_webhook_handler(&config, review_watcher.clone());
 
         // Build dependency graph for cascade support
         let relationships = if config.cascade.enabled {
             let mut rels = RepoRelationships::with_defaults();
-            match sqlite_tracker.list_all_dependencies() {
+            match tracker.list_all_dependencies() {
                 Ok(db_deps) if !db_deps.is_empty() => {
                     tracing::info!(count = db_deps.len(), "Loading dependencies from database");
                     for dep in &db_deps {
@@ -2108,18 +2106,18 @@ async fn async_main() -> anyhow::Result<()> {
 
         // Create GitHub client for PR merge checking.
         let github_client_for_watcher = if config.is_github_enabled() {
-            Some(GitHubClient::new(config.github.clone()))
+            Some(GitHubClient::new(config.github().clone()))
         } else {
             None
         };
 
         // Build issue embedding service for semantic dedup
-        let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
+        let issue_embedding_service = build_issue_embedding_service(&tracker);
 
         // Create watcher if polling is enabled
         // Build generic SCM provider for PR merge detection (GitLab, etc.)
         let scm_provider: Option<Arc<dyn ScmProvider>> =
-            if let Some(ref gitlab_config) = config.gitlab {
+            if let Some(gitlab_config) = config.gitlab() {
                 if gitlab_config.enabled && gitlab_config.token.is_some() {
                     Some(Arc::new(claudear::gitlab::GitLabClient::new(
                         gitlab_config.clone(),
@@ -2130,6 +2128,17 @@ async fn async_main() -> anyhow::Result<()> {
             } else {
                 None
             };
+
+        let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
+            ClaudeRunnerConfig {
+                timeout_secs: config.agent.timeout_secs,
+                model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
+                instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
+                permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
+                skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
+            },
+            tracker.clone(),
+        ));
 
         let watcher = if enable_polling {
             Some(Arc::new(Watcher::new(WatcherOptions {
@@ -2145,6 +2154,7 @@ async fn async_main() -> anyhow::Result<()> {
                 github_client: github_client_for_watcher,
                 scm_provider,
                 user_registry: user_registry.clone(),
+                agent: agent.clone(),
                 dry_run: false,
             })))
         } else {
@@ -2201,7 +2211,6 @@ async fn async_main() -> anyhow::Result<()> {
         // Start regression monitoring background task
         let regression_handle = start_regression_monitoring(
             &config,
-            sqlite_tracker.clone(),
             tracker.clone(),
             sources.clone(),
             notifier.clone(),
@@ -2265,23 +2274,12 @@ async fn async_main() -> anyhow::Result<()> {
                     return Err(anyhow::anyhow!("No webhook handlers configured"));
                 }
 
-                // Webhook server also serves health endpoint which dashboard uses
-                let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
-                    ClaudeRunnerConfig {
-                        timeout_secs: config.agent.timeout_secs,
-                        model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
-                        instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
-                        permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
-                        skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
-                    },
-                    tracker.clone(),
-                ));
                 let mut server = WebhookServer::new_with_github(
                     config.clone(),
                     handlers,
                     notifier.clone(),
                     tracker.clone(),
-                    Some(sqlite_tracker.clone()),
+                    Some(tracker.clone()),
                     inferrer_clone,
                     github_webhook_handler_for_http,
                     agent,
@@ -2344,27 +2342,27 @@ async fn async_main() -> anyhow::Result<()> {
             anyhow::bail!("GitHub token not configured. Set GITHUB_TOKEN environment variable.");
         }
 
-        let github_client = GitHubClient::new(config.github.clone());
+        let github_client = GitHubClient::new(config.github().clone());
         let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
         let sources = create_sources(&config);
         let pr_monitor = if config.regression.enabled {
             PrMonitor::with_regression_tracking(
                 provider,
                 tracker.clone(),
-                config.github.auto_resolve_on_merge,
-                sqlite_tracker.clone(),
+                config.github().auto_resolve_on_merge,
+                tracker.clone(),
             )
         } else {
             PrMonitor::new(
                 provider,
                 tracker.clone(),
-                config.github.auto_resolve_on_merge,
+                config.github().auto_resolve_on_merge,
             )
         };
 
         if continuous {
             tracing::info!("Starting PR monitor (continuous mode)...");
-            let configured_poll_interval_ms = config.github.poll_interval_ms;
+            let configured_poll_interval_ms = config.github().poll_interval_ms;
             let poll_interval_ms = configured_poll_interval_ms.max(1);
             if configured_poll_interval_ms == 0 {
                 tracing::warn!(
@@ -2375,7 +2373,7 @@ async fn async_main() -> anyhow::Result<()> {
             tracing::info!("  Poll interval: {}ms", poll_interval_ms);
             tracing::info!(
                 "  Auto-resolve on merge: {}",
-                config.github.auto_resolve_on_merge
+                config.github().auto_resolve_on_merge
             );
 
             let mut poll_timer = interval(Duration::from_millis(poll_interval_ms));
@@ -2605,7 +2603,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
 
         // Create GitHub client for API-based repo discovery
-        let github_client = GitHubClient::new(config.github.clone());
+        let github_client = GitHubClient::new(config.github().clone());
 
         // Build inferrer for retry processing (with embeddings for semantic matching)
         let (inferrer, embedding_client) =
@@ -2613,9 +2611,20 @@ async fn async_main() -> anyhow::Result<()> {
 
         // Create ReviewWatcher for PR review tracking
         let review_watcher =
-            create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+            create_review_watcher(&config, tracker.clone());
 
-        let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
+        let issue_embedding_service = build_issue_embedding_service(&tracker);
+
+        let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
+            ClaudeRunnerConfig {
+                timeout_secs: config.agent.timeout_secs,
+                model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
+                instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
+                permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
+                skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
+            },
+            tracker.clone(),
+        ));
 
         let watcher = Watcher::new(WatcherOptions {
             config: config.clone(),
@@ -2630,6 +2639,7 @@ async fn async_main() -> anyhow::Result<()> {
             github_client: None,
             scm_provider: None,
             user_registry: user_registry.clone(),
+            agent,
             dry_run: false,
         });
 
@@ -2826,7 +2836,7 @@ async fn async_main() -> anyhow::Result<()> {
 
             let handlers = create_webhook_handlers(&config);
             let review_watcher =
-                create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+                create_review_watcher(&config, tracker.clone());
             let github_webhook_handler =
                 create_github_webhook_handler(&config, review_watcher.clone());
 
@@ -2835,12 +2845,12 @@ async fn async_main() -> anyhow::Result<()> {
             }
 
             // Create GitHub client for API-based repo discovery
-            let github_client = GitHubClient::new(config.github.clone());
+            let github_client = GitHubClient::new(config.github().clone());
 
             // Build inferrer for repo inference
             let inferrer = WebhookServer::build_inferrer(&config, Some(&github_client)).await?;
 
-            let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
+            let issue_embedding_service = build_issue_embedding_service(&tracker);
 
             let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
                 ClaudeRunnerConfig {
@@ -2856,8 +2866,8 @@ async fn async_main() -> anyhow::Result<()> {
                 config,
                 handlers,
                 notifier,
-                tracker,
-                Some(sqlite_tracker),
+                tracker.clone(),
+                Some(tracker),
                 inferrer,
                 github_webhook_handler,
                 agent,
@@ -2893,7 +2903,7 @@ async fn async_main() -> anyhow::Result<()> {
             let notifier_for_regression = notifier.clone();
 
             // Create GitHub client for API-based repo discovery
-            let github_client = GitHubClient::new(config.github.clone());
+            let github_client = GitHubClient::new(config.github().clone());
 
             // Build inferrer for repo inference (with embeddings for semantic matching)
             let (inferrer, embedding_client) =
@@ -2901,9 +2911,20 @@ async fn async_main() -> anyhow::Result<()> {
 
             // Create ReviewWatcher for PR review tracking
             let review_watcher =
-                create_review_watcher(&config, tracker.clone(), sqlite_tracker.clone());
+                create_review_watcher(&config, tracker.clone());
 
-            let issue_embedding_service = build_issue_embedding_service(&sqlite_tracker);
+            let issue_embedding_service = build_issue_embedding_service(&tracker);
+
+            let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.agent.timeout_secs,
+                    model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
+                    instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
+                    permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
+                    skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
+                },
+                tracker.clone(),
+            ));
 
             let tracker_for_api = tracker.clone();
             let watcher = Watcher::new(WatcherOptions {
@@ -2917,12 +2938,13 @@ async fn async_main() -> anyhow::Result<()> {
                 issue_embedding_service,
                 relationships: None,
                 github_client: if config.is_github_enabled() {
-                    Some(GitHubClient::new(config.github.clone()))
+                    Some(GitHubClient::new(config.github().clone()))
                 } else {
                     None
                 },
                 scm_provider: None,
                 user_registry: user_registry.clone(),
+                agent,
                 dry_run,
             });
 
@@ -2958,7 +2980,6 @@ async fn async_main() -> anyhow::Result<()> {
                     // fixes complete the regression-final-check -> resolve flow.
                     let _regression_handle = start_regression_monitoring(
                         &config,
-                        sqlite_tracker.clone(),
                         tracker_for_api.clone(),
                         sources_for_regression.clone(),
                         notifier_for_regression.clone(),

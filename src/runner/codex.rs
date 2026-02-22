@@ -7,7 +7,7 @@ use crate::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
 use crate::types::{ActivityLogEntry, AgentExecution, AgentResult, Issue};
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -389,5 +389,117 @@ mod tests {
         assert!(!caps.structured_output);
         assert!(!caps.tool_permissions);
         assert!(caps.custom_instructions);
+    }
+
+    #[test]
+    fn test_codex_name() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
+        assert_eq!(runner.name(), "codex");
+    }
+
+    #[test]
+    fn test_codex_capabilities_no_structured_output() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
+        let caps = runner.capabilities();
+        assert!(!caps.structured_output);
+        assert!(!caps.tool_permissions);
+        assert!(caps.custom_instructions);
+        assert!(!caps.streaming_events);
+        assert!(!caps.cost_reporting);
+    }
+
+    #[test]
+    fn test_codex_runner_config_custom() {
+        let config = CodexRunnerConfig {
+            timeout_secs: 3600,
+            model: Some("o3".to_string()),
+            instructions: Some("Follow instructions.md".to_string()),
+            binary: "/usr/local/bin/codex".to_string(),
+            sandbox: Some("network-on".to_string()),
+        };
+        assert_eq!(config.timeout_secs, 3600);
+        assert_eq!(config.model.as_deref(), Some("o3"));
+        assert_eq!(config.binary, "/usr/local/bin/codex");
+        assert_eq!(config.sandbox.as_deref(), Some("network-on"));
+    }
+
+    #[test]
+    fn test_codex_runner_config_default_sandbox() {
+        let config = CodexRunnerConfig::default();
+        assert_eq!(config.sandbox, Some("network-off".to_string()));
+    }
+
+    #[test]
+    fn test_extract_pr_url_github_with_trailing_text() {
+        let output = "PR created: https://github.com/org/repo/pull/456 successfully";
+        assert_eq!(
+            CodexAgentRunner::extract_pr_url(output),
+            Some("https://github.com/org/repo/pull/456".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_pr_url_github_multiline() {
+        let output = "Working on fix...\nDone!\nhttps://github.com/myorg/myrepo/pull/789\nAll checks pass.";
+        assert_eq!(
+            CodexAgentRunner::extract_pr_url(output),
+            Some("https://github.com/myorg/myrepo/pull/789".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_pr_url_prefers_github_over_gitlab() {
+        let output = "https://github.com/a/b/pull/1 https://gitlab.com/c/d/-/merge_requests/2";
+        let url = CodexAgentRunner::extract_pr_url(output).unwrap();
+        assert!(url.contains("github.com"));
+    }
+
+    #[test]
+    fn test_extract_pr_url_empty_string() {
+        assert_eq!(CodexAgentRunner::extract_pr_url(""), None);
+    }
+
+    #[tokio::test]
+    async fn test_codex_execute_nonexistent_binary_returns_error() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let config = CodexRunnerConfig {
+            binary: "nonexistent-codex-binary-xyz-12345".to_string(),
+            ..CodexRunnerConfig::default()
+        };
+        let runner = CodexAgentRunner::new(config, tracker);
+        let result = runner
+            .execute_with_attempt("fix this", None, None, Path::new("/tmp"))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to spawn"), "Expected spawn error, got: {}", err);
+    }
+
+    #[test]
+    fn test_build_prompt_contains_source_and_context() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
+        let issue = Issue::new("42", "SENTRY-42", "Error", "https://sentry.io/issue/42", "sentry");
+        let prompt = runner.build_prompt(&issue, "NullPointerException at line 5", Path::new("/tmp"));
+        assert!(prompt.contains("Sentry"), "prompt should mention Sentry: {}", prompt);
+        assert!(prompt.contains("NullPointerException"), "prompt should contain context: {}", prompt);
+        assert!(prompt.contains("Error"), "prompt should contain the issue title: {}", prompt);
+    }
+
+    #[test]
+    fn test_build_prompt_for_issue_delegates_to_build_prompt() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
+        let issue = Issue::new("1", "LIN-1", "Feature", "url", "linear");
+        let p1 = runner.build_prompt(&issue, "ctx", Path::new("/tmp"));
+        let p2 = runner.build_prompt_for_issue(&issue, "ctx", Path::new("/tmp"));
+        assert_eq!(p1, p2);
     }
 }

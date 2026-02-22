@@ -4,7 +4,7 @@
 //! backends for PR monitoring and review watching.
 
 use crate::error::Result;
-use crate::storage::{FixAttemptTracker, SqliteTracker};
+use crate::storage::FixAttemptTracker;
 use crate::types::{ActivityLogEntry, FixAttempt, IssueType, PrReviewRecord, RegressionWatch};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -490,10 +490,10 @@ pub struct PrMonitor {
     provider: Arc<dyn ScmProvider>,
     tracker: Arc<dyn FixAttemptTracker>,
     auto_resolve: bool,
-    /// Optional SQLite tracker for regression watching.
+    /// Optional tracker for regression watching.
     /// When set, merged PRs for bug issues will create regression watches
     /// instead of auto-resolving.
-    regression_tracker: Option<Arc<SqliteTracker>>,
+    regression_tracker: Option<Arc<dyn FixAttemptTracker>>,
 }
 
 impl PrMonitor {
@@ -516,7 +516,7 @@ impl PrMonitor {
         provider: Arc<dyn ScmProvider>,
         tracker: Arc<dyn FixAttemptTracker>,
         auto_resolve: bool,
-        regression_tracker: Arc<SqliteTracker>,
+        regression_tracker: Arc<dyn FixAttemptTracker>,
     ) -> Self {
         Self {
             provider,
@@ -2217,10 +2217,6 @@ mod tests {
         }
 
         impl FixAttemptTracker for MockFixAttemptTracker {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-
             fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
                 Ok(false)
             }
@@ -3947,9 +3943,6 @@ mod tests {
         struct MockTracker;
 
         impl FixAttemptTracker for MockTracker {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
             fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
                 Ok(false)
             }
@@ -4631,9 +4624,6 @@ mod tests {
         }
 
         impl FixAttemptTracker for MockFixAttemptTracker {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
             fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
                 Ok(false)
             }
@@ -5230,9 +5220,6 @@ mod tests {
         }
 
         impl FixAttemptTracker for MockTrackerWithRecording {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
             fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
                 Ok(false)
             }

@@ -128,9 +128,6 @@ mod tests {
 
     // Minimal FixAttemptTracker impl for testing
     impl FixAttemptTracker for MockTracker {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
         fn has_attempted(&self, _: &str, _: &str) -> Result<bool> {
             Ok(false)
         }

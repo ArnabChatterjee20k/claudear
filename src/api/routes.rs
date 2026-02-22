@@ -448,7 +448,7 @@ async fn attempt_detail_handler(
 async fn sources_handler(_user: AuthUser, State(state): State<ApiState>) -> Json<SourcesResponse> {
     let mut sources = Vec::new();
 
-    if let Some(ref linear) = state.config.linear {
+    if let Some(linear) = state.config.linear() {
         sources.push(SourceInfo {
             name: "linear".to_string(),
             enabled: linear.enabled,
@@ -460,7 +460,7 @@ async fn sources_handler(_user: AuthUser, State(state): State<ApiState>) -> Json
         });
     }
 
-    if let Some(ref sentry) = state.config.sentry {
+    if let Some(ref sentry) = state.config.issues.sentry {
         sources.push(SourceInfo {
             name: "sentry".to_string(),
             enabled: sentry.enabled,
@@ -473,24 +473,24 @@ async fn sources_handler(_user: AuthUser, State(state): State<ApiState>) -> Json
         });
     }
 
-    if state.config.whatsapp.source_enabled {
+    if state.config.notifiers.whatsapp.source_enabled {
         sources.push(SourceInfo {
             name: "whatsapp".to_string(),
             enabled: true,
             config: serde_json::json!({
-                "has_access_token": state.config.whatsapp.access_token.is_some(),
-                "has_phone_number_id": state.config.whatsapp.phone_number_id.is_some(),
+                "has_access_token": state.config.notifiers.whatsapp.access_token.is_some(),
+                "has_phone_number_id": state.config.notifiers.whatsapp.phone_number_id.is_some(),
             }),
         });
     }
 
-    if state.config.telegram.source_enabled {
+    if state.config.notifiers.telegram.source_enabled {
         sources.push(SourceInfo {
             name: "telegram".to_string(),
             enabled: true,
             config: serde_json::json!({
-                "has_bot_token": state.config.telegram.bot_token.is_some(),
-                "chat_id": state.config.telegram.chat_id.is_some(),
+                "has_bot_token": state.config.notifiers.telegram.bot_token.is_some(),
+                "chat_id": state.config.notifiers.telegram.chat_id.is_some(),
             }),
         });
     }
@@ -2359,9 +2359,8 @@ async fn put_config_handler(
 mod tests {
     use super::*;
     use crate::config::{
-        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, DiscordConfig, EmailConfig,
-        GitHubAppConfig, GitHubConfig, LearningConfig, PrioritisationConfig, PushConfig,
-        RegressionConfig, RetryConfig, SlackConfig, SmsConfig,
+        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, IssuesConfig, LearningConfig,
+        NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig, ScmConfig,
     };
     use crate::secret::SecretValue;
     use crate::storage::{IndexingProgress, SqliteTracker};
@@ -2386,19 +2385,11 @@ mod tests {
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
             agent: AgentConfig::default(),
-            discord: DiscordConfig::default(),
-            slack: SlackConfig::default(),
-            email: EmailConfig::default(),
-            sms: SmsConfig::default(),
-            push: PushConfig::default(),
+            scm: ScmConfig::default(),
+            issues: IssuesConfig::default(),
+            notifiers: NotifiersConfig::default(),
             ask: AskConfig::default(),
-            github: GitHubConfig::default(),
-            github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),
-            linear: None,
-            sentry: None,
-            jira: None,
-            gitlab: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
@@ -2408,6 +2399,7 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            tenant_id: None,
         }
     }
 
@@ -5123,7 +5115,7 @@ mod tests {
     async fn test_sources_with_linear_configured() {
         let tracker = create_test_tracker();
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig {
+        config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
             trigger_labels: vec!["autofix".to_string()],
             trigger_states: vec!["Triage".to_string()],
@@ -5165,7 +5157,7 @@ mod tests {
     async fn test_sources_with_sentry_configured() {
         let tracker = create_test_tracker();
         let mut config = test_config();
-        config.sentry = Some(crate::config::SentryConfig {
+        config.issues.sentry = Some(crate::config::SentryConfig {
             enabled: true,
             org_slug: "my-org".to_string(),
             project_slugs: vec!["proj-1".to_string()],
@@ -5208,8 +5200,8 @@ mod tests {
     async fn test_sources_with_both_linear_and_sentry() {
         let tracker = create_test_tracker();
         let mut config = test_config();
-        config.linear = Some(crate::config::LinearConfig::default());
-        config.sentry = Some(crate::config::SentryConfig::default());
+        config.issues.linear = Some(crate::config::LinearConfig::default());
+        config.issues.sentry = Some(crate::config::SentryConfig::default());
 
         let password_hash = bcrypt::hash("testpass", 4).unwrap();
         tracker
@@ -6045,7 +6037,7 @@ mod tests {
         // Build a valid config TOML (must pass validate(), which requires a source
         // with a non-empty API key)
         let mut valid_config = test_config();
-        valid_config.linear = Some(crate::config::LinearConfig {
+        valid_config.issues.linear = Some(crate::config::LinearConfig {
             api_key: SecretValue::new("lin_api_test_key_123"),
             ..crate::config::LinearConfig::default()
         });

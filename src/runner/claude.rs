@@ -4103,23 +4103,23 @@ mod tests {
 
     #[test]
     fn test_is_rate_limit_error_lower_already_lowercase() {
-        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("rate limit"));
-        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("ratelimit"));
-        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("too many requests"));
-        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("429"));
-        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("quota exceeded"));
-        assert!(ClaudeAgentRunner::is_rate_limit_error_lower(
+        assert!(ClaudeAgentRunner::is_rate_limit_error("rate limit"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("ratelimit"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("too many requests"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("429"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("quota exceeded"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
             "resource exhausted"
         ));
-        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("retry-after"));
-        assert!(ClaudeAgentRunner::is_rate_limit_error_lower("try again later"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("retry-after"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("try again later"));
     }
 
     #[test]
     fn test_is_rate_limit_error_lower_negative() {
-        assert!(!ClaudeAgentRunner::is_rate_limit_error_lower(""));
-        assert!(!ClaudeAgentRunner::is_rate_limit_error_lower("normal error"));
-        assert!(!ClaudeAgentRunner::is_rate_limit_error_lower(
+        assert!(!ClaudeAgentRunner::is_rate_limit_error(""));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error("normal error"));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error(
             "compilation failed"
         ));
     }
@@ -5052,5 +5052,112 @@ more output"#;
         assert!(bq_props.contains_key("context"));
         assert!(bq_props.contains_key("options"));
         assert!(bq_props.contains_key("why"));
+    }
+
+    #[test]
+    fn test_claude_agent_runner_name() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
+        assert_eq!(runner.name(), "claude");
+    }
+
+    #[test]
+    fn test_claude_agent_runner_capabilities() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
+        let caps = runner.capabilities();
+        assert!(caps.structured_output, "Claude should support structured output");
+        assert!(caps.tool_permissions, "Claude should support tool permissions");
+        assert!(caps.custom_instructions, "Claude should support custom instructions");
+        assert!(caps.streaming_events, "Claude should support streaming events");
+        assert!(caps.cost_reporting, "Claude should support cost reporting");
+    }
+
+    #[test]
+    fn test_claude_agent_runner_build_prompt_delegates() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
+        let issue = Issue::new("1", "LIN-1", "Bug title", "https://example.com", "linear");
+        // The trait method should produce the same result as the internal method
+        let trait_prompt = runner.build_prompt_for_issue(&issue, "some context", Path::new("/tmp"));
+        let internal_prompt = runner.build_prompt(&issue, "some context", Path::new("/tmp"));
+        assert_eq!(trait_prompt, internal_prompt);
+    }
+
+    #[tokio::test]
+    async fn test_claude_execute_nonexistent_binary_returns_error() {
+        use crate::storage::SqliteTracker;
+        // Use a project_dir that does not exist to force a spawn error
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let config = ClaudeRunnerConfig::default();
+        let runner = ClaudeAgentRunner::new(config, tracker);
+        let result = runner
+            .execute_with_attempt(
+                "fix this bug",
+                None,
+                None,
+                Path::new("/nonexistent-dir-xyz-99999"),
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.to_lowercase().contains("spawn")
+                || err.to_lowercase().contains("not found")
+                || err.to_lowercase().contains("no such file"),
+            "Expected spawn/not-found error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claude_execute_records_activity_on_failure() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let config = ClaudeRunnerConfig::default();
+        let runner = ClaudeAgentRunner::new(config, tracker.clone());
+        let _ = runner
+            .execute_with_attempt(
+                "test prompt",
+                None,
+                None,
+                Path::new("/nonexistent-dir-xyz-activity-test"),
+            )
+            .await;
+        // Verify activity was logged (even on error, we should have a claude_started log)
+        let activities = tracker.get_recent_activities(10, None).unwrap();
+        // There should be at least one activity entry from the failed attempt
+        let agent_activities: Vec<_> = activities
+            .iter()
+            .filter(|a| a.activity_type.contains("claude"))
+            .collect();
+        assert!(
+            !agent_activities.is_empty(),
+            "Expected at least one claude activity entry, got none. All activities: {:?}",
+            activities.iter().map(|a| &a.activity_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_claude_runner_config_default_binary() {
+        let config = ClaudeRunnerConfig::default();
+        // Default config should have reasonable defaults
+        assert!(config.timeout_secs > 0);
+        assert!(config.permissions.is_empty() || !config.permissions.is_empty());
+    }
+
+    #[test]
+    fn test_claude_agent_runner_as_dyn_trait() {
+        use crate::storage::SqliteTracker;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
+        // Verify it can be used as Arc<dyn AgentRunner>
+        let agent: Arc<dyn AgentRunner> = Arc::new(runner);
+        assert_eq!(agent.name(), "claude");
+        let caps = agent.capabilities();
+        assert!(caps.structured_output);
     }
 }

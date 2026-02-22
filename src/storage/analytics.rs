@@ -9,7 +9,7 @@ use crate::types::{AnalyticsSummary, ErrorPattern, ProcessingMetric};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 
-use super::SqliteTracker;
+use super::FixAttemptTracker;
 
 /// Time period for trend analysis.
 #[derive(Debug, Clone, Copy)]
@@ -98,12 +98,12 @@ impl TrendAnalysis {
 
 /// Analytics service for querying and analyzing operational data.
 pub struct AnalyticsService<'a> {
-    tracker: &'a SqliteTracker,
+    tracker: &'a dyn FixAttemptTracker,
 }
 
 impl<'a> AnalyticsService<'a> {
     /// Create a new analytics service.
-    pub fn new(tracker: &'a SqliteTracker) -> Self {
+    pub fn new(tracker: &'a dyn FixAttemptTracker) -> Self {
         Self { tracker }
     }
 
@@ -222,7 +222,7 @@ impl<'a> AnalyticsService<'a> {
 
     /// Calculate throughput (issues processed per hour) over a time period.
     pub fn calculate_throughput(&self, period: TimePeriod) -> Result<f64> {
-        let activities = self.tracker.get_recent_activities(10000, None)?;
+        let activities = self.tracker.get_recent_activities(10000)?;
 
         let start_time = period.start_time();
         let processing_count = activities
@@ -244,7 +244,7 @@ impl<'a> AnalyticsService<'a> {
 
     /// Get error rate (errors per total processing) over a time period.
     pub fn calculate_error_rate(&self, period: TimePeriod) -> Result<f64> {
-        let activities = self.tracker.get_recent_activities(10000, None)?;
+        let activities = self.tracker.get_recent_activities(10000)?;
         let start_time = period.start_time();
 
         let total = activities
@@ -332,6 +332,7 @@ pub fn classify_error(error_message: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::SqliteTracker;
 
     #[test]
     fn test_time_period_duration() {

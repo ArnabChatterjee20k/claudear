@@ -2,7 +2,10 @@
 
 pub mod analytics;
 #[cfg(feature = "sqlite")]
+pub(crate) mod migrator;
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod tenant;
 pub mod types;
 #[cfg(feature = "sqlite")]
 pub mod vectorlite;
@@ -30,12 +33,43 @@ use crate::types::{
 };
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+/// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
+const MAX_PR_URL_LENGTH: usize = 2048;
+
+/// Compiled regex for parsing GitHub PR URLs into repo/PR number.
+static PR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+    regex_lite::Regex::new(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
+        .expect("PR URL regex should be valid")
+});
+
+/// Compiled regex for parsing GitLab MR URLs.
+static MR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+    regex_lite::Regex::new(r"https?://[^/]+/(.+?)/-/merge_requests/(\d+)")
+        .expect("MR URL regex should be valid")
+});
+
+/// Parse a GitHub PR or GitLab MR URL into `(repo, number)`.
+pub fn parse_pr_url(url: &str) -> Option<(String, i64)> {
+    if url.len() > MAX_PR_URL_LENGTH {
+        return None;
+    }
+    if let Some(caps) = PR_URL_REGEX.captures(url) {
+        let repo = caps.get(1)?.as_str().to_string();
+        let pr_number: i64 = caps.get(2)?.as_str().parse().ok()?;
+        return Some((repo, pr_number));
+    }
+    if let Some(caps) = MR_URL_REGEX.captures(url) {
+        let project = caps.get(1)?.as_str().to_string();
+        let mr_iid: i64 = caps.get(2)?.as_str().parse().ok()?;
+        return Some((project, mr_iid));
+    }
+    None
+}
 
 /// Trait for tracking fix attempts.
 pub trait FixAttemptTracker: Send + Sync {
-    /// Downcast to concrete type for auth operations.
-    fn as_any(&self) -> &dyn std::any::Any;
-
     /// Check if an issue has already been attempted.
     fn has_attempted(&self, source: &str, issue_id: &str) -> Result<bool>;
 
@@ -847,6 +881,16 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(())
     }
 
+    /// Get a regression watch by ID.
+    fn get_regression_watch(&self, _id: i64) -> Result<Option<RegressionWatch>> {
+        Ok(None)
+    }
+
+    /// Record a regression check. Returns the check ID.
+    fn record_regression_check(&self, _check: &RegressionCheck) -> Result<i64> {
+        Ok(0)
+    }
+
     // --- PR Review State ---
 
     /// Save a PR review state.
@@ -1106,6 +1150,90 @@ pub trait FixAttemptTracker: Send + Sync {
     fn get_indexed_repo(&self, _name: &str) -> Result<Option<StoredIndexedRepo>> {
         Ok(None)
     }
+
+    // --- Analytics ---
+
+    /// Get the overall success rate (0.0-1.0).
+    fn get_success_rate(&self) -> Result<f64> {
+        Ok(0.0)
+    }
+
+    // --- Code Indexing ---
+
+    /// Get or create a repository ID by name.
+    fn get_or_create_repo_id(&self, _name: &str) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Check if a file's content hash matches what's already indexed.
+    fn code_chunk_hash_matches(
+        &self,
+        _repo_id: i64,
+        _file_path: &str,
+        _file_hash: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Delete all code symbols, chunks, and embeddings for a specific file.
+    fn delete_code_data_for_file(&self, _repo_id: i64, _file_path: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete code chunks by IDs.
+    fn delete_code_chunks_by_ids(&self, _chunk_ids: &[i64]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove code data for files that no longer exist in the repository.
+    fn cleanup_stale_code_data(&self, _repo_id: i64, _current_paths: &[String]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Batch-save extracted code symbols.
+    fn save_code_symbols(
+        &self,
+        _symbols: &[crate::repo::code_index::CodeSymbol],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Batch-save code chunks. Returns the assigned IDs.
+    fn save_code_chunks(
+        &self,
+        _chunks: &[crate::repo::code_index::CodeChunk],
+    ) -> Result<Vec<i64>> {
+        Ok(Vec::new())
+    }
+
+    /// Save embeddings for code chunks.
+    fn save_code_chunk_embeddings(
+        &self,
+        _pairs: &[(i64, &[f32])],
+        _model_name: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Search code chunks by vector similarity.
+    fn search_code_chunks(
+        &self,
+        _query_embedding: &[f32],
+        _repo_id: Option<i64>,
+        _limit: usize,
+    ) -> Result<Vec<crate::repo::code_index::CodeSearchResult>> {
+        Ok(Vec::new())
+    }
+
+    /// Find code symbols by name substring.
+    fn find_code_symbols(
+        &self,
+        _name: &str,
+        _kind: Option<crate::repo::code_index::SymbolKind>,
+        _repo_id: Option<i64>,
+    ) -> Result<Vec<crate::repo::code_index::CodeSymbol>> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]
@@ -1117,9 +1245,6 @@ mod tests {
     struct NoOpTracker;
 
     impl FixAttemptTracker for NoOpTracker {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
         fn has_attempted(&self, _: &str, _: &str) -> Result<bool> {
             Ok(false)
         }

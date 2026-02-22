@@ -4933,4 +4933,243 @@ mod tests {
             err
         );
     }
+
+    #[test]
+    fn test_agent_execution_new_has_none_provider_fields() {
+        let exec = AgentExecution::new();
+        assert!(exec.provider.is_none());
+        assert!(exec.experiment_name.is_none());
+        assert!(exec.experiment_variant.is_none());
+    }
+
+    #[test]
+    fn test_agent_execution_provider_field() {
+        let mut exec = AgentExecution::new();
+        exec.provider = Some("codex".to_string());
+        assert_eq!(exec.provider.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn test_agent_execution_experiment_fields() {
+        let mut exec = AgentExecution::new();
+        exec.experiment_name = Some("claude-vs-codex".to_string());
+        exec.experiment_variant = Some("claude".to_string());
+        assert_eq!(exec.experiment_name.as_deref(), Some("claude-vs-codex"));
+        assert_eq!(exec.experiment_variant.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn test_agent_execution_serialization_with_provider() {
+        let mut exec = AgentExecution::new();
+        exec.provider = Some("claude".to_string());
+        exec.experiment_name = Some("test-exp".to_string());
+        let json = serde_json::to_string(&exec).unwrap();
+        assert!(json.contains("\"provider\":\"claude\""));
+        assert!(json.contains("\"experiment_name\":\"test-exp\""));
+    }
+
+    #[test]
+    fn test_agent_execution_serialization_skips_none_provider() {
+        let exec = AgentExecution::new();
+        let json = serde_json::to_string(&exec).unwrap();
+        // skip_serializing_if = "Option::is_none" should omit these
+        assert!(!json.contains("\"provider\""));
+        assert!(!json.contains("\"experiment_name\""));
+        assert!(!json.contains("\"experiment_variant\""));
+    }
+
+    #[test]
+    fn test_experiment_provider_stats_serialization() {
+        let stats = ExperimentProviderStats {
+            provider: "claude".to_string(),
+            total_attempts: 100,
+            success_count: 85,
+            avg_cost: Some(0.42),
+            avg_duration: Some(120.5),
+            success_rate: 0.85,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        assert!(json.contains("\"provider\":\"claude\""));
+        assert!(json.contains("\"total_attempts\":100"));
+        assert!(json.contains("\"success_count\":85"));
+        assert!(json.contains("\"success_rate\":0.85"));
+    }
+
+    #[test]
+    fn test_experiment_provider_stats_deserialization() {
+        let json = r#"{
+            "provider": "codex",
+            "total_attempts": 50,
+            "success_count": 30,
+            "avg_cost": null,
+            "avg_duration": 90.0,
+            "success_rate": 0.6
+        }"#;
+        let stats: ExperimentProviderStats = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.provider, "codex");
+        assert_eq!(stats.total_attempts, 50);
+        assert_eq!(stats.success_count, 30);
+        assert!(stats.avg_cost.is_none());
+        assert_eq!(stats.avg_duration, Some(90.0));
+        assert!((stats.success_rate - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_experiment_provider_stats_zero_values() {
+        let stats = ExperimentProviderStats {
+            provider: "gemini".to_string(),
+            total_attempts: 0,
+            success_count: 0,
+            avg_cost: None,
+            avg_duration: None,
+            success_rate: 0.0,
+        };
+        assert_eq!(stats.total_attempts, 0);
+        assert_eq!(stats.success_count, 0);
+        assert!(stats.avg_cost.is_none());
+        assert_eq!(stats.success_rate, 0.0);
+    }
+
+    // --- AgentExecution provider/experiment field tests ---
+
+    #[test]
+    fn test_agent_execution_new_has_no_provider() {
+        let exec = AgentExecution::new();
+        assert!(exec.provider.is_none());
+        assert!(exec.experiment_name.is_none());
+        assert!(exec.experiment_variant.is_none());
+    }
+
+    #[test]
+    fn test_agent_execution_complete_sets_duration() {
+        let mut exec = AgentExecution::new();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        exec.complete(Some(0), false);
+        assert!(exec.completed_at.is_some());
+        assert!(exec.duration_secs.unwrap() >= 0.0);
+        assert_eq!(exec.exit_code, Some(0));
+        assert!(!exec.timed_out);
+    }
+
+    #[test]
+    fn test_agent_execution_complete_timed_out() {
+        let mut exec = AgentExecution::new();
+        exec.complete(None, true);
+        assert!(exec.timed_out);
+        assert!(exec.exit_code.is_none());
+    }
+
+    #[test]
+    fn test_agent_execution_with_attempt_id_builder() {
+        let exec = AgentExecution::new().with_attempt_id(42);
+        assert_eq!(exec.attempt_id, Some(42));
+    }
+
+    #[test]
+    fn test_agent_execution_default_equals_new() {
+        let a = AgentExecution::new();
+        let b = AgentExecution::default();
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.provider, b.provider);
+        assert_eq!(a.timed_out, b.timed_out);
+    }
+
+    #[test]
+    fn test_agent_execution_serialization_skips_none_fields() {
+        let exec = AgentExecution::new();
+        let json = serde_json::to_string(&exec).unwrap();
+        // None fields should be skipped
+        assert!(!json.contains("\"provider\""));
+        assert!(!json.contains("\"experiment_name\""));
+        assert!(!json.contains("\"experiment_variant\""));
+        assert!(!json.contains("\"stdout_preview\""));
+    }
+
+    // --- AgentResult serialization tests ---
+
+    #[test]
+    fn test_agent_result_success_serialization() {
+        let result = AgentResult {
+            success: true,
+            output: "Done".to_string(),
+            pr_url: Some("https://github.com/org/repo/pull/1".to_string()),
+            changelog: Some("- Fixed bug".to_string()),
+            error: None,
+            blocking_question: None,
+            used_qa_ids: vec![1, 2, 3],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"pr_url\""));
+        assert!(!json.contains("\"error\""));
+        assert!(!json.contains("\"blocking_question\""));
+    }
+
+    #[test]
+    fn test_agent_result_failure_serialization() {
+        let result = AgentResult {
+            success: false,
+            output: String::new(),
+            pr_url: None,
+            changelog: None,
+            error: Some("Process exited with code 1".to_string()),
+            blocking_question: None,
+            used_qa_ids: Vec::new(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"success\":false"));
+        assert!(json.contains("\"error\""));
+        assert!(!json.contains("\"pr_url\""));
+    }
+
+    #[test]
+    fn test_agent_result_with_blocking_question() {
+        let result = AgentResult {
+            success: false,
+            output: String::new(),
+            pr_url: None,
+            changelog: None,
+            error: None,
+            blocking_question: Some(BlockingQuestion {
+                question: "Which database?".to_string(),
+                context: Some("Multiple DBs found".to_string()),
+                options: vec!["postgres".to_string(), "mysql".to_string()],
+                why: Some("Need to know which DB to fix".to_string()),
+            }),
+            used_qa_ids: Vec::new(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: AgentResult = serde_json::from_str(&json).unwrap();
+        assert!(deser.blocking_question.is_some());
+        let bq = deser.blocking_question.unwrap();
+        assert_eq!(bq.question, "Which database?");
+        assert_eq!(bq.options.len(), 2);
+    }
+
+    #[test]
+    fn test_agent_result_roundtrip() {
+        let original = AgentResult {
+            success: true,
+            output: "Fixed the bug".to_string(),
+            pr_url: Some("https://github.com/a/b/pull/99".to_string()),
+            changelog: Some("- Updated handler\n- Added test".to_string()),
+            error: None,
+            blocking_question: None,
+            used_qa_ids: vec![5, 10],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let deser: AgentResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.success, original.success);
+        assert_eq!(deser.output, original.output);
+        assert_eq!(deser.pr_url, original.pr_url);
+        assert_eq!(deser.changelog, original.changelog);
+        assert_eq!(deser.used_qa_ids, original.used_qa_ids);
+    }
+
+    #[test]
+    fn test_agent_result_empty_used_qa_ids_default() {
+        let json = r#"{"success":true,"output":"ok"}"#;
+        let result: AgentResult = serde_json::from_str(json).unwrap();
+        assert!(result.used_qa_ids.is_empty());
+    }
 }

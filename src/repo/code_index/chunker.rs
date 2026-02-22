@@ -1000,7 +1000,7 @@ pub fn gamma(z: i32) -> i32 {
     result + 2
 }
 "#;
-        let (symbols, chunks) = chunk_file(src, Language::Rust, 1, "multi.rs", "mh").unwrap();
+        let (_symbols, chunks) = chunk_file(src, Language::Rust, 1, "multi.rs", "mh").unwrap();
 
         let fn_names: Vec<_> = chunks
             .iter()

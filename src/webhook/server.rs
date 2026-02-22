@@ -16,10 +16,10 @@ use crate::qa::{
 use crate::repo::{worktree_path, GitOps};
 use crate::runner::{self, AgentRunner};
 use crate::scm::{PrReviewState, ReviewWatcher};
-use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
+use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker};
 use crate::types::{
-    validate_issue_id, ActivityLogEntry, AskRequest, ErrorPattern, Issue, IssueEmbedding,
-    ProcessingMetric, QaKnowledgeEntry,
+    validate_issue_id, ActivityLogEntry, AgentExecution, AskRequest, ErrorPattern, Issue,
+    IssueEmbedding, ProcessingMetric, QaKnowledgeEntry,
 };
 use crate::users::UserRegistry;
 use axum::{
@@ -51,7 +51,7 @@ struct AppState {
     handlers: WebhookHandlerRegistry,
     notifier: Arc<dyn Notifier>,
     tracker: Arc<dyn FixAttemptTracker>,
-    sqlite_tracker: Option<Arc<SqliteTracker>>,
+    sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
     inferrer: Option<RepoInferrer>,
     embedding_client: Option<crate::feedback::EmbeddingClient>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
@@ -72,7 +72,7 @@ pub struct WebhookServer {
     handlers: WebhookHandlerRegistry,
     notifier: Arc<dyn Notifier>,
     tracker: Arc<dyn FixAttemptTracker>,
-    sqlite_tracker: Option<Arc<SqliteTracker>>,
+    sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
     inferrer: Option<RepoInferrer>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     review_watcher: Option<Arc<ReviewWatcher>>,
@@ -88,7 +88,7 @@ impl WebhookServer {
         handlers: WebhookHandlerRegistry,
         notifier: Arc<dyn Notifier>,
         tracker: Arc<dyn FixAttemptTracker>,
-        sqlite_tracker: Option<Arc<SqliteTracker>>,
+        sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
         inferrer: Option<RepoInferrer>,
         agent: Arc<dyn AgentRunner>,
     ) -> Self {
@@ -110,7 +110,7 @@ impl WebhookServer {
         handlers: WebhookHandlerRegistry,
         notifier: Arc<dyn Notifier>,
         tracker: Arc<dyn FixAttemptTracker>,
-        sqlite_tracker: Option<Arc<SqliteTracker>>,
+        sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
         inferrer: Option<RepoInferrer>,
         github_handler: Option<GitHubWebhookHandler>,
         agent: Arc<dyn AgentRunner>,
@@ -1238,7 +1238,7 @@ async fn process_issue(
                 // Register PR for review watching (actual Merged outcome is
                 // recorded later when the review loop detects the merge)
                 if let Some(ref review_watcher) = state.review_watcher {
-                    if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(&pr_url) {
+                    if let Some((repo, pr_number)) = crate::storage::parse_pr_url(&pr_url) {
                         let pr_state = PrReviewState::new(
                             &pr_url,
                             &repo,
@@ -1412,7 +1412,7 @@ async fn record_feedback_outcome_from_attempt(
         .sqlite_tracker
         .as_ref()
         .and_then(|t| t.get_executions_for_attempt(attempt.id).ok())
-        .and_then(|execs| execs.into_iter().next())
+        .and_then(|execs: Vec<AgentExecution>| execs.into_iter().next())
         .and_then(|exec| exec.prompt_used)
         .unwrap_or_default();
 
@@ -1574,9 +1574,8 @@ fn record_error_pattern(state: &AppState, source: &str, issue_id: &str, error_ms
 mod tests {
     use super::*;
     use crate::config::{
-        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, DiscordConfig, EmailConfig,
-        GitHubAppConfig, GitHubConfig, LearningConfig, PrioritisationConfig, PushConfig,
-        RegressionConfig, RetryConfig, SlackConfig, SmsConfig,
+        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, IssuesConfig, LearningConfig,
+        NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig, ScmConfig,
     };
     use crate::notifier::Notifier;
     use crate::reports::Report;
@@ -1696,19 +1695,11 @@ mod tests {
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
             agent: AgentConfig::default(),
-            discord: DiscordConfig::default(),
-            slack: SlackConfig::default(),
-            email: EmailConfig::default(),
-            sms: SmsConfig::default(),
-            push: PushConfig::default(),
+            scm: ScmConfig::default(),
+            issues: IssuesConfig::default(),
+            notifiers: NotifiersConfig::default(),
             ask: AskConfig::default(),
-            github: GitHubConfig::default(),
-            github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),
-            linear: None,
-            sentry: None,
-            jira: None,
-            gitlab: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
@@ -1718,6 +1709,7 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            tenant_id: None,
         }
     }
 
@@ -2898,8 +2890,8 @@ mod tests {
 
     fn make_app_state(
         handlers: WebhookHandlerRegistry,
-        tracker: Arc<SqliteTracker>,
-        sqlite_tracker: Option<Arc<SqliteTracker>>,
+        tracker: Arc<dyn FixAttemptTracker>,
+        sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
     ) -> Arc<AppState> {
         let config = test_config();
         Arc::new(AppState {
@@ -2926,7 +2918,7 @@ mod tests {
 
     fn make_app_state_with_processing(
         handlers: WebhookHandlerRegistry,
-        tracker: Arc<SqliteTracker>,
+        tracker: Arc<dyn FixAttemptTracker>,
         processing: HashMap<String, Instant>,
     ) -> Arc<AppState> {
         let config = test_config();
@@ -2954,7 +2946,7 @@ mod tests {
 
     fn make_app_state_with_github(
         github_handler: Option<GitHubWebhookHandler>,
-        tracker: Arc<SqliteTracker>,
+        tracker: Arc<dyn FixAttemptTracker>,
     ) -> Arc<AppState> {
         let config = test_config();
         Arc::new(AppState {

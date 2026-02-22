@@ -824,11 +824,11 @@ mod tests {
     use super::*;
     use crate::api::routes::create_api_router;
     use crate::config::{
-        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, Config, DiscordConfig,
-        EmailConfig, GitHubAppConfig, GitHubConfig, LearningConfig, PrioritisationConfig,
-        PushConfig, RegressionConfig, RetryConfig, SlackConfig, SmsConfig,
+        AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, Config, IssuesConfig,
+        LearningConfig, NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig,
+        ScmConfig,
     };
-    use crate::storage::{FixAttemptTracker, SqliteTracker};
+    use crate::storage::SqliteTracker;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -850,19 +850,11 @@ mod tests {
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
             agent: AgentConfig::default(),
-            discord: DiscordConfig::default(),
-            slack: SlackConfig::default(),
-            email: EmailConfig::default(),
-            sms: SmsConfig::default(),
-            push: PushConfig::default(),
+            scm: ScmConfig::default(),
+            issues: IssuesConfig::default(),
+            notifiers: NotifiersConfig::default(),
             ask: AskConfig::default(),
-            github: GitHubConfig::default(),
-            github_app: GitHubAppConfig::default(),
             retry: RetryConfig::default(),
-            linear: None,
-            sentry: None,
-            jira: None,
-            gitlab: None,
             regression: RegressionConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
@@ -872,6 +864,7 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            tenant_id: None,
         }
     }
 

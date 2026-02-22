@@ -25,8 +25,8 @@ pub struct ReleaseTrackerConfig {
     pub target_repos: Vec<String>,
     /// How often to poll for new releases (in milliseconds).
     pub poll_interval_ms: u64,
-    /// Package name overrides (repo name -> package name).
-    pub package_names: HashMap<String, String>,
+    /// Package name overrides (repo name -> package names).
+    pub package_names: HashMap<String, Vec<String>>,
 }
 
 /// Tracks releases to detect when bug fixes are included in production.
@@ -315,51 +315,65 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
         // Infer verification method from dependency type
         let verified = match dep_type {
             DependencyType::Composer => {
-                // Get package name (use override or default to repo name)
-                let package_name = self
+                // Get package names (use overrides or default to repo name)
+                let package_names = self
                     .config
                     .package_names
                     .get(fix_repo)
                     .cloned()
-                    .unwrap_or_else(|| fix_repo.to_string());
+                    .unwrap_or_else(|| vec![fix_repo.to_string()]);
 
-                self.verify_lock_file(
-                    watch,
-                    fix_repo,
-                    merged_at,
-                    target_repo,
-                    &target_release.tag_name,
-                    &package_name,
-                    "composer.lock",
-                )
-                .await?
+                let mut verified = false;
+                for package_name in &package_names {
+                    if self.verify_lock_file(
+                        watch,
+                        fix_repo,
+                        merged_at,
+                        target_repo,
+                        &target_release.tag_name,
+                        package_name,
+                        "composer.lock",
+                    )
+                    .await? {
+                        verified = true;
+                        break;
+                    }
+                }
+                verified
             }
             DependencyType::Npm => {
-                // Get package name (use override or extract from repo name)
-                let package_name = self
+                // Get package names (use overrides or extract from repo name)
+                let package_names = self
                     .config
                     .package_names
                     .get(fix_repo)
                     .cloned()
                     .unwrap_or_else(|| {
                         // npm packages typically use just the repo name part
-                        fix_repo
+                        vec![fix_repo
                             .split('/')
                             .next_back()
                             .unwrap_or(fix_repo)
-                            .to_string()
+                            .to_string()]
                     });
 
-                self.verify_lock_file(
-                    watch,
-                    fix_repo,
-                    merged_at,
-                    target_repo,
-                    &target_release.tag_name,
-                    &package_name,
-                    "package-lock.json",
-                )
-                .await?
+                let mut verified = false;
+                for package_name in &package_names {
+                    if self.verify_lock_file(
+                        watch,
+                        fix_repo,
+                        merged_at,
+                        target_repo,
+                        &target_release.tag_name,
+                        package_name,
+                        "package-lock.json",
+                    )
+                    .await? {
+                        verified = true;
+                        break;
+                    }
+                }
+                verified
             }
             DependencyType::GitSubmodule => {
                 self.verify_commit_ancestry(
@@ -765,7 +779,7 @@ mod tests {
         let mut package_names = HashMap::new();
         package_names.insert(
             "utopia-database".to_string(),
-            "utopia-php/database".to_string(),
+            vec!["utopia-php/database".to_string()],
         );
 
         let config = ReleaseTrackerConfig {
@@ -781,7 +795,7 @@ mod tests {
         assert_eq!(config.poll_interval_ms, 30_000);
         assert_eq!(
             config.package_names.get("utopia-database"),
-            Some(&"utopia-php/database".to_string())
+            Some(&vec!["utopia-php/database".to_string()])
         );
     }
 
@@ -1270,7 +1284,7 @@ mod tests {
     #[test]
     fn test_release_tracker_config_clone() {
         let mut package_names = HashMap::new();
-        package_names.insert("lib".to_string(), "pkg".to_string());
+        package_names.insert("lib".to_string(), vec!["pkg".to_string()]);
 
         let config = ReleaseTrackerConfig {
             target_repos: vec!["repo1".to_string()],
@@ -1319,7 +1333,7 @@ mod tests {
                 let mut m = HashMap::new();
                 m.insert(
                     "utopia-database".to_string(),
-                    "utopia-php/database".to_string(),
+                    vec!["utopia-php/database".to_string()],
                 );
                 m
             },
@@ -1329,7 +1343,7 @@ mod tests {
         assert_eq!(rt.config().poll_interval_ms, 60_000);
         assert_eq!(
             rt.config().package_names.get("utopia-database"),
-            Some(&"utopia-php/database".to_string())
+            Some(&vec!["utopia-php/database".to_string()])
         );
     }
 
@@ -1455,7 +1469,7 @@ mod tests {
                 let mut m = HashMap::new();
                 m.insert(
                     "utopia-php/database".to_string(),
-                    "utopia-php/database".to_string(),
+                    vec!["utopia-php/database".to_string()],
                 );
                 m
             },
@@ -1691,7 +1705,7 @@ mod tests {
         let config = ReleaseTrackerConfig {
             package_names: {
                 let mut m = HashMap::new();
-                m.insert("org/source".to_string(), "my-package".to_string());
+                m.insert("org/source".to_string(), vec!["my-package".to_string()]);
                 m
             },
             ..Default::default()
@@ -1843,7 +1857,7 @@ mod tests {
         let config = ReleaseTrackerConfig {
             package_names: {
                 let mut m = HashMap::new();
-                m.insert("org/source".to_string(), "@scope/custom-pkg".to_string());
+                m.insert("org/source".to_string(), vec!["@scope/custom-pkg".to_string()]);
                 m
             },
             ..Default::default()
@@ -3135,9 +3149,9 @@ mod tests {
     #[test]
     fn test_release_tracker_config_multiple_package_overrides() {
         let mut package_names = HashMap::new();
-        package_names.insert("repo-a".to_string(), "vendor-a/pkg-a".to_string());
-        package_names.insert("repo-b".to_string(), "vendor-b/pkg-b".to_string());
-        package_names.insert("repo-c".to_string(), "@scope/pkg-c".to_string());
+        package_names.insert("repo-a".to_string(), vec!["vendor-a/pkg-a".to_string()]);
+        package_names.insert("repo-b".to_string(), vec!["vendor-b/pkg-b".to_string()]);
+        package_names.insert("repo-c".to_string(), vec!["@scope/pkg-c".to_string()]);
 
         let config = ReleaseTrackerConfig {
             target_repos: vec!["target".to_string()],
@@ -3148,11 +3162,11 @@ mod tests {
         assert_eq!(config.package_names.len(), 3);
         assert_eq!(
             config.package_names.get("repo-a"),
-            Some(&"vendor-a/pkg-a".to_string())
+            Some(&vec!["vendor-a/pkg-a".to_string()])
         );
         assert_eq!(
             config.package_names.get("repo-c"),
-            Some(&"@scope/pkg-c".to_string())
+            Some(&vec!["@scope/pkg-c".to_string()])
         );
     }
 
@@ -3585,7 +3599,7 @@ mod tests {
         let config = ReleaseTrackerConfig {
             package_names: {
                 let mut m = HashMap::new();
-                m.insert("org/source".to_string(), "my-pkg".to_string());
+                m.insert("org/source".to_string(), vec!["my-pkg".to_string()]);
                 m
             },
             ..Default::default()
@@ -4699,7 +4713,7 @@ mod tests {
         let client = ReleaseClient::with_http_client("test-token", mock);
 
         let mut package_names = HashMap::new();
-        package_names.insert("a".to_string(), "b".to_string());
+        package_names.insert("a".to_string(), vec!["b".to_string()]);
 
         let config = ReleaseTrackerConfig {
             target_repos: vec!["x".to_string(), "y".to_string(), "z".to_string()],
@@ -4712,7 +4726,7 @@ mod tests {
         let config_ref = release_tracker.config();
         assert_eq!(config_ref.target_repos.len(), 3);
         assert_eq!(config_ref.poll_interval_ms, 42);
-        assert_eq!(config_ref.package_names.get("a"), Some(&"b".to_string()));
+        assert_eq!(config_ref.package_names.get("a"), Some(&vec!["b".to_string()]));
     }
 
     // --- verify_release_after: source release with very distant timestamps ---
@@ -4861,7 +4875,7 @@ mod tests {
     #[test]
     fn test_release_tracker_config_debug_format_with_values() {
         let mut package_names = HashMap::new();
-        package_names.insert("repo".to_string(), "pkg".to_string());
+        package_names.insert("repo".to_string(), vec!["pkg".to_string()]);
 
         let config = ReleaseTrackerConfig {
             target_repos: vec!["org/repo".to_string()],
@@ -4957,7 +4971,7 @@ mod tests {
             target_repos: vec!["vendor/app".to_string()],
             package_names: {
                 let mut m = HashMap::new();
-                m.insert("vendor/library".to_string(), "vendor/library".to_string());
+                m.insert("vendor/library".to_string(), vec!["vendor/library".to_string()]);
                 m
             },
             ..Default::default()
@@ -5061,7 +5075,7 @@ mod tests {
             target_repos: vec!["final/cloud".to_string()],
             package_names: {
                 let mut m = HashMap::new();
-                m.insert("base/lib".to_string(), "base/lib".to_string());
+                m.insert("base/lib".to_string(), vec!["base/lib".to_string()]);
                 m
             },
             ..Default::default()
@@ -5278,7 +5292,7 @@ mod tests {
             package_names: {
                 let mut m = HashMap::new();
                 // Map "org/source" to "custom/pkg-name" in composer.lock
-                m.insert("org/source".to_string(), "custom/pkg-name".to_string());
+                m.insert("org/source".to_string(), vec!["custom/pkg-name".to_string()]);
                 m
             },
             ..Default::default()

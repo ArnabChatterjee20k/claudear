@@ -18,7 +18,7 @@ use crate::retry::RetryManager;
 use crate::runner::{self, AgentRunner};
 use crate::scm::{PrReviewState, PrStatus, ReviewEvent, ReviewWatcher, ScmProvider};
 use crate::source::IssueSource;
-use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker, SqliteTracker};
+use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker};
 use crate::types::{
     ActivityLogEntry, AskRequest, ErrorPattern, FixAttemptStats, FixAttemptStatus, Issue,
     IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric, QaKnowledgeEntry,
@@ -215,7 +215,7 @@ impl Watcher {
             None, // gitlab_provider
             &[],  // gitlab_groups
             &config.work_dir,
-            config.github.use_ssh,
+            config.github().use_ssh,
         )
         .await?;
 
@@ -271,7 +271,7 @@ impl Watcher {
             None, // gitlab_provider
             &[],  // gitlab_groups
             &config.work_dir,
-            config.github.use_ssh,
+            config.github().use_ssh,
         )
         .await?;
 
@@ -1379,13 +1379,13 @@ Create a PR with your changes.{custom_instructions}"#,
                 );
 
                 // Update the cascade attempt with PR details
-                if let Some((repo, pr_num)) = SqliteTracker::parse_pr_url(pr_url) {
+                if let Some((repo, pr_num)) = crate::storage::parse_pr_url(pr_url) {
                     self.tracker.update_attempt_pr(attempt_id, pr_url, &repo, pr_num)?;
                 }
 
                 // Register for review watching — this enables recursive cascade
                 if let Some(ref review_watcher) = self.review_watcher {
-                    if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(pr_url) {
+                    if let Some((repo, pr_number)) = crate::storage::parse_pr_url(pr_url) {
                         let state = PrReviewState::new(
                             pr_url,
                             &repo,
@@ -2023,7 +2023,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
                     // Auto-resolve only when enabled and no regression watch is active.
                     let should_resolve =
-                        regression_watch_id.is_none() && self.config.github.auto_resolve_on_merge;
+                        regression_watch_id.is_none() && self.config.github().auto_resolve_on_merge;
                     if should_resolve {
                         if let Some(source) =
                             self.sources.iter().find(|s| s.name() == attempt.source)
@@ -3347,7 +3347,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     }
 
                     // Create or update prs table record
-                    if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(pr_url) {
+                    if let Some((repo, pr_number)) = crate::storage::parse_pr_url(pr_url) {
                         // Try to load existing record to preserve accumulated fields
                         let mut pr_record = if let Ok(Some(existing)) = self.tracker.get_pr(pr_url) {
                             existing
@@ -3404,7 +3404,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
                     // Register PR for review watching
                     if let Some(ref review_watcher) = self.review_watcher {
-                        if let Some((repo, pr_number)) = SqliteTracker::parse_pr_url(pr_url) {
+                        if let Some((repo, pr_number)) = crate::storage::parse_pr_url(pr_url) {
                             let state = PrReviewState::new(
                                 pr_url,
                                 &repo,
@@ -4532,19 +4532,11 @@ mod tests {
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
             agent: crate::config::AgentConfig::default(),
-            discord: crate::config::DiscordConfig::default(),
-            slack: crate::config::SlackConfig::default(),
-            email: crate::config::EmailConfig::default(),
-            sms: crate::config::SmsConfig::default(),
-            push: crate::config::PushConfig::default(),
+            scm: crate::config::ScmConfig::default(),
+            issues: crate::config::IssuesConfig::default(),
+            notifiers: crate::config::NotifiersConfig::default(),
             ask: crate::config::AskConfig::default(),
-            github: crate::config::GitHubConfig::default(),
-            github_app: crate::config::GitHubAppConfig::default(),
             retry: crate::config::RetryConfig::default(),
-            linear: None,
-            sentry: None,
-            jira: None,
-            gitlab: None,
             regression: crate::config::RegressionConfig::default(),
             cascade: crate::config::CascadeConfig::default(),
             users: std::collections::HashMap::new(),
@@ -4554,6 +4546,7 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            tenant_id: None,
         }
     }
 
@@ -4573,7 +4566,7 @@ mod tests {
             config: test_config(),
             sources,
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,       // Tests don't need inference
             embedding_client: None,
             review_watcher: None,
@@ -4881,6 +4874,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: true,
         };
 
@@ -5445,7 +5442,7 @@ mod tests {
             config,
             sources: vec![source.clone()],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -5454,6 +5451,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
@@ -5502,6 +5503,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
@@ -5565,6 +5570,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
@@ -5620,6 +5629,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
@@ -6019,7 +6032,7 @@ mod tests {
             config,
             sources,
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -6028,6 +6041,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -6099,7 +6116,7 @@ mod tests {
             config,
             sources: vec![source.clone()],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -6108,6 +6125,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: true,
         });
 
@@ -6148,6 +6169,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
@@ -6780,7 +6805,7 @@ mod tests {
             config: test_config(),
             sources,
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -6789,6 +6814,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -7152,7 +7181,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7161,6 +7190,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -7260,7 +7293,7 @@ mod tests {
             config,
             sources,
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7269,6 +7302,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -7318,7 +7355,7 @@ mod tests {
             config,
             sources,
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7327,6 +7364,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -7371,7 +7412,7 @@ mod tests {
             config,
             sources,
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7380,6 +7421,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -7429,7 +7474,7 @@ mod tests {
             config,
             sources,
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7438,6 +7483,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -7622,6 +7671,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: true,
         });
 
@@ -7753,7 +7806,7 @@ mod tests {
             config: test_config(),
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7762,6 +7815,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -7850,6 +7907,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: true,
         });
 
@@ -7926,7 +7987,7 @@ mod tests {
             config,
             sources,
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -7935,6 +7996,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8055,6 +8120,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: true,
         });
 
@@ -8087,7 +8156,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8096,6 +8165,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8250,7 +8323,7 @@ mod tests {
             config: test_config(),
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8259,6 +8332,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8286,7 +8363,7 @@ mod tests {
             config: test_config(),
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8295,6 +8372,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8330,7 +8411,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8339,6 +8420,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8363,7 +8448,7 @@ mod tests {
             config,
             sources: vec![source],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8372,6 +8457,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8395,7 +8484,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8404,6 +8493,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8426,7 +8519,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8435,6 +8528,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8460,7 +8557,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8469,6 +8566,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8511,7 +8612,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8520,6 +8621,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8563,7 +8668,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8572,6 +8677,10 @@ mod tests {
             github_client: None, // No GitHub client
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8615,7 +8724,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8624,6 +8733,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8667,7 +8780,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8676,6 +8789,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8717,7 +8834,7 @@ mod tests {
             config: test_config(),
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8726,6 +8843,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8768,7 +8889,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -8777,6 +8898,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -8911,6 +9036,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: true,
         });
 
@@ -9155,7 +9284,7 @@ mod tests {
                 Arc::new(MockSource::new("s2")) as Arc<dyn IssueSource>,
             ],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9164,6 +9293,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: true,
         });
 
@@ -9211,6 +9344,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
@@ -9277,6 +9414,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
         // NOT setting is_running - should break the retry loop early
@@ -9389,7 +9530,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9398,6 +9539,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -9589,6 +9734,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: true,
         });
 
@@ -9658,7 +9807,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9667,6 +9816,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -9718,7 +9871,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9727,6 +9880,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -9829,7 +9986,7 @@ mod tests {
             config: test_config(),
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9838,6 +9995,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -9855,7 +10016,7 @@ mod tests {
             config: test_config(),
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -9864,6 +10025,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -10055,6 +10220,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
@@ -10089,7 +10258,7 @@ mod tests {
             config,
             sources: vec![],
             notifier,
-            tracker,
+            tracker: tracker.clone(),
             inferrer: None,
             embedding_client: None,
             review_watcher: None,
@@ -10098,6 +10267,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         });
 
@@ -10161,6 +10334,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
             dry_run: false,
         })
     }
@@ -10555,6 +10732,10 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                sqlite.clone(),
+            )),
             dry_run: false,
         });
 
@@ -10621,5 +10802,130 @@ mod tests {
         assert!(sqlite.has_attempted("seed_src", "10").unwrap());
         assert!(sqlite.has_attempted("seed_src", "11").unwrap());
         assert!(sqlite.has_attempted("seed_src", "12").unwrap());
+    }
+
+    #[test]
+    fn test_watcher_accepts_non_claude_agent() {
+        use crate::runner::AgentRunner;
+
+        struct MockAgent;
+
+        #[async_trait]
+        impl AgentRunner for MockAgent {
+            fn name(&self) -> &str { "mock-agent" }
+            fn capabilities(&self) -> crate::runner::ProviderCapabilities {
+                crate::runner::ProviderCapabilities::default()
+            }
+            fn build_prompt_for_issue(
+                &self,
+                _issue: &Issue,
+                _context: &str,
+                _project_dir: &std::path::Path,
+            ) -> String {
+                "mock prompt".to_string()
+            }
+            async fn execute_with_attempt(
+                &self,
+                _prompt: &str,
+                _issue: Option<&Issue>,
+                _attempt_id: Option<i64>,
+                _project_dir: &std::path::Path,
+            ) -> crate::error::Result<crate::types::AgentResult> {
+                Ok(crate::types::AgentResult {
+                    success: true,
+                    output: "mock output".to_string(),
+                    pr_url: None,
+                    changelog: None,
+                    error: None,
+                    blocking_question: None,
+                    used_qa_ids: Vec::new(),
+                })
+            }
+        }
+
+        // Create a Watcher with the mock agent to verify trait abstraction works
+        let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
+            Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let mock_agent: Arc<dyn AgentRunner> = Arc::new(MockAgent);
+
+        let watcher = Watcher::new(WatcherOptions {
+            config: test_config(),
+            sources: vec![],
+            notifier: Arc::new(crate::notifier::ConsoleNotifier),
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: true,
+            agent: mock_agent,
+        });
+
+        // Verify the watcher was created successfully with a non-Claude agent
+        assert!(watcher.config.work_dir.to_str().is_some());
+    }
+
+    #[test]
+    fn test_watcher_with_orchestrator_agent() {
+        use crate::runner::{AgentRunner, AgentOrchestrator, SelectionStrategy, WeightedProvider};
+
+        let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
+            Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+
+        // Create an orchestrator with a simple mock as the agent
+        struct SimpleRunner;
+
+        #[async_trait]
+        impl AgentRunner for SimpleRunner {
+            fn name(&self) -> &str { "simple" }
+            fn capabilities(&self) -> crate::runner::ProviderCapabilities {
+                crate::runner::ProviderCapabilities::default()
+            }
+            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &std::path::Path) -> String {
+                "simple prompt".to_string()
+            }
+            async fn execute_with_attempt(
+                &self, _: &str, _: Option<&Issue>, _: Option<i64>, _: &std::path::Path,
+            ) -> crate::error::Result<crate::types::AgentResult> {
+                Ok(crate::types::AgentResult {
+                    success: true, output: String::new(), pr_url: None,
+                    changelog: None, error: None, blocking_question: None, used_qa_ids: Vec::new(),
+                })
+            }
+        }
+
+        let orchestrator = AgentOrchestrator::new(
+            vec![WeightedProvider {
+                provider: Arc::new(SimpleRunner),
+                weight: 1.0,
+            }],
+            SelectionStrategy::Primary,
+            Some("test-experiment".to_string()),
+        );
+
+        let agent: Arc<dyn AgentRunner> = Arc::new(orchestrator);
+
+        let watcher = Watcher::new(WatcherOptions {
+            config: test_config(),
+            sources: vec![],
+            notifier: Arc::new(crate::notifier::ConsoleNotifier),
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            dry_run: true,
+            agent,
+        });
+
+        assert!(watcher.config.work_dir.to_str().is_some());
     }
 }

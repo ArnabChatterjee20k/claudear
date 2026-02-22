@@ -15,7 +15,7 @@ pub use types::{CodeChunk, CodeIndexStats, CodeSearchResult, CodeSymbol, Languag
 
 use crate::error::Result;
 use crate::feedback::EmbeddingClient;
-use crate::storage::SqliteTracker;
+use crate::storage::FixAttemptTracker;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
@@ -28,14 +28,14 @@ const DEFAULT_BATCH_SIZE: usize = 32;
 
 /// Write-side: indexes a repository's source code.
 pub struct CodeIndexer {
-    tracker: Arc<SqliteTracker>,
+    tracker: Arc<dyn FixAttemptTracker>,
     embedding_client: Arc<EmbeddingClient>,
     max_file_size: u64,
     batch_size: usize,
 }
 
 impl CodeIndexer {
-    pub fn new(tracker: Arc<SqliteTracker>, embedding_client: Arc<EmbeddingClient>) -> Self {
+    pub fn new(tracker: Arc<dyn FixAttemptTracker>, embedding_client: Arc<EmbeddingClient>) -> Self {
         Self {
             tracker,
             embedding_client,
@@ -45,7 +45,7 @@ impl CodeIndexer {
     }
 
     pub fn with_config(
-        tracker: Arc<SqliteTracker>,
+        tracker: Arc<dyn FixAttemptTracker>,
         embedding_client: Arc<EmbeddingClient>,
         max_file_size_kb: u64,
         batch_size: usize,
@@ -262,12 +262,12 @@ impl CodeIndexer {
 
 /// Read-side: search indexed code.
 pub struct CodeSearchService {
-    tracker: Arc<SqliteTracker>,
+    tracker: Arc<dyn FixAttemptTracker>,
     embedding_client: Arc<EmbeddingClient>,
 }
 
 impl CodeSearchService {
-    pub fn new(tracker: Arc<SqliteTracker>, embedding_client: Arc<EmbeddingClient>) -> Self {
+    pub fn new(tracker: Arc<dyn FixAttemptTracker>, embedding_client: Arc<EmbeddingClient>) -> Self {
         Self {
             tracker,
             embedding_client,

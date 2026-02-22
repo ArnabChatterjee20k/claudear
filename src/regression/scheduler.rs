@@ -5,7 +5,7 @@
 
 use crate::error::Result;
 use crate::regression::RegressionChecker;
-use crate::storage::{FixAttemptTracker, SqliteTracker};
+use crate::storage::FixAttemptTracker;
 use crate::types::{RegressionCheck, RegressionWatch, RegressionWatchStatus};
 use chrono::{Duration, Utc};
 use std::sync::Arc;
@@ -56,13 +56,13 @@ pub struct CheckCycleResult {
 /// Schedules and runs regression checks.
 pub struct RegressionScheduler<C: RegressionChecker> {
     checker: C,
-    tracker: Arc<SqliteTracker>,
+    tracker: Arc<dyn FixAttemptTracker>,
     config: RegressionSchedulerConfig,
 }
 
 impl<C: RegressionChecker> RegressionScheduler<C> {
     /// Create a new regression scheduler.
-    pub fn new(checker: C, tracker: Arc<SqliteTracker>, config: RegressionSchedulerConfig) -> Self {
+    pub fn new(checker: C, tracker: Arc<dyn FixAttemptTracker>, config: RegressionSchedulerConfig) -> Self {
         Self {
             checker,
             tracker,
@@ -234,8 +234,8 @@ mod tests {
         }
     }
 
-    fn create_test_tracker() -> Arc<SqliteTracker> {
-        Arc::new(SqliteTracker::in_memory().unwrap())
+    fn create_test_tracker() -> Arc<dyn FixAttemptTracker> {
+        Arc::new(crate::storage::SqliteTracker::in_memory().unwrap())
     }
 
     #[test]
@@ -260,8 +260,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_watch_no_regression() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a fix attempt
@@ -305,8 +303,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_watch_regression_detected() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a fix attempt
@@ -351,8 +347,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_final_check_resolves_watch() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a fix attempt
@@ -399,8 +393,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_watches_due_for_check() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a fix attempt
@@ -436,8 +428,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_watch_no_monitoring_started_at() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a fix attempt
@@ -478,8 +468,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_watch_not_time_yet() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a fix attempt
@@ -520,8 +508,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_watch_exceeded_max_checks() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a fix attempt
@@ -649,8 +635,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_monitoring_watches_multiple() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create two fix attempts
@@ -702,8 +686,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_number_progresses_correctly() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a fix attempt
@@ -804,13 +786,12 @@ mod tests {
     /// Helper: create a fix attempt + monitoring watch with specified start time.
     /// Returns (watch_id, stored_watch).
     fn setup_watch(
-        tracker: &Arc<SqliteTracker>,
+        tracker: &Arc<dyn FixAttemptTracker>,
         source: &str,
         issue_id: &str,
         short_id: &str,
         started_hours_ago: i64,
     ) -> (i64, RegressionWatch) {
-        use crate::storage::FixAttemptTracker;
         tracker.record_attempt(source, issue_id, short_id).unwrap();
         tracker
             .mark_success(
@@ -1288,8 +1269,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_monitoring_watches_ignores_non_monitoring() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a watch in AwaitingRelease status (not Monitoring)
@@ -1355,7 +1334,6 @@ mod tests {
 
         // One awaiting release
         {
-            use crate::storage::FixAttemptTracker;
             tracker.record_attempt("sentry", "mix-aw", "MA-1").unwrap();
             tracker
                 .mark_success("sentry", "mix-aw", "https://github.com/org/repo/pull/200")
@@ -1568,8 +1546,6 @@ mod tests {
 
     #[test]
     fn test_get_watches_due_for_check_no_monitoring_started_at_excluded() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
         tracker
             .record_attempt("sentry", "no-start", "NS-2")
@@ -1619,7 +1595,6 @@ mod tests {
         let tracker = create_test_tracker();
         // Started 30 seconds ago
         {
-            use crate::storage::FixAttemptTracker;
             tracker
                 .record_attempt("sentry", "cust-int", "CI-1")
                 .unwrap();
@@ -1829,7 +1804,6 @@ mod tests {
 
         // Started exactly 3600 seconds ago
         {
-            use crate::storage::FixAttemptTracker;
             tracker
                 .record_attempt("sentry", "exact-3600", "E36-1")
                 .unwrap();
@@ -1867,8 +1841,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_monitoring_watches_with_no_monitoring_started() {
-        use crate::storage::FixAttemptTracker;
-
         let tracker = create_test_tracker();
 
         // Create a watch with monitoring status but no monitoring_started_at
@@ -1930,7 +1902,6 @@ mod tests {
 
         // Started 1.5 hours ago (5400 seconds)
         {
-            use crate::storage::FixAttemptTracker;
             tracker
                 .record_attempt("sentry", "notdue-2nd", "ND2-1")
                 .unwrap();

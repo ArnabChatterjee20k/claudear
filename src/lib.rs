@@ -100,10 +100,247 @@ pub use reports::{Report, ReportFrequency, ReportGenerator, ReportSchedule, Repo
 pub use retry::{RetryDecision, RetryManager};
 pub use scm::GitHubUser;
 pub use storage::{
-    classify_error, compute_error_hash, AnalyticsService, FixAttemptTracker, StoredDependency,
-    StoredRepository, TimePeriod, TrendAnalysis, TrendDirection,
+    classify_error, compute_error_hash, parse_pr_url, AnalyticsService, FixAttemptTracker,
+    StoredDependency, StoredRepository, TimePeriod, TrendAnalysis, TrendDirection,
 };
 #[cfg(feature = "sqlite")]
 pub use storage::{SqliteTracker, is_vectorlite_available, try_load_vectorlite};
 pub use types::*;
 pub use users::{ResolvedUser, UserRegistry};
+
+// ---------------------------------------------------------------------------
+// Composable startup: lets alternative binaries (e.g. SaaS) bring their own
+// storage backend while reusing all watcher / webhook / API logic.
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+/// Shared state assembled during startup, passed to `run_daemon` / `run_webhook_server`.
+pub struct AppComponents {
+    pub config: Config,
+    pub tracker: Arc<dyn storage::FixAttemptTracker>,
+    pub sources: Vec<Arc<dyn source::IssueSource>>,
+    pub notifier: Arc<dyn notifier::Notifier>,
+    pub user_registry: UserRegistry,
+    pub inferrer: Option<RepoInferrer>,
+    pub embedding_client: Option<EmbeddingClient>,
+    pub review_watcher: Option<Arc<ReviewWatcher>>,
+    pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    pub agent: Arc<dyn runner::AgentRunner>,
+}
+
+/// Build all non-storage components.
+///
+/// The caller provides the config and a tracker (which may be backed by
+/// SQLite, Postgres, or anything else that implements [`FixAttemptTracker`]).
+/// Everything else is wired up from the config.
+pub async fn build_app(
+    config: Config,
+    tracker: Arc<dyn storage::FixAttemptTracker>,
+) -> anyhow::Result<AppComponents> {
+    let user_registry = UserRegistry::new(config.users.clone());
+
+    // Notifier
+    let notifier = build_notifier(&config, user_registry.clone());
+
+    // Sources
+    let sources = build_sources(&config);
+
+    // GitHub client for inferrer
+    let github_client = github::GitHubClient::new(config.github().clone());
+    let (inferrer, embedding_client) =
+        watcher::Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
+
+    // Review watcher
+    let review_watcher = build_review_watcher(&config, tracker.clone());
+
+    // Issue embedding service
+    let issue_embedding_service = build_embedding_service(&tracker);
+
+    // Agent runner
+    let agent: Arc<dyn runner::AgentRunner> = Arc::new(runner::ClaudeAgentRunner::new(
+        runner::ClaudeRunnerConfig {
+            timeout_secs: config.agent.timeout_secs,
+            model: config
+                .agent
+                .default_provider_config()
+                .and_then(|p| p.model.clone()),
+            instructions: config
+                .agent
+                .default_provider_config()
+                .and_then(|p| p.instructions.clone()),
+            permissions: config
+                .agent
+                .default_provider_config()
+                .map(|p| p.permissions.clone())
+                .unwrap_or_default(),
+            skip_permissions: config
+                .agent
+                .default_provider_config()
+                .map(|p| p.skip_permissions)
+                .unwrap_or(false),
+        },
+        tracker.clone(),
+    ));
+
+    Ok(AppComponents {
+        config,
+        tracker,
+        sources,
+        notifier,
+        user_registry,
+        inferrer,
+        embedding_client,
+        review_watcher,
+        issue_embedding_service,
+        agent,
+    })
+}
+
+// --- internal helpers used by both build_app and main.rs ---
+
+fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notifier::Notifier> {
+    use notifier::*;
+
+    let mut composite = CompositeNotifier::new();
+    composite.add(Arc::new(ConsoleNotifier::new()));
+
+    let discord_notifier = DiscordNotifier::new(config.discord_merged(), user_registry.clone());
+    if discord_notifier.is_enabled() {
+        composite.add(Arc::new(discord_notifier));
+    }
+
+    let slack_notifier = SlackNotifier::new(config.slack_merged(), user_registry.clone());
+    if slack_notifier.is_enabled() {
+        composite.add(Arc::new(slack_notifier));
+    }
+
+    if let Ok(email_notifier) = EmailNotifier::new(config.email().clone(), user_registry.clone()) {
+        if email_notifier.is_enabled() {
+            composite.add(Arc::new(email_notifier));
+        }
+    }
+
+    let sms_notifier = SmsNotifier::new(config.sms().clone(), user_registry.clone());
+    if sms_notifier.is_enabled() {
+        composite.add(Arc::new(sms_notifier));
+    }
+
+    let push_notifier = PushNotifier::new(config.push_config().clone(), user_registry.clone());
+    if push_notifier.is_enabled() {
+        composite.add(Arc::new(push_notifier));
+    }
+
+    let whatsapp_notifier =
+        WhatsAppNotifier::new(config.notifiers.whatsapp.clone(), user_registry.clone());
+    if whatsapp_notifier.is_enabled() {
+        composite.add(Arc::new(whatsapp_notifier));
+    }
+
+    let telegram_notifier =
+        TelegramNotifier::new(config.notifiers.telegram.clone(), user_registry);
+    if telegram_notifier.is_enabled() {
+        composite.add(Arc::new(telegram_notifier));
+    }
+
+    Arc::new(composite)
+}
+
+fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {
+    use source::*;
+
+    let mut sources: Vec<Arc<dyn IssueSource>> = Vec::new();
+
+    if let Some(linear_config) = config.linear() {
+        if linear_config.enabled {
+            sources.push(Arc::new(LinearSource::new(linear_config.clone())));
+        }
+    }
+
+    if let Some(sentry_config) = config.sentry_config() {
+        if sentry_config.enabled {
+            sources.push(Arc::new(SentrySource::new(sentry_config.clone())));
+        }
+    }
+
+    if let Some(jira_config) = config.jira() {
+        if jira_config.enabled {
+            sources.push(Arc::new(JiraSource::new(jira_config.clone())));
+        }
+    }
+
+    let discord = config.discord_merged();
+    if discord.source_enabled {
+        if discord.bot_token.is_some()
+            && (discord.listen_channel_id.is_some() || discord.channel_id.is_some())
+        {
+            sources.push(Arc::new(DiscordSource::new(discord)));
+        }
+    }
+
+    let slack = config.slack_merged();
+    if slack.source_enabled {
+        if slack.bot_token.is_some()
+            && (slack.listen_channel_id.is_some() || slack.channel_id.is_some())
+        {
+            sources.push(Arc::new(SlackSource::new(slack)));
+        }
+    }
+
+    if config.notifiers.whatsapp.source_enabled {
+        if config.notifiers.whatsapp.access_token.is_some()
+            && config.notifiers.whatsapp.phone_number_id.is_some()
+        {
+            sources.push(Arc::new(WhatsAppSource::new(
+                config.notifiers.whatsapp.clone(),
+            )));
+        }
+    }
+
+    if config.notifiers.telegram.source_enabled {
+        if config.notifiers.telegram.bot_token.is_some() {
+            sources.push(Arc::new(TelegramSource::new(
+                config.notifiers.telegram.clone(),
+            )));
+        }
+    }
+
+    sources
+}
+
+fn build_review_watcher(
+    config: &Config,
+    tracker: Arc<dyn storage::FixAttemptTracker>,
+) -> Option<Arc<ReviewWatcher>> {
+    if !config.is_github_enabled() {
+        return None;
+    }
+
+    let github_client = github::GitHubClient::new(config.github().clone());
+    if !github_client.is_enabled() {
+        return None;
+    }
+
+    let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
+    let review_watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+
+    if let Ok(states) = tracker.get_active_pr_review_states() {
+        if !states.is_empty() {
+            review_watcher.load_states(states);
+        }
+    }
+
+    Some(Arc::new(review_watcher))
+}
+
+fn build_embedding_service(
+    tracker: &Arc<dyn storage::FixAttemptTracker>,
+) -> Option<Arc<IssueEmbeddingService>> {
+    match EmbeddingClient::new(EmbeddingConfig::default()) {
+        Ok(client) => Some(Arc::new(IssueEmbeddingService::with_defaults(
+            Arc::new(client),
+            tracker.clone(),
+        ))),
+        Err(_) => None,
+    }
+}
