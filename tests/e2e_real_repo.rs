@@ -353,12 +353,18 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
     let source = Arc::new(TaskSource::new("linear", tasks));
     let notifier = Arc::new(RecordingNotifier::default());
 
+    let agent: Arc<dyn claudear::runner::AgentRunner> = Arc::new(
+        claudear::runner::ClaudeAgentRunner::new(
+            claudear::runner::ClaudeRunnerConfig::default(),
+            tracker.clone(),
+        ),
+    );
+
     let watcher = Watcher::new(WatcherOptions {
         config: build_config(&temp_dir),
         sources: vec![source.clone() as Arc<dyn IssueSource>],
         notifier: notifier.clone() as Arc<dyn Notifier>,
         tracker: tracker_trait,
-        sqlite_tracker: Some(tracker.clone()),
         inferrer: Some(inferrer),
         embedding_client: None,
         review_watcher: None,
@@ -367,6 +373,7 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
         github_client: None,
         scm_provider: None,
         user_registry: UserRegistry::new(HashMap::new()),
+        agent,
         dry_run: false,
     });
 

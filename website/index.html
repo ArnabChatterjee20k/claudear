@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Claudear - Your AI Team Mate</title>
-  <meta name="description" content="Autonomous issue-to-PR pipeline powered by Claude Code. Issues go in. Pull requests come out.">
+  <meta name="description" content="Autonomous issue-to-PR pipeline powered by AI agents. Issues go in. Pull requests come out.">
 
   <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -222,7 +222,7 @@
             Issues go in.<br>Pull requests come out.
           </h1>
           <p class="font-sans text-lg md:text-xl text-body leading-relaxed mb-8 max-w-lg">
-            Claudear watches your issue trackers, spawns Claude Code agents to fix bugs and ship features, and opens PRs — autonomously. Your AI team mate that actually writes code.
+            Claudear watches your issue trackers, spawns agents to fix bugs and ship features, and opens PRs — autonomously. Your AI team mate that actually writes code.
           </p>
           <div class="flex flex-wrap gap-4 mb-8">
             <a href="#" class="bg-accent text-bg font-sans font-medium px-6 py-3 rounded-btn btn-transition cursor-pointer inline-flex items-center gap-2 hover:bg-accent-dim">
@@ -308,7 +308,7 @@
                 <i data-lucide="cpu" class="w-5 h-5 text-accent"></i>
               </div>
               <h3 class="font-mono font-bold text-sm text-heading mb-1">Fixed</h3>
-              <p class="font-sans text-xs text-muted">Claude Code agent reads, edits, and tests the fix</p>
+              <p class="font-sans text-xs text-muted">Agent reads, edits, and tests the fix</p>
             </div>
             <div class="bg-card border border-border rounded-card p-5 text-center">
               <div class="w-10 h-10 mx-auto mb-3 flex items-center justify-center rounded-full bg-accent/10">
@@ -366,8 +366,8 @@
               <i data-lucide="cpu" class="w-5 h-5 text-accent"></i>
             </div>
             <div>
-              <h3 class="font-mono font-bold text-sm text-heading mb-1">Claude Code Fixes</h3>
-              <p class="font-sans text-xs text-muted">Agent reads, edits, and tests the fix</p>
+              <h3 class="font-mono font-bold text-sm text-heading mb-1">Agent Fixes</h3>
+              <p class="font-sans text-xs text-muted">Reads, edits, and tests the fix autonomously</p>
             </div>
           </div>
           <div class="flex justify-center"><i data-lucide="arrow-down" class="w-4 h-4 text-border"></i></div>
@@ -395,7 +395,7 @@
 
       <p class="font-sans text-sm text-muted mt-12 text-center flex items-center justify-center gap-2">
         <i data-lucide="message-circle" class="w-4 h-4 text-muted"></i>
-        If Claude gets stuck, it asks your team a question via Discord, Slack, or Email -- then keeps going.
+        If the agent gets stuck, it asks your team a question via Discord, Slack, or Email -- then keeps going.
       </p>
     </div>
   </section>
@@ -468,10 +468,10 @@
         </div>
         <div class="feature-card bg-card border border-border rounded-card p-6">
           <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
-            <i data-lucide="terminal" class="w-5 h-5 text-accent"></i>
+            <i data-lucide="bot" class="w-5 h-5 text-accent"></i>
           </div>
-          <h3 class="font-mono font-bold text-base text-heading mb-2">Full Claude Code</h3>
-          <p class="font-sans text-sm text-body leading-relaxed">Not a wrapper. Spawns real Claude Code processes with read, edit, bash, and full tool access.</p>
+          <h3 class="font-mono font-bold text-base text-heading mb-2">Multi-Agent</h3>
+          <p class="font-sans text-sm text-body leading-relaxed">Bring your own agent. Ships with support for Claude Code, Codex, Gemini CLI, and Copilot — or plug in your own.</p>
         </div>
 
         <!-- Row 2 -->
@@ -487,7 +487,7 @@
             <i data-lucide="message-square" class="w-5 h-5 text-accent"></i>
           </div>
           <h3 class="font-mono font-bold text-base text-heading mb-2">Human Q&A Loop</h3>
-          <p class="font-sans text-sm text-body leading-relaxed">When blocked, Claude asks your team via Discord, Slack, or Email. First reply wins. Work resumes instantly.</p>
+          <p class="font-sans text-sm text-body leading-relaxed">When blocked, the agent asks your team via Discord, Slack, or Email. First reply wins. Work resumes instantly.</p>
         </div>
         <div class="feature-card bg-card border border-border rounded-card p-6">
           <div class="w-10 h-10 mb-4 flex items-center justify-center rounded-full bg-accent/10">
@@ -564,9 +564,25 @@
           <i data-lucide="hash" class="w-7 h-7"></i>
           <span class="font-mono text-xs">Slack</span>
         </div>
-        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default">
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
           <i data-lucide="mail" class="w-7 h-7"></i>
           <span class="font-mono text-xs">Email</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <i data-lucide="message-circle" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">WhatsApp</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <i data-lucide="send" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">Telegram</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default border-r border-border">
+          <i data-lucide="smartphone" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">SMS</span>
+        </div>
+        <div class="integration-icon flex flex-col items-center gap-3 px-6 py-4 sm:px-8 cursor-default">
+          <i data-lucide="bell" class="w-7 h-7"></i>
+          <span class="font-mono text-xs">Push</span>
         </div>
       </div>
     </div>
@@ -594,23 +610,24 @@
 <span class="syn-key">known_orgs</span> = <span class="syn-bracket">[</span><span class="syn-str">"acme"</span><span class="syn-bracket">]</span>
 <span class="syn-key">max_concurrent</span> = <span class="syn-num">2</span>
 
+<span class="syn-comment"># SCM</span>
+<span class="syn-bracket">[</span><span class="syn-key">scm.github</span><span class="syn-bracket">]</span>
+<span class="syn-key">auto_resolve_on_merge</span> = <span class="syn-num">true</span>
+
 <span class="syn-comment"># Sources</span>
-<span class="syn-bracket">[</span><span class="syn-key">linear</span><span class="syn-bracket">]</span>
+<span class="syn-bracket">[</span><span class="syn-key">issues.linear</span><span class="syn-bracket">]</span>
 <span class="syn-key">api_key</span> = <span class="syn-str">"lin_api_xxxx"</span>
 <span class="syn-key">trigger_labels</span> = <span class="syn-bracket">[</span><span class="syn-str">"bug"</span>, <span class="syn-str">"claudear"</span><span class="syn-bracket">]</span>
 
-<span class="syn-bracket">[</span><span class="syn-key">sentry</span><span class="syn-bracket">]</span>
+<span class="syn-bracket">[</span><span class="syn-key">issues.sentry</span><span class="syn-bracket">]</span>
 <span class="syn-key">org_slug</span> = <span class="syn-str">"acme"</span>
 <span class="syn-key">min_event_count</span> = <span class="syn-num">5</span>
 
-<span class="syn-bracket">[</span><span class="syn-key">github</span><span class="syn-bracket">]</span>
-<span class="syn-key">auto_resolve_on_merge</span> = <span class="syn-num">true</span>
-
 <span class="syn-comment"># Notifications</span>
-<span class="syn-bracket">[</span><span class="syn-key">discord</span><span class="syn-bracket">]</span>
+<span class="syn-bracket">[</span><span class="syn-key">notifiers.discord</span><span class="syn-bracket">]</span>
 <span class="syn-key">channel_id</span> = <span class="syn-str">"1234567890"</span>
 
-<span class="syn-bracket">[</span><span class="syn-key">slack</span><span class="syn-bracket">]</span>
+<span class="syn-bracket">[</span><span class="syn-key">notifiers.slack</span><span class="syn-bracket">]</span>
 <span class="syn-key">channel_id</span> = <span class="syn-str">"C0123456789"</span></pre>
           </div>
         </div>
@@ -632,7 +649,7 @@
     &#9553;  &#9553;  &#9554;&#9552;&#9565;&#9553; &#9553; &#9553;&#9553;&#9553;&#9553;  &#9554;&#9552;&#9565;&#9554;&#9574;&#9557;
     &#9562;&#9552;&#9565;&#9562;&#9552;&#9565;&#9562; &#9562;&#9562;&#9552;&#9565;&#9552;&#9562;&#9565;&#9562;&#9552;&#9565;&#9562; &#9562;&#9562;&#9577;&#9552;</span>
 
-<span class="text-muted">    v0.14.2 | Rust + Claude Code</span>
+<span class="text-muted">    v0.14.2 | Rust</span>
 <span class="text-muted">    Dashboard: http://localhost:3100</span>
 
 <span class="text-accent">  [ok]</span> Config loaded from ./claudear.toml
@@ -663,7 +680,7 @@
           <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
         </div>
         <p class="font-sans text-sm text-muted">
-          Built with <span class="text-body">Rust</span> &amp; <span class="text-body">Claude Code</span>
+          Built with <span class="text-body">Rust</span>
         </p>
       </div>
     </div>
@@ -709,18 +726,18 @@
 
       // Each line: { html: string, delay: ms before showing this line }
       var lines = [
-        { html: '<span class="text-muted">$</span> <span class="syn-cmd">claudear start</span> <span class="syn-flag">--poll</span>', delay: 0, typed: true },
+        { html: '<span class="text-muted">$</span> <span class="syn-cmd">claudear start</span>', delay: 0, typed: true },
+        { html: '', delay: 200 },
+        { html: '<span class="text-accent">  &#10003;</span> <span class="text-body">Connected to Linear, Sentry, GitHub</span>', delay: 300 },
+        { html: '<span class="text-accent">  &#10003;</span> <span class="text-body">Indexed 12 repositories</span>', delay: 200 },
+        { html: '<span class="text-accent">  &#10003;</span> <span class="text-body">Watching for issues...</span>', delay: 200 },
         { html: '', delay: 400 },
-        { html: '<span class="text-accent">  &#10003;</span> <span class="text-body">Connected to Linear, Sentry, GitHub</span>', delay: 600 },
-        { html: '<span class="text-accent">  &#10003;</span> <span class="text-body">Indexed 12 repositories</span>', delay: 400 },
-        { html: '<span class="text-accent">  &#10003;</span> <span class="text-body">Watching for issues...</span>', delay: 400 },
-        { html: '', delay: 800 },
-        { html: '  <span class="text-link">&#9656;</span> <span class="text-body">New issue: <span class="text-heading">LIN-4521</span> &quot;Fix auth token refresh race condition&quot;</span>', delay: 600 },
-        { html: '  <span class="text-link">&#9656;</span> <span class="text-body">Inferred repo: <span class="text-heading">api-server</span> (confidence: 0.94)</span>', delay: 500 },
-        { html: '  <span class="text-link">&#9656;</span> <span class="text-body">Spawning Claude Code agent...</span>', delay: 400 },
-        { html: '  <span class="text-link">&#9656;</span> <span class="text-muted">Agent working... (2m 34s)</span>', delay: 2000 },
-        { html: '  <span class="text-accent">&#9656;</span> <span class="text-accent">PR #847 opened:</span> <span class="text-heading">&quot;fix: resolve auth token refresh race condition&quot;</span>', delay: 600 },
-        { html: '  <span class="text-accent">&#9656;</span> <span class="text-accent">Issue LIN-4521</span> <span class="text-muted">&#8594;</span> <span class="text-accent">resolved</span>', delay: 500 }
+        { html: '  <span class="text-link">&#9656;</span> <span class="text-body">New issue: <span class="text-heading">LIN-4521</span> &quot;Fix token race condition&quot;</span>', delay: 300 },
+        { html: '  <span class="text-link">&#9656;</span> <span class="text-body">Inferred repo: <span class="text-heading">api-server</span> (confidence: 94%)</span>', delay: 250 },
+        { html: '  <span class="text-link">&#9656;</span> <span class="text-body">Spawning agent...</span>', delay: 200 },
+        { html: '  <span class="text-link">&#9656;</span> <span class="text-muted">Agent working... (2m 34s)</span>', delay: 1000 },
+        { html: '  <span class="text-accent">&#9656;</span> <span class="text-accent">PR #847 opened:</span> <span class="text-heading">&quot;fix: token refresh race condition&quot;</span>', delay: 300 },
+        { html: '  <span class="text-accent">&#9656;</span> <span class="text-accent">Issue LIN-4521</span> <span class="text-muted">&#8594;</span> <span class="text-accent">resolved</span>', delay: 250 }
       ];
 
       if (prefersReducedMotion) {

@@ -69,7 +69,7 @@ export function Sidebar() {
   return (
     <aside className="w-56 border-r bg-card flex flex-col h-screen sticky top-0">
       <div className="p-4 border-b">
-        <h1 className="text-lg font-bold flex items-center gap-1 font-mono">
+        <h1 className="text-xl font-bold flex items-center gap-0 font-mono tracking-tight">
           claudear
           <span className="inline-block w-[10px] h-[20px] bg-primary ml-0.5 rounded-[1px]" />
         </h1>

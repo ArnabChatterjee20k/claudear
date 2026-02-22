@@ -82,7 +82,13 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 ### Issue Sources
 - **Linear** -- Trigger on labels (`auto-implement`, `claude`) or states (`backlog`, `todo`), with team/project filtering
 - **Sentry** -- Process top escalating errors by event count, time period, and escalation threshold
+- **Jira** -- JQL-based issue filtering with label and status support
+- **GitHub Issues** -- Monitor issues across repositories
+- **GitLab** -- Fetch issues from GitLab groups and projects
 - **Discord** -- Process messages and threads from Discord channels as issues
+- **Slack** -- Poll Slack channels for messages as issues
+- **WhatsApp** -- Receive WhatsApp messages via Cloud API webhooks
+- **Telegram** -- Poll Telegram chats via Bot API
 - **GitHub Review Comments** -- Respond to PR review comments tagged with `/claudear`
 - Per-source rate limiting, concurrent processing controls, and configurable poll intervals
 
@@ -139,6 +145,8 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - **Email** -- SMTP sending + IMAP reply polling for Q&A
 - **SMS** -- Twilio integration
 - **Push** -- Pushover notifications
+- **WhatsApp** -- WhatsApp Business Cloud API
+- **Telegram** -- Telegram Bot API
 - **Console** -- Always-on logging
 - Mix and match any combination of channels
 
@@ -168,6 +176,38 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - Real-time event processing from Linear, Sentry, and GitHub
 - HMAC-SHA256 signature verification
 - One-command auto-configuration: `claudear webhook --setup-webhooks --base-url <url>`
+
+### Integrations at a Glance
+
+| Category | Integration | Protocol | Notes |
+|----------|------------|----------|-------|
+| **Issue Sources** | Linear | REST API | Labels, states, team/project filters |
+| | Sentry | REST API | Escalating errors, event thresholds |
+| | Jira | REST API | JQL queries, labels, status filters |
+| | GitHub Issues | REST API | Cross-repo monitoring |
+| | GitLab | REST API | Group and project issues |
+| | Discord | Bot API | Channel messages and threads |
+| | Slack | Bot API | Channel message polling |
+| | WhatsApp | Cloud API | Webhook-fed message buffer |
+| | Telegram | Bot API | `getUpdates` long-polling |
+| **SCM** | GitHub | REST + Git | PRs, review comments, webhooks |
+| | GitLab | REST + Git | PRs, issue resolution |
+| **Notifications** | Console | stdout | Always-on logging |
+| | Discord | Webhook | Rich embeds, reply-based Q&A |
+| | Slack | Webhook | Messages, reply-based Q&A |
+| | Email | SMTP + IMAP | Send + reply polling for Q&A |
+| | SMS | Twilio API | Text message alerts |
+| | Push | Pushover API | Mobile push notifications |
+| | WhatsApp | Cloud API | WhatsApp Business messages |
+| | Telegram | Bot API | Chat messages with HTML formatting |
+| **Agent Runners** | Claude Code | CLI | Primary runner, full tool access |
+| | Codex | CLI | OpenAI Codex runner |
+| | Gemini | CLI | Google Gemini *(planned)* |
+| | Copilot | CLI | GitHub Copilot *(planned)* |
+| **Storage** | SQLite | Local file | WAL mode, Vectorlite extension |
+| **Embeddings** | Nomic | ONNX | Default model, local inference |
+| | MiniLM | ONNX | Lightweight alternative |
+| | BGE | ONNX | BAAI general embedding |
 
 ---
 

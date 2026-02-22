@@ -35,9 +35,6 @@ max_activity_entries = 10000
 # IPC request timeout in seconds (default: 30)
 ipc_timeout_secs = 30
 
-# Claude process execution timeout in seconds (default: 21600 = 6 hours)
-claude_timeout_secs = 21600
-
 # GitHub organizations to track
 # Repositories from these orgs will be indexed for issue-to-repo inference
 known_orgs = [
@@ -63,10 +60,18 @@ base_delay_ms = 60000
 max_delay_ms = 3600000
 
 # ============================================
-# Claude
+# Agent
 # ============================================
+# Supports multiple providers (Claude, Codex, etc.) and A/B experiments.
 
-[claude]
+[agent]
+# Default provider to use (default: "claude")
+default_provider = "claude"
+
+# Agent process execution timeout in seconds (default: 21600 = 6 hours)
+timeout_secs = 21600
+
+[agent.providers.claude]
 # Model to use (default: Claude CLI default)
 # Options: sonnet, opus, haiku, or full model ID (e.g., claude-sonnet-4-5-20250929)
 model = "sonnet"
@@ -90,7 +95,7 @@ skip_permissions = true
 # ============================================
 # Map team members to their identifiers across services.
 # When an issue is assigned to a user, notifications are routed to them specifically.
-# Global config fields (e.g. discord.user_id) can reference user slugs instead of raw IDs.
+# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs.
 
 [users.jake]
 # Source identifiers
@@ -105,6 +110,8 @@ slack_id = "U0123456789"
 email = "jake@example.com"
 push_user_key = "pushover_user_key"
 sms_number = "+1234567890"
+whatsapp_number = "+1234567890"
+telegram_chat_id = "123456789"
 
 # ============================================
 # Human Q&A Ask Loop
@@ -139,10 +146,10 @@ max_reuse_candidates = 3
 best_effort_on_timeout = true
 
 # ============================================
-# SCM
+# SCM (Source Control Management)
 # ============================================
 
-[github]
+[scm.github]
 # GitHub personal access token (for checking PR status)
 token = "ghp_xxxxxxxxxxxx"
 
@@ -168,7 +175,7 @@ use_ssh = false
 # GitHub App Authentication (Optional)
 # Configure this section to use GitHub App authentication instead of PAT.
 
-[github.app]
+[scm.github.app]
 # GitHub App ID
 app_id = ""
 
@@ -194,7 +201,7 @@ client_secret = ""
 # Optional: Public base URL for GitHub App manifest flow
 base_url = ""
 
-[gitlab]
+[scm.gitlab]
 
 # Enable/disable GitLab source (default: false)
 enabled = true
@@ -237,11 +244,11 @@ max_issues_per_cycle = 3
 max_concurrent = 2
 
 # ============================================
-# Sources
+# Issue Sources
 # ============================================
 # To use Linear, provide an API key from Linear Settings > API
 
-[linear]
+[issues.linear]
 # Enable/disable Linear source (default: true if api_key provided)
 enabled = true
 
@@ -278,7 +285,7 @@ max_concurrent = 2
 
 # To use Sentry, provide an auth token from https://sentry.io/settings/account/api/auth-tokens/
 
-[sentry]
+[issues.sentry]
 # Enable/disable Sentry source (default: true if auth_token provided)
 enabled = true
 
@@ -318,7 +325,7 @@ max_concurrent = 4
 # To use Jira Cloud, provide an API token from https://id.atlassian.com/manage-profile/security/api-tokens
 # To use Jira Server/DC, provide a personal access token (PAT).
 
-[jira]
+[issues.jira]
 # Enable/disable Jira source (default: true if api_token provided)
 enabled = true
 
@@ -365,36 +372,59 @@ max_issues_per_cycle = 3
 max_concurrent = 2
 poll_interval_ms = 300000
 
+# Discord as an issue source (messages become issues)
+# Shared credentials (bot_token, channel_id) are inherited from notifiers.discord if not set here.
+
+[issues.discord]
+# Bot token for reading messages (inherited from notifiers.discord if omitted)
+# bot_token = ""
+
+# Channel to listen for issue messages
+# listen_channel_id = ""
+
+# Guild (server) ID for constructing message URLs
+# guild_id = ""
+
+# Polling interval in milliseconds (overrides global)
+# poll_interval_ms = 300000
+
+# Slack as an issue source (messages become issues)
+# Shared credentials (bot_token, channel_id) are inherited from notifiers.slack if not set here.
+
+[issues.slack]
+# Bot token for reading messages (inherited from notifiers.slack if omitted)
+# bot_token = ""
+
+# Channel to listen for issue messages
+# listen_channel_id = ""
+
+# Workspace name for constructing message URLs
+# workspace = "mycompany"
+
+# Polling interval in milliseconds (overrides global)
+# poll_interval_ms = 300000
+
 # ============================================
 # Notifiers
 # ============================================
 
-[discord]
+[notifiers.discord]
 # Discord webhook URL for notifications
 webhook_url = "https://discord.com/api/webhooks/..."
 
 # Discord user ID to mention in notifications
 user_id = ""
 
-# Bot token for reply polling (required for Discord replies)
+# Bot token for reply polling (required for Discord replies and ask-questions)
 bot_token = ""
 
-# Channel ID to poll for replies (required for Discord replies)
+# Channel ID to poll for replies
 channel_id = ""
-
-# Enable Discord as an issue source (messages become issues) (default: false)
-source_enabled = false
-
-# Channel to listen for issue messages (falls back to channel_id)
-listen_channel_id = ""
 
 # Guild (server) ID for constructing message URLs
 guild_id = ""
 
-# Polling interval in milliseconds for Discord source (overrides global)
-# poll_interval_ms = 300000
-
-[slack]
+[notifiers.slack]
 # Slack Bot Token (xoxb-) for API calls
 bot_token = ""
 
@@ -410,16 +440,7 @@ user_id = ""
 # Workspace name for constructing message URLs
 # workspace = "mycompany"
 
-# Enable Slack as an issue source (default: false)
-# source_enabled = false
-
-# Channel to listen for issue messages (falls back to channel_id)
-# listen_channel_id = ""
-
-# Polling interval in milliseconds for Slack source (overrides global)
-# poll_interval_ms = 300000
-
-[email]
+[notifiers.email]
 # SMTP server host
 smtp_host = "smtp.gmail.com"
 
@@ -459,7 +480,7 @@ imap_use_tls = true
 # IMAP folder to scan for replies (default: INBOX)
 imap_folder = "INBOX"
 
-[sms]
+[notifiers.sms]
 # Twilio Account SID
 account_sid = ""
 
@@ -472,7 +493,7 @@ from_number = ""
 # Recipient phone numbers
 to_numbers = []
 
-[push]
+[notifiers.push]
 # Pushover API token
 api_token = ""
 
@@ -484,6 +505,26 @@ device = ""
 
 # Optional: Priority (-2 to 2)
 priority = 0
+
+[notifiers.whatsapp]
+# WhatsApp Business phone number ID
+# phone_number_id = ""
+
+# Meta Graph API access token
+# access_token = ""
+
+# Default recipient phone numbers
+# to_numbers = []
+
+[notifiers.telegram]
+# Telegram Bot API token
+# bot_token = ""
+
+# Default chat ID for notifications
+# chat_id = ""
+
+# Additional recipient chat IDs
+# to_chat_ids = []
 
 # ============================================
 # Monitoring
@@ -514,15 +555,16 @@ similarity_threshold = 0.75
 target_repos = []
 
 # Optional: GitHub token override for regression issue search
-# Falls back to github.token when empty
+# Falls back to scm.github.token when empty
 github_token = ""
 
 # Optional: Repositories to search for similar issues
 github_search_repos = []
 
 # Optional: Repo name -> package name overrides when they differ
+# Each repo can map to multiple package names.
 # [regression.package_names]
-# "utopia-php/database" = "utopia-php/database"
+# "utopia-php/database" = ["utopia-php/database"]
 
 # Enables chained follow-up fixes across repositories.
 
