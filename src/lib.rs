@@ -41,6 +41,8 @@ pub mod inference;
 pub mod ipc;
 pub mod learning;
 pub mod notifier;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod prioritisation;
 pub mod qa;
 pub mod regression;
@@ -53,8 +55,6 @@ pub mod scm;
 pub mod secret;
 pub mod source;
 pub mod storage;
-#[cfg(feature = "postgres")]
-pub mod postgres;
 pub mod templates;
 pub mod types;
 pub mod users;

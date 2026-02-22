@@ -5,9 +5,9 @@ import { PageHeader } from '../components/layout/page-header'
 import { Select } from '../components/ui/select'
 import { Badge } from '../components/ui/badge'
 import { Card, CardContent } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { Modal } from '../components/shared/modal'
+import { TableRowsSkeleton } from '../components/shared/page-skeletons'
 
 const outcomeColors: Record<string, string> = {
   success: 'bg-green-500/10 text-green-700 dark:text-green-400',
@@ -111,13 +111,7 @@ export default function FeedbackPage() {
         <div className="text-destructive text-sm">Failed to load feedback data.</div>
       )}
 
-      {isLoading && (
-        <div className="space-y-2">
-          {Array.from({ length: 5 }).map((_, i) => (
-            <Skeleton key={i} className="h-10 w-full" />
-          ))}
-        </div>
-      )}
+      {isLoading && <TableRowsSkeleton rows={5} />}
 
       {data && (
         <Card>

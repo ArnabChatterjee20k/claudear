@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import useSWR from 'swr'
 import { fetchOverview, getRetries, type Overview, type AttemptSummary, type RetriesResponse } from '../lib/api'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { OverviewPageSkeleton } from '../components/shared/page-skeletons'
 import { StatsCard } from '../components/shared/stats-card'
 import { StatusBadge } from '../components/shared/status-badge'
 import { getTimeAgo } from '../components/shared/time-ago'
@@ -59,11 +60,7 @@ export default function OverviewPage() {
   }
 
   if (overviewLoading || !overview) {
-    return (
-      <div className="flex items-center justify-center h-full">
-        <div className="animate-pulse text-muted-foreground">Loading...</div>
-      </div>
-    )
+    return <OverviewPageSkeleton />
   }
 
   const { stats, success_rate, merge_rate, recent_attempts, sources } = overview

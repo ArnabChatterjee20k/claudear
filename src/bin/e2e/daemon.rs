@@ -34,7 +34,6 @@ impl DaemonHandle {
             _ => None,
         }
     }
-
 }
 
 /// Start a native daemon process.
@@ -265,4 +264,3 @@ pub async fn wait_healthy(port: u16, timeout: Duration) -> Result<()> {
         }
     }
 }
-

@@ -12,10 +12,10 @@ import {
   type TelemetryTimeseries,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
+import { BlockSkeleton, StatsGridSkeleton } from '../components/shared/page-skeletons'
 import { StatsCard } from '../components/shared/stats-card'
 import { Select } from '../components/ui/select'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import {
   Activity,
   Bot,
@@ -160,11 +160,7 @@ export default function TelemetryPage() {
       )}
 
       {overviewLoading && (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-          {Array.from({ length: 8 }).map((_, i) => (
-            <Skeleton key={i} className="h-28" />
-          ))}
-        </div>
+        <StatsGridSkeleton count={14} className="md:grid-cols-2 lg:grid-cols-4" />
       )}
 
       {overview && (
@@ -299,7 +295,7 @@ export default function TelemetryPage() {
               <CardDescription>Success, failure, and pending volume over time</CardDescription>
             </CardHeader>
             <CardContent>
-              {seriesLoading && <Skeleton className="h-72 w-full" />}
+              {seriesLoading && <BlockSkeleton className="h-72 w-full" />}
               {!seriesLoading && chartData.length === 0 && (
                 <p className="text-sm text-muted-foreground py-8 text-center">
                   No telemetry samples yet
@@ -330,7 +326,7 @@ export default function TelemetryPage() {
               <CardDescription>Stage conversion, retries, PR checks, and cascade outcomes</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              {pipelineLoading && <Skeleton className="h-40 w-full" />}
+              {pipelineLoading && <BlockSkeleton className="h-40 w-full" />}
               {!pipelineLoading && pipeline && (
                 <>
                   <div className="grid gap-3 md:grid-cols-4">
@@ -424,7 +420,7 @@ export default function TelemetryPage() {
               <CardDescription>Latency histogram and per-status processing summaries</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              {latencyLoading && <Skeleton className="h-56 w-full" />}
+              {latencyLoading && <BlockSkeleton className="h-56 w-full" />}
               {!latencyLoading && latency && (
                 <>
                   <div className="grid gap-3 md:grid-cols-4">

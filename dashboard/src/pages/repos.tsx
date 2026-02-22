@@ -12,12 +12,12 @@ import {
   type IndexingProgress,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
+import { BlockSkeleton, StatsGridSkeleton } from '../components/shared/page-skeletons'
 import { StatsCard } from '../components/shared/stats-card'
 import { TimeAgo } from '../components/shared/time-ago'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { Modal } from '../components/shared/modal'
 import { Tabs } from '../components/ui/tabs'
-import { Skeleton } from '../components/ui/skeleton'
 import { Card, CardContent } from '../components/ui/card'
 import { formatNumber, formatDate } from '../lib/formatters'
 import { Database, FileText, Clock, ExternalLink, Loader2, GraduationCap } from 'lucide-react'
@@ -216,11 +216,7 @@ export default function ReposPage() {
       {isIndexing && <IndexingProgressBar progress={indexingProgress!} />}
 
       {statsLoading && (
-        <div className="grid gap-4 md:grid-cols-3">
-          {Array.from({ length: 3 }).map((_, i) => (
-            <Skeleton key={i} className="h-28" />
-          ))}
-        </div>
+        <StatsGridSkeleton count={3} className="md:grid-cols-3" />
       )}
 
       {stats && (
@@ -254,7 +250,7 @@ export default function ReposPage() {
         {activeTab =>
           activeTab === 'repos' ? (
             <>
-              {reposLoading && <Skeleton className="h-48 w-full" />}
+              {reposLoading && <BlockSkeleton className="h-48 w-full" />}
               {repos && (
                 <DataTable
                   columns={repoColumns}
@@ -267,7 +263,7 @@ export default function ReposPage() {
             </>
           ) : (
             <>
-              {depsLoading && <Skeleton className="h-32 w-full" />}
+              {depsLoading && <BlockSkeleton className="h-32 w-full" />}
               {deps && (
                 <DataTable
                   columns={depColumns}

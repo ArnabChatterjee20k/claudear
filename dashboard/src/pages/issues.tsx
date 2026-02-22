@@ -13,8 +13,8 @@ import { DataTable, type Column } from '../components/shared/data-table'
 import { StatusBadge } from '../components/shared/status-badge'
 import { TimeAgo } from '../components/shared/time-ago'
 import { Modal } from '../components/shared/modal'
+import { TableRowsSkeleton } from '../components/shared/page-skeletons'
 import { Card, CardContent } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import { formatDate, parseUTCDate } from '../lib/formatters'
 
 export default function IssuesPage() {
@@ -127,11 +127,7 @@ export default function IssuesPage() {
       )}
 
       {isLoading && (
-        <div className="space-y-2">
-          {Array.from({ length: 6 }).map((_, i) => (
-            <Skeleton key={i} className="h-10 w-full" />
-          ))}
-        </div>
+        <TableRowsSkeleton rows={6} />
       )}
 
       {data && (

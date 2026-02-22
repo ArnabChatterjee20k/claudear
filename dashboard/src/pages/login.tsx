@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useAuth } from '../lib/auth'
-import { Activity } from 'lucide-react'
+import { hideSentryFeedbackWidget } from '../lib/sentry'
 
 export default function LoginPage() {
   const { login } = useAuth()
@@ -22,6 +22,10 @@ export default function LoginPage() {
     }
   }
 
+  useEffect(() => {
+    hideSentryFeedbackWidget()
+  }, [])
+
   return (
     <div className="relative min-h-screen overflow-hidden bg-background">
       <div className="pointer-events-none absolute inset-0">
@@ -36,15 +40,15 @@ export default function LoginPage() {
             <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-primary/70 to-transparent" />
 
             <div className="border-b border-border/80 bg-background/60 px-4 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2">
+              <div className="relative flex items-center justify-center">
+                <div className="absolute left-0 flex items-center gap-2">
                   <span className="h-2.5 w-2.5 rounded-full bg-rose-400/70" />
                   <span className="h-2.5 w-2.5 rounded-full bg-amber-400/70" />
                   <span className="h-2.5 w-2.5 rounded-full bg-primary/80" />
                 </div>
-                <div className="font-mono text-[11px] text-muted-foreground">auth://dashboard</div>
-                <div className="rounded-full border border-primary/20 bg-primary/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-primary">
-                  secure
+                <div className="flex items-center gap-0 font-mono text-sm text-muted-foreground">
+                  claudear
+                  <span className="ml-[0.1em] inline-block h-[1em] w-[0.5em] rounded-[0.05em] bg-primary" />
                 </div>
               </div>
             </div>
@@ -52,21 +56,14 @@ export default function LoginPage() {
             <div className="p-6 sm:p-8">
               <div className="relative mb-6 overflow-hidden rounded-xl border border-border/70 bg-background/70 p-4">
                 <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary/8 via-transparent to-transparent" />
-                <div className="relative flex items-start justify-between gap-4">
+                <div className="relative min-w-0">
                   <div className="min-w-0">
-                    <div className="mb-1 flex items-center gap-0 font-mono text-sm font-semibold tracking-tight">
-                      claudear
-                      <span className="ml-1 inline-block h-3.5 w-1.5 rounded-[1px] bg-primary" />
-                    </div>
-                    <h1 className="mt-3 text-2xl font-semibold tracking-tight text-foreground">
+                    <h1 className="text-2xl font-semibold tracking-tight text-foreground">
                       Sign in
                     </h1>
                     <p className="mt-1 text-sm text-muted-foreground">
                       Dashboard access
                     </p>
-                  </div>
-                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-primary/25 bg-primary/10">
-                    <Activity className={`h-4 w-4 text-primary ${loading ? 'animate-spin' : ''}`} />
                   </div>
                 </div>
               </div>

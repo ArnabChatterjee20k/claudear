@@ -17,6 +17,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,7 +103,14 @@ pub fn create_api_router_with_dashboard(
             "/api/regressions/{id}/checks",
             get(regression_checks_handler),
         )
-        .route("/api/experiments", get(experiments_handler))
+        .route(
+            "/api/experiments",
+            get(experiments_handler).post(create_experiment_handler),
+        )
+        .route(
+            "/api/experiments/{id}",
+            axum::routing::put(update_experiment_handler),
+        )
         .route("/api/repos", get(repos_handler))
         .route("/api/repos/stats", get(repo_stats_handler))
         .route(
@@ -1491,6 +1499,96 @@ async fn experiments_handler(
         })
 }
 
+#[derive(Deserialize)]
+struct CreateExperimentRequest {
+    experiment_name: String,
+    variant: String,
+    prompt_template: String,
+    #[serde(default)]
+    active: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct UpdateExperimentRequest {
+    experiment_name: String,
+    variant: String,
+    prompt_template: String,
+    #[serde(default)]
+    active: Option<bool>,
+}
+
+async fn create_experiment_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Json(body): Json<CreateExperimentRequest>,
+) -> Result<(StatusCode, Json<crate::types::PromptExperiment>), StatusCode> {
+    let experiment_name = body.experiment_name.trim().to_string();
+    let variant = body.variant.trim().to_string();
+    if experiment_name.is_empty() || variant.is_empty() || body.prompt_template.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(body.prompt_template.as_bytes());
+    let prompt_hash = hex::encode(hasher.finalize());
+
+    let mut experiment = crate::types::PromptExperiment::new(
+        experiment_name,
+        variant,
+        body.prompt_template,
+        prompt_hash,
+    );
+    experiment.active = body.active.unwrap_or(true);
+
+    let id = state.tracker.save_experiment(&experiment).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    experiment.id = id;
+
+    Ok((StatusCode::CREATED, Json(experiment)))
+}
+
+async fn update_experiment_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateExperimentRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let experiment_name = body.experiment_name.trim().to_string();
+    let variant = body.variant.trim().to_string();
+    if experiment_name.is_empty() || variant.is_empty() || body.prompt_template.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(body.prompt_template.as_bytes());
+    let prompt_hash = hex::encode(hasher.finalize());
+
+    let updated = state
+        .tracker
+        .update_experiment(
+            id,
+            &experiment_name,
+            &variant,
+            &body.prompt_template,
+            &prompt_hash,
+            body.active.unwrap_or(true),
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if !updated {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 async fn repos_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
@@ -2447,6 +2545,26 @@ mod tests {
             .unwrap()
     }
 
+    fn auth_post_json(uri: &str, token: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("cookie", format!("claudear_session={}", token))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn auth_put_json(uri: &str, token: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("cookie", format!("claudear_session={}", token))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_health_endpoint() {
         let tracker = create_test_tracker();
@@ -3223,6 +3341,130 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let experiments: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(experiments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_experiment_endpoint() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_post_json(
+                "/api/experiments",
+                &token,
+                serde_json::json!({
+                    "experiment_name": "prompt-ab",
+                    "variant": "control",
+                    "prompt_template": "Fix issue: {{issue}}",
+                    "active": true
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let experiment: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(experiment["experiment_name"], "prompt-ab");
+        assert_eq!(experiment["variant"], "control");
+        assert_eq!(experiment["prompt_template"], "Fix issue: {{issue}}");
+        assert_eq!(experiment["active"], true);
+        assert!(experiment["id"].as_i64().unwrap() > 0);
+        assert_eq!(experiment["success_count"], 0);
+        assert_eq!(experiment["failure_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_experiment_endpoint_invalid_payload() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_post_json(
+                "/api/experiments",
+                &token,
+                serde_json::json!({
+                    "experiment_name": "  ",
+                    "variant": "control",
+                    "prompt_template": ""
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_experiment_endpoint() {
+        let tracker = create_test_tracker();
+        let exp_id = tracker
+            .save_experiment(&crate::types::PromptExperiment::new(
+                "prompt-ab",
+                "control",
+                "Fix issue: {{issue}}",
+                "oldhash",
+            ))
+            .unwrap();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_put_json(
+                &format!("/api/experiments/{exp_id}"),
+                &token,
+                serde_json::json!({
+                    "experiment_name": "prompt-ab-v2",
+                    "variant": "variant-a",
+                    "prompt_template": "Fix issue carefully: {{issue}}",
+                    "active": true
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let experiments = tracker.get_active_experiments().unwrap();
+        assert_eq!(experiments.len(), 1);
+        assert_eq!(experiments[0].id, exp_id);
+        assert_eq!(experiments[0].experiment_name, "prompt-ab-v2");
+        assert_eq!(experiments[0].variant, "variant-a");
+        assert_eq!(
+            experiments[0].prompt_template,
+            "Fix issue carefully: {{issue}}"
+        );
+        assert_ne!(experiments[0].prompt_hash, "oldhash");
+    }
+
+    #[tokio::test]
+    async fn test_update_experiment_endpoint_can_deactivate() {
+        let tracker = create_test_tracker();
+        let exp_id = tracker
+            .save_experiment(&crate::types::PromptExperiment::new(
+                "prompt-ab",
+                "control",
+                "Fix issue: {{issue}}",
+                "oldhash",
+            ))
+            .unwrap();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_put_json(
+                &format!("/api/experiments/{exp_id}"),
+                &token,
+                serde_json::json!({
+                    "experiment_name": "prompt-ab",
+                    "variant": "control",
+                    "prompt_template": "Fix issue: {{issue}}",
+                    "active": false
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(tracker.get_active_experiments().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -7,9 +7,9 @@ import {
 } from '../lib/api'
 import { parseUTCDate, formatMins } from '../lib/formatters'
 import { PageHeader } from '../components/layout/page-header'
+import { BlockSkeleton, StatsGridSkeleton } from '../components/shared/page-skeletons'
 import { StatsCard } from '../components/shared/stats-card'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import { BarChart3, Clock, CheckCircle2, AlertTriangle, DollarSign, TrendingUp } from 'lucide-react'
 import {
   LineChart,
@@ -49,11 +49,7 @@ export default function AnalyticsPage() {
       <PageHeader title="Analytics" description="Trends, metrics, and performance insights" />
 
       {summaryLoading && (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <Skeleton key={i} className="h-28" />
-          ))}
-        </div>
+        <StatsGridSkeleton count={6} className="md:grid-cols-3 xl:grid-cols-6" />
       )}
 
       {summary && (
@@ -211,7 +207,7 @@ export default function AnalyticsPage() {
           <CardDescription>Time series of processing durations</CardDescription>
         </CardHeader>
         <CardContent>
-          {metricsLoading && <Skeleton className="h-64 w-full" />}
+          {metricsLoading && <BlockSkeleton className="h-64 w-full" />}
           {!metricsLoading && chartData.length === 0 && (
             <p className="text-sm text-muted-foreground py-8 text-center">
               No metrics data available yet

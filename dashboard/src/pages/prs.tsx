@@ -11,9 +11,9 @@ import { StatsCard } from '../components/shared/stats-card'
 import { StatusBadge } from '../components/shared/status-badge'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { Modal } from '../components/shared/modal'
+import { StatsGridSkeleton, TableRowsSkeleton } from '../components/shared/page-skeletons'
 import { Select } from '../components/ui/select'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import { formatMins, formatDate } from '../lib/formatters'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import {
@@ -117,11 +117,7 @@ export default function PrsPage() {
       <PageHeader title="Pull Requests" description="PR lifecycle and review analytics" />
 
       {analyticsLoading && (
-        <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-6">
-          {Array.from({ length: 6 }).map((_, i) => (
-            <Skeleton key={i} className="h-28" />
-          ))}
-        </div>
+        <StatsGridSkeleton count={7} className="md:grid-cols-3 lg:grid-cols-7" />
       )}
 
       {analytics && (
@@ -186,10 +182,37 @@ export default function PrsPage() {
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={analytics.rejection_reasons} layout="vertical">
                   <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
-                  <XAxis type="number" tick={{ fontSize: 12 }} className="text-muted-foreground" />
-                  <YAxis type="category" dataKey="category" tick={{ fontSize: 12 }} className="text-muted-foreground" width={150} />
-                  <Tooltip />
-                  <Bar dataKey="count" fill="#f97316" radius={[0, 4, 4, 0]} name="Count" />
+                  <XAxis
+                    type="number"
+                    allowDecimals={false}
+                    tick={{ fontSize: 12 }}
+                    className="text-muted-foreground"
+                  />
+                  <YAxis
+                    type="category"
+                    dataKey="category"
+                    tick={{ fontSize: 12 }}
+                    className="text-muted-foreground"
+                    width={150}
+                  />
+                  <Tooltip
+                    cursor={{ fill: 'hsl(var(--muted) / 0.35)' }}
+                    contentStyle={{
+                      backgroundColor: 'hsl(var(--card))',
+                      border: '1px solid hsl(var(--border))',
+                      borderRadius: '8px',
+                      color: 'hsl(var(--card-foreground))',
+                    }}
+                    labelStyle={{ color: 'hsl(var(--muted-foreground))' }}
+                    itemStyle={{ color: 'hsl(var(--foreground))' }}
+                  />
+                  <Bar
+                    dataKey="count"
+                    fill="hsl(var(--primary))"
+                    fillOpacity={0.95}
+                    radius={[4, 4, 4, 4]}
+                    name="Count"
+                  />
                 </BarChart>
               </ResponsiveContainer>
             </div>
@@ -212,11 +235,7 @@ export default function PrsPage() {
       )}
 
       {prsLoading && (
-        <div className="space-y-2">
-          {Array.from({ length: 5 }).map((_, i) => (
-            <Skeleton key={i} className="h-10 w-full" />
-          ))}
-        </div>
+        <TableRowsSkeleton rows={5} />
       )}
 
       {prs && (

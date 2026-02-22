@@ -12,7 +12,7 @@ import { PageHeader } from '../components/layout/page-header'
 import { Select } from '../components/ui/select'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
 import { Badge } from '../components/ui/badge'
-import { Skeleton } from '../components/ui/skeleton'
+import { BlockSkeleton, TableRowsSkeleton } from '../components/shared/page-skeletons'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { StatusBadge } from '../components/shared/status-badge'
 import { TimeAgo } from '../components/shared/time-ago'
@@ -182,11 +182,7 @@ export default function AttemptsPage() {
       )}
 
       {isLoading && (
-        <div className="space-y-2">
-          {Array.from({ length: 6 }).map((_, i) => (
-            <Skeleton key={i} className="h-10 w-full" />
-          ))}
-        </div>
+        <TableRowsSkeleton rows={6} />
       )}
 
       {data && (
@@ -231,7 +227,7 @@ export default function AttemptsPage() {
 
       {selectedId && (
         <div className="space-y-4">
-          {detailLoading && <Skeleton className="h-48 w-full" />}
+          {detailLoading && <BlockSkeleton className="h-48 w-full" />}
 
           {detail && (
             <>
@@ -408,7 +404,7 @@ export default function AttemptsPage() {
                     )}
                   </CardHeader>
                   <CardContent>
-                    {executionLogLoading && <Skeleton className="h-48 w-full" />}
+                    {executionLogLoading && <BlockSkeleton className="h-48 w-full" />}
                     {executionLogError && (
                       <p className="text-sm text-destructive">
                         Failed to load execution log.

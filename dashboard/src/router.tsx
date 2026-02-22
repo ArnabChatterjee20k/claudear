@@ -40,7 +40,7 @@ export function RouterProvider({ children }: { children: React.ReactNode }) {
 export function Router({
   routes,
 }: {
-  routes: Record<string, () => JSX.Element>
+  routes: Record<string, () => JSX.Element | null>
 }) {
   const { path } = useRouter()
 

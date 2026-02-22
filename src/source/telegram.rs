@@ -394,9 +394,7 @@ mod tests {
                 is_bot,
                 username: Some("testuser".to_string()),
             }),
-            chat: TelegramChat {
-                id: -1001234567890,
-            },
+            chat: TelegramChat { id: -1001234567890 },
             text: Some(text.to_string()),
         }
     }
@@ -587,9 +585,7 @@ mod tests {
         let msg = TelegramMessage {
             message_id: 99,
             from: None,
-            chat: TelegramChat {
-                id: -1001234567890,
-            },
+            chat: TelegramChat { id: -1001234567890 },
             text: Some("Anonymous message".to_string()),
         };
         let issue = TelegramSource::message_to_issue(&msg);
@@ -603,9 +599,7 @@ mod tests {
         let msg = TelegramMessage {
             message_id: 50,
             from: None,
-            chat: TelegramChat {
-                id: 100,
-            },
+            chat: TelegramChat { id: 100 },
             text: None,
         };
         let issue = TelegramSource::message_to_issue(&msg);
@@ -764,9 +758,7 @@ mod tests {
                 is_bot: false,
                 username: None,
             }),
-            chat: TelegramChat {
-                id: -1001234567890,
-            },
+            chat: TelegramChat { id: -1001234567890 },
             text: None,
         };
 
@@ -786,9 +778,7 @@ mod tests {
                 is_bot: false,
                 username: None,
             }),
-            chat: TelegramChat {
-                id: -1009999999999,
-            },
+            chat: TelegramChat { id: -1009999999999 },
             text: Some("hello".to_string()),
         };
 
@@ -937,9 +927,7 @@ mod tests {
                 is_bot: false,
                 username: None,
             }),
-            chat: TelegramChat {
-                id: -1001234567890,
-            },
+            chat: TelegramChat { id: -1001234567890 },
             text: Some("hello".to_string()),
         };
         let issue = TelegramSource::message_to_issue(&msg);
@@ -1119,9 +1107,7 @@ mod tests {
                 is_bot: false,
                 username: Some("alice".to_string()),
             }),
-            chat: TelegramChat {
-                id: 12345,
-            },
+            chat: TelegramChat { id: 12345 },
             text: Some("DM message".to_string()),
         };
         let issue = TelegramSource::message_to_issue(&msg);

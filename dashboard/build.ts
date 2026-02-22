@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync, renameSync, existsSync, globSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, readdirSync, unlinkSync, renameSync, existsSync } from "fs";
 import { join } from "path";
 import { createHash } from "crypto";
 

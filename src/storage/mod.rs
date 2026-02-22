@@ -1101,6 +1101,19 @@ pub trait FixAttemptTracker: Send + Sync {
         Ok(0)
     }
 
+    /// Update an existing prompt experiment configuration.
+    fn update_experiment(
+        &self,
+        _experiment_id: i64,
+        _experiment_name: &str,
+        _variant: &str,
+        _prompt_template: &str,
+        _prompt_hash: &str,
+        _active: bool,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Update experiment stats after a result.
     fn update_experiment_stats(
         &self,

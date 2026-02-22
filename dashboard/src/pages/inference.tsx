@@ -7,13 +7,13 @@ import {
   type InferenceHistoryEntry,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
+import { BlockSkeleton, StatsGridSkeleton } from '../components/shared/page-skeletons'
 import { StatsCard } from '../components/shared/stats-card'
 import { TimeAgo } from '../components/shared/time-ago'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { Modal } from '../components/shared/modal'
 import { Badge } from '../components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import { formatDate } from '../lib/formatters'
 import {
   Brain,
@@ -118,11 +118,7 @@ export default function InferencePage() {
       <PageHeader title="Inference" description="Repository inference accuracy and history" />
 
       {statsLoading && (
-        <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-6">
-          {Array.from({ length: 6 }).map((_, i) => (
-            <Skeleton key={i} className="h-28" />
-          ))}
-        </div>
+        <StatsGridSkeleton count={6} className="md:grid-cols-3 lg:grid-cols-6" />
       )}
 
       {stats && (
@@ -170,7 +166,7 @@ export default function InferencePage() {
         <div className="text-destructive text-sm">Failed to load inference history.</div>
       )}
 
-      {historyLoading && <Skeleton className="h-64 w-full" />}
+      {historyLoading && <BlockSkeleton className="h-64 w-full" />}
 
       {history && (
         <Card>

@@ -725,8 +725,7 @@ fn create_tracker(config: &Config) -> Arc<dyn FixAttemptTracker> {
             .clone()
             .unwrap_or_else(|| "default".to_string());
         let cache = config.redis_url.as_ref().map(|url| {
-            let client =
-                redis::Client::open(url.as_str()).expect("Failed to create Redis client");
+            let client = redis::Client::open(url.as_str()).expect("Failed to create Redis client");
             rt.block_on(redis::aio::ConnectionManager::new(client))
                 .expect("Failed to connect to Redis")
         });

@@ -10,13 +10,19 @@
  */
 
 import { chromium, type Page, type Route } from 'playwright';
-import { resolve, join } from 'path';
+import { mkdirSync, readdirSync, symlinkSync, unlinkSync } from 'fs';
+import { resolve, join, dirname, relative } from 'path';
 import * as mock from './mock-data';
 
 const ROOT = resolve(import.meta.dir, '..', '..');
 const DASHBOARD_DIR = join(ROOT, 'dashboard');
 const DIST_DIR = join(DASHBOARD_DIR, 'dist');
-const OUTPUT_DIR = join(ROOT, 'website', 'assets', 'screenshots');
+const OUTPUT_DIR = join(ROOT, 'assets', 'screenshots');
+const WEBSITE_SCREENSHOTS_DIR = join(ROOT, 'website', 'assets', 'screenshots');
+const WEBSITE_LINKED_SCREENSHOTS = new Set(['overview', 'analytics', 'telemetry']);
+
+mkdirSync(OUTPUT_DIR, { recursive: true });
+mkdirSync(WEBSITE_SCREENSHOTS_DIR, { recursive: true });
 
 // ── 1. Build dashboard ──────────────────────────────────────────────────
 
@@ -65,6 +71,7 @@ console.log(`  Serving at ${BASE_URL}`);
 // ── 3. Route interception map ───────────────────────────────────────────
 
 type MockEntry = { pattern: RegExp; data: unknown };
+const unmatchedApiRoutes = new Set<string>();
 
 const mocks: MockEntry[] = [
   // Auth -- must come first so auth gate is bypassed
@@ -102,6 +109,7 @@ const mocks: MockEntry[] = [
 
 async function interceptRoute(route: Route) {
   const url = route.request().url();
+  const reqUrl = new URL(url);
 
   for (const { pattern, data } of mocks) {
     if (pattern.test(url)) {
@@ -114,15 +122,54 @@ async function interceptRoute(route: Route) {
   }
 
   // Catch-all for unmatched API routes
-  if (url.includes('/api/')) {
+  if (reqUrl.origin === BASE_URL && reqUrl.pathname.startsWith('/api/')) {
+    unmatchedApiRoutes.add(url);
     return route.fulfill({
-      status: 200,
+      status: 500,
       contentType: 'application/json',
-      body: JSON.stringify({}),
+      body: JSON.stringify({ error: 'Unmocked API route', url }),
     });
   }
 
   return route.continue();
+}
+
+function failIfUnmatchedApiRoutes(context: string) {
+  if (unmatchedApiRoutes.size === 0) return;
+  const urls = [...unmatchedApiRoutes].map((u) => `  - ${u}`).join('\n');
+  throw new Error(`Unmocked API route(s) detected while ${context}:\n${urls}`);
+}
+
+function linkWebsiteScreenshot(name: string) {
+  if (!WEBSITE_LINKED_SCREENSHOTS.has(name)) return;
+
+  const sourcePath = join(OUTPUT_DIR, `${name}.png`);
+  const linkPath = join(WEBSITE_SCREENSHOTS_DIR, `${name}.png`);
+  const targetFromWebsiteDir = relative(dirname(linkPath), sourcePath);
+
+  try {
+    unlinkSync(linkPath);
+  } catch (err) {
+    if (!(err instanceof Error) || !('code' in err) || (err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw err;
+    }
+  }
+
+  symlinkSync(targetFromWebsiteDir, linkPath);
+  console.log(`  Linked ${linkPath} -> ${targetFromWebsiteDir}`);
+}
+
+function pruneManagedWebsiteScreenshots(targetNames: string[]) {
+  const managedTargetFiles = new Set(targetNames.map((name) => `${name}.png`));
+  const linkedFiles = new Set([...WEBSITE_LINKED_SCREENSHOTS].map((name) => `${name}.png`));
+
+  for (const entry of readdirSync(WEBSITE_SCREENSHOTS_DIR)) {
+    if (!entry.endsWith('.png')) continue;
+    if (!managedTargetFiles.has(entry)) continue;
+    if (linkedFiles.has(entry)) continue;
+    unlinkSync(join(WEBSITE_SCREENSHOTS_DIR, entry));
+    console.log(`  Removed stale website screenshot ${join(WEBSITE_SCREENSHOTS_DIR, entry)}`);
+  }
 }
 
 // ── 4. Capture screenshots ──────────────────────────────────────────────
@@ -137,7 +184,7 @@ interface ScreenshotTarget {
 const targets: ScreenshotTarget[] = [
   { name: 'overview',    path: '/',             waitFor: 'text=Total Attempts' },
   { name: 'issues',      path: '/issues',       waitFor: 'text=Issue ID' },
-  { name: 'attempts',    path: '/attempts',     waitFor: 'text=Status' },
+  { name: 'attempts',    path: '/attempts',     waitFor: 'h1:has-text("Attempts")' },
   { name: 'prs',         path: '/prs',          waitFor: 'text=Total PRs' },
   { name: 'analytics',   path: '/analytics',    waitFor: 'text=Success Rate by Source' },
   { name: 'errors',      path: '/errors',       waitFor: 'text=Error Type' },
@@ -171,31 +218,42 @@ const page = await context.newPage();
 // Register route interception for all requests
 await page.route('**/*', interceptRoute);
 
-for (const target of targets) {
-  const url = `${BASE_URL}${target.path}`;
-  console.log(`  Capturing ${target.name} (${target.path})...`);
+try {
+  for (const target of targets) {
+    const url = `${BASE_URL}${target.path}`;
+    console.log(`  Capturing ${target.name} (${target.path})...`);
 
-  await page.goto(url, { waitUntil: 'networkidle' });
+    const unmatchedCountBefore = unmatchedApiRoutes.size;
 
-  // Wait for the key content selector
-  try {
-    await page.waitForSelector(target.waitFor, { timeout: 10_000 });
-  } catch {
-    console.warn(`  Warning: selector "${target.waitFor}" not found for ${target.name}, capturing anyway`);
+    await page.goto(url, { waitUntil: 'networkidle' });
+    if (unmatchedApiRoutes.size !== unmatchedCountBefore) {
+      failIfUnmatchedApiRoutes(`loading ${target.name}`);
+    }
+
+    // Wait for the key content selector
+    try {
+      await page.waitForSelector(target.waitFor, { timeout: 10_000 });
+    } catch {
+      console.warn(`  Warning: selector "${target.waitFor}" not found for ${target.name}, capturing anyway`);
+    }
+
+    // Let animations settle
+    await page.waitForTimeout(1500);
+    if (unmatchedApiRoutes.size !== unmatchedCountBefore) {
+      failIfUnmatchedApiRoutes(`capturing ${target.name}`);
+    }
+
+    const outPath = join(OUTPUT_DIR, `${target.name}.png`);
+    await page.screenshot({ path: outPath, fullPage: false });
+    console.log(`  Saved ${outPath}`);
+    linkWebsiteScreenshot(target.name);
   }
 
-  // Let animations settle
-  await page.waitForTimeout(1500);
-
-  const outPath = join(OUTPUT_DIR, `${target.name}.png`);
-  await page.screenshot({ path: outPath, fullPage: false });
-  console.log(`  Saved ${outPath}`);
+  pruneManagedWebsiteScreenshots(targets.map((t) => t.name));
+  console.log(`\nDone! ${targets.length} screenshots saved to ${OUTPUT_DIR}`);
+} finally {
+  // ── 5. Cleanup ────────────────────────────────────────────────────────
+  console.log('[4/4] Cleaning up...');
+  await browser.close();
+  server.stop();
 }
-
-// ── 5. Cleanup ──────────────────────────────────────────────────────────
-
-console.log('[4/4] Cleaning up...');
-await browser.close();
-server.stop();
-
-console.log(`\nDone! ${targets.length} screenshots saved to ${OUTPUT_DIR}`);

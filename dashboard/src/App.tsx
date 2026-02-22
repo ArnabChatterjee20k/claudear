@@ -41,7 +41,7 @@ function SentryFallback() {
   )
 }
 
-const routes: Record<string, () => JSX.Element> = {
+const routes: Record<string, () => JSX.Element | null> = {
   '/': OverviewPage,
   '/issues': IssuesPage,
   '/attempts': AttemptsPage,

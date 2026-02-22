@@ -387,6 +387,13 @@ export interface PromptExperiment {
   avg_review_score: number | null;
 }
 
+export interface CreatePromptExperimentRequest {
+  experiment_name: string;
+  variant: string;
+  prompt_template: string;
+  active?: boolean;
+}
+
 export interface StoredIndexedRepo {
   id: number;
   name: string;
@@ -815,6 +822,19 @@ export async function fetchRegressionChecks(watchId: number): Promise<Regression
 
 export async function fetchExperiments(): Promise<PromptExperiment[]> {
   return fetchJson(`${API_BASE}/experiments`);
+}
+
+export async function createExperiment(
+  data: CreatePromptExperimentRequest,
+): Promise<PromptExperiment> {
+  return postJson(`${API_BASE}/experiments`, data);
+}
+
+export async function updateExperiment(
+  id: number,
+  data: CreatePromptExperimentRequest,
+): Promise<{ ok: boolean }> {
+  return putJson(`${API_BASE}/experiments/${id}`, data);
 }
 
 export async function fetchRepos(): Promise<StoredIndexedRepo[]> {

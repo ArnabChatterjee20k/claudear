@@ -1,29 +1,23 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState } from 'react'
+import useSWR from 'swr'
 import { fetchUsers, createUser, updateUser, deleteUser, type UserRecord } from '../lib/api'
 import { parseUTCDate } from '../lib/formatters'
 import { useAuth } from '../lib/auth'
+import { UsersTableSkeleton } from '../components/shared/page-skeletons'
 import { Plus, Pencil, Trash2, X } from 'lucide-react'
 
 export default function UsersPage() {
   const { user: currentUser } = useAuth()
-  const [users, setUsers] = useState<UserRecord[]>([])
-  const [loading, setLoading] = useState(true)
   const [showForm, setShowForm] = useState(false)
   const [editingUser, setEditingUser] = useState<UserRecord | null>(null)
-  const [error, setError] = useState('')
+  const [actionError, setActionError] = useState('')
 
-  const loadUsers = useCallback(async () => {
-    try {
-      const data = await fetchUsers()
-      setUsers(data)
-    } catch {
-      setError('Failed to load users')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => { loadUsers() }, [loadUsers])
+  const {
+    data: users = [],
+    error: loadError,
+    isLoading,
+    mutate,
+  } = useSWR<UserRecord[]>('users', fetchUsers)
 
   if (currentUser?.role !== 'admin') {
     return <div className="text-muted-foreground text-sm">You don't have permission to manage users.</div>
@@ -31,11 +25,12 @@ export default function UsersPage() {
 
   const handleDelete = async (id: number) => {
     if (!confirm('Delete this user?')) return
+    setActionError('')
     try {
       await deleteUser(id)
-      await loadUsers()
+      await mutate()
     } catch {
-      setError('Failed to delete user')
+      setActionError('Failed to delete user')
     }
   }
 
@@ -51,20 +46,26 @@ export default function UsersPage() {
         </button>
       </div>
 
-      {error && (
-        <div className="bg-destructive/10 text-destructive text-sm p-3 rounded-md">{error}</div>
+      {(actionError || loadError) && (
+        <div className="bg-destructive/10 text-destructive text-sm p-3 rounded-md">
+          {actionError || 'Failed to load users'}
+        </div>
       )}
 
       {showForm && (
         <UserForm
           user={editingUser}
-          onSave={async () => { setShowForm(false); await loadUsers() }}
+          onSave={() => {
+            setShowForm(false)
+            setActionError('')
+            void mutate().catch(() => setActionError('Failed to refresh users'))
+          }}
           onCancel={() => setShowForm(false)}
         />
       )}
 
-      {loading ? (
-        <div className="text-muted-foreground text-sm">Loading...</div>
+      {isLoading ? (
+        <UsersTableSkeleton rows={5} />
       ) : (
         <div className="border rounded-lg overflow-hidden">
           <table className="w-full text-sm">

@@ -104,10 +104,7 @@ impl PostgresBackend {
     /// Get a client from the pool (async, called inside block_on).
     async fn client(
         &self,
-    ) -> std::result::Result<
-        deadpool_postgres::Object,
-        deadpool_postgres::PoolError,
-    > {
+    ) -> std::result::Result<deadpool_postgres::Object, deadpool_postgres::PoolError> {
         self.pool.get().await
     }
 
@@ -138,9 +135,7 @@ impl PostgresBackend {
         let mut conn = cache.clone();
         match serde_json::to_string(value) {
             Ok(json) => {
-                if let Err(e) =
-                    self.block_on(async { conn.set::<_, _, ()>(key, json).await })
-                {
+                if let Err(e) = self.block_on(async { conn.set::<_, _, ()>(key, json).await }) {
                     tracing::warn!(error = %e, key, "redis: SET failed");
                 }
             }
@@ -244,7 +239,12 @@ impl PostgresBackend {
             .await
             .ok()
             .flatten()
-            .map(|r| (Some(r.get::<_, i64>("id")), r.get::<_, Option<String>>("pr_url")))
+            .map(|r| {
+                (
+                    Some(r.get::<_, i64>("id")),
+                    r.get::<_, Option<String>>("pr_url"),
+                )
+            })
             .unwrap_or((None, None))
         })
     }
@@ -347,12 +347,8 @@ impl PostgresBackend {
             name: row.get("name"),
             role: row.get("role"),
             avatar_url: row.get("avatar_url"),
-            created_at: row
-                .get::<_, DateTime<Utc>>("created_at")
-                .to_rfc3339(),
-            updated_at: row
-                .get::<_, DateTime<Utc>>("updated_at")
-                .to_rfc3339(),
+            created_at: row.get::<_, DateTime<Utc>>("created_at").to_rfc3339(),
+            updated_at: row.get::<_, DateTime<Utc>>("updated_at").to_rfc3339(),
         }
     }
 }
@@ -765,7 +761,13 @@ impl FixAttemptTracker for PostgresBackend {
         short_id: &str,
         labels: &[String],
     ) -> Result<()> {
-        tracing::info!(source, issue_id, short_id, labels_count = labels.len(), "Recording fix attempt");
+        tracing::info!(
+            source,
+            issue_id,
+            short_id,
+            labels_count = labels.len(),
+            "Recording fix attempt"
+        );
 
         let labels_json: Option<String> = if labels.is_empty() {
             None
@@ -820,7 +822,11 @@ impl FixAttemptTracker for PostgresBackend {
                 tracing::info!(source, issue_id, "Fix attempt updated (was in reset state)");
             }
             Some((_id, None)) => {
-                tracing::warn!(source, issue_id, "Attempt already exists and is not in reset state, skipping");
+                tracing::warn!(
+                    source,
+                    issue_id,
+                    "Attempt already exists and is not in reset state, skipping"
+                );
             }
         }
 
@@ -859,7 +865,12 @@ impl FixAttemptTracker for PostgresBackend {
     }
 
     fn mark_failed(&self, source: &str, issue_id: &str, error_message: &str) -> Result<()> {
-        tracing::info!(source, issue_id, error_message, "Marking fix attempt as failed");
+        tracing::info!(
+            source,
+            issue_id,
+            error_message,
+            "Marking fix attempt as failed"
+        );
 
         let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
         self.block_on(async {
@@ -977,7 +988,12 @@ impl FixAttemptTracker for PostgresBackend {
     }
 
     fn mark_cannot_fix(&self, source: &str, issue_id: &str, reason: &str) -> Result<()> {
-        tracing::info!(source, issue_id, reason, "Marking fix attempt as cannot_fix");
+        tracing::info!(
+            source,
+            issue_id,
+            reason,
+            "Marking fix attempt as cannot_fix"
+        );
 
         let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
         self.block_on(async {
@@ -1051,7 +1067,12 @@ impl FixAttemptTracker for PostgresBackend {
         })?;
 
         if let Some(id) = existing_id {
-            tracing::info!(source, issue_id, cascade_repo, "Cascade attempt already exists, skipping");
+            tracing::info!(
+                source,
+                issue_id,
+                cascade_repo,
+                "Cascade attempt already exists, skipping"
+            );
             return Ok(id);
         }
 
@@ -1069,7 +1090,14 @@ impl FixAttemptTracker for PostgresBackend {
             Ok::<i64, crate::error::Error>(row.get("id"))
         })?;
 
-        tracing::info!(source, issue_id, cascade_repo, parent_attempt_id, attempt_id = id, "Recorded cascade fix attempt");
+        tracing::info!(
+            source,
+            issue_id,
+            cascade_repo,
+            parent_attempt_id,
+            attempt_id = id,
+            "Recorded cascade fix attempt"
+        );
         self.invalidate_attempt_keys(source, issue_id, Some(id), None);
         Ok(id)
     }
@@ -1222,13 +1250,7 @@ impl FixAttemptTracker for PostgresBackend {
     // User writes (with cache invalidation)
     // -----------------------------------------------------------------------
 
-    fn create_user(
-        &self,
-        email: &str,
-        password_hash: &str,
-        name: &str,
-        role: &str,
-    ) -> Result<i64> {
+    fn create_user(&self, email: &str, password_hash: &str, name: &str, role: &str) -> Result<i64> {
         let id: i64 = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
             let row = c

@@ -5,8 +5,8 @@ import { PageHeader } from '../components/layout/page-header'
 import { Select } from '../components/ui/select'
 import { Badge } from '../components/ui/badge'
 import { Card, CardContent } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import { EmptyState } from '../components/shared/empty-state'
+import { TableRowsSkeleton } from '../components/shared/page-skeletons'
 import { TimeAgo } from '../components/shared/time-ago'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
@@ -76,13 +76,7 @@ export default function ActivityPage() {
         <div className="text-destructive text-sm">Failed to load activity log.</div>
       )}
 
-      {isLoading && (
-        <div className="space-y-3">
-          {Array.from({ length: 8 }).map((_, i) => (
-            <Skeleton key={i} className="h-16 w-full" />
-          ))}
-        </div>
-      )}
+      {isLoading && <TableRowsSkeleton rows={8} rowClassName="h-16 w-full" className="space-y-3" />}
 
       {data && data.length === 0 && <EmptyState message="No activity recorded yet" />}
 

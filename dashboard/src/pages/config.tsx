@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import useSWR from 'swr'
 import { fetchConfig, saveConfig, type ConfigResponse } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
+import { CardStackSkeleton } from '../components/shared/page-skeletons'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import { Badge } from '../components/ui/badge'
 import {
   Settings, Save, RotateCcw, FileText, AlertTriangle,
@@ -508,11 +508,7 @@ export default function ConfigPage() {
 
       {/* Loading */}
       {isLoading && (
-        <div className="space-y-4">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <Skeleton key={i} className="h-32" />
-          ))}
-        </div>
+        <CardStackSkeleton count={4} itemClassName="h-32" />
       )}
 
       {/* Error */}

@@ -7,14 +7,14 @@ import {
   type RepoLearningResponse,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
+import { StatsGridSkeleton } from '../components/shared/page-skeletons'
 import { StatsCard } from '../components/shared/stats-card'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { Tabs } from '../components/ui/tabs'
-import { Skeleton } from '../components/ui/skeleton'
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
 import { formatDate } from '../lib/formatters'
 import {
-  BookOpen, ScrollText, Eye, Lightbulb, GitCompare, Link2, ChevronDown,
+  BookOpen, ScrollText, Eye, Lightbulb, Link2, ChevronDown,
 } from 'lucide-react'
 
 const tabItems = [
@@ -116,11 +116,7 @@ export default function LearningPage() {
       )}
 
       {selectedRepo && isLoading && (
-        <div className="grid gap-4 md:grid-cols-4">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <Skeleton key={i} className="h-28" />
-          ))}
-        </div>
+        <StatsGridSkeleton count={4} className="md:grid-cols-4" />
       )}
 
       {selectedRepo && error && (

@@ -3638,6 +3638,37 @@ impl FixAttemptTracker for SqliteTracker {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Update prompt experiment configuration fields.
+    fn update_experiment(
+        &self,
+        experiment_id: i64,
+        experiment_name: &str,
+        variant: &str,
+        prompt_template: &str,
+        prompt_hash: &str,
+        active: bool,
+    ) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+
+        let rows = conn.execute(
+            r#"
+            UPDATE prompt_experiments
+            SET experiment_name = ?, variant = ?, prompt_template = ?, prompt_hash = ?, active = ?
+            WHERE id = ?
+            "#,
+            params![
+                experiment_name,
+                variant,
+                prompt_template,
+                prompt_hash,
+                active as i32,
+                experiment_id,
+            ],
+        )?;
+
+        Ok(rows > 0)
+    }
+
     /// Update experiment statistics.
     fn update_experiment_stats(
         &self,

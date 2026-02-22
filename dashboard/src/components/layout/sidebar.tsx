@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useRouter } from '../../router'
 import { useAuth } from '../../lib/auth'
 import { getInitials } from '../../lib/formatters'
+import { prefetchRouteData } from '../../lib/route-prefetch'
 import {
   BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
@@ -60,6 +61,10 @@ export function Sidebar() {
   const { user, logout } = useAuth()
   const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
 
+  const handlePrefetch = (nextPath: string) => {
+    prefetchRouteData(nextPath)
+  }
+
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
     localStorage.setItem('theme', dark ? 'dark' : 'light')
@@ -89,6 +94,8 @@ export function Sidebar() {
                   <button
                     key={itemPath}
                     onClick={() => navigate(itemPath)}
+                    onMouseEnter={() => handlePrefetch(itemPath)}
+                    onFocus={() => handlePrefetch(itemPath)}
                     className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
                       isActive
                         ? 'bg-primary/10 text-primary font-medium'
@@ -111,6 +118,8 @@ export function Sidebar() {
             <div className="space-y-0.5">
               <button
                 onClick={() => navigate('/config')}
+                onMouseEnter={() => handlePrefetch('/config')}
+                onFocus={() => handlePrefetch('/config')}
                 className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
                   path === '/config'
                     ? 'bg-primary/10 text-primary font-medium'
@@ -122,6 +131,8 @@ export function Sidebar() {
               </button>
               <button
                 onClick={() => navigate('/users')}
+                onMouseEnter={() => handlePrefetch('/users')}
+                onFocus={() => handlePrefetch('/users')}
                 className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
                   path === '/users'
                     ? 'bg-primary/10 text-primary font-medium'
@@ -139,6 +150,8 @@ export function Sidebar() {
         <div className="flex items-center justify-between">
           <button
             onClick={() => navigate('/settings')}
+            onMouseEnter={() => handlePrefetch('/settings')}
+            onFocus={() => handlePrefetch('/settings')}
             className="flex items-center gap-2 min-w-0 hover:opacity-80 transition-opacity"
             title="Account settings"
           >

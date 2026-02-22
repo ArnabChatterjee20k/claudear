@@ -4,10 +4,10 @@ import { fetchErrors, type ErrorPattern } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
 import { Badge } from '../components/ui/badge'
 import { Card, CardContent } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { TimeAgo } from '../components/shared/time-ago'
 import { Modal } from '../components/shared/modal'
+import { TableRowsSkeleton } from '../components/shared/page-skeletons'
 import { formatDate } from '../lib/formatters'
 
 function truncate(text: string | null, maxLen: number): string {
@@ -83,13 +83,7 @@ export default function ErrorsPage() {
         <div className="text-destructive text-sm">Failed to load error patterns.</div>
       )}
 
-      {isLoading && (
-        <div className="space-y-2">
-          {Array.from({ length: 5 }).map((_, i) => (
-            <Skeleton key={i} className="h-10 w-full" />
-          ))}
-        </div>
-      )}
+      {isLoading && <TableRowsSkeleton rows={5} />}
 
       {sorted && (
         <Card>

@@ -7,9 +7,9 @@ import {
   type RegressionCheck,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
+import { BlockSkeleton, TableRowsSkeleton } from '../components/shared/page-skeletons'
 import { Tabs } from '../components/ui/tabs'
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
-import { Skeleton } from '../components/ui/skeleton'
 import { DataTable, type Column } from '../components/shared/data-table'
 import { StatusBadge } from '../components/shared/status-badge'
 import { TimeAgo } from '../components/shared/time-ago'
@@ -90,13 +90,7 @@ function RegressionTab({ status }: { status: string }) {
   }
 
   if (isLoading) {
-    return (
-      <div className="space-y-2">
-        {Array.from({ length: 4 }).map((_, i) => (
-          <Skeleton key={i} className="h-10 w-full" />
-        ))}
-      </div>
-    )
+    return <TableRowsSkeleton rows={4} />
   }
 
   return (
@@ -118,7 +112,7 @@ function RegressionTab({ status }: { status: string }) {
             <CardTitle>Regression Checks Timeline</CardTitle>
           </CardHeader>
           <CardContent>
-            {checksLoading && <Skeleton className="h-24 w-full" />}
+            {checksLoading && <BlockSkeleton className="h-24 w-full" />}
             {checks && checks.length === 0 && (
               <p className="text-sm text-muted-foreground">No checks recorded yet</p>
             )}
