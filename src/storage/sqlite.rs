@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::feedback::{FixOutcome, Outcome};
 use crate::learning::cross_repo_correlator::CrossRepoCorrelation;
 use crate::types::{
-    ActivityLogEntry, AnalyticsSummary, AgentExecution, ErrorPattern, ExperimentProviderStats,
+    ActivityLogEntry, AgentExecution, AnalyticsSummary, ErrorPattern, ExperimentProviderStats,
     FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, PrReviewRecord,
     ProcessingMetric, PromptExperiment, QaKnowledgeEntry, QaMatch, SimilarIssue, SourceStats,
 };
@@ -162,8 +162,7 @@ impl SqliteTracker {
         )?;
 
         // Run versioned SQL migrations (tracked in schema_migrations table).
-        super::migrator::run(&conn)
-            .map_err(|e| crate::error::Error::Database(e))?;
+        super::migrator::run(&conn).map_err(|e| crate::error::Error::Database(e))?;
 
         // Reset any stuck "running" indexing progress rows from a previous crash
         conn.execute(
@@ -2851,10 +2850,7 @@ impl FixAttemptTracker for SqliteTracker {
     }
 
     /// Count activity events grouped by type since a timestamp.
-    fn get_activity_type_counts_since(
-        &self,
-        since: DateTime<Utc>,
-    ) -> Result<HashMap<String, i64>> {
+    fn get_activity_type_counts_since(&self, since: DateTime<Utc>) -> Result<HashMap<String, i64>> {
         let conn = self.acquire_lock()?;
         let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
         let mut stmt = conn.prepare(
@@ -3731,11 +3727,7 @@ impl FixAttemptTracker for SqliteTracker {
     /// Sync repositories from a RepoIndex to the database.
     ///
     /// Updates paths for all repos in the index and optionally syncs files.
-    fn sync_from_index(
-        &self,
-        index: &crate::repo::RepoIndex,
-        sync_files: bool,
-    ) -> Result<usize> {
+    fn sync_from_index(&self, index: &crate::repo::RepoIndex, sync_files: bool) -> Result<usize> {
         let repos = index.list();
         let mut synced = 0;
 
@@ -4305,13 +4297,7 @@ impl FixAttemptTracker for SqliteTracker {
         Ok(conn.last_insert_rowid())
     }
 
-    fn create_user(
-        &self,
-        email: &str,
-        password_hash: &str,
-        name: &str,
-        role: &str,
-    ) -> Result<i64> {
+    fn create_user(&self, email: &str, password_hash: &str, name: &str, role: &str) -> Result<i64> {
         let conn = self.acquire_lock()?;
         conn.execute(
             "INSERT INTO users (email, password_hash, name, role) VALUES (?1, ?2, ?3, ?4)",
@@ -4876,25 +4862,15 @@ impl FixAttemptTracker for SqliteTracker {
         SqliteTracker::cleanup_stale_code_data(self, repo_id, current_paths)
     }
 
-    fn save_code_symbols(
-        &self,
-        symbols: &[crate::repo::code_index::CodeSymbol],
-    ) -> Result<()> {
+    fn save_code_symbols(&self, symbols: &[crate::repo::code_index::CodeSymbol]) -> Result<()> {
         SqliteTracker::save_code_symbols(self, symbols)
     }
 
-    fn save_code_chunks(
-        &self,
-        chunks: &[crate::repo::code_index::CodeChunk],
-    ) -> Result<Vec<i64>> {
+    fn save_code_chunks(&self, chunks: &[crate::repo::code_index::CodeChunk]) -> Result<Vec<i64>> {
         SqliteTracker::save_code_chunks(self, chunks)
     }
 
-    fn save_code_chunk_embeddings(
-        &self,
-        pairs: &[(i64, &[f32])],
-        model_name: &str,
-    ) -> Result<()> {
+    fn save_code_chunk_embeddings(&self, pairs: &[(i64, &[f32])], model_name: &str) -> Result<()> {
         SqliteTracker::save_code_chunk_embeddings(self, pairs, model_name)
     }
 
@@ -7479,9 +7455,7 @@ impl SqliteTracker {
             created_at: Self::parse_datetime(&row.get::<_, String>(5)?),
         })
     }
-
 }
-
 
 // ============================================================
 // Continuous Learning SqliteTracker implementations

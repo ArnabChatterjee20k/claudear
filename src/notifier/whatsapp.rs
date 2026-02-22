@@ -1341,7 +1341,9 @@ mod tests {
     async fn test_notify_merged_disabled() {
         let notifier = WhatsAppNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
-        let result = notifier.notify_merged(&issue, "https://github.com/pr/1").await;
+        let result = notifier
+            .notify_merged(&issue, "https://github.com/pr/1")
+            .await;
         assert!(result.is_ok());
     }
 
@@ -1349,7 +1351,9 @@ mod tests {
     async fn test_notify_closed_disabled() {
         let notifier = WhatsAppNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
-        let result = notifier.notify_closed(&issue, "https://github.com/pr/1").await;
+        let result = notifier
+            .notify_closed(&issue, "https://github.com/pr/1")
+            .await;
         assert!(result.is_ok());
     }
 

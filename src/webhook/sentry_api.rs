@@ -93,7 +93,10 @@ impl SentryApiClient {
 
     /// Create from a SentryConfig.
     pub fn from_config(config: &SentryConfig) -> Self {
-        Self::new(config.auth_token.expose().to_string(), config.org_slug.clone())
+        Self::new(
+            config.auth_token.expose().to_string(),
+            config.org_slug.clone(),
+        )
     }
 
     /// Get the organization slug.
@@ -337,8 +340,8 @@ impl SentryApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret::SecretValue;
     use crate::config::TopIssuesPeriod;
+    use crate::secret::SecretValue;
 
     #[test]
     fn test_sentry_api_client_new() {

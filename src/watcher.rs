@@ -82,8 +82,7 @@ pub struct Watcher {
 impl Watcher {
     /// Create a new watcher.
     pub fn new(options: WatcherOptions) -> Self {
-        let feedback_analyzer =
-            FeedbackAnalyzer::new().with_tracker(options.tracker.clone());
+        let feedback_analyzer = FeedbackAnalyzer::new().with_tracker(options.tracker.clone());
 
         Self {
             agent: options.agent,
@@ -1380,7 +1379,8 @@ Create a PR with your changes.{custom_instructions}"#,
 
                 // Update the cascade attempt with PR details
                 if let Some((repo, pr_num)) = crate::storage::parse_pr_url(pr_url) {
-                    self.tracker.update_attempt_pr(attempt_id, pr_url, &repo, pr_num)?;
+                    self.tracker
+                        .update_attempt_pr(attempt_id, pr_url, &repo, pr_num)?;
                 }
 
                 // Register for review watching — this enables recursive cascade
@@ -3919,9 +3919,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     if let Some(ref log_path) = exec.stdout_log_path {
                         let path = std::path::Path::new(log_path);
                         if path.exists() {
-                            match crate::learning::LogExtractor::extract_learnings_from_log(
-                                path,
-                            ) {
+                            match crate::learning::LogExtractor::extract_learnings_from_log(path) {
                                 Ok(learnings) => {
                                     let summary =
                                         crate::learning::LogExtractor::summarize(&learnings);
@@ -4547,6 +4545,8 @@ mod tests {
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
             tenant_id: None,
+            database_url: None,
+            redis_url: None,
         }
     }
 
@@ -4556,18 +4556,17 @@ mod tests {
         sources: Vec<Arc<dyn IssueSource>>,
         dry_run: bool,
     ) -> Watcher {
-        let agent: Arc<dyn crate::runner::AgentRunner> = Arc::new(
-            crate::runner::ClaudeAgentRunner::new(
+        let agent: Arc<dyn crate::runner::AgentRunner> =
+            Arc::new(crate::runner::ClaudeAgentRunner::new(
                 crate::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
-            ),
-        );
+            ));
         Watcher::new(WatcherOptions {
             config: test_config(),
             sources,
             notifier,
             tracker: tracker.clone(),
-            inferrer: None,       // Tests don't need inference
+            inferrer: None, // Tests don't need inference
             embedding_client: None,
             review_watcher: None,
             issue_embedding_service: None,
@@ -10812,7 +10811,9 @@ mod tests {
 
         #[async_trait]
         impl AgentRunner for MockAgent {
-            fn name(&self) -> &str { "mock-agent" }
+            fn name(&self) -> &str {
+                "mock-agent"
+            }
             fn capabilities(&self) -> crate::runner::ProviderCapabilities {
                 crate::runner::ProviderCapabilities::default()
             }
@@ -10871,7 +10872,7 @@ mod tests {
 
     #[test]
     fn test_watcher_with_orchestrator_agent() {
-        use crate::runner::{AgentRunner, AgentOrchestrator, SelectionStrategy, WeightedProvider};
+        use crate::runner::{AgentOrchestrator, AgentRunner, SelectionStrategy, WeightedProvider};
 
         let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
             Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
@@ -10881,7 +10882,9 @@ mod tests {
 
         #[async_trait]
         impl AgentRunner for SimpleRunner {
-            fn name(&self) -> &str { "simple" }
+            fn name(&self) -> &str {
+                "simple"
+            }
             fn capabilities(&self) -> crate::runner::ProviderCapabilities {
                 crate::runner::ProviderCapabilities::default()
             }
@@ -10889,11 +10892,20 @@ mod tests {
                 "simple prompt".to_string()
             }
             async fn execute_with_attempt(
-                &self, _: &str, _: Option<&Issue>, _: Option<i64>, _: &std::path::Path,
+                &self,
+                _: &str,
+                _: Option<&Issue>,
+                _: Option<i64>,
+                _: &std::path::Path,
             ) -> crate::error::Result<crate::types::AgentResult> {
                 Ok(crate::types::AgentResult {
-                    success: true, output: String::new(), pr_url: None,
-                    changelog: None, error: None, blocking_question: None, used_qa_ids: Vec::new(),
+                    success: true,
+                    output: String::new(),
+                    pr_url: None,
+                    changelog: None,
+                    error: None,
+                    blocking_question: None,
+                    used_qa_ids: Vec::new(),
                 })
             }
         }

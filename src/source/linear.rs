@@ -258,7 +258,11 @@ impl<H: LinearHttpClient> LinearSource<H> {
 
         let response = self
             .http
-            .post("https://api.linear.app/graphql", self.config.api_key.expose(), body)
+            .post(
+                "https://api.linear.app/graphql",
+                self.config.api_key.expose(),
+                body,
+            )
             .await?;
 
         if !response.is_success() {

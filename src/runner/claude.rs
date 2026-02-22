@@ -1,11 +1,11 @@
 //! Claude CLI runner for executing fixes.
 
 use super::{AgentRunner, ProviderCapabilities};
-use async_trait::async_trait;
 use crate::error::{Error, Result};
 use crate::storage::FixAttemptTracker;
 use crate::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
-use crate::types::{ActivityLogEntry, BlockingQuestion, AgentExecution, AgentResult, Issue};
+use crate::types::{ActivityLogEntry, AgentExecution, AgentResult, BlockingQuestion, Issue};
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -222,6 +222,7 @@ impl ClaudeAgentRunner {
     }
 
     /// Create a new Claude runner without template support (for testing).
+    #[cfg(feature = "sqlite")]
     pub fn new_simple(config: ClaudeRunnerConfig) -> Self {
         use crate::storage::SqliteTracker;
         // Use a temporary in-memory tracker
@@ -1500,12 +1501,7 @@ impl AgentRunner for ClaudeAgentRunner {
         }
     }
 
-    fn build_prompt_for_issue(
-        &self,
-        issue: &Issue,
-        context: &str,
-        project_dir: &Path,
-    ) -> String {
+    fn build_prompt_for_issue(&self, issue: &Issue, context: &str, project_dir: &Path) -> String {
         self.build_prompt(issue, context, project_dir)
     }
 
@@ -2105,7 +2101,8 @@ mod tests {
     #[test]
     fn test_extract_pr_url_http_not_https() {
         assert!(
-            ClaudeAgentRunner::extract_pr_url("PR at http://github.com/org/repo/pull/123").is_none()
+            ClaudeAgentRunner::extract_pr_url("PR at http://github.com/org/repo/pull/123")
+                .is_none()
         );
     }
 
@@ -2143,7 +2140,9 @@ mod tests {
 
     #[test]
     fn test_extract_pr_url_github_pr_zero() {
-        assert!(ClaudeAgentRunner::extract_pr_url("PR: https://github.com/org/repo/pull/0").is_some());
+        assert!(
+            ClaudeAgentRunner::extract_pr_url("PR: https://github.com/org/repo/pull/0").is_some()
+        );
     }
 
     #[test]
@@ -2174,10 +2173,10 @@ mod tests {
 
     #[test]
     fn test_claude_result_pr_url_with_trailing_slash() {
-        assert!(
-            ClaudeAgentRunner::extract_pr_url("PR_URL: https://github.com/org/repo/pull/123/ Done")
-                .is_some()
-        );
+        assert!(ClaudeAgentRunner::extract_pr_url(
+            "PR_URL: https://github.com/org/repo/pull/123/ Done"
+        )
+        .is_some());
     }
 
     #[test]
@@ -2221,7 +2220,9 @@ mod tests {
         assert!(ClaudeAgentRunner::is_rate_limit_error(
             "Claude API returned 429 Too Many Requests"
         ));
-        assert!(ClaudeAgentRunner::is_rate_limit_error("rate limit exceeded"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
+            "rate limit exceeded"
+        ));
         assert!(!ClaudeAgentRunner::is_rate_limit_error("cargo test failed"));
     }
 
@@ -2249,10 +2250,10 @@ mod tests {
 
     #[test]
     fn test_extract_blocking_question_ignores_malformed() {
-        assert!(
-            ClaudeAgentRunner::extract_blocking_question("CLAUDEAR_QUESTION: {not valid json}")
-                .is_none()
-        );
+        assert!(ClaudeAgentRunner::extract_blocking_question(
+            "CLAUDEAR_QUESTION: {not valid json}"
+        )
+        .is_none());
     }
 
     #[test]
@@ -2431,7 +2432,9 @@ mod tests {
 
     #[test]
     fn test_is_rate_limit_error_rate_limit() {
-        assert!(ClaudeAgentRunner::is_rate_limit_error("rate limit exceeded"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
+            "rate limit exceeded"
+        ));
     }
 
     #[test]
@@ -2451,7 +2454,9 @@ mod tests {
 
     #[test]
     fn test_is_rate_limit_error_quota_exceeded() {
-        assert!(ClaudeAgentRunner::is_rate_limit_error("quota exceeded for api"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
+            "quota exceeded for api"
+        ));
     }
 
     #[test]
@@ -2461,17 +2466,23 @@ mod tests {
 
     #[test]
     fn test_is_rate_limit_error_retry_after() {
-        assert!(ClaudeAgentRunner::is_rate_limit_error("retry-after: 30 seconds"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
+            "retry-after: 30 seconds"
+        ));
     }
 
     #[test]
     fn test_is_rate_limit_error_try_again_later() {
-        assert!(ClaudeAgentRunner::is_rate_limit_error("please try again later"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
+            "please try again later"
+        ));
     }
 
     #[test]
     fn test_is_rate_limit_error_case_insensitivity() {
-        assert!(ClaudeAgentRunner::is_rate_limit_error("Rate Limit Exceeded"));
+        assert!(ClaudeAgentRunner::is_rate_limit_error(
+            "Rate Limit Exceeded"
+        ));
         assert!(ClaudeAgentRunner::is_rate_limit_error("RATE LIMIT"));
         assert!(ClaudeAgentRunner::is_rate_limit_error("RateLimit"));
     }
@@ -2504,7 +2515,9 @@ mod tests {
 
     #[test]
     fn test_is_hard_error_failed_to_wait_for_claude() {
-        assert!(ClaudeAgentRunner::is_hard_error("failed to wait for claude"));
+        assert!(ClaudeAgentRunner::is_hard_error(
+            "failed to wait for claude"
+        ));
     }
 
     #[test]
@@ -2524,7 +2537,9 @@ mod tests {
 
     #[test]
     fn test_is_hard_error_timed_out_after() {
-        assert!(ClaudeAgentRunner::is_hard_error("timed out after 3600 seconds"));
+        assert!(ClaudeAgentRunner::is_hard_error(
+            "timed out after 3600 seconds"
+        ));
     }
 
     #[test]
@@ -2539,7 +2554,9 @@ mod tests {
 
     #[test]
     fn test_is_hard_error_internal_server_error() {
-        assert!(ClaudeAgentRunner::is_hard_error("500 internal server error"));
+        assert!(ClaudeAgentRunner::is_hard_error(
+            "500 internal server error"
+        ));
     }
 
     #[test]
@@ -3369,7 +3386,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_label_mixed_valid_and_invalid() {
-        assert_eq!(ClaudeAgentRunner::sanitize_label("PROJ-123/fix"), "PROJ-123_fix");
+        assert_eq!(
+            ClaudeAgentRunner::sanitize_label("PROJ-123/fix"),
+            "PROJ-123_fix"
+        );
     }
 
     #[test]
@@ -3678,8 +3698,13 @@ mod tests {
     #[tokio::test]
     async fn test_append_execution_event_with_none_writer_is_noop() {
         // Should return immediately without error when writer is None
-        ClaudeAgentRunner::append_execution_event(&None, "test", "some_event", json!({"key": "value"}))
-            .await;
+        ClaudeAgentRunner::append_execution_event(
+            &None,
+            "test",
+            "some_event",
+            json!({"key": "value"}),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3734,9 +3759,11 @@ mod tests {
             .unwrap();
         let writer = Some(Arc::new(Mutex::new(file)));
 
-        ClaudeAgentRunner::append_execution_event(&writer, "lbl", "event_1", json!({"seq": 1})).await;
+        ClaudeAgentRunner::append_execution_event(&writer, "lbl", "event_1", json!({"seq": 1}))
+            .await;
 
-        ClaudeAgentRunner::append_execution_event(&writer, "lbl", "event_2", json!({"seq": 2})).await;
+        ClaudeAgentRunner::append_execution_event(&writer, "lbl", "event_2", json!({"seq": 2}))
+            .await;
 
         drop(writer);
 
@@ -3874,7 +3901,8 @@ mod tests {
 
     #[test]
     fn test_compose_failure_message_resource_exhausted_in_combined() {
-        let msg = ClaudeAgentRunner::compose_failure_message(1, "some output", "resource exhausted");
+        let msg =
+            ClaudeAgentRunner::compose_failure_message(1, "some output", "resource exhausted");
         assert!(msg.starts_with("Claude rate limit hit:"));
     }
 
@@ -4108,9 +4136,7 @@ mod tests {
         assert!(ClaudeAgentRunner::is_rate_limit_error("too many requests"));
         assert!(ClaudeAgentRunner::is_rate_limit_error("429"));
         assert!(ClaudeAgentRunner::is_rate_limit_error("quota exceeded"));
-        assert!(ClaudeAgentRunner::is_rate_limit_error(
-            "resource exhausted"
-        ));
+        assert!(ClaudeAgentRunner::is_rate_limit_error("resource exhausted"));
         assert!(ClaudeAgentRunner::is_rate_limit_error("retry-after"));
         assert!(ClaudeAgentRunner::is_rate_limit_error("try again later"));
     }
@@ -4655,7 +4681,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_label_already_clean() {
-        assert_eq!(ClaudeAgentRunner::sanitize_label("my-label_123"), "my-label_123");
+        assert_eq!(
+            ClaudeAgentRunner::sanitize_label("my-label_123"),
+            "my-label_123"
+        );
     }
 
     #[test]
@@ -4790,9 +4819,13 @@ more output"#;
 
     #[test]
     fn test_is_rate_limit_error_non_matching() {
-        assert!(!ClaudeAgentRunner::is_rate_limit_error("everything is fine"));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error(
+            "everything is fine"
+        ));
         assert!(!ClaudeAgentRunner::is_rate_limit_error(""));
-        assert!(!ClaudeAgentRunner::is_rate_limit_error("generic error occurred"));
+        assert!(!ClaudeAgentRunner::is_rate_limit_error(
+            "generic error occurred"
+        ));
     }
 
     #[test]
@@ -4811,7 +4844,9 @@ more output"#;
 
     #[test]
     fn test_is_hard_error_failed_to_wait() {
-        assert!(ClaudeAgentRunner::is_hard_error("Failed to wait for Claude"));
+        assert!(ClaudeAgentRunner::is_hard_error(
+            "Failed to wait for Claude"
+        ));
     }
 
     #[test]
@@ -4824,7 +4859,9 @@ more output"#;
     fn test_is_hard_error_non_matching() {
         assert!(!ClaudeAgentRunner::is_hard_error("everything is fine"));
         assert!(!ClaudeAgentRunner::is_hard_error(""));
-        assert!(!ClaudeAgentRunner::is_hard_error("some random failure message"));
+        assert!(!ClaudeAgentRunner::is_hard_error(
+            "some random failure message"
+        ));
     }
 
     #[test]
@@ -5068,10 +5105,22 @@ more output"#;
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         let caps = runner.capabilities();
-        assert!(caps.structured_output, "Claude should support structured output");
-        assert!(caps.tool_permissions, "Claude should support tool permissions");
-        assert!(caps.custom_instructions, "Claude should support custom instructions");
-        assert!(caps.streaming_events, "Claude should support streaming events");
+        assert!(
+            caps.structured_output,
+            "Claude should support structured output"
+        );
+        assert!(
+            caps.tool_permissions,
+            "Claude should support tool permissions"
+        );
+        assert!(
+            caps.custom_instructions,
+            "Claude should support custom instructions"
+        );
+        assert!(
+            caps.streaming_events,
+            "Claude should support streaming events"
+        );
         assert!(caps.cost_reporting, "Claude should support cost reporting");
     }
 
@@ -5137,7 +5186,10 @@ more output"#;
         assert!(
             !agent_activities.is_empty(),
             "Expected at least one claude activity entry, got none. All activities: {:?}",
-            activities.iter().map(|a| &a.activity_type).collect::<Vec<_>>()
+            activities
+                .iter()
+                .map(|a| &a.activity_type)
+                .collect::<Vec<_>>()
         );
     }
 

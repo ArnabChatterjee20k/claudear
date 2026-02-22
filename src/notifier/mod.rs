@@ -75,11 +75,11 @@ use std::sync::Arc;
 /// Return the emoji for a given issue source.
 pub(crate) fn get_source_emoji(source: &str) -> &'static str {
     match source.to_lowercase().as_str() {
-        "linear" => "\u{1F4CB}", // clipboard
-        "sentry" => "\u{1F534}", // red circle
-        "github" => "\u{1F419}", // octopus
-        "jira" => "\u{1F3AB}",   // ticket
-        "slack" => "\u{1F4AC}",     // speech balloon
+        "linear" => "\u{1F4CB}",   // clipboard
+        "sentry" => "\u{1F534}",   // red circle
+        "github" => "\u{1F419}",   // octopus
+        "jira" => "\u{1F3AB}",     // ticket
+        "slack" => "\u{1F4AC}",    // speech balloon
         "whatsapp" => "\u{1F4F1}", // mobile phone
         "telegram" => "\u{2708}",  // airplane/paper plane
         _ => "\u{1F4CC}",          // pushpin

@@ -722,11 +722,7 @@ async fn process_issue(
     tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
 
     // Infer the target repository using the shared resolution function
-    let resolution = resolve_repo_for_issue(
-        state.inferrer.as_ref(),
-        &issue,
-        Some(&state.tracker),
-    );
+    let resolution = resolve_repo_for_issue(state.inferrer.as_ref(), &issue, Some(&state.tracker));
 
     let project_dir = match &resolution {
         RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
@@ -1710,6 +1706,8 @@ mod tests {
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
             tenant_id: None,
+            database_url: None,
+            redis_url: None,
         }
     }
 
@@ -1727,7 +1725,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         assert_eq!(server.port, 8080);
     }
@@ -1740,7 +1746,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         assert_eq!(server.port, 3000);
     }
@@ -2623,7 +2637,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config.clone(), handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config.clone(),
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         assert_eq!(server.port, config.webhook_port);
         assert_eq!(server.config.work_dir, config.work_dir);
@@ -3771,7 +3793,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let mut server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let mut server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         assert!(server.review_watcher.is_none());
         server.set_review_watcher(None);
@@ -3785,7 +3815,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let mut server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let mut server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         assert!(server.issue_embedding_service.is_none());
         server.set_issue_embedding_service(None);
@@ -3823,8 +3861,16 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server =
-            WebhookServer::new_with_github(config, handlers, notifier, tracker.clone(), None, None, None, test_agent(tracker));
+        let server = WebhookServer::new_with_github(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         assert!(server.github_handler.is_none());
     }
@@ -4422,7 +4468,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         assert!(server.inferrer.is_none());
         assert!(server.sqlite_tracker.is_none());
@@ -4443,7 +4497,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         assert_eq!(server.port, 9999);
         assert_eq!(
@@ -4465,7 +4527,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let mut server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let mut server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         // Initially None
         assert!(server.review_watcher.is_none());
@@ -4482,7 +4552,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let mut server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let mut server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         // Initially None
         assert!(server.issue_embedding_service.is_none());
@@ -5062,7 +5140,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
 
         // new() should result in github_handler being None
         assert!(server.github_handler.is_none());
@@ -6602,7 +6688,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
         assert_eq!(server.config.agent.timeout_secs, 999);
     }
 
@@ -6614,7 +6708,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
         assert_eq!(server.config.max_concurrent, 10);
     }
 
@@ -6971,7 +7073,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
         assert_eq!(server.port, 8080);
     }
 
@@ -6983,7 +7093,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
         assert_eq!(server.port, 65535);
     }
 
@@ -6995,7 +7113,15 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let server = WebhookServer::new(config, handlers, notifier, tracker.clone(), None, None, test_agent(tracker));
+        let server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
         assert_eq!(server.port, 80);
     }
 

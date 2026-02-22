@@ -1281,7 +1281,10 @@ mod tests {
     fn test_new_creates_source_with_defaults() {
         let source = SlackSource::new(make_config());
         assert!(source.last_seen_ts.read().unwrap().is_none());
-        assert_eq!(source.config.bot_token.as_ref().map(|s| s.expose()), Some("xoxb-test-token"));
+        assert_eq!(
+            source.config.bot_token.as_ref().map(|s| s.expose()),
+            Some("xoxb-test-token")
+        );
     }
 
     #[test]
@@ -1422,7 +1425,10 @@ mod tests {
             poll_interval_ms: Some(5000),
             ..Default::default()
         };
-        assert_eq!(config.bot_token.as_ref().map(|s| s.expose()), Some("xoxb-abc-123"));
+        assert_eq!(
+            config.bot_token.as_ref().map(|s| s.expose()),
+            Some("xoxb-abc-123")
+        );
         assert_eq!(config.channel_id.as_deref(), Some("C_MAIN"));
         assert!(config.source_enabled);
         assert_eq!(config.listen_channel_id.as_deref(), Some("C_LISTEN"));
@@ -1626,7 +1632,10 @@ mod tests {
             ..Default::default()
         };
         let source = SlackSource::new(config);
-        assert_eq!(source.config.bot_token.as_ref().map(|s| s.expose()), Some("xoxb-test-123"));
+        assert_eq!(
+            source.config.bot_token.as_ref().map(|s| s.expose()),
+            Some("xoxb-test-123")
+        );
         assert_eq!(source.config.workspace.as_deref(), Some("testws"));
         assert_eq!(source.config.poll_interval_ms, Some(10000));
     }

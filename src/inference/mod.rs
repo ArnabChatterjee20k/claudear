@@ -2088,7 +2088,8 @@ mod tests {
 
     #[test]
     fn test_record_inference_attempt_with_tracker_no_match() {
-        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
         let issue = create_test_issue("linear", "test", "desc");
         let context = IssueContext {
             filenames: vec![],
@@ -2106,7 +2107,8 @@ mod tests {
 
     #[test]
     fn test_record_inference_attempt_with_tracker_and_match() {
-        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
         let issue = create_test_issue("sentry", "Auth error", "error in auth");
         let context = IssueContext {
             filenames: vec!["auth.ts".to_string()],
@@ -2180,7 +2182,8 @@ mod tests {
 
     #[test]
     fn test_resolve_repo_for_issue_with_tracker_records_analytics() {
-        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
         let index = create_test_index();
         let inferrer = RepoInferrer::new(index);
 
@@ -2196,7 +2199,8 @@ mod tests {
 
     #[test]
     fn test_resolve_repo_for_issue_no_match_with_tracker() {
-        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> = std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
         let index = create_test_index();
         let inferrer = RepoInferrer::new(index);
 

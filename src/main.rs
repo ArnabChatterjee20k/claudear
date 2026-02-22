@@ -20,12 +20,12 @@ use claudear::{
     repo::{DependencyType, RepoIndex, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
+    runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
     source::{
         DiscordSource, IssueSource, JiraSource, LinearSource, SentrySource, SlackSource,
         TelegramSource, WhatsAppSource,
     },
-    runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     storage::{FixAttemptTracker, SqliteTracker},
     types::{ActivityLogEntry, FixAttemptStatus, Issue},
     users::UserRegistry,
@@ -511,8 +511,7 @@ fn create_review_watcher(
     }
 
     let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
-    let review_watcher =
-        ReviewWatcher::with_tracker(provider, tracker.clone());
+    let review_watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
 
     // Restore states from database
     match tracker.get_active_pr_review_states() {
@@ -593,8 +592,12 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
     }
 
     if config.notifiers.whatsapp.source_enabled {
-        if config.notifiers.whatsapp.access_token.is_some() && config.notifiers.whatsapp.phone_number_id.is_some() {
-            sources.push(Arc::new(WhatsAppSource::new(config.notifiers.whatsapp.clone())));
+        if config.notifiers.whatsapp.access_token.is_some()
+            && config.notifiers.whatsapp.phone_number_id.is_some()
+        {
+            sources.push(Arc::new(WhatsAppSource::new(
+                config.notifiers.whatsapp.clone(),
+            )));
             tracing::info!("WhatsApp source initialized");
         } else {
             tracing::warn!(
@@ -605,7 +608,9 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
 
     if config.notifiers.telegram.source_enabled {
         if config.notifiers.telegram.bot_token.is_some() {
-            sources.push(Arc::new(TelegramSource::new(config.notifiers.telegram.clone())));
+            sources.push(Arc::new(TelegramSource::new(
+                config.notifiers.telegram.clone(),
+            )));
             tracing::info!("Telegram source initialized");
         } else {
             tracing::warn!("Telegram source_enabled but missing bot_token; skipping");
@@ -691,7 +696,8 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
     }
 
     // Add WhatsApp if configured
-    let whatsapp_notifier = WhatsAppNotifier::new(config.notifiers.whatsapp.clone(), user_registry.clone());
+    let whatsapp_notifier =
+        WhatsAppNotifier::new(config.notifiers.whatsapp.clone(), user_registry.clone());
     if whatsapp_notifier.is_enabled() {
         composite.add(Arc::new(whatsapp_notifier));
         tracing::info!("WhatsApp notifier enabled");
@@ -708,6 +714,31 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
 }
 
 fn create_tracker(config: &Config) -> Arc<dyn FixAttemptTracker> {
+    #[cfg(feature = "postgres")]
+    if let Some(ref database_url) = config.database_url {
+        let rt = tokio::runtime::Handle::current();
+        let pool = rt
+            .block_on(sqlx::PgPool::connect(database_url))
+            .expect("Failed to connect to PostgreSQL");
+        let tenant_id = config
+            .tenant_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let cache = config.redis_url.as_ref().map(|url| {
+            let client =
+                redis::Client::open(url.as_str()).expect("Failed to create Redis client");
+            rt.block_on(redis::aio::ConnectionManager::new(client))
+                .expect("Failed to connect to Redis")
+        });
+        tracing::info!(
+            tenant_id = %tenant_id,
+            cache_enabled = cache.is_some(),
+            "Using PostgresBackend"
+        );
+        return Arc::new(claudear::postgres::PostgresBackend::new(
+            pool, tenant_id, cache,
+        ));
+    }
     Arc::new(SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker"))
 }
 
@@ -732,11 +763,13 @@ fn start_regression_monitoring(
     }
 
     // Get GitHub token (from regression config or fall back to github config)
-    let github_token = config
-        .regression
-        .github_token
-        .clone()
-        .or_else(|| config.github().token.as_ref().map(|t| t.expose().to_string()));
+    let github_token = config.regression.github_token.clone().or_else(|| {
+        config
+            .github()
+            .token
+            .as_ref()
+            .map(|t| t.expose().to_string())
+    });
 
     let github_token = match github_token {
         Some(token) if !token.is_empty() => token,
@@ -813,11 +846,8 @@ fn start_regression_monitoring(
     let release_tracker =
         ReleaseTracker::with_config(github_token, tracker.clone(), release_config);
 
-    let scheduler = RegressionScheduler::new(
-        composite_checker,
-        tracker.clone(),
-        scheduler_config.clone(),
-    );
+    let scheduler =
+        RegressionScheduler::new(composite_checker, tracker.clone(), scheduler_config.clone());
 
     let check_interval_secs = scheduler_config.check_interval_secs.max(1);
     if scheduler_config.check_interval_secs == 0 {
@@ -2013,6 +2043,45 @@ async fn async_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Handle Dashboard command early (doesn't need source validation)
+    if let Commands::Dashboard {
+        port,
+        dashboard_dir,
+    } = cli.command
+    {
+        let tracker = create_tracker(&config);
+        let server = if let Some(dir) = dashboard_dir {
+            ApiServer::with_dashboard(
+                config,
+                tracker,
+                port,
+                dir,
+                std::path::PathBuf::from(config_path.clone()),
+            )
+        } else {
+            ApiServer::with_port(
+                config,
+                tracker,
+                port,
+                std::path::PathBuf::from(config_path.clone()),
+            )
+        };
+
+        let shutdown = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install signal handler");
+            tracing::info!("\nReceived shutdown signal...");
+        };
+
+        tokio::select! {
+            result = server.start() => result?,
+            _ = shutdown => {}
+        }
+
+        return Ok(());
+    }
+
     config.validate()?;
 
     // Initialize components
@@ -2072,8 +2141,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
 
         // Create ReviewWatcher for PR review tracking
-        let review_watcher =
-            create_review_watcher(&config, tracker.clone());
+        let review_watcher = create_review_watcher(&config, tracker.clone());
         let github_webhook_handler = create_github_webhook_handler(&config, review_watcher.clone());
 
         // Build dependency graph for cascade support
@@ -2132,10 +2200,24 @@ async fn async_main() -> anyhow::Result<()> {
         let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
             ClaudeRunnerConfig {
                 timeout_secs: config.agent.timeout_secs,
-                model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
-                instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
-                permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
-                skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
+                model: config
+                    .agent
+                    .default_provider_config()
+                    .and_then(|p| p.model.clone()),
+                instructions: config
+                    .agent
+                    .default_provider_config()
+                    .and_then(|p| p.instructions.clone()),
+                permissions: config
+                    .agent
+                    .default_provider_config()
+                    .map(|p| p.permissions.clone())
+                    .unwrap_or_default(),
+                skip_permissions: config
+                    .agent
+                    .default_provider_config()
+                    .map(|p| p.skip_permissions)
+                    .unwrap_or(false),
             },
             tracker.clone(),
         ));
@@ -2610,18 +2692,31 @@ async fn async_main() -> anyhow::Result<()> {
             Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
 
         // Create ReviewWatcher for PR review tracking
-        let review_watcher =
-            create_review_watcher(&config, tracker.clone());
+        let review_watcher = create_review_watcher(&config, tracker.clone());
 
         let issue_embedding_service = build_issue_embedding_service(&tracker);
 
         let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
             ClaudeRunnerConfig {
                 timeout_secs: config.agent.timeout_secs,
-                model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
-                instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
-                permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
-                skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
+                model: config
+                    .agent
+                    .default_provider_config()
+                    .and_then(|p| p.model.clone()),
+                instructions: config
+                    .agent
+                    .default_provider_config()
+                    .and_then(|p| p.instructions.clone()),
+                permissions: config
+                    .agent
+                    .default_provider_config()
+                    .map(|p| p.permissions.clone())
+                    .unwrap_or_default(),
+                skip_permissions: config
+                    .agent
+                    .default_provider_config()
+                    .map(|p| p.skip_permissions)
+                    .unwrap_or(false),
             },
             tracker.clone(),
         ));
@@ -2659,45 +2754,6 @@ async fn async_main() -> anyhow::Result<()> {
         }
 
         println!("\nRetry processing complete.");
-        return Ok(());
-    }
-
-    if let Commands::Dashboard {
-        port,
-        dashboard_dir,
-    } = cli.command
-    {
-        // --dashboard-dir overrides the embedded dashboard (useful for development)
-        let server = if let Some(dir) = dashboard_dir {
-            ApiServer::with_dashboard(
-                config,
-                tracker,
-                port,
-                dir,
-                std::path::PathBuf::from(config_path.clone()),
-            )
-        } else {
-            ApiServer::with_port(
-                config,
-                tracker,
-                port,
-                std::path::PathBuf::from(config_path.clone()),
-            )
-        };
-
-        // Handle shutdown signals
-        let shutdown = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install signal handler");
-            tracing::info!("\nReceived shutdown signal...");
-        };
-
-        tokio::select! {
-            result = server.start() => result?,
-            _ = shutdown => {}
-        }
-
         return Ok(());
     }
 
@@ -2835,8 +2891,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
 
             let handlers = create_webhook_handlers(&config);
-            let review_watcher =
-                create_review_watcher(&config, tracker.clone());
+            let review_watcher = create_review_watcher(&config, tracker.clone());
             let github_webhook_handler =
                 create_github_webhook_handler(&config, review_watcher.clone());
 
@@ -2855,10 +2910,24 @@ async fn async_main() -> anyhow::Result<()> {
             let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.agent.timeout_secs,
-                    model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
-                    instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
-                    permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
-                    skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
+                    model: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.model.clone()),
+                    instructions: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.instructions.clone()),
+                    permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.permissions.clone())
+                        .unwrap_or_default(),
+                    skip_permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.skip_permissions)
+                        .unwrap_or(false),
                 },
                 tracker.clone(),
             ));
@@ -2910,18 +2979,31 @@ async fn async_main() -> anyhow::Result<()> {
                 Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
 
             // Create ReviewWatcher for PR review tracking
-            let review_watcher =
-                create_review_watcher(&config, tracker.clone());
+            let review_watcher = create_review_watcher(&config, tracker.clone());
 
             let issue_embedding_service = build_issue_embedding_service(&tracker);
 
             let agent: Arc<dyn AgentRunner> = Arc::new(ClaudeAgentRunner::new(
                 ClaudeRunnerConfig {
                     timeout_secs: config.agent.timeout_secs,
-                    model: config.agent.default_provider_config().and_then(|p| p.model.clone()),
-                    instructions: config.agent.default_provider_config().and_then(|p| p.instructions.clone()),
-                    permissions: config.agent.default_provider_config().map(|p| p.permissions.clone()).unwrap_or_default(),
-                    skip_permissions: config.agent.default_provider_config().map(|p| p.skip_permissions).unwrap_or(false),
+                    model: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.model.clone()),
+                    instructions: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.instructions.clone()),
+                    permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.permissions.clone())
+                        .unwrap_or_default(),
+                    skip_permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.skip_permissions)
+                        .unwrap_or(false),
                 },
                 tracker.clone(),
             ));

@@ -266,7 +266,10 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
                 "text": message.text,
                 "blocks": message.blocks,
             });
-            let response = self.http.post_json(webhook_url.expose(), &body, None).await?;
+            let response = self
+                .http
+                .post_json(webhook_url.expose(), &body, None)
+                .await?;
 
             if response.status < 200 || response.status >= 300 {
                 return Err(Error::notifier(
@@ -283,7 +286,8 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
         {
             let token_str = token.expose();
             if !token_str.is_empty() && !channel_id.is_empty() {
-                self.post_chat_message(token_str, channel_id, &message).await?;
+                self.post_chat_message(token_str, channel_id, &message)
+                    .await?;
                 return Ok(());
             }
         }
@@ -300,7 +304,11 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
         let token = match self.config.bot_token.as_ref() {
             Some(t) => {
                 let exposed = t.expose();
-                if !exposed.is_empty() { exposed } else { return Ok(None); }
+                if !exposed.is_empty() {
+                    exposed
+                } else {
+                    return Ok(None);
+                }
             }
             _ => return Ok(None),
         };
@@ -1211,7 +1219,11 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
         let token_str = match self.config.bot_token.as_ref() {
             Some(t) => {
                 let exposed = t.expose();
-                if !exposed.is_empty() { exposed } else { return Ok(Vec::new()); }
+                if !exposed.is_empty() {
+                    exposed
+                } else {
+                    return Ok(Vec::new());
+                }
             }
             _ => return Ok(Vec::new()),
         };

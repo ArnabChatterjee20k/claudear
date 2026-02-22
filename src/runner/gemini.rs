@@ -73,7 +73,9 @@ mod tests {
     #[tokio::test]
     async fn test_gemini_execute_returns_not_implemented() {
         let runner = GeminiAgentRunner;
-        let result = runner.execute_with_attempt("test", None, None, Path::new("/tmp")).await;
+        let result = runner
+            .execute_with_attempt("test", None, None, Path::new("/tmp"))
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not yet implemented"));

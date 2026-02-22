@@ -2106,13 +2106,12 @@ async fn telemetry_pipeline_handler(
         .get_metric_sums_by_source_since(&per_source_metric_names, since)
         .unwrap_or_default();
     for ((metric_name, source), value) in per_source_sums {
-        let entry =
-            per_source
-                .entry(source.clone())
-                .or_insert_with(|| TelemetryPipelineSource {
-                    source,
-                    ..TelemetryPipelineSource::default()
-                });
+        let entry = per_source
+            .entry(source.clone())
+            .or_insert_with(|| TelemetryPipelineSource {
+                source,
+                ..TelemetryPipelineSource::default()
+            });
         match metric_name.as_str() {
             "issues_fetched" => entry.fetched += value,
             "issues_matched" => entry.matched += value,
@@ -2400,6 +2399,8 @@ mod tests {
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
             tenant_id: None,
+            database_url: None,
+            redis_url: None,
         }
     }
 

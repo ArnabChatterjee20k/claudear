@@ -486,11 +486,7 @@ impl<H: HttpClient> GitLabClient<H> {
             .ok_or_else(|| Error::config("GitLab token not configured"))?;
 
         let encoded = Self::encode_project_path(project);
-        let url = format!(
-            "{}/api/v4/projects/{}/releases",
-            self.api_base(),
-            encoded
-        );
+        let url = format!("{}/api/v4/projects/{}/releases", self.api_base(), encoded);
         let headers = self.build_headers(token.expose());
         let payload = serde_json::json!({
             "tag_name": tag,
@@ -498,10 +494,7 @@ impl<H: HttpClient> GitLabClient<H> {
             "description": body,
         });
 
-        let response = self
-            .http
-            .post(&url, headers, &payload.to_string())
-            .await?;
+        let response = self.http.post(&url, headers, &payload.to_string()).await?;
 
         if !response.is_success() {
             return Err(Error::Other(format!(
@@ -1003,10 +996,7 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
         caps.get(1)?.as_str().parse().ok()
     }
 
-    async fn get_latest_release(
-        &self,
-        project: &str,
-    ) -> Result<Option<crate::scm::ScmRelease>> {
+    async fn get_latest_release(&self, project: &str) -> Result<Option<crate::scm::ScmRelease>> {
         GitLabClient::get_latest_release(self, project).await
     }
 

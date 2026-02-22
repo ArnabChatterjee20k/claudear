@@ -122,12 +122,7 @@ impl AgentRunner for CodexAgentRunner {
         }
     }
 
-    fn build_prompt_for_issue(
-        &self,
-        issue: &Issue,
-        context: &str,
-        project_dir: &Path,
-    ) -> String {
+    fn build_prompt_for_issue(&self, issue: &Issue, context: &str, project_dir: &Path) -> String {
         self.build_prompt(issue, context, project_dir)
     }
 
@@ -138,9 +133,7 @@ impl AgentRunner for CodexAgentRunner {
         attempt_id: Option<i64>,
         project_dir: &Path,
     ) -> Result<AgentResult> {
-        let label = issue
-            .map(|i| i.short_id.as_str())
-            .unwrap_or("custom");
+        let label = issue.map(|i| i.short_id.as_str()).unwrap_or("custom");
 
         let mut execution = AgentExecution::new();
         execution.provider = Some("codex".to_string());
@@ -195,8 +188,14 @@ impl AgentRunner for CodexAgentRunner {
             }
         };
 
-        let stdout = child.stdout.take().ok_or_else(|| Error::runner("Failed to capture stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| Error::runner("Failed to capture stderr"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::runner("Failed to capture stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::runner("Failed to capture stderr"))?;
 
         let stdout_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -273,12 +272,7 @@ impl AgentRunner for CodexAgentRunner {
         let pr_url = Self::extract_pr_url(&stdout_output);
 
         execution.complete(status.code(), timed_out);
-        execution.stdout_preview = Some(
-            stdout_output
-                .chars()
-                .take(2000)
-                .collect::<String>(),
-        );
+        execution.stdout_preview = Some(stdout_output.chars().take(2000).collect::<String>());
         execution.stderr_preview = if stderr_output.is_empty() {
             None
         } else {
@@ -287,17 +281,14 @@ impl AgentRunner for CodexAgentRunner {
         self.tracker.record_execution(&execution).ok();
 
         let activity = if success {
-            ActivityLogEntry::new(
-                "agent_completed",
-                format!("Codex completed for {}", label),
-            )
-            .with_source("codex".to_string())
-            .with_metadata(json!({
-                "duration_secs": execution.duration_secs,
-                "exit_code": exit_code,
-                "has_pr": pr_url.is_some(),
-                "label": label
-            }))
+            ActivityLogEntry::new("agent_completed", format!("Codex completed for {}", label))
+                .with_source("codex".to_string())
+                .with_metadata(json!({
+                    "duration_secs": execution.duration_secs,
+                    "exit_code": exit_code,
+                    "has_pr": pr_url.is_some(),
+                    "label": label
+                }))
         } else {
             ActivityLogEntry::new(
                 "agent_failed",
@@ -444,7 +435,8 @@ mod tests {
 
     #[test]
     fn test_extract_pr_url_github_multiline() {
-        let output = "Working on fix...\nDone!\nhttps://github.com/myorg/myrepo/pull/789\nAll checks pass.";
+        let output =
+            "Working on fix...\nDone!\nhttps://github.com/myorg/myrepo/pull/789\nAll checks pass.";
         assert_eq!(
             CodexAgentRunner::extract_pr_url(output),
             Some("https://github.com/myorg/myrepo/pull/789".to_string())
@@ -477,7 +469,11 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Failed to spawn"), "Expected spawn error, got: {}", err);
+        assert!(
+            err.contains("Failed to spawn"),
+            "Expected spawn error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -485,11 +481,30 @@ mod tests {
         use crate::storage::SqliteTracker;
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let runner = CodexAgentRunner::new(CodexRunnerConfig::default(), tracker);
-        let issue = Issue::new("42", "SENTRY-42", "Error", "https://sentry.io/issue/42", "sentry");
-        let prompt = runner.build_prompt(&issue, "NullPointerException at line 5", Path::new("/tmp"));
-        assert!(prompt.contains("Sentry"), "prompt should mention Sentry: {}", prompt);
-        assert!(prompt.contains("NullPointerException"), "prompt should contain context: {}", prompt);
-        assert!(prompt.contains("Error"), "prompt should contain the issue title: {}", prompt);
+        let issue = Issue::new(
+            "42",
+            "SENTRY-42",
+            "Error",
+            "https://sentry.io/issue/42",
+            "sentry",
+        );
+        let prompt =
+            runner.build_prompt(&issue, "NullPointerException at line 5", Path::new("/tmp"));
+        assert!(
+            prompt.contains("Sentry"),
+            "prompt should mention Sentry: {}",
+            prompt
+        );
+        assert!(
+            prompt.contains("NullPointerException"),
+            "prompt should contain context: {}",
+            prompt
+        );
+        assert!(
+            prompt.contains("Error"),
+            "prompt should contain the issue title: {}",
+            prompt
+        );
     }
 
     #[test]

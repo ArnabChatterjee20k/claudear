@@ -73,7 +73,9 @@ mod tests {
     #[tokio::test]
     async fn test_copilot_execute_returns_not_implemented() {
         let runner = CopilotAgentRunner;
-        let result = runner.execute_with_attempt("test", None, None, Path::new("/tmp")).await;
+        let result = runner
+            .execute_with_attempt("test", None, None, Path::new("/tmp"))
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not yet implemented"));

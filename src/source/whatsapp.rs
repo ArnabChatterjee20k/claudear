@@ -164,7 +164,9 @@ impl IssueSource for WhatsAppSource {
     ) -> Result<Issue> {
         let phone_number_id = self
             .listen_phone_number_id()
-            .ok_or_else(|| Error::config("WhatsApp phone_number_id is required to create an issue"))?
+            .ok_or_else(|| {
+                Error::config("WhatsApp phone_number_id is required to create an issue")
+            })?
             .to_string();
 
         let access_token = self
@@ -219,9 +221,10 @@ impl IssueSource for WhatsAppSource {
             )));
         }
 
-        let resp_body: serde_json::Value = resp.json().await.map_err(|e| {
-            Error::Other(format!("Failed to parse WhatsApp API response: {}", e))
-        })?;
+        let resp_body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::Other(format!("Failed to parse WhatsApp API response: {}", e)))?;
 
         // Extract the message ID from the response.
         let msg_id = resp_body["messages"][0]["id"]
@@ -314,7 +317,11 @@ mod tests {
 
     #[test]
     fn test_message_to_issue_basic() {
-        let msg = make_message("wamid_abc12345xyz", "+15551234567", "Fix the login bug\nDetails");
+        let msg = make_message(
+            "wamid_abc12345xyz",
+            "+15551234567",
+            "Fix the login bug\nDetails",
+        );
         let issue = WhatsAppSource::message_to_issue(&msg);
 
         assert_eq!(issue.id, "wamid_abc12345xyz");
@@ -660,7 +667,13 @@ mod tests {
     #[tokio::test]
     async fn test_build_issue_context_with_url() {
         let source = WhatsAppSource::new(make_config());
-        let mut issue = Issue::new("1", "WA-1", "Fix login", "https://wa.me/msg/123", "whatsapp");
+        let mut issue = Issue::new(
+            "1",
+            "WA-1",
+            "Fix login",
+            "https://wa.me/msg/123",
+            "whatsapp",
+        );
         issue.description = Some("Details here".to_string());
 
         let context = source.build_issue_context(&issue).await.unwrap();

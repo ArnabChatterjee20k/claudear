@@ -26,7 +26,7 @@ use crate::error::Result;
 use crate::feedback::FixOutcome;
 use crate::learning::cross_repo_correlator::CrossRepoCorrelation;
 use crate::types::{
-    ActivityLogEntry, AnalyticsSummary, AgentExecution, ErrorPattern, FixAttempt, FixAttemptStats,
+    ActivityLogEntry, AgentExecution, AnalyticsSummary, ErrorPattern, FixAttempt, FixAttemptStats,
     FixAttemptStatus, IssueEmbedding, PrAnalytics, PrRecord, PrReviewRecord, ProcessingMetric,
     PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck, RegressionWatch,
     RegressionWatchStatus, SimilarIssue,
@@ -822,11 +822,7 @@ pub trait FixAttemptTracker: Send + Sync {
     // --- Repository Sync ---
 
     /// Sync repositories from a RepoIndex into storage. Returns count synced.
-    fn sync_from_index(
-        &self,
-        _index: &crate::repo::RepoIndex,
-        _sync_files: bool,
-    ) -> Result<usize> {
+    fn sync_from_index(&self, _index: &crate::repo::RepoIndex, _sync_files: bool) -> Result<usize> {
         Ok(0)
     }
 
@@ -918,10 +914,7 @@ pub trait FixAttemptTracker: Send + Sync {
     }
 
     /// Get all stored review comments for a PR.
-    fn get_comments_for_pr(
-        &self,
-        _pr_url: &str,
-    ) -> Result<Vec<types::StoredPrReviewComment>> {
+    fn get_comments_for_pr(&self, _pr_url: &str) -> Result<Vec<types::StoredPrReviewComment>> {
         Ok(Vec::new())
     }
 
@@ -1065,11 +1058,7 @@ pub trait FixAttemptTracker: Send + Sync {
     }
 
     /// Get an embedding by source and issue ID.
-    fn get_embedding(
-        &self,
-        _source: &str,
-        _issue_id: &str,
-    ) -> Result<Option<IssueEmbedding>> {
+    fn get_embedding(&self, _source: &str, _issue_id: &str) -> Result<Option<IssueEmbedding>> {
         Ok(None)
     }
 
@@ -1137,10 +1126,7 @@ pub trait FixAttemptTracker: Send + Sync {
     // --- Release Tracking ---
 
     /// Record a release tracking entry. Returns the row ID.
-    fn record_release_tracking(
-        &self,
-        _tracking: &crate::types::ReleaseTracking,
-    ) -> Result<i64> {
+    fn record_release_tracking(&self, _tracking: &crate::types::ReleaseTracking) -> Result<i64> {
         Ok(0)
     }
 
@@ -1191,18 +1177,12 @@ pub trait FixAttemptTracker: Send + Sync {
     }
 
     /// Batch-save extracted code symbols.
-    fn save_code_symbols(
-        &self,
-        _symbols: &[crate::repo::code_index::CodeSymbol],
-    ) -> Result<()> {
+    fn save_code_symbols(&self, _symbols: &[crate::repo::code_index::CodeSymbol]) -> Result<()> {
         Ok(())
     }
 
     /// Batch-save code chunks. Returns the assigned IDs.
-    fn save_code_chunks(
-        &self,
-        _chunks: &[crate::repo::code_index::CodeChunk],
-    ) -> Result<Vec<i64>> {
+    fn save_code_chunks(&self, _chunks: &[crate::repo::code_index::CodeChunk]) -> Result<Vec<i64>> {
         Ok(Vec::new())
     }
 

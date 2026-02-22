@@ -35,12 +35,6 @@ impl DaemonHandle {
         }
     }
 
-    pub fn container_id(&self) -> Option<&str> {
-        match self {
-            DaemonHandle::Docker { container_id, .. } => Some(container_id),
-            _ => None,
-        }
-    }
 }
 
 /// Start a native daemon process.
@@ -272,11 +266,3 @@ pub async fn wait_healthy(port: u16, timeout: Duration) -> Result<()> {
     }
 }
 
-/// Remove a Docker volume (for scenario reset).
-pub fn remove_volume(name: &str) {
-    let _ = Command::new("docker")
-        .args(["volume", "rm", "-f", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-}

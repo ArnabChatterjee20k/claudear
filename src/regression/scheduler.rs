@@ -62,7 +62,11 @@ pub struct RegressionScheduler<C: RegressionChecker> {
 
 impl<C: RegressionChecker> RegressionScheduler<C> {
     /// Create a new regression scheduler.
-    pub fn new(checker: C, tracker: Arc<dyn FixAttemptTracker>, config: RegressionSchedulerConfig) -> Self {
+    pub fn new(
+        checker: C,
+        tracker: Arc<dyn FixAttemptTracker>,
+        config: RegressionSchedulerConfig,
+    ) -> Self {
         Self {
             checker,
             tracker,

@@ -35,7 +35,10 @@ pub struct CodeIndexer {
 }
 
 impl CodeIndexer {
-    pub fn new(tracker: Arc<dyn FixAttemptTracker>, embedding_client: Arc<EmbeddingClient>) -> Self {
+    pub fn new(
+        tracker: Arc<dyn FixAttemptTracker>,
+        embedding_client: Arc<EmbeddingClient>,
+    ) -> Self {
         Self {
             tracker,
             embedding_client,
@@ -267,7 +270,10 @@ pub struct CodeSearchService {
 }
 
 impl CodeSearchService {
-    pub fn new(tracker: Arc<dyn FixAttemptTracker>, embedding_client: Arc<EmbeddingClient>) -> Self {
+    pub fn new(
+        tracker: Arc<dyn FixAttemptTracker>,
+        embedding_client: Arc<EmbeddingClient>,
+    ) -> Self {
         Self {
             tracker,
             embedding_client,

@@ -865,6 +865,8 @@ mod tests {
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
             tenant_id: None,
+            database_url: None,
+            redis_url: None,
         }
     }
 
@@ -894,7 +896,9 @@ mod tests {
         let user_id = tracker
             .create_user("admin@test.com", &password_hash, "Admin User", "admin")
             .unwrap();
-        let token = tracker.create_session(user_id, "2099-12-31 23:59:59").unwrap();
+        let token = tracker
+            .create_session(user_id, "2099-12-31 23:59:59")
+            .unwrap();
         (user_id, token)
     }
 
@@ -906,7 +910,9 @@ mod tests {
         let user_id = tracker
             .create_user("viewer@test.com", &password_hash, "Viewer User", "viewer")
             .unwrap();
-        let token = tracker.create_session(user_id, "2099-12-31 23:59:59").unwrap();
+        let token = tracker
+            .create_session(user_id, "2099-12-31 23:59:59")
+            .unwrap();
         (user_id, token)
     }
 
@@ -916,7 +922,8 @@ mod tests {
 
         // Seed a user (not via seed_admin, to test login flow directly)
         let password_hash = bcrypt::hash("secret123", 4).unwrap();
-        tracker.create_user("user@test.com", &password_hash, "Test User", "admin")
+        tracker
+            .create_user("user@test.com", &password_hash, "Test User", "admin")
             .unwrap();
 
         let response = router
@@ -956,7 +963,8 @@ mod tests {
         let (router, tracker) = create_test_app();
 
         let password_hash = bcrypt::hash("correct_password", 4).unwrap();
-        tracker.create_user("user@test.com", &password_hash, "Test User", "admin")
+        tracker
+            .create_user("user@test.com", &password_hash, "Test User", "admin")
             .unwrap();
 
         let response = router
@@ -1120,7 +1128,9 @@ mod tests {
         let user_id = tracker
             .create_user(email, &password_hash, "Admin User", "admin")
             .unwrap();
-        let token = tracker.create_session(user_id, "2099-12-31 23:59:59").unwrap();
+        let token = tracker
+            .create_session(user_id, "2099-12-31 23:59:59")
+            .unwrap();
         (user_id, token)
     }
 
@@ -1286,7 +1296,8 @@ mod tests {
 
         // Create a user first
         let hash = bcrypt::hash("password", 4).unwrap();
-        tracker.create_user("dup@test.com", &hash, "Dup User", "viewer")
+        tracker
+            .create_user("dup@test.com", &hash, "Dup User", "viewer")
             .unwrap();
 
         // Try to create another user with the same email
@@ -1413,7 +1424,8 @@ mod tests {
 
         // Create an additional user
         let hash = bcrypt::hash("password", 4).unwrap();
-        tracker.create_user("extra-list@test.com", &hash, "Extra User", "viewer")
+        tracker
+            .create_user("extra-list@test.com", &hash, "Extra User", "viewer")
             .unwrap();
 
         let response = router
@@ -1876,7 +1888,8 @@ mod tests {
     async fn test_login_sends_x_forwarded_for_ip() {
         let (router, tracker) = create_test_app();
         let password_hash = bcrypt::hash("secret123", 4).unwrap();
-        tracker.create_user("iptest@test.com", &password_hash, "IP User", "admin")
+        tracker
+            .create_user("iptest@test.com", &password_hash, "IP User", "admin")
             .unwrap();
 
         let response = router
@@ -2246,7 +2259,8 @@ mod tests {
     async fn test_login_response_body_structure() {
         let (router, tracker) = create_test_app();
         let password_hash = bcrypt::hash("testpass1", 4).unwrap();
-        tracker.create_user("struct@test.com", &password_hash, "Struct User", "viewer")
+        tracker
+            .create_user("struct@test.com", &password_hash, "Struct User", "viewer")
             .unwrap();
 
         let response = router
@@ -2345,7 +2359,8 @@ mod tests {
         config.storage_dir = storage_dir;
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        tracker.create_user("avatar@test.com", &password_hash, "Avatar User", "admin")
+        tracker
+            .create_user("avatar@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2412,7 +2427,8 @@ mod tests {
         config.storage_dir = storage_dir;
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        tracker.create_user("avatar2@test.com", &password_hash, "Avatar User", "admin")
+        tracker
+            .create_user("avatar2@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2464,7 +2480,8 @@ mod tests {
         config.storage_dir = storage_dir;
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        tracker.create_user("avatar3@test.com", &password_hash, "Avatar User", "admin")
+        tracker
+            .create_user("avatar3@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2522,7 +2539,8 @@ mod tests {
         config.storage_dir = storage_dir;
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        tracker.create_user("avatar4@test.com", &password_hash, "Avatar User", "admin")
+        tracker
+            .create_user("avatar4@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 
@@ -2575,7 +2593,8 @@ mod tests {
         config.storage_dir = storage_dir;
 
         let password_hash = bcrypt::hash("password", 4).unwrap();
-        tracker.create_user("avatar5@test.com", &password_hash, "Avatar User", "admin")
+        tracker
+            .create_user("avatar5@test.com", &password_hash, "Avatar User", "admin")
             .unwrap();
         let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
 

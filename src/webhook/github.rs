@@ -2686,8 +2686,14 @@ mod tests {
     #[test]
     fn test_create_test_config_with_secret() {
         let config = create_test_config(Some("my_secret"));
-        assert_eq!(config.webhook_secret.as_ref().map(|s| s.expose()), Some("my_secret"));
-        assert_eq!(config.token.as_ref().map(|s| s.expose()), Some("test_token"));
+        assert_eq!(
+            config.webhook_secret.as_ref().map(|s| s.expose()),
+            Some("my_secret")
+        );
+        assert_eq!(
+            config.token.as_ref().map(|s| s.expose()),
+            Some("test_token")
+        );
         assert_eq!(config.review_trigger, "@claudear");
     }
 

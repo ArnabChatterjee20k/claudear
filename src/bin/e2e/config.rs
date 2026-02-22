@@ -66,7 +66,10 @@ impl ConfigBuilder {
     }
 
     pub fn skip_permissions(mut self) -> Self {
-        self.config.agent.default_provider_config_mut().skip_permissions = true;
+        self.config
+            .agent
+            .default_provider_config_mut()
+            .skip_permissions = true;
         self
     }
 
@@ -145,7 +148,11 @@ impl ConfigBuilder {
     }
 
     pub fn slack_user_id(mut self, user_id: &str) -> Self {
-        let slack = self.config.issues.slack.get_or_insert_with(Default::default);
+        let slack = self
+            .config
+            .issues
+            .slack
+            .get_or_insert_with(Default::default);
         slack.user_id = Some(user_id.to_string());
         self
     }
@@ -157,7 +164,8 @@ impl ConfigBuilder {
     }
 
     pub fn instructions(mut self, instructions: &str) -> Self {
-        self.config.agent.default_provider_config_mut().instructions = Some(instructions.to_string());
+        self.config.agent.default_provider_config_mut().instructions =
+            Some(instructions.to_string());
         self
     }
 
@@ -187,13 +195,6 @@ impl ConfigBuilder {
             monitoring_duration_secs: Some(10),
             ..Default::default()
         };
-        self
-    }
-
-    pub fn cascade(mut self, rules: Vec<claudear::CascadeConfig>) -> Self {
-        if let Some(first) = rules.into_iter().next() {
-            self.config.cascade = first;
-        }
         self
     }
 

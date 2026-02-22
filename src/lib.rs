@@ -53,6 +53,8 @@ pub mod scm;
 pub mod secret;
 pub mod source;
 pub mod storage;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod templates;
 pub mod types;
 pub mod users;
@@ -104,7 +106,7 @@ pub use storage::{
     StoredDependency, StoredRepository, TimePeriod, TrendAnalysis, TrendDirection,
 };
 #[cfg(feature = "sqlite")]
-pub use storage::{SqliteTracker, is_vectorlite_available, try_load_vectorlite};
+pub use storage::{is_vectorlite_available, try_load_vectorlite, SqliteTracker};
 pub use types::*;
 pub use users::{ResolvedUser, UserRegistry};
 
@@ -237,8 +239,7 @@ fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notif
         composite.add(Arc::new(whatsapp_notifier));
     }
 
-    let telegram_notifier =
-        TelegramNotifier::new(config.notifiers.telegram.clone(), user_registry);
+    let telegram_notifier = TelegramNotifier::new(config.notifiers.telegram.clone(), user_registry);
     if telegram_notifier.is_enabled() {
         composite.add(Arc::new(telegram_notifier));
     }

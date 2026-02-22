@@ -353,12 +353,11 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
     let source = Arc::new(TaskSource::new("linear", tasks));
     let notifier = Arc::new(RecordingNotifier::default());
 
-    let agent: Arc<dyn claudear::runner::AgentRunner> = Arc::new(
-        claudear::runner::ClaudeAgentRunner::new(
+    let agent: Arc<dyn claudear::runner::AgentRunner> =
+        Arc::new(claudear::runner::ClaudeAgentRunner::new(
             claudear::runner::ClaudeRunnerConfig::default(),
             tracker.clone(),
-        ),
-    );
+        ));
 
     let watcher = Watcher::new(WatcherOptions {
         config: build_config(&temp_dir),

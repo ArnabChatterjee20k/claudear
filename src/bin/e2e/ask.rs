@@ -10,9 +10,6 @@ use std::time::Duration;
 /// Trait for E2E question flow orchestration.
 #[async_trait]
 pub trait E2eAsk: Send + Sync {
-    /// Backend name (e.g., "discord", "slack").
-    fn name(&self) -> &str;
-
     /// Downcast helper for backend-specific operations.
     fn as_any(&self) -> &dyn std::any::Any;
 
@@ -41,10 +38,6 @@ impl DiscordAsk {
 
 #[async_trait]
 impl E2eAsk for DiscordAsk {
-    fn name(&self) -> &str {
-        "discord"
-    }
-
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -172,10 +165,6 @@ impl SlackAsk {
 
 #[async_trait]
 impl E2eAsk for SlackAsk {
-    fn name(&self) -> &str {
-        "slack"
-    }
-
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

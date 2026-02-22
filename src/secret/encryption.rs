@@ -7,7 +7,7 @@
 
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
-    Aes256Gcm, AeadCore, Nonce,
+    AeadCore, Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use std::path::{Path, PathBuf};
@@ -38,10 +38,7 @@ impl MasterKey {
         let bytes = hex::decode(hex.trim())
             .map_err(|e| format!("Invalid hex-encoded master key: {}", e))?;
         if bytes.len() != 32 {
-            return Err(format!(
-                "Master key must be 32 bytes, got {}",
-                bytes.len()
-            ));
+            return Err(format!("Master key must be 32 bytes, got {}", bytes.len()));
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&bytes);
@@ -191,13 +188,8 @@ fn load_key_from_file(path: &Path) -> Result<MasterKey, String> {
 pub fn write_key_file(path: &Path, key: &MasterKey) -> Result<(), String> {
     // Create parent directory
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create directory '{}': {}",
-                parent.display(),
-                e
-            )
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory '{}': {}", parent.display(), e))?;
     }
 
     std::fs::write(path, key.to_hex())
@@ -278,7 +270,8 @@ mod tests {
 
     #[test]
     fn test_master_key_from_hex_invalid_chars() {
-        let result = MasterKey::from_hex("not_valid_hex_string_of_64_chars_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+        let result =
+            MasterKey::from_hex("not_valid_hex_string_of_64_chars_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
         assert!(result.is_err());
     }
 

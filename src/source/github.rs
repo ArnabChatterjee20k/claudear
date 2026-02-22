@@ -623,12 +623,7 @@ mod tests {
                 }
             }
 
-            fn mock_response(
-                &self,
-                url: impl Into<String>,
-                status: u16,
-                body: impl Into<String>,
-            ) {
+            fn mock_response(&self, url: impl Into<String>, status: u16, body: impl Into<String>) {
                 self.responses.lock().unwrap().insert(
                     url.into(),
                     HttpResponse {

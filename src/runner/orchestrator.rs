@@ -103,16 +103,14 @@ impl AgentRunner for AgentOrchestrator {
             .unwrap_or_default()
     }
 
-    fn build_prompt_for_issue(
-        &self,
-        issue: &Issue,
-        context: &str,
-        project_dir: &Path,
-    ) -> String {
+    fn build_prompt_for_issue(&self, issue: &Issue, context: &str, project_dir: &Path) -> String {
         // Use the primary provider's prompt building.
         self.providers
             .first()
-            .map(|p| p.provider.build_prompt_for_issue(issue, context, project_dir))
+            .map(|p| {
+                p.provider
+                    .build_prompt_for_issue(issue, context, project_dir)
+            })
             .unwrap_or_default()
     }
 
@@ -405,8 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_orchestrator_returns_error() {
-        let orchestrator =
-            AgentOrchestrator::new(vec![], SelectionStrategy::Primary, None);
+        let orchestrator = AgentOrchestrator::new(vec![], SelectionStrategy::Primary, None);
 
         let result = orchestrator
             .execute_with_attempt("test", None, None, Path::new("/tmp"))
@@ -485,7 +482,10 @@ mod tests {
             "my-experiment",
             "fallback",
         );
-        assert_eq!(orchestrator.experiment_name.as_deref(), Some("my-experiment"));
+        assert_eq!(
+            orchestrator.experiment_name.as_deref(),
+            Some("my-experiment")
+        );
         assert!(matches!(orchestrator.strategy, SelectionStrategy::Fallback));
     }
 
@@ -574,7 +574,9 @@ mod tests {
         struct CapProvider;
         #[async_trait]
         impl AgentRunner for CapProvider {
-            fn name(&self) -> &str { "cap-test" }
+            fn name(&self) -> &str {
+                "cap-test"
+            }
             fn capabilities(&self) -> ProviderCapabilities {
                 ProviderCapabilities {
                     structured_output: true,
@@ -584,17 +586,39 @@ mod tests {
                     cost_reporting: true,
                 }
             }
-            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String { String::new() }
-            async fn execute_with_attempt(&self, _: &str, _: Option<&Issue>, _: Option<i64>, _: &Path) -> Result<AgentResult> {
-                Ok(AgentResult { success: true, output: String::new(), pr_url: None, changelog: None, error: None, blocking_question: None, used_qa_ids: Vec::new() })
+            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String {
+                String::new()
+            }
+            async fn execute_with_attempt(
+                &self,
+                _: &str,
+                _: Option<&Issue>,
+                _: Option<i64>,
+                _: &Path,
+            ) -> Result<AgentResult> {
+                Ok(AgentResult {
+                    success: true,
+                    output: String::new(),
+                    pr_url: None,
+                    changelog: None,
+                    error: None,
+                    blocking_question: None,
+                    used_qa_ids: Vec::new(),
+                })
             }
         }
 
         let orchestrator = AgentOrchestrator::new(
             vec![
-                WeightedProvider { provider: Arc::new(CapProvider), weight: 1.0 },
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "other".into(), should_fail: false }),
+                    provider: Arc::new(CapProvider),
+                    weight: 1.0,
+                },
+                WeightedProvider {
+                    provider: Arc::new(MockProvider {
+                        name: "other".into(),
+                        should_fail: false,
+                    }),
                     weight: 1.0,
                 },
             ],
@@ -633,13 +657,19 @@ mod tests {
     fn test_from_experiment_weighted_random() {
         let orchestrator = AgentOrchestrator::from_experiment(
             vec![WeightedProvider {
-                provider: Arc::new(MockProvider { name: "test".into(), should_fail: false }),
+                provider: Arc::new(MockProvider {
+                    name: "test".into(),
+                    should_fail: false,
+                }),
                 weight: 1.0,
             }],
             "exp-wr",
             "weighted_random",
         );
-        assert!(matches!(orchestrator.strategy, SelectionStrategy::WeightedRandom));
+        assert!(matches!(
+            orchestrator.strategy,
+            SelectionStrategy::WeightedRandom
+        ));
         assert_eq!(orchestrator.experiment_name.as_deref(), Some("exp-wr"));
     }
 
@@ -647,7 +677,10 @@ mod tests {
     fn test_from_experiment_unknown_strategy_defaults_to_primary() {
         let orchestrator = AgentOrchestrator::from_experiment(
             vec![WeightedProvider {
-                provider: Arc::new(MockProvider { name: "test".into(), should_fail: false }),
+                provider: Arc::new(MockProvider {
+                    name: "test".into(),
+                    should_fail: false,
+                }),
                 weight: 1.0,
             }],
             "exp-unknown",
@@ -661,11 +694,17 @@ mod tests {
         let orchestrator = AgentOrchestrator::new(
             vec![
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "a".into(), should_fail: false }),
+                    provider: Arc::new(MockProvider {
+                        name: "a".into(),
+                        should_fail: false,
+                    }),
                     weight: 0.0,
                 },
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "b".into(), should_fail: false }),
+                    provider: Arc::new(MockProvider {
+                        name: "b".into(),
+                        should_fail: false,
+                    }),
                     weight: 0.0,
                 },
             ],
@@ -679,7 +718,10 @@ mod tests {
     async fn test_fallback_single_working_provider() {
         let orchestrator = AgentOrchestrator::new(
             vec![WeightedProvider {
-                provider: Arc::new(MockProvider { name: "sole".into(), should_fail: false }),
+                provider: Arc::new(MockProvider {
+                    name: "sole".into(),
+                    should_fail: false,
+                }),
                 weight: 1.0,
             }],
             SelectionStrategy::Fallback,
@@ -699,15 +741,24 @@ mod tests {
         let orchestrator = AgentOrchestrator::new(
             vec![
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "fail-a".into(), should_fail: true }),
+                    provider: Arc::new(MockProvider {
+                        name: "fail-a".into(),
+                        should_fail: true,
+                    }),
                     weight: 1.0,
                 },
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "fail-b".into(), should_fail: true }),
+                    provider: Arc::new(MockProvider {
+                        name: "fail-b".into(),
+                        should_fail: true,
+                    }),
                     weight: 1.0,
                 },
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "success-c".into(), should_fail: false }),
+                    provider: Arc::new(MockProvider {
+                        name: "success-c".into(),
+                        should_fail: false,
+                    }),
                     weight: 1.0,
                 },
             ],
@@ -728,11 +779,17 @@ mod tests {
         let orchestrator = AgentOrchestrator::new(
             vec![
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "first".into(), should_fail: true }),
+                    provider: Arc::new(MockProvider {
+                        name: "first".into(),
+                        should_fail: true,
+                    }),
                     weight: 1.0,
                 },
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "last".into(), should_fail: true }),
+                    provider: Arc::new(MockProvider {
+                        name: "last".into(),
+                        should_fail: true,
+                    }),
                     weight: 1.0,
                 },
             ],
@@ -759,7 +816,10 @@ mod tests {
             .execute_with_attempt("test", None, None, Path::new("/tmp"))
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No providers configured"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No providers configured"));
     }
 
     #[tokio::test]
@@ -776,11 +836,17 @@ mod tests {
         let orchestrator = AgentOrchestrator::new(
             vec![
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "a".into(), should_fail: false }),
+                    provider: Arc::new(MockProvider {
+                        name: "a".into(),
+                        should_fail: false,
+                    }),
                     weight: 1.0,
                 },
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "b".into(), should_fail: false }),
+                    provider: Arc::new(MockProvider {
+                        name: "b".into(),
+                        should_fail: false,
+                    }),
                     weight: 1.0,
                 },
             ],
@@ -814,9 +880,15 @@ mod tests {
 
         #[async_trait]
         impl AgentRunner for AttemptCapture {
-            fn name(&self) -> &str { "capture" }
-            fn capabilities(&self) -> ProviderCapabilities { ProviderCapabilities::default() }
-            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String { String::new() }
+            fn name(&self) -> &str {
+                "capture"
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String {
+                String::new()
+            }
             async fn execute_with_attempt(
                 &self,
                 _prompt: &str,
@@ -839,9 +911,14 @@ mod tests {
             }
         }
 
-        let capture = Arc::new(AttemptCapture { captured_attempt: AtomicI64::new(0) });
+        let capture = Arc::new(AttemptCapture {
+            captured_attempt: AtomicI64::new(0),
+        });
         let orchestrator = AgentOrchestrator::new(
-            vec![WeightedProvider { provider: capture.clone(), weight: 1.0 }],
+            vec![WeightedProvider {
+                provider: capture.clone(),
+                weight: 1.0,
+            }],
             SelectionStrategy::Primary,
             None,
         );
@@ -863,9 +940,15 @@ mod tests {
 
         #[async_trait]
         impl AgentRunner for IssueCapture {
-            fn name(&self) -> &str { "issue-capture" }
-            fn capabilities(&self) -> ProviderCapabilities { ProviderCapabilities::default() }
-            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String { String::new() }
+            fn name(&self) -> &str {
+                "issue-capture"
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String {
+                String::new()
+            }
             async fn execute_with_attempt(
                 &self,
                 _prompt: &str,
@@ -888,9 +971,14 @@ mod tests {
             }
         }
 
-        let capture = Arc::new(IssueCapture { captured_source: Mutex::new(None) });
+        let capture = Arc::new(IssueCapture {
+            captured_source: Mutex::new(None),
+        });
         let orchestrator = AgentOrchestrator::new(
-            vec![WeightedProvider { provider: capture.clone(), weight: 1.0 }],
+            vec![WeightedProvider {
+                provider: capture.clone(),
+                weight: 1.0,
+            }],
             SelectionStrategy::Primary,
             None,
         );
@@ -918,9 +1006,15 @@ mod tests {
 
         #[async_trait]
         impl AgentRunner for PromptCapture {
-            fn name(&self) -> &str { "prompt-capture" }
-            fn capabilities(&self) -> ProviderCapabilities { ProviderCapabilities::default() }
-            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String { String::new() }
+            fn name(&self) -> &str {
+                "prompt-capture"
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String {
+                String::new()
+            }
             async fn execute_with_attempt(
                 &self,
                 prompt: &str,
@@ -941,9 +1035,14 @@ mod tests {
             }
         }
 
-        let capture = Arc::new(PromptCapture { captured_prompt: Mutex::new(None) });
+        let capture = Arc::new(PromptCapture {
+            captured_prompt: Mutex::new(None),
+        });
         let orchestrator = AgentOrchestrator::new(
-            vec![WeightedProvider { provider: capture.clone(), weight: 1.0 }],
+            vec![WeightedProvider {
+                provider: capture.clone(),
+                weight: 1.0,
+            }],
             SelectionStrategy::Primary,
             None,
         );
@@ -968,9 +1067,15 @@ mod tests {
 
         #[async_trait]
         impl AgentRunner for DirCapture {
-            fn name(&self) -> &str { "dir-capture" }
-            fn capabilities(&self) -> ProviderCapabilities { ProviderCapabilities::default() }
-            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String { String::new() }
+            fn name(&self) -> &str {
+                "dir-capture"
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String {
+                String::new()
+            }
             async fn execute_with_attempt(
                 &self,
                 _prompt: &str,
@@ -991,9 +1096,14 @@ mod tests {
             }
         }
 
-        let capture = Arc::new(DirCapture { captured_dir: Mutex::new(None) });
+        let capture = Arc::new(DirCapture {
+            captured_dir: Mutex::new(None),
+        });
         let orchestrator = AgentOrchestrator::new(
-            vec![WeightedProvider { provider: capture.clone(), weight: 1.0 }],
+            vec![WeightedProvider {
+                provider: capture.clone(),
+                weight: 1.0,
+            }],
             SelectionStrategy::Primary,
             None,
         );
@@ -1016,24 +1126,46 @@ mod tests {
 
         #[async_trait]
         impl AgentRunner for NamedPromptProvider {
-            fn name(&self) -> &str { &self.provider_name }
-            fn capabilities(&self) -> ProviderCapabilities { ProviderCapabilities::default() }
+            fn name(&self) -> &str {
+                &self.provider_name
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
             fn build_prompt_for_issue(&self, issue: &Issue, context: &str, _: &Path) -> String {
                 format!("[{}] {} - {}", self.provider_name, issue.short_id, context)
             }
-            async fn execute_with_attempt(&self, _: &str, _: Option<&Issue>, _: Option<i64>, _: &Path) -> Result<AgentResult> {
-                Ok(AgentResult { success: true, output: String::new(), pr_url: None, changelog: None, error: None, blocking_question: None, used_qa_ids: Vec::new() })
+            async fn execute_with_attempt(
+                &self,
+                _: &str,
+                _: Option<&Issue>,
+                _: Option<i64>,
+                _: &Path,
+            ) -> Result<AgentResult> {
+                Ok(AgentResult {
+                    success: true,
+                    output: String::new(),
+                    pr_url: None,
+                    changelog: None,
+                    error: None,
+                    blocking_question: None,
+                    used_qa_ids: Vec::new(),
+                })
             }
         }
 
         let orchestrator = AgentOrchestrator::new(
             vec![
                 WeightedProvider {
-                    provider: Arc::new(NamedPromptProvider { provider_name: "claude".into() }),
+                    provider: Arc::new(NamedPromptProvider {
+                        provider_name: "claude".into(),
+                    }),
                     weight: 1.0,
                 },
                 WeightedProvider {
-                    provider: Arc::new(NamedPromptProvider { provider_name: "codex".into() }),
+                    provider: Arc::new(NamedPromptProvider {
+                        provider_name: "codex".into(),
+                    }),
                     weight: 1.0,
                 },
             ],
@@ -1044,7 +1176,11 @@ mod tests {
         let issue = Issue::new("1", "LIN-1", "Bug", "url", "linear");
         let prompt = orchestrator.build_prompt_for_issue(&issue, "context", Path::new("/tmp"));
         // Should delegate to the FIRST provider (claude), not codex
-        assert!(prompt.starts_with("[claude]"), "Expected prompt from claude, got: {}", prompt);
+        assert!(
+            prompt.starts_with("[claude]"),
+            "Expected prompt from claude, got: {}",
+            prompt
+        );
         assert!(prompt.contains("LIN-1"));
     }
 
@@ -1053,7 +1189,10 @@ mod tests {
         let make = |strategy: &str| {
             AgentOrchestrator::from_experiment(
                 vec![WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "t".into(), should_fail: false }),
+                    provider: Arc::new(MockProvider {
+                        name: "t".into(),
+                        should_fail: false,
+                    }),
                     weight: 1.0,
                 }],
                 "exp",
@@ -1061,10 +1200,22 @@ mod tests {
             )
         };
 
-        assert!(matches!(make("weighted_random").strategy, SelectionStrategy::WeightedRandom));
-        assert!(matches!(make("fallback").strategy, SelectionStrategy::Fallback));
-        assert!(matches!(make("primary").strategy, SelectionStrategy::Primary));
-        assert!(matches!(make("anything_else").strategy, SelectionStrategy::Primary));
+        assert!(matches!(
+            make("weighted_random").strategy,
+            SelectionStrategy::WeightedRandom
+        ));
+        assert!(matches!(
+            make("fallback").strategy,
+            SelectionStrategy::Fallback
+        ));
+        assert!(matches!(
+            make("primary").strategy,
+            SelectionStrategy::Primary
+        ));
+        assert!(matches!(
+            make("anything_else").strategy,
+            SelectionStrategy::Primary
+        ));
         assert!(matches!(make("").strategy, SelectionStrategy::Primary));
     }
 
@@ -1073,11 +1224,17 @@ mod tests {
         let orchestrator = AgentOrchestrator::new(
             vec![
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "a".into(), should_fail: false }),
+                    provider: Arc::new(MockProvider {
+                        name: "a".into(),
+                        should_fail: false,
+                    }),
                     weight: -1.0,
                 },
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "b".into(), should_fail: false }),
+                    provider: Arc::new(MockProvider {
+                        name: "b".into(),
+                        should_fail: false,
+                    }),
                     weight: -2.0,
                 },
             ],
@@ -1090,11 +1247,7 @@ mod tests {
 
     #[test]
     fn test_weighted_selection_empty_providers_returns_zero() {
-        let orchestrator = AgentOrchestrator::new(
-            vec![],
-            SelectionStrategy::WeightedRandom,
-            None,
-        );
+        let orchestrator = AgentOrchestrator::new(vec![], SelectionStrategy::WeightedRandom, None);
         assert_eq!(orchestrator.select_weighted_random(), 0);
     }
 
@@ -1104,10 +1257,22 @@ mod tests {
 
         #[async_trait]
         impl AgentRunner for PrProvider {
-            fn name(&self) -> &str { "pr-provider" }
-            fn capabilities(&self) -> ProviderCapabilities { ProviderCapabilities::default() }
-            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String { String::new() }
-            async fn execute_with_attempt(&self, _: &str, _: Option<&Issue>, _: Option<i64>, _: &Path) -> Result<AgentResult> {
+            fn name(&self) -> &str {
+                "pr-provider"
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String {
+                String::new()
+            }
+            async fn execute_with_attempt(
+                &self,
+                _: &str,
+                _: Option<&Issue>,
+                _: Option<i64>,
+                _: &Path,
+            ) -> Result<AgentResult> {
                 Ok(AgentResult {
                     success: true,
                     output: "created PR".to_string(),
@@ -1123,7 +1288,10 @@ mod tests {
         let orchestrator = AgentOrchestrator::new(
             vec![
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "fail".into(), should_fail: true }),
+                    provider: Arc::new(MockProvider {
+                        name: "fail".into(),
+                        should_fail: true,
+                    }),
                     weight: 1.0,
                 },
                 WeightedProvider {
@@ -1140,7 +1308,10 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert_eq!(result.pr_url.as_deref(), Some("https://github.com/org/repo/pull/42"));
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://github.com/org/repo/pull/42")
+        );
         assert_eq!(result.changelog.as_deref(), Some("- Fixed auth"));
         assert_eq!(result.used_qa_ids, vec![1]);
     }
@@ -1150,11 +1321,17 @@ mod tests {
         let orchestrator = AgentOrchestrator::new(
             vec![
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "failing-primary".into(), should_fail: true }),
+                    provider: Arc::new(MockProvider {
+                        name: "failing-primary".into(),
+                        should_fail: true,
+                    }),
                     weight: 1.0,
                 },
                 WeightedProvider {
-                    provider: Arc::new(MockProvider { name: "backup".into(), should_fail: false }),
+                    provider: Arc::new(MockProvider {
+                        name: "backup".into(),
+                        should_fail: false,
+                    }),
                     weight: 1.0,
                 },
             ],

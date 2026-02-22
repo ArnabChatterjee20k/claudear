@@ -41,7 +41,6 @@ struct TelegramMessage {
     chat: TelegramChat,
     #[serde(default)]
     text: Option<String>,
-    date: i64,
 }
 
 /// A Telegram user (message sender).
@@ -51,16 +50,12 @@ struct TelegramUser {
     is_bot: bool,
     #[serde(default)]
     username: Option<String>,
-    #[serde(default)]
-    first_name: Option<String>,
 }
 
 /// A Telegram chat (group, supergroup, or private).
 #[derive(Debug, Clone, Deserialize)]
 struct TelegramChat {
     id: i64,
-    #[serde(default)]
-    title: Option<String>,
 }
 
 /// Response from the `sendMessage` API.
@@ -201,12 +196,10 @@ impl IssueSource for TelegramSource {
             url.push_str(&format!("&offset={}", id + 1));
         }
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| Error::source("telegram", format!("getUpdates request failed: {}", e)))?;
+        let resp =
+            self.client.get(&url).send().await.map_err(|e| {
+                Error::source("telegram", format!("getUpdates request failed: {}", e))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -223,10 +216,7 @@ impl IssueSource for TelegramSource {
             .map_err(|e| Error::source("telegram", format!("Failed to parse response: {}", e)))?;
 
         if !api_resp.ok {
-            return Err(Error::source(
-                "telegram",
-                "Telegram API returned ok=false",
-            ));
+            return Err(Error::source("telegram", "Telegram API returned ok=false"));
         }
 
         let updates = api_resp.result;
@@ -254,29 +244,17 @@ impl IssueSource for TelegramSource {
         }
 
         // Resolve listen chat filter.
-        let listen_chat: Option<i64> = self
-            .listen_chat_id()
-            .and_then(|s| s.parse::<i64>().ok());
+        let listen_chat: Option<i64> = self.listen_chat_id().and_then(|s| s.parse::<i64>().ok());
 
         let issues: Vec<Issue> = updates
             .iter()
             .filter_map(|u| u.message.as_ref())
             // Skip bot messages.
-            .filter(|msg| {
-                msg.from
-                    .as_ref()
-                    .map_or(true, |user| !user.is_bot)
-            })
+            .filter(|msg| msg.from.as_ref().map_or(true, |user| !user.is_bot))
             // Skip messages without text.
-            .filter(|msg| {
-                msg.text
-                    .as_ref()
-                    .map_or(false, |t| !t.trim().is_empty())
-            })
+            .filter(|msg| msg.text.as_ref().map_or(false, |t| !t.trim().is_empty()))
             // Filter to listen_chat_id if configured.
-            .filter(|msg| {
-                listen_chat.map_or(true, |cid| msg.chat.id == cid)
-            })
+            .filter(|msg| listen_chat.map_or(true, |cid| msg.chat.id == cid))
             .map(|msg| {
                 self.cache_message(msg);
                 Self::message_to_issue(msg)
@@ -284,10 +262,7 @@ impl IssueSource for TelegramSource {
             .collect();
 
         if !issues.is_empty() {
-            tracing::info!(
-                count = issues.len(),
-                "Telegram source fetched new issues"
-            );
+            tracing::info!(count = issues.len(), "Telegram source fetched new issues");
         }
 
         Ok(issues)
@@ -356,9 +331,7 @@ impl IssueSource for TelegramSource {
             }))
             .send()
             .await
-            .map_err(|e| {
-                Error::Other(format!("Failed to send Telegram message: {}", e))
-            })?;
+            .map_err(|e| Error::Other(format!("Failed to send Telegram message: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -382,9 +355,9 @@ impl IssueSource for TelegramSource {
             ));
         }
 
-        let msg = api_resp.result.ok_or_else(|| {
-            Error::Other("Telegram sendMessage response missing result".into())
-        })?;
+        let msg = api_resp
+            .result
+            .ok_or_else(|| Error::Other("Telegram sendMessage response missing result".into()))?;
 
         self.cache_message(&msg);
         Ok(Self::message_to_issue(&msg))
@@ -402,7 +375,9 @@ mod tests {
 
     fn make_config() -> TelegramConfig {
         TelegramConfig {
-            bot_token: Some(SecretValue::new("123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11")),
+            bot_token: Some(SecretValue::new(
+                "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            )),
             chat_id: Some("-1001234567890".to_string()),
             to_chat_ids: vec![],
             source_enabled: true,
@@ -418,14 +393,11 @@ mod tests {
                 id: 42,
                 is_bot,
                 username: Some("testuser".to_string()),
-                first_name: Some("Test".to_string()),
             }),
             chat: TelegramChat {
                 id: -1001234567890,
-                title: Some("Test Group".to_string()),
             },
             text: Some(text.to_string()),
-            date: 1700000000,
         }
     }
 
@@ -465,7 +437,6 @@ mod tests {
         assert_eq!(msg.message_id, 1);
         assert_eq!(msg.text.as_deref(), Some("hello world"));
         assert_eq!(msg.chat.id, -1001234567890);
-        assert_eq!(msg.chat.title.as_deref(), Some("Dev"));
     }
 
     #[test]
@@ -495,7 +466,6 @@ mod tests {
         assert_eq!(msg.message_id, 5);
         assert!(msg.from.is_none());
         assert!(msg.text.is_none());
-        assert!(msg.chat.title.is_none());
     }
 
     #[test]
@@ -505,7 +475,6 @@ mod tests {
         assert_eq!(user.id, 10);
         assert!(!user.is_bot);
         assert!(user.username.is_none());
-        assert!(user.first_name.is_none());
     }
 
     #[test]
@@ -620,10 +589,8 @@ mod tests {
             from: None,
             chat: TelegramChat {
                 id: -1001234567890,
-                title: Some("Chat".to_string()),
             },
             text: Some("Anonymous message".to_string()),
-            date: 1700000000,
         };
         let issue = TelegramSource::message_to_issue(&msg);
         assert_eq!(issue.id, "99");
@@ -638,10 +605,8 @@ mod tests {
             from: None,
             chat: TelegramChat {
                 id: 100,
-                title: None,
             },
             text: None,
-            date: 1700000000,
         };
         let issue = TelegramSource::message_to_issue(&msg);
         assert_eq!(issue.title, "");
@@ -772,9 +737,7 @@ mod tests {
         let bot_msg = make_message(1, "bot says hi", true);
         let human_msg = make_message(2, "human says hi", false);
 
-        let is_bot = |msg: &TelegramMessage| {
-            msg.from.as_ref().map_or(false, |u| u.is_bot)
-        };
+        let is_bot = |msg: &TelegramMessage| msg.from.as_ref().map_or(false, |u| u.is_bot);
 
         assert!(is_bot(&bot_msg));
         assert!(!is_bot(&human_msg));
@@ -785,9 +748,8 @@ mod tests {
         let empty_msg = make_message(1, "   ", false);
         let valid_msg = make_message(2, "hello", false);
 
-        let has_text = |msg: &TelegramMessage| {
-            msg.text.as_ref().map_or(false, |t| !t.trim().is_empty())
-        };
+        let has_text =
+            |msg: &TelegramMessage| msg.text.as_ref().map_or(false, |t| !t.trim().is_empty());
 
         assert!(!has_text(&empty_msg));
         assert!(has_text(&valid_msg));
@@ -801,19 +763,15 @@ mod tests {
                 id: 42,
                 is_bot: false,
                 username: None,
-                first_name: None,
             }),
             chat: TelegramChat {
                 id: -1001234567890,
-                title: None,
             },
             text: None,
-            date: 1700000000,
         };
 
-        let has_text = |msg: &TelegramMessage| {
-            msg.text.as_ref().map_or(false, |t| !t.trim().is_empty())
-        };
+        let has_text =
+            |msg: &TelegramMessage| msg.text.as_ref().map_or(false, |t| !t.trim().is_empty());
 
         assert!(!has_text(&msg));
     }
@@ -827,20 +785,15 @@ mod tests {
                 id: 42,
                 is_bot: false,
                 username: None,
-                first_name: None,
             }),
             chat: TelegramChat {
                 id: -1009999999999,
-                title: None,
             },
             text: Some("hello".to_string()),
-            date: 1700000000,
         };
 
         let listen: Option<i64> = Some(-1001234567890);
-        let matches_chat = |msg: &TelegramMessage| {
-            listen.map_or(true, |cid| msg.chat.id == cid)
-        };
+        let matches_chat = |msg: &TelegramMessage| listen.map_or(true, |cid| msg.chat.id == cid);
 
         assert!(matches_chat(&msg_right));
         assert!(!matches_chat(&msg_wrong));
@@ -850,9 +803,7 @@ mod tests {
     fn test_no_chat_filter_passes_all() {
         let msg = make_message(1, "hello", false);
         let listen: Option<i64> = None;
-        let matches_chat = |msg: &TelegramMessage| {
-            listen.map_or(true, |cid| msg.chat.id == cid)
-        };
+        let matches_chat = |msg: &TelegramMessage| listen.map_or(true, |cid| msg.chat.id == cid);
         assert!(matches_chat(&msg));
     }
 
@@ -947,8 +898,13 @@ mod tests {
     #[tokio::test]
     async fn test_build_issue_context_no_description() {
         let source = TelegramSource::new(make_config());
-        let issue =
-            Issue::new("1", "TG-1", "Fix login", "https://t.me/c/1234567890/1", "telegram");
+        let issue = Issue::new(
+            "1",
+            "TG-1",
+            "Fix login",
+            "https://t.me/c/1234567890/1",
+            "telegram",
+        );
         let context = source.build_issue_context(&issue).await.unwrap();
         assert!(context.contains("Fix login"));
         assert!(!context.contains("Message:"));
@@ -980,14 +936,11 @@ mod tests {
                 id: 99,
                 is_bot: false,
                 username: None,
-                first_name: Some("NoUsername".to_string()),
             }),
             chat: TelegramChat {
                 id: -1001234567890,
-                title: None,
             },
             text: Some("hello".to_string()),
-            date: 1700000000,
         };
         let issue = TelegramSource::message_to_issue(&msg);
         assert!(issue.get_metadata::<String>("author_username").is_none());
@@ -1165,14 +1118,11 @@ mod tests {
                 id: 42,
                 is_bot: false,
                 username: Some("alice".to_string()),
-                first_name: None,
             }),
             chat: TelegramChat {
                 id: 12345,
-                title: None,
             },
             text: Some("DM message".to_string()),
-            date: 1700000000,
         };
         let issue = TelegramSource::message_to_issue(&msg);
         assert_eq!(issue.url, "");
@@ -1208,13 +1158,7 @@ mod tests {
             msg.from.as_ref().unwrap().username.as_deref(),
             Some("alice")
         );
-        assert_eq!(
-            msg.from.as_ref().unwrap().first_name.as_deref(),
-            Some("Alice")
-        );
-        assert_eq!(msg.chat.title.as_deref(), Some("Dev Chat"));
         assert_eq!(msg.text.as_deref(), Some("Hello world"));
-        assert_eq!(msg.date, 1700000000);
     }
 
     #[test]

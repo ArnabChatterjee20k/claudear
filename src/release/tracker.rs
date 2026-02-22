@@ -325,16 +325,18 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
 
                 let mut verified = false;
                 for package_name in &package_names {
-                    if self.verify_lock_file(
-                        watch,
-                        fix_repo,
-                        merged_at,
-                        target_repo,
-                        &target_release.tag_name,
-                        package_name,
-                        "composer.lock",
-                    )
-                    .await? {
+                    if self
+                        .verify_lock_file(
+                            watch,
+                            fix_repo,
+                            merged_at,
+                            target_repo,
+                            &target_release.tag_name,
+                            package_name,
+                            "composer.lock",
+                        )
+                        .await?
+                    {
                         verified = true;
                         break;
                     }
@@ -359,16 +361,18 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
 
                 let mut verified = false;
                 for package_name in &package_names {
-                    if self.verify_lock_file(
-                        watch,
-                        fix_repo,
-                        merged_at,
-                        target_repo,
-                        &target_release.tag_name,
-                        package_name,
-                        "package-lock.json",
-                    )
-                    .await? {
+                    if self
+                        .verify_lock_file(
+                            watch,
+                            fix_repo,
+                            merged_at,
+                            target_repo,
+                            &target_release.tag_name,
+                            package_name,
+                            "package-lock.json",
+                        )
+                        .await?
+                    {
                         verified = true;
                         break;
                     }
@@ -1857,7 +1861,10 @@ mod tests {
         let config = ReleaseTrackerConfig {
             package_names: {
                 let mut m = HashMap::new();
-                m.insert("org/source".to_string(), vec!["@scope/custom-pkg".to_string()]);
+                m.insert(
+                    "org/source".to_string(),
+                    vec!["@scope/custom-pkg".to_string()],
+                );
                 m
             },
             ..Default::default()
@@ -4726,7 +4733,10 @@ mod tests {
         let config_ref = release_tracker.config();
         assert_eq!(config_ref.target_repos.len(), 3);
         assert_eq!(config_ref.poll_interval_ms, 42);
-        assert_eq!(config_ref.package_names.get("a"), Some(&vec!["b".to_string()]));
+        assert_eq!(
+            config_ref.package_names.get("a"),
+            Some(&vec!["b".to_string()])
+        );
     }
 
     // --- verify_release_after: source release with very distant timestamps ---
@@ -4971,7 +4981,10 @@ mod tests {
             target_repos: vec!["vendor/app".to_string()],
             package_names: {
                 let mut m = HashMap::new();
-                m.insert("vendor/library".to_string(), vec!["vendor/library".to_string()]);
+                m.insert(
+                    "vendor/library".to_string(),
+                    vec!["vendor/library".to_string()],
+                );
                 m
             },
             ..Default::default()
@@ -5292,7 +5305,10 @@ mod tests {
             package_names: {
                 let mut m = HashMap::new();
                 // Map "org/source" to "custom/pkg-name" in composer.lock
-                m.insert("org/source".to_string(), vec!["custom/pkg-name".to_string()]);
+                m.insert(
+                    "org/source".to_string(),
+                    vec!["custom/pkg-name".to_string()],
+                );
                 m
             },
             ..Default::default()

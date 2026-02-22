@@ -401,7 +401,11 @@ impl Notifier for EmailNotifier {
         let imap_password = match self.config.imap_password.as_ref() {
             Some(v) => {
                 let exposed = v.expose().to_string();
-                if !exposed.is_empty() { exposed } else { return Ok(Vec::new()); }
+                if !exposed.is_empty() {
+                    exposed
+                } else {
+                    return Ok(Vec::new());
+                }
             }
             _ => return Ok(Vec::new()),
         };

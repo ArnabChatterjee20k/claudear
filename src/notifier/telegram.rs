@@ -118,10 +118,7 @@ impl<H: TelegramHttpClient> TelegramNotifier<H> {
             None => return Ok(()),
         };
 
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
 
         // Truncate message to Telegram limit (4096 chars)
         let truncated_text = if text.len() > 4096 {
@@ -895,8 +892,10 @@ mod tests {
 
     #[test]
     fn test_resolve_recipients_returns_config_chat_ids_when_no_issue() {
-        let notifier =
-            TelegramNotifier::with_http_client(multi_recipient_config(), MockTelegramClient::success());
+        let notifier = TelegramNotifier::with_http_client(
+            multi_recipient_config(),
+            MockTelegramClient::success(),
+        );
         let recipients = notifier.resolve_recipients(None);
         assert_eq!(
             recipients,
@@ -1365,7 +1364,9 @@ mod tests {
     async fn test_notify_merged_disabled() {
         let notifier = TelegramNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
-        let result = notifier.notify_merged(&issue, "https://github.com/pr/1").await;
+        let result = notifier
+            .notify_merged(&issue, "https://github.com/pr/1")
+            .await;
         assert!(result.is_ok());
     }
 
@@ -1373,7 +1374,9 @@ mod tests {
     async fn test_notify_closed_disabled() {
         let notifier = TelegramNotifier::new(disabled_config(), empty_registry());
         let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
-        let result = notifier.notify_closed(&issue, "https://github.com/pr/1").await;
+        let result = notifier
+            .notify_closed(&issue, "https://github.com/pr/1")
+            .await;
         assert!(result.is_ok());
     }
 

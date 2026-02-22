@@ -674,8 +674,10 @@ impl<H: HttpClient> GitHubClient<H> {
             let count = issues.len();
 
             // Filter out pull requests (GitHub Issues API includes PRs)
-            let real_issues: Vec<GitHubIssue> =
-                issues.into_iter().filter(|i| i.pull_request.is_none()).collect();
+            let real_issues: Vec<GitHubIssue> = issues
+                .into_iter()
+                .filter(|i| i.pull_request.is_none())
+                .collect();
             all_issues.extend(real_issues);
 
             if count < PER_PAGE {
@@ -716,10 +718,7 @@ impl<H: HttpClient> GitHubClient<H> {
         }
 
         if !response.is_success() {
-            return Err(Error::Other(format!(
-                "GitHub API error: {}",
-                response.body
-            )));
+            return Err(Error::Other(format!("GitHub API error: {}", response.body)));
         }
 
         response.json()

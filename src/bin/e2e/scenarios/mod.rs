@@ -58,11 +58,6 @@ impl<'a> ScenarioContext<'a> {
         Ok("target/release/claudear".to_string())
     }
 
-    /// Extract the org/owner from the repo name (e.g., "owner/repo" -> "owner").
-    pub fn repo_owner(&self) -> &str {
-        self.repo.split('/').next().unwrap_or(self.repo)
-    }
-
     /// Clone a repo to a local directory for the daemon's repo discovery.
     ///
     /// Returns the path to the cloned repo.

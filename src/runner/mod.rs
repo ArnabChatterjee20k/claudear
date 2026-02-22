@@ -44,12 +44,7 @@ pub trait AgentRunner: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities;
 
     /// Build a prompt for an issue.
-    fn build_prompt_for_issue(
-        &self,
-        issue: &Issue,
-        context: &str,
-        project_dir: &Path,
-    ) -> String;
+    fn build_prompt_for_issue(&self, issue: &Issue, context: &str, project_dir: &Path) -> String;
 
     /// Run the agent and return a uniform result.
     async fn execute_with_attempt(
@@ -265,9 +260,7 @@ mod tests {
         assert!(is_hard_error(
             "Failed to spawn /usr/bin/claude: No such file or directory"
         ));
-        assert!(is_hard_error(
-            "Connection reset by peer while streaming"
-        ));
+        assert!(is_hard_error("Connection reset by peer while streaming"));
     }
 
     #[test]
@@ -305,7 +298,9 @@ mod tests {
     fn test_is_rate_limit_error_unicode_safe() {
         // Should handle non-ASCII without panic
         assert!(!is_rate_limit_error("错误：无法连接"));
-        assert!(is_rate_limit_error("Error: rate limit exceeded. 请稍后再试"));
+        assert!(is_rate_limit_error(
+            "Error: rate limit exceeded. 请稍后再试"
+        ));
     }
 
     #[test]
