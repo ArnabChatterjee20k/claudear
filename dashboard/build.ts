@@ -18,6 +18,14 @@ const result = await Bun.build({
   target: "browser",
   format: "esm",
   naming: "assets/[name]-[hash].[ext]",
+  define: {
+    "process.env.SENTRY_DSN": JSON.stringify(process.env.SENTRY_DSN || ""),
+    "process.env.SENTRY_RELEASE": JSON.stringify(process.env.SENTRY_RELEASE || ""),
+    "process.env.SENTRY_ENVIRONMENT": JSON.stringify(process.env.SENTRY_ENVIRONMENT || ""),
+    "__SENTRY_DEBUG__": "false",
+    "__RRWEB_EXCLUDE_IFRAME__": "true",
+    "__RRWEB_EXCLUDE_SHADOW_DOM__": "true",
+  },
 });
 
 if (!result.success) {

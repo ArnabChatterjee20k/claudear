@@ -3,7 +3,6 @@ import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/re
 import { SWRConfig } from "swr";
 import type { ReactNode } from "react";
 
-// ─── Helpers ──────────────────────────────────
 
 const originalFetch = globalThis.fetch;
 
@@ -77,7 +76,6 @@ function renderPage(ui: ReactNode) {
   return render(ui, { wrapper: Wrapper });
 }
 
-// ─── Tests ──────────────────────────────────
 
 describe("Page Components", () => {
   beforeEach(() => {
@@ -89,7 +87,6 @@ describe("Page Components", () => {
     globalThis.fetch = originalFetch;
   });
 
-  // ─── ActivityPage ──────────────────────────────────
 
   describe("ActivityPage", () => {
     const mockActivityData = [
@@ -146,7 +143,6 @@ describe("Page Components", () => {
     });
   });
 
-  // ─── AttemptsPage ──────────────────────────────────
 
   describe("AttemptsPage", () => {
     const mockAttemptsData = {
@@ -210,7 +206,7 @@ describe("Page Components", () => {
           attempt: {
             id: 1, issue_id: "SEN-999", short_id: "def456", source: "sentry",
             attempted_at: "2024-01-01T00:00:00Z", pr_url: "https://github.com/test/pr/99",
-            github_repo: "test/repo", github_pr_number: 99, status: "success",
+            scm_repo: "test/repo", scm_pr_number: 99, status: "success",
             error_message: null, merged_at: null, resolved_at: null,
             retry_count: 1, last_retry_at: null, issue_labels: ["bug", "critical"],
             parent_attempt_id: null, cascade_repo: null,
@@ -267,7 +263,6 @@ describe("Page Components", () => {
     });
   });
 
-  // ─── AnalyticsPage ──────────────────────────────────
 
   describe("AnalyticsPage", () => {
     const mockSummary = {
@@ -522,7 +517,6 @@ describe("Page Components", () => {
     });
   });
 
-  // ─── ErrorsPage ──────────────────────────────────
 
   describe("ErrorsPage", () => {
     const mockErrorsData = [
@@ -580,7 +574,6 @@ describe("Page Components", () => {
     });
   });
 
-  // ─── PrsPage ──────────────────────────────────
 
   describe("PrsPage", () => {
     const mockAnalytics = {
@@ -599,7 +592,7 @@ describe("Page Components", () => {
       {
         id: 1,
         pr_url: "https://github.com/test/pr/1",
-        github_repo: "test/repo",
+        scm_repo: "test/repo",
         pr_number: 42,
         attempt_id: 1,
         issue_id: "LIN-1",
@@ -673,7 +666,6 @@ describe("Page Components", () => {
     });
   });
 
-  // ─── FeedbackPage ──────────────────────────────────
 
   describe("FeedbackPage", () => {
     const mockFeedbackData = [
@@ -731,7 +723,6 @@ describe("Page Components", () => {
     });
   });
 
-  // ─── RegressionsPage ──────────────────────────────────
 
   describe("RegressionsPage", () => {
     const mockRegressionsData = [
@@ -836,7 +827,6 @@ describe("Page Components", () => {
     });
   });
 
-  // ─── ExperimentsPage ──────────────────────────────────
 
   describe("ExperimentsPage", () => {
     const mockExperimentsData = [
@@ -915,7 +905,6 @@ describe("Page Components", () => {
     });
   });
 
-  // ─── ReposPage ──────────────────────────────────
 
   describe("ReposPage", () => {
     const mockRepos = [
@@ -923,7 +912,7 @@ describe("Page Components", () => {
         id: 1,
         name: "my-app",
         path: "/home/user/my-app",
-        github_url: "https://github.com/user/my-app",
+        scm_url: "https://github.com/user/my-app",
         default_branch: "main",
         file_count: 150,
         last_indexed_at: "2024-01-01T00:00:00Z",
@@ -1002,7 +991,103 @@ describe("Page Components", () => {
     });
   });
 
-  // ─── InferencePage ──────────────────────────────────
+
+  describe("LearningPage", () => {
+    const mockRepos = [
+      {
+        id: 1,
+        name: "my-app",
+        path: "/home/user/my-app",
+        scm_url: "https://github.com/user/my-app",
+        default_branch: "main",
+        file_count: 150,
+        last_indexed_at: "2024-01-01T00:00:00Z",
+        created_at: "2024-01-01T00:00:00Z",
+      },
+    ];
+
+    const mockLearning = {
+      repo: "my-app",
+      knowledge: [
+        {
+          key: "test_pattern",
+          label: "Test Patterns",
+          entries: [
+            {
+              id: 1,
+              value: "Tests live in __tests__ directories",
+              source_type: "review",
+              confidence: 0.85,
+              occurrence_count: 5,
+              updated_at: "2024-01-01T00:00:00Z",
+            },
+          ],
+        },
+      ],
+      knowledge_total: 1,
+      instructions: [
+        {
+          id: 1,
+          repo: "my-app",
+          source_type: "qa",
+          instruction_text: "Always run lint before committing",
+          occurrence_count: 3,
+          confidence: 0.9,
+          is_active: true,
+          created_at: "2024-01-01T00:00:00Z",
+          updated_at: "2024-01-01T00:00:00Z",
+        },
+      ],
+      review_patterns: [],
+      review_pattern_summary: { total_patterns: 0, by_category: {}, promoted_count: 0 },
+      strategies: [],
+      diff_analyses: [],
+      correlations: [],
+    };
+
+    test("renders without crashing", async () => {
+      mockFetchByUrl({
+        "/api/repos/my-app/learning": mockLearning,
+        "/api/repos": mockRepos,
+      });
+      const LearningPage = (await import("../src/pages/learning")).default;
+      renderPage(<LearningPage />);
+      expect(screen.getByText("Learning")).toBeDefined();
+    });
+
+    test("shows stats and knowledge after selecting repo", async () => {
+      mockFetchByUrl({
+        "/api/repos/my-app/learning": mockLearning,
+        "/api/repos": mockRepos,
+      });
+      const LearningPage = (await import("../src/pages/learning")).default;
+      renderPage(<LearningPage />);
+
+      // Select repo from dropdown
+      await waitFor(() => {
+        expect(screen.getByText("Learning")).toBeDefined();
+      });
+      const select = screen.getByRole("combobox") as HTMLSelectElement;
+      fireEvent.change(select, { target: { value: "my-app" } });
+
+      await waitFor(() => {
+        expect(screen.getByText("Knowledge Items")).toBeDefined();
+      });
+      expect(screen.getByText("Test Patterns")).toBeDefined();
+      expect(screen.getByText("Tests live in __tests__ directories")).toBeDefined();
+    });
+
+    test("shows prompt to select repo when none selected", async () => {
+      mockFetchByUrl({
+        "/api/repos": mockRepos,
+      });
+      const LearningPage = (await import("../src/pages/learning")).default;
+      renderPage(<LearningPage />);
+
+      expect(screen.getByText("Select a repository above to view learning data.")).toBeDefined();
+    });
+  });
+
 
   describe("InferencePage", () => {
     const mockInferenceStats = {

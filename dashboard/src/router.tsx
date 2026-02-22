@@ -6,17 +6,17 @@ const RouterContext = createContext<{ path: string; navigate: (path: string) => 
 })
 
 function useHistory() {
-  const [path, setPath] = useState(() => window.location.pathname)
+  const [path, setPath] = useState(() => window.location.pathname.split('?')[0])
 
   useEffect(() => {
-    const onPopState = () => setPath(window.location.pathname)
+    const onPopState = () => setPath(window.location.pathname.split('?')[0])
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
   }, [])
 
   const navigate = useCallback((newPath: string) => {
     window.history.pushState(null, '', newPath)
-    setPath(newPath)
+    setPath(newPath.split('?')[0])
   }, [])
 
   return { path, navigate }

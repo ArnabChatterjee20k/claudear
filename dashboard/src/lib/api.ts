@@ -6,7 +6,6 @@ export function getWsBase(): string {
   return `${proto}//${loc.host}`;
 }
 
-// ─── Existing types ──────────────────────────────────
 
 export interface Stats {
   total: number;
@@ -114,7 +113,6 @@ export interface SourcesResponse {
   sources: SourceInfo[];
 }
 
-// ─── Auth types ──────────────────────────────────
 
 export interface AuthUser {
   id: number
@@ -138,7 +136,6 @@ export interface UserRecord {
   updated_at: string
 }
 
-// ─── New types ──────────────────────────────────
 
 export interface ActivityLogEntry {
   id: number;
@@ -195,8 +192,8 @@ export interface FixAttemptDetail {
   source: string;
   attempted_at: string;
   pr_url: string | null;
-  github_repo: string | null;
-  github_pr_number: number | null;
+  scm_repo: string | null;
+  scm_pr_number: number | null;
   status: string;
   error_message: string | null;
   merged_at: string | null;
@@ -264,7 +261,7 @@ export interface ErrorPattern {
 export interface PrRecord {
   id: number;
   pr_url: string;
-  github_repo: string;
+  scm_repo: string;
   pr_number: number;
   attempt_id: number | null;
   issue_id: string | null;
@@ -392,7 +389,7 @@ export interface StoredIndexedRepo {
   id: number;
   name: string;
   path: string;
-  github_url: string | null;
+  scm_url: string | null;
   default_branch: string;
   file_count: number;
   last_indexed_at: string;
@@ -613,7 +610,6 @@ export interface TelemetryLatency {
   histogram: TelemetryLatencyHistogramBucket[];
 }
 
-// ─── Fetchers ──────────────────────────────────
 
 let onUnauthorized: (() => void) | null = null
 
@@ -854,7 +850,102 @@ export async function fetchTelemetryLatency(params?: {
   return fetchJson(`${API_BASE}/telemetry/latency?${searchParams}`);
 }
 
-// ─── Config API ──────────────────────────────────
+
+export interface KnowledgeEntry {
+  id: number
+  value: string
+  source_type: string
+  confidence: number
+  occurrence_count: number
+  updated_at: string
+}
+
+export interface KnowledgeGroup {
+  key: string
+  label: string
+  entries: KnowledgeEntry[]
+}
+
+export interface ReviewPatternSummary {
+  total_patterns: number
+  by_category: Record<string, number>
+  promoted_count: number
+}
+
+export interface ReviewPattern {
+  id: number
+  scm_repo: string
+  category: string
+  pattern_text: string
+  example_comments: string[]
+  occurrence_count: number
+  promoted_to_instruction: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface PromotedInstruction {
+  id: number
+  repo: string
+  source_type: string
+  instruction_text: string
+  occurrence_count: number
+  confidence: number
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface StrategyFingerprint {
+  id: number
+  attempt_id: number
+  files_explored: string[]
+  tests_run: number
+  tools_used: Record<string, number>
+  fix_approach: string
+  strategy_summary: string
+  fix_quality_score: number | null
+  created_at: string
+}
+
+export interface DiffAnalysisSummary {
+  id: number
+  attempt_id: number
+  pr_url: string
+  scm_repo: string
+  pr_number: number
+  files_changed: string[]
+  file_types: Record<string, number>
+  change_categories: string[]
+  diff_summary: string
+  created_at: string
+}
+
+export interface CrossRepoCorrelation {
+  id: number
+  repo_a: string
+  repo_b: string
+  correlation_count: number
+  last_seen_at: string
+  window_hours: number
+}
+
+export interface RepoLearningResponse {
+  repo: string
+  knowledge: KnowledgeGroup[]
+  knowledge_total: number
+  instructions: PromotedInstruction[]
+  review_patterns: ReviewPattern[]
+  review_pattern_summary: ReviewPatternSummary
+  strategies: StrategyFingerprint[]
+  diff_analyses: DiffAnalysisSummary[]
+  correlations: CrossRepoCorrelation[]
+}
+
+export async function fetchRepoLearning(repo: string): Promise<RepoLearningResponse> {
+  return fetchJson(`${API_BASE}/repos/${encodeURIComponent(repo)}/learning`)
+}
+
 
 export interface ConfigResponse {
   content: string
@@ -869,7 +960,6 @@ export async function saveConfig(content: string): Promise<{ ok: boolean; messag
   return putJson(`${API_BASE}/config`, { content })
 }
 
-// ─── Auth API ────────────────────────────────────
 
 export async function login(email: string, password: string): Promise<LoginResponse> {
   return postJson(`${API_BASE}/auth/login`, { email, password })
@@ -901,7 +991,6 @@ export async function uploadAvatar(file: File): Promise<{ avatar_url: string }> 
   return res.json()
 }
 
-// ─── User Management API ─────────────────────────
 
 export async function fetchUsers(): Promise<UserRecord[]> {
   return fetchJson(`${API_BASE}/users`)

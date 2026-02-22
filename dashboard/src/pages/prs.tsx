@@ -70,9 +70,9 @@ export default function PrsPage() {
       ),
     },
     {
-      key: 'github_repo',
+      key: 'scm_repo',
       header: 'Repo',
-      render: row => <span className="text-sm">{row.github_repo}</span>,
+      render: row => <span className="text-sm">{row.scm_repo}</span>,
     },
     {
       key: 'title',
@@ -247,7 +247,7 @@ export default function PrsPage() {
               </div>
               <div>
                 <p className="text-sm text-muted-foreground">Repository</p>
-                <p className="text-sm">{selectedPr.github_repo}</p>
+                <p className="text-sm">{selectedPr.scm_repo}</p>
               </div>
               <div className="sm:col-span-2">
                 <p className="text-sm text-muted-foreground">Title</p>

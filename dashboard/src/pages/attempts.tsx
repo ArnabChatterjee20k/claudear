@@ -254,7 +254,7 @@ export default function AttemptsPage() {
                     </div>
                     <div>
                       <p className="text-sm text-muted-foreground">Repo</p>
-                      <p className="text-sm">{detail.attempt.github_repo || '--'}</p>
+                      <p className="text-sm">{detail.attempt.scm_repo || '--'}</p>
                     </div>
                     <div>
                       <p className="text-sm text-muted-foreground">PR URL</p>

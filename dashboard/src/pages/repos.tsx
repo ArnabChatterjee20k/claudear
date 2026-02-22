@@ -20,7 +20,8 @@ import { Tabs } from '../components/ui/tabs'
 import { Skeleton } from '../components/ui/skeleton'
 import { Card, CardContent } from '../components/ui/card'
 import { formatNumber, formatDate } from '../lib/formatters'
-import { Database, FileText, Clock, ExternalLink, Loader2 } from 'lucide-react'
+import { Database, FileText, Clock, ExternalLink, Loader2, GraduationCap } from 'lucide-react'
+import { useRouter } from '../router'
 
 const tabItems = [
   { value: 'repos', label: 'Repositories' },
@@ -114,6 +115,7 @@ function useIndexingProgress() {
 }
 
 export default function ReposPage() {
+  const { navigate } = useRouter()
   const [selectedRepo, setSelectedRepo] = useState<StoredIndexedRepo | null>(null)
 
   const { data: repos, isLoading: reposLoading } = useSWR<StoredIndexedRepo[]>(
@@ -152,12 +154,12 @@ export default function ReposPage() {
       ),
     },
     {
-      key: 'github_url',
+      key: 'scm_url',
       header: 'GitHub URL',
       render: row =>
-        row.github_url ? (
+        row.scm_url ? (
           <a
-            href={row.github_url}
+            href={row.scm_url}
             target="_blank"
             rel="noopener noreferrer"
             className="text-primary hover:underline inline-flex items-center gap-1 text-sm"
@@ -301,15 +303,15 @@ export default function ReposPage() {
               </div>
               <div>
                 <p className="text-sm text-muted-foreground">GitHub URL</p>
-                {selectedRepo.github_url ? (
+                {selectedRepo.scm_url ? (
                   <a
-                    href={selectedRepo.github_url}
+                    href={selectedRepo.scm_url}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-sm text-primary hover:underline inline-flex items-center gap-1"
                   >
                     <ExternalLink className="h-3 w-3" />
-                    {selectedRepo.github_url}
+                    {selectedRepo.scm_url}
                   </a>
                 ) : (
                   <p className="text-sm text-muted-foreground">--</p>
@@ -324,6 +326,16 @@ export default function ReposPage() {
                 <p className="text-sm">{formatDate(selectedRepo.created_at)}</p>
               </div>
             </div>
+            <button
+              onClick={() => {
+                setSelectedRepo(null)
+                navigate(`/learning?repo=${encodeURIComponent(selectedRepo.name)}`)
+              }}
+              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-muted transition-colors"
+            >
+              <GraduationCap className="h-4 w-4" />
+              View Learning
+            </button>
           </div>
         )}
       </Modal>

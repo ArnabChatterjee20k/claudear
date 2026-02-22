@@ -5,7 +5,7 @@ import { getInitials } from '../../lib/formatters'
 import {
   Activity, BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
-  Users, LogOut, Gauge, Settings, Sun, Moon, Ticket,
+  Users, LogOut, Gauge, Settings, Sun, Moon, Ticket, GraduationCap,
 } from 'lucide-react'
 
 type NavGroup = {
@@ -42,6 +42,7 @@ const navGroups: NavGroup[] = [
       { path: '/experiments', label: 'Experiments', icon: FlaskConical },
       { path: '/inference', label: 'Inference', icon: Brain },
       { path: '/repos', label: 'Repos', icon: FolderGit2 },
+      { path: '/learning', label: 'Learning', icon: GraduationCap },
     ],
   },
   {
