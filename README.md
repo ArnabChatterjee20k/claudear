@@ -469,6 +469,24 @@ claudear dashboard --dashboard-dir ./dashboard/dist
 - Recent attempt history with direct PR links
 - Retryable issues with one-click retry
 
+<p align="center">
+  <img src="website/assets/screenshots/overview.png" alt="Dashboard overview" width="800" />
+  <br />
+  <em>Overview — live stats, source breakdown, and recent attempts at a glance</em>
+</p>
+
+<p align="center">
+  <img src="website/assets/screenshots/analytics.png" alt="Analytics page" width="800" />
+  <br />
+  <em>Analytics — success rates by source, MTTR trend, cost estimates, and repo leaderboard</em>
+</p>
+
+<p align="center">
+  <img src="website/assets/screenshots/prs.png" alt="Pull requests page" width="800" />
+  <br />
+  <em>Pull Requests — review metrics, merge rates, and rejection analysis</em>
+</p>
+
 **API endpoints:**
 
 | Endpoint | Description |

@@ -60,26 +60,18 @@
       pointer-events: none;
     }
 
-    /* Blinking cursor */
-    @keyframes blink {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0; }
-    }
+    /* Static cursor (always on) */
     .cursor-blink {
-      animation: blink 1s step-end infinite;
+      opacity: 1;
     }
 
-    /* Terminal typing cursor */
-    @keyframes termBlink {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0; }
-    }
+    /* Terminal typing cursor (static) */
     .term-cursor {
       display: inline-block;
       width: 8px;
       height: 18px;
       background: #22C55E;
-      animation: termBlink 0.7s step-end infinite;
+      opacity: 1;
       vertical-align: text-bottom;
       margin-left: 2px;
     }
@@ -246,7 +238,6 @@
           <div class="inline-flex items-center bg-card border border-border rounded-btn px-4 py-2.5">
             <span class="font-mono text-sm text-muted mr-2">$</span>
             <span class="font-mono text-sm text-accent">claudear start --poll</span>
-            <span class="term-cursor ml-1" style="height: 14px; width: 7px;"></span>
           </div>
         </div>
 
@@ -409,6 +400,50 @@
     </div>
   </section>
 
+  <!-- ==================== DASHBOARD PREVIEW ==================== -->
+  <section id="dashboard" class="relative z-10 py-20 md:py-28">
+    <div class="max-w-6xl mx-auto px-6">
+      <h2 class="font-mono font-bold text-2xl md:text-3xl text-heading mb-4">Full visibility</h2>
+      <p class="font-sans text-body mb-12 max-w-2xl">Real-time dashboard with analytics, telemetry, PR tracking, and issue management. Nothing is a black box.</p>
+
+      <!-- Hero screenshot: overview -->
+      <div class="rounded-card overflow-hidden border border-border terminal-glow mb-6">
+        <img
+          src="assets/screenshots/overview.png"
+          alt="Claudear dashboard overview showing total attempts, success rate, and recent activity"
+          width="1440"
+          height="900"
+          loading="lazy"
+          class="w-full h-auto block"
+        />
+      </div>
+
+      <!-- 2-column grid: analytics + telemetry -->
+      <div class="grid md:grid-cols-2 gap-6">
+        <div class="rounded-card overflow-hidden border border-border terminal-glow">
+          <img
+            src="assets/screenshots/analytics.png"
+            alt="Analytics page showing success rates by source, MTTR trend, and repo leaderboard"
+            width="1440"
+            height="900"
+            loading="lazy"
+            class="w-full h-auto block"
+          />
+        </div>
+        <div class="rounded-card overflow-hidden border border-border terminal-glow">
+          <img
+            src="assets/screenshots/telemetry.png"
+            alt="Telemetry page with pipeline metrics, latency distribution, and source breakdown"
+            width="1440"
+            height="900"
+            loading="lazy"
+            class="w-full h-auto block"
+          />
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- ==================== FEATURES ==================== -->
   <section id="features" class="relative z-10 py-20 md:py-28">
     <div class="max-w-6xl mx-auto px-6">
@@ -555,28 +590,28 @@
             <span class="font-mono text-xs text-muted ml-2">claudear.toml</span>
           </div>
           <div class="bg-card p-5 overflow-x-auto">
-            <pre class="font-mono text-sm leading-7"><span class="syn-comment"># Issue sources</span>
-<span class="syn-bracket">[[</span><span class="syn-key">sources</span><span class="syn-bracket">]]</span>
-<span class="syn-key">type</span> = <span class="syn-str">"linear"</span>
-<span class="syn-key">team</span> = <span class="syn-str">"ENG"</span>
-<span class="syn-key">labels</span> = <span class="syn-bracket">[</span><span class="syn-str">"bug"</span>, <span class="syn-str">"claudear"</span><span class="syn-bracket">]</span>
+            <pre class="font-mono text-sm leading-7"><span class="syn-key">work_dir</span> = <span class="syn-str">"~/.claudear/repos"</span>
+<span class="syn-key">known_orgs</span> = <span class="syn-bracket">[</span><span class="syn-str">"acme"</span><span class="syn-bracket">]</span>
+<span class="syn-key">max_concurrent</span> = <span class="syn-num">2</span>
 
-<span class="syn-bracket">[[</span><span class="syn-key">sources</span><span class="syn-bracket">]]</span>
-<span class="syn-key">type</span> = <span class="syn-str">"sentry"</span>
-<span class="syn-key">project</span> = <span class="syn-str">"api-server"</span>
-<span class="syn-key">min_events</span> = <span class="syn-num">5</span>
+<span class="syn-comment"># Sources</span>
+<span class="syn-bracket">[</span><span class="syn-key">linear</span><span class="syn-bracket">]</span>
+<span class="syn-key">api_key</span> = <span class="syn-str">"lin_api_xxxx"</span>
+<span class="syn-key">trigger_labels</span> = <span class="syn-bracket">[</span><span class="syn-str">"bug"</span>, <span class="syn-str">"claudear"</span><span class="syn-bracket">]</span>
 
-<span class="syn-bracket">[[</span><span class="syn-key">sources</span><span class="syn-bracket">]]</span>
-<span class="syn-key">type</span> = <span class="syn-str">"github"</span>
-<span class="syn-key">repo</span> = <span class="syn-str">"acme/api-server"</span>
-<span class="syn-key">labels</span> = <span class="syn-bracket">[</span><span class="syn-str">"claudear"</span><span class="syn-bracket">]</span>
+<span class="syn-bracket">[</span><span class="syn-key">sentry</span><span class="syn-bracket">]</span>
+<span class="syn-key">org_slug</span> = <span class="syn-str">"acme"</span>
+<span class="syn-key">min_event_count</span> = <span class="syn-num">5</span>
+
+<span class="syn-bracket">[</span><span class="syn-key">github</span><span class="syn-bracket">]</span>
+<span class="syn-key">auto_resolve_on_merge</span> = <span class="syn-num">true</span>
 
 <span class="syn-comment"># Notifications</span>
-<span class="syn-bracket">[</span><span class="syn-key">notifications.discord</span><span class="syn-bracket">]</span>
+<span class="syn-bracket">[</span><span class="syn-key">discord</span><span class="syn-bracket">]</span>
 <span class="syn-key">channel_id</span> = <span class="syn-str">"1234567890"</span>
 
-<span class="syn-bracket">[</span><span class="syn-key">notifications.slack</span><span class="syn-bracket">]</span>
-<span class="syn-key">channel</span> = <span class="syn-str">"#claudear-alerts"</span></pre>
+<span class="syn-bracket">[</span><span class="syn-key">slack</span><span class="syn-bracket">]</span>
+<span class="syn-key">channel_id</span> = <span class="syn-str">"C0123456789"</span></pre>
           </div>
         </div>
 
@@ -610,7 +645,7 @@
 <span class="text-accent">  [ok]</span> Vector store loaded (847 embeddings)
 <span class="text-accent">  [ok]</span> Polling started (interval: 30s)
 
-<span class="text-muted">  Watching for issues...</span><span class="term-cursor"></span></pre>
+<span class="text-muted">  Watching for issues...</span></pre>
           </div>
         </div>
       </div>
@@ -621,10 +656,7 @@
   <footer class="relative z-10 border-t border-border py-12">
     <div class="max-w-6xl mx-auto px-6">
       <div class="flex flex-col md:flex-row items-center justify-between gap-6">
-        <div class="flex items-center gap-0">
-          <span class="font-mono font-bold text-lg text-heading tracking-tight">claudear</span>
-          <span class="cursor-blink inline-block w-[8px] h-[16px] bg-accent ml-0.5 rounded-[1px]"></span>
-        </div>
+        <span class="font-mono font-bold text-lg text-heading tracking-tight">claudear</span>
         <div class="flex items-center gap-6">
           <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
           <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
