@@ -1,11 +1,12 @@
 //! Webhook auto-configuration orchestrator.
 
 use crate::config::{
-    Config, GitHubConfig, GitLabConfig, JiraConfig, LinearConfig, SentryConfig, SlackSourceConfig,
-    TelegramConfig, WhatsAppConfig,
+    Config, DiscordNotifierConfig, GitHubConfig, GitLabConfig, JiraConfig, LinearConfig,
+    SentryConfig, SlackSourceConfig, TelegramConfig, WhatsAppConfig,
 };
 use crate::env_writer::update_env_file;
 use crate::error::{Error, Result};
+use crate::github_app::GitHubAppAuth;
 use crate::webhook::linear_api::LinearApiClient;
 use crate::webhook::sentry_api::SentryApiClient;
 use serde::Deserialize;
@@ -64,6 +65,13 @@ struct SlackApiOkResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DiscordWebhookCreateResponse {
+    id: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
 /// Orchestrates webhook auto-configuration for supported webhook services.
 pub struct WebhookConfigurator {
     config: Config,
@@ -87,7 +95,8 @@ impl WebhookConfigurator {
     ///
     /// This will:
     /// 1. Create webhooks for enabled auto-configurable services
-    ///    (Linear, Sentry, GitHub, GitLab, Jira, Telegram, Slack, WhatsApp)
+    ///    (Linear, Sentry, GitHub PAT/App, GitLab, Jira, Telegram, Slack, WhatsApp,
+    ///    and Discord notifier webhook URLs)
     /// 2. Emit notes for enabled services that currently require manual setup
     /// 2. Write the returned secrets to the .env file
     ///
@@ -186,6 +195,14 @@ impl WebhookConfigurator {
             }
         }
 
+        // Discord source is polling-based (no inbound webhook registration API).
+        if self.config.issues.discord.is_some() {
+            notes.push(
+                "Discord source uses channel polling (bot API) and does not support inbound webhook auto-setup."
+                    .to_string(),
+            );
+        }
+
         // Configure Telegram webhook (/webhook/telegram)
         if self.config.notifiers.telegram.source_enabled {
             let telegram_config = &self.config.notifiers.telegram;
@@ -214,6 +231,55 @@ impl WebhookConfigurator {
                     "Telegram source is enabled but telegram.bot_token is missing; skipping Telegram webhook auto-setup."
                         .to_string(),
                 );
+            }
+        }
+
+        // Configure Discord notifier webhook URL (channel webhook -> DISCORD_WEBHOOK_URL)
+        let discord_notifier = &self.config.notifiers.discord;
+        let discord_webhook_present = discord_notifier
+            .webhook_url
+            .as_ref()
+            .is_some_and(|s| !s.expose().trim().is_empty());
+        let discord_bot_present = discord_notifier
+            .bot_token
+            .as_ref()
+            .is_some_and(|s| !s.expose().trim().is_empty());
+        let discord_channel_present = discord_notifier
+            .channel_id
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+
+        if !discord_webhook_present {
+            if discord_bot_present && discord_channel_present {
+                attempted_auto_config = true;
+                match self.configure_discord_notifier(discord_notifier).await {
+                    Ok(webhook_url) => {
+                        configured_any = true;
+                        env_updates.insert("DISCORD_WEBHOOK_URL".to_string(), webhook_url);
+                        notes.push(
+                            "Discord notifier webhook URL auto-created for configured channel"
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        let warning =
+                            format!("Failed to configure Discord notifier webhook URL: {}", e);
+                        tracing::warn!("{}", warning);
+                        failure_warnings.push(warning);
+                    }
+                }
+            } else if discord_bot_present || discord_channel_present {
+                let mut missing = Vec::new();
+                if !discord_bot_present {
+                    missing.push("discord.bot_token");
+                }
+                if !discord_channel_present {
+                    missing.push("discord.channel_id");
+                }
+                notes.push(format!(
+                    "Discord notifier webhook auto-setup requires {} (or set discord.webhook_url manually).",
+                    missing.join(", ")
+                ));
             }
         }
 
@@ -268,6 +334,26 @@ impl WebhookConfigurator {
                     missing.join(", ")
                 ));
             }
+        }
+
+        let slack_notifier = &self.config.notifiers.slack;
+        let slack_notifier_has_webhook = slack_notifier
+            .webhook_url
+            .as_ref()
+            .is_some_and(|s| !s.expose().trim().is_empty());
+        let slack_notifier_has_bot_channel = slack_notifier
+            .bot_token
+            .as_ref()
+            .is_some_and(|s| !s.expose().trim().is_empty())
+            && slack_notifier
+                .channel_id
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty());
+        if !slack_notifier_has_webhook && slack_notifier_has_bot_channel {
+            notes.push(
+                "Slack notifier incoming webhook URL is not auto-provisioned here; notifier can use slack.bot_token + slack.channel_id (chat.postMessage)."
+                    .to_string(),
+            );
         }
 
         // Configure WhatsApp webhook subscription (WABA subscribed_apps -> /webhook/whatsapp)
@@ -386,9 +472,26 @@ impl WebhookConfigurator {
             }
         } else if !github_config.repos.is_empty() && github_config.token.is_none() {
             if self.config.github_app().is_configured() {
-                notes.push(
-                    "GitHub repos are configured but no PAT is set; GitHub App webhook setup is managed separately (manifest/app settings) and is not auto-configured here yet.".to_string(),
-                );
+                attempted_auto_config = true;
+                match self.configure_github_app(github_config, base_url).await {
+                    Ok((secret, persist_app_secret, persist_github_secret)) => {
+                        configured_any = true;
+                        if persist_app_secret {
+                            env_updates
+                                .insert("GITHUB_APP_WEBHOOK_SECRET".to_string(), secret.clone());
+                        }
+                        if persist_github_secret {
+                            env_updates.insert("GITHUB_WEBHOOK_SECRET".to_string(), secret);
+                        }
+                        notes
+                            .push("GitHub App webhook configured via /app/hook/config".to_string());
+                    }
+                    Err(e) => {
+                        let warning = format!("Failed to configure GitHub App webhook: {}", e);
+                        tracing::warn!("{}", warning);
+                        failure_warnings.push(warning);
+                    }
+                }
             } else {
                 notes.push(
                     "GitHub repos are configured but no GitHub token is available; skipping GitHub webhook auto-setup.".to_string(),
@@ -414,7 +517,7 @@ impl WebhookConfigurator {
             }
             if !attempted_auto_config && result.warnings.is_empty() {
                 return Err(Error::config(
-                    "No webhook sources are enabled. Enable Linear, Sentry, GitHub (with repos), GitLab (with groups), Jira, Telegram source, Slack source, or WhatsApp source in your configuration."
+                    "No webhook sources are enabled. Enable Linear, Sentry, GitHub (with repos), GitLab (with groups), Jira, Telegram source, Slack source, WhatsApp source, or provide Discord notifier bot_token+channel_id for webhook URL auto-setup in your configuration."
                 ));
             }
             if !attempted_auto_config {
@@ -505,6 +608,141 @@ impl WebhookConfigurator {
         }
 
         Ok((configured_count, generated_secret))
+    }
+
+    async fn configure_github_app(
+        &self,
+        github_config: &GitHubConfig,
+        base_url: &str,
+    ) -> Result<(String, bool, bool)> {
+        let app_config = github_config.app.clone();
+        if !app_config.is_configured() {
+            return Err(Error::config(
+                "GitHub App must be configured (app_id + private key) for webhook auto-setup",
+            ));
+        }
+
+        let app_secret = app_config
+            .webhook_secret
+            .as_ref()
+            .map(|s| s.expose().trim().to_string())
+            .filter(|s| !s.is_empty());
+        let github_secret = github_config
+            .webhook_secret
+            .as_ref()
+            .map(|s| s.expose().trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let secret = app_secret
+            .clone()
+            .or(github_secret.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "ghappwh_{}{}",
+                    Uuid::new_v4().simple(),
+                    Uuid::new_v4().simple()
+                )
+            });
+        let persist_app_secret = app_secret.is_none();
+        let persist_github_secret = github_secret.is_none();
+
+        let auth = GitHubAppAuth::new(app_config);
+        let headers = auth.jwt_headers()?;
+        let callback_url = format!("{}/webhook/github", base_url.trim_end_matches('/'));
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let mut request = client.patch("https://api.github.com/app/hook/config");
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        request = request.header("User-Agent", "claudear");
+
+        let resp = request
+            .json(&serde_json::json!({
+                "url": callback_url,
+                "content_type": "json",
+                "secret": secret,
+            }))
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("GitHub App webhook config request failed: {}", e)))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::api(format!(
+                "GitHub App webhook config returned {}: {}",
+                status, body
+            )));
+        }
+
+        Ok((secret, persist_app_secret, persist_github_secret))
+    }
+
+    async fn configure_discord_notifier(&self, config: &DiscordNotifierConfig) -> Result<String> {
+        let bot_token = config
+            .bot_token
+            .as_ref()
+            .map(|s| s.expose().trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::config("Discord bot_token is required for notifier webhook auto-setup")
+            })?;
+        let channel_id = config
+            .channel_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::config("Discord channel_id is required for notifier webhook auto-setup")
+            })?;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/webhooks",
+            channel_id
+        );
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", bot_token))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "name": "claudear",
+            }))
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("Discord create webhook request failed: {}", e)))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::api(format!(
+                "Discord create webhook returned {}: {}",
+                status, body
+            )));
+        }
+
+        let parsed: DiscordWebhookCreateResponse = serde_json::from_str(&body)
+            .map_err(|e| Error::api(format!("Failed to parse Discord webhook response: {}", e)))?;
+        let token = parsed
+            .token
+            .filter(|t| !t.trim().is_empty())
+            .ok_or_else(|| Error::api("Discord webhook response missing token".to_string()))?;
+
+        Ok(format!(
+            "https://discord.com/api/webhooks/{}/{}",
+            parsed.id, token
+        ))
     }
 
     async fn configure_jira(&self, config: &JiraConfig, base_url: &str) -> Result<bool> {
@@ -1298,6 +1536,19 @@ impl WebhookConfigurator {
         let github = self.config.github();
         let github_needs =
             !github.repos.is_empty() && github.token.is_some() && github.webhook_secret.is_none();
+        let github_app_secret_present = github
+            .app
+            .webhook_secret
+            .as_ref()
+            .is_some_and(|s| !s.expose().trim().is_empty())
+            || github
+                .webhook_secret
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty());
+        let github_app_needs = !github.repos.is_empty()
+            && github.token.is_none()
+            && github.app.is_configured()
+            && !github_app_secret_present;
 
         let gitlab_needs = self.config.gitlab().is_some_and(|c| {
             c.enabled && !c.groups.is_empty() && c.token.is_some() && c.webhook_secret.is_none()
@@ -1342,14 +1593,31 @@ impl WebhookConfigurator {
                 .as_ref()
                 .is_some_and(|s| !s.expose().trim().is_empty());
 
+        let discord_notifier = &self.config.notifiers.discord;
+        let discord_notifier_needs = discord_notifier
+            .webhook_url
+            .as_ref()
+            .map(|s| s.expose().trim().is_empty())
+            .unwrap_or(true)
+            && discord_notifier
+                .bot_token
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty())
+            && discord_notifier
+                .channel_id
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty());
+
         linear_needs
             || sentry_needs
             || github_needs
+            || github_app_needs
             || gitlab_needs
             || jira_needs
             || telegram_needs
             || slack_needs
             || whatsapp_needs
+            || discord_notifier_needs
     }
 }
 
@@ -1438,9 +1706,6 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
-            tenant_id: None,
-            database_url: None,
-            redis_url: None,
         }
     }
 
@@ -1920,6 +2185,62 @@ mod tests {
         config.scm.github.token = Some("ghp_test".into());
         config.scm.github.repos = vec!["owner/repo".to_string()];
         config.scm.github.webhook_secret = Some("gh-secret".into());
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_github_app_repos_no_pat_no_secret() {
+        let mut config = test_config();
+        config.scm.github.token = None;
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.app.app_id = Some(12345);
+        config.scm.github.app.private_key = Some(crate::secret::SecretValue::new(
+            "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        ));
+        config.scm.github.app.webhook_secret = None;
+        config.scm.github.webhook_secret = None;
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_github_app_uses_existing_legacy_secret() {
+        let mut config = test_config();
+        config.scm.github.token = None;
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.app.app_id = Some(12345);
+        config.scm.github.app.private_key = Some(crate::secret::SecretValue::new(
+            "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        ));
+        config.scm.github.webhook_secret = Some("shared-secret".into());
+        config.scm.github.app.webhook_secret = None;
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_discord_notifier_webhook_missing_but_bot_channel_present() {
+        let mut config = test_config();
+        config.notifiers.discord.bot_token = Some("discord-bot-token".into());
+        config.notifiers.discord.channel_id = Some("123456789".to_string());
+        config.notifiers.discord.webhook_url = None;
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_discord_notifier_webhook_present() {
+        let mut config = test_config();
+        config.notifiers.discord.bot_token = Some("discord-bot-token".into());
+        config.notifiers.discord.channel_id = Some("123456789".to_string());
+        config.notifiers.discord.webhook_url = Some(crate::secret::SecretValue::new(
+            "https://discord.com/api/webhooks/1/token",
+        ));
 
         let configurator = WebhookConfigurator::new(config, "/tmp/.env");
         assert!(!configurator.needs_configuration());
@@ -2418,6 +2739,38 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("No auto-configurable webhook services are enabled"));
         assert!(err_msg.contains("Slack source is configured"));
+    }
+
+    #[tokio::test]
+    async fn test_configure_discord_source_only_returns_polling_note() {
+        let mut config = test_config();
+        config.issues.discord = Some(crate::config::DiscordSourceConfig {
+            bot_token: Some("discord-bot".into()),
+            channel_id: Some("123".to_string()),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-discord-source-note.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("No auto-configurable webhook services are enabled"));
+        assert!(err_msg.contains("Discord source uses channel polling"));
+    }
+
+    #[tokio::test]
+    async fn test_configure_slack_notifier_bot_channel_only_returns_chat_postmessage_note() {
+        let mut config = test_config();
+        config.notifiers.slack.bot_token = Some("xoxb-test".into());
+        config.notifiers.slack.channel_id = Some("C123".to_string());
+        config.notifiers.slack.webhook_url = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-slack-notifier-note.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("No auto-configurable webhook services are enabled"));
+        assert!(err_msg.contains("Slack notifier incoming webhook URL is not auto-provisioned"));
     }
 
     #[tokio::test]

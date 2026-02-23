@@ -37,11 +37,25 @@ impl GitHubWebhookHandler {
         "github"
     }
 
+    fn webhook_secret(&self) -> Option<&crate::secret::SecretValue> {
+        self.config
+            .webhook_secret
+            .as_ref()
+            .filter(|s| !s.expose().is_empty())
+            .or_else(|| {
+                self.config
+                    .app
+                    .webhook_secret
+                    .as_ref()
+                    .filter(|s| !s.expose().is_empty())
+            })
+    }
+
     /// Verify the webhook signature using HMAC-SHA256.
     ///
     /// GitHub uses `x-hub-signature-256` header with format: `sha256=<hex>`
     pub fn verify_signature(&self, payload: &[u8], headers: &HashMap<String, String>) -> bool {
-        let secret = match &self.config.webhook_secret {
+        let secret = match self.webhook_secret() {
             Some(s) => s,
             None => {
                 tracing::error!(
@@ -93,7 +107,7 @@ impl GitHubWebhookHandler {
 
     /// Check if this handler is enabled (has webhook secret and review watcher).
     pub fn is_enabled(&self) -> bool {
-        self.config.webhook_secret.is_some() && self.review_watcher.is_some()
+        self.webhook_secret().is_some() && self.review_watcher.is_some()
     }
 
     /// Get the event type from headers.
@@ -533,6 +547,26 @@ mod tests {
         );
 
         assert!(!handler.verify_signature(payload, &headers));
+    }
+
+    #[test]
+    fn test_github_webhook_signature_falls_back_to_app_secret() {
+        let mut config = create_test_config(None);
+        config.app.webhook_secret = Some("app_secret".into());
+        let handler = GitHubWebhookHandler::new(config, None);
+
+        let payload = b"test payload";
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"app_secret").unwrap();
+        mac.update(payload);
+        let expected = mac.finalize().into_bytes();
+        let signature = format!("sha256={}", hex::encode(expected));
+
+        let mut headers = HashMap::new();
+        headers.insert("x-hub-signature-256".to_string(), signature);
+
+        assert!(handler.verify_signature(payload, &headers));
     }
 
     #[test]
@@ -1259,7 +1293,7 @@ mod tests {
 
     #[test]
     fn test_signature_empty_secret_rejects() {
-        // An empty string IS a configured secret, so HMAC is attempted
+        // Empty webhook secrets are treated as missing and rejected.
         let config = create_test_config(Some(""));
         let handler = GitHubWebhookHandler::new(config, None);
 
@@ -1268,10 +1302,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("x-hub-signature-256".to_string(), sig);
 
-        assert!(
-            handler.verify_signature(payload, &headers),
-            "Empty string secret with matching signature should verify"
-        );
+        assert!(!handler.verify_signature(payload, &headers));
     }
 
     #[test]
@@ -1521,15 +1552,12 @@ mod tests {
 
     #[test]
     fn test_is_enabled_empty_secret_with_watcher() {
-        // An empty string is Some(""), so webhook_secret.is_some() == true
+        // Empty webhook secrets are treated as missing.
         let mock = Arc::new(MockScmProvider::new());
         let watcher = Arc::new(ReviewWatcher::new(mock));
         let config = create_test_config(Some(""));
         let handler = GitHubWebhookHandler::new(config, Some(watcher));
-        assert!(
-            handler.is_enabled(),
-            "Handler with empty string secret and watcher should be enabled"
-        );
+        assert!(!handler.is_enabled());
     }
 
     // source_name
