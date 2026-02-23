@@ -918,10 +918,7 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert!(
-            !result.unwrap(),
-            "Unwatched PR should return Ok(false)"
-        );
+        assert!(!result.unwrap(), "Unwatched PR should return Ok(false)");
     }
 
     #[tokio::test]
@@ -1088,10 +1085,7 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert!(
-            !result.unwrap(),
-            "Pending review should return Ok(false)"
-        );
+        assert!(!result.unwrap(), "Pending review should return Ok(false)");
     }
 
     // handle_review_comment tests (3 tests)
@@ -1150,10 +1144,7 @@ mod tests {
         });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert!(
-            !result.unwrap(),
-            "Bot comment should return Ok(false)"
-        );
+        assert!(!result.unwrap(), "Bot comment should return Ok(false)");
     }
 
     // parse edge case tests (2 tests)
@@ -2036,10 +2027,7 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert!(
-            !result.unwrap(),
-            "Check suite event should be ignored"
-        );
+        assert!(!result.unwrap(), "Check suite event should be ignored");
     }
 
     #[tokio::test]
@@ -2121,10 +2109,7 @@ mod tests {
         let payload = serde_json::json!({ "action": "dismissed" });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert!(
-            !result.unwrap(),
-            "Dismissed action should return Ok(false)"
-        );
+        assert!(!result.unwrap(), "Dismissed action should return Ok(false)");
     }
 
     #[tokio::test]

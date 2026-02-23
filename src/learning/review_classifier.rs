@@ -838,8 +838,10 @@ mod tests {
     #[test]
     fn test_semantic_classifier_struct_fields() {
         // Verify the reference embedding data structure works correctly
-        let categories = [(ReviewCategory::Security, vec![1.0, 0.0, 0.0]),
-            (ReviewCategory::MissingTests, vec![0.0, 1.0, 0.0])];
+        let categories = [
+            (ReviewCategory::Security, vec![1.0, 0.0, 0.0]),
+            (ReviewCategory::MissingTests, vec![0.0, 1.0, 0.0]),
+        ];
 
         assert_eq!(categories.len(), 2);
         assert_eq!(categories[0].0, ReviewCategory::Security);

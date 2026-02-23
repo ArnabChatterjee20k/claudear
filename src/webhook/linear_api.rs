@@ -1403,12 +1403,14 @@ mod tests {
 
     #[test]
     fn test_error_message_for_graphql_errors() {
-        let errors = [GraphQLError {
+        let errors = [
+            GraphQLError {
                 message: "Auth required".to_string(),
             },
             GraphQLError {
                 message: "Rate limit".to_string(),
-            }];
+            },
+        ];
         let error_messages: Vec<String> = errors.iter().map(|e| e.message.clone()).collect();
         let joined = error_messages.join(", ");
         assert_eq!(joined, "Auth required, Rate limit");
@@ -1564,8 +1566,10 @@ mod tests {
     #[test]
     fn test_webhook_exists_logic_found() {
         // Simulate webhook_exists logic
-        let webhooks = [("wh_1".to_string(), "https://a.test/hook".to_string(), true),
-            ("wh_2".to_string(), "https://b.test/hook".to_string(), false)];
+        let webhooks = [
+            ("wh_1".to_string(), "https://a.test/hook".to_string(), true),
+            ("wh_2".to_string(), "https://b.test/hook".to_string(), false),
+        ];
         let target_url = "https://a.test/hook";
         let exists = webhooks.iter().any(|(_, wh_url, _)| wh_url == target_url);
         assert!(exists);
@@ -1619,7 +1623,8 @@ mod tests {
     fn test_webhook_exists_true() {
         // Simulate the webhook_exists logic: list_webhooks returns tuples, then
         // we check if any URL matches.
-        let webhooks = [(
+        let webhooks = [
+            (
                 "wh_1".to_string(),
                 "https://example.com/webhook/linear".to_string(),
                 true,
@@ -1628,7 +1633,8 @@ mod tests {
                 "wh_2".to_string(),
                 "https://other.com/hook".to_string(),
                 true,
-            )];
+            ),
+        ];
         let target_url = "https://example.com/webhook/linear";
         let exists = webhooks.iter().any(|(_, wh_url, _)| wh_url == target_url);
         assert!(exists, "should find a webhook with matching URL");
@@ -1637,7 +1643,8 @@ mod tests {
     /// Test webhook_exists logic returns false when no matching webhook URL is present.
     #[test]
     fn test_webhook_exists_false() {
-        let webhooks = [(
+        let webhooks = [
+            (
                 "wh_1".to_string(),
                 "https://example.com/webhook/linear".to_string(),
                 true,
@@ -1646,7 +1653,8 @@ mod tests {
                 "wh_2".to_string(),
                 "https://other.com/hook".to_string(),
                 false,
-            )];
+            ),
+        ];
         let target_url = "https://nonexistent.com/webhook";
         let exists = webhooks.iter().any(|(_, wh_url, _)| wh_url == target_url);
         assert!(

@@ -192,7 +192,6 @@ pub struct ScmConfig {
     pub gitlab: Option<GitLabConfig>,
 }
 
-
 /// Issue sources configuration group.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

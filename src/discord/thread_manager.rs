@@ -3220,12 +3220,14 @@ mod tests {
 
     #[test]
     fn test_each_color_is_unique() {
-        let all_colors = [colors::SUCCESS,
+        let all_colors = [
+            colors::SUCCESS,
             colors::ERROR,
             colors::INFO,
             colors::WARNING,
             colors::PURPLE,
-            colors::REVIEW];
+            colors::REVIEW,
+        ];
         let unique: std::collections::HashSet<_> = all_colors.iter().collect();
         assert_eq!(
             unique.len(),

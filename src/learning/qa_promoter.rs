@@ -505,8 +505,10 @@ mod tests {
     #[test]
     fn test_check_embedding_similarity_two_identical_embeddings() {
         // Two identical embeddings → cosine similarity = 1.0
-        let entries = [make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0])),
-            make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0]))];
+        let entries = [
+            make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0])),
+            make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0])),
+        ];
         let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
         // threshold=0.9, similarity=1.0 → true
         assert!(
@@ -524,8 +526,10 @@ mod tests {
     fn test_check_embedding_similarity_only_first_has_embedding() {
         // First entry has embedding, second doesn't → only 1 in the
         // filtered vec → falls back to true
-        let entries = [make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0])),
-            make_qa_match_with_embedding(0.9, None)];
+        let entries = [
+            make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0])),
+            make_qa_match_with_embedding(0.9, None),
+        ];
         let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
         assert!(
             QaPromoter::check_embedding_similarity(&refs, 0.9),
@@ -704,8 +708,10 @@ mod tests {
     #[test]
     fn test_check_embedding_similarity_dissimilar_below_threshold() {
         // Two entries with orthogonal embeddings -> similarity ~0.0 < threshold
-        let entries = [make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0])),
-            make_qa_match_with_embedding(0.9, Some(vec![0.0, 1.0, 0.0]))];
+        let entries = [
+            make_qa_match_with_embedding(0.9, Some(vec![1.0, 0.0, 0.0])),
+            make_qa_match_with_embedding(0.9, Some(vec![0.0, 1.0, 0.0])),
+        ];
         let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
         // threshold=0.5, similarity ~0.0 -> false
         assert!(
@@ -717,8 +723,10 @@ mod tests {
     #[test]
     fn test_check_embedding_similarity_similar_above_threshold() {
         // Two very similar embeddings
-        let entries = [make_qa_match_with_embedding(0.9, Some(vec![0.9, 0.1, 0.0])),
-            make_qa_match_with_embedding(0.9, Some(vec![0.85, 0.15, 0.0]))];
+        let entries = [
+            make_qa_match_with_embedding(0.9, Some(vec![0.9, 0.1, 0.0])),
+            make_qa_match_with_embedding(0.9, Some(vec![0.85, 0.15, 0.0])),
+        ];
         let refs: Vec<&crate::types::QaMatch> = entries.iter().collect();
         // High similarity, threshold=0.5 -> true
         assert!(

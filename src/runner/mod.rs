@@ -98,8 +98,7 @@ fn contains_standalone_429(s: &str) -> bool {
         if let Some(pos) = s[start..].find("429") {
             let abs = start + pos;
             let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
-            let after_ok =
-                abs + 3 >= bytes.len() || !bytes[abs + 3].is_ascii_alphanumeric();
+            let after_ok = abs + 3 >= bytes.len() || !bytes[abs + 3].is_ascii_alphanumeric();
             if before_ok && after_ok {
                 return true;
             }
