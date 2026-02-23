@@ -43,7 +43,7 @@
     </div>
   </header>
 
-  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
     <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
       <nav>
         <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
@@ -157,6 +157,39 @@ make dashboard-test     # Dashboard tests</code></pre>
       </div>
       <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
     </main>
+
+    <!-- On this page (right TOC) -->
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="prerequisites"><a class="toc-link" data-toc-link href="#prerequisites" data-target-id="prerequisites"><span class="toc-link-label">Prerequisites</span></a></li>
+        <li class="toc-item" data-toc-text="build commands"><a class="toc-link" data-toc-link href="#build-commands" data-target-id="build-commands"><span class="toc-link-label">Build commands</span></a></li>
+        <li class="toc-item" data-toc-text="test commands"><a class="toc-link" data-toc-link href="#test-commands" data-target-id="test-commands"><span class="toc-link-label">Test commands</span></a></li>
+        <li class="toc-item" data-toc-text="production e2e smoke test env vars"><a class="toc-link toc-link-sub" data-toc-link href="#production-e2e-smoke-test-env-vars" data-target-id="production-e2e-smoke-test-env-vars"><span class="toc-link-label">Production E2E smoke test env vars</span></a></li>
+        <li class="toc-item" data-toc-text="dashboard frontend development"><a class="toc-link" data-toc-link href="#dashboard-frontend-development" data-target-id="dashboard-frontend-development"><span class="toc-link-label">Dashboard frontend development</span></a></li>
+        <li class="toc-item" data-toc-text="high-signal repository layout"><a class="toc-link" data-toc-link href="#high-signal-repository-layout" data-target-id="high-signal-repository-layout"><span class="toc-link-label">High-signal repository layout</span></a></li>
+        <li class="toc-item" data-toc-text="runtime and backend"><a class="toc-link toc-link-sub" data-toc-link href="#runtime-and-backend" data-target-id="runtime-and-backend"><span class="toc-link-label">Runtime and backend</span></a></li>
+        <li class="toc-item" data-toc-text="frontend and website"><a class="toc-link toc-link-sub" data-toc-link href="#frontend-and-website" data-target-id="frontend-and-website"><span class="toc-link-label">Frontend and website</span></a></li>
+        <li class="toc-item" data-toc-text="e2e and scripts"><a class="toc-link toc-link-sub" data-toc-link href="#e2e-and-scripts" data-target-id="e2e-and-scripts"><span class="toc-link-label">E2E and scripts</span></a></li>
+        <li class="toc-item" data-toc-text="prompt customization and conventions"><a class="toc-link" data-toc-link href="#prompt-customization-and-conventions" data-target-id="prompt-customization-and-conventions"><span class="toc-link-label">Prompt customization and conventions</span></a></li>
+        <li class="toc-item" data-toc-text="practical debugging workflow for contributors"><a class="toc-link" data-toc-link href="#practical-debugging-workflow-for-contributors" data-target-id="practical-debugging-workflow-for-contributors"><span class="toc-link-label">Practical debugging workflow for contributors</span></a></li>
+        <li class="toc-item" data-toc-text="packaging and release-sensitive changes"><a class="toc-link" data-toc-link href="#packaging-and-release-sensitive-changes" data-target-id="packaging-and-release-sensitive-changes"><span class="toc-link-label">Packaging and release-sensitive changes</span></a></li>
+        <li class="toc-item" data-toc-text="regenerating docs after changes"><a class="toc-link" data-toc-link href="#regenerating-docs-after-changes" data-target-id="regenerating-docs-after-changes"><span class="toc-link-label">Regenerating docs after changes</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
   </div>
 
   <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>

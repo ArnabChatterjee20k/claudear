@@ -43,7 +43,7 @@
     </div>
   </header>
 
-  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
     <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
       <nav>
         <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
@@ -189,6 +189,41 @@ docker compose down</code></pre>
       </div>
       <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
     </main>
+
+    <!-- On this page (right TOC) -->
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="how a fix works"><a class="toc-link" data-toc-link href="#how-a-fix-works" data-target-id="how-a-fix-works"><span class="toc-link-label">How a fix works</span></a></li>
+        <li class="toc-item" data-toc-text="retries"><a class="toc-link" data-toc-link href="#retries" data-target-id="retries"><span class="toc-link-label">Retries</span></a></li>
+        <li class="toc-item" data-toc-text="pr monitoring"><a class="toc-link" data-toc-link href="#pr-monitoring" data-target-id="pr-monitoring"><span class="toc-link-label">PR monitoring</span></a></li>
+        <li class="toc-item" data-toc-text="answering ai questions"><a class="toc-link" data-toc-link href="#answering-ai-questions" data-target-id="answering-ai-questions"><span class="toc-link-label">Answering AI questions</span></a></li>
+        <li class="toc-item" data-toc-text="regression monitoring"><a class="toc-link" data-toc-link href="#regression-monitoring" data-target-id="regression-monitoring"><span class="toc-link-label">Regression monitoring</span></a></li>
+        <li class="toc-item" data-toc-text="cascading fixes across repos"><a class="toc-link" data-toc-link href="#cascading-fixes" data-target-id="cascading-fixes"><span class="toc-link-label">Cascading fixes across repos</span></a></li>
+        <li class="toc-item" data-toc-text="learning from results"><a class="toc-link" data-toc-link href="#learning-from-results" data-target-id="learning-from-results"><span class="toc-link-label">Learning from results</span></a></li>
+        <li class="toc-item" data-toc-text="issue prioritisation"><a class="toc-link" data-toc-link href="#issue-prioritisation" data-target-id="issue-prioritisation"><span class="toc-link-label">Issue prioritisation</span></a></li>
+        <li class="toc-item" data-toc-text="running as a background service"><a class="toc-link" data-toc-link href="#running-as-a-service" data-target-id="running-as-a-service"><span class="toc-link-label">Running as a background service</span></a></li>
+        <li class="toc-item" data-toc-text="macos (launchd)"><a class="toc-link toc-link-sub" data-toc-link href="#macos-launchd" data-target-id="macos-launchd"><span class="toc-link-label">macOS (launchd)</span></a></li>
+        <li class="toc-item" data-toc-text="linux (systemd)"><a class="toc-link toc-link-sub" data-toc-link href="#linux-systemd" data-target-id="linux-systemd"><span class="toc-link-label">Linux (systemd)</span></a></li>
+        <li class="toc-item" data-toc-text="running with docker"><a class="toc-link" data-toc-link href="#running-with-docker" data-target-id="running-with-docker"><span class="toc-link-label">Running with Docker</span></a></li>
+        <li class="toc-item" data-toc-text="compose (recommended)"><a class="toc-link toc-link-sub" data-toc-link href="#compose-recommended" data-target-id="compose-recommended"><span class="toc-link-label">Compose (recommended)</span></a></li>
+        <li class="toc-item" data-toc-text="standalone"><a class="toc-link toc-link-sub" data-toc-link href="#standalone-container" data-target-id="standalone-container"><span class="toc-link-label">Standalone</span></a></li>
+        <li class="toc-item" data-toc-text="deployment checklist"><a class="toc-link" data-toc-link href="#deployment-checklist" data-target-id="deployment-checklist"><span class="toc-link-label">Deployment checklist</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
   </div>
 
   <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>

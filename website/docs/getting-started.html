@@ -50,7 +50,7 @@
   </header>
 
   <!-- Main layout: sidebar + content -->
-  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
 
     <!-- Sidebar -->
     <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
@@ -194,6 +194,41 @@ open http://localhost:3100
         Claudear documentation
       </footer>
     </main>
+
+    <!-- On this page (right TOC) -->
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="install"><a class="toc-link" data-toc-link href="#install" data-target-id="install"><span class="toc-link-label">Install</span></a></li>
+        <li class="toc-item" data-toc-text="homebrew (macos/linux)"><a class="toc-link toc-link-sub" data-toc-link href="#homebrew-macoslinux" data-target-id="homebrew-macoslinux"><span class="toc-link-label">Homebrew (macOS/Linux)</span></a></li>
+        <li class="toc-item" data-toc-text="apt (debian/ubuntu)"><a class="toc-link toc-link-sub" data-toc-link href="#apt-debianubuntu" data-target-id="apt-debianubuntu"><span class="toc-link-label">APT (Debian/Ubuntu)</span></a></li>
+        <li class="toc-item" data-toc-text="prebuilt binaries"><a class="toc-link toc-link-sub" data-toc-link href="#prebuilt-binaries" data-target-id="prebuilt-binaries"><span class="toc-link-label">Prebuilt binaries</span></a></li>
+        <li class="toc-item" data-toc-text="from source"><a class="toc-link toc-link-sub" data-toc-link href="#from-source" data-target-id="from-source"><span class="toc-link-label">From source</span></a></li>
+        <li class="toc-item" data-toc-text="docker image"><a class="toc-link toc-link-sub" data-toc-link href="#docker-image" data-target-id="docker-image"><span class="toc-link-label">Docker image</span></a></li>
+        <li class="toc-item" data-toc-text="what you need"><a class="toc-link" data-toc-link href="#what-you-need" data-target-id="what-you-need"><span class="toc-link-label">What you need</span></a></li>
+        <li class="toc-item" data-toc-text="quick start"><a class="toc-link" data-toc-link href="#quick-start" data-target-id="quick-start"><span class="toc-link-label">Quick start</span></a></li>
+        <li class="toc-item" data-toc-text="verify it works"><a class="toc-link" data-toc-link href="#verify-it-works" data-target-id="verify-it-works"><span class="toc-link-label">Verify it works</span></a></li>
+        <li class="toc-item" data-toc-text="choose your runtime mode"><a class="toc-link" data-toc-link href="#choose-your-runtime-mode" data-target-id="choose-your-runtime-mode"><span class="toc-link-label">Choose your runtime mode</span></a></li>
+        <li class="toc-item" data-toc-text="background daemon (recommended)"><a class="toc-link toc-link-sub" data-toc-link href="#background-daemon" data-target-id="background-daemon"><span class="toc-link-label">Background daemon (recommended)</span></a></li>
+        <li class="toc-item" data-toc-text="foreground polling"><a class="toc-link toc-link-sub" data-toc-link href="#foreground-polling" data-target-id="foreground-polling"><span class="toc-link-label">Foreground polling</span></a></li>
+        <li class="toc-item" data-toc-text="webhooks"><a class="toc-link toc-link-sub" data-toc-link href="#webhooks" data-target-id="webhooks"><span class="toc-link-label">Webhooks</span></a></li>
+        <li class="toc-item" data-toc-text="tips for going live"><a class="toc-link" data-toc-link href="#tips-for-going-live" data-target-id="tips-for-going-live"><span class="toc-link-label">Tips for going live</span></a></li>
+        <li class="toc-item" data-toc-text="next steps"><a class="toc-link" data-toc-link href="#next-steps" data-target-id="next-steps"><span class="toc-link-label">Next steps</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
   </div>
 
   <!-- Scroll to top -->

@@ -50,7 +50,7 @@
   </header>
 
   <!-- Main layout: sidebar + content -->
-  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
 
     <!-- Sidebar -->
     <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
@@ -175,6 +175,34 @@
         Claudear documentation
       </footer>
     </main>
+
+    <!-- On this page (right TOC) -->
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="what is claudear"><a class="toc-link" data-toc-link href="#what-is-claudear" data-target-id="what-is-claudear"><span class="toc-link-label">What is Claudear</span></a></li>
+        <li class="toc-item" data-toc-text="how it works"><a class="toc-link" data-toc-link href="#how-it-works" data-target-id="how-it-works"><span class="toc-link-label">How it works</span></a></li>
+        <li class="toc-item" data-toc-text="what's supported"><a class="toc-link" data-toc-link href="#whats-supported" data-target-id="whats-supported"><span class="toc-link-label">What's supported</span></a></li>
+        <li class="toc-item" data-toc-text="issue sources"><a class="toc-link toc-link-sub" data-toc-link href="#issue-sources" data-target-id="issue-sources"><span class="toc-link-label">Issue sources</span></a></li>
+        <li class="toc-item" data-toc-text="notification channels"><a class="toc-link toc-link-sub" data-toc-link href="#notification-channels" data-target-id="notification-channels"><span class="toc-link-label">Notification channels</span></a></li>
+        <li class="toc-item" data-toc-text="ai and source control"><a class="toc-link toc-link-sub" data-toc-link href="#ai-and-source-control" data-target-id="ai-and-source-control"><span class="toc-link-label">AI and source control</span></a></li>
+        <li class="toc-item" data-toc-text="documentation map"><a class="toc-link" data-toc-link href="#documentation-map" data-target-id="documentation-map"><span class="toc-link-label">Documentation map</span></a></li>
+        <li class="toc-item" data-toc-text="where to start"><a class="toc-link" data-toc-link href="#where-to-start" data-target-id="where-to-start"><span class="toc-link-label">Where to start</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
   </div>
 
   <!-- Scroll to top -->

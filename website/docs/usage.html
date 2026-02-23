@@ -43,7 +43,7 @@
     </div>
   </header>
 
-  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
     <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
       <nav>
         <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
@@ -196,6 +196,40 @@ claudear dry-run</code></pre>
       </div>
       <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
     </main>
+
+    <!-- On this page (right TOC) -->
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="commands at a glance"><a class="toc-link" data-toc-link href="#commands-at-a-glance" data-target-id="commands-at-a-glance"><span class="toc-link-label">Commands at a glance</span></a></li>
+        <li class="toc-item" data-toc-text="running claudear"><a class="toc-link" data-toc-link href="#running-claudear" data-target-id="running-claudear"><span class="toc-link-label">Running Claudear</span></a></li>
+        <li class="toc-item" data-toc-text="control commands"><a class="toc-link toc-link-sub" data-toc-link href="#control-commands" data-target-id="control-commands"><span class="toc-link-label">Control commands</span></a></li>
+        <li class="toc-item" data-toc-text="foreground polling"><a class="toc-link" data-toc-link href="#foreground-polling" data-target-id="foreground-polling"><span class="toc-link-label">Foreground polling</span></a></li>
+        <li class="toc-item" data-toc-text="webhooks"><a class="toc-link" data-toc-link href="#webhooks" data-target-id="webhooks"><span class="toc-link-label">Webhooks</span></a></li>
+        <li class="toc-item" data-toc-text="triggering fixes manually"><a class="toc-link" data-toc-link href="#triggering-fixes-manually" data-target-id="triggering-fixes-manually"><span class="toc-link-label">Triggering fixes manually</span></a></li>
+        <li class="toc-item" data-toc-text="managing prs and retries"><a class="toc-link" data-toc-link href="#managing-prs-and-retries" data-target-id="managing-prs-and-retries"><span class="toc-link-label">Managing PRs and retries</span></a></li>
+        <li class="toc-item" data-toc-text="dashboard"><a class="toc-link" data-toc-link href="#dashboard" data-target-id="dashboard"><span class="toc-link-label">Dashboard</span></a></li>
+        <li class="toc-item" data-toc-text="reports"><a class="toc-link" data-toc-link href="#reports" data-target-id="reports"><span class="toc-link-label">Reports</span></a></li>
+        <li class="toc-item" data-toc-text="repository management"><a class="toc-link" data-toc-link href="#repository-management" data-target-id="repository-management"><span class="toc-link-label">Repository management</span></a></li>
+        <li class="toc-item" data-toc-text="analytics"><a class="toc-link" data-toc-link href="#analytics" data-target-id="analytics"><span class="toc-link-label">Analytics</span></a></li>
+        <li class="toc-item" data-toc-text="troubleshooting"><a class="toc-link" data-toc-link href="#troubleshooting" data-target-id="troubleshooting"><span class="toc-link-label">Troubleshooting</span></a></li>
+        <li class="toc-item" data-toc-text="getting started sequence"><a class="toc-link" data-toc-link href="#getting-started-sequence" data-target-id="getting-started-sequence"><span class="toc-link-label">Getting started sequence</span></a></li>
+        <li class="toc-item" data-toc-text="pause and stop"><a class="toc-link toc-link-sub" data-toc-link href="#pause-stop" data-target-id="pause-stop"><span class="toc-link-label">Pause and stop</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
   </div>
 
   <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>

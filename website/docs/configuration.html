@@ -43,7 +43,7 @@
     </div>
   </header>
 
-  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
     <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
       <nav>
         <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
@@ -1158,6 +1158,62 @@ hourly_engineer_rate = 75.0</code></pre>
       </div>
       <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
     </main>
+
+    <!-- On this page (right TOC) -->
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="config file"><a class="toc-link" data-toc-link href="#config-file" data-target-id="config-file"><span class="toc-link-label">Config file</span></a></li>
+        <li class="toc-item" data-toc-text="environment variables"><a class="toc-link" data-toc-link href="#environment-variables" data-target-id="environment-variables"><span class="toc-link-label">Environment variables</span></a></li>
+        <li class="toc-item" data-toc-text="core settings"><a class="toc-link" data-toc-link href="#core-settings" data-target-id="core-settings"><span class="toc-link-label">Core settings</span></a></li>
+        <li class="toc-item" data-toc-text="tips"><a class="toc-link toc-link-sub" data-toc-link href="#tips" data-target-id="tips"><span class="toc-link-label">Tips</span></a></li>
+        <li class="toc-item" data-toc-text="retries ([retry])"><a class="toc-link" data-toc-link href="#retries" data-target-id="retries"><span class="toc-link-label">Retries ([retry])</span></a></li>
+        <li class="toc-item" data-toc-text="ai agent ([agent])"><a class="toc-link" data-toc-link href="#ai-agent" data-target-id="ai-agent"><span class="toc-link-label">AI agent ([agent])</span></a></li>
+        <li class="toc-item" data-toc-text="claude provider settings ([agent.providers.claude])"><a class="toc-link toc-link-sub" data-toc-link href="#claude-provider" data-target-id="claude-provider"><span class="toc-link-label">Claude provider settings ([agent.providers.claude])</span></a></li>
+        <li class="toc-item" data-toc-text="user mapping ([users.&amp;lt;slug&amp;gt;])"><a class="toc-link" data-toc-link href="#user-mapping" data-target-id="user-mapping"><span class="toc-link-label">User mapping ([users.&amp;lt;slug&amp;gt;])</span></a></li>
+        <li class="toc-item" data-toc-text="questions ([ask])"><a class="toc-link" data-toc-link href="#questions" data-target-id="questions"><span class="toc-link-label">Questions ([ask])</span></a></li>
+        <li class="toc-item" data-toc-text="source control ([scm.*])"><a class="toc-link" data-toc-link href="#source-control" data-target-id="source-control"><span class="toc-link-label">Source control ([scm.*])</span></a></li>
+        <li class="toc-item" data-toc-text="github ([scm.github])"><a class="toc-link toc-link-sub" data-toc-link href="#github" data-target-id="github"><span class="toc-link-label">GitHub ([scm.github])</span></a></li>
+        <li class="toc-item" data-toc-text="github app ([scm.github.app])"><a class="toc-link toc-link-sub" data-toc-link href="#github-app" data-target-id="github-app"><span class="toc-link-label">GitHub App ([scm.github.app])</span></a></li>
+        <li class="toc-item" data-toc-text="gitlab ([scm.gitlab])"><a class="toc-link toc-link-sub" data-toc-link href="#gitlab" data-target-id="gitlab"><span class="toc-link-label">GitLab ([scm.gitlab])</span></a></li>
+        <li class="toc-item" data-toc-text="issue sources ([issues.*])"><a class="toc-link" data-toc-link href="#issue-sources" data-target-id="issue-sources"><span class="toc-link-label">Issue sources ([issues.*])</span></a></li>
+        <li class="toc-item" data-toc-text="linear ([issues.linear])"><a class="toc-link toc-link-sub" data-toc-link href="#linear" data-target-id="linear"><span class="toc-link-label">Linear ([issues.linear])</span></a></li>
+        <li class="toc-item" data-toc-text="sentry ([issues.sentry])"><a class="toc-link toc-link-sub" data-toc-link href="#sentry" data-target-id="sentry"><span class="toc-link-label">Sentry ([issues.sentry])</span></a></li>
+        <li class="toc-item" data-toc-text="jira ([issues.jira])"><a class="toc-link toc-link-sub" data-toc-link href="#jira" data-target-id="jira"><span class="toc-link-label">Jira ([issues.jira])</span></a></li>
+        <li class="toc-item" data-toc-text="discord and slack ([issues.discord], [issues.slack])"><a class="toc-link toc-link-sub" data-toc-link href="#discord-slack-sources" data-target-id="discord-slack-sources"><span class="toc-link-label">Discord and Slack ([issues.discord], [issues.slack])</span></a></li>
+        <li class="toc-item" data-toc-text="notifications ([notifiers.*])"><a class="toc-link" data-toc-link href="#notifications" data-target-id="notifications"><span class="toc-link-label">Notifications ([notifiers.*])</span></a></li>
+        <li class="toc-item" data-toc-text="discord ([notifiers.discord])"><a class="toc-link toc-link-sub" data-toc-link href="#notifier-discord" data-target-id="notifier-discord"><span class="toc-link-label">Discord ([notifiers.discord])</span></a></li>
+        <li class="toc-item" data-toc-text="slack ([notifiers.slack])"><a class="toc-link toc-link-sub" data-toc-link href="#notifier-slack" data-target-id="notifier-slack"><span class="toc-link-label">Slack ([notifiers.slack])</span></a></li>
+        <li class="toc-item" data-toc-text="email ([notifiers.email])"><a class="toc-link toc-link-sub" data-toc-link href="#notifier-email" data-target-id="notifier-email"><span class="toc-link-label">Email ([notifiers.email])</span></a></li>
+        <li class="toc-item" data-toc-text="sms ([notifiers.sms])"><a class="toc-link toc-link-sub" data-toc-link href="#notifier-sms" data-target-id="notifier-sms"><span class="toc-link-label">SMS ([notifiers.sms])</span></a></li>
+        <li class="toc-item" data-toc-text="push ([notifiers.push])"><a class="toc-link toc-link-sub" data-toc-link href="#notifier-push" data-target-id="notifier-push"><span class="toc-link-label">Push ([notifiers.push])</span></a></li>
+        <li class="toc-item" data-toc-text="whatsapp ([notifiers.whatsapp])"><a class="toc-link toc-link-sub" data-toc-link href="#notifier-whatsapp" data-target-id="notifier-whatsapp"><span class="toc-link-label">WhatsApp ([notifiers.whatsapp])</span></a></li>
+        <li class="toc-item" data-toc-text="telegram ([notifiers.telegram])"><a class="toc-link toc-link-sub" data-toc-link href="#notifier-telegram" data-target-id="notifier-telegram"><span class="toc-link-label">Telegram ([notifiers.telegram])</span></a></li>
+        <li class="toc-item" data-toc-text="advanced features"><a class="toc-link" data-toc-link href="#advanced-features" data-target-id="advanced-features"><span class="toc-link-label">Advanced features</span></a></li>
+        <li class="toc-item" data-toc-text="regression monitoring ([regression])"><a class="toc-link toc-link-sub" data-toc-link href="#regression" data-target-id="regression"><span class="toc-link-label">Regression monitoring ([regression])</span></a></li>
+        <li class="toc-item" data-toc-text="dependency cascades ([cascade])"><a class="toc-link toc-link-sub" data-toc-link href="#cascade" data-target-id="cascade"><span class="toc-link-label">Dependency cascades ([cascade])</span></a></li>
+        <li class="toc-item" data-toc-text="continuous learning ([learning])"><a class="toc-link toc-link-sub" data-toc-link href="#learning" data-target-id="learning"><span class="toc-link-label">Continuous learning ([learning])</span></a></li>
+        <li class="toc-item" data-toc-text="prioritisation ([prioritisation])"><a class="toc-link toc-link-sub" data-toc-link href="#prioritisation" data-target-id="prioritisation"><span class="toc-link-label">Prioritisation ([prioritisation])</span></a></li>
+        <li class="toc-item" data-toc-text="code indexing ([code_index])"><a class="toc-link toc-link-sub" data-toc-link href="#code-index" data-target-id="code-index"><span class="toc-link-label">Code indexing ([code_index])</span></a></li>
+        <li class="toc-item" data-toc-text="self-evaluation ([evaluation])"><a class="toc-link toc-link-sub" data-toc-link href="#evaluation" data-target-id="evaluation"><span class="toc-link-label">Self-evaluation ([evaluation])</span></a></li>
+        <li class="toc-item" data-toc-text="dashboard ([dashboard])"><a class="toc-link toc-link-sub" data-toc-link href="#dashboard-config" data-target-id="dashboard-config"><span class="toc-link-label">Dashboard ([dashboard])</span></a></li>
+        <li class="toc-item" data-toc-text="minimal config to get started"><a class="toc-link" data-toc-link href="#minimal-config" data-target-id="minimal-config"><span class="toc-link-label">Minimal config to get started</span></a></li>
+        <li class="toc-item" data-toc-text="full annotated example config (appendix)"><a class="toc-link" data-toc-link href="#full-annotated-example-config-appendix" data-target-id="full-annotated-example-config-appendix"><span class="toc-link-label">Full annotated example config (appendix)</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
   </div>
 
   <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>

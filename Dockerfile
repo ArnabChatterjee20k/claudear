@@ -73,7 +73,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN if [ -n "${APP_VERSION}" ] && [ "${APP_VERSION}" != "0.1.0" ]; then \
-      sed -i "s/^version = .*/version = \"${APP_VERSION}\"/" Cargo.toml; \
+      sed -i '/^\[package\]/,/^$/ s/^version = .*/version = "'"${APP_VERSION}"'"/' Cargo.toml; \
     fi
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
 RUN mkdir -p dashboard/dist

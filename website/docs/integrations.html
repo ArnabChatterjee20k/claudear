@@ -43,7 +43,7 @@
     </div>
   </header>
 
-  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
     <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
       <nav>
         <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
@@ -140,6 +140,35 @@
       </div>
       <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
     </main>
+
+    <!-- On this page (right TOC) -->
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="connecting your tools"><a class="toc-link" data-toc-link href="#connecting-your-tools" data-target-id="connecting-your-tools"><span class="toc-link-label">Connecting your tools</span></a></li>
+        <li class="toc-item" data-toc-text="issue sources"><a class="toc-link" data-toc-link href="#issue-sources" data-target-id="issue-sources"><span class="toc-link-label">Issue sources</span></a></li>
+        <li class="toc-item" data-toc-text="source control"><a class="toc-link" data-toc-link href="#source-control" data-target-id="source-control"><span class="toc-link-label">Source control</span></a></li>
+        <li class="toc-item" data-toc-text="notifications"><a class="toc-link" data-toc-link href="#notifications" data-target-id="notifications"><span class="toc-link-label">Notifications</span></a></li>
+        <li class="toc-item" data-toc-text="reply-capable (recommended &amp;mdash; lets you answer ai questions)"><a class="toc-link toc-link-sub" data-toc-link href="#reply-capable-channels" data-target-id="reply-capable-channels"><span class="toc-link-label">Reply-capable (recommended &amp;mdash; lets you answer AI questions)</span></a></li>
+        <li class="toc-item" data-toc-text="delivery-only"><a class="toc-link toc-link-sub" data-toc-link href="#delivery-only-channels" data-target-id="delivery-only-channels"><span class="toc-link-label">Delivery-only</span></a></li>
+        <li class="toc-item" data-toc-text="webhooks"><a class="toc-link" data-toc-link href="#webhooks" data-target-id="webhooks"><span class="toc-link-label">Webhooks</span></a></li>
+        <li class="toc-item" data-toc-text="user mapping"><a class="toc-link" data-toc-link href="#user-mapping" data-target-id="user-mapping"><span class="toc-link-label">User mapping</span></a></li>
+        <li class="toc-item" data-toc-text="recommended setup order"><a class="toc-link" data-toc-link href="#recommended-setup-order" data-target-id="recommended-setup-order"><span class="toc-link-label">Recommended setup order</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
   </div>
 
   <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>

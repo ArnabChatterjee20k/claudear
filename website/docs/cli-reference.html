@@ -43,7 +43,7 @@
     </div>
   </header>
 
-  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
     <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
       <nav>
         <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
@@ -772,6 +772,50 @@ Options:
       </div>
       <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
     </main>
+
+    <!-- On this page (right TOC) -->
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="all commands"><a class="toc-link" data-toc-link href="#all-commands" data-target-id="all-commands"><span class="toc-link-label">All commands</span></a></li>
+        <li class="toc-item" data-toc-text="command reference"><a class="toc-link" data-toc-link href="#command-reference" data-target-id="command-reference"><span class="toc-link-label">Command reference</span></a></li>
+        <li class="toc-item" data-toc-text="claudear start"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-start" data-target-id="claudear-start"><span class="toc-link-label">claudear start</span></a></li>
+        <li class="toc-item" data-toc-text="claudear stop"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-stop" data-target-id="claudear-stop"><span class="toc-link-label">claudear stop</span></a></li>
+        <li class="toc-item" data-toc-text="claudear status"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-status" data-target-id="claudear-status"><span class="toc-link-label">claudear status</span></a></li>
+        <li class="toc-item" data-toc-text="claudear pause"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-pause" data-target-id="claudear-pause"><span class="toc-link-label">claudear pause</span></a></li>
+        <li class="toc-item" data-toc-text="claudear resume"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-resume" data-target-id="claudear-resume"><span class="toc-link-label">claudear resume</span></a></li>
+        <li class="toc-item" data-toc-text="claudear activity"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-activity" data-target-id="claudear-activity"><span class="toc-link-label">claudear activity</span></a></li>
+        <li class="toc-item" data-toc-text="claudear seed"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-seed" data-target-id="claudear-seed"><span class="toc-link-label">claudear seed</span></a></li>
+        <li class="toc-item" data-toc-text="claudear dry-run"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-dry-run" data-target-id="claudear-dry-run"><span class="toc-link-label">claudear dry-run</span></a></li>
+        <li class="toc-item" data-toc-text="claudear poll"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-poll" data-target-id="claudear-poll"><span class="toc-link-label">claudear poll</span></a></li>
+        <li class="toc-item" data-toc-text="claudear webhook"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-webhook" data-target-id="claudear-webhook"><span class="toc-link-label">claudear webhook</span></a></li>
+        <li class="toc-item" data-toc-text="claudear trigger"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-trigger" data-target-id="claudear-trigger"><span class="toc-link-label">claudear trigger</span></a></li>
+        <li class="toc-item" data-toc-text="claudear reset"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-reset" data-target-id="claudear-reset"><span class="toc-link-label">claudear reset</span></a></li>
+        <li class="toc-item" data-toc-text="claudear stats"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-stats" data-target-id="claudear-stats"><span class="toc-link-label">claudear stats</span></a></li>
+        <li class="toc-item" data-toc-text="claudear sources"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-sources" data-target-id="claudear-sources"><span class="toc-link-label">claudear sources</span></a></li>
+        <li class="toc-item" data-toc-text="claudear dashboard"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-dashboard" data-target-id="claudear-dashboard"><span class="toc-link-label">claudear dashboard</span></a></li>
+        <li class="toc-item" data-toc-text="claudear repos"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-repos" data-target-id="claudear-repos"><span class="toc-link-label">claudear repos</span></a></li>
+        <li class="toc-item" data-toc-text="claudear prs"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-prs" data-target-id="claudear-prs"><span class="toc-link-label">claudear prs</span></a></li>
+        <li class="toc-item" data-toc-text="claudear retries"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-retries" data-target-id="claudear-retries"><span class="toc-link-label">claudear retries</span></a></li>
+        <li class="toc-item" data-toc-text="claudear inference"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-inference" data-target-id="claudear-inference"><span class="toc-link-label">claudear inference</span></a></li>
+        <li class="toc-item" data-toc-text="claudear report"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-report" data-target-id="claudear-report"><span class="toc-link-label">claudear report</span></a></li>
+        <li class="toc-item" data-toc-text="claudear diag"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-diag" data-target-id="claudear-diag"><span class="toc-link-label">claudear diag</span></a></li>
+        <li class="toc-item" data-toc-text="claudear users"><a class="toc-link toc-link-sub" data-toc-link href="#claudear-users" data-target-id="claudear-users"><span class="toc-link-label">claudear users</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
   </div>
 
   <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>
