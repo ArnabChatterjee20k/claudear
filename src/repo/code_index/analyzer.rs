@@ -433,6 +433,7 @@ fn contains_return(node: tree_sitter::Node, return_type: &str) -> bool {
     // Check control flow and block children recursively (but not nested functions)
     if is_control_flow(node.kind())
         || node.kind() == "block"
+        || node.kind() == "statement_list"
         || node.kind() == "expression_statement"
     {
         let mut cursor = node.walk();

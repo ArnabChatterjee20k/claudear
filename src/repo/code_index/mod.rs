@@ -16,7 +16,9 @@ pub use types::{CodeChunk, CodeIndexStats, CodeSearchResult, CodeSymbol, Languag
 use crate::error::Result;
 use crate::feedback::EmbeddingClient;
 use crate::storage::FixAttemptTracker;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use walkdir::WalkDir;
@@ -70,6 +72,19 @@ impl CodeIndexer {
         let repo_id = self.tracker.get_or_create_repo_id(repo_name)?;
         let mut stats = CodeIndexStats::default();
 
+        if let Ok(Some(stored_model)) = self.tracker.get_code_embedding_model(repo_id) {
+            let current_model = self.embedding_client.model();
+            if stored_model != current_model {
+                tracing::warn!(
+                    repo = %repo_name,
+                    old_model = %stored_model,
+                    new_model = %current_model,
+                    "Embedding model changed — deleting all code data to force full re-index"
+                );
+                self.tracker.delete_all_code_data_for_repo(repo_id)?;
+            }
+        }
+
         // Collect all source files.
         let files = self.collect_source_files(repo_path);
         tracing::info!(
@@ -78,49 +93,77 @@ impl CodeIndexer {
             "Starting code indexing"
         );
 
-        // Track which file paths we see so we can clean up stale entries.
-        let mut seen_paths: Vec<String> = Vec::with_capacity(files.len());
+        // --- Parallel phase (Issue #2) ---
+        // Read, hash-check, parse, and chunk files concurrently using rayon.
+        // The tracker calls (hash_matches, delete_code_data_for_file) are behind
+        // a Mutex, so they are safe to call from rayon threads.
+        let repo_path_owned = repo_path.to_path_buf();
+        let tracker = Arc::clone(&self.tracker);
+        let file_results: Vec<FileProcessResult> = files
+            .par_iter()
+            .map(|(path, language)| {
+                let rel_path = path
+                    .strip_prefix(&repo_path_owned)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
 
-        // Batch of chunks pending embedding.
+                // Read file content.
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(file = %rel_path, error = %e, "Failed to read file");
+                        return FileProcessResult::Failed(());
+                    }
+                };
+
+                // Compute hash for incremental detection.
+                let file_hash = sha256_hex(&content);
+
+                // Check if file is already indexed with this hash.
+                match tracker.code_chunk_hash_matches(repo_id, &rel_path, &file_hash) {
+                    Ok(true) => return FileProcessResult::Skipped(rel_path),
+                    Err(e) => {
+                        tracing::debug!(file = %rel_path, error = %e, "Hash check failed");
+                        return FileProcessResult::Failed(());
+                    }
+                    Ok(false) => {}
+                }
+
+                // Delete old data for this file before re-indexing.
+                if let Err(e) = tracker.delete_code_data_for_file(repo_id, &rel_path) {
+                    tracing::debug!(file = %rel_path, error = %e, "Failed to delete old data");
+                    return FileProcessResult::Failed(());
+                }
+
+                // Parse and chunk.
+                match chunker::chunk_file(&content, *language, repo_id, &rel_path, &file_hash) {
+                    Ok((symbols, chunks)) => FileProcessResult::Parsed {
+                        rel_path,
+                        symbols,
+                        chunks,
+                    },
+                    Err(e) => {
+                        tracing::debug!(file = %rel_path, error = %e, "Failed to parse file");
+                        FileProcessResult::Failed(())
+                    }
+                }
+            })
+            .collect();
+
+        // --- Sequential phase ---
+        // Accumulate results from the parallel phase.
+        let mut seen_paths: Vec<String> = Vec::with_capacity(files.len());
         let mut pending_chunks: Vec<types::CodeChunk> = Vec::new();
         let mut pending_symbols: Vec<types::CodeSymbol> = Vec::new();
 
-        for (path, language) in &files {
-            let rel_path = path
-                .strip_prefix(repo_path)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-
-            // Read file content.
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(file = %rel_path, error = %e, "Failed to read file");
-                    stats.files_failed += 1;
-                    continue;
-                }
-            };
-
-            // Compute hash for incremental detection.
-            let file_hash = sha256_hex(&content);
-
-            // Check if file is already indexed with this hash.
-            if self
-                .tracker
-                .code_chunk_hash_matches(repo_id, &rel_path, &file_hash)?
-            {
-                stats.files_skipped += 1;
-                seen_paths.push(rel_path);
-                continue;
-            }
-
-            // Delete old data for this file before re-indexing.
-            self.tracker.delete_code_data_for_file(repo_id, &rel_path)?;
-
-            // Parse and chunk.
-            match chunker::chunk_file(&content, *language, repo_id, &rel_path, &file_hash) {
-                Ok((symbols, chunks)) => {
+        for result in file_results {
+            match result {
+                FileProcessResult::Parsed {
+                    rel_path,
+                    symbols,
+                    chunks,
+                } => {
                     stats.files_processed += 1;
                     stats.symbols_extracted += symbols.len();
                     stats.chunks_created += chunks.len();
@@ -128,8 +171,11 @@ impl CodeIndexer {
                     pending_chunks.extend(chunks);
                     seen_paths.push(rel_path);
                 }
-                Err(e) => {
-                    tracing::debug!(file = %rel_path, error = %e, "Failed to parse file");
+                FileProcessResult::Skipped(rel_path) => {
+                    stats.files_skipped += 1;
+                    seen_paths.push(rel_path);
+                }
+                FileProcessResult::Failed(_) => {
                     stats.files_failed += 1;
                 }
             }
@@ -155,6 +201,10 @@ impl CodeIndexer {
     }
 
     /// Flush a batch of symbols and chunks: store symbols, store chunks, embed, store embeddings.
+    ///
+    /// Content-hash deduplication (Issue #11): chunks with identical `chunk_text`
+    /// share a single embedding computation. Each unique text is embedded once
+    /// and the resulting vector is reused for all chunks with that content hash.
     async fn flush_batch(
         &self,
         symbols: &mut Vec<types::CodeSymbol>,
@@ -171,41 +221,70 @@ impl CodeIndexer {
             return Ok(());
         }
 
+        // Compute content hashes for deduplication.
+        for chunk in chunks.iter_mut() {
+            chunk.content_hash = Some(sha256_hex(&chunk.chunk_text));
+        }
+
         // Store chunks and get their IDs.
         let chunk_ids = self.tracker.save_code_chunks(chunks)?;
 
-        // Generate embeddings for context_text.
-        let texts: Vec<&str> = chunks.iter().map(|c| c.context_text.as_str()).collect();
+        // --- Content-hash deduplication (Issue #11) ---
+        // Group chunks by content_hash: embed each unique text only once.
+        // Build full context (prefix + code) for embedding (Issue #6).
+        let mut unique_texts: Vec<String> = Vec::new();
+        let mut hash_to_embed_idx: HashMap<String, usize> = HashMap::new();
+        let mut chunk_to_embed_idx: Vec<usize> = Vec::with_capacity(chunks.len());
 
-        // Batch in groups of batch_size.
-        for (batch_idx, text_batch) in texts.chunks(self.batch_size).enumerate() {
-            match self.embedding_client.embed_batch(text_batch).await {
-                Ok(embeddings) => {
-                    let start = batch_idx * self.batch_size;
-                    let pairs: Vec<(i64, &[f32])> = embeddings
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, emb)| {
-                            chunk_ids.get(start + i).map(|&id| (id, emb.as_slice()))
-                        })
-                        .collect();
+        for chunk in chunks.iter() {
+            let content_hash = chunk.content_hash.as_deref().unwrap_or("");
+            if let Some(&idx) = hash_to_embed_idx.get(content_hash) {
+                chunk_to_embed_idx.push(idx);
+            } else {
+                let idx = unique_texts.len();
+                // Reconstruct full context text for embedding:
+                // stored prefix (context_text) + "\n" + chunk_text
+                let full_context = chunker::build_context_text(
+                    &chunk.file_path,
+                    chunk.language,
+                    &chunk.chunk_type,
+                    chunk.symbol_name.as_deref(),
+                    None,
+                    &chunk.chunk_text,
+                );
+                unique_texts.push(full_context);
+                hash_to_embed_idx.insert(content_hash.to_string(), idx);
+                chunk_to_embed_idx.push(idx);
+            }
+        }
 
-                    let model_name = self.embedding_client.model();
-                    self.tracker
-                        .save_code_chunk_embeddings(&pairs, model_name)?;
-                    stats.embeddings_generated += pairs.len();
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to generate code chunk embeddings");
-                    // Delete the chunks that failed to embed so they get
-                    // re-processed on the next indexing run instead of
-                    // remaining as ghost chunks with no embeddings.
-                    let start = batch_idx * self.batch_size;
-                    let end = (start + text_batch.len()).min(chunk_ids.len());
-                    let failed_ids: Vec<i64> = chunk_ids[start..end].to_vec();
-                    if let Err(del_err) = self.tracker.delete_code_chunks_by_ids(&failed_ids) {
-                        tracing::warn!(error = %del_err, "Failed to delete unembed code chunks");
-                    }
+        // Embed all unique texts in a single batch (Issue #3: no double-batching).
+        let unique_refs: Vec<&str> = unique_texts.iter().map(|s| s.as_str()).collect();
+        match self.embedding_client.embed_batch(&unique_refs).await {
+            Ok(unique_embeddings) => {
+                // Map each chunk to its embedding via the dedup index.
+                let pairs: Vec<(i64, &[f32])> = chunk_ids
+                    .iter()
+                    .zip(chunk_to_embed_idx.iter())
+                    .filter_map(|(&id, &embed_idx)| {
+                        unique_embeddings
+                            .get(embed_idx)
+                            .map(|emb| (id, emb.as_slice()))
+                    })
+                    .collect();
+
+                let model_name = self.embedding_client.model();
+                self.tracker
+                    .save_code_chunk_embeddings(&pairs, model_name)?;
+                stats.embeddings_generated += pairs.len();
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to generate code chunk embeddings");
+                // Delete the chunks that failed to embed so they get
+                // re-processed on the next indexing run instead of
+                // remaining as ghost chunks with no embeddings.
+                if let Err(del_err) = self.tracker.delete_code_chunks_by_ids(&chunk_ids) {
+                    tracing::warn!(error = %del_err, "Failed to delete unembed code chunks");
                 }
             }
         }
@@ -261,6 +340,17 @@ impl CodeIndexer {
 
         files
     }
+}
+
+/// Result from processing a single file in the parallel phase.
+enum FileProcessResult {
+    Parsed {
+        rel_path: String,
+        symbols: Vec<types::CodeSymbol>,
+        chunks: Vec<types::CodeChunk>,
+    },
+    Skipped(String),
+    Failed(()),
 }
 
 /// Read-side: search indexed code.

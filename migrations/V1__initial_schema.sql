@@ -648,11 +648,13 @@ CREATE TABLE IF NOT EXISTS code_chunks (
     end_line INTEGER NOT NULL,
     chunk_text TEXT NOT NULL,
     context_text TEXT NOT NULL,
-    file_hash TEXT NOT NULL
+    file_hash TEXT NOT NULL,
+    content_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_code_chunks_file ON code_chunks(repo_id, file_path);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_symbol ON code_chunks(symbol_name);
-CREATE INDEX IF NOT EXISTS idx_code_chunks_hash ON code_chunks(repo_id, file_path, file_hash);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_hash ON code_chunks(repo_id, file_path, file_hash, id);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_content_hash ON code_chunks(content_hash);
 
 CREATE TABLE IF NOT EXISTS code_chunk_embeddings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

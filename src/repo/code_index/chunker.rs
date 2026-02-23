@@ -16,6 +16,8 @@ const MIN_CHUNK_CHARS: usize = 50;
 const LARGE_CLASS_LINES: usize = 100;
 /// Top-level chunk cap.
 const TOP_LEVEL_MAX_LINES: usize = 200;
+/// Number of lines to carry forward when splitting oversized chunks.
+const OVERLAP_LINES: usize = 3;
 
 /// Chunk a source file using its AST, producing semantic chunks for embedding.
 pub fn chunk_file(
@@ -110,8 +112,7 @@ pub fn chunk_file(
             let start = top_level_lines[0];
             let end = *top_level_lines.last().unwrap() + 1;
             if text.len() >= MIN_CHUNK_CHARS && top_level_lines.len() >= MIN_CHUNK_LINES {
-                let context =
-                    build_context_text(file_path, language, "top_level", None, None, &text);
+                let prefix = build_context_prefix(file_path, language, "top_level", None, None);
                 chunks.push(CodeChunk {
                     id: None,
                     repo_id,
@@ -122,8 +123,9 @@ pub fn chunk_file(
                     start_line: start + 1,
                     end_line: end,
                     chunk_text: text,
-                    context_text: context,
+                    context_text: prefix,
                     file_hash: file_hash.to_string(),
+                    content_hash: None,
                 });
             }
         } else {
@@ -133,8 +135,7 @@ pub fn chunk_file(
                 let start = batch[0];
                 let end = *batch.last().unwrap() + 1;
                 if text.len() >= MIN_CHUNK_CHARS && batch.len() >= MIN_CHUNK_LINES {
-                    let context =
-                        build_context_text(file_path, language, "top_level", None, None, &text);
+                    let prefix = build_context_prefix(file_path, language, "top_level", None, None);
                     chunks.push(CodeChunk {
                         id: None,
                         repo_id,
@@ -145,8 +146,9 @@ pub fn chunk_file(
                         start_line: start + 1,
                         end_line: end,
                         chunk_text: text,
-                        context_text: context,
+                        context_text: prefix,
                         file_hash: file_hash.to_string(),
+                        content_hash: None,
                     });
                 }
             }
@@ -184,16 +186,55 @@ fn collect_lines(lines: &[&str], start: usize, end: usize) -> String {
 }
 
 /// Gather preceding comment/attribute lines for a symbol.
+///
+/// Handles multi-line Python docstrings (`"""` / `'''`): when we encounter a
+/// closing delimiter we continue walking back until the matching opening
+/// delimiter is found so that the full docstring is captured.
 fn gather_leading_context(lines: &[&str], start_0idx: usize) -> usize {
     if start_0idx >= lines.len() {
         return start_0idx;
     }
     let mut ctx_start = start_0idx;
+    let mut inside_triple_quote: Option<&str> = None; // "\"\"\"" or "'''"
     while ctx_start > 0 {
         let prev = lines[ctx_start - 1].trim();
+
+        // When inside a multi-line docstring, keep walking until we find
+        // the matching opening delimiter.
+        if let Some(delim) = inside_triple_quote {
+            ctx_start -= 1;
+            if prev.contains(delim) {
+                inside_triple_quote = None;
+            }
+            continue;
+        }
+
         if prev.is_empty() {
             break;
         }
+
+        // Check for closing triple-quote delimiter that starts a backwards
+        // walk through a multi-line docstring.
+        if prev.ends_with("\"\"\"") || prev.starts_with("\"\"\"") {
+            let delim = "\"\"\"";
+            ctx_start -= 1;
+            // If the opening and closing are on the same line, we're done.
+            let count = prev.matches(delim).count();
+            if count < 2 {
+                inside_triple_quote = Some(delim);
+            }
+            continue;
+        }
+        if prev.ends_with("'''") || prev.starts_with("'''") {
+            let delim = "'''";
+            ctx_start -= 1;
+            let count = prev.matches(delim).count();
+            if count < 2 {
+                inside_triple_quote = Some(delim);
+            }
+            continue;
+        }
+
         if prev.starts_with("//")       // C-style line comments (includes ///)
             || prev.starts_with("#[")    // Rust attributes
             || prev.starts_with("#![")   // Rust inner attributes
@@ -201,10 +242,8 @@ fn gather_leading_context(lines: &[&str], start_0idx: usize) -> usize {
             || prev.starts_with("/**")   // Block doc comment start
             || prev.starts_with("* ")    // Block doc comment continuation
             || prev.starts_with("*/")    // Block doc comment end
-            || prev.starts_with("@")     // Java/Kotlin annotations
-            || prev.starts_with("'''")   // Python triple-quote docstrings
-            || prev.starts_with("\"\"\"")
-        // Python triple-quote docstrings
+            || prev.starts_with("@")
+        // Java/Kotlin annotations
         {
             ctx_start -= 1;
         } else {
@@ -248,13 +287,12 @@ fn build_symbol_chunk(
         SymbolKind::Constant => "top_level",
     };
 
-    let context = build_context_text(
+    let prefix = build_context_prefix(
         file_path,
         language,
         chunk_type,
         Some(&sym.symbol_name),
         sym.parent_symbol.as_deref(),
-        &text,
     );
 
     Some(CodeChunk {
@@ -267,8 +305,9 @@ fn build_symbol_chunk(
         start_line: start + 1,
         end_line: end,
         chunk_text: text,
-        context_text: context,
+        context_text: prefix,
         file_hash: file_hash.to_string(),
+        content_hash: None,
     })
 }
 
@@ -308,14 +347,7 @@ fn build_skeleton_chunk(
         }
     }
 
-    let context = build_context_text(
-        file_path,
-        language,
-        "class",
-        Some(&sym.symbol_name),
-        None,
-        &skeleton,
-    );
+    let prefix = build_context_prefix(file_path, language, "class", Some(&sym.symbol_name), None);
 
     CodeChunk {
         id: None,
@@ -327,9 +359,36 @@ fn build_skeleton_chunk(
         start_line: start + 1,
         end_line: end,
         chunk_text: skeleton,
-        context_text: context,
+        context_text: prefix,
         file_hash: file_hash.to_string(),
+        content_hash: None,
     }
+}
+
+/// Build the metadata prefix for storage in the DB.
+///
+/// This is a lightweight version of `build_context_text` that excludes the code body.
+/// The full context (prefix + code) is reconstructed at embedding time and search time.
+pub fn build_context_prefix(
+    file_path: &str,
+    language: Language,
+    chunk_type: &str,
+    symbol_name: Option<&str>,
+    parent: Option<&str>,
+) -> String {
+    let mut ctx = format!("File: {}\nLanguage: {}\n", file_path, language);
+
+    if let Some(name) = symbol_name {
+        ctx.push_str(&format!("Symbol: {} ({})\n", name, chunk_type));
+    } else {
+        ctx.push_str(&format!("Type: {}\n", chunk_type));
+    }
+
+    if let Some(p) = parent {
+        ctx.push_str(&format!("Parent: {}\n", p));
+    }
+
+    ctx
 }
 
 /// Build enriched context text for embedding.
@@ -372,6 +431,10 @@ pub fn build_context_text(
 }
 
 /// Split chunks that exceed MAX_CHUNK_CHARS.
+///
+/// Carries forward the last [`OVERLAP_LINES`] lines from each sub-chunk to the
+/// start of the next so that boundary context is preserved for better embedding
+/// quality.
 fn split_oversized(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
     let mut result = Vec::with_capacity(chunks.len());
 
@@ -380,6 +443,14 @@ fn split_oversized(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
             result.push(chunk);
             continue;
         }
+
+        let prefix = build_context_prefix(
+            &chunk.file_path,
+            chunk.language,
+            &chunk.chunk_type,
+            chunk.symbol_name.as_deref(),
+            None,
+        );
 
         // Split at line boundaries near the limit.
         let lines: Vec<&str> = chunk.chunk_text.lines().collect();
@@ -393,14 +464,6 @@ fn split_oversized(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
                 let part_end = i + 1;
                 let text = lines[part_start..part_end].join("\n");
                 if text.len() >= MIN_CHUNK_CHARS {
-                    let context = build_context_text(
-                        &chunk.file_path,
-                        chunk.language,
-                        &chunk.chunk_type,
-                        chunk.symbol_name.as_deref(),
-                        None,
-                        &text,
-                    );
                     result.push(CodeChunk {
                         id: None,
                         repo_id: chunk.repo_id,
@@ -411,12 +474,17 @@ fn split_oversized(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
                         start_line: base_start_line + part_start,
                         end_line: base_start_line + part_end - 1,
                         chunk_text: text,
-                        context_text: context,
+                        context_text: prefix.clone(),
                         file_hash: chunk.file_hash.clone(),
+                        content_hash: None,
                     });
                 }
-                part_start = part_end;
-                current_size = 0;
+                // Carry forward the last OVERLAP_LINES lines for context.
+                part_start = part_end.saturating_sub(OVERLAP_LINES);
+                current_size = lines[part_start..part_end]
+                    .iter()
+                    .map(|l| l.len() + 1)
+                    .sum();
             }
         }
     }
@@ -726,6 +794,7 @@ def main():
             chunk_text: "fn small() {\n    println!(\"hello\");\n}".to_string(),
             context_text: "File: test.rs".to_string(),
             file_hash: "hash1".to_string(),
+            content_hash: None,
         };
         let result = split_oversized(vec![chunk.clone()]);
         assert_eq!(result.len(), 1);
@@ -754,6 +823,7 @@ def main():
             chunk_text: big_text,
             context_text: "File: big.rs".to_string(),
             file_hash: "hash2".to_string(),
+            content_hash: None,
         };
         let result = split_oversized(vec![chunk]);
         // Should produce more than one chunk
@@ -1309,12 +1379,12 @@ use std::process;
     #[test]
     fn test_gather_leading_context_triple_quote_docstring() {
         let lines = vec!["\"\"\"", "This is a docstring.", "\"\"\"", "def foo():"];
-        // The gather function checks prev.starts_with("\"\"\"") for triple-quote
         let start = gather_leading_context(&lines, 3);
-        // index 2 starts with \"\"\", index 1 is plain text (won't match), so stops
+        // With multi-line docstring support, we walk back through the closing
+        // triple-quote, across the body, and through the opening triple-quote.
         assert_eq!(
-            start, 2,
-            "Should walk back past closing triple-quote but stop at non-matching line"
+            start, 0,
+            "Should walk back through entire multi-line triple-quote docstring"
         );
     }
 
@@ -1322,10 +1392,10 @@ use std::process;
     fn test_gather_leading_context_python_single_triple_quote() {
         let lines = vec!["'''", "Docstring body.", "'''", "def bar():"];
         let start = gather_leading_context(&lines, 3);
-        // index 2 is "'''" which matches, index 1 is plain text that doesn't match
+        // With multi-line docstring support, we walk back through the full docstring.
         assert_eq!(
-            start, 2,
-            "Should walk back past ''' but stop at non-matching line"
+            start, 0,
+            "Should walk back through entire multi-line single-quote docstring"
         );
     }
 
@@ -1635,6 +1705,7 @@ use std::process;
             chunk_text: "fn small() {\n    println!(\"small\");\n}".to_string(),
             context_text: "ctx".to_string(),
             file_hash: "h".to_string(),
+            content_hash: None,
         };
 
         let long_line = "y".repeat(200);
@@ -1654,6 +1725,7 @@ use std::process;
             chunk_text: big_text,
             context_text: "ctx".to_string(),
             file_hash: "h".to_string(),
+            content_hash: None,
         };
 
         let result = split_oversized(vec![small_chunk.clone(), big_chunk]);
@@ -1688,6 +1760,7 @@ use std::process;
             chunk_text: big_text,
             context_text: "ctx".to_string(),
             file_hash: "meta_hash".to_string(),
+            content_hash: None,
         };
 
         let result = split_oversized(vec![chunk]);
@@ -1725,6 +1798,7 @@ use std::process;
             chunk_text: big_text,
             context_text: "ctx".to_string(),
             file_hash: "h".to_string(),
+            content_hash: None,
         };
 
         let result = split_oversized(vec![chunk]);

@@ -152,6 +152,7 @@ pub struct CodeChunk {
     pub chunk_text: String,
     pub context_text: String,
     pub file_hash: String,
+    pub content_hash: Option<String>,
 }
 
 /// A code search result with similarity score.
