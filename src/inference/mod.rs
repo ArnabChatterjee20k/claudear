@@ -564,71 +564,92 @@ impl RepoInferrer {
         index.get(repo_name).cloned()
     }
 
-    /// Clone all API-discovered repos and index their files.
+    /// Clone missing repos and index files for all repos on disk.
     ///
-    /// Clones repos in parallel using `parallelism` workers.
-    /// Returns the number of repos successfully cloned and indexed.
+    /// 1. Clones repos not yet on disk in parallel using `parallelism` workers.
+    /// 2. Indexes files for all repos that exist on disk but have no files indexed.
+    ///
+    /// Returns the number of repos cloned.
     pub async fn clone_and_index_all(&self, parallelism: usize) -> crate::error::Result<usize> {
         use crate::repo::GitOps;
         use futures::stream::{self, StreamExt};
 
-        // Get repos that need cloning
-        let repos_to_clone: Vec<_> = {
+        // Partition repos into those needing cloning vs those already on disk but unindexed
+        let (repos_to_clone, repos_to_index): (Vec<_>, Vec<_>) = {
             let index = self
                 .index
                 .read()
                 .map_err(|e| crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))?;
-            index
-                .list()
-                .into_iter()
-                .filter(|r| !r.path.exists())
-                .map(|r| {
-                    (
+            let (mut to_clone, mut to_index) = (Vec::new(), Vec::new());
+            for r in index.list() {
+                if !r.path.exists() {
+                    to_clone.push((
                         r.name.clone(),
                         r.path.clone(),
                         r.scm_url.clone(),
                         r.default_branch.clone(),
-                    )
-                })
-                .collect()
+                    ));
+                } else if r.files.is_empty() {
+                    to_index.push(r.name.clone());
+                }
+            }
+            (to_clone, to_index)
         };
 
-        if repos_to_clone.is_empty() {
-            return Ok(0);
-        }
+        // Clone missing repos
+        let cloned_count = if repos_to_clone.is_empty() {
+            0
+        } else {
+            tracing::info!(
+                count = repos_to_clone.len(),
+                parallelism = parallelism,
+                "Cloning API-discovered repositories"
+            );
 
-        tracing::info!(
-            count = repos_to_clone.len(),
-            parallelism = parallelism,
-            "Cloning API-discovered repositories"
-        );
-
-        // Clone in parallel
-        let results: Vec<_> = stream::iter(repos_to_clone)
-            .map(|(name, path, scm_url, default_branch)| async move {
-                match GitOps::ensure_repo_at_path(&path, &scm_url, &default_branch).await {
-                    Ok(()) => Some(name),
-                    Err(e) => {
-                        tracing::error!(repo = %name, error = %e, "Failed to clone repository");
-                        None
+            let results: Vec<_> = stream::iter(repos_to_clone)
+                .map(|(name, path, scm_url, default_branch)| async move {
+                    match GitOps::ensure_repo_at_path(&path, &scm_url, &default_branch).await {
+                        Ok(()) => Some(name),
+                        Err(e) => {
+                            tracing::error!(repo = %name, error = %e, "Failed to clone repository");
+                            None
+                        }
                     }
+                })
+                .buffer_unordered(parallelism)
+                .collect()
+                .await;
+
+            let cloned_repos: Vec<_> = results.into_iter().flatten().collect();
+            let count = cloned_repos.len();
+
+            for repo_name in cloned_repos {
+                if let Err(e) = self.index_cloned_repo(&repo_name) {
+                    tracing::warn!(repo = %repo_name, error = %e, "Failed to index cloned repo files");
                 }
-            })
-            .buffer_unordered(parallelism)
-            .collect()
-            .await;
-
-        // Index files for successfully cloned repos
-        let cloned_repos: Vec<_> = results.into_iter().flatten().collect();
-        let cloned_count = cloned_repos.len();
-
-        for repo_name in cloned_repos {
-            if let Err(e) = self.index_cloned_repo(&repo_name) {
-                tracing::warn!(repo = %repo_name, error = %e, "Failed to index cloned repo files");
             }
+
+            tracing::info!(count, "Finished cloning repositories");
+            count
+        };
+
+        // Index files for repos already on disk but not yet indexed
+        if !repos_to_index.is_empty() {
+            tracing::info!(
+                count = repos_to_index.len(),
+                "Indexing files for existing repositories"
+            );
+            for repo_name in &repos_to_index {
+                if let Err(e) = self.index_cloned_repo(repo_name) {
+                    tracing::warn!(repo = %repo_name, error = %e, "Failed to index repo files");
+                }
+            }
+            tracing::info!(
+                count = repos_to_index.len(),
+                "Finished indexing existing repositories"
+            );
         }
 
-        tracing::info!(count = cloned_count, "Finished cloning repositories");
         Ok(cloned_count)
     }
 
@@ -683,58 +704,6 @@ impl RepoInferrer {
                     "Matched project to repo by simple name"
                 );
                 return Some((*repo).clone());
-            }
-        }
-
-        None
-    }
-
-    /// Find a repository by partial name match.
-    ///
-    /// This handles cases where the extracted repo reference is partial:
-    /// - "utopia-php/database" should match "utopia-php/database" in index
-    /// - "database" could match "utopia-php/database" if it's the only match
-    fn find_repo_by_partial_name(&self, index: &RepoIndex, name: &str) -> Option<IndexedRepo> {
-        let repos = index.list();
-        let name_lower = name.to_lowercase();
-
-        // First, try exact match on the simple name (after org)
-        let mut matches: Vec<_> = repos
-            .iter()
-            .filter(|r| {
-                let simple = r
-                    .name
-                    .split('/')
-                    .next_back()
-                    .unwrap_or(&r.name)
-                    .to_lowercase();
-                simple == name_lower
-            })
-            .collect();
-
-        // If exactly one match, return it
-        if matches.len() == 1 {
-            return Some((*matches[0]).clone());
-        }
-
-        // If no exact matches, try contains matching
-        if matches.is_empty() {
-            matches = repos
-                .iter()
-                .filter(|r| {
-                    let name_lower_repo = r.name.to_lowercase();
-                    name_lower_repo.contains(&name_lower)
-                        || name_lower.contains(
-                            name_lower_repo
-                                .split('/')
-                                .next_back()
-                                .unwrap_or(&name_lower_repo),
-                        )
-                })
-                .collect();
-
-            if matches.len() == 1 {
-                return Some((*matches[0]).clone());
             }
         }
 
@@ -819,8 +788,10 @@ impl RepoInferrer {
         }
 
         // Strategy 1: Explicit repository reference (e.g., "utopia-php/database")
+        // Only exact matches — no partial/substring matching to avoid false positives
+        // like "cloud" matching "cloudevents". Fuzzy resolution is left to
+        // file-based and embedding strategies below.
         for repo_ref in &context.repos {
-            // First try exact match
             if let Some(repo) = index.get(repo_ref) {
                 tracing::info!(
                     issue_id = %issue.short_id,
@@ -831,22 +802,6 @@ impl RepoInferrer {
                     repo: repo.clone(),
                     confidence: Confidence::High,
                     reason: format!("Explicit repo reference: {}", repo_ref),
-                    matched_file: None,
-                });
-            }
-
-            // Try partial match (repo name contains the reference or vice versa)
-            if let Some(repo) = self.find_repo_by_partial_name(&index, repo_ref) {
-                tracing::info!(
-                    issue_id = %issue.short_id,
-                    repo = %repo.name,
-                    reference = %repo_ref,
-                    "High confidence match: partial repo reference"
-                );
-                return Some(InferredRepo {
-                    repo: repo.clone(),
-                    confidence: Confidence::High,
-                    reason: format!("Partial repo reference: {} -> {}", repo_ref, repo.name),
                     matched_file: None,
                 });
             }
@@ -2051,6 +2006,38 @@ mod tests {
         let result = inferrer.infer(&issue);
         assert!(result.is_some());
         assert_eq!(result.unwrap().repo.name, "myorg/payment-service");
+    }
+
+    #[test]
+    fn test_no_partial_repo_match_cloud_cloudevents() {
+        // "cloud" (from a Sentry project name like "cloud-staging") must NOT
+        // match "utopia-php/cloudevents" via any text-based strategy.
+        // Only exact repo references and file/embedding inference should resolve repos.
+        let mut index = RepoIndex::new();
+        index.add_repo(IndexedRepo::new(
+            "utopia-php/cloudevents",
+            "/path/cloudevents",
+        ));
+        let inferrer = RepoInferrer::new(index);
+
+        let issue = create_test_issue(
+            "sentry",
+            "Pool not found",
+            "Pool 'database_db_fra1_self_hosted_0_0' not found",
+        );
+        // Manually set the project metadata to "cloud-staging"
+        let mut issue = issue;
+        issue
+            .metadata
+            .insert("project".to_string(), serde_json::json!("cloud-staging"));
+
+        let result = inferrer.infer(&issue);
+        // Must NOT match cloudevents
+        assert!(
+            result.is_none() || result.as_ref().unwrap().repo.name != "utopia-php/cloudevents",
+            "cloud should never match cloudevents, got: {:?}",
+            result
+        );
     }
 
     #[test]
