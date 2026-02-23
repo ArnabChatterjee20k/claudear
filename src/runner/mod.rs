@@ -69,19 +69,46 @@ pub fn is_rate_limit_error(message: &str) -> bool {
 
 /// Rate-limit detection on an already-lowercased string (avoids double allocation).
 fn is_rate_limit_error_lower(lower: &str) -> bool {
-    [
+    // Check non-numeric patterns first.
+    let simple_patterns = [
         "rate limit",
         "ratelimit",
         "hit your limit",
         "too many requests",
-        "429",
         "quota exceeded",
         "resource exhausted",
         "retry-after",
         "try again later",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    ];
+    if simple_patterns.iter().any(|needle| lower.contains(needle)) {
+        return true;
+    }
+    // "429" must appear as a standalone token (not inside a UUID, hex string, or
+    // longer number like "4299"). Check that surrounding characters are non-alphanumeric.
+    contains_standalone_429(lower)
+}
+
+/// Check if "429" appears as a standalone token, not embedded in a longer
+/// alphanumeric/hex sequence (e.g. UUIDs like `4299-a2e5`).
+fn contains_standalone_429(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let _needle = b"429";
+    let mut start = 0;
+    while start + 3 <= bytes.len() {
+        if let Some(pos) = s[start..].find("429") {
+            let abs = start + pos;
+            let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+            let after_ok =
+                abs + 3 >= bytes.len() || !bytes[abs + 3].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + 1;
+        } else {
+            break;
+        }
+    }
+    false
 }
 
 /// Detect "hard" runtime failures that should be escalated immediately.
@@ -320,5 +347,34 @@ mod tests {
     fn test_is_hard_error_long_message() {
         let long_msg = "a".repeat(100_000) + " failed to spawn process";
         assert!(is_hard_error(&long_msg));
+    }
+
+    // --- contains_standalone_429 tests ---
+
+    #[test]
+    fn test_429_standalone() {
+        assert!(is_rate_limit_error("429"));
+        assert!(is_rate_limit_error("HTTP 429 Too Many Requests"));
+        assert!(is_rate_limit_error("error 429"));
+        assert!(is_rate_limit_error("status:429"));
+        assert!(is_rate_limit_error("(429)"));
+    }
+
+    #[test]
+    fn test_429_not_in_uuid() {
+        // UUID containing "4299" should NOT match
+        assert!(!is_rate_limit_error(
+            r#"{"uuid":"26355e0a-810a-4299-a2e5-4cea5f762d2e"}"#
+        ));
+        // UUID containing "429" bounded by hex should NOT match
+        assert!(!is_rate_limit_error("a429b"));
+        assert!(!is_rate_limit_error("x4290y"));
+    }
+
+    #[test]
+    fn test_429_in_claude_stream_json() {
+        // Real false positive from Claude Code NDJSON stream
+        let json = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_xyz","type":"tool_result","content":"ok"}]},"session_id":"1a814bc2-22af-42a1-906a-9c3e03e9dd8c","uuid":"26355e0a-810a-4299-a2e5-4cea5f762d2e","tool_use_result":"ok"}"#;
+        assert!(!is_rate_limit_error(json));
     }
 }
