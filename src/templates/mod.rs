@@ -20,10 +20,13 @@ pub const DEFAULT_FIX_TEMPLATE: &str = r#"You are fixing an issue from {{source}
 Your task:
 1. Analyze the issue/error and any stack traces
 2. Find the relevant code in this codebase
-3. Implement a fix for the issue
-4. Write or update tests if applicable
-5. Create a PR with your changes
-6. Ensure all checks pass on the PR
+3. Write a failing test that reproduces the bug before changing any application code
+4. Implement the minimal fix to make the failing test pass
+5. Verify all existing tests still pass
+6. Create a PR with your changes
+7. Ensure all checks pass on the PR
+
+IMPORTANT: Always use a test-driven development (TDD) approach for bug fixes. Start by adding a failing test that reproduces the issue, then fix the code to make it pass. Do not skip the failing test step.
 
 The PR title should include the issue ID: {{short_id}}
 
@@ -48,6 +51,8 @@ Description:
 
 {{context}}
 
+IMPORTANT: Use a test-driven development (TDD) approach for bug fixes. Before changing any application code, write a failing test that reproduces the issue. Then implement the minimal fix to make the test pass and verify all existing tests still pass.
+
 Create a PR that addresses this issue. Include "{{short_id}}" in the PR title.
 "#;
 
@@ -66,8 +71,9 @@ Event count: {{event_count}}
 {{context}}
 
 Analyze the stack trace and error context to identify the root cause.
-Implement a fix that prevents this error from occurring.
-Write tests to verify the fix if applicable.
+
+IMPORTANT: Use a test-driven development (TDD) approach. Before changing any application code, write a failing test that reproduces the error. Then implement the minimal fix to make the test pass and verify all existing tests still pass.
+
 Ensure all checks pass on the PR.
 
 Create a PR that fixes this error.
