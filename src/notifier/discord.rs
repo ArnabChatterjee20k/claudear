@@ -1065,7 +1065,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     async fn poll_question_replies(
         &self,
         request: &AskRequest,
-        since: DateTime<Utc>,
+        _since: DateTime<Utc>,
     ) -> Result<Vec<AskReply>> {
         let client = match self.bot_client.as_ref() {
             Some(c) => c,
@@ -1103,11 +1103,11 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
                 let parsed = DateTime::parse_from_rfc3339(&message.timestamp)
                     .ok()
                     .map(|dt| dt.with_timezone(&Utc))?;
-                if parsed < since {
-                    return None;
-                }
 
                 // Only accept Discord replies (message_reference) to an ask message.
+                // No timestamp filter: replies matched by message_reference are
+                // authoritative regardless of timing (the reply can arrive before
+                // the daemon finishes internal bookkeeping).
                 let is_reply_to_ask = message
                     .message_reference
                     .as_ref()

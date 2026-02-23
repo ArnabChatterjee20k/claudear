@@ -1147,18 +1147,27 @@ impl Watcher {
             return Ok(());
         }
 
-        // Need an SCM provider for release polling
-        let scm = match &self.scm_provider {
-            Some(p) => p.clone(),
-            None => return Ok(()),
-        };
+        // Need an SCM provider or GitHub client for release polling
+        let has_scm = self.scm_provider.is_some() || self.github_client.is_some();
+        if !has_scm {
+            return Ok(());
+        }
 
         for upstream in upstreams {
-            let release = match scm.get_latest_release(upstream).await {
+            // Use generic SCM provider when available, fall back to GitHub client
+            let release_result = if let Some(ref provider) = self.scm_provider {
+                provider.get_latest_release(upstream).await
+            } else if let Some(ref gh) = self.github_client {
+                gh.get_latest_release(upstream).await
+            } else {
+                break;
+            };
+
+            let release = match release_result {
                 Ok(Some(r)) => r,
                 Ok(None) => continue,
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         upstream = %upstream,
                         error = %e,
                         "Failed to check latest release for cascade"
@@ -1197,7 +1206,7 @@ impl Watcher {
             let attempt = match merged_attempt {
                 Some(a) => a,
                 None => {
-                    tracing::debug!(
+                    tracing::info!(
                         upstream = %upstream,
                         "No merged attempt found for release-triggered cascade"
                     );
@@ -7242,7 +7251,7 @@ mod tests {
             state: state.to_string(),
             body: Some(body.to_string()),
             user: crate::scm::ReviewUser {
-                id: id,
+                id,
                 login: format!("user{}", id),
                 user_type: Some("User".to_string()),
             },
@@ -8097,7 +8106,7 @@ mod tests {
         assert_eq!(notifier.get_call_count(), 5);
 
         notifier
-            .notify_urgent_issues(&[issue.clone()])
+            .notify_urgent_issues(std::slice::from_ref(&issue))
             .await
             .unwrap();
         assert_eq!(notifier.get_call_count(), 6);
@@ -8124,15 +8133,17 @@ mod tests {
 
     #[test]
     fn test_seed_result_by_source_tracking() {
-        let mut result = SeedResult::default();
-        result.total = 10;
+        let mut result = SeedResult {
+            total: 10,
+            ..Default::default()
+        };
         result.by_source.insert("linear".to_string(), 6);
         result.by_source.insert("sentry".to_string(), 4);
 
         assert_eq!(result.total, 10);
         assert_eq!(*result.by_source.get("linear").unwrap(), 6);
         assert_eq!(*result.by_source.get("sentry").unwrap(), 4);
-        assert!(result.by_source.get("jira").is_none());
+        assert!(!result.by_source.contains_key("jira"));
     }
 
     // =========================================================================
@@ -9485,7 +9496,7 @@ mod tests {
     #[test]
     fn test_truncate_error_all_unicode() {
         // A string of 200 4-byte emojis (800 bytes, 200 chars)
-        let error: String = std::iter::repeat('\u{1F600}').take(200).collect();
+        let error: String = std::iter::repeat_n('\u{1F600}', 200).collect();
         let result = Watcher::truncate_error_for_activity(&error);
         // Should not panic and should end with "..."
         assert!(result.ends_with("..."));
@@ -10307,8 +10318,10 @@ mod tests {
 
     #[test]
     fn test_seed_result_multiple_sources() {
-        let mut result = SeedResult::default();
-        result.total = 15;
+        let mut result = SeedResult {
+            total: 15,
+            ..Default::default()
+        };
         result.by_source.insert("sentry".to_string(), 7);
         result.by_source.insert("linear".to_string(), 5);
         result.by_source.insert("jira".to_string(), 3);
