@@ -7,10 +7,6 @@
   background-size: 24px 24px;
 }
 
-/* Reading progress bar */
-.top-progress { position: fixed; inset: 0 0 auto 0; height: 2px; z-index: 60; background: rgba(255,255,255,0.03); pointer-events: none; }
-.top-progress-bar { height: 100%; width: 100%; transform-origin: left; transform: scaleX(0); background: linear-gradient(90deg, #22C55E, #60A5FA); }
-
 /* ── Article / markdown content ── */
 .markdown { color: #A1A1AA; font-size: 14px; line-height: 1.72; }
 .markdown > *:first-child { margin-top: 0; }
@@ -171,7 +167,7 @@
 
 /* ── Print ── */
 @media print {
-  .dot-grid, .top-progress, .scroll-top-btn { display: none !important; }
+  .dot-grid, .scroll-top-btn { display: none !important; }
   .markdown { color: #000; }
   .markdown a { color: #000; text-decoration: underline; }
 }

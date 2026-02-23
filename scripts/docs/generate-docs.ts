@@ -542,7 +542,6 @@ function buildPageTemplate({ page, pages, articleHtml, tocHtml, toc, global }) {
 </head>
 <body id="top" data-page="${escapeHtml(page.slug)}">
   <div class="dot-grid" aria-hidden="true"></div>
-  <div class="top-progress" aria-hidden="true"><div class="top-progress-bar" data-reading-progress></div></div>
 
   <header class="topbar">
     <div class="topbar-inner">
@@ -692,8 +691,6 @@ code, pre { font-family: 'JetBrains Mono', monospace; }
 body::before, body::after { content: ''; position: fixed; pointer-events: none; z-index: 0; filter: blur(100px); width: 42rem; height: 42rem; border-radius: 999px; opacity: 0.12; }
 body::before { top: -12rem; right: -12rem; background: radial-gradient(circle at center, rgba(34,197,94,0.9), rgba(34,197,94,0)); }
 body::after { left: -14rem; bottom: -14rem; background: radial-gradient(circle at center, rgba(96,165,250,0.85), rgba(96,165,250,0)); }
-.top-progress { position: fixed; inset: 0 0 auto 0; height: 2px; z-index: 60; background: rgba(255,255,255,0.03); pointer-events: none; }
-.top-progress-bar { height: 100%; width: 100%; transform-origin: left center; transform: scaleX(0); background: linear-gradient(90deg, var(--accent), var(--blue)); box-shadow: 0 0 18px rgba(34,197,94,0.4); }
 .topbar { position: sticky; top: 0; z-index: 50; border-bottom: 1px solid rgba(255,255,255,0.06); background: rgba(9, 9, 11, 0.9); backdrop-filter: blur(12px); box-shadow: 0 8px 24px rgba(0,0,0,0.2); }
 .topbar::after { content: ''; position: absolute; inset: auto 0 0 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,197,94,0.35), rgba(96,165,250,0.35), transparent); opacity: 0.45; }
 .topbar-inner { max-width: var(--content-max); margin: 0 auto; height: var(--topbar-h); padding: 0 18px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
@@ -952,25 +949,6 @@ function docsJs() {
     });
   }
 
-  function initProgress() {
-    const bar = document.querySelector('[data-reading-progress]');
-    if (!bar) return;
-    const article = markdown.closest('.content-card') || markdown;
-    const update = () => {
-      const rect = article.getBoundingClientRect();
-      const vh = window.innerHeight || document.documentElement.clientHeight;
-      const articleTop = window.scrollY + rect.top;
-      const articleHeight = Math.max(article.scrollHeight, rect.height, 1);
-      const start = articleTop - vh * 0.2;
-      const end = articleTop + articleHeight - vh * 0.65;
-      const ratio = (window.scrollY - start) / Math.max(1, end - start);
-      bar.style.transform = 'scaleX(' + Math.max(0, Math.min(1, ratio)) + ')';
-    };
-    window.addEventListener('scroll', update, { passive: true });
-    window.addEventListener('resize', update);
-    update();
-  }
-
   function initScrollTop() {
     const btn = document.querySelector('[data-scroll-top]');
     if (!btn) return;
@@ -1039,7 +1017,6 @@ function docsJs() {
   removeReadmeToc();
   setExternalLinkAttrs();
   enhanceCodeBlocks();
-  initProgress();
   initScrollTop();
   initTocFilter();
   initActiveToc();

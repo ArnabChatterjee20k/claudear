@@ -65,25 +65,6 @@
     });
   }
 
-  function initProgress() {
-    const bar = document.querySelector('[data-reading-progress]');
-    if (!bar) return;
-    const article = markdown.closest('article') || markdown;
-    const update = () => {
-      const rect = article.getBoundingClientRect();
-      const vh = window.innerHeight;
-      const top = window.scrollY + rect.top;
-      const height = Math.max(article.scrollHeight, rect.height, 1);
-      const start = top - vh * 0.2;
-      const end = top + height - vh * 0.65;
-      const ratio = (window.scrollY - start) / Math.max(1, end - start);
-      bar.style.transform = 'scaleX(' + Math.max(0, Math.min(1, ratio)) + ')';
-    };
-    window.addEventListener('scroll', update, { passive: true });
-    window.addEventListener('resize', update);
-    update();
-  }
-
   function initScrollTop() {
     const btn = document.querySelector('[data-scroll-top]');
     if (!btn) return;
@@ -151,7 +132,6 @@
 
   setExternalLinkAttrs();
   enhanceCodeBlocks();
-  initProgress();
   initScrollTop();
   initTocFilter();
   initActiveToc();
