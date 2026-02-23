@@ -97,32 +97,32 @@ permissions = ["Bash(git *)", "Read", "Edit"]
 skip_permissions = true
 
 # CLI binary name/path (default: auto-detected, e.g., "claude", "codex")
-# binary = "claude"
+binary = "claude"
 
 # API key for API-based providers (alternative to CLI-based execution)
-# api_key = ""
+api_key = ""
 
 # API base URL for API-based providers
-# api_url = ""
+api_url = ""
 
 # Sandbox mode (e.g., "network-off" for Codex)
-# sandbox = ""
+sandbox = ""
 
 # A/B Experiments (optional)
 # Test different providers or configurations against each other.
 #
-# [[agent.experiments]]
-# name = "claude-vs-codex"
-# enabled = true
-# strategy = "weighted_random"   # "weighted_random" or "fallback"
-#
-# [[agent.experiments.providers]]
-# name = "claude"
-# weight = 0.8
-#
-# [[agent.experiments.providers]]
-# name = "codex"
-# weight = 0.2
+[[agent.experiments]]
+name = "claude-vs-codex"
+enabled = true
+strategy = "weighted_random"   # "weighted_random" or "fallback"
+
+[[agent.experiments.providers]]
+name = "claude"
+weight = 0.8
+
+[[agent.experiments.providers]]
+name = "codex"
+weight = 0.2
 
 # ============================================
 # Users
@@ -207,13 +207,13 @@ review_trigger = "@claudear"
 use_ssh = false
 
 # GitHub Issues: Repositories to monitor for issues (e.g., ["owner/repo"])
-# repos = ["my-org/my-repo"]
+repos = ["my-org/my-repo"]
 
 # GitHub Issues: Labels that trigger automation
-# trigger_labels = ["auto-implement", "claude"]
+trigger_labels = ["auto-implement", "claude"]
 
 # GitHub Issues: Issue states that trigger automation (e.g., ["open"])
-# trigger_states = ["open"]
+trigger_states = ["open"]
 
 # GitHub App Authentication (Optional)
 # Configure this section to use GitHub App authentication instead of PAT.
@@ -420,35 +420,35 @@ poll_interval_ms = 300000
 
 [issues.discord]
 # Bot token for reading messages (inherited from notifiers.discord if omitted)
-# bot_token = ""
+bot_token = ""
 
 # Channel to listen for issue messages
-# listen_channel_id = ""
+listen_channel_id = ""
 
 # Guild (server) ID for constructing message URLs
-# guild_id = ""
+guild_id = ""
 
 # Polling interval in milliseconds (overrides global)
-# poll_interval_ms = 300000
+poll_interval_ms = 300000
 
 # Slack as an issue source (messages become issues)
 # Shared credentials (bot_token, channel_id) are inherited from notifiers.slack if not set here.
 
 [issues.slack]
 # Bot token for reading messages (inherited from notifiers.slack if omitted)
-# bot_token = ""
+bot_token = ""
 
 # Channel to listen for issue messages
-# listen_channel_id = ""
+listen_channel_id = ""
 
 # Workspace name for constructing message URLs
-# workspace = "mycompany"
+workspace = "mycompany"
 
 # Slack user ID (e.g., bot's own user ID for reply detection)
-# user_id = ""
+user_id = ""
 
 # Polling interval in milliseconds (overrides global)
-# poll_interval_ms = 300000
+poll_interval_ms = 300000
 
 # ============================================
 # Notifiers
@@ -478,13 +478,13 @@ bot_token = ""
 channel_id = ""
 
 # Incoming Webhook URL (optional, notification-only alternative to bot token)
-# webhook_url = "https://hooks.slack.com/services/..."
+webhook_url = "https://hooks.slack.com/services/..."
 
 # Slack user ID to mention in notifications
 user_id = ""
 
 # Workspace name for constructing message URLs
-# workspace = "mycompany"
+workspace = "mycompany"
 
 [notifiers.email]
 # SMTP server host
@@ -554,41 +554,41 @@ priority = 0
 
 [notifiers.whatsapp]
 # WhatsApp Business phone number ID
-# phone_number_id = ""
+phone_number_id = ""
 
 # Meta Graph API access token
-# access_token = ""
+access_token = ""
 
 # Default recipient phone numbers
-# to_numbers = []
+to_numbers = []
 
 # Enable WhatsApp as an issue source (messages become issues, default: false)
-# source_enabled = false
+source_enabled = false
 
 # Override phone number ID for source (falls back to phone_number_id)
-# listen_phone_number_id = ""
+listen_phone_number_id = ""
 
 # Polling interval in milliseconds for WhatsApp source (overrides global)
-# poll_interval_ms = 300000
+poll_interval_ms = 300000
 
 [notifiers.telegram]
 # Telegram Bot API token
-# bot_token = ""
+bot_token = ""
 
 # Default chat ID for notifications
-# chat_id = ""
+chat_id = ""
 
 # Additional recipient chat IDs
-# to_chat_ids = []
+to_chat_ids = []
 
 # Enable Telegram as an issue source (messages become issues, default: false)
-# source_enabled = false
+source_enabled = false
 
 # Override chat ID for source (falls back to chat_id)
-# listen_chat_id = ""
+listen_chat_id = ""
 
 # Polling interval in milliseconds for Telegram source (overrides global)
-# poll_interval_ms = 300000
+poll_interval_ms = 300000
 
 # ============================================
 # Monitoring
@@ -610,10 +610,10 @@ check_interval_hours = 1
 monitoring_duration_hours = 24
 
 # Override check interval in seconds (for testing, takes precedence over check_interval_hours)
-# check_interval_secs = 60
+check_interval_secs = 60
 
 # Override monitoring duration in seconds (for testing, takes precedence over monitoring_duration_hours)
-# monitoring_duration_secs = 3600
+monitoring_duration_secs = 3600
 
 # Minimum Sentry event count to consider regression candidate (default: 1)
 sentry_event_threshold = 1
@@ -633,8 +633,8 @@ github_search_repos = []
 
 # Optional: Repo name -> package name overrides when they differ
 # Each repo can map to multiple package names.
-# [regression.package_names]
-# "utopia-php/database" = ["utopia-php/database"]
+[regression.package_names]
+"utopia-php/database" = ["utopia-php/database"]
 
 # Enables chained follow-up fixes across repositories.
 
@@ -649,13 +649,13 @@ max_depth = 0
 # Each rule controls how a specific upstream->downstream pair is cascaded.
 # If no rule matches, default behavior applies (trigger on release, update version).
 
-# [[cascade.rules]]
-# upstream = "org/library"
-# downstream = "org/application"
-# trigger = "release"         # "merge" or "release" (default)
-# target_branch = "develop"   # Override downstream branch (default: repo default)
-# version_update = true       # Update dependency version in downstream (default: true)
-# instructions = "Run composer install after updating the dependency"
+[[cascade.rules]]
+upstream = "org/library"
+downstream = "org/application"
+trigger = "release"                           # "merge" or "release" (default)
+target_branch = "develop"                     # Override downstream branch (default: repo default)
+version_update = true                         # Update dependency version in downstream (default: true)
+instructions = "Run composer install after updating the dependency"
 
 # ============================================
 # Continuous Learning
@@ -730,7 +730,7 @@ cluster_weight = 0.10
 # Path patterns for blast radius classification.
 # Issues touching these paths are classified at the corresponding tier.
 # Case-insensitive segment matching (split on /, \, ., _, -) against filename, function, and culprit metadata.
-critical_paths = ["auth", "payment", "billing", "security", "login", "oauth"]
+critical_paths = ["auth", "payment", "billing", "security", "login", "oauth", "key"]
 core_paths = ["api", "core", "middleware", "router", "handler"]
 infra_paths = ["deploy", "infra", "ci", "docker", "terraform", "k8s", "database", "migration"]
 test_paths = ["test", "spec", "fixture", "mock"]
@@ -743,12 +743,12 @@ min_content_cluster_size = 2
 
 # Suppression rules: skip known-noisy issues before they consume processing slots.
 # Each rule matches a field against a pattern. First matching rule wins.
-# suppression_rules = [
-#     { name = "flaky-ci", field = "title", pattern = "flaky", match_mode = "contains", reason = "Known flaky test" },
-#     { name = "rate-limits", field = "error_type", pattern = "RateLimitError", match_mode = "contains", sources = ["sentry"], reason = "Transient rate limit errors" },
-#     { name = "docs-typos", field = "filename", pattern = "readme", match_mode = "contains", reason = "Cosmetic documentation issues" },
-#     { name = "bot-noise", field = "title", pattern = "^\\[bot\\]", match_mode = "regex", reason = "Automated bot issues" },
-# ]
+suppression_rules = [
+    { name = "flaky-ci", field = "title", pattern = "flaky", match_mode = "contains", reason = "Known flaky test" },
+    { name = "rate-limits", field = "error_type", pattern = "RateLimitError", match_mode = "contains", sources = ["sentry"], reason = "Transient rate limit errors" },
+    { name = "docs-typos", field = "filename", pattern = "readme", match_mode = "contains", reason = "Cosmetic documentation issues" },
+    { name = "bot-noise", field = "title", pattern = "^\\[bot\\]", match_mode = "regex", reason = "Automated bot issues" },
+]
 
 # ============================================
 # Code Indexing
@@ -800,10 +800,10 @@ post_pr_comment = true
 fail_on_regression = false
 
 # Custom command overrides (auto-detected when empty)
-# custom_test_cmd = "npm test"
-# custom_lint_cmd = "npm run lint"
-# custom_analysis_cmd = "phpstan analyse"
-# custom_coverage_cmd = "npm run coverage"
+custom_test_cmd = "npm test"
+custom_lint_cmd = "npm run lint"
+custom_analysis_cmd = "phpstan analyse"
+custom_coverage_cmd = "npm run coverage"
 
 # ============================================
 # Dashboard
@@ -815,5 +815,5 @@ fail_on_regression = false
 # total_cost_usd is not available from CLI). Set to 0 to disable. (default: 0.0)
 max_plan_monthly_cost = 0.0
 
-# Hourly engineer rate for cost-savings calculation (default: 75.0)
-hourly_engineer_rate = 75.0
+# Hourly engineer rate for cost-savings calculation (default: 150.0)
+hourly_engineer_rate = 150.0
