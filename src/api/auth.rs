@@ -364,10 +364,17 @@ pub async fn login_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Set cookie
+    // Only set Secure flag when not on localhost — browsers (notably Firefox)
+    // may refuse to send Secure cookies over ws:// WebSocket connections even
+    // to localhost, breaking the indexing-progress WebSocket endpoint.
+    let is_localhost = matches!(
+        state.config.bind_address.as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    );
     let mut cookie = Cookie::new(SESSION_COOKIE, token);
     cookie.set_path("/");
     cookie.set_http_only(true);
-    cookie.set_secure(true);
+    cookie.set_secure(!is_localhost);
     cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
     cookie.set_max_age(tower_cookies::cookie::time::Duration::days(
         SESSION_MAX_AGE_DAYS,
@@ -864,9 +871,6 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
-            tenant_id: None,
-            database_url: None,
-            redis_url: None,
         }
     }
 

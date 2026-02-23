@@ -1243,10 +1243,6 @@ impl SqliteTracker {
             return Ok(false);
         }
 
-        if Self::table_exists(conn, QA_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
         if !is_vectorlite_available(conn) {
             match try_load_vectorlite(conn) {
                 Ok(true) => {}
@@ -1256,6 +1252,10 @@ impl SqliteTracker {
                     return Ok(false);
                 }
             }
+        }
+
+        if Self::table_exists(conn, QA_VECTOR_TABLE)? {
+            return Ok(true);
         }
 
         let sql = format!(
@@ -1321,10 +1321,6 @@ impl SqliteTracker {
             return Ok(false);
         }
 
-        if Self::table_exists(conn, ISSUE_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
         if !is_vectorlite_available(conn) {
             match try_load_vectorlite(conn) {
                 Ok(true) => {}
@@ -1334,6 +1330,10 @@ impl SqliteTracker {
                     return Ok(false);
                 }
             }
+        }
+
+        if Self::table_exists(conn, ISSUE_VECTOR_TABLE)? {
+            return Ok(true);
         }
 
         let sql = format!(
@@ -1403,10 +1403,6 @@ impl SqliteTracker {
             return Ok(false);
         }
 
-        if Self::table_exists(conn, OUTCOME_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
         if !is_vectorlite_available(conn) {
             match try_load_vectorlite(conn) {
                 Ok(true) => {}
@@ -1416,6 +1412,10 @@ impl SqliteTracker {
                     return Ok(false);
                 }
             }
+        }
+
+        if Self::table_exists(conn, OUTCOME_VECTOR_TABLE)? {
+            return Ok(true);
         }
 
         let sql = format!(
@@ -2577,6 +2577,10 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
         SqliteTracker::subscribe_indexing_progress(self)
+    }
+
+    fn add_dependency(&self, upstream: &str, downstream: &str, dep_type: &str) -> Result<()> {
+        SqliteTracker::add_dependency(self, upstream, downstream, dep_type)
     }
 
     fn list_all_dependencies(&self) -> Result<Vec<StoredDependency>> {
@@ -4919,6 +4923,14 @@ impl FixAttemptTracker for SqliteTracker {
         repo_id: Option<i64>,
     ) -> Result<Vec<crate::repo::code_index::CodeSymbol>> {
         SqliteTracker::find_code_symbols(self, name, kind, repo_id)
+    }
+
+    fn get_code_embedding_model(&self, repo_id: i64) -> Result<Option<String>> {
+        SqliteTracker::get_code_embedding_model(self, repo_id)
+    }
+
+    fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
+        SqliteTracker::delete_all_code_data_for_repo(self, repo_id)
     }
 }
 
@@ -8322,13 +8334,11 @@ impl SqliteTracker {
         }
 
         // Get all file paths we have indexed for this repo.
-        // Query outside the write transaction to avoid holding a write lock during the read.
+        // code_chunks is the primary artifact; stale symbols are cleaned up
+        // via delete_code_data_for_file which deletes both tables.
         let indexed_paths: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1
-                 UNION
-                 SELECT DISTINCT file_path FROM code_symbols WHERE repo_id = ?1",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id = ?1")?;
             let rows: Vec<String> = stmt
                 .query_map(params![repo_id], |row| row.get(0))?
                 .filter_map(|r| r.ok())
@@ -8405,8 +8415,8 @@ impl SqliteTracker {
         {
             let mut stmt = tx.prepare(
                 r#"
-                INSERT INTO code_chunks (repo_id, file_path, chunk_type, symbol_name, language, start_line, end_line, chunk_text, context_text, file_hash)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                INSERT INTO code_chunks (repo_id, file_path, chunk_type, symbol_name, language, start_line, end_line, chunk_text, context_text, file_hash, content_hash)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 "#,
             )?;
 
@@ -8422,6 +8432,7 @@ impl SqliteTracker {
                     &chunk.chunk_text,
                     &chunk.context_text,
                     &chunk.file_hash,
+                    chunk.content_hash.as_deref(),
                 ])?;
                 ids.push(tx.last_insert_rowid());
             }
@@ -8485,10 +8496,6 @@ impl SqliteTracker {
             return Ok(false);
         }
 
-        if Self::table_exists(conn, CODE_CHUNK_VECTOR_TABLE)? {
-            return Ok(true);
-        }
-
         if !is_vectorlite_available(conn) {
             match try_load_vectorlite(conn) {
                 Ok(true) => {}
@@ -8498,6 +8505,10 @@ impl SqliteTracker {
                     return Ok(false);
                 }
             }
+        }
+
+        if Self::table_exists(conn, CODE_CHUNK_VECTOR_TABLE)? {
+            return Ok(true);
         }
 
         let sql = format!(
@@ -8605,6 +8616,10 @@ impl SqliteTracker {
             |row| {
                 let similarity: f64 = row.get(0)?;
                 let lang_str: String = row.get(6)?;
+                let chunk_text: String = row.get(9)?;
+                let stored_prefix: String = row.get(10)?;
+                // Reconstruct full context_text from stored prefix + chunk_text.
+                let context_text = format!("{}\n{}", stored_prefix.trim_end(), chunk_text);
 
                 Ok(CodeSearchResult {
                     chunk: CodeChunk {
@@ -8616,9 +8631,10 @@ impl SqliteTracker {
                         language: parse_language(&lang_str),
                         start_line: row.get::<_, i64>(7)? as usize,
                         end_line: row.get::<_, i64>(8)? as usize,
-                        chunk_text: row.get(9)?,
-                        context_text: row.get(10)?,
+                        chunk_text,
+                        context_text,
                         file_hash: row.get(11)?,
+                        content_hash: None,
                     },
                     score: similarity,
                 })
@@ -8695,6 +8711,40 @@ impl SqliteTracker {
             results.push(sym);
         }
         Ok(results)
+    }
+
+    /// Get the embedding model used for a repo's existing code chunk embeddings.
+    pub fn get_code_embedding_model(&self, repo_id: i64) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<String> = conn
+            .query_row(
+                r#"
+                SELECT embedding_model FROM code_chunk_embeddings
+                WHERE chunk_id IN (SELECT id FROM code_chunks WHERE repo_id = ?1)
+                LIMIT 1
+                "#,
+                params![repo_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Delete all code data (symbols, chunks, embeddings) for a repo.
+    pub fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM code_symbols WHERE repo_id = ?1",
+            params![repo_id],
+        )?;
+        // Embeddings are CASCADE-deleted via code_chunks FK.
+        tx.execute(
+            "DELETE FROM code_chunks WHERE repo_id = ?1",
+            params![repo_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -16609,6 +16659,7 @@ mod tests {
                 chunk_text: "fn main() { }".to_string(),
                 context_text: "// main entry point".to_string(),
                 file_hash: "abc123".to_string(),
+                content_hash: None,
             },
             crate::repo::code_index::CodeChunk {
                 id: None,
@@ -16622,6 +16673,7 @@ mod tests {
                 chunk_text: "mod tests { }".to_string(),
                 context_text: "// test module".to_string(),
                 file_hash: "def456".to_string(),
+                content_hash: None,
             },
         ];
 
@@ -16657,6 +16709,7 @@ mod tests {
             chunk_text: "fn main() {}".to_string(),
             context_text: "".to_string(),
             file_hash: "abc123".to_string(),
+            content_hash: None,
         }];
         let ids = tracker.save_code_chunks(&chunks).unwrap();
 
@@ -16720,6 +16773,7 @@ mod tests {
             chunk_text: "fn main() {}".to_string(),
             context_text: "".to_string(),
             file_hash: "abc".to_string(),
+            content_hash: None,
         }];
         tracker.save_code_chunks(&chunks).unwrap();
 
@@ -16755,6 +16809,7 @@ mod tests {
                 chunk_text: "fn a() {}".to_string(),
                 context_text: "".to_string(),
                 file_hash: "h1".to_string(),
+                content_hash: None,
             },
             crate::repo::code_index::CodeChunk {
                 id: None,
@@ -16768,6 +16823,7 @@ mod tests {
                 chunk_text: "fn b() {}".to_string(),
                 context_text: "".to_string(),
                 file_hash: "h2".to_string(),
+                content_hash: None,
             },
         ];
         let ids = tracker.save_code_chunks(&chunks).unwrap();
@@ -16807,6 +16863,7 @@ mod tests {
             chunk_text: "fn old() {}".to_string(),
             context_text: "".to_string(),
             file_hash: "hash".to_string(),
+            content_hash: None,
         }];
         tracker.save_code_chunks(&chunks).unwrap();
 
@@ -16838,6 +16895,7 @@ mod tests {
                 chunk_text: "fn keep() {}".to_string(),
                 context_text: "".to_string(),
                 file_hash: "h1".to_string(),
+                content_hash: None,
             },
             crate::repo::code_index::CodeChunk {
                 id: None,
@@ -16851,6 +16909,7 @@ mod tests {
                 chunk_text: "fn stale() {}".to_string(),
                 context_text: "".to_string(),
                 file_hash: "h2".to_string(),
+                content_hash: None,
             },
         ];
         tracker.save_code_chunks(&chunks).unwrap();

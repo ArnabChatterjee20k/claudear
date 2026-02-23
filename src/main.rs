@@ -6,6 +6,7 @@ use claudear::{
     config::Config,
     feedback::{EmbeddingClient, EmbeddingConfig, IssueEmbeddingService},
     github::GitHubClient,
+    housekeeping::HousekeepingWorker,
     ipc::{default_socket_path, is_daemon_running, print_response, IpcClient, IpcServer},
     notifier::{
         CompositeNotifier, ConsoleNotifier, DiscordNotifier, EmailNotifier, Notifier, PushNotifier,
@@ -40,7 +41,9 @@ use claudear::{
 use serde_json::json;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{
+    filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+};
 
 #[derive(Parser)]
 #[command(name = "claudear")]
@@ -50,6 +53,10 @@ struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "claudear.toml")]
     config: String,
+
+    /// Enable verbose console logging (timestamps, info/debug logs)
+    #[arg(short, long, global = true)]
+    verbose: bool,
 
     /// Directory for log files (with daily rotation). Set to empty string to disable file logging.
     #[arg(long, env = "CLAUDEAR_LOG_DIR", default_value = "./logs")]
@@ -428,12 +435,32 @@ enum UsersCommands {
 /// Returns a guard that must be kept alive for the duration of the program.
 fn init_logging(
     log_dir: Option<&std::path::Path>,
+    verbose: bool,
+    suppress_console_info: bool,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,ort=warn"));
 
-    // Console layer - always enabled
-    let console_layer = fmt::layer().with_target(false).with_writer(std::io::stdout);
+    // Console layer is always enabled, but concise by default.
+    let console_layer = if verbose {
+        fmt::layer()
+            .with_target(false)
+            .with_writer(std::io::stdout)
+            .boxed()
+    } else if suppress_console_info {
+        fmt::layer()
+            .with_target(false)
+            .without_time()
+            .with_writer(std::io::stdout)
+            .with_filter(LevelFilter::WARN)
+            .boxed()
+    } else {
+        fmt::layer()
+            .with_target(false)
+            .without_time()
+            .with_writer(std::io::stdout)
+            .boxed()
+    };
 
     // File layer - optional, with daily rotation
     if let Some(dir) = log_dir {
@@ -478,6 +505,117 @@ fn init_logging(
     }
 }
 
+fn format_interval_compact(ms: u64) -> String {
+    if ms % 3_600_000 == 0 {
+        format!("{}h", ms / 3_600_000)
+    } else if ms % 60_000 == 0 {
+        format!("{}m", ms / 60_000)
+    } else if ms % 1_000 == 0 {
+        format!("{}s", ms / 1_000)
+    } else {
+        format!("{}ms", ms)
+    }
+}
+
+fn dashboard_host_for_display(bind_address: &str) -> &str {
+    match bind_address {
+        "127.0.0.1" | "0.0.0.0" | "::1" => "localhost",
+        _ => bind_address,
+    }
+}
+
+fn format_status_with_detail(label: &str, detail: Option<String>) -> String {
+    match detail.filter(|d| !d.is_empty()) {
+        Some(detail) => format!("{label} ({detail})"),
+        None => label.to_string(),
+    }
+}
+
+fn print_startup_ok(message: impl AsRef<str>) {
+    println!("  [ok] {}", message.as_ref());
+}
+
+fn print_startup_banner_and_status(
+    config: &Config,
+    config_path: &str,
+    port: u16,
+    enable_dashboard: bool,
+    enable_polling: bool,
+    poll_interval_ms: u64,
+    inferrer_embedding_count: Option<usize>,
+    user_registry: &UserRegistry,
+) {
+    println!();
+    println!("    ╔═╗ ╦   ╔═╗ ╦ ╦ ╔╦╗ ╔═╗ ╔═╗ ╦═╗");
+    println!("    ║   ║   ╠═╣ ║ ║ ║║║ ║╣  ╠═╣ ╠╦╝");
+    println!("    ╚═╝ ╩═╝ ╩ ╩ ╚═╝ ╚╩╝ ╚═╝ ╩ ╩ ╩╚═");
+    println!();
+    println!("    v{}", env!("CARGO_PKG_VERSION"));
+    if enable_dashboard {
+        println!(
+            "    Dashboard: http://{}:{}",
+            dashboard_host_for_display(&config.bind_address),
+            port
+        );
+    }
+    println!();
+
+    print_startup_ok(format!("Config loaded from {}", config_path));
+
+    print_startup_ok("Database initialized (SQLite)");
+
+    if let Some(linear) = config.linear().filter(|c| c.enabled) {
+        let detail = linear
+            .team_id
+            .clone()
+            .or_else(|| linear.project_id.clone())
+            .or_else(|| linear.trigger_assignee.clone());
+        print_startup_ok(format_status_with_detail("Connected: Linear", detail));
+    }
+
+    if let Some(sentry_cfg) = config.sentry_config().filter(|c| c.enabled) {
+        let detail = sentry_cfg
+            .project_slugs
+            .first()
+            .cloned()
+            .or_else(|| (!sentry_cfg.org_slug.is_empty()).then(|| sentry_cfg.org_slug.clone()));
+        print_startup_ok(format_status_with_detail("Connected: Sentry", detail));
+    }
+
+    if config.is_github_enabled() {
+        let github_cfg = config.github();
+        let detail = github_cfg.repos.first().cloned().or_else(|| {
+            config
+                .is_github_app_configured()
+                .then(|| "GitHub App".to_string())
+        });
+        print_startup_ok(format_status_with_detail("Connected: GitHub", detail));
+    }
+
+    if DiscordNotifier::new(config.discord_merged(), user_registry.clone()).is_enabled() {
+        print_startup_ok("Discord notifier ready");
+    }
+
+    if SlackNotifier::new(config.slack_merged(), user_registry.clone()).is_enabled() {
+        print_startup_ok("Slack notifier ready");
+    }
+
+    if let Some(count) = inferrer_embedding_count {
+        print_startup_ok(format!("Vector store loaded ({count} embeddings)"));
+    }
+
+    if enable_polling {
+        print_startup_ok(format!(
+            "Polling started (interval: {})",
+            format_interval_compact(poll_interval_ms)
+        ));
+    }
+
+    println!();
+    println!("  Watching for issues...");
+    println!();
+}
+
 /// Build an `IssueEmbeddingService` for semantic dedup and context enrichment.
 ///
 /// Returns `None` if the embedding model fails to load, allowing graceful degradation.
@@ -494,6 +632,133 @@ fn build_issue_embedding_service(
             None
         }
     }
+}
+
+/// Common dependencies needed to construct a [`Watcher`].
+///
+/// Built once by [`build_watcher_deps`] and consumed by both `Commands::Start`
+/// and `Commands::Webhook`.
+struct WatcherDeps {
+    sources: Vec<Arc<dyn IssueSource>>,
+    scm_provider: Option<Arc<dyn ScmProvider>>,
+    github_client: Option<GitHubClient>,
+    relationships: Option<RepoRelationships>,
+    inferrer: Option<claudear::inference::RepoInferrer>,
+    embedding_client: Option<EmbeddingClient>,
+    review_watcher: Option<Arc<ReviewWatcher>>,
+    issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    agent: Arc<dyn AgentRunner>,
+}
+
+/// Build the common watcher dependencies shared between `Commands::Start` and
+/// `Commands::Webhook`.
+async fn build_watcher_deps(
+    config: &Config,
+    tracker: &Arc<dyn FixAttemptTracker>,
+) -> anyhow::Result<WatcherDeps> {
+    let sources = create_sources(config);
+
+    // GitHub client for API-based repo discovery
+    let github_client = GitHubClient::new(config.github().clone());
+
+    // Inferrer + embedding client
+    let (inferrer, embedding_client) =
+        Watcher::build_inferrer_with_embeddings(config, Some(&github_client)).await?;
+    if inferrer.is_some() {
+        tracing::info!("Repository inference enabled");
+    }
+
+    // ReviewWatcher for PR review tracking
+    let review_watcher = create_review_watcher(config, tracker.clone());
+
+    // Dependency graph for cascade support
+    let relationships = if config.cascade.enabled {
+        let mut rels = RepoRelationships::with_defaults();
+        match tracker.list_all_dependencies() {
+            Ok(db_deps) if !db_deps.is_empty() => {
+                tracing::info!(count = db_deps.len(), "Loading dependencies from database");
+                for dep in &db_deps {
+                    if let Some(dep_type) = DependencyType::parse(&dep.dep_type) {
+                        rels.add_dependency(&dep.upstream, &dep.downstream, dep_type, None)
+                            .ok();
+                    } else {
+                        tracing::warn!(
+                            dep_type = %dep.dep_type,
+                            "Unknown dependency type, skipping"
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to load dependencies from database");
+            }
+        }
+        Some(rels)
+    } else {
+        None
+    };
+
+    // GitHub client for PR merge checking
+    let github_client_for_watcher = if config.is_github_enabled() {
+        Some(GitHubClient::new(config.github().clone()))
+    } else {
+        None
+    };
+
+    // Issue embedding service for semantic dedup
+    let issue_embedding_service = build_issue_embedding_service(tracker);
+
+    // Generic SCM provider for PR merge detection (GitLab, etc.)
+    let scm_provider: Option<Arc<dyn ScmProvider>> = if let Some(gitlab_config) = config.gitlab() {
+        if gitlab_config.enabled && gitlab_config.token.is_some() {
+            Some(InstrumentedScm::wrap(Arc::new(
+                claudear::gitlab::GitLabClient::new(gitlab_config.clone()),
+            )))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Agent runner
+    let agent: Arc<dyn AgentRunner> = InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
+        ClaudeRunnerConfig {
+            timeout_secs: config.agent.timeout_secs,
+            model: config
+                .agent
+                .default_provider_config()
+                .and_then(|p| p.model.clone()),
+            instructions: config
+                .agent
+                .default_provider_config()
+                .and_then(|p| p.instructions.clone()),
+            permissions: config
+                .agent
+                .default_provider_config()
+                .map(|p| p.permissions.clone())
+                .unwrap_or_default(),
+            skip_permissions: config
+                .agent
+                .default_provider_config()
+                .map(|p| p.skip_permissions)
+                .unwrap_or(false),
+        },
+        tracker.clone(),
+    )));
+
+    Ok(WatcherDeps {
+        sources,
+        scm_provider,
+        github_client: github_client_for_watcher,
+        relationships,
+        inferrer,
+        embedding_client,
+        review_watcher,
+        issue_embedding_service,
+        agent,
+    })
 }
 
 /// Create a ReviewWatcher if GitHub is configured.
@@ -751,45 +1016,6 @@ fn create_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn Noti
 }
 
 fn create_tracker(config: &Config) -> Arc<dyn FixAttemptTracker> {
-    #[cfg(feature = "postgres")]
-    if let Some(ref database_url) = config.database_url {
-        let mut pg_cfg = deadpool_postgres::Config::new();
-        pg_cfg.url = Some(database_url.to_string());
-        let pool = pg_cfg
-            .create_pool(
-                Some(deadpool_postgres::Runtime::Tokio1),
-                tokio_postgres::NoTls,
-            )
-            .expect("Failed to create PostgreSQL connection pool");
-        let tenant_id = config
-            .tenant_id
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-
-        #[cfg(feature = "redis")]
-        let cache = config.redis_url.as_ref().map(|url| {
-            let client = redis::Client::open(url.as_str()).expect("Failed to create Redis client");
-            let rt = tokio::runtime::Handle::current();
-            tokio::task::block_in_place(|| rt.block_on(redis::aio::ConnectionManager::new(client)))
-                .expect("Failed to connect to Redis")
-        });
-
-        #[cfg(feature = "redis")]
-        tracing::info!(
-            tenant_id = %tenant_id,
-            cache_enabled = cache.is_some(),
-            "Using PostgresBackend"
-        );
-        #[cfg(not(feature = "redis"))]
-        tracing::info!(tenant_id = %tenant_id, "Using PostgresBackend");
-
-        #[cfg(feature = "redis")]
-        return Arc::new(claudear::postgres::PostgresBackend::new(
-            pool, tenant_id, cache,
-        ));
-        #[cfg(not(feature = "redis"))]
-        return Arc::new(claudear::postgres::PostgresBackend::new(pool, tenant_id));
-    }
     Arc::new(SqliteTracker::new(&config.db_path).expect("Failed to initialize SQLite tracker"))
 }
 
@@ -1092,6 +1318,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let verbose = cli.verbose;
 
     // Initialize logging (must keep _guard alive for file logging to work)
     // Empty path disables file logging
@@ -1100,7 +1327,8 @@ async fn async_main() -> anyhow::Result<()> {
     } else {
         Some(cli.log_dir.as_path())
     };
-    let _log_guard = init_logging(log_dir);
+    let suppress_console_info = !verbose && matches!(&cli.command, Commands::Start { .. });
+    let _log_guard = init_logging(log_dir, verbose, suppress_console_info);
 
     let config_path = cli.config.clone();
 
@@ -1713,6 +1941,36 @@ async fn async_main() -> anyhow::Result<()> {
                 } else {
                     println!("  Skipped file lists (use without --skip-files for full indexing)");
                 }
+
+                // Auto-discover dependencies
+                use claudear::DependencyDiscovery;
+                let discovery = DependencyDiscovery::new(config.known_orgs.clone());
+                match discovery.scan_directories(&config.auto_discover_paths) {
+                    Ok(discovered) if !discovered.is_empty() => {
+                        let mut dep_count = 0;
+                        for dep in &discovered {
+                            if let Err(e) =
+                                db_tracker.add_dependency(&dep.depends_on, &dep.repo, &dep.dep_type)
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    upstream = %dep.depends_on,
+                                    downstream = %dep.repo,
+                                    "Failed to save dependency"
+                                );
+                            } else {
+                                dep_count += 1;
+                            }
+                        }
+                        println!("  Discovered and saved {} dependencies", dep_count);
+                    }
+                    Ok(_) => {
+                        println!("  No dependencies found between indexed repos.");
+                    }
+                    Err(e) => {
+                        println!("  Warning: dependency discovery failed: {}", e);
+                    }
+                }
             }
         }
 
@@ -2154,11 +2412,6 @@ async fn async_main() -> anyhow::Result<()> {
             anyhow::bail!("A daemon is already running. Stop it first with 'claudear stop'");
         }
 
-        let sources = create_sources(&config);
-        if sources.is_empty() {
-            anyhow::bail!("No sources were initialized");
-        }
-
         // Determine what services to run
         let enable_webhooks = !no_webhooks;
         let enable_dashboard = !no_dashboard;
@@ -2181,131 +2434,42 @@ async fn async_main() -> anyhow::Result<()> {
         }
         let mode_str = modes.join("+");
 
-        // Create GitHub client for API-based repo discovery
-        let github_client = GitHubClient::new(config.github().clone());
-
-        // Build repository inferrer for issue-to-repo mapping (with embeddings for semantic matching)
-        let (inferrer, embedding_client) =
-            Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
-        if inferrer.is_some() {
-            tracing::info!("Repository inference enabled");
+        // Build shared watcher dependencies
+        let deps = build_watcher_deps(&config, &tracker).await?;
+        let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
+        let sources = deps.sources;
+        if sources.is_empty() {
+            anyhow::bail!("No sources were initialized");
         }
 
-        // Create ReviewWatcher for PR review tracking
-        let review_watcher = create_review_watcher(&config, tracker.clone());
-        let github_webhook_handler = create_github_webhook_handler(&config, review_watcher.clone());
+        let github_webhook_handler =
+            create_github_webhook_handler(&config, deps.review_watcher.clone());
 
-        // Build dependency graph for cascade support
-        let relationships = if config.cascade.enabled {
-            let mut rels = RepoRelationships::with_defaults();
-            match tracker.list_all_dependencies() {
-                Ok(db_deps) if !db_deps.is_empty() => {
-                    tracing::info!(count = db_deps.len(), "Loading dependencies from database");
-                    for dep in &db_deps {
-                        if let Some(dep_type) = DependencyType::parse(&dep.dep_type) {
-                            rels.add_dependency(&dep.upstream, &dep.downstream, dep_type, None)
-                                .ok();
-                        } else {
-                            tracing::warn!(
-                                dep_type = %dep.dep_type,
-                                "Unknown dependency type, skipping"
-                            );
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to load dependencies from database");
-                }
-            }
-            Some(rels)
-        } else {
-            None
-        };
-
-        // Create GitHub client for PR merge checking.
-        let github_client_for_watcher = if config.is_github_enabled() {
-            Some(GitHubClient::new(config.github().clone()))
-        } else {
-            None
-        };
-
-        // Build issue embedding service for semantic dedup
-        let issue_embedding_service = build_issue_embedding_service(&tracker);
-
-        // Create watcher if polling is enabled
-        // Build generic SCM provider for PR merge detection (GitLab, etc.)
-        let scm_provider: Option<Arc<dyn ScmProvider>> =
-            if let Some(gitlab_config) = config.gitlab() {
-                if gitlab_config.enabled && gitlab_config.token.is_some() {
-                    Some(InstrumentedScm::wrap(Arc::new(
-                        claudear::gitlab::GitLabClient::new(gitlab_config.clone()),
-                    )))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-        let agent: Arc<dyn AgentRunner> =
-            InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.agent.timeout_secs,
-                    model: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.model.clone()),
-                    instructions: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.instructions.clone()),
-                    permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.permissions.clone())
-                        .unwrap_or_default(),
-                    skip_permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.skip_permissions)
-                        .unwrap_or(false),
-                },
-                tracker.clone(),
-            )));
-
-        let watcher = if enable_polling {
-            Some(Arc::new(Watcher::new(WatcherOptions {
-                config: config.clone(),
-                sources: sources.clone(),
-                notifier: notifier.clone(),
-                tracker: tracker.clone(),
-                inferrer: inferrer.clone(),
-                embedding_client,
-                review_watcher: review_watcher.clone(),
-                issue_embedding_service: issue_embedding_service.clone(),
-                relationships,
-                github_client: github_client_for_watcher,
-                scm_provider,
-                user_registry: user_registry.clone(),
-                agent: agent.clone(),
-                dry_run: false,
-            })))
-        } else {
-            None
-        };
+        // Always create watcher (used for both polling and housekeeping-only)
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
+            config: config.clone(),
+            sources: sources.clone(),
+            notifier: notifier.clone(),
+            tracker: tracker.clone(),
+            inferrer: deps.inferrer.clone(),
+            embedding_client: deps.embedding_client,
+            review_watcher: deps.review_watcher.clone(),
+            issue_embedding_service: deps.issue_embedding_service.clone(),
+            relationships: deps.relationships,
+            github_client: deps.github_client,
+            scm_provider: deps.scm_provider,
+            user_registry: user_registry.clone(),
+            agent: deps.agent.clone(),
+            dry_run: false,
+        }));
 
         // Create IPC server
-        let ipc_server = Arc::new({
-            let server = IpcServer::builder(tracker.clone(), sources.clone(), notifier.clone())
+        let ipc_server = Arc::new(
+            IpcServer::builder(tracker.clone(), sources.clone(), notifier.clone())
                 .max_retries(config.retry.max_retries)
-                .build();
-            if let Some(ref w) = watcher {
-                server.with_watcher(w.clone())
-            } else {
-                server
-            }
-        });
+                .build()
+                .with_watcher(watcher.clone()),
+        );
 
         ipc_server.set_mode(&mode_str).await;
         if enable_polling {
@@ -2353,6 +2517,17 @@ async fn async_main() -> anyhow::Result<()> {
             tracing::info!("  Regression monitoring: enabled");
         }
 
+        print_startup_banner_and_status(
+            &config,
+            &config_path,
+            *port,
+            enable_dashboard,
+            enable_polling,
+            *poll_interval,
+            vector_store_embeddings,
+            &user_registry,
+        );
+
         // Shutdown signal handler with graceful drain
         let watcher_for_shutdown = watcher.clone();
         let tracker_for_shutdown = tracker.clone();
@@ -2366,10 +2541,7 @@ async fn async_main() -> anyhow::Result<()> {
                     tracing::info!("\nReceived IPC shutdown command, initiating graceful shutdown...");
                 }
             }
-            if let Some(w) = watcher_for_shutdown {
-                // Use stop_and_drain for graceful shutdown that waits for active tasks
-                w.stop_and_drain().await;
-            }
+            watcher_for_shutdown.stop_and_drain().await;
 
             // Log watcher_stopped activity
             let activity = ActivityLogEntry::new("watcher_stopped", "Watcher daemon stopped")
@@ -2394,10 +2566,11 @@ async fn async_main() -> anyhow::Result<()> {
         // Start all services concurrently
         let ipc_future = ipc_server.start();
 
-        // Dashboard + Webhooks can share the same axum server
-        // For now, we'll run them on the same port with webhooks taking precedence
-        let inferrer_clone = inferrer.clone();
+        let inferrer_clone = deps.inferrer.clone();
         let github_webhook_handler_for_http = github_webhook_handler;
+        let review_watcher_clone = deps.review_watcher.clone();
+        let issue_embedding_service_clone = deps.issue_embedding_service.clone();
+        let agent_clone = deps.agent.clone();
         let http_future = async move {
             if enable_webhooks {
                 let handlers = create_webhook_handlers(&config);
@@ -2416,10 +2589,10 @@ async fn async_main() -> anyhow::Result<()> {
                     Some(tracker.clone()),
                     inferrer_clone,
                     github_webhook_handler_for_http,
-                    agent,
+                    agent_clone,
                 );
-                server.set_issue_embedding_service(issue_embedding_service.clone());
-                server.set_review_watcher(review_watcher.clone());
+                server.set_issue_embedding_service(issue_embedding_service_clone);
+                server.set_review_watcher(review_watcher_clone);
                 server.start().await?;
             } else if enable_dashboard {
                 // Dashboard only (no webhooks)
@@ -2434,12 +2607,14 @@ async fn async_main() -> anyhow::Result<()> {
             Ok::<(), anyhow::Error>(())
         };
 
-        let poll_future = async {
-            if let Some(w) = watcher {
-                w.start(Some(*poll_interval)).await?;
+        let watcher_for_poll = watcher.clone();
+        let poll_future = async move {
+            if enable_polling {
+                watcher_for_poll.start(Some(*poll_interval)).await?;
             } else {
-                // Just wait forever if no polling
-                std::future::pending::<()>().await;
+                // Run housekeeping without source polling
+                let worker = HousekeepingWorker::new(watcher_for_poll, *poll_interval);
+                worker.start().await?;
             }
             Ok::<(), anyhow::Error>(())
         };
@@ -2944,70 +3119,80 @@ async fn async_main() -> anyhow::Result<()> {
             }
 
             let handlers = create_webhook_handlers(&config);
-            let review_watcher = create_review_watcher(&config, tracker.clone());
+
+            // Build shared watcher dependencies (needed for housekeeping)
+            let deps = build_watcher_deps(&config, &tracker).await?;
             let github_webhook_handler =
-                create_github_webhook_handler(&config, review_watcher.clone());
+                create_github_webhook_handler(&config, deps.review_watcher.clone());
 
             if handlers.get_all().is_empty() && github_webhook_handler.is_none() {
                 anyhow::bail!("No webhook handlers were registered");
             }
 
-            // Create GitHub client for API-based repo discovery
-            let github_client = GitHubClient::new(config.github().clone());
+            // Create a Watcher for housekeeping (retries, cascades, auto-close, etc.)
+            let watcher = Arc::new(Watcher::new(WatcherOptions {
+                config: config.clone(),
+                sources: deps.sources,
+                notifier: notifier.clone(),
+                tracker: tracker.clone(),
+                inferrer: deps.inferrer.clone(),
+                embedding_client: deps.embedding_client,
+                review_watcher: deps.review_watcher.clone(),
+                issue_embedding_service: deps.issue_embedding_service.clone(),
+                relationships: deps.relationships,
+                github_client: deps.github_client,
+                scm_provider: deps.scm_provider,
+                user_registry: user_registry.clone(),
+                agent: deps.agent.clone(),
+                dry_run: false,
+            }));
 
-            // Build inferrer for repo inference
-            let inferrer = WebhookServer::build_inferrer(&config, Some(&github_client)).await?;
+            let worker = HousekeepingWorker::new(watcher.clone(), config.poll_interval_ms);
 
-            let issue_embedding_service = build_issue_embedding_service(&tracker);
-
-            let agent: Arc<dyn AgentRunner> =
-                InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
-                    ClaudeRunnerConfig {
-                        timeout_secs: config.agent.timeout_secs,
-                        model: config
-                            .agent
-                            .default_provider_config()
-                            .and_then(|p| p.model.clone()),
-                        instructions: config
-                            .agent
-                            .default_provider_config()
-                            .and_then(|p| p.instructions.clone()),
-                        permissions: config
-                            .agent
-                            .default_provider_config()
-                            .map(|p| p.permissions.clone())
-                            .unwrap_or_default(),
-                        skip_permissions: config
-                            .agent
-                            .default_provider_config()
-                            .map(|p| p.skip_permissions)
-                            .unwrap_or(false),
-                    },
-                    tracker.clone(),
-                )));
             let mut server = WebhookServer::new_with_github(
-                config,
+                config.clone(),
                 handlers,
-                notifier,
+                notifier.clone(),
                 tracker.clone(),
-                Some(tracker),
-                inferrer,
+                Some(tracker.clone()),
+                deps.inferrer,
                 github_webhook_handler,
-                agent,
+                deps.agent,
             );
-            server.set_issue_embedding_service(issue_embedding_service);
-            server.set_review_watcher(review_watcher);
+            server.set_issue_embedding_service(deps.issue_embedding_service);
+            server.set_review_watcher(deps.review_watcher);
+
+            // Start regression monitoring background task
+            let regression_handle = start_regression_monitoring(
+                &config,
+                tracker.clone(),
+                create_sources(&config),
+                notifier.clone(),
+            );
+            if regression_handle.is_some() {
+                tracing::info!("Regression monitoring: enabled");
+            }
 
             // Handle shutdown signals
-            let shutdown = async {
+            let watcher_for_shutdown = watcher.clone();
+            let shutdown = async move {
                 tokio::signal::ctrl_c()
                     .await
                     .expect("Failed to install signal handler");
                 tracing::info!("\nReceived shutdown signal...");
+                watcher_for_shutdown.stop_and_drain().await;
+                if let Some(h) = regression_handle {
+                    h.abort();
+                }
             };
 
             tokio::select! {
                 result = server.start() => result?,
+                result = worker.start() => {
+                    if let Err(e) = result {
+                        tracing::error!("Housekeeping worker error: {}", e);
+                    }
+                }
                 _ = shutdown => {}
             }
         }
@@ -3064,7 +3249,7 @@ async fn async_main() -> anyhow::Result<()> {
                 )));
 
             let tracker_for_api = tracker.clone();
-            let watcher = Watcher::new(WatcherOptions {
+            let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
                 sources,
                 notifier,
@@ -3083,7 +3268,7 @@ async fn async_main() -> anyhow::Result<()> {
                 user_registry: user_registry.clone(),
                 agent,
                 dry_run,
-            });
+            }));
 
             // Handle shutdown signals
             let watcher_ref = &watcher;

@@ -53,6 +53,7 @@ pub fn start_process(
         .args([
             "--config",
             config_path.to_str().unwrap_or(""),
+            "--verbose",
             "start",
             "--poll",
             "--poll-interval",
@@ -198,6 +199,7 @@ pub fn start_docker(
         "claudear".to_string(),
         "--config".to_string(),
         "/app/config.toml".to_string(),
+        "--verbose".to_string(),
         "start".to_string(),
         "--poll".to_string(),
         "--poll-interval".to_string(),

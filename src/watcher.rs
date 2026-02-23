@@ -114,7 +114,7 @@ impl Watcher {
     ///
     /// Parses the DSN from SENTRY_DSN env var and sends a check-in for the
     /// "claudear-watcher-poll" monitor. Does nothing if SENTRY_DSN is not set.
-    fn send_cron_check_in(
+    pub fn send_cron_check_in(
         &self,
         status: &str,
         check_in_id: &str,
@@ -338,6 +338,71 @@ impl Watcher {
         inferrer.refresh_repos(client).await
     }
 
+    /// Discover dependencies between indexed repos and save them to the database.
+    pub async fn discover_dependencies(&self) {
+        let inferrer = match &self.inferrer {
+            Some(inf) => inf,
+            None => return,
+        };
+
+        let known_orgs = self.config.known_orgs.clone();
+        if known_orgs.is_empty() {
+            return;
+        }
+
+        let repo_paths: Vec<String> = match inferrer.with_index(|index| {
+            Ok(index
+                .list()
+                .iter()
+                .map(|r| r.path.to_string_lossy().to_string())
+                .collect())
+        }) {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!("Failed to get repo paths for dependency discovery: {}", e);
+                return;
+            }
+        };
+
+        if repo_paths.is_empty() {
+            return;
+        }
+
+        let tracker = self.tracker.clone();
+        let result = tokio::task::spawn_blocking(move || -> crate::error::Result<usize> {
+            let discovery = crate::repo::DependencyDiscovery::new(known_orgs);
+            let discovered = discovery.scan_directories(&repo_paths)?;
+            let mut count = 0;
+            for dep in &discovered {
+                if let Err(e) = tracker.add_dependency(&dep.depends_on, &dep.repo, &dep.dep_type) {
+                    tracing::warn!(
+                        error = %e,
+                        upstream = %dep.depends_on,
+                        downstream = %dep.repo,
+                        "Failed to save dependency"
+                    );
+                } else {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(count)) if count > 0 => {
+                tracing::info!("Discovered and saved {} dependencies", count);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Dependency discovery failed: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!("Dependency discovery task panicked: {}", e);
+            }
+            _ => {}
+        }
+    }
+
     /// Sync repository index to the database.
     ///
     /// Updates repository paths and optionally file lists in the database
@@ -351,8 +416,143 @@ impl Watcher {
         inferrer.with_index(|index| self.tracker.sync_from_index(index, sync_files))
     }
 
+    /// Warm-start: clone repos, sync to DB, index code, and load feedback outcomes.
+    ///
+    /// This is called at the beginning of `start()` and can also be used independently
+    /// by the `HousekeepingWorker` to prepare the watcher for background tasks.
+    pub async fn warm_start(&self) -> Result<()> {
+        // Clone any API-discovered repos that aren't local yet
+        if let Some(inferrer) = &self.inferrer {
+            let parallelism = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            match inferrer.clone_and_index_all(parallelism).await {
+                Ok(0) => {} // No repos to clone
+                Ok(n) => tracing::info!("Cloned and indexed {} repositories", n),
+                Err(e) => tracing::warn!("Error cloning repositories: {}", e),
+            }
+        }
+
+        // Sync repository index to database (includes file lists)
+        // Use spawn_blocking since sync_repos_to_db performs blocking I/O
+        let inferrer = self.inferrer.clone();
+        let tracker = self.tracker.clone();
+        let sync_result = tokio::task::spawn_blocking(move || -> crate::error::Result<usize> {
+            let inferrer = match &inferrer {
+                Some(inf) => inf,
+                None => return Ok(0),
+            };
+            inferrer.with_index(|index| tracker.sync_from_index(index, true))
+        })
+        .await;
+
+        match sync_result {
+            Ok(Ok(count)) if count > 0 => {
+                tracing::info!("Synced {} repositories to database", count);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Failed to sync repos to database: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!("Sync task panicked: {}", e);
+            }
+            _ => {}
+        }
+
+        // Discover dependencies between indexed repos
+        self.discover_dependencies().await;
+
+        // Tree-sitter code indexing for all repos on disk
+        if self.config.code_index.enabled {
+            if let Some(inferrer) = &self.inferrer {
+                match crate::feedback::EmbeddingClient::new(
+                    crate::feedback::EmbeddingConfig::default(),
+                ) {
+                    Ok(emb_client) => {
+                        let emb_client = Arc::new(emb_client);
+                        let code_indexer = crate::repo::code_index::CodeIndexer::with_config(
+                            self.tracker.clone(),
+                            emb_client,
+                            self.config.code_index.max_file_size_kb,
+                            self.config.code_index.batch_size,
+                        );
+
+                        // Collect repos that exist on disk
+                        let repos: Vec<(String, std::path::PathBuf)> = inferrer
+                            .with_index(|index| {
+                                Ok(index
+                                    .list()
+                                    .into_iter()
+                                    .filter(|r| r.path.exists())
+                                    .map(|r| (r.name.clone(), r.path.clone()))
+                                    .collect())
+                            })
+                            .unwrap_or_default();
+
+                        if !repos.is_empty() {
+                            tracing::info!(
+                                count = repos.len(),
+                                "Starting code indexing for repositories"
+                            );
+                            let _ = self.tracker.start_indexing_progress(repos.len());
+                            let mut total_chunks = 0usize;
+                            let mut total_indexed = 0usize;
+                            for (name, path) in &repos {
+                                let _ = self.tracker.update_indexing_progress(
+                                    total_indexed,
+                                    name,
+                                    0,
+                                    total_chunks,
+                                );
+                                match code_indexer.index_repo(name, path).await {
+                                    Ok(stats) => {
+                                        total_chunks += stats.chunks_created;
+                                        if stats.files_processed > 0 {
+                                            total_indexed += 1;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(repo = %name, error = %e, "Failed to index repo code");
+                                    }
+                                }
+                            }
+                            let _ = self.tracker.finish_indexing_progress();
+                            tracing::info!(
+                                repos = total_indexed,
+                                chunks = total_chunks,
+                                "Code indexing complete"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to initialize embedding client for code indexing");
+                    }
+                }
+            }
+        }
+
+        // Load feedback outcomes from DB for learning
+        match self.tracker.get_feedback_outcomes(None, 1000) {
+            Ok(outcomes) if !outcomes.is_empty() => {
+                let count = outcomes.len();
+                let mut analyzer = self.feedback_analyzer.lock().await;
+                analyzer.load_outcomes(outcomes);
+                tracing::info!(count = count, "Loaded feedback outcomes for learning");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "Failed to load feedback outcomes"),
+        }
+
+        Ok(())
+    }
+
+    /// Set the running state of the watcher.
+    pub fn set_running(&self, running: bool) {
+        self.is_running.store(running, Ordering::SeqCst);
+    }
+
     /// Start the watcher with polling.
-    pub async fn start(&self, interval_ms: Option<u64>) -> Result<()> {
+    pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
 
         let configured_poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
@@ -428,61 +628,33 @@ impl Watcher {
 
         tracing::info!("");
 
-        // Clone any API-discovered repos that aren't local yet
-        if let Some(inferrer) = &self.inferrer {
-            let parallelism = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(4);
-            match inferrer.clone_and_index_all(parallelism).await {
-                Ok(0) => {} // No repos to clone
-                Ok(n) => tracing::info!("Cloned and indexed {} repositories", n),
-                Err(e) => tracing::warn!("Error cloning repositories: {}", e),
-            }
-        }
-
-        // Sync repository index to database (includes file lists)
-        // Use spawn_blocking since sync_repos_to_db performs blocking I/O
-        let inferrer = self.inferrer.clone();
-        let tracker = self.tracker.clone();
-        let sync_result = tokio::task::spawn_blocking(move || -> crate::error::Result<usize> {
-            let inferrer = match &inferrer {
-                Some(inf) => inf,
-                None => return Ok(0),
-            };
-            inferrer.with_index(|index| tracker.sync_from_index(index, true))
-        })
-        .await;
-
-        match sync_result {
-            Ok(Ok(count)) if count > 0 => {
-                tracing::info!("Synced {} repositories to database", count);
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("Failed to sync repos to database: {}", e);
-            }
-            Err(e) => {
-                tracing::warn!("Sync task panicked: {}", e);
-            }
-            _ => {}
-        }
-
-        // Warm-start: load feedback outcomes from DB for learning
-        match self.tracker.get_feedback_outcomes(None, 1000) {
-            Ok(outcomes) if !outcomes.is_empty() => {
-                let count = outcomes.len();
-                let mut analyzer = self.feedback_analyzer.lock().await;
-                analyzer.load_outcomes(outcomes);
-                tracing::info!(count = count, "Loaded feedback outcomes for learning");
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "Failed to load feedback outcomes"),
-        }
-
+        self.warm_start().await?;
         self.is_running.store(true, Ordering::SeqCst);
 
-        // Initial poll of all sources + housekeeping
+        // Initial poll of all sources
         self.poll().await?;
 
+        // Source polling loop
+        let poll_future = self.run_source_poll_loop(poll_interval);
+
+        // Housekeeping loop (retries, cascades, auto-close, reviews, learning, deps)
+        let housekeeping = crate::housekeeping::HousekeepingWorker::new(
+            Arc::clone(self),
+            poll_interval,
+        );
+        let housekeeping_future = housekeeping.run_loop();
+
+        tokio::select! {
+            result = poll_future => result,
+            result = housekeeping_future => result.map_err(|e| crate::error::Error::Config(e.to_string())),
+        }
+    }
+
+    /// Run the source polling loop.
+    ///
+    /// Polls each source at its configured interval. Housekeeping is handled
+    /// separately by [`HousekeepingWorker`].
+    async fn run_source_poll_loop(&self, poll_interval: u64) -> Result<()> {
         // Build per-source timer state: (source index, interval_ms, last_poll)
         let now = std::time::Instant::now();
         let mut source_timers: Vec<(usize, u64, std::time::Instant)> = self
@@ -511,15 +683,6 @@ impl Watcher {
         let mut base_timer = interval(Duration::from_millis(base_tick_ms));
         base_timer.tick().await; // Skip immediate first tick
 
-        // Global housekeeping timer
-        let global_interval = Duration::from_millis(poll_interval);
-        let mut last_global = std::time::Instant::now();
-
-        // Counter for periodic repo refresh (every 5 global cycles)
-        let mut global_cycle_count: u32 = 0;
-        const REFRESH_INTERVAL: u32 = 5;
-        const LEARNING_INTERVAL: u32 = 10;
-
         while self.is_running.load(Ordering::SeqCst) {
             base_timer.tick().await;
             if !self.is_running.load(Ordering::SeqCst) {
@@ -544,53 +707,6 @@ impl Watcher {
                     }
                     *last_poll = std::time::Instant::now();
                 }
-            }
-
-            // Global housekeeping on the global timer
-            if last_global.elapsed() >= global_interval {
-                last_global = std::time::Instant::now();
-                global_cycle_count = global_cycle_count.wrapping_add(1);
-
-                let cron_id = uuid::Uuid::new_v4().to_string();
-                let cron_start = std::time::Instant::now();
-                self.send_cron_check_in("in_progress", &cron_id, None, poll_interval);
-                let mut housekeeping_ok = true;
-
-                // Periodically refresh repo index to detect new repositories
-                if global_cycle_count.is_multiple_of(REFRESH_INTERVAL) {
-                    match self.refresh_repos().await {
-                        Ok(0) => {} // No new repos
-                        Ok(n) => tracing::info!("Discovered and embedded {} new repositories", n),
-                        Err(e) => tracing::debug!(error = %e, "Error refreshing repos"),
-                    }
-                }
-
-                if !self.dry_run {
-                    // Check for PRs to auto-close due to issue state changes
-                    if let Err(e) = self.check_and_auto_close_prs().await {
-                        tracing::debug!(error = %e, "Error checking for auto-close PRs");
-                    }
-
-                    // Check for PR reviews
-                    if let Err(e) = self.check_reviews().await {
-                        tracing::debug!(error = %e, "Error checking for PR reviews");
-                    }
-                }
-
-                // Run housekeeping (retries, cascades, metrics)
-                if let Err(e) = self.poll_housekeeping().await {
-                    tracing::error!(component = "watcher", error = %e, "Housekeeping error");
-                    housekeeping_ok = false;
-                }
-
-                // Periodic learning subsystem tasks
-                if !self.dry_run && global_cycle_count.is_multiple_of(LEARNING_INTERVAL) {
-                    self.run_periodic_learning().await;
-                }
-
-                let duration_secs = cron_start.elapsed().as_secs_f64();
-                let cron_status = if housekeeping_ok { "ok" } else { "error" };
-                self.send_cron_check_in(cron_status, &cron_id, Some(duration_secs), poll_interval);
             }
         }
 
@@ -647,6 +763,11 @@ impl Watcher {
     /// Get the count of currently active processing tasks.
     pub fn active_count(&self) -> usize {
         self.active_processing.load(Ordering::SeqCst)
+    }
+
+    /// Check if the watcher is in dry-run mode.
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
     }
 
     /// Check for new PR reviews that require action.
@@ -1689,30 +1810,28 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Run housekeeping tasks: retries, cascades, and metrics.
     /// Called on the global timer, separate from per-source polling.
-    async fn poll_housekeeping(&self) -> Result<()> {
+    pub async fn run_housekeeping_cycle(&self) -> Result<()> {
         if self.is_rate_limit_paused().await {
             return Ok(());
         }
 
         let housekeeping_started_at = std::time::Instant::now();
 
-        // Process any ready retries
+        // Run retries, PR merge cascades, and release cascades concurrently
         if !self.dry_run {
-            if let Err(e) = self.process_ready_retries().await {
+            let (retries_result, pr_merges_result, releases_result) = tokio::join!(
+                self.process_ready_retries(),
+                self.check_pr_merges_and_cascade(),
+                self.check_releases_and_cascade(),
+            );
+
+            if let Err(e) = retries_result {
                 tracing::error!(component = "watcher", error = %e, "Error processing retries");
             }
-        }
-
-        // Check for PR merges and trigger cascades
-        if !self.dry_run {
-            if let Err(e) = self.check_pr_merges_and_cascade().await {
+            if let Err(e) = pr_merges_result {
                 tracing::error!(component = "watcher", error = %e, "Error checking PR merges for cascade");
             }
-        }
-
-        // Check for new releases and trigger release-based cascades
-        if !self.dry_run {
-            if let Err(e) = self.check_releases_and_cascade().await {
+            if let Err(e) = releases_result {
                 tracing::error!(component = "watcher", error = %e, "Error checking releases for cascade");
             }
         }
@@ -3794,7 +3913,7 @@ Create a PR with your changes.{custom_instructions}"#,
         }
     }
 
-    async fn is_rate_limit_paused(&self) -> bool {
+    pub async fn is_rate_limit_paused(&self) -> bool {
         let now = Utc::now();
         let mut pause_until = self.rate_limit_pause_until.write().await;
         let expired_until = match *pause_until {
@@ -4083,7 +4202,7 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Run periodic learning subsystem tasks (QA promotion, cluster detection).
-    async fn run_periodic_learning(&self) {
+    pub async fn run_periodic_learning(&self) {
         let learning = &self.config.learning;
 
         // System 3: Promote repeated Q&A answers to standing instructions
@@ -4896,9 +5015,6 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
-            tenant_id: None,
-            database_url: None,
-            redis_url: None,
         }
     }
 
@@ -6996,18 +7112,18 @@ mod tests {
     }
 
     // =========================================================================
-    // Tests for poll_housekeeping
+    // Tests for run_housekeeping_cycle
     // =========================================================================
 
     #[tokio::test]
-    async fn test_poll_housekeeping_dry_run_skips_retries_and_cascades() {
+    async fn test_run_housekeeping_cycle_dry_run_skips_retries_and_cascades() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let sources: Vec<Arc<dyn IssueSource>> = vec![];
 
         let watcher = create_test_watcher(notifier, tracker.clone(), sources, true);
 
-        let result = watcher.poll_housekeeping().await;
+        let result = watcher.run_housekeeping_cycle().await;
         assert!(result.is_ok());
 
         // In dry-run mode, no retries or cascade metrics should be recorded
@@ -7021,7 +7137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_poll_housekeeping_records_metrics() {
+    async fn test_run_housekeeping_cycle_records_metrics() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let sources: Vec<Arc<dyn IssueSource>> = vec![];
@@ -7029,7 +7145,7 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker.clone(), sources, false);
         watcher.is_running.store(true, Ordering::SeqCst);
 
-        let result = watcher.poll_housekeeping().await;
+        let result = watcher.run_housekeeping_cycle().await;
         assert!(result.is_ok());
 
         // Verify housekeeping metrics
@@ -9345,18 +9461,18 @@ mod tests {
     }
 
     // =========================================================================
-    // Additional coverage: poll_housekeeping non-dry-run with active processing
+    // Additional coverage: run_housekeeping_cycle non-dry-run with active processing
     // =========================================================================
 
     #[tokio::test]
-    async fn test_poll_housekeeping_with_active_processing() {
+    async fn test_run_housekeeping_cycle_with_active_processing() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let watcher = create_test_watcher(notifier, tracker.clone(), vec![], false);
         watcher.is_running.store(true, Ordering::SeqCst);
         watcher.active_processing.fetch_add(5, Ordering::SeqCst);
 
-        let result = watcher.poll_housekeeping().await;
+        let result = watcher.run_housekeeping_cycle().await;
         assert!(result.is_ok());
 
         let active = tracker.get_metrics("active_processing", None, 10).unwrap();

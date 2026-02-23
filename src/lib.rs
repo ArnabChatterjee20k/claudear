@@ -37,13 +37,12 @@ pub mod feedback;
 pub mod github;
 pub mod github_app;
 pub mod gitlab;
+pub mod housekeeping;
 pub mod http;
 pub mod inference;
 pub mod ipc;
 pub mod learning;
 pub mod notifier;
-#[cfg(feature = "postgres")]
-pub mod postgres;
 pub mod prioritisation;
 pub mod qa;
 pub mod regression;
@@ -77,6 +76,7 @@ pub use feedback::{
 };
 pub use github::GitHubClient;
 pub use gitlab::GitLabClient;
+pub use housekeeping::HousekeepingWorker;
 pub use scm::{
     CodeReview, OrgRepo, PostReviewAction, PrInfo, PrMonitor, PrReview, PrReviewComment,
     PrReviewState, PrStatus, PrStatusUpdate, PrSummary, RemoteRepo, ReviewComment, ReviewEvent,
@@ -136,7 +136,7 @@ pub struct AppComponents {
 /// Build all non-storage components.
 ///
 /// The caller provides the config and a tracker (which may be backed by
-/// SQLite, Postgres, or anything else that implements [`FixAttemptTracker`]).
+/// SQLite or anything else that implements [`FixAttemptTracker`]).
 /// Everything else is wired up from the config.
 pub async fn build_app(
     config: Config,

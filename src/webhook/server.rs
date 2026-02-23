@@ -1799,9 +1799,6 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
-            tenant_id: None,
-            database_url: None,
-            redis_url: None,
         }
     }
 

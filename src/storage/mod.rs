@@ -397,11 +397,37 @@ pub trait FixAttemptTracker: Send + Sync {
         })
     }
 
+    /// Start indexing progress tracking.
+    fn start_indexing_progress(&self, _total_repos: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Update indexing progress for a specific repo.
+    fn update_indexing_progress(
+        &self,
+        _indexed_repos: usize,
+        _current_repo: &str,
+        _current_repo_files: usize,
+        _total_files_indexed: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Mark indexing as complete.
+    fn finish_indexing_progress(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Subscribe to real-time indexing progress updates via a watch channel.
     /// Default implementation returns a receiver that never changes (dead channel).
     fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
         let (_, rx) = tokio::sync::watch::channel(IndexingProgress::default());
         rx
+    }
+
+    /// Add a dependency between two repositories. Creates the repos if they don't exist.
+    fn add_dependency(&self, _upstream: &str, _downstream: &str, _dep_type: &str) -> Result<()> {
+        Ok(())
     }
 
     /// List all dependencies.
@@ -1217,6 +1243,17 @@ pub trait FixAttemptTracker: Send + Sync {
         _limit: usize,
     ) -> Result<Vec<crate::repo::code_index::CodeSearchResult>> {
         Ok(Vec::new())
+    }
+
+    /// Get the embedding model name used for a repo's code chunks.
+    /// Returns `None` if no embeddings exist for the repo.
+    fn get_code_embedding_model(&self, _repo_id: i64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Delete all code data (symbols, chunks, embeddings) for a repo.
+    fn delete_all_code_data_for_repo(&self, _repo_id: i64) -> Result<()> {
+        Ok(())
     }
 
     /// Find code symbols by name substring.
