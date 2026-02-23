@@ -162,7 +162,7 @@ impl SqliteTracker {
         )?;
 
         // Run versioned SQL migrations (tracked in schema_migrations table).
-        super::migrator::run(&conn).map_err(|e| crate::error::Error::Database(e))?;
+        super::migrator::run(&conn).map_err(crate::error::Error::Database)?;
 
         // Reset any stuck "running" indexing progress rows from a previous crash
         conn.execute(
@@ -4126,25 +4126,23 @@ impl FixAttemptTracker for SqliteTracker {
     ) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
-        // Check if this cascade already exists
-        let exists: bool = conn
+        // Check if there's already a pending cascade (no PR yet) for this combo.
+        // Completed cascades (with PR) are allowed to be re-triggered (e.g. merge + release).
+        let pending_id: Option<i64> = conn
             .prepare_cached(
-                "SELECT 1 FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ?",
+                "SELECT id FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ? AND (pr_url IS NULL OR pr_url = '')",
             )?
-            .exists(params![source, issue_id, cascade_repo])?;
+            .query_row(params![source, issue_id, cascade_repo], |row| row.get(0))
+            .ok();
 
-        if exists {
+        if let Some(id) = pending_id {
             tracing::info!(
                 source = source,
                 issue_id = issue_id,
                 cascade_repo = cascade_repo,
-                "Cascade attempt already exists, skipping"
+                attempt_id = id,
+                "Pending cascade attempt already exists, skipping"
             );
-            let id: i64 = conn.query_row(
-                "SELECT id FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ?",
-                params![source, issue_id, cascade_repo],
-                |row| row.get(0),
-            )?;
             return Ok(id);
         }
 
@@ -17072,7 +17070,7 @@ mod tests {
         // (old_avg * (success_count - 2) + ttm) / (success_count - 1) after 2nd success
         // The exact formula depends on the SQL implementation, just check it's between 60 and 120
         let avg_ttm = updated.avg_time_to_merge.unwrap();
-        assert!(avg_ttm >= 60.0 && avg_ttm <= 120.0);
+        assert!((60.0..=120.0).contains(&avg_ttm));
     }
 
     #[test]

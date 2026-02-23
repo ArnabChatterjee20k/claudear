@@ -1072,9 +1072,10 @@ impl FixAttemptTracker for PostgresBackend {
     ) -> Result<i64> {
         let (id, was_existing) = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            // Check if cascade already exists
+            // Check if there's a pending cascade (no PR yet) for this combo.
+            // Completed cascades (with PR) are allowed to be re-triggered (e.g. merge + release).
             let s1 = c.prepare_cached(
-                "SELECT id FROM fix_attempts WHERE source = $1 AND issue_id = $2 AND cascade_repo = $3",
+                "SELECT id FROM fix_attempts WHERE source = $1 AND issue_id = $2 AND cascade_repo = $3 AND (pr_url IS NULL OR pr_url = '')",
             ).await.map_err(db_err)?;
             let existing = c.query_opt(&s1, &[&source, &issue_id, &cascade_repo]).await.map_err(db_err)?;
 
