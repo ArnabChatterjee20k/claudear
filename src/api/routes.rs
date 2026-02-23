@@ -7155,7 +7155,21 @@ mod tests {
     #[tokio::test]
     async fn test_config_endpoint_response() {
         let tracker = create_test_tracker();
-        let (router, token) = create_authenticated_router(&tracker);
+        let config = test_config();
+
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        tracker
+            .create_user("admin@test.com", &password_hash, "Admin", "admin")
+            .unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        // Write a temp config file so the handler can read it
+        let config_path = std::env::temp_dir().join("claudear_test_config_endpoint_response.toml");
+        std::fs::write(&config_path, "# test config\nworkspace = \"/tmp\"\n").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(config, tracker.clone(), config_path.clone(), indexing_rx)
+            .layer(CookieManagerLayer::new());
 
         let response = router
             .oneshot(auth_get("/api/config", &token))
@@ -7166,6 +7180,8 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(resp.is_object());
+
+        let _ = std::fs::remove_file(&config_path);
     }
 
     #[tokio::test]

@@ -638,10 +638,8 @@ impl Watcher {
         let poll_future = self.run_source_poll_loop(poll_interval);
 
         // Housekeeping loop (retries, cascades, auto-close, reviews, learning, deps)
-        let housekeeping = crate::housekeeping::HousekeepingWorker::new(
-            Arc::clone(self),
-            poll_interval,
-        );
+        let housekeeping =
+            crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
         let housekeeping_future = housekeeping.run_loop();
 
         tokio::select! {
