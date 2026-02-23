@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Captures dashboard screenshots using Playwright with mocked API data.
- * No backend required -- all /api/* routes are intercepted.
+ * No backend required: all /api/* routes are intercepted.
  *
  * Usage:
  *   cd scripts/screenshots
@@ -10,8 +10,8 @@
  */
 
 import { chromium, type Page, type Route } from 'playwright';
-import { mkdirSync, readdirSync, symlinkSync, unlinkSync } from 'fs';
-import { resolve, join, dirname, relative } from 'path';
+import { mkdir, readdir, symlink, unlink } from 'node:fs/promises';
+import { resolve, join, dirname, relative } from 'node:path';
 import * as mock from './mock-data';
 
 const ROOT = resolve(import.meta.dir, '..', '..');
@@ -21,8 +21,8 @@ const OUTPUT_DIR = join(ROOT, 'assets', 'screenshots');
 const WEBSITE_SCREENSHOTS_DIR = join(ROOT, 'website', 'assets', 'screenshots');
 const WEBSITE_LINKED_SCREENSHOTS = new Set(['overview', 'analytics', 'telemetry']);
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-mkdirSync(WEBSITE_SCREENSHOTS_DIR, { recursive: true });
+await mkdir(OUTPUT_DIR, { recursive: true });
+await mkdir(WEBSITE_SCREENSHOTS_DIR, { recursive: true });
 
 // ── 1. Build dashboard ──────────────────────────────────────────────────
 
@@ -74,7 +74,7 @@ type MockEntry = { pattern: RegExp; data: unknown };
 const unmatchedApiRoutes = new Set<string>();
 
 const mocks: MockEntry[] = [
-  // Auth -- must come first so auth gate is bypassed
+  // Auth: must come first so auth gate is bypassed
   { pattern: /\/api\/auth\/me$/, data: mock.authMe },
   { pattern: /\/api\/health$/, data: mock.health },
   { pattern: /\/api\/stats\/overview$/, data: mock.overview },
@@ -140,7 +140,7 @@ function failIfUnmatchedApiRoutes(context: string) {
   throw new Error(`Unmocked API route(s) detected while ${context}:\n${urls}`);
 }
 
-function linkWebsiteScreenshot(name: string) {
+async function linkWebsiteScreenshot(name: string) {
   if (!WEBSITE_LINKED_SCREENSHOTS.has(name)) return;
 
   const sourcePath = join(OUTPUT_DIR, `${name}.png`);
@@ -148,26 +148,26 @@ function linkWebsiteScreenshot(name: string) {
   const targetFromWebsiteDir = relative(dirname(linkPath), sourcePath);
 
   try {
-    unlinkSync(linkPath);
+    await unlink(linkPath);
   } catch (err) {
     if (!(err instanceof Error) || !('code' in err) || (err as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw err;
     }
   }
 
-  symlinkSync(targetFromWebsiteDir, linkPath);
+  await symlink(targetFromWebsiteDir, linkPath);
   console.log(`  Linked ${linkPath} -> ${targetFromWebsiteDir}`);
 }
 
-function pruneManagedWebsiteScreenshots(targetNames: string[]) {
+async function pruneManagedWebsiteScreenshots(targetNames: string[]) {
   const managedTargetFiles = new Set(targetNames.map((name) => `${name}.png`));
   const linkedFiles = new Set([...WEBSITE_LINKED_SCREENSHOTS].map((name) => `${name}.png`));
 
-  for (const entry of readdirSync(WEBSITE_SCREENSHOTS_DIR)) {
+  for (const entry of await readdir(WEBSITE_SCREENSHOTS_DIR)) {
     if (!entry.endsWith('.png')) continue;
     if (!managedTargetFiles.has(entry)) continue;
     if (linkedFiles.has(entry)) continue;
-    unlinkSync(join(WEBSITE_SCREENSHOTS_DIR, entry));
+    await unlink(join(WEBSITE_SCREENSHOTS_DIR, entry));
     console.log(`  Removed stale website screenshot ${join(WEBSITE_SCREENSHOTS_DIR, entry)}`);
   }
 }
@@ -244,12 +244,24 @@ try {
     }
 
     const outPath = join(OUTPUT_DIR, `${target.name}.png`);
-    await page.screenshot({ path: outPath, fullPage: false });
+    const newBytes = await page.screenshot({ fullPage: false });
+    const newHash = Bun.hash(newBytes);
+
+    const existing = Bun.file(outPath);
+    if (await existing.exists()) {
+      const oldHash = Bun.hash(new Uint8Array(await existing.arrayBuffer()));
+      if (oldHash === newHash) {
+        console.log(`  Skipped ${target.name} (unchanged)`);
+        continue;
+      }
+    }
+
+    await Bun.write(outPath, newBytes);
     console.log(`  Saved ${outPath}`);
-    linkWebsiteScreenshot(target.name);
+    await linkWebsiteScreenshot(target.name);
   }
 
-  pruneManagedWebsiteScreenshots(targets.map((t) => t.name));
+  await pruneManagedWebsiteScreenshots(targets.map((t) => t.name));
   console.log(`\nDone! ${targets.length} screenshots saved to ${OUTPUT_DIR}`);
 } finally {
   // ── 5. Cleanup ────────────────────────────────────────────────────────

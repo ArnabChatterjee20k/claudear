@@ -1,0 +1,8 @@
+{
+  "name": "claudear-docs",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "marked": "^15.0.0"
+  }
+}

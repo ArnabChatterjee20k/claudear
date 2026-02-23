@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CLI Reference · Claudear Docs</title>
+  <meta name="description" content="Complete command reference for the Claudear CLI.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090B', card: '#111113', border: '#27272A',
+            accent: '#22C55E', 'accent-dim': '#16a34a',
+            link: '#60A5FA', heading: '#FAFAFA', body: '#A1A1AA', muted: '#71717A',
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="stylesheet" href="./assets/docs.css">
+</head>
+<body id="top" class="bg-bg text-heading font-sans">
+  <div class="fixed inset-0 z-0 pointer-events-none opacity-[0.03]" style="background-image:radial-gradient(circle,#FAFAFA 0.5px,transparent 0.5px);background-size:24px 24px" aria-hidden="true"></div>
+  <div class="fixed top-0 left-0 right-0 h-0.5 z-[60] bg-white/[0.03]" aria-hidden="true"><div class="h-full w-full origin-left scale-x-0 bg-gradient-to-r from-accent to-link" data-reading-progress></div></div>
+
+  <header class="sticky top-0 z-50 border-b border-white/[0.06] bg-bg/90 backdrop-blur-xl">
+    <div class="max-w-[1400px] mx-auto h-14 px-5 flex items-center justify-between">
+      <a class="font-mono font-bold text-lg tracking-tight text-heading no-underline flex items-center" href="../index.html">claudear<span class="w-2.5 h-[18px] ml-1 rounded-[1px] bg-accent inline-block" aria-hidden="true"></span></a>
+      <nav class="flex items-center gap-1.5 text-[13px]">
+        <a href="../index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Home</a>
+        <a href="./index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Docs</a>
+        <a href="https://github.com/abnegate/claudear" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">GitHub</a>
+        <a href="https://github.com/abnegate/claudear/releases" class="bg-accent text-[#041108] font-semibold px-3 py-1.5 rounded-md hover:bg-accent-dim transition-colors">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+    <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
+      <nav>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
+        <a href="./index.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Overview</a>
+        <a href="./getting-started.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Getting Started</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Core</div>
+        <a href="./configuration.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
+        <a href="./usage.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Usage</a>
+        <a href="./integrations.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Integrations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Product</div>
+        <a href="./dashboard.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
+        <a href="./operations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Operations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Reference</div>
+        <a href="./cli-reference.html" class="text-heading bg-accent/10 border border-accent/20 block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI Reference</a>
+        <a href="./development.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
+      </nav>
+    </aside>
+
+    <main class="flex-1 min-w-0 px-8 py-8 lg:px-12 lg:py-10">
+      <div class="mb-8">
+        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Reference</p>
+        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">CLI Reference</h1>
+        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">Complete command reference for the Claudear CLI.</p>
+      </div>
+      <article class="markdown max-w-[780px]" data-docs-markdown>
+        <div class="border border-link/20 bg-link/5 rounded-lg p-4 text-[14px] text-blue-100 mb-6">This is the complete command reference for Claudear. For common workflows and examples, see the <a href="./usage.html" class="text-link hover:underline">Usage</a> page.</div>
+        <ul>
+        <li><code>claudear start</code>: Start the watcher daemon with all configured services</li>
+        <li><code>claudear stop</code>: Stop the running watcher daemon</li>
+        <li><code>claudear status</code>: Show the status of the running daemon</li>
+        <li><code>claudear pause</code>: Pause the running watcher (stops processing new issues)</li>
+        <li><code>claudear resume</code>: Resume a paused watcher</li>
+        <li><code>claudear activity</code>: Show recent activity from the daemon</li>
+        <li><code>claudear seed</code>: Mark all existing issues as seen (run this first!)</li>
+        <li><code>claudear dry-run</code>: Show what would be processed without running Claude</li>
+        <li><code>claudear poll</code>: Start polling all enabled sources (foreground, no daemon)</li>
+        <li><code>claudear webhook</code>: Start webhook server for real-time events</li>
+        <li><code>claudear trigger</code>: Manually trigger a fix for an issue</li>
+        <li><code>claudear reset</code>: Reset a failed attempt to allow retry</li>
+        <li><code>claudear stats</code>: Show statistics about fix attempts</li>
+        <li><code>claudear sources</code>: List configured sources</li>
+        <li><code>claudear dashboard</code>: Start the dashboard API server</li>
+        <li><code>claudear repos</code>: Repository management commands</li>
+        <li><code>claudear prs</code>: Pull request management commands</li>
+        <li><code>claudear retries</code>: Retry management commands</li>
+        <li><code>claudear inference</code>: Inference analytics and management</li>
+        <li><code>claudear report</code>: Report generation and scheduling</li>
+        <li><code>claudear diag</code>: Diagnostic commands for debugging</li>
+        <li><code>claudear users</code>: User management commands</li>
+        </ul>
+
+        <h2 id="all-commands">All commands</h2>
+        <pre><code class="language-text">Unified watcher for issue trackers and error services
+
+Usage: claudear [OPTIONS] &lt;COMMAND&gt;
+
+Commands:
+  start      Start the watcher daemon with all configured services
+  stop       Stop the running watcher daemon
+  status     Show the status of the running daemon
+  pause      Pause the running watcher (stops processing new issues)
+  resume     Resume a paused watcher
+  activity   Show recent activity from the daemon
+  seed       Mark all existing issues as seen (run this first!)
+  dry-run    Show what would be processed without running Claude
+  poll       Start polling all enabled sources (foreground, no daemon)
+  webhook    Start webhook server for real-time events
+  trigger    Manually trigger a fix for an issue
+  reset      Reset a failed attempt to allow retry
+  stats      Show statistics about fix attempts
+  sources    List configured sources
+  dashboard  Start the dashboard API server
+  repos      Repository management commands
+  prs        Pull request management commands
+  retries    Retry management commands
+  inference  Inference analytics and management
+  report     Report generation and scheduling
+  diag       Diagnostic commands for debugging
+  users      User management commands
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -c, --config &lt;CONFIG&gt;    Path to config file [default: claudear.toml]
+      --log-dir &lt;LOG_DIR&gt;  Directory for log files (with daily rotation). Set to empty string to disable file logging [env: CLAUDEAR_LOG_DIR=] [default: ./logs]
+  -h, --help               Print help
+  -V, --version            Print version</code></pre>
+
+        <h2 id="command-reference">Command reference</h2>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-start"><code>claudear start</code></h3>
+          <p>Start the watcher daemon with all configured services</p>
+          <div class="cli-help-block"><pre><code>Start the watcher daemon with all configured services
+
+Usage: claudear start [OPTIONS]
+
+Options:
+      --port &lt;PORT&gt;                    HTTP port for dashboard API and webhooks [default: 3100]
+      --poll                           Enable background polling (in addition to webhooks)
+      --poll-interval &lt;POLL_INTERVAL&gt;  Polling interval in milliseconds (requires --poll) [default: 300000]
+      --no-webhooks                    Disable webhook server
+      --no-dashboard                   Disable dashboard API
+  -h, --help                           Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-stop"><code>claudear stop</code></h3>
+          <p>Stop the running watcher daemon</p>
+          <div class="cli-help-block"><pre><code>Stop the running watcher daemon
+
+Usage: claudear stop
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-status"><code>claudear status</code></h3>
+          <p>Show the status of the running daemon</p>
+          <div class="cli-help-block"><pre><code>Show the status of the running daemon
+
+Usage: claudear status
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-pause"><code>claudear pause</code></h3>
+          <p>Pause the running watcher (stops processing new issues)</p>
+          <div class="cli-help-block"><pre><code>Pause the running watcher (stops processing new issues)
+
+Usage: claudear pause
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-resume"><code>claudear resume</code></h3>
+          <p>Resume a paused watcher</p>
+          <div class="cli-help-block"><pre><code>Resume a paused watcher
+
+Usage: claudear resume
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-activity"><code>claudear activity</code></h3>
+          <p>Show recent activity from the daemon</p>
+          <div class="cli-help-block"><pre><code>Show recent activity from the daemon
+
+Usage: claudear activity [LIMIT]
+
+Arguments:
+  [LIMIT]  Number of entries to show [default: 20]
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-seed"><code>claudear seed</code></h3>
+          <p>Mark all existing issues as seen (run this first!)</p>
+          <div class="cli-help-block"><pre><code>Mark all existing issues as seen (run this first!)
+
+Usage: claudear seed
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-dry-run"><code>claudear dry-run</code></h3>
+          <p>Show what would be processed without running Claude</p>
+          <div class="cli-help-block"><pre><code>Show what would be processed without running Claude
+
+Usage: claudear dry-run
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-poll"><code>claudear poll</code></h3>
+          <p>Start polling all enabled sources (foreground, no daemon)</p>
+          <div class="cli-help-block"><pre><code>Start polling all enabled sources (foreground, no daemon)
+
+Usage: claudear poll [OPTIONS] [INTERVAL]
+
+Arguments:
+  [INTERVAL]  Polling interval in milliseconds [default: 300000]
+
+Options:
+      --port &lt;PORT&gt;   HTTP port for dashboard API [default: 3100]
+      --no-dashboard  Disable dashboard API
+  -h, --help          Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-webhook"><code>claudear webhook</code></h3>
+          <p>Start webhook server for real-time events</p>
+          <div class="cli-help-block"><pre><code>Start webhook server for real-time events
+
+Usage: claudear webhook [OPTIONS] [PORT]
+
+Arguments:
+  [PORT]  Port to listen on [default: 3100]
+
+Options:
+      --setup-webhooks       Auto-configure webhooks with Linear/Sentry APIs before starting
+      --base-url &lt;BASE_URL&gt;  Public base URL where webhooks will be received (required with --setup-webhooks)
+      --env-file &lt;ENV_FILE&gt;  Path to .env file for saving webhook secrets [default: .env]
+  -h, --help                 Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-trigger"><code>claudear trigger</code></h3>
+          <p>Manually trigger a fix for an issue</p>
+          <div class="cli-help-block"><pre><code>Manually trigger a fix for an issue
+
+Usage: claudear trigger &lt;SOURCE&gt; &lt;ISSUE_ID&gt;
+
+Arguments:
+  &lt;SOURCE&gt;    Source name (linear, sentry)
+  &lt;ISSUE_ID&gt;  Issue ID
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-reset"><code>claudear reset</code></h3>
+          <p>Reset a failed attempt to allow retry</p>
+          <div class="cli-help-block"><pre><code>Reset a failed attempt to allow retry
+
+Usage: claudear reset &lt;SOURCE&gt; &lt;ISSUE_ID&gt;
+
+Arguments:
+  &lt;SOURCE&gt;    Source name (linear, sentry)
+  &lt;ISSUE_ID&gt;  Issue ID
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-stats"><code>claudear stats</code></h3>
+          <p>Show statistics about fix attempts</p>
+          <div class="cli-help-block"><pre><code>Show statistics about fix attempts
+
+Usage: claudear stats
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-sources"><code>claudear sources</code></h3>
+          <p>List configured sources</p>
+          <div class="cli-help-block"><pre><code>List configured sources
+
+Usage: claudear sources
+
+Options:
+  -h, --help  Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-dashboard"><code>claudear dashboard</code></h3>
+          <p>Start the dashboard API server</p>
+          <div class="cli-help-block"><pre><code>Start the dashboard API server
+
+Usage: claudear dashboard [OPTIONS] [PORT]
+
+Arguments:
+  [PORT]  Port to listen on [default: 3100]
+
+Options:
+      --dashboard-dir &lt;DASHBOARD_DIR&gt;  Path to built dashboard files (optional, serves static files)
+  -h, --help                           Print help</code></pre></div>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-repos"><code>claudear repos</code></h3>
+          <p>Repository management commands</p>
+          <div class="cli-help-block"><pre><code>Repository management commands
+
+Usage: claudear repos &lt;COMMAND&gt;
+
+Commands:
+  list      List all indexed repositories
+  index     Build/refresh the repository file index
+  search    Search for files across all indexed repositories
+  stats     Show index statistics
+  link      Link two repositories (declare a dependency)
+  graph     Show the dependency graph
+  cascade   Show what would cascade from a repository change
+  discover  Auto-discover dependencies by scanning directories
+  sync      Sync repository index to database (paths and files)
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help</code></pre></div>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-repos-list"><code>claudear repos list</code></h4>
+            <p>List all indexed repositories</p>
+            <div class="cli-help-block"><pre><code>List all indexed repositories
+
+Usage: claudear repos list
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-repos-index"><code>claudear repos index</code></h4>
+            <p>Build/refresh the repository file index</p>
+            <div class="cli-help-block"><pre><code>Build/refresh the repository file index
+
+Usage: claudear repos index [OPTIONS]
+
+Options:
+      --force  Force full re-indexing even if already indexed
+  -h, --help   Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-repos-search"><code>claudear repos search</code></h4>
+            <p>Search for files across all indexed repositories</p>
+            <div class="cli-help-block"><pre><code>Search for files across all indexed repositories
+
+Usage: claudear repos search &lt;QUERY&gt;
+
+Arguments:
+  &lt;QUERY&gt;  Search query (file name or partial path)
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-repos-stats"><code>claudear repos stats</code></h4>
+            <p>Show index statistics</p>
+            <div class="cli-help-block"><pre><code>Show index statistics
+
+Usage: claudear repos stats
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-repos-link"><code>claudear repos link</code></h4>
+            <p>Link two repositories (declare a dependency)</p>
+            <div class="cli-help-block"><pre><code>Link two repositories (declare a dependency)
+
+Usage: claudear repos link [OPTIONS] &lt;UPSTREAM&gt; &lt;DOWNSTREAM&gt;
+
+Arguments:
+  &lt;UPSTREAM&gt;    Upstream repository (the dependency)
+  &lt;DOWNSTREAM&gt;  Downstream repository (depends on upstream)
+
+Options:
+      --dep-type &lt;DEP_TYPE&gt;  Dependency type (npm, composer, git_submodule, manual) [default: manual]
+  -h, --help                 Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-repos-graph"><code>claudear repos graph</code></h4>
+            <p>Show the dependency graph</p>
+            <div class="cli-help-block"><pre><code>Show the dependency graph
+
+Usage: claudear repos graph [OPTIONS]
+
+Options:
+      --root &lt;ROOT&gt;  Start from a specific repository
+  -h, --help         Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-repos-cascade"><code>claudear repos cascade</code></h4>
+            <p>Show what would cascade from a repository change</p>
+            <div class="cli-help-block"><pre><code>Show what would cascade from a repository change
+
+Usage: claudear repos cascade &lt;REPO&gt;
+
+Arguments:
+  &lt;REPO&gt;  Repository that changed
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-repos-discover"><code>claudear repos discover</code></h4>
+            <p>Auto-discover dependencies by scanning directories</p>
+            <div class="cli-help-block"><pre><code>Auto-discover dependencies by scanning directories
+
+Usage: claudear repos discover [OPTIONS]
+
+Options:
+      --paths &lt;PATHS&gt;  Paths to scan (defaults to config's auto_discover_paths)
+      --save           Save discovered dependencies to database
+      --clear          Clear existing dependencies before saving
+  -h, --help           Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-repos-sync"><code>claudear repos sync</code></h4>
+            <p>Sync repository index to database (paths and files)</p>
+            <div class="cli-help-block"><pre><code>Sync repository index to database (paths and files)
+
+Usage: claudear repos sync [OPTIONS]
+
+Options:
+      --skip-files  Skip syncing file lists (faster but limits inference accuracy)
+  -h, --help        Print help</code></pre></div>
+          </section>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-prs"><code>claudear prs</code></h3>
+          <p>Pull request management commands</p>
+          <div class="cli-help-block"><pre><code>Pull request management commands
+
+Usage: claudear prs &lt;COMMAND&gt;
+
+Commands:
+  list     List all PRs that are being tracked
+  monitor  Monitor PRs for merge status and auto-resolve issues
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help</code></pre></div>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-prs-list"><code>claudear prs list</code></h4>
+            <p>List all PRs that are being tracked</p>
+            <div class="cli-help-block"><pre><code>List all PRs that are being tracked
+
+Usage: claudear prs list
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-prs-monitor"><code>claudear prs monitor</code></h4>
+            <p>Monitor PRs for merge status and auto-resolve issues</p>
+            <div class="cli-help-block"><pre><code>Monitor PRs for merge status and auto-resolve issues
+
+Usage: claudear prs monitor [OPTIONS]
+
+Options:
+      --continuous  Run continuously with polling
+  -h, --help        Print help</code></pre></div>
+          </section>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-retries"><code>claudear retries</code></h3>
+          <p>Retry management commands</p>
+          <div class="cli-help-block"><pre><code>Retry management commands
+
+Usage: claudear retries &lt;COMMAND&gt;
+
+Commands:
+  list     List issues that are eligible for retry
+  process  Process ready retries now
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help</code></pre></div>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-retries-list"><code>claudear retries list</code></h4>
+            <p>List issues that are eligible for retry</p>
+            <div class="cli-help-block"><pre><code>List issues that are eligible for retry
+
+Usage: claudear retries list
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-retries-process"><code>claudear retries process</code></h4>
+            <p>Process ready retries now</p>
+            <div class="cli-help-block"><pre><code>Process ready retries now
+
+Usage: claudear retries process
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-inference"><code>claudear inference</code></h3>
+          <p>Inference analytics and management</p>
+          <div class="cli-help-block"><pre><code>Inference analytics and management
+
+Usage: claudear inference &lt;COMMAND&gt;
+
+Commands:
+  stats     Show inference statistics (success rates by confidence level)
+  history   List recent inference attempts
+  feedback  Provide feedback on an inference attempt
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help</code></pre></div>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-inference-stats"><code>claudear inference stats</code></h4>
+            <p>Show inference statistics (success rates by confidence level)</p>
+            <div class="cli-help-block"><pre><code>Show inference statistics (success rates by confidence level)
+
+Usage: claudear inference stats
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-inference-history"><code>claudear inference history</code></h4>
+            <p>List recent inference attempts</p>
+            <div class="cli-help-block"><pre><code>List recent inference attempts
+
+Usage: claudear inference history [OPTIONS]
+
+Options:
+      --limit &lt;LIMIT&gt;  Maximum number of entries to show [default: 20]
+  -h, --help           Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-inference-feedback"><code>claudear inference feedback</code></h4>
+            <p>Provide feedback on an inference attempt</p>
+            <div class="cli-help-block"><pre><code>Provide feedback on an inference attempt
+
+Usage: claudear inference feedback [OPTIONS] &lt;ID&gt;
+
+Arguments:
+  &lt;ID&gt;  Inference attempt ID
+
+Options:
+      --correct                    Whether the inference was correct
+      --actual-repo &lt;ACTUAL_REPO&gt;  Actual repository name if inference was incorrect
+  -h, --help                       Print help</code></pre></div>
+          </section>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-report"><code>claudear report</code></h3>
+          <p>Report generation and scheduling</p>
+          <div class="cli-help-block"><pre><code>Report generation and scheduling
+
+Usage: claudear report &lt;COMMAND&gt;
+
+Commands:
+  preview   Generate and show a report (preview without sending)
+  send      Generate and send a report immediately
+  schedule  Start the report scheduler (runs in background)
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help</code></pre></div>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-report-preview"><code>claudear report preview</code></h4>
+            <p>Generate and show a report (preview without sending)</p>
+            <div class="cli-help-block"><pre><code>Generate and show a report (preview without sending)
+
+Usage: claudear report preview [FREQUENCY]
+
+Arguments:
+  [FREQUENCY]  Report frequency: daily, weekly, monthly [default: daily]
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-report-send"><code>claudear report send</code></h4>
+            <p>Generate and send a report immediately</p>
+            <div class="cli-help-block"><pre><code>Generate and send a report immediately
+
+Usage: claudear report send [FREQUENCY]
+
+Arguments:
+  [FREQUENCY]  Report frequency: daily, weekly, monthly [default: daily]
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-report-schedule"><code>claudear report schedule</code></h4>
+            <p>Start the report scheduler (runs in background)</p>
+            <div class="cli-help-block"><pre><code>Start the report scheduler (runs in background)
+
+Usage: claudear report schedule [OPTIONS]
+
+Options:
+      --daily        Enable daily reports
+      --weekly       Enable weekly reports (Monday)
+      --hour &lt;HOUR&gt;  Hour to send reports (0-23 UTC) [default: 9]
+  -h, --help         Print help</code></pre></div>
+          </section>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-diag"><code>claudear diag</code></h3>
+          <p>Diagnostic commands for debugging</p>
+          <div class="cli-help-block"><pre><code>Diagnostic commands for debugging
+
+Usage: claudear diag &lt;COMMAND&gt;
+
+Commands:
+  db             Show database table counts and recent operations
+  release-graph  Show the dependency graph used for release tracking
+  release-check  Check if a PR's fix would be detected in a target release (dry-run)
+  release-path   Show the dependency path from source to target repo
+  help           Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help</code></pre></div>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-diag-db"><code>claudear diag db</code></h4>
+            <p>Show database table counts and recent operations</p>
+            <div class="cli-help-block"><pre><code>Show database table counts and recent operations
+
+Usage: claudear diag db
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-diag-release-graph"><code>claudear diag release-graph</code></h4>
+            <p>Show the dependency graph used for release tracking</p>
+            <div class="cli-help-block"><pre><code>Show the dependency graph used for release tracking
+
+Usage: claudear diag release-graph
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-diag-release-check"><code>claudear diag release-check</code></h4>
+            <p>Check if a PR&#39;s fix would be detected in a target release (dry-run)</p>
+            <div class="cli-help-block"><pre><code>Check if a PR's fix would be detected in a target release (dry-run)
+
+Usage: claudear diag release-check [OPTIONS] &lt;REPO&gt; &lt;PR&gt;
+
+Arguments:
+  &lt;REPO&gt;  Repository (owner/repo format)
+  &lt;PR&gt;    PR number
+
+Options:
+      --target &lt;TARGET&gt;  Target repository to check against (optional, uses config targets if not specified)
+  -h, --help             Print help</code></pre></div>
+          </section>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-diag-release-path"><code>claudear diag release-path</code></h4>
+            <p>Show the dependency path from source to target repo</p>
+            <div class="cli-help-block"><pre><code>Show the dependency path from source to target repo
+
+Usage: claudear diag release-path &lt;SOURCE&gt; &lt;TARGET&gt;
+
+Arguments:
+  &lt;SOURCE&gt;  Source repository (where fix was made)
+  &lt;TARGET&gt;  Target repository (where release happens)
+
+Options:
+  -h, --help  Print help</code></pre></div>
+          </section>
+        </section>
+
+        <section class="cli-section" data-cli-depth="3">
+          <h3 id="claudear-users"><code>claudear users</code></h3>
+          <p>User management commands</p>
+          <div class="cli-help-block"><pre><code>User management commands
+
+Usage: claudear users &lt;COMMAND&gt;
+
+Commands:
+  seed  Seed an admin user (creates or updates password if email exists)
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help</code></pre></div>
+
+          <section class="cli-section" data-cli-depth="4">
+            <h4 id="claudear-users-seed"><code>claudear users seed</code></h4>
+            <p>Seed an admin user (creates or updates password if email exists)</p>
+            <div class="cli-help-block"><pre><code>Seed an admin user (creates or updates password if email exists)
+
+Usage: claudear users seed [OPTIONS] --email &lt;EMAIL&gt; --password &lt;PASSWORD&gt;
+
+Options:
+      --email &lt;EMAIL&gt;        User email
+      --password &lt;PASSWORD&gt;  User password
+      --name &lt;NAME&gt;          User display name [default: Admin]
+  -h, --help                 Print help</code></pre></div>
+          </section>
+        </section>
+      </article>
+      <div class="grid grid-cols-2 gap-4 mt-12 max-w-[780px]">
+        <a href="./operations.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Operations</span>
+        </a>
+        <a href="./development.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Next</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Development</span>
+        </a>
+      </div>
+      <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
+    </main>
+  </div>
+
+  <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>
+  <script src="./assets/docs.js"></script>
+</body>
+</html>

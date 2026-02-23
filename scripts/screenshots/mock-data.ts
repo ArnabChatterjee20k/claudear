@@ -550,7 +550,7 @@ export const inferenceHistory = Array.from({ length: 20 }, (_, i) => ({
 // ── Config ──────────────────────────────────────────────────────────────
 
 export const config = {
-  content: `work_dir = "~/.claudear/repos"
+  content: `workspace = "~/.claudear/repos"
 known_orgs = ["acme"]
 auto_discover_paths = ["~/projects"]
 poll_interval_ms = 300000

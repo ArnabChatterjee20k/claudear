@@ -174,7 +174,7 @@
     }
   </style>
 </head>
-<body class="overflow-x-hidden">
+<body id="top" class="overflow-x-hidden">
 
   <!-- Dot grid bg -->
   <div class="dot-grid"></div>
@@ -182,17 +182,17 @@
   <!-- ==================== NAVBAR ==================== -->
   <nav id="navbar" class="fixed top-0 left-0 right-0 z-50 transition-all duration-300">
     <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
-      <a href="#" class="flex items-center gap-0 cursor-pointer">
+      <a href="#top" class="flex items-center gap-0 cursor-pointer">
         <span class="font-mono font-bold text-xl text-heading tracking-tight">claudear</span>
         <span class="cursor-blink inline-block w-[10px] h-[20px] bg-accent ml-0.5 rounded-[1px]"></span>
       </a>
       <div class="hidden md:flex items-center gap-8">
         <a href="#pipeline" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">How it works</a>
         <a href="#features" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Features</a>
-        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
-        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
-        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
-        <a href="#" class="bg-accent text-bg font-sans text-sm font-medium px-4 py-2 rounded-btn btn-transition cursor-pointer hover:bg-accent-dim">
+        <a href="docs/index.html" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
+        <a href="#dashboard" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
+        <a href="https://github.com/abnegate/claudear" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
+        <a href="https://github.com/abnegate/claudear#quick-start" class="bg-accent text-bg font-sans text-sm font-medium px-4 py-2 rounded-btn btn-transition cursor-pointer hover:bg-accent-dim">
           Get Started
         </a>
       </div>
@@ -204,10 +204,10 @@
       <div class="flex flex-col gap-4 pt-4">
         <a href="#pipeline" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">How it works</a>
         <a href="#features" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Features</a>
-        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
-        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
-        <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
-        <a href="#" class="bg-accent text-bg font-sans text-sm font-medium px-4 py-2 rounded-btn btn-transition cursor-pointer text-center hover:bg-accent-dim">Get Started</a>
+        <a href="docs/index.html" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
+        <a href="#dashboard" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
+        <a href="https://github.com/abnegate/claudear" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
+        <a href="https://github.com/abnegate/claudear#quick-start" class="bg-accent text-bg font-sans text-sm font-medium px-4 py-2 rounded-btn btn-transition cursor-pointer text-center hover:bg-accent-dim">Get Started</a>
       </div>
     </div>
   </nav>
@@ -225,11 +225,11 @@
             Claudear watches your issue trackers, spawns agents to fix bugs and ship features, and opens PRs — autonomously. Your AI team mate that actually writes code.
           </p>
           <div class="flex flex-wrap gap-4 mb-8">
-            <a href="#" class="bg-accent text-bg font-sans font-medium px-6 py-3 rounded-btn btn-transition cursor-pointer inline-flex items-center gap-2 hover:bg-accent-dim">
+            <a href="https://github.com/abnegate/claudear#quick-start" class="bg-accent text-bg font-sans font-medium px-6 py-3 rounded-btn btn-transition cursor-pointer inline-flex items-center gap-2 hover:bg-accent-dim">
               <i data-lucide="arrow-right" class="w-4 h-4"></i>
               Get Started
             </a>
-            <a href="#" class="border border-border text-heading font-sans font-medium px-6 py-3 rounded-btn btn-transition cursor-pointer inline-flex items-center gap-2 hover:border-body">
+            <a href="https://github.com/abnegate/claudear" class="border border-border text-heading font-sans font-medium px-6 py-3 rounded-btn btn-transition cursor-pointer inline-flex items-center gap-2 hover:border-body">
               <i data-lucide="github" class="w-4 h-4"></i>
               View on GitHub
             </a>
@@ -395,7 +395,7 @@
 
       <p class="font-sans text-sm text-muted mt-12 text-center flex items-center justify-center gap-2">
         <i data-lucide="message-circle" class="w-4 h-4 text-muted"></i>
-        If the agent gets stuck, it asks your team a question via Discord, Slack, or Email -- then keeps going.
+        If the agent gets stuck, it asks your team a question via Discord, Slack, or Email: then keeps going.
       </p>
     </div>
   </section>
@@ -606,7 +606,7 @@
             <span class="font-mono text-xs text-muted ml-2">claudear.toml</span>
           </div>
           <div class="bg-card p-5 overflow-x-auto">
-            <pre class="font-mono text-sm leading-7"><span class="syn-key">work_dir</span> = <span class="syn-str">"~/.claudear/repos"</span>
+            <pre class="font-mono text-sm leading-7"><span class="syn-key">workspace</span> = <span class="syn-str">"~/.claudear/repos"</span>
 <span class="syn-key">known_orgs</span> = <span class="syn-bracket">[</span><span class="syn-str">"acme"</span><span class="syn-bracket">]</span>
 <span class="syn-key">max_concurrent</span> = <span class="syn-num">2</span>
 
@@ -675,9 +675,9 @@
       <div class="flex flex-col md:flex-row items-center justify-between gap-6">
         <span class="font-mono font-bold text-lg text-heading tracking-tight">claudear</span>
         <div class="flex items-center gap-6">
-          <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
-          <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
-          <a href="#" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
+          <a href="docs/index.html" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Docs</a>
+          <a href="https://github.com/abnegate/claudear" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">GitHub</a>
+          <a href="#dashboard" class="font-sans text-sm text-body hover:text-heading transition-colors duration-200 cursor-pointer">Dashboard</a>
         </div>
         <p class="font-sans text-sm text-muted">
           Built with <span class="text-body">Rust</span>

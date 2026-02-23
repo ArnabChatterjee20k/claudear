@@ -120,7 +120,7 @@ if (sentryToken && sentryOrg && sentryProject && sentryRelease) {
   console.log(`Uploading source maps to Sentry (org=${sentryOrg}, project=${sentryProject}, release=${sentryRelease})...`);
   const uploadResult = Bun.spawnSync({
     cmd: [
-      "npx", "@sentry/cli", "sourcemaps", "upload",
+      "bunx", "@sentry/cli", "sourcemaps", "upload",
       "--org", sentryOrg,
       "--project", sentryProject,
       "--release", sentryRelease,

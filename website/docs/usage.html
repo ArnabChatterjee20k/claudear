@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Usage &amp; Workflows · Claudear Docs</title>
+  <meta name="description" content="Daemon control, polling, webhooks, manual triggers, retries, reports, and diagnostics.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090B', card: '#111113', border: '#27272A',
+            accent: '#22C55E', 'accent-dim': '#16a34a',
+            link: '#60A5FA', heading: '#FAFAFA', body: '#A1A1AA', muted: '#71717A',
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="stylesheet" href="./assets/docs.css">
+</head>
+<body id="top" class="bg-bg text-heading font-sans">
+  <div class="fixed inset-0 z-0 pointer-events-none opacity-[0.03]" style="background-image:radial-gradient(circle,#FAFAFA 0.5px,transparent 0.5px);background-size:24px 24px" aria-hidden="true"></div>
+  <div class="fixed top-0 left-0 right-0 h-0.5 z-[60] bg-white/[0.03]" aria-hidden="true"><div class="h-full w-full origin-left scale-x-0 bg-gradient-to-r from-accent to-link" data-reading-progress></div></div>
+
+  <header class="sticky top-0 z-50 border-b border-white/[0.06] bg-bg/90 backdrop-blur-xl">
+    <div class="max-w-[1400px] mx-auto h-14 px-5 flex items-center justify-between">
+      <a class="font-mono font-bold text-lg tracking-tight text-heading no-underline flex items-center" href="../index.html">claudear<span class="w-2.5 h-[18px] ml-1 rounded-[1px] bg-accent inline-block" aria-hidden="true"></span></a>
+      <nav class="flex items-center gap-1.5 text-[13px]">
+        <a href="../index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Home</a>
+        <a href="./index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Docs</a>
+        <a href="https://github.com/abnegate/claudear" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">GitHub</a>
+        <a href="https://github.com/abnegate/claudear/releases" class="bg-accent text-[#041108] font-semibold px-3 py-1.5 rounded-md hover:bg-accent-dim transition-colors">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+    <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
+      <nav>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
+        <a href="./index.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Overview</a>
+        <a href="./getting-started.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Getting Started</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Core</div>
+        <a href="./configuration.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
+        <a href="./usage.html" class="block text-[13px] text-heading bg-accent/10 border border-accent/20 px-2 py-1.5 rounded-md mb-0.5 transition-colors">Usage</a>
+        <a href="./integrations.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Integrations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Product</div>
+        <a href="./dashboard.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
+        <a href="./operations.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Operations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Reference</div>
+        <a href="./cli-reference.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI Reference</a>
+        <a href="./development.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
+      </nav>
+    </aside>
+
+    <main class="flex-1 min-w-0 px-8 py-8 lg:px-12 lg:py-10">
+      <div class="mb-8">
+        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Core</p>
+        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">Usage &amp; Workflows</h1>
+        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">Daemon control, polling, webhooks, manual triggers, retries, reports, and diagnostics.</p>
+      </div>
+      <article class="markdown max-w-[780px]" data-docs-markdown>
+        <h2 id="commands-at-a-glance"><a class="anchor-link" href="#commands-at-a-glance" aria-label="Link to Commands at a glance">#</a>Commands at a glance</h2>
+        <table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody><tr><td><code>claudear start</code></td><td>Start the watcher daemon with all configured services</td></tr><tr><td><code>claudear stop</code></td><td>Stop the running watcher daemon</td></tr><tr><td><code>claudear status</code></td><td>Show the status of the running daemon</td></tr><tr><td><code>claudear pause</code></td><td>Pause the running watcher (stops processing new issues)</td></tr><tr><td><code>claudear resume</code></td><td>Resume a paused watcher</td></tr><tr><td><code>claudear activity</code></td><td>Show recent activity from the daemon</td></tr><tr><td><code>claudear seed</code></td><td>Mark all existing issues as seen (run this first!)</td></tr><tr><td><code>claudear dry-run</code></td><td>Show what would be processed without running Claude</td></tr><tr><td><code>claudear poll</code></td><td>Start polling all enabled sources (foreground, no daemon)</td></tr><tr><td><code>claudear webhook</code></td><td>Start webhook server for real-time events</td></tr><tr><td><code>claudear trigger</code></td><td>Manually trigger a fix for an issue</td></tr><tr><td><code>claudear reset</code></td><td>Reset a failed attempt to allow retry</td></tr><tr><td><code>claudear stats</code></td><td>Show statistics about fix attempts</td></tr><tr><td><code>claudear sources</code></td><td>List configured sources</td></tr><tr><td><code>claudear dashboard</code></td><td>Start the dashboard API server</td></tr><tr><td><code>claudear repos</code></td><td>Repository management commands</td></tr><tr><td><code>claudear prs</code></td><td>Pull request management commands</td></tr><tr><td><code>claudear retries</code></td><td>Retry management commands</td></tr><tr><td><code>claudear inference</code></td><td>Inference analytics and management</td></tr><tr><td><code>claudear report</code></td><td>Report generation and scheduling</td></tr><tr><td><code>claudear diag</code></td><td>Diagnostic commands for debugging</td></tr><tr><td><code>claudear users</code></td><td>User management commands</td></tr></tbody></table>
+
+        <h2 id="running-claudear"><a class="anchor-link" href="#running-claudear" aria-label="Link to Running Claudear">#</a>Running Claudear</h2>
+        <p>The recommended way to run Claudear is as a background daemon. It watches your configured sources, processes new issues automatically, and stays running until you tell it to stop.</p>
+        <pre><code class="language-bash"># Start with polling + webhooks + dashboard
+claudear start --poll --port 3100
+
+# Custom poll interval
+claudear start --poll --poll-interval 60000
+
+# Worker-like mode (no webhooks/dashboard)
+claudear start --poll --no-webhooks --no-dashboard</code></pre>
+        <h3 id="control-commands"><a class="anchor-link" href="#control-commands" aria-label="Link to Control commands">#</a>Control commands</h3>
+        <p>Once the daemon is running, you can check on it and control it without restarting:</p>
+        <pre><code class="language-bash">claudear status
+claudear pause
+claudear resume
+claudear activity
+claudear activity 50
+claudear stop</code></pre>
+
+        <h2 id="foreground-polling"><a class="anchor-link" href="#foreground-polling" aria-label="Link to Foreground polling">#</a>Foreground polling</h2>
+        <p>Runs in your terminal: useful for testing and debugging your setup.</p>
+        <pre><code class="language-bash">claudear poll
+claudear poll 60000
+claudear poll --port 8080</code></pre>
+
+        <h2 id="webhooks"><a class="anchor-link" href="#webhooks" aria-label="Link to Webhooks">#</a>Webhooks</h2>
+        <p>Webhooks let Claudear react to events instantly instead of waiting for the next poll. You can start a standalone webhook server, or use <code>--setup-webhooks</code> to automatically register webhooks with your providers and start listening.</p>
+        <pre><code class="language-bash">claudear webhook
+claudear webhook --setup-webhooks --base-url https://my-server.example.com:3100</code></pre>
+
+        <h2 id="triggering-fixes-manually"><a class="anchor-link" href="#triggering-fixes-manually" aria-label="Link to Triggering fixes manually">#</a>Triggering fixes manually</h2>
+        <p>Sometimes you want to kick off a fix for a specific issue, or retry one that failed. You can do both from the CLI:</p>
+        <pre><code class="language-bash"># Trigger a fix manually
+claudear trigger linear abc123-def456
+claudear trigger sentry 12345678
+
+# Reset failed attempt for retry
+claudear reset sentry 12345678
+
+# Visibility helpers
+claudear stats
+claudear sources</code></pre>
+
+        <h2 id="managing-prs-and-retries"><a class="anchor-link" href="#managing-prs-and-retries" aria-label="Link to Managing PRs and retries">#</a>Managing PRs and retries</h2>
+        <p>Track the pull requests Claudear has created, and manage the retry queue for issues that need another attempt.</p>
+        <pre><code class="language-bash"># PR tracking
+claudear prs list
+claudear prs monitor
+claudear prs monitor --continuous
+
+# Retry queues
+claudear retries list
+claudear retries process</code></pre>
+
+        <h2 id="dashboard"><a class="anchor-link" href="#dashboard" aria-label="Link to Dashboard">#</a>Dashboard</h2>
+        <p>Launch the web dashboard to monitor everything visually.</p>
+        <pre><code class="language-bash">claudear dashboard
+claudear dashboard 8080
+claudear dashboard --dashboard-dir ./dashboard/dist</code></pre>
+
+        <h2 id="reports"><a class="anchor-link" href="#reports" aria-label="Link to Reports">#</a>Reports</h2>
+        <p>Generate summary reports of what Claudear has been doing. Preview them locally, send them to your configured notification channels, or set up a recurring schedule.</p>
+        <pre><code class="language-bash">claudear report preview daily
+claudear report preview weekly
+claudear report send daily
+claudear report schedule --daily --hour 9
+claudear report schedule --daily --weekly --hour 9</code></pre>
+
+        <h2 id="repository-management"><a class="anchor-link" href="#repository-management" aria-label="Link to Repository management">#</a>Repository management</h2>
+        <p>Claudear can discover your repos, track dependencies between them, and show what would be affected by changes.</p>
+        <pre><code class="language-bash">claudear repos discover
+claudear repos discover --paths ~/projects ~/work --save
+claudear repos list
+claudear repos index
+claudear repos stats
+claudear repos sync
+claudear repos search "auth middleware"
+claudear repos link my-lib my-app --dep-type npm
+claudear repos graph
+claudear repos graph --root my-lib
+claudear repos cascade my-lib</code></pre>
+
+        <h2 id="analytics"><a class="anchor-link" href="#analytics" aria-label="Link to Analytics">#</a>Analytics</h2>
+        <p>See how Claudear is performing: which repos it targets, how confident its decisions are, and whether its choices are correct. You can also provide feedback to help improve future results.</p>
+        <pre><code class="language-bash">claudear inference stats
+claudear inference history
+claudear inference history --limit 50
+claudear inference feedback 42 --correct
+claudear inference feedback 43 --actual-repo my-other-repo</code></pre>
+
+        <h2 id="troubleshooting"><a class="anchor-link" href="#troubleshooting" aria-label="Link to Troubleshooting">#</a>Troubleshooting</h2>
+        <p>If something is not working as expected, these commands help you diagnose the problem. <code>dry-run</code> shows exactly what Claudear would process without actually running any fixes.</p>
+        <pre><code class="language-bash">claudear diag db
+claudear diag release-graph
+claudear diag release-check owner/repo 42 --target owner/target-repo
+claudear diag release-path owner/source-repo owner/target-repo
+claudear dry-run</code></pre>
+
+        <h2 id="getting-started-sequence"><a class="anchor-link" href="#getting-started-sequence" aria-label="Link to Getting started sequence">#</a>Getting started sequence</h2>
+        <ol>
+        <li>Run <code>claudear seed</code> to mark existing issues as seen (so Claudear doesn't re-process your backlog)</li>
+        <li>Run <code>claudear dry-run</code> to preview what would be processed</li>
+        <li>Start the daemon: <code>claudear start --poll</code></li>
+        <li>Enable webhooks for instant response times</li>
+        <li>Turn on reports, regression monitoring, and advanced features as needed</li>
+        </ol>
+        <h3 id="pause-stop"><a class="anchor-link" href="#pause-stop" aria-label="Link to Pause and stop">#</a>Pause and stop</h3>
+        <ul>
+        <li><code>claudear pause</code>: stops picking up new work, keeps the process running so you can resume later</li>
+        <li><code>claudear stop</code>: shuts down the daemon completely</li>
+        </ul>
+      </article>
+      <div class="grid grid-cols-2 gap-4 mt-12 max-w-[780px]">
+        <a href="./configuration.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Configuration</span>
+        </a>
+        <a href="./integrations.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Next</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Integrations</span>
+        </a>
+      </div>
+      <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
+    </main>
+  </div>
+
+  <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>
+  <script src="./assets/docs.js"></script>
+</body>
+</html>

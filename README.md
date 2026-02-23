@@ -11,7 +11,7 @@
   </p>
 </p>
 
-Claudear watches your issue trackers and error monitoring services, automatically spawning [Claude Code](https://docs.anthropic.com/en/docs/claude-code) agents to fix issues and open pull requests -- no human in the loop required (unless Claude has a question for you).
+Claudear watches your issue trackers and error monitoring services, automatically spawning [Claude Code](https://docs.anthropic.com/en/docs/claude-code) agents to fix issues and open pull requests: no human in the loop required (unless Claude has a question for you).
 
 Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out which repo the issue belongs to, clones it, runs Claude Code with your project's conventions, opens a PR, monitors the PR through merge, auto-resolves the source issue, and learns from the outcome to get smarter over time.
 
@@ -80,16 +80,16 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 ## Features
 
 ### Issue Sources
-- **Linear** -- Trigger on labels (`auto-implement`, `claude`) or states (`backlog`, `todo`), with team/project filtering
-- **Sentry** -- Process top escalating errors by event count, time period, and escalation threshold
-- **Jira** -- JQL-based issue filtering with label and status support
-- **GitHub Issues** -- Monitor issues across repositories
-- **GitLab** -- Fetch issues from GitLab groups and projects
-- **Discord** -- Process messages and threads from Discord channels as issues
-- **Slack** -- Poll Slack channels for messages as issues
-- **WhatsApp** -- Receive WhatsApp messages via Cloud API webhooks
-- **Telegram** -- Poll Telegram chats via Bot API
-- **GitHub Review Comments** -- Respond to PR review comments tagged with `/claudear`
+- **Linear**: Trigger on labels (`auto-implement`, `claude`) or states (`backlog`, `todo`), with team/project filtering
+- **Sentry**: Process top escalating errors by event count, time period, and escalation threshold
+- **Jira**: JQL-based issue filtering with label and status support
+- **GitHub Issues**: Monitor issues across repositories
+- **GitLab**: Fetch issues from GitLab groups and projects
+- **Discord**: Process messages and threads from Discord channels as issues
+- **Slack**: Poll Slack channels for messages as issues
+- **WhatsApp**: Receive WhatsApp messages via Cloud API webhooks
+- **Telegram**: Poll Telegram chats via Bot API
+- **GitHub Review Comments**: Respond to PR review comments tagged with `/claudear`
 - Per-source rate limiting, concurrent processing controls, and configurable poll intervals
 
 ### Intelligent Repository Routing
@@ -113,13 +113,13 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 ### Human Q&A Loop
 - When Claude is blocked on ambiguity, it asks a question via your notification channels
 - Claudear fans out the question to all enabled notifiers (Discord, Email, etc.)
-- First reply wins -- Claude resumes immediately with the answer
+- First reply wins: Claude resumes immediately with the answer
 - Q&A pairs are stored and reused via embedding-based semantic matching so the same question is never asked twice
 - Configurable timeouts with best-effort continuation
 
 ### AI Feedback Loop
 - Tracks outcomes of every fix attempt (merged, closed, failed)
-- Generates local vector embeddings for all issue content (no external APIs -- runs on ONNX Runtime)
+- Generates local vector embeddings for all issue content (no external APIs: runs on ONNX Runtime)
 - Finds similar past issues and extracts patterns from successes and failures
 - Enhances future prompts with learnings from past outcomes
 - Supported models: Nomic, MiniLM, BGE
@@ -141,13 +141,13 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - Semantic versioning support
 
 ### Notifications
-- **Discord** -- Webhook messages + bot reply polling for Q&A
-- **Email** -- SMTP sending + IMAP reply polling for Q&A
-- **SMS** -- Twilio integration
-- **Push** -- Pushover notifications
-- **WhatsApp** -- WhatsApp Business Cloud API
-- **Telegram** -- Telegram Bot API
-- **Console** -- Always-on logging
+- **Discord**: Webhook messages + bot reply polling for Q&A
+- **Email**: SMTP sending + IMAP reply polling for Q&A
+- **SMS**: Twilio integration
+- **Push**: Pushover notifications
+- **WhatsApp**: WhatsApp Business Cloud API
+- **Telegram**: Telegram Bot API
+- **Console**: Always-on logging
 - Mix and match any combination of channels
 
 ### User Registry
@@ -160,7 +160,7 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - Stats overview: total attempts, success rate, merge rate
 - Status breakdown, source-by-source metrics, recent attempt history
 - Retryable issues view with one-click retry
-- Embedded in the release binary -- no separate deployment needed
+- Embedded in the release binary: no separate deployment needed
 
 ### Scheduled Reports
 - Daily, weekly, and monthly automated status reports
@@ -175,7 +175,7 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 ### Webhooks
 - Real-time event processing from Linear, Sentry, and GitHub
 - HMAC-SHA256 signature verification
-- One-command auto-configuration: `claudear webhook --setup-webhooks --base-url <url>`
+- One-command auto-configuration: `claudear webhook --setup --base-url <url>`
 
 ### Integrations at a Glance
 
@@ -347,7 +347,7 @@ All config values can be overridden with environment variables, useful for keepi
 ### Minimal Configuration
 
 ```toml
-work_dir = "~/.claudear/repos"
+workspace = "~/.claudear/repos"
 
 known_orgs = ["your-github-org"]
 
@@ -361,7 +361,7 @@ api_key = "lin_api_xxxx"
 
 | Section | Description |
 |---------|-------------|
-| `work_dir` | Directory where repositories are cloned **(required)** |
+| `workspace` | Directory where repositories are cloned **(required)** |
 | `known_orgs` | GitHub organizations to track for auto-discovery |
 | `auto_discover_paths` | Local paths to scan for repository clones |
 | `poll_interval_ms` | Polling interval in milliseconds (default: 300000 = 5 min) |
@@ -438,10 +438,10 @@ Real-time event processing via webhooks from Linear, Sentry, and GitHub.
 claudear webhook
 
 # Auto-configure webhooks with Linear/Sentry APIs
-claudear webhook --setup-webhooks --base-url https://my-server.example.com:3100
+claudear webhook --setup --base-url https://my-server.example.com:3100
 ```
 
-The `--setup-webhooks` flag:
+The `--setup` flag:
 1. Connects to Linear/Sentry APIs using your configured API keys
 2. Creates webhooks pointing to your server
 3. Retrieves signing secrets and writes them to your `.env` file
@@ -705,11 +705,11 @@ When an issue is assigned to a user, Claudear routes notifications to their conf
 
 Claudear learns from every fix attempt to improve future performance.
 
-1. **Track Outcomes** -- Every attempt result (merged, closed, failed) is recorded
-2. **Generate Embeddings** -- Issue content is vectorized locally using fastembed (ONNX Runtime)
-3. **Find Similar Issues** -- When a new issue arrives, similar past issues are retrieved
-4. **Extract Patterns** -- Keywords and strategies from successful fixes are extracted
-5. **Enhance Prompts** -- Future Claude prompts are augmented with learnings from similar past issues
+1. **Track Outcomes**: Every attempt result (merged, closed, failed) is recorded
+2. **Generate Embeddings**: Issue content is vectorized locally using fastembed (ONNX Runtime)
+3. **Find Similar Issues**: When a new issue arrives, similar past issues are retrieved
+4. **Extract Patterns**: Keywords and strategies from successful fixes are extracted
+5. **Enhance Prompts**: Future Claude prompts are augmented with learnings from similar past issues
 
 All embedding computation runs locally. No external API calls. Supported models: `nomic`, `minilm`, `bge`.
 

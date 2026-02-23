@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Development · Claudear Docs</title>
+  <meta name="description" content="Local setup, repo layout, build/test workflows, and contributing guide.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090B', card: '#111113', border: '#27272A',
+            accent: '#22C55E', 'accent-dim': '#16a34a',
+            link: '#60A5FA', heading: '#FAFAFA', body: '#A1A1AA', muted: '#71717A',
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="stylesheet" href="./assets/docs.css">
+</head>
+<body id="top" class="bg-bg text-heading font-sans">
+  <div class="fixed inset-0 z-0 pointer-events-none opacity-[0.03]" style="background-image:radial-gradient(circle,#FAFAFA 0.5px,transparent 0.5px);background-size:24px 24px" aria-hidden="true"></div>
+  <div class="fixed top-0 left-0 right-0 h-0.5 z-[60] bg-white/[0.03]" aria-hidden="true"><div class="h-full w-full origin-left scale-x-0 bg-gradient-to-r from-accent to-link" data-reading-progress></div></div>
+
+  <header class="sticky top-0 z-50 border-b border-white/[0.06] bg-bg/90 backdrop-blur-xl">
+    <div class="max-w-[1400px] mx-auto h-14 px-5 flex items-center justify-between">
+      <a class="font-mono font-bold text-lg tracking-tight text-heading no-underline flex items-center" href="../index.html">claudear<span class="w-2.5 h-[18px] ml-1 rounded-[1px] bg-accent inline-block" aria-hidden="true"></span></a>
+      <nav class="flex items-center gap-1.5 text-[13px]">
+        <a href="../index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Home</a>
+        <a href="./index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Docs</a>
+        <a href="https://github.com/abnegate/claudear" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">GitHub</a>
+        <a href="https://github.com/abnegate/claudear/releases" class="bg-accent text-[#041108] font-semibold px-3 py-1.5 rounded-md hover:bg-accent-dim transition-colors">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+    <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
+      <nav>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
+        <a href="./index.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Overview</a>
+        <a href="./getting-started.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Getting Started</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Core</div>
+        <a href="./configuration.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
+        <a href="./usage.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Usage</a>
+        <a href="./integrations.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Integrations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Product</div>
+        <a href="./dashboard.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
+        <a href="./operations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Operations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Reference</div>
+        <a href="./cli-reference.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI Reference</a>
+        <a href="./development.html" class="text-heading bg-accent/10 border border-accent/20 block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
+      </nav>
+    </aside>
+
+    <main class="flex-1 min-w-0 px-8 py-8 lg:px-12 lg:py-10">
+      <div class="mb-8">
+        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Reference</p>
+        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">Development</h1>
+        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">Local setup, repo layout, build/test workflows, and contributing guide.</p>
+      </div>
+      <article class="markdown max-w-[780px]" data-docs-markdown>
+        <h2 id="prerequisites">Prerequisites</h2>
+        <p>The README documents the primary development prerequisites:</p>
+        <ul>
+        <li>Rust 1.93+</li>
+        <li>Bun (dashboard tooling)</li>
+        <li>Docker (optional)</li>
+        </ul>
+
+        <h2 id="build-commands">Build commands</h2>
+        <pre><code class="language-bash">make build              # Debug build
+make build-release      # Release build with embedded dashboard
+make install            # Install to /usr/local/bin</code></pre>
+
+        <h2 id="test-commands">Test commands</h2>
+        <pre><code class="language-bash">make test               # Rust tests
+make test-all           # Rust + dashboard tests
+make test-prod-e2e      # Real production E2E smoke (requires credentials)
+make check              # Format + lint + test</code></pre>
+        <h3 id="production-e2e-smoke-test-env-vars">Production E2E smoke test env vars</h3>
+        <p>The README documents required credentials for the live E2E path (Linear, GitHub, and agent credentials). Use a dedicated test repo/environment.</p>
+
+        <h2 id="dashboard-frontend-development">Dashboard frontend development</h2>
+        <pre><code class="language-bash">make dashboard          # Install dependencies
+make dashboard-dev      # Dev server on :5173
+make dashboard-build    # Build dashboard for production
+make dashboard-test     # Dashboard tests</code></pre>
+
+        <h2 id="high-signal-repository-layout">High-signal repository layout</h2>
+        <h3 id="runtime-and-backend">Runtime and backend</h3>
+        <ul>
+        <li><code>src/main.rs</code>: CLI command wiring and app entry</li>
+        <li><code>src/config.rs</code>: configuration model and parsing</li>
+        <li><code>src/watcher.rs</code>: orchestration core</li>
+        <li><code>src/source/*</code>: issue source integrations</li>
+        <li><code>src/webhook/*</code>: webhook server + provider handlers</li>
+        <li><code>src/runner/*</code>: agent provider adapters</li>
+        <li><code>src/repo/*</code>: repo discovery, indexing, relationships, code index</li>
+        <li><code>src/api/*</code>: dashboard API and static serving</li>
+        <li><code>src/notifier/*</code>: notifier channels and ask orchestration</li>
+        <li><code>src/regression/*</code>, <code>src/release/*</code>, <code>src/reports/*</code>: post-fix monitoring/reporting</li>
+        <li><code>src/learning/*</code>, <code>src/feedback/*</code>, <code>src/prioritisation/*</code>: learning and prioritisation</li>
+        <li><code>src/ipc/*</code>: daemon IPC protocol and control server/client</li>
+        </ul>
+        <h3 id="frontend-and-website">Frontend and website</h3>
+        <ul>
+        <li><code>dashboard/</code>: React dashboard app</li>
+        <li><code>website/</code>: landing page + generated docs output</li>
+        <li><code>scripts/docs/generate-website-docs.ts</code>: Bun docs site generator</li>
+        </ul>
+        <h3 id="e2e-and-scripts">E2E and scripts</h3>
+        <ul>
+        <li><code>src/bin/e2e/</code>: E2E helper binary + scenarios</li>
+        <li><code>scripts/prod-e2e-smoke.sh</code>: production smoke automation helper</li>
+        <li><code>scripts/screenshots/</code>: dashboard screenshot tooling</li>
+        </ul>
+
+        <h2 id="prompt-customization-and-conventions">Prompt customization and conventions</h2>
+        <p>Claudear supports per-repo <code>AGENT.md</code> files and config-level agent instructions. When changing prompt construction behavior, test both paths (repo-specific and global).</p>
+
+        <h2 id="practical-debugging-workflow-for-contributors">Practical debugging workflow for contributors</h2>
+        <ul>
+        <li>run <code>claudear dry-run</code> after config changes</li>
+        <li>use foreground <code>claudear poll</code> when debugging source behavior</li>
+        <li>use dashboard/API endpoints to inspect analytics/attempt data</li>
+        <li>use <code>claudear activity</code> and <code>claudear diag ...</code> for runtime diagnostics</li>
+        </ul>
+
+        <h2 id="packaging-and-release-sensitive-changes">Packaging and release-sensitive changes</h2>
+        <p>The project publishes binaries, Docker images, Homebrew, and APT packages. Changes to CLI flags, embedded dashboard behavior, or health endpoints can affect packaging and release automation, so validate CI/release assumptions early.</p>
+
+        <h2 id="regenerating-docs-after-changes">Regenerating docs after changes</h2>
+        <pre><code class="language-bash">bun scripts/docs/generate-website-docs.ts</code></pre>
+        <p>Then verify:</p>
+        <ul>
+        <li><code>website/docs/*.html</code> regenerated</li>
+        <li><code>website/docs/assets/*</code> updated if needed</li>
+        <li>landing page docs links point to <code>docs/</code></li>
+        </ul>
+      </article>
+      <div class="grid grid-cols-2 gap-4 mt-12 max-w-[780px]">
+        <a href="./cli-reference.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">CLI Reference</span>
+        </a>
+        <div></div>
+      </div>
+      <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
+    </main>
+  </div>
+
+  <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>
+  <script src="./assets/docs.js"></script>
+</body>
+</html>

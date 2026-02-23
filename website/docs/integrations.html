@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Integrations · Claudear Docs</title>
+  <meta name="description" content="Connect your issue trackers, source control, and notification channels to Claudear.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090B', card: '#111113', border: '#27272A',
+            accent: '#22C55E', 'accent-dim': '#16a34a',
+            link: '#60A5FA', heading: '#FAFAFA', body: '#A1A1AA', muted: '#71717A',
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="stylesheet" href="./assets/docs.css">
+</head>
+<body id="top" class="bg-bg text-heading font-sans">
+  <div class="fixed inset-0 z-0 pointer-events-none opacity-[0.03]" style="background-image:radial-gradient(circle,#FAFAFA 0.5px,transparent 0.5px);background-size:24px 24px" aria-hidden="true"></div>
+  <div class="fixed top-0 left-0 right-0 h-0.5 z-[60] bg-white/[0.03]" aria-hidden="true"><div class="h-full w-full origin-left scale-x-0 bg-gradient-to-r from-accent to-link" data-reading-progress></div></div>
+
+  <header class="sticky top-0 z-50 border-b border-white/[0.06] bg-bg/90 backdrop-blur-xl">
+    <div class="max-w-[1400px] mx-auto h-14 px-5 flex items-center justify-between">
+      <a class="font-mono font-bold text-lg tracking-tight text-heading no-underline flex items-center" href="../index.html">claudear<span class="w-2.5 h-[18px] ml-1 rounded-[1px] bg-accent inline-block" aria-hidden="true"></span></a>
+      <nav class="flex items-center gap-1.5 text-[13px]">
+        <a href="../index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Home</a>
+        <a href="./index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Docs</a>
+        <a href="https://github.com/abnegate/claudear" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">GitHub</a>
+        <a href="https://github.com/abnegate/claudear/releases" class="bg-accent text-[#041108] font-semibold px-3 py-1.5 rounded-md hover:bg-accent-dim transition-colors">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+    <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
+      <nav>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
+        <a href="./index.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Overview</a>
+        <a href="./getting-started.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Getting Started</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Core</div>
+        <a href="./configuration.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
+        <a href="./usage.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Usage</a>
+        <a href="./integrations.html" class="block text-[13px] text-heading bg-accent/10 border border-accent/20 px-2 py-1.5 rounded-md mb-0.5 transition-colors">Integrations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Product</div>
+        <a href="./dashboard.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
+        <a href="./operations.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Operations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Reference</div>
+        <a href="./cli-reference.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI Reference</a>
+        <a href="./development.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
+      </nav>
+    </aside>
+
+    <main class="flex-1 min-w-0 px-8 py-8 lg:px-12 lg:py-10">
+      <div class="mb-8">
+        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Core</p>
+        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">Integrations</h1>
+        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">Connect your issue trackers, source control, and notification channels to Claudear.</p>
+      </div>
+      <article class="markdown max-w-[780px]" data-docs-markdown>
+        <h2 id="connecting-your-tools"><a class="anchor-link" href="#connecting-your-tools" aria-label="Link to Connecting your tools">#</a>Connecting your tools</h2>
+        <p>Claudear connects to your existing tools in four categories: where issues come from, where code lives, where you get notified, and who you are across those platforms. You only need one of each to get started.</p>
+
+        <h2 id="issue-sources"><a class="anchor-link" href="#issue-sources" aria-label="Link to Issue sources">#</a>Issue sources</h2>
+        <p>These are the places Claudear picks up work from:</p>
+        <ul>
+        <li><strong>Linear</strong>: picks up issues matching your label, state, or assignee triggers. Webhooks for instant pickup.</li>
+        <li><strong>Sentry</strong>: monitors top errors above configurable event count and escalation thresholds. Great for automatic bug triage.</li>
+        <li><strong>Jira</strong>: Jira Cloud and Server/Data Center. Filter by project, status, label, issue type, or custom JQL.</li>
+        <li><strong>GitHub Issues</strong>: native GitHub issue automation. Trigger on labels. Webhook support.</li>
+        <li><strong>GitLab Issues</strong>: native GitLab issue and MR automation. Filter by label and state.</li>
+        <li><strong>Discord</strong>: treat messages in a channel as issues. Useful for incident channels.</li>
+        <li><strong>Slack</strong>: treat messages in a channel as issues. Useful for ad-hoc operational queues.</li>
+        </ul>
+
+        <h2 id="source-control"><a class="anchor-link" href="#source-control" aria-label="Link to Source control">#</a>Source control</h2>
+        <p>Where Claudear creates pull requests:</p>
+        <ul>
+        <li><strong>GitHub (Personal Access Token)</strong>: quickest to set up. Grant repo access and paste your token.</li>
+        <li><strong>GitHub App</strong>: for organisations that prefer app-based auth with scoped installation access.</li>
+        <li><strong>GitLab</strong>: personal access token + optional self-hosted base URL.</li>
+        </ul>
+        <p>On GitHub and GitLab you can also configure a <code>review_trigger</code> tag (default: <code>@claudear</code>) &mdash; adding it to a PR review comment kicks off a reply from Claudear.</p>
+
+        <h2 id="notifications"><a class="anchor-link" href="#notifications" aria-label="Link to Notifications">#</a>Notifications</h2>
+        <p>Where Claudear sends updates and questions.</p>
+        <h3 id="reply-capable-channels"><a class="anchor-link" href="#reply-capable-channels" aria-label="Link to Reply-capable channels">#</a>Reply-capable (recommended &mdash; lets you answer AI questions)</h3>
+        <ul>
+        <li><strong>Discord</strong>: bot token + channel. Bi-directional.</li>
+        <li><strong>Slack</strong>: bot token + channel. Bi-directional.</li>
+        <li><strong>Email</strong>: SMTP for sending, IMAP for reading replies.</li>
+        </ul>
+        <h3 id="delivery-only-channels"><a class="anchor-link" href="#delivery-only-channels" aria-label="Link to Delivery-only channels">#</a>Delivery-only</h3>
+        <ul>
+        <li><strong>SMS</strong> (via Twilio)</li>
+        <li><strong>Push</strong> (via Pushover)</li>
+        <li><strong>WhatsApp</strong></li>
+        <li><strong>Telegram</strong></li>
+        </ul>
+        <p>Set up at least one reply-capable channel so Claudear can ask you questions when it gets stuck.</p>
+
+        <h2 id="webhooks"><a class="anchor-link" href="#webhooks" aria-label="Link to Webhooks">#</a>Webhooks</h2>
+        <p>Webhooks let Claudear react to events instantly rather than waiting for the next poll cycle. Use the CLI to automatically register webhooks with supported providers:</p>
+        <pre><code class="language-bash">claudear webhook --setup-webhooks --base-url https://your-server.com</code></pre>
+        <p>Always verify webhook secrets are set and check provider delivery logs after setup.</p>
+
+        <h2 id="user-mapping"><a class="anchor-link" href="#user-mapping" aria-label="Link to User mapping">#</a>User mapping</h2>
+        <p>Map team members across all your platforms in <code>[users.&lt;slug&gt;]</code>. When an issue is assigned to someone, notifications route directly to them. Configure their identifiers once and Claudear handles the routing automatically.</p>
+
+        <h2 id="recommended-setup-order"><a class="anchor-link" href="#recommended-setup-order" aria-label="Link to Recommended setup order">#</a>Recommended setup order</h2>
+        <ol>
+        <li>One issue source + one source control provider + one notification channel</li>
+        <li>Verify a complete end-to-end attempt works</li>
+        <li>Add a reply-capable notification channel for AI questions</li>
+        <li>Enable webhooks for instant pickup</li>
+        <li>Add user mappings for targeted notifications</li>
+        <li>Expand to additional sources and advanced features</li>
+        </ol>
+      </article>
+      <div class="grid grid-cols-2 gap-4 mt-12 max-w-[780px]">
+        <a href="./usage.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Usage</span>
+        </a>
+        <a href="./dashboard.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Next</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Dashboard</span>
+        </a>
+      </div>
+      <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
+    </main>
+  </div>
+
+  <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>
+  <script src="./assets/docs.js"></script>
+</body>
+</html>

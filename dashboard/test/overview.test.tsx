@@ -113,7 +113,9 @@ describe("OverviewPage", () => {
     // Fetch that never resolves
     globalThis.fetch = mock(() => new Promise<Response>(() => {})) as unknown as typeof fetch;
     renderWithSWR(<OverviewPage />);
-    expect(screen.getByText("Loading...")).toBeTruthy();
+    expect(screen.getByText("Overview")).toBeTruthy();
+    // Loading state renders skeleton placeholders, not text
+    expect(document.querySelector('.animate-pulse')).toBeTruthy();
   });
 
   test("renders error state", async () => {

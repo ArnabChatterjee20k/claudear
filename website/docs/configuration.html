@@ -1,0 +1,1167 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Configuration · Claudear Docs</title>
+  <meta name="description" content="TOML structure, secret overrides, per-section reference, and the complete annotated example.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090B', card: '#111113', border: '#27272A',
+            accent: '#22C55E', 'accent-dim': '#16a34a',
+            link: '#60A5FA', heading: '#FAFAFA', body: '#A1A1AA', muted: '#71717A',
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="stylesheet" href="./assets/docs.css">
+</head>
+<body id="top" class="bg-bg text-heading font-sans">
+  <div class="fixed inset-0 z-0 pointer-events-none opacity-[0.03]" style="background-image:radial-gradient(circle,#FAFAFA 0.5px,transparent 0.5px);background-size:24px 24px" aria-hidden="true"></div>
+  <div class="fixed top-0 left-0 right-0 h-0.5 z-[60] bg-white/[0.03]" aria-hidden="true"><div class="h-full w-full origin-left scale-x-0 bg-gradient-to-r from-accent to-link" data-reading-progress></div></div>
+
+  <header class="sticky top-0 z-50 border-b border-white/[0.06] bg-bg/90 backdrop-blur-xl">
+    <div class="max-w-[1400px] mx-auto h-14 px-5 flex items-center justify-between">
+      <a class="font-mono font-bold text-lg tracking-tight text-heading no-underline flex items-center" href="../index.html">claudear<span class="w-2.5 h-[18px] ml-1 rounded-[1px] bg-accent inline-block" aria-hidden="true"></span></a>
+      <nav class="flex items-center gap-1.5 text-[13px]">
+        <a href="../index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Home</a>
+        <a href="./index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Docs</a>
+        <a href="https://github.com/abnegate/claudear" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">GitHub</a>
+        <a href="https://github.com/abnegate/claudear/releases" class="bg-accent text-[#041108] font-semibold px-3 py-1.5 rounded-md hover:bg-accent-dim transition-colors">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="relative z-10 max-w-[1400px] mx-auto flex min-h-[calc(100vh-56px)]">
+    <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
+      <nav>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
+        <a href="./index.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Overview</a>
+        <a href="./getting-started.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Getting Started</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Core</div>
+        <a href="./configuration.html" class="block text-[13px] text-heading bg-accent/10 border border-accent/20 px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
+        <a href="./usage.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Usage</a>
+        <a href="./integrations.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Integrations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Product</div>
+        <a href="./dashboard.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
+        <a href="./operations.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Operations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Reference</div>
+        <a href="./cli-reference.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI Reference</a>
+        <a href="./development.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
+      </nav>
+    </aside>
+
+    <main class="flex-1 min-w-0 px-8 py-8 lg:px-12 lg:py-10">
+      <div class="mb-8">
+        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Core</p>
+        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">Configuration</h1>
+        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">TOML structure, secret overrides, per-section reference, and the complete annotated example.</p>
+      </div>
+      <article class="markdown max-w-[780px]" data-docs-markdown>
+        <h2 id="config-file"><a class="anchor-link" href="#config-file" aria-label="Link to Config file">#</a>Config file</h2>
+        <p>Claudear uses a single TOML config file. Copy the example and fill in your values:</p>
+        <pre><code class="language-bash">cp claudear.example.toml claudear.toml</code></pre>
+        <p>By default, Claudear looks for <code>claudear.toml</code> in the current directory. You can override the path with <code>--config</code>:</p>
+        <pre><code class="language-bash">claudear --config /path/to/config.toml poll</code></pre>
+
+        <h2 id="environment-variables"><a class="anchor-link" href="#environment-variables" aria-label="Link to Environment variables">#</a>Environment variables</h2>
+        <p>Use environment variables for secrets instead of putting them in the config file. This is especially useful in containers and CI.</p>
+        <table>
+          <thead><tr><th>Env var</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>LINEAR_API_KEY</code></td><td>Linear API key override</td></tr>
+            <tr><td><code>SENTRY_AUTH_TOKEN</code></td><td>Sentry auth token override</td></tr>
+            <tr><td><code>GITHUB_TOKEN</code></td><td>GitHub SCM token override</td></tr>
+            <tr><td><code>LINEAR_WEBHOOK_SECRET</code></td><td>Linear webhook verification</td></tr>
+            <tr><td><code>SENTRY_CLIENT_SECRET</code></td><td>Sentry webhook verification</td></tr>
+            <tr><td><code>GITHUB_WEBHOOK_SECRET</code></td><td>GitHub webhook verification</td></tr>
+            <tr><td><code>EMBEDDING_MODEL</code></td><td>Embedding model selection</td></tr>
+            <tr><td><code>EMBEDDING_CACHE_DIR</code></td><td>Embedding cache directory</td></tr>
+          </tbody>
+        </table>
+
+        <h2 id="core-settings"><a class="anchor-link" href="#core-settings" aria-label="Link to Core settings">#</a>Core settings</h2>
+        <p>These top-level settings control where Claudear stores data and how fast it works.</p>
+        <ul>
+        <li><code>workspace</code>: where repos are cloned to on disk.</li>
+        <li><code>db_path</code>: location of the SQLite database file.</li>
+        <li><code>webhook_port</code>: the port Claudear listens on for webhooks and the dashboard.</li>
+        <li><code>poll_interval_ms</code>: how often to check your issue sources for new work (in milliseconds).</li>
+        <li><code>max_concurrent</code>: how many issues to work on at the same time. Start with <code>1</code> and increase once you are comfortable.</li>
+        <li><code>known_orgs</code>: your GitHub or GitLab organizations. Claudear uses these to match issues to the right repo.</li>
+        <li><code>auto_discover_paths</code>: local directories to scan for existing repo clones.</li>
+        </ul>
+        <h3 id="tips"><a class="anchor-link" href="#tips" aria-label="Link to Tips">#</a>Tips</h3>
+        <ul>
+        <li>Increase <code>max_concurrent</code> gradually: too high and you can saturate your AI provider or API rate limits.</li>
+        <li>Keep <code>processing_delay_ms</code> above zero to process issues at a steady pace without hammering APIs.</li>
+        <li>When running in Docker or as a system service, set explicit absolute paths for <code>db_path</code> and <code>workspace</code>.</li>
+        </ul>
+
+        <h2 id="retries"><a class="anchor-link" href="#retries" aria-label="Link to Retries">#</a>Retries (<code>[retry]</code>)</h2>
+        <p>When a fix attempt fails, Claudear can automatically retry with exponential backoff.</p>
+        <ul>
+        <li><code>max_retries</code>: how many times to retry a failed attempt (default: 2).</li>
+        <li><code>base_delay_ms</code>: initial delay between retries in milliseconds. Each subsequent retry doubles this value.</li>
+        <li><code>max_delay_ms</code>: the upper limit on retry delay, so backoff does not grow forever.</li>
+        </ul>
+        <p>For most teams, the defaults work well. Lower <code>base_delay_ms</code> if you want faster retries during development; raise it in production to avoid hammering APIs.</p>
+
+        <h2 id="ai-agent"><a class="anchor-link" href="#ai-agent" aria-label="Link to AI agent">#</a>AI agent (<code>[agent]</code>)</h2>
+        <p>Configure which AI provider Claudear uses and how it behaves.</p>
+        <ul>
+        <li><code>default_provider</code>: which provider to use (default: <code>"claude"</code>).</li>
+        <li><code>timeout_secs</code>: maximum time an agent run can take before being stopped.</li>
+        </ul>
+        <h3 id="claude-provider"><a class="anchor-link" href="#claude-provider" aria-label="Link to Claude provider settings">#</a>Claude provider settings (<code>[agent.providers.claude]</code>)</h3>
+        <ul>
+        <li><code>model</code>: the Claude model to use (e.g. <code>"sonnet"</code>, <code>"opus"</code>, <code>"haiku"</code>, or a full model ID).</li>
+        <li><code>instructions</code>: custom instructions appended to Claude's system prompt. Use this to enforce coding standards, style rules, or project-specific guidance.</li>
+        <li><code>instructions_file</code>: path to a file with additional instructions. If both <code>instructions</code> and <code>instructions_file</code> are set, the file content comes first.</li>
+        <li><code>permissions</code>: tool permissions granted without prompting (e.g. <code>["Bash(git *)", "Read", "Edit"]</code>).</li>
+        <li><code>skip_permissions</code>: skip all interactive permission prompts (default: <code>true</code>).</li>
+        </ul>
+
+        <h2 id="user-mapping"><a class="anchor-link" href="#user-mapping" aria-label="Link to User mapping">#</a>User mapping (<code>[users.&lt;slug&gt;]</code>)</h2>
+        <p>Map your team members across platforms so notifications and assignments go to the right person. Each user gets a slug (like <code>[users.jake]</code>) and you fill in their identifiers for each service they use:</p>
+        <ul>
+        <li>Issue trackers: <code>linear_name</code>, <code>sentry_username</code>, <code>jira_username</code></li>
+        <li>Source control: <code>github_username</code>, <code>gitlab_username</code></li>
+        <li>Notifications: <code>discord_id</code>, <code>slack_id</code>, <code>email</code>, <code>push_user_key</code>, <code>sms_number</code>, <code>whatsapp_number</code>, <code>telegram_chat_id</code></li>
+        </ul>
+        <p>When an issue is assigned to someone, Claudear routes notifications directly to that person on their preferred channels.</p>
+
+        <h2 id="questions"><a class="anchor-link" href="#questions" aria-label="Link to Questions">#</a>Questions (<code>[ask]</code>)</h2>
+        <p>When the AI gets stuck or needs clarification, it can ask you a question. The question is sent to all your enabled notification channels, and the first reply wins.</p>
+        <ul>
+        <li><code>enabled</code>: turn the ask loop on or off.</li>
+        <li><code>wait_timeout_secs</code>: how long to wait for a reply before giving up.</li>
+        <li><code>poll_interval_secs</code>: how often to check for replies while waiting.</li>
+        <li><code>max_rounds_per_attempt</code>: limit how many questions the AI can ask per issue attempt.</li>
+        <li><code>best_effort_on_timeout</code>: if no reply arrives in time, continue with a best-effort note instead of failing.</li>
+        </ul>
+        <p>The <code>semantic_threshold_scoped</code> and <code>semantic_threshold_global</code> settings control automatic answer reuse. If a similar question was already answered, Claudear can reuse that answer instead of asking again. Lower thresholds mean more reuse; higher thresholds mean stricter matching.</p>
+
+        <h2 id="source-control"><a class="anchor-link" href="#source-control" aria-label="Link to Source control">#</a>Source control (<code>[scm.*]</code>)</h2>
+        <h3 id="github"><a class="anchor-link" href="#github" aria-label="Link to GitHub">#</a>GitHub (<code>[scm.github]</code>)</h3>
+        <p>Connect Claudear to GitHub so it can create branches, open pull requests, and respond to review comments.</p>
+        <ul>
+        <li><code>token</code>: a personal access token with repo access.</li>
+        <li><code>auto_resolve_on_merge</code>: automatically close the source issue when the PR merges.</li>
+        <li><code>review_trigger</code>: the tag that triggers Claudear to respond to PR review comments (default: <code>@claudear</code>).</li>
+        <li><code>use_ssh</code>: clone repos over SSH instead of HTTPS.</li>
+        <li><code>webhook_secret</code>: for verifying incoming GitHub webhooks.</li>
+        </ul>
+        <h3 id="github-app"><a class="anchor-link" href="#github-app" aria-label="Link to GitHub App">#</a>GitHub App (<code>[scm.github.app]</code>)</h3>
+        <p>If you prefer GitHub App authentication over a personal access token, configure your App ID and private key here. The installation ID is auto-detected if not set.</p>
+        <ul>
+        <li><code>app_id</code>: GitHub App ID.</li>
+        <li><code>private_key_path</code>: path to a PEM private key file.</li>
+        <li><code>private_key</code>: inline PEM private key content (alternative to <code>private_key_path</code>).</li>
+        <li><code>webhook_secret</code>: secret for verifying GitHub App webhook payloads.</li>
+        <li><code>installation_id</code>: installation ID (auto-detected when empty).</li>
+        <li><code>client_id</code>: OAuth client ID for manifest/user auth flows.</li>
+        <li><code>client_secret</code>: OAuth client secret.</li>
+        <li><code>base_url</code>: public base URL for the GitHub App manifest flow.</li>
+        </ul>
+        <h3 id="gitlab"><a class="anchor-link" href="#gitlab" aria-label="Link to GitLab">#</a>GitLab (<code>[scm.gitlab]</code>)</h3>
+        <p>Connect Claudear to GitLab for merge request automation.</p>
+        <ul>
+        <li><code>enabled</code>: enable or disable the GitLab backend.</li>
+        <li><code>token</code>: GitLab personal access token.</li>
+        <li><code>base_url</code>: GitLab instance URL (default: <code>"https://gitlab.com"</code>; change for self-hosted).</li>
+        <li><code>groups</code>: GitLab groups to monitor.</li>
+        <li><code>trigger_labels</code>: labels that trigger automation.</li>
+        <li><code>trigger_states</code>: issue states that trigger automation.</li>
+        <li><code>poll_interval_ms</code>: MR status check interval in milliseconds.</li>
+        <li><code>auto_resolve_on_merge</code>: close source issues when MRs merge.</li>
+        <li><code>webhook_secret</code>: secret for verifying GitLab webhook payloads.</li>
+        <li><code>review_trigger</code>: tag that triggers Claudear on MR review comments.</li>
+        <li><code>use_ssh</code>: clone repos over SSH instead of HTTPS.</li>
+        <li><code>max_issues_per_cycle</code>, <code>max_concurrent</code>: per-source rate limiting overrides.</li>
+        </ul>
+
+        <h2 id="issue-sources"><a class="anchor-link" href="#issue-sources" aria-label="Link to Issue sources">#</a>Issue sources (<code>[issues.*]</code>)</h2>
+        <p>Issue sources tell Claudear where to find work. You can enable as many as you need.</p>
+        <h3 id="linear"><a class="anchor-link" href="#linear" aria-label="Link to Linear">#</a>Linear (<code>[issues.linear]</code>)</h3>
+        <p>Pull issues from Linear based on labels, states, or assignee.</p>
+        <ul>
+        <li><code>enabled</code>: enable or disable this source.</li>
+        <li><code>api_key</code>: Linear API key <strong>(required)</strong>.</li>
+        <li><code>trigger_labels</code>: labels that trigger automation.</li>
+        <li><code>trigger_states</code>: workflow states that trigger automation.</li>
+        <li><code>trigger_assignee</code>: only process issues assigned to this user (display name).</li>
+        <li><code>team_id</code>: optional team filter.</li>
+        <li><code>project_id</code>: optional project filter.</li>
+        <li><code>webhook_secret</code>: secret for verifying Linear webhook payloads.</li>
+        <li><code>max_issues_per_cycle</code>, <code>max_concurrent</code>, <code>poll_interval_ms</code>: per-source overrides.</li>
+        </ul>
+        <h3 id="sentry"><a class="anchor-link" href="#sentry" aria-label="Link to Sentry">#</a>Sentry (<code>[issues.sentry]</code>)</h3>
+        <p>Automatically pick up escalating errors from Sentry.</p>
+        <ul>
+        <li><code>enabled</code>: enable or disable this source.</li>
+        <li><code>auth_token</code>: Sentry auth token <strong>(required)</strong>.</li>
+        <li><code>org_slug</code>: Sentry organization slug <strong>(required)</strong>.</li>
+        <li><code>project_slugs</code>: optional list of project slugs to filter.</li>
+        <li><code>top_issues_count</code>: number of top issues to fetch (default: 100).</li>
+        <li><code>top_issues_period</code>: lookback period: <code>"1h"</code>, <code>"12h"</code>, <code>"24h"</code>, <code>"7d"</code>, <code>"30d"</code>.</li>
+        <li><code>min_event_count</code>: minimum event count before an issue is processed.</li>
+        <li><code>escalation_threshold_percent</code>: percentage increase to consider an issue escalating.</li>
+        <li><code>client_secret</code>: secret for verifying Sentry webhook payloads.</li>
+        <li><code>max_issues_per_cycle</code>, <code>max_concurrent</code>: per-source overrides.</li>
+        </ul>
+        <h3 id="jira"><a class="anchor-link" href="#jira" aria-label="Link to Jira">#</a>Jira (<code>[issues.jira]</code>)</h3>
+        <p>Works with both Jira Cloud (email + API token) and Jira Server/Data Center (bearer token).</p>
+        <ul>
+        <li><code>enabled</code>: enable or disable this source.</li>
+        <li><code>base_url</code>: Jira instance URL <strong>(required)</strong>.</li>
+        <li><code>email</code>: email address for Basic auth (Jira Cloud).</li>
+        <li><code>api_token</code>: API token (Cloud) or personal access token (Server/DC).</li>
+        <li><code>auth_mode</code>: <code>"basic"</code> for Cloud, <code>"bearer"</code> for Server/DC.</li>
+        <li><code>project_keys</code>: project keys to monitor.</li>
+        <li><code>trigger_labels</code>: labels that trigger automation.</li>
+        <li><code>trigger_statuses</code>: issue statuses that trigger automation.</li>
+        <li><code>trigger_assignee</code>: only process issues assigned to this user.</li>
+        <li><code>issue_types</code>: filter by issue types (e.g. <code>["Bug", "Task"]</code>).</li>
+        <li><code>custom_jql</code>: additional JQL appended to the generated query.</li>
+        <li><code>max_results</code>: maximum results per search request.</li>
+        <li><code>max_issues_per_cycle</code>, <code>max_concurrent</code>, <code>poll_interval_ms</code>: per-source overrides.</li>
+        </ul>
+        <h3 id="discord-slack-sources"><a class="anchor-link" href="#discord-slack-sources" aria-label="Link to Discord and Slack">#</a>Discord and Slack (<code>[issues.discord]</code>, <code>[issues.slack]</code>)</h3>
+        <p>Treat chat messages as issues. Credentials are inherited from the matching notifier section when not set here.</p>
+        <ul>
+        <li><code>bot_token</code>: bot token for reading messages (inherits from notifier if omitted).</li>
+        <li><code>listen_channel_id</code>: channel to monitor for messages.</li>
+        <li><code>guild_id</code> (Discord only): guild ID for constructing message URLs.</li>
+        <li><code>workspace</code> (Slack only): workspace name for constructing message URLs.</li>
+        <li><code>user_id</code> (Slack only): bot user ID for reply detection.</li>
+        <li><code>poll_interval_ms</code>: per-source polling override.</li>
+        </ul>
+
+        <h2 id="notifications"><a class="anchor-link" href="#notifications" aria-label="Link to Notifications">#</a>Notifications (<code>[notifiers.*]</code>)</h2>
+        <p>Claudear sends status updates and ask-loop questions through your notification channels. Some channels also support receiving replies.</p>
+        <h3 id="notifier-discord"><a class="anchor-link" href="#notifier-discord" aria-label="Link to Discord notifier">#</a>Discord (<code>[notifiers.discord]</code>)</h3>
+        <ul>
+        <li><code>webhook_url</code>: Discord webhook URL for outbound notifications.</li>
+        <li><code>user_id</code>: Discord user ID to mention in notifications.</li>
+        <li><code>bot_token</code>: bot token for reply polling and ask-loop questions.</li>
+        <li><code>channel_id</code>: channel ID to poll for replies.</li>
+        <li><code>guild_id</code>: guild (server) ID for constructing message URLs.</li>
+        </ul>
+        <h3 id="notifier-slack"><a class="anchor-link" href="#notifier-slack" aria-label="Link to Slack notifier">#</a>Slack (<code>[notifiers.slack]</code>)</h3>
+        <ul>
+        <li><code>bot_token</code>: Slack bot token (<code>xoxb-</code>) for API calls.</li>
+        <li><code>channel_id</code>: channel ID for notifications.</li>
+        <li><code>webhook_url</code>: incoming webhook URL (notification-only alternative to bot token).</li>
+        <li><code>user_id</code>: Slack user ID to mention in notifications.</li>
+        <li><code>workspace</code>: workspace name for constructing message URLs.</li>
+        </ul>
+        <h3 id="notifier-email"><a class="anchor-link" href="#notifier-email" aria-label="Link to Email notifier">#</a>Email (<code>[notifiers.email]</code>)</h3>
+        <ul>
+        <li><code>smtp_host</code>, <code>smtp_port</code>: SMTP server address and port.</li>
+        <li><code>smtp_username</code>, <code>smtp_password</code>: SMTP credentials.</li>
+        <li><code>from_address</code>: sender email address.</li>
+        <li><code>to_addresses</code>: list of recipient email addresses.</li>
+        <li><code>use_tls</code>: use TLS for SMTP (default: <code>true</code>).</li>
+        <li><code>imap_host</code>, <code>imap_port</code>: IMAP server for reply polling.</li>
+        <li><code>imap_username</code>, <code>imap_password</code>: IMAP credentials.</li>
+        <li><code>imap_use_tls</code>: use TLS for IMAP (default: <code>true</code>).</li>
+        <li><code>imap_folder</code>: IMAP folder to scan for replies (default: <code>"INBOX"</code>).</li>
+        </ul>
+        <h3 id="notifier-sms"><a class="anchor-link" href="#notifier-sms" aria-label="Link to SMS notifier">#</a>SMS (<code>[notifiers.sms]</code>)</h3>
+        <ul>
+        <li><code>account_sid</code>: Twilio account SID.</li>
+        <li><code>auth_token</code>: Twilio auth token.</li>
+        <li><code>from_number</code>: Twilio sender phone number.</li>
+        <li><code>to_numbers</code>: list of recipient phone numbers.</li>
+        </ul>
+        <h3 id="notifier-push"><a class="anchor-link" href="#notifier-push" aria-label="Link to Push notifier">#</a>Push (<code>[notifiers.push]</code>)</h3>
+        <ul>
+        <li><code>api_token</code>: Pushover application API token.</li>
+        <li><code>user_key</code>: Pushover user key.</li>
+        <li><code>device</code>: optional device name (sends to all devices when empty).</li>
+        <li><code>priority</code>: Pushover priority level (<code>-2</code> to <code>2</code>).</li>
+        </ul>
+        <h3 id="notifier-whatsapp"><a class="anchor-link" href="#notifier-whatsapp" aria-label="Link to WhatsApp notifier">#</a>WhatsApp (<code>[notifiers.whatsapp]</code>)</h3>
+        <ul>
+        <li><code>phone_number_id</code>: WhatsApp Business phone number ID.</li>
+        <li><code>access_token</code>: Meta Graph API access token.</li>
+        <li><code>to_numbers</code>: default recipient phone numbers.</li>
+        <li><code>source_enabled</code>: also treat incoming WhatsApp messages as issues (default: <code>false</code>).</li>
+        <li><code>listen_phone_number_id</code>: phone number ID for source mode (falls back to <code>phone_number_id</code>).</li>
+        <li><code>poll_interval_ms</code>: polling override for source mode.</li>
+        </ul>
+        <h3 id="notifier-telegram"><a class="anchor-link" href="#notifier-telegram" aria-label="Link to Telegram notifier">#</a>Telegram (<code>[notifiers.telegram]</code>)</h3>
+        <ul>
+        <li><code>bot_token</code>: Telegram Bot API token.</li>
+        <li><code>chat_id</code>: default chat ID for notifications.</li>
+        <li><code>to_chat_ids</code>: additional recipient chat IDs.</li>
+        <li><code>source_enabled</code>: also treat incoming Telegram messages as issues (default: <code>false</code>).</li>
+        <li><code>listen_chat_id</code>: chat ID for source mode (falls back to <code>chat_id</code>).</li>
+        <li><code>poll_interval_ms</code>: polling override for source mode.</li>
+        </ul>
+
+        <h2 id="advanced-features"><a class="anchor-link" href="#advanced-features" aria-label="Link to Advanced features">#</a>Advanced features</h2>
+        <p>These sections are entirely optional. You can skip them when getting started and enable them later as needed.</p>
+        <h3 id="regression"><a class="anchor-link" href="#regression" aria-label="Link to Regression monitoring">#</a>Regression monitoring (<code>[regression]</code>)</h3>
+        <p>After a fix ships, Claudear watches for regressions by monitoring Sentry error rates and matching new issues against recently merged fixes.</p>
+        <ul>
+        <li><code>enabled</code>: enable or disable regression monitoring.</li>
+        <li><code>check_interval_hours</code>: how often to check for regressions in hours.</li>
+        <li><code>monitoring_duration_hours</code>: how long to monitor after a release.</li>
+        <li><code>sentry_event_threshold</code>: minimum Sentry event count to consider a regression.</li>
+        <li><code>similarity_threshold</code>: semantic similarity threshold for matching related issues.</li>
+        <li><code>target_repos</code>: repositories whose merges indicate a release is live.</li>
+        <li><code>github_token</code>: optional GitHub token override (falls back to <code>scm.github.token</code>).</li>
+        <li><code>github_search_repos</code>: repositories to search for similar issues.</li>
+        </ul>
+        <h3 id="cascade"><a class="anchor-link" href="#cascade" aria-label="Link to Dependency cascades">#</a>Dependency cascades (<code>[cascade]</code>)</h3>
+        <p>When a library fix is released, Claudear automatically opens follow-up PRs in downstream repos that depend on it.</p>
+        <ul>
+        <li><code>enabled</code>: enable or disable cascade chaining.</li>
+        <li><code>max_depth</code>: maximum cascade depth (0 = unlimited).</li>
+        <li><code>[[cascade.rules]]</code>: per-upstream/downstream pair rules with <code>upstream</code>, <code>downstream</code>, <code>trigger</code> (<code>"merge"</code> or <code>"release"</code>), <code>target_branch</code>, <code>version_update</code>, and <code>instructions</code>.</li>
+        </ul>
+        <h3 id="learning"><a class="anchor-link" href="#learning" aria-label="Link to Continuous learning">#</a>Continuous learning (<code>[learning]</code>)</h3>
+        <p>Claudear learns from execution logs, merged PR diffs, review feedback, and Q&amp;A answers to improve future fix quality.</p>
+        <ul>
+        <li><code>auto_extract_learnings</code>: extract learnings from Claude execution logs.</li>
+        <li><code>diff_analysis</code>: analyze PR diffs on merge.</li>
+        <li><code>qa_promotion</code>: promote repeated Q&amp;A answers to standing instructions.</li>
+        <li><code>qa_promotion_threshold</code>: occurrences before a Q&amp;A answer is promoted.</li>
+        <li><code>repo_knowledge</code>: accumulate per-repo knowledge from successful fixes.</li>
+        <li><code>review_classification</code>: classify review feedback patterns.</li>
+        <li><code>review_promotion_threshold</code>: occurrences before a review pattern is promoted.</li>
+        <li><code>strategy_fingerprinting</code>: track how Claude approaches fixes.</li>
+        <li><code>quality_scoring</code>: score fix quality based on merge velocity.</li>
+        <li><code>cluster_detection</code>: detect clusters of correlated issues.</li>
+        <li><code>cluster_window_minutes</code>: time window for cluster detection.</li>
+        <li><code>min_cluster_size</code>: minimum issues to form a cluster.</li>
+        <li><code>auto_agent_md</code>: auto-generate an <code>AGENT.md</code> from accumulated knowledge.</li>
+        <li><code>cross_repo_correlation</code>: detect cross-repo failure correlation.</li>
+        <li><code>cross_repo_window_hours</code>: time window for cross-repo correlation.</li>
+        </ul>
+        <h3 id="prioritisation"><a class="anchor-link" href="#prioritisation" aria-label="Link to Prioritisation">#</a>Prioritisation (<code>[prioritisation]</code>)</h3>
+        <p>The prioritisation engine scores incoming issues based on severity, frequency, regression risk, blast radius, and content clustering.</p>
+        <ul>
+        <li><code>enabled</code>: enable or disable the prioritisation engine.</li>
+        <li><code>severity_weight</code>, <code>frequency_weight</code>, <code>regression_weight</code>, <code>blast_radius_weight</code>, <code>cluster_weight</code>: scoring weights (should sum to ~1.0).</li>
+        <li><code>critical_paths</code>, <code>core_paths</code>, <code>infra_paths</code>, <code>test_paths</code>, <code>cosmetic_paths</code>: path patterns for blast radius classification.</li>
+        <li><code>content_clustering</code>: group similar issues by error type and title.</li>
+        <li><code>cluster_similarity_threshold</code>: similarity threshold for clustering.</li>
+        <li><code>min_content_cluster_size</code>: minimum issues to form a content cluster.</li>
+        <li><code>suppression_rules</code>: rules to skip known-noisy issues before they consume processing slots. Each rule specifies <code>name</code>, <code>field</code>, <code>pattern</code>, <code>match_mode</code> (<code>"contains"</code> or <code>"regex"</code>), and optional <code>sources</code> filter.</li>
+        </ul>
+        <h3 id="code-index"><a class="anchor-link" href="#code-index" aria-label="Link to Code indexing">#</a>Code indexing (<code>[code_index]</code>)</h3>
+        <p>Tree-sitter based code indexing for semantic search across repositories. Used to give Claude richer codebase context when working on a fix.</p>
+        <ul>
+        <li><code>enabled</code>: enable or disable code indexing.</li>
+        <li><code>max_file_size_kb</code>: maximum file size to index in KB.</li>
+        <li><code>batch_size</code>: embedding batch size.</li>
+        </ul>
+        <h3 id="evaluation"><a class="anchor-link" href="#evaluation" aria-label="Link to Self-evaluation">#</a>Self-evaluation (<code>[evaluation]</code>)</h3>
+        <p>Runs before/after comparisons (tests, lint, static analysis, coverage) to validate fixes before submitting PRs. Opt-in because it can be slow.</p>
+        <ul>
+        <li><code>enabled</code>: enable or disable evaluation (default: <code>false</code>).</li>
+        <li><code>test_delta</code>: run test suite before/after comparison.</li>
+        <li><code>lint_delta</code>: run linter before/after comparison.</li>
+        <li><code>static_analysis_delta</code>: run static analysis before/after comparison.</li>
+        <li><code>coverage_delta</code>: run coverage before/after comparison (slowest).</li>
+        <li><code>tool_timeout_secs</code>: timeout per tool in seconds.</li>
+        <li><code>total_timeout_secs</code>: total timeout across all tools.</li>
+        <li><code>post_pr_comment</code>: post evaluation results as a PR comment.</li>
+        <li><code>fail_on_regression</code>: fail the fix attempt if a regression is detected.</li>
+        <li><code>custom_test_cmd</code>, <code>custom_lint_cmd</code>, <code>custom_analysis_cmd</code>, <code>custom_coverage_cmd</code>: custom command overrides (auto-detected when empty).</li>
+        </ul>
+        <h3 id="dashboard-config"><a class="anchor-link" href="#dashboard-config" aria-label="Link to Dashboard config">#</a>Dashboard (<code>[dashboard]</code>)</h3>
+        <p>Display and cost estimation settings for the web dashboard.</p>
+        <ul>
+        <li><code>max_plan_monthly_cost</code>: monthly cost of your Claude Max plan, used to estimate per-fix cost when token pricing is unavailable. Set to <code>0</code> to disable.</li>
+        <li><code>hourly_engineer_rate</code>: hourly engineer rate for cost-savings calculations (default: <code>75.0</code>).</li>
+        </ul>
+
+        <h2 id="minimal-config"><a class="anchor-link" href="#minimal-config" aria-label="Link to Minimal config to get started">#</a>Minimal config to get started</h2>
+        <p>You do not need to configure everything at once. A minimal setup to get Claudear running needs just:</p>
+        <ul>
+        <li><code>workspace</code>: a directory for cloned repos</li>
+        <li>One issue source (e.g. Linear with an API key and trigger labels)</li>
+        <li>One SCM backend (e.g. GitHub with a token)</li>
+        <li>One notifier (e.g. Discord or Slack)</li>
+        <li>Agent provider settings (or just use the defaults)</li>
+        </ul>
+        <p>Add <code>known_orgs</code> or <code>auto_discover_paths</code> if you have many repos and want Claudear to automatically figure out which repo an issue belongs to.</p>
+        <h2 id="full-annotated-example-config-appendix"><a class="anchor-link" href="#full-annotated-example-config-appendix" aria-label="Link to Full annotated example config (appendix)">#</a>Full annotated example config (appendix)</h2>
+        <pre><code class="language-toml"># ============================================
+# Claudear Configuration
+# ============================================
+# Copy this file to claudear.toml and fill in your values.
+# Environment variables can override any setting (useful for secrets in containers).
+
+# ============================================
+# Core
+# ============================================
+
+# Working directory where repositories are cloned
+workspace = &quot;~/.claudear/repos&quot;
+
+# SQLite database path (default: ./claudear.db)
+db_path = &quot;./claudear.db&quot;
+
+# Webhook server port (default: 3100)
+webhook_port = 3100
+
+# Polling interval in milliseconds (default: 300000 = 5 minutes)
+poll_interval_ms = 300000
+
+# Max issues to process per poll cycle (default: 5)
+max_issues_per_cycle = 5
+
+# Max concurrent issue processing (default: 1)
+max_concurrent = 1
+
+# Delay between processing issues in ms (default: 5000)
+processing_delay_ms = 5000
+
+# Maximum number of activity entries kept in IPC memory (default: 10000)
+max_activity_entries = 10000
+
+# IPC request timeout in seconds (default: 30)
+ipc_timeout_secs = 30
+
+# GitHub organizations to track
+# Repositories from these orgs will be indexed for issue-to-repo inference
+known_orgs = [
+    &quot;utopia-php&quot;,
+    &quot;appwrite&quot;,
+    &quot;appwrite-labs&quot;,
+    &quot;open-runtimes&quot;
+]
+
+# Paths to scan for local repository clones
+# These directories are scanned to find repos matching known_orgs
+auto_discover_paths = [&quot;~/Local&quot;]
+
+[retry]
+# Maximum retry attempts for failed fixes (default: 2)
+max_retries = 2
+
+# Base delay between retries in ms (default: 60000 = 1 minute)
+# Uses exponential backoff: delay = base_delay * 2^retry_count
+base_delay_ms = 60000
+
+# Maximum delay between retries in ms (default: 3600000 = 1 hour)
+max_delay_ms = 3600000
+
+# ============================================
+# Agent
+# ============================================
+# Supports multiple providers (Claude, Codex, etc.) and A/B experiments.
+
+[agent]
+# Default provider to use (default: &quot;claude&quot;)
+default_provider = &quot;claude&quot;
+
+# Agent process execution timeout in seconds (default: 21600 = 6 hours)
+timeout_secs = 21600
+
+[agent.providers.claude]
+# Model to use (default: Claude CLI default)
+# Options: sonnet, opus, haiku, or full model ID (e.g., claude-sonnet-4-5-20250929)
+model = &quot;sonnet&quot;
+
+# Custom instructions appended to Claude&#39;s system prompt
+instructions = &quot;Always write tests. Follow existing code style.&quot;
+
+# Path to a file containing custom instructions (relative to this config file)
+# If both instructions and instructions_file are set, file content comes first
+instructions_file = &quot;./claude-instructions.md&quot;
+
+# Tool permissions granted without prompting (--allowedTools)
+# See: https://docs.anthropic.com/en/docs/claude-code/settings
+permissions = [&quot;Bash(git *)&quot;, &quot;Read&quot;, &quot;Edit&quot;]
+
+# Skip all permission prompts (default: true)
+skip_permissions = true
+
+# ============================================
+# Users
+# ============================================
+# Map team members to their identifiers across services.
+# When an issue is assigned to a user, notifications are routed to them specifically.
+# Global config fields (e.g. notifiers.discord.user_id) can reference user slugs instead of raw IDs.
+
+[users.jake]
+# Source identifiers
+linear_name = &quot;Jake Barnby&quot;
+github_username = &quot;jakebarnby&quot;
+sentry_username = &quot;jake&quot;
+jira_username = &quot;jake.barnby&quot;
+gitlab_username = &quot;jakebarnby&quot;
+# Notification channel IDs
+discord_id = &quot;123456789012345678&quot;
+slack_id = &quot;U0123456789&quot;
+email = &quot;jake@example.com&quot;
+push_user_key = &quot;pushover_user_key&quot;
+sms_number = &quot;+1234567890&quot;
+whatsapp_number = &quot;+1234567890&quot;
+telegram_chat_id = &quot;123456789&quot;
+
+# ============================================
+# Human Q&amp;A Ask Loop
+# ============================================
+# Claude can ask blocking questions through all enabled notifiers.
+# Reply-capable channels: Discord, Slack, and Email.
+# Delivery is fan-out to all enabled channels; first reply wins.
+
+[ask]
+# Enable human Q&amp;A flow (default: true)
+enabled = true
+
+# Wait timeout for replies in seconds (default: 900)
+wait_timeout_secs = 900
+
+# Poll interval in seconds while waiting (default: 15)
+poll_interval_secs = 15
+
+# Maximum ask rounds per attempt before stopping (default: 2)
+max_rounds_per_attempt = 2
+
+# Semantic reuse threshold for source+repo matches (default: 0.82)
+semantic_threshold_scoped = 0.82
+
+# Semantic reuse threshold for global matches (default: 0.88)
+semantic_threshold_global = 0.88
+
+# Number of reuse candidates to include (default: 3)
+max_reuse_candidates = 3
+
+# On timeout, continue with uncertainty note instead of hard-fail (default: true)
+best_effort_on_timeout = true
+
+# ============================================
+# SCM (Source Control Management)
+# ============================================
+
+[scm.github]
+# GitHub personal access token (for checking PR status)
+token = &quot;ghp_xxxxxxxxxxxx&quot;
+
+# PR status check interval in milliseconds (default: 60000 = 1 minute)
+poll_interval_ms = 60000
+
+# Auto-resolve issues on Linear/Sentry when PRs merge (default: false)
+auto_resolve_on_merge = false
+
+# Optional: Webhook secret for verifying GitHub webhook signatures
+# Set via GITHUB_WEBHOOK_SECRET env var for security
+webhook_secret = &quot;&quot;
+
+# Trigger tag for GitHub review comments (default: @claudear)
+# Comments must include this tag to trigger Claude.
+# Set to empty string to respond to all comments.
+review_trigger = &quot;@claudear&quot;
+
+# Use SSH URLs for cloning instead of HTTPS (default: false)
+# Set to true if SSH keys are configured for GitHub.
+use_ssh = false
+
+# GitHub App Authentication (Optional)
+# Configure this section to use GitHub App authentication instead of PAT.
+
+[scm.github.app]
+# GitHub App ID
+app_id = &quot;&quot;
+
+# Path to private key PEM file (alternative to private_key)
+private_key_path = &quot;&quot;
+
+# Inline private key PEM content (alternative to private_key_path)
+private_key = &quot;&quot;
+
+# Optional: Webhook secret for GitHub App webhook verification
+# Set via GITHUB_APP_WEBHOOK_SECRET env var for security
+webhook_secret = &quot;&quot;
+
+# Optional: Installation ID (auto-detected if empty)
+installation_id = &quot;&quot;
+
+# Optional: OAuth Client ID for manifest/user auth flows
+client_id = &quot;&quot;
+
+# Optional: OAuth Client Secret
+client_secret = &quot;&quot;
+
+# Optional: Public base URL for GitHub App manifest flow
+base_url = &quot;&quot;
+
+[scm.gitlab]
+
+# Enable/disable GitLab source (default: false)
+enabled = true
+
+# GitLab personal access token
+# Set via GITLAB_TOKEN env var for security
+token = &quot;glpat-xxxxxxxxxxxx&quot;
+
+# GitLab base URL (default: &quot;https://gitlab.com&quot;)
+# For self-hosted instances, change to your GitLab URL
+base_url = &quot;https://gitlab.com&quot;
+
+# GitLab groups to monitor for issues
+groups = [&quot;my-group&quot;, &quot;my-group/subgroup&quot;]
+
+# Labels that trigger automation (default: [&quot;auto-implement&quot;, &quot;claude&quot;])
+trigger_labels = [&quot;auto-implement&quot;, &quot;claude&quot;]
+
+# States that trigger automation (default: [&quot;opened&quot;])
+trigger_states = [&quot;opened&quot;]
+
+# MR status check interval in milliseconds (default: 60000 = 1 minute)
+poll_interval_ms = 60000
+
+# Auto-resolve issues when MRs merge (default: false)
+auto_resolve_on_merge = false
+
+# Webhook secret for verifying GitLab webhook requests
+# Set via GITLAB_WEBHOOK_SECRET env var for security
+webhook_secret = &quot;&quot;
+
+# Trigger tag for MR review comments (default: @claudear)
+review_trigger = &quot;@claudear&quot;
+
+# Use SSH URLs for cloning instead of HTTPS (default: false)
+use_ssh = false
+
+# Per-source rate limiting (overrides global values if set)
+max_issues_per_cycle = 3
+max_concurrent = 2
+
+# ============================================
+# Issue Sources
+# ============================================
+# To use Linear, provide an API key from Linear Settings &gt; API
+
+[issues.linear]
+# Enable/disable Linear source (default: true if api_key provided)
+enabled = true
+
+# Linear API key (REQUIRED for Linear)
+api_key = &quot;lin_api_xxxx&quot;
+
+# Labels that trigger automation
+trigger_labels = [&quot;auto-implement&quot;, &quot;claude&quot;]
+
+# Optional: Only process issues assigned to this user (display name, case-insensitive).
+# When set, trigger_labels becomes optional — issues matching the assignee are
+# processed regardless of labels if trigger_labels is empty.
+trigger_assignee = &quot;Jane Smith&quot;
+
+# States that trigger automation
+trigger_states = [&quot;backlog&quot;, &quot;todo&quot;]
+
+# Optional: Filter by team ID
+team_id = &quot;&quot;
+
+# Optional: Filter by project ID
+project_id = &quot;&quot;
+
+# Optional: Webhook signature verification secret
+# Set via LINEAR_WEBHOOK_SECRET env var for security
+webhook_secret = &quot;&quot;
+
+# Per-source rate limiting (overrides global values if set)
+max_issues_per_cycle = 3
+max_concurrent = 2
+
+# Polling interval in milliseconds for Linear source (overrides global)
+# poll_interval_ms = 300000
+
+# To use Sentry, provide an auth token from https://sentry.io/settings/account/api/auth-tokens/
+
+[issues.sentry]
+# Enable/disable Sentry source (default: true if auth_token provided)
+enabled = true
+
+# Sentry auth token (REQUIRED for Sentry)
+auth_token = &quot;&quot;
+
+# Sentry organization slug (REQUIRED if using Sentry)
+org_slug = &quot;your-org&quot;
+
+# Optional: Filter by project slugs
+project_slugs = []
+
+# Number of top issues to fetch (default: 100)
+top_issues_count = 100
+
+# Time period for fetching top issues (default: 24h)
+# Options: 1h (1 hour), 12h (12 hours), 24h (1 day), 7d (1 week), 30d (1 month)
+top_issues_period = &quot;24h&quot;
+
+# Minimum event count for issue to be processed (default: 10)
+min_event_count = 10
+
+# Percentage increase to consider issue escalating (default: 50)
+escalation_threshold_percent = 50
+
+# Optional: Webhook client secret for signature verification
+# Set via SENTRY_CLIENT_SECRET env var for security
+client_secret = &quot;&quot;
+
+# Per-source rate limiting (overrides global values if set)
+max_issues_per_cycle = 2
+max_concurrent = 4
+
+# Polling interval in milliseconds for Sentry source (overrides global)
+# poll_interval_ms = 300000
+
+# To use Jira Cloud, provide an API token from https://id.atlassian.com/manage-profile/security/api-tokens
+# To use Jira Server/DC, provide a personal access token (PAT).
+
+[issues.jira]
+# Enable/disable Jira source (default: true if api_token provided)
+enabled = true
+
+# Jira base URL (REQUIRED for Jira)
+# Cloud: &quot;https://your-domain.atlassian.net&quot;
+# Server/DC: &quot;https://jira.your-company.com&quot;
+base_url = &quot;&quot;
+
+# Email address for Basic auth (REQUIRED for Jira Cloud)
+email = &quot;&quot;
+
+# API token (Cloud) or personal access token (Server/DC)
+# Set via JIRA_API_TOKEN env var for security
+api_token = &quot;&quot;
+
+# Authentication mode: &quot;basic&quot; (email:token, Jira Cloud) or &quot;bearer&quot; (PAT, Server/DC)
+auth_mode = &quot;basic&quot;
+
+# Jira project keys to monitor (e.g., [&quot;PROJ&quot;, &quot;BACKEND&quot;])
+project_keys = []
+
+# Labels that trigger automation (default: [&quot;auto-implement&quot;, &quot;claude&quot;])
+trigger_labels = [&quot;auto-implement&quot;, &quot;claude&quot;]
+
+# Statuses that trigger automation (default: [&quot;To Do&quot;, &quot;Backlog&quot;])
+trigger_statuses = [&quot;To Do&quot;, &quot;Backlog&quot;]
+
+# Optional: Only process issues assigned to this user (display name).
+# When set, trigger_labels becomes optional — issues matching the assignee are
+# processed regardless of labels if trigger_labels is empty.
+trigger_assignee = &quot;Jane Smith&quot;
+
+# Optional: Filter by issue types (e.g., [&quot;Bug&quot;, &quot;Task&quot;, &quot;Story&quot;])
+issue_types = [&quot;Bug&quot;, &quot;Task&quot;]
+
+# Optional: Custom JQL appended to the generated query
+custom_jql = &quot;priority = High&quot;
+
+# Maximum results per search request (default: 50, max: 100)
+max_results = 50
+
+# Per-source rate limiting (overrides global values if set)
+max_issues_per_cycle = 3
+max_concurrent = 2
+poll_interval_ms = 300000
+
+# Discord as an issue source (messages become issues)
+# Shared credentials (bot_token, channel_id) are inherited from notifiers.discord if not set here.
+
+[issues.discord]
+# Bot token for reading messages (inherited from notifiers.discord if omitted)
+# bot_token = &quot;&quot;
+
+# Channel to listen for issue messages
+# listen_channel_id = &quot;&quot;
+
+# Guild (server) ID for constructing message URLs
+# guild_id = &quot;&quot;
+
+# Polling interval in milliseconds (overrides global)
+# poll_interval_ms = 300000
+
+# Slack as an issue source (messages become issues)
+# Shared credentials (bot_token, channel_id) are inherited from notifiers.slack if not set here.
+
+[issues.slack]
+# Bot token for reading messages (inherited from notifiers.slack if omitted)
+# bot_token = &quot;&quot;
+
+# Channel to listen for issue messages
+# listen_channel_id = &quot;&quot;
+
+# Workspace name for constructing message URLs
+# workspace = &quot;mycompany&quot;
+
+# Polling interval in milliseconds (overrides global)
+# poll_interval_ms = 300000
+
+# ============================================
+# Notifiers
+# ============================================
+
+[notifiers.discord]
+# Discord webhook URL for notifications
+webhook_url = &quot;https://discord.com/api/webhooks/...&quot;
+
+# Discord user ID to mention in notifications
+user_id = &quot;&quot;
+
+# Bot token for reply polling (required for Discord replies and ask-questions)
+bot_token = &quot;&quot;
+
+# Channel ID to poll for replies
+channel_id = &quot;&quot;
+
+# Guild (server) ID for constructing message URLs
+guild_id = &quot;&quot;
+
+[notifiers.slack]
+# Slack Bot Token (xoxb-) for API calls
+bot_token = &quot;&quot;
+
+# Slack channel ID for notifications
+channel_id = &quot;&quot;
+
+# Incoming Webhook URL (optional, notification-only alternative to bot token)
+# webhook_url = &quot;https://hooks.slack.com/services/...&quot;
+
+# Slack user ID to mention in notifications
+user_id = &quot;&quot;
+
+# Workspace name for constructing message URLs
+# workspace = &quot;mycompany&quot;
+
+[notifiers.email]
+# SMTP server host
+smtp_host = &quot;smtp.gmail.com&quot;
+
+# SMTP server port (default: 587)
+smtp_port = 587
+
+# SMTP username
+smtp_username = &quot;&quot;
+
+# SMTP password
+smtp_password = &quot;&quot;
+
+# Sender email address
+from_address = &quot;&quot;
+
+# Recipient email addresses
+to_addresses = []
+
+# Use TLS (default: true)
+use_tls = true
+
+# IMAP host for reply polling (required for Email replies)
+imap_host = &quot;imap.gmail.com&quot;
+
+# IMAP port (default: 993)
+imap_port = 993
+
+# IMAP username
+imap_username = &quot;&quot;
+
+# IMAP password
+imap_password = &quot;&quot;
+
+# Use TLS for IMAP (default: true)
+imap_use_tls = true
+
+# IMAP folder to scan for replies (default: INBOX)
+imap_folder = &quot;INBOX&quot;
+
+[notifiers.sms]
+# Twilio Account SID
+account_sid = &quot;&quot;
+
+# Twilio Auth Token
+auth_token = &quot;&quot;
+
+# Twilio phone number (sender)
+from_number = &quot;&quot;
+
+# Recipient phone numbers
+to_numbers = []
+
+[notifiers.push]
+# Pushover API token
+api_token = &quot;&quot;
+
+# Pushover user key
+user_key = &quot;&quot;
+
+# Optional: Device name (sends to all devices if empty)
+device = &quot;&quot;
+
+# Optional: Priority (-2 to 2)
+priority = 0
+
+[notifiers.whatsapp]
+# WhatsApp Business phone number ID
+# phone_number_id = &quot;&quot;
+
+# Meta Graph API access token
+# access_token = &quot;&quot;
+
+# Default recipient phone numbers
+# to_numbers = []
+
+[notifiers.telegram]
+# Telegram Bot API token
+# bot_token = &quot;&quot;
+
+# Default chat ID for notifications
+# chat_id = &quot;&quot;
+
+# Additional recipient chat IDs
+# to_chat_ids = []
+
+# ============================================
+# Monitoring
+# ============================================
+# Sentry error monitoring (set via environment variables):
+#   SENTRY_DSN          - Sentry DSN for backend error reporting (disabled when empty/unset)
+#   SENTRY_ENVIRONMENT  - Environment name (e.g. &quot;production&quot;, &quot;staging&quot;)
+#
+# Tracks post-fix regressions after releases.
+
+[regression]
+# Enable/disable regression monitoring (default: true)
+enabled = true
+
+# How often to check for regressions in hours (default: 1)
+check_interval_hours = 1
+
+# Monitoring window duration after release in hours (default: 24)
+monitoring_duration_hours = 24
+
+# Minimum Sentry event count to consider regression candidate (default: 1)
+sentry_event_threshold = 1
+
+# Semantic similarity threshold for matching related issues (default: 0.75)
+similarity_threshold = 0.75
+
+# Target repositories that indicate releases are live
+target_repos = []
+
+# Optional: GitHub token override for regression issue search
+# Falls back to scm.github.token when empty
+github_token = &quot;&quot;
+
+# Optional: Repositories to search for similar issues
+github_search_repos = []
+
+# Optional: Repo name -&gt; package name overrides when they differ
+# Each repo can map to multiple package names.
+# [regression.package_names]
+# &quot;utopia-php/database&quot; = [&quot;utopia-php/database&quot;]
+
+# Enables chained follow-up fixes across repositories.
+
+[cascade]
+# Enable/disable cascade chaining (default: false)
+enabled = false
+
+# Maximum cascade depth (default: 0 = unlimited)
+max_depth = 0
+
+# Per-dependency cascade rules (optional).
+# Each rule controls how a specific upstream-&gt;downstream pair is cascaded.
+# If no rule matches, default behavior applies (trigger on release, update version).
+
+# [[cascade.rules]]
+# upstream = &quot;org/library&quot;
+# downstream = &quot;org/application&quot;
+# trigger = &quot;release&quot;         # &quot;merge&quot; or &quot;release&quot; (default)
+# target_branch = &quot;develop&quot;   # Override downstream branch (default: repo default)
+# version_update = true       # Update dependency version in downstream (default: true)
+# instructions = &quot;Run composer install after updating the dependency&quot;
+
+# ============================================
+# Continuous Learning
+# ============================================
+# Accumulates knowledge from Claude&#39;s execution logs, PR diffs, Q&amp;A answers,
+# and review feedback to improve future fix quality.
+
+[learning]
+# Auto-extract learnings from Claude execution logs (default: true)
+auto_extract_learnings = true
+
+# Analyze PR diffs on merge (default: true)
+diff_analysis = true
+
+# Promote repeated Q&amp;A answers to standing instructions (default: true)
+qa_promotion = true
+
+# Minimum occurrences before Q&amp;A answer is promoted (default: 2)
+qa_promotion_threshold = 2
+
+# Accumulate per-repo knowledge from successful fixes (default: true)
+repo_knowledge = true
+
+# Classify review feedback patterns (default: true)
+review_classification = true
+
+# Minimum occurrences before review pattern is promoted (default: 3)
+review_promotion_threshold = 3
+
+# Track how Claude approaches fixes (default: true)
+strategy_fingerprinting = true
+
+# Score fix quality based on merge velocity (default: true)
+quality_scoring = true
+
+# Detect clusters of correlated issues (default: true)
+cluster_detection = true
+
+# Time window for cluster detection in minutes (default: 30)
+cluster_window_minutes = 30
+
+# Minimum issues to form a cluster (default: 3)
+min_cluster_size = 3
+
+# Auto-generate AGENT.md from accumulated knowledge (default: false)
+auto_agent_md = false
+
+# ============================================
+# Prioritisation Engine
+# ============================================
+# Computes composite severity scores from multiple signals, classifies blast
+# radius, clusters content-similar issues, and evaluates suppression rules.
+
+[prioritisation]
+# Enable/disable the prioritisation engine (default: true).
+# When false, the legacy two-level sort (MatchPriority then IssuePriority) is used.
+enabled = true
+
+# Component weights (must sum to ~1.0 for intuitive scores)
+severity_weight = 0.30
+frequency_weight = 0.25
+regression_weight = 0.20
+blast_radius_weight = 0.15
+cluster_weight = 0.10
+
+# Path patterns for blast radius classification.
+# Issues touching these paths are classified at the corresponding tier.
+# Case-insensitive segment matching (split on /, \, ., _, -) against filename, function, and culprit metadata.
+critical_paths = [&quot;auth&quot;, &quot;payment&quot;, &quot;billing&quot;, &quot;security&quot;, &quot;login&quot;, &quot;oauth&quot;]
+core_paths = [&quot;api&quot;, &quot;core&quot;, &quot;middleware&quot;, &quot;router&quot;, &quot;handler&quot;]
+infra_paths = [&quot;deploy&quot;, &quot;infra&quot;, &quot;ci&quot;, &quot;docker&quot;, &quot;terraform&quot;, &quot;k8s&quot;, &quot;database&quot;, &quot;migration&quot;]
+test_paths = [&quot;test&quot;, &quot;spec&quot;, &quot;fixture&quot;, &quot;mock&quot;]
+cosmetic_paths = [&quot;readme&quot;, &quot;changelog&quot;, &quot;license&quot;, &quot;docs&quot;, &quot;md&quot;]
+
+# Content clustering (groups similar issues by error type + culprit + title similarity)
+content_clustering = true
+cluster_similarity_threshold = 0.60
+min_content_cluster_size = 2
+
+# Suppression rules: skip known-noisy issues before they consume processing slots.
+# Each rule matches a field against a pattern. First matching rule wins.
+# suppression_rules = [
+#     { name = &quot;flaky-ci&quot;, field = &quot;title&quot;, pattern = &quot;flaky&quot;, match_mode = &quot;contains&quot;, reason = &quot;Known flaky test&quot; },
+#     { name = &quot;rate-limits&quot;, field = &quot;error_type&quot;, pattern = &quot;RateLimitError&quot;, match_mode = &quot;contains&quot;, sources = [&quot;sentry&quot;], reason = &quot;Transient rate limit errors&quot; },
+#     { name = &quot;docs-typos&quot;, field = &quot;filename&quot;, pattern = &quot;readme&quot;, match_mode = &quot;contains&quot;, reason = &quot;Cosmetic documentation issues&quot; },
+#     { name = &quot;bot-noise&quot;, field = &quot;title&quot;, pattern = &quot;^\\[bot\\]&quot;, match_mode = &quot;regex&quot;, reason = &quot;Automated bot issues&quot; },
+# ]
+
+# ============================================
+# Code Indexing
+# ============================================
+# Tree-sitter based code indexing for semantic search across repositories.
+
+[code_index]
+# Enable tree-sitter code indexing (default: true)
+enabled = true
+
+# Maximum file size to index in KB (default: 1024)
+max_file_size_kb = 1024
+
+# Embedding batch size (default: 32)
+batch_size = 32
+
+# ============================================
+# Self-Evaluation
+# ============================================
+# Runs before/after comparisons (tests, lint, static analysis, coverage)
+# to validate fixes before submitting PRs.
+
+[evaluation]
+# Enable evaluation (default: false, opt-in — can be slow)
+enabled = false
+
+# Run test before/after comparison (default: true)
+test_delta = true
+
+# Run lint before/after comparison (default: true)
+lint_delta = true
+
+# Run static analysis before/after comparison (default: true)
+static_analysis_delta = true
+
+# Run coverage before/after comparison (default: false, slowest)
+coverage_delta = false
+
+# Timeout per tool in seconds (default: 300)
+tool_timeout_secs = 300
+
+# Total timeout for all tools in seconds (default: 900)
+total_timeout_secs = 900
+
+# Post evaluation results as PR comment (default: true)
+post_pr_comment = true
+
+# Fail the fix attempt on regression (default: false)
+fail_on_regression = false
+
+# Custom command overrides (auto-detected when empty)
+# custom_test_cmd = &quot;npm test&quot;
+# custom_lint_cmd = &quot;npm run lint&quot;
+# custom_analysis_cmd = &quot;phpstan analyse&quot;
+# custom_coverage_cmd = &quot;npm run coverage&quot;
+
+# ============================================
+# Dashboard
+# ============================================
+# Display and cost estimation settings for the web dashboard.
+
+[dashboard]
+# Monthly cost of Claude Max plan (used to estimate per-fix cost when
+# total_cost_usd is not available from CLI). Set to 0 to disable. (default: 0.0)
+max_plan_monthly_cost = 0.0
+
+# Hourly engineer rate for cost-savings calculation (default: 75.0)
+hourly_engineer_rate = 75.0</code></pre>
+      </article>
+      <div class="grid grid-cols-2 gap-4 mt-12 max-w-[780px]">
+        <a href="./getting-started.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Getting Started</span>
+        </a>
+        <a href="./usage.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Next</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Usage</span>
+        </a>
+      </div>
+      <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
+    </main>
+  </div>
+
+  <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>
+  <script src="./assets/docs.js"></script>
+</body>
+</html>

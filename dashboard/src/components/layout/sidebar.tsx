@@ -6,7 +6,7 @@ import { prefetchRouteData } from '../../lib/route-prefetch'
 import {
   BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
-  Users, LogOut, Gauge, Settings, Sun, Moon, Ticket, GraduationCap,
+  Users, LogOut, Gauge, Settings, Sun, Moon, Ticket, GraduationCap, BookOpen,
 } from 'lucide-react'
 import { setSentryColorScheme } from '../../lib/sentry'
 
@@ -168,6 +168,15 @@ export function Sidebar() {
             </div>
           </button>
           <div className="flex items-center gap-0.5">
+            <a
+              href="/docs/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="p-1.5 rounded hover:bg-muted text-muted-foreground"
+              title="Documentation"
+            >
+              <BookOpen className="h-4 w-4" />
+            </a>
             <button
               onClick={() => setDark(d => !d)}
               className="p-1.5 rounded hover:bg-muted text-muted-foreground"
