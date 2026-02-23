@@ -1,0 +1,159 @@
+//! Shared storage types used across trait signatures and API responses.
+
+use serde::Serialize;
+use std::collections::HashMap;
+
+/// A user row from the database.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserRow {
+    pub id: i64,
+    pub email: String,
+    #[serde(skip_serializing)]
+    pub password_hash: String,
+    pub name: String,
+    pub role: String,
+    pub avatar_url: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// An indexed repository stored in the database.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredIndexedRepo {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+    pub scm_url: Option<String>,
+    pub default_branch: String,
+    pub file_count: i64,
+    pub last_indexed_at: String,
+    pub created_at: String,
+}
+
+/// Index statistics.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexStats {
+    pub repo_count: usize,
+    pub file_count: usize,
+    pub last_indexed_at: Option<String>,
+}
+
+/// Current indexing progress.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IndexingProgress {
+    pub status: String,
+    pub total_repos: usize,
+    pub indexed_repos: usize,
+    pub current_repo: Option<String>,
+    pub current_repo_files: usize,
+    pub total_files_indexed: usize,
+    pub started_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl Default for IndexingProgress {
+    fn default() -> Self {
+        Self {
+            status: "idle".to_string(),
+            total_repos: 0,
+            indexed_repos: 0,
+            current_repo: None,
+            current_repo_files: 0,
+            total_files_indexed: 0,
+            started_at: None,
+            updated_at: None,
+        }
+    }
+}
+
+/// Inference statistics.
+#[derive(Debug, Clone, Serialize)]
+pub struct InferenceStats {
+    pub total_attempts: usize,
+    pub with_feedback: usize,
+    pub correct: usize,
+    pub accuracy: f64,
+    pub by_confidence: ConfidenceBreakdown,
+}
+
+/// Breakdown by confidence level.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfidenceBreakdown {
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+    pub none: usize,
+}
+
+/// A single inference attempt from the history.
+#[derive(Debug, Clone, Serialize)]
+pub struct InferenceHistoryEntry {
+    pub id: i64,
+    pub issue_id: String,
+    pub issue_source: String,
+    pub extracted_keywords: Option<String>,
+    pub inferred_repo_name: Option<String>,
+    pub confidence: Option<String>,
+    pub inference_reason: Option<String>,
+    pub was_correct: Option<bool>,
+    pub duration_ms: Option<i64>,
+    pub created_at: String,
+}
+
+/// A repository stored in the database.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredRepository {
+    pub id: i64,
+    pub name: String,
+    pub path: Option<String>,
+    pub scm_url: String,
+    pub created_at: String,
+}
+
+/// A dependency relationship stored in the database.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredDependency {
+    pub id: i64,
+    pub upstream: String,
+    pub downstream: String,
+    pub dep_type: String,
+    pub created_at: String,
+}
+
+/// Diagnostic counts for all major tables.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticCounts {
+    pub fix_attempts: i64,
+    pub fix_attempts_by_status: HashMap<String, i64>,
+    pub activity_log: i64,
+    pub claude_executions: i64,
+    pub pr_reviews: i64,
+    pub pr_review_states: i64,
+    pub issues: i64,
+    pub similar_issues: i64,
+    pub repositories: i64,
+    pub repo_files: i64,
+    pub inference_attempts: i64,
+    pub error_patterns: i64,
+    pub processing_metrics: i64,
+    pub feedback_outcomes: i64,
+    pub prs: i64,
+    pub recent_fix_attempts: Vec<(String, String, String, String)>,
+}
+
+/// A stored PR review comment from the database.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredPrReviewComment {
+    pub id: i64,
+    pub scm_comment_id: i64,
+    pub pr_url: String,
+    pub review_id: Option<i64>,
+    pub path: String,
+    pub position: Option<i64>,
+    pub line: Option<i64>,
+    pub body: String,
+    pub author: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+}

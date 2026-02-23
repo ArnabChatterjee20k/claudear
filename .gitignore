@@ -22,4 +22,4 @@ vectorlite.dylib
 vectorlite.so
 claudear.toml
 workspace
-storage
+/storage/
