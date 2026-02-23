@@ -150,6 +150,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
                 "s1",
                 None,
                 Some(&repos_dir),
+                true, // reset volume for fresh start
             )?
         } else {
             let binary = ctx.binary_path()?;
@@ -216,6 +217,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
                 "s1",
                 None,
                 Some(&repos_dir),
+                true, // reset volume for fresh start
             )?
         } else {
             let binary = ctx.binary_path()?;

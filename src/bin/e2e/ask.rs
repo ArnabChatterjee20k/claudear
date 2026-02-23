@@ -103,14 +103,18 @@ impl E2eAsk for DiscordAsk {
                 .await
                 .unwrap_or_default();
 
-            // Look for a message with embeds (bot ask question format)
+            // Look for an ask question embed (title contains "Input needed")
             for msg in &messages {
-                if !msg.embeds.is_empty() {
-                    tracing::info!(
-                        msg_id = %msg.id,
-                        "Found ask question embed"
-                    );
-                    return Ok(msg.id.clone());
+                for embed in &msg.embeds {
+                    if let Some(ref title) = embed.title {
+                        if title.contains("Input needed") {
+                            tracing::info!(
+                                msg_id = %msg.id,
+                                "Found ask question embed"
+                            );
+                            return Ok(msg.id.clone());
+                        }
+                    }
                 }
             }
 

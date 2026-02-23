@@ -122,6 +122,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             "s3",
             None,
             Some(&repos_dir),
+            true, // reset volume for fresh start
         )?
     } else {
         let binary = ctx.binary_path()?;

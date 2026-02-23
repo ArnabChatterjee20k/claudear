@@ -109,6 +109,11 @@ fn get_keychain_oauth_token() -> Option<String> {
 }
 
 /// Start a Docker daemon container.
+///
+/// When `reset_volume` is true the named volume is destroyed and recreated so
+/// the daemon starts with a clean database.  Pass `false` when restarting
+/// mid-scenario to preserve DB state.
+#[allow(clippy::too_many_arguments)]
 pub fn start_docker(
     image: &str,
     config_path: &Path,
@@ -117,12 +122,20 @@ pub fn start_docker(
     label: &str,
     volume_name: Option<&str>,
     repos_dir: Option<&Path>,
+    reset_volume: bool,
 ) -> Result<DaemonHandle> {
     std::fs::create_dir_all(log_dir)?;
     let log_path = log_dir.join(format!("{}.log", label));
 
     let default_vol = format!("claudear-e2e-db-{}", port);
     let vol = volume_name.unwrap_or(&default_vol);
+
+    if reset_volume {
+        // Remove stale volume from previous run (ignore errors if it doesn't exist)
+        let _ = Command::new("docker")
+            .args(["volume", "rm", "-f", vol])
+            .output();
+    }
 
     // Ensure volume exists
     let _ = Command::new("docker")

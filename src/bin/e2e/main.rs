@@ -151,7 +151,7 @@ fn build_source(cli: &Cli) -> Result<Arc<dyn IssueSource>> {
             let webhook_url = std::env::var("CLAUDEAR_E2E_DISCORD_WEBHOOK_URL")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .map(|s| claudear::secret::SecretValue::new(s));
+                .map(claudear::secret::SecretValue::new);
             let config = claudear::config::DiscordConfig {
                 bot_token: Some(bot_token.into()),
                 channel_id: Some(channel_id.clone()),
@@ -171,7 +171,7 @@ fn build_source(cli: &Cli) -> Result<Arc<dyn IssueSource>> {
             let webhook_url = std::env::var("CLAUDEAR_E2E_SLACK_WEBHOOK_URL")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .map(|s| claudear::secret::SecretValue::new(s));
+                .map(claudear::secret::SecretValue::new);
             let config = claudear::config::SlackConfig {
                 bot_token: Some(bot_token.into()),
                 channel_id: Some(channel_id.clone()),
