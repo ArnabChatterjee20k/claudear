@@ -275,40 +275,36 @@ fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {
     }
 
     let discord = config.discord_merged();
-    if discord.source_enabled {
-        if discord.bot_token.is_some()
+    if discord.source_enabled
+        && discord.bot_token.is_some()
             && (discord.listen_channel_id.is_some() || discord.channel_id.is_some())
         {
             sources.push(Arc::new(DiscordSource::new(discord)));
         }
-    }
 
     let slack = config.slack_merged();
-    if slack.source_enabled {
-        if slack.bot_token.is_some()
+    if slack.source_enabled
+        && slack.bot_token.is_some()
             && (slack.listen_channel_id.is_some() || slack.channel_id.is_some())
         {
             sources.push(Arc::new(SlackSource::new(slack)));
         }
-    }
 
-    if config.notifiers.whatsapp.source_enabled {
-        if config.notifiers.whatsapp.access_token.is_some()
+    if config.notifiers.whatsapp.source_enabled
+        && config.notifiers.whatsapp.access_token.is_some()
             && config.notifiers.whatsapp.phone_number_id.is_some()
         {
             sources.push(Arc::new(WhatsAppSource::new(
                 config.notifiers.whatsapp.clone(),
             )));
         }
-    }
 
-    if config.notifiers.telegram.source_enabled {
-        if config.notifiers.telegram.bot_token.is_some() {
+    if config.notifiers.telegram.source_enabled
+        && config.notifiers.telegram.bot_token.is_some() {
             sources.push(Arc::new(TelegramSource::new(
                 config.notifiers.telegram.clone(),
             )));
         }
-    }
 
     sources
         .into_iter()

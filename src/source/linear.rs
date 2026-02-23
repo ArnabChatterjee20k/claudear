@@ -544,6 +544,7 @@ impl<H: LinearHttpClient + 'static> IssueSource for LinearSource<H> {
             nodes: Vec<WorkflowState>,
         }
         #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
         struct WorkflowState {
             id: String,
             name: String,

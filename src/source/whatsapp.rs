@@ -219,7 +219,7 @@ impl IssueSource for WhatsAppSource {
 
         let resp = http
             .post(&url)
-            .bearer_auth(&access_token)
+            .bearer_auth(access_token)
             .json(&payload)
             .send()
             .await

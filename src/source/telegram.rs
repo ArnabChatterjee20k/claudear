@@ -173,10 +173,10 @@ impl TelegramSource {
             if let Some(ref username) = user.username {
                 issue.set_metadata("author_username", username);
             }
-            issue.set_metadata("author_id", &user.id.to_string());
+            issue.set_metadata("author_id", user.id.to_string());
         }
-        issue.set_metadata("chat_id", &msg.chat.id.to_string());
-        issue.set_metadata("message_id", &msg.message_id.to_string());
+        issue.set_metadata("chat_id", msg.chat.id.to_string());
+        issue.set_metadata("message_id", msg.message_id.to_string());
 
         issue
     }
@@ -232,11 +232,10 @@ impl IssueSource for TelegramSource {
     }
 
     async fn fetch_issues(&self) -> Result<Vec<Issue>> {
-        let last_id = self
+        let last_id = *self
             .last_update_id
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .unwrap_or_else(|e| e.into_inner());
 
         // Build getUpdates URL with optional offset.
         let mut url = self.api_url("getUpdates")?;
@@ -296,11 +295,11 @@ impl IssueSource for TelegramSource {
             .filter_map(|u| u.message.as_ref())
             .inspect(|msg| self.record_ask_reply_candidate(msg))
             // Skip bot messages.
-            .filter(|msg| msg.from.as_ref().map_or(true, |user| !user.is_bot))
+            .filter(|msg| msg.from.as_ref().is_none_or(|user| !user.is_bot))
             // Skip messages without text.
-            .filter(|msg| msg.text.as_ref().map_or(false, |t| !t.trim().is_empty()))
+            .filter(|msg| msg.text.as_ref().is_some_and(|t| !t.trim().is_empty()))
             // Filter to listen_chat_id if configured.
-            .filter(|msg| listen_chat.map_or(true, |cid| msg.chat.id == cid))
+            .filter(|msg| listen_chat.is_none_or(|cid| msg.chat.id == cid))
             .map(|msg| {
                 self.cache_message(msg);
                 Self::message_to_issue(msg)
@@ -779,7 +778,7 @@ mod tests {
         let bot_msg = make_message(1, "bot says hi", true);
         let human_msg = make_message(2, "human says hi", false);
 
-        let is_bot = |msg: &TelegramMessage| msg.from.as_ref().map_or(false, |u| u.is_bot);
+        let is_bot = |msg: &TelegramMessage| msg.from.as_ref().is_some_and(|u| u.is_bot);
 
         assert!(is_bot(&bot_msg));
         assert!(!is_bot(&human_msg));
@@ -791,7 +790,7 @@ mod tests {
         let valid_msg = make_message(2, "hello", false);
 
         let has_text =
-            |msg: &TelegramMessage| msg.text.as_ref().map_or(false, |t| !t.trim().is_empty());
+            |msg: &TelegramMessage| msg.text.as_ref().is_some_and(|t| !t.trim().is_empty());
 
         assert!(!has_text(&empty_msg));
         assert!(has_text(&valid_msg));
@@ -813,7 +812,7 @@ mod tests {
         };
 
         let has_text =
-            |msg: &TelegramMessage| msg.text.as_ref().map_or(false, |t| !t.trim().is_empty());
+            |msg: &TelegramMessage| msg.text.as_ref().is_some_and(|t| !t.trim().is_empty());
 
         assert!(!has_text(&msg));
     }
@@ -835,7 +834,7 @@ mod tests {
         };
 
         let listen: Option<i64> = Some(-1001234567890);
-        let matches_chat = |msg: &TelegramMessage| listen.map_or(true, |cid| msg.chat.id == cid);
+        let matches_chat = |msg: &TelegramMessage| listen.is_none_or(|cid| msg.chat.id == cid);
 
         assert!(matches_chat(&msg_right));
         assert!(!matches_chat(&msg_wrong));
@@ -845,7 +844,7 @@ mod tests {
     fn test_no_chat_filter_passes_all() {
         let msg = make_message(1, "hello", false);
         let listen: Option<i64> = None;
-        let matches_chat = |msg: &TelegramMessage| listen.map_or(true, |cid| msg.chat.id == cid);
+        let matches_chat = |msg: &TelegramMessage| listen.is_none_or(|cid| msg.chat.id == cid);
         assert!(matches_chat(&msg));
     }
 

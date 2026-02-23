@@ -4042,7 +4042,7 @@ mod tests {
         mock.mock_get(
             "https://sentry.io/api/0/issues/12345/events/latest/",
             200,
-            &event_json.to_string(),
+            event_json.to_string(),
         );
         let source = SentrySource::with_http_client(config, mock);
 
@@ -4395,13 +4395,13 @@ mod tests {
             }
         ]);
         mock.mock_get(
-            &format!(
+            format!(
                 "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=date&limit=100",
                 config.org_slug,
                 urlencoding::encode("is:unresolved is:escalating")
             ),
             200,
-            &escalating_issue.to_string(),
+            escalating_issue.to_string(),
         );
 
         // Top issues endpoint returns the same issue (duplicate)
@@ -4425,7 +4425,7 @@ mod tests {
             }
         ]);
         mock.mock_get(
-            &format!(
+            format!(
                 "https://sentry.io/api/0/organizations/{}/issues/?query={}&sort=freq&limit={}&statsPeriod={}",
                 config.org_slug,
                 urlencoding::encode("is:unresolved"),
@@ -4433,7 +4433,7 @@ mod tests {
                 config.top_issues_period.to_stats_period()
             ),
             200,
-            &top_issues.to_string(),
+            top_issues.to_string(),
         );
 
         let source = SentrySource::with_http_client(config, mock);

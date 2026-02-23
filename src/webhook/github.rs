@@ -465,7 +465,7 @@ mod tests {
             token: Some("test_token".into()),
             poll_interval_ms: 60000,
             auto_resolve_on_merge: false,
-            webhook_secret: webhook_secret.map(|s| SecretValue::new(s)),
+            webhook_secret: webhook_secret.map(SecretValue::new),
             review_trigger: "@claudear".to_string(),
             use_ssh: false,
             ..Default::default()
@@ -821,9 +821,8 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Missing event header should return Ok(false)"
         );
     }
@@ -838,9 +837,8 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Unknown event type should return Ok(false)"
         );
     }
@@ -872,9 +870,8 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "Valid review submitted for watched PR should return Ok(true)"
         );
     }
@@ -892,7 +889,7 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert_eq!(result.unwrap(), false, "No watcher should return Ok(false)");
+        assert!(!result.unwrap(), "No watcher should return Ok(false)");
     }
 
     #[tokio::test]
@@ -921,9 +918,8 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Unwatched PR should return Ok(false)"
         );
     }
@@ -960,9 +956,8 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "Valid comment created for watched PR should return Ok(true)"
         );
     }
@@ -992,9 +987,8 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Comment on unwatched PR should return Ok(false)"
         );
     }
@@ -1007,9 +1001,8 @@ mod tests {
         let payload = serde_json::json!({ "action": "edited" });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Non-submitted action should return Ok(false)"
         );
     }
@@ -1023,9 +1016,8 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Missing review field should return Ok(false)"
         );
     }
@@ -1043,9 +1035,8 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Missing pull_request field should return Ok(false)"
         );
     }
@@ -1072,7 +1063,7 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(result.unwrap(), false, "Bot review should return Ok(false)");
+        assert!(!result.unwrap(), "Bot review should return Ok(false)");
     }
 
     #[tokio::test]
@@ -1097,9 +1088,8 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Pending review should return Ok(false)"
         );
     }
@@ -1112,9 +1102,8 @@ mod tests {
         let payload = serde_json::json!({ "action": "edited" });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Non-created action should return Ok(false)"
         );
     }
@@ -1128,9 +1117,8 @@ mod tests {
         });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Missing comment field should return Ok(false)"
         );
     }
@@ -1162,9 +1150,8 @@ mod tests {
         });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Bot comment should return Ok(false)"
         );
     }
@@ -2023,7 +2010,7 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert_eq!(result.unwrap(), false, "Ping event should be ignored");
+        assert!(!result.unwrap(), "Ping event should be ignored");
     }
 
     #[tokio::test]
@@ -2036,7 +2023,7 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert_eq!(result.unwrap(), false, "Issues event should be ignored");
+        assert!(!result.unwrap(), "Issues event should be ignored");
     }
 
     #[tokio::test]
@@ -2049,9 +2036,8 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Check suite event should be ignored"
         );
     }
@@ -2067,9 +2053,8 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "pull_request event (not review) should be ignored"
         );
     }
@@ -2084,7 +2069,7 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert_eq!(result.unwrap(), false, "Empty event type should be ignored");
+        assert!(!result.unwrap(), "Empty event type should be ignored");
     }
 
     #[tokio::test]
@@ -2124,9 +2109,8 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Missing action should be treated as non-submitted"
         );
     }
@@ -2137,9 +2121,8 @@ mod tests {
         let payload = serde_json::json!({ "action": "dismissed" });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Dismissed action should return Ok(false)"
         );
     }
@@ -2177,9 +2160,8 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "CHANGES_REQUESTED review on watched PR should return Ok(true)"
         );
     }
@@ -2217,9 +2199,8 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "COMMENTED review on watched PR should return Ok(true)"
         );
     }
@@ -2246,9 +2227,8 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Lowercase 'pending' should also be skipped"
         );
     }
@@ -2272,7 +2252,7 @@ mod tests {
 
         // No watcher, so returns Ok(false) — but should not panic
         let result = handler.handle_review_submitted(&payload).await;
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     // handle_review_comment — additional cases
@@ -2283,9 +2263,8 @@ mod tests {
         let payload = serde_json::json!({ "action": "edited" });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Edited comment action should return Ok(false)"
         );
     }
@@ -2296,9 +2275,8 @@ mod tests {
         let payload = serde_json::json!({ "action": "deleted" });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Deleted comment action should return Ok(false)"
         );
     }
@@ -2320,9 +2298,8 @@ mod tests {
         });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Missing action should be treated as non-created"
         );
     }
@@ -2344,9 +2321,8 @@ mod tests {
         });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Missing pull_request field should return Ok(false)"
         );
     }
@@ -2358,7 +2334,7 @@ mod tests {
         let payload = comment_created_payload(pr_url);
 
         let result = handler.handle_review_comment(&payload).await;
-        assert_eq!(result.unwrap(), false, "No watcher should return Ok(false)");
+        assert!(!result.unwrap(), "No watcher should return Ok(false)");
     }
 
     // constructor and handler struct tests
@@ -2436,7 +2412,7 @@ mod tests {
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[tokio::test]
@@ -2493,7 +2469,7 @@ mod tests {
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[tokio::test]
@@ -2536,7 +2512,7 @@ mod tests {
             .process_webhook(payload, &serde_json::json!([]), &headers)
             .await;
         // action will be None -> unwrap_or("") -> not "submitted" -> Ok(false)
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]
@@ -2570,7 +2546,7 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     // Header validation edge cases

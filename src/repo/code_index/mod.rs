@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn test_sha256_hex_different_inputs_different_hashes() {
-        let inputs = vec!["a", "b", "c", "ab", "abc", "A", "B"];
+        let inputs = ["a", "b", "c", "ab", "abc", "A", "B"];
         let hashes: Vec<String> = inputs.iter().map(|i| sha256_hex(i)).collect();
         for i in 0..hashes.len() {
             for j in (i + 1)..hashes.len() {

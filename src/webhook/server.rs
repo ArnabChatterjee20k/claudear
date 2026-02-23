@@ -118,6 +118,7 @@ impl WebhookServer {
     }
 
     /// Create a new webhook server with optional GitHub review webhook handling.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_github(
         config: Config,
         handlers: WebhookHandlerRegistry,
@@ -3515,7 +3516,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
-        assert!(json["handlers"].as_array().unwrap().len() >= 1);
+        assert!(!json["handlers"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4789,7 +4790,7 @@ mod tests {
 
         // Should have roughly half remaining
         assert!(processing.len() < MAX_PROCESSING_ENTRIES);
-        assert!(processing.len() > 0);
+        assert!(!processing.is_empty());
     }
 
     // ---------------------------------------------------------------
@@ -6067,7 +6068,7 @@ mod tests {
         };
 
         let mut issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
-        issue.set_metadata("resolved_user", &"some-user".to_string());
+        issue.set_metadata("resolved_user", "some-user".to_string());
         assert!(issue.get_metadata::<String>("resolved_user").is_some());
 
         // Hard error should trigger escalation (global notification with resolved_user removed)
@@ -6104,7 +6105,7 @@ mod tests {
         };
 
         let mut issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
-        issue.set_metadata("resolved_user", &"some-user".to_string());
+        issue.set_metadata("resolved_user", "some-user".to_string());
 
         // Normal error should NOT remove resolved_user (the original issue is passed as-is)
         let result =
@@ -7017,7 +7018,7 @@ mod tests {
                 "https://test.com",
                 "labeled",
             );
-            issue.set_metadata("labels", &vec!["bug".to_string(), "critical".to_string()]);
+            issue.set_metadata("labels", vec!["bug".to_string(), "critical".to_string()]);
             Ok(Some(issue))
         }
         fn matches_criteria(&self, _issue: &Issue) -> MatchResult {

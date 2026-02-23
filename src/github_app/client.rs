@@ -560,7 +560,7 @@ zvWGmeHev+iEP/vneCazbHGQpeC1zFX+P+tQr/zhl1klmnSGl6Zs3w==
         // so exp - iat ~ 660 seconds
         let diff = exp - iat;
         assert!(
-            diff >= 600 && diff <= 720,
+            (600..=720).contains(&diff),
             "exp - iat should be ~660 seconds (got {})",
             diff
         );

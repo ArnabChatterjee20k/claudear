@@ -184,6 +184,7 @@ fn default_weight() -> f64 {
 /// SCM (Source Control Management) configuration group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ScmConfig {
     /// GitHub configuration for PR monitoring and issue management.
     pub github: GitHubConfig,
@@ -191,14 +192,6 @@ pub struct ScmConfig {
     pub gitlab: Option<GitLabConfig>,
 }
 
-impl Default for ScmConfig {
-    fn default() -> Self {
-        Self {
-            github: GitHubConfig::default(),
-            gitlab: None,
-        }
-    }
-}
 
 /// Issue sources configuration group.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4089,17 +4082,21 @@ trigger_labels = ["label1", "label2"]
 
     #[test]
     fn test_regression_config_effective_seconds_overrides() {
-        let mut config = RegressionConfig::default();
-        config.check_interval_secs = Some(10);
-        config.monitoring_duration_secs = Some(30);
+        let config = RegressionConfig {
+            check_interval_secs: Some(10),
+            monitoring_duration_secs: Some(30),
+            ..Default::default()
+        };
         assert_eq!(config.effective_check_interval_secs(), 10);
         assert_eq!(config.effective_monitoring_duration_secs(), 30);
     }
 
     #[test]
     fn test_regression_config_effective_check_interval_min_clamp() {
-        let mut config = RegressionConfig::default();
-        config.check_interval_secs = Some(0);
+        let config = RegressionConfig {
+            check_interval_secs: Some(0),
+            ..Default::default()
+        };
         // Should clamp to 1 second minimum
         assert_eq!(config.effective_check_interval_secs(), 1);
     }

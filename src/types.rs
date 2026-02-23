@@ -4681,9 +4681,11 @@ mod tests {
 
     #[test]
     fn test_fix_attempt_stats_serde_roundtrip() {
-        let mut stats = FixAttemptStats::default();
-        stats.total = 100;
-        stats.success = 50;
+        let mut stats = FixAttemptStats {
+            total: 100,
+            success: 50,
+            ..Default::default()
+        };
         stats.by_source.insert(
             "sentry".to_string(),
             SourceStats {

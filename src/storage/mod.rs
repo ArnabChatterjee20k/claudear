@@ -1019,6 +1019,7 @@ pub trait FixAttemptTracker: Send + Sync {
     // --- Inference ---
 
     /// Record an inference attempt. Returns the row ID.
+    #[allow(clippy::too_many_arguments)]
     fn record_inference_attempt(
         &self,
         _issue_id: &str,

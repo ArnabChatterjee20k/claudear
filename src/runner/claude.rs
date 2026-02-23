@@ -3097,7 +3097,7 @@ mod tests {
 
         assert_eq!(label, "custom");
         // Should not contain any issue-specific env vars
-        assert!(env.get("LINEAR_ISSUE_ID").is_none());
+        assert!(!env.contains_key("LINEAR_ISSUE_ID"));
     }
 
     #[test]

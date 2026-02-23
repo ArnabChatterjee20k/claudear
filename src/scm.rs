@@ -1246,6 +1246,17 @@ impl ReviewWatcher {
     }
 }
 
+// Backward-compatibility aliases
+
+/// Alias for backward compatibility (was `PrReview` in github.rs).
+pub type PrReview = CodeReview;
+/// Alias for backward compatibility (was `PrReviewComment` in github.rs).
+pub type PrReviewComment = ReviewComment;
+/// Alias for backward compatibility (was `GitHubUser` in github.rs).
+pub type GitHubUser = ReviewUser;
+/// Alias for backward compatibility (was `OrgRepo` in github.rs).
+pub type OrgRepo = RemoteRepo;
+
 // Tests
 
 #[cfg(test)]
@@ -1360,7 +1371,7 @@ mod tests {
     #[test]
     fn pr_status_clone() {
         let status = PrStatus::Merged;
-        let cloned = status.clone();
+        let cloned = status;
         assert_eq!(status, cloned);
     }
 
@@ -2116,10 +2127,12 @@ mod tests {
         use std::collections::{HashMap, HashSet};
         use std::sync::{Arc, Mutex};
 
+        type PrStatusMap = Arc<Mutex<HashMap<(String, i64), Result<PrStatus>>>>;
+
         /// A mock SCM provider that returns configurable PrStatus per (repo, pr_number).
         struct MockPrScmProvider {
             enabled: bool,
-            statuses: Arc<Mutex<HashMap<(String, i64), Result<PrStatus>>>>,
+            statuses: PrStatusMap,
         }
 
         impl MockPrScmProvider {
@@ -4540,9 +4553,11 @@ mod tests {
         use std::collections::{HashMap, HashSet};
         use std::sync::{Arc, Mutex};
 
+        type PrStatusMap = Arc<Mutex<HashMap<(String, i64), Result<PrStatus>>>>;
+
         struct MockPrScmProvider {
             enabled: bool,
-            statuses: Arc<Mutex<HashMap<(String, i64), Result<PrStatus>>>>,
+            statuses: PrStatusMap,
         }
 
         impl MockPrScmProvider {
@@ -5629,14 +5644,3 @@ mod tests {
         }
     }
 }
-
-// Backward-compatibility aliases
-
-/// Alias for backward compatibility (was `PrReview` in github.rs).
-pub type PrReview = CodeReview;
-/// Alias for backward compatibility (was `PrReviewComment` in github.rs).
-pub type PrReviewComment = ReviewComment;
-/// Alias for backward compatibility (was `GitHubUser` in github.rs).
-pub type GitHubUser = ReviewUser;
-/// Alias for backward compatibility (was `OrgRepo` in github.rs).
-pub type OrgRepo = RemoteRepo;

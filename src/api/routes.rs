@@ -4230,7 +4230,7 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp["period"], "hour");
         assert_eq!(resp["bucket_minutes"], 5);
-        assert!(resp["points"].as_array().unwrap().len() > 0);
+        assert!(!resp["points"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4268,7 +4268,7 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp["period"], "week");
         assert!(resp["overall"].is_object());
-        assert!(resp["histogram"].as_array().unwrap().len() > 0);
+        assert!(!resp["histogram"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -5672,7 +5672,7 @@ mod tests {
         assert!(resp["windows"].as_array().unwrap().len() == 3);
         assert!(resp["queue"].is_object());
         assert!(resp["processing_time"].is_object());
-        assert!(resp["source_breakdown"].as_array().unwrap().len() > 0);
+        assert!(!resp["source_breakdown"].as_array().unwrap().is_empty());
         assert!(resp["pr_analytics"].is_object());
     }
 
@@ -5795,7 +5795,7 @@ mod tests {
 
         assert_eq!(resp["period"], "week");
         assert!(resp["overall"]["samples"].as_i64().unwrap() > 0);
-        assert!(resp["by_status"].as_array().unwrap().len() > 0);
+        assert!(!resp["by_status"].as_array().unwrap().is_empty());
 
         // Verify histogram has 6 buckets (5 defined + 1 overflow)
         let histogram = resp["histogram"].as_array().unwrap();
@@ -5875,7 +5875,7 @@ mod tests {
         assert!(resp["totals"]["matched"].as_f64().unwrap() > 0.0);
         assert!(resp["conversion"]["match_rate"].as_f64().is_some());
         assert!(resp["poll_load"]["poll_cycles"].as_i64().unwrap() > 0);
-        assert!(resp["per_source"].as_array().unwrap().len() > 0);
+        assert!(!resp["per_source"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -6491,10 +6491,10 @@ mod tests {
         for i in 0..5 {
             let entry = crate::types::ActivityLogEntry::new(
                 "issue_received",
-                &format!("Received PROJ-{}", i),
+                format!("Received PROJ-{}", i),
             )
             .with_source("linear")
-            .with_issue(&format!("issue-{}", i), &format!("PROJ-{}", i));
+            .with_issue(format!("issue-{}", i), format!("PROJ-{}", i));
             tracker.record_activity(&entry).unwrap();
         }
 

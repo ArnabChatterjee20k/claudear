@@ -1609,7 +1609,7 @@ mod tests {
             &tracker,
             &std::collections::HashMap::new(),
         );
-        assert!(result.len() >= 1);
+        assert!(!result.is_empty());
 
         let score = &result[0].severity_score;
         // All components should be at or near 1.0
@@ -4239,9 +4239,9 @@ mod tests {
             .enumerate()
             .map(|(i, source)| {
                 let mut issue = crate::types::Issue::new(
-                    &format!("src-{}", i),
-                    &format!("src-{}", i),
-                    &format!("Bug from {}", source),
+                    format!("src-{}", i),
+                    format!("src-{}", i),
+                    format!("Bug from {}", source),
                     "url",
                     *source,
                 );

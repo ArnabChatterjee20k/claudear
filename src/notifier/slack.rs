@@ -2842,7 +2842,7 @@ mod tests {
         };
         let msg = build_report_message(&report);
 
-        assert!(msg.text.len() > 0);
+        assert!(!msg.text.is_empty());
         let blocks = msg.blocks.unwrap();
         assert_eq!(blocks.len(), 3); // Header + Section + Context
         let block_json = serde_json::to_string(&blocks).unwrap();

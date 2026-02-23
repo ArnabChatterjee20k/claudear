@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn test_truncate_output_very_small_max() {
         let s = "hello world this is a test string";
-        let result = truncate_output(&s, 5);
+        let result = truncate_output(s, 5);
         assert!(result.ends_with("...[truncated]"));
     }
 

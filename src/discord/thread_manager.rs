@@ -3210,24 +3210,22 @@ mod tests {
     #[test]
     fn test_color_constants_are_valid_hex_colors() {
         // Discord colors must be in range 0x000000..=0xFFFFFF
-        assert!(colors::SUCCESS <= 0xFFFFFF);
-        assert!(colors::ERROR <= 0xFFFFFF);
-        assert!(colors::INFO <= 0xFFFFFF);
-        assert!(colors::WARNING <= 0xFFFFFF);
-        assert!(colors::PURPLE <= 0xFFFFFF);
-        assert!(colors::REVIEW <= 0xFFFFFF);
+        const { assert!(colors::SUCCESS <= 0xFFFFFF) };
+        const { assert!(colors::ERROR <= 0xFFFFFF) };
+        const { assert!(colors::INFO <= 0xFFFFFF) };
+        const { assert!(colors::WARNING <= 0xFFFFFF) };
+        const { assert!(colors::PURPLE <= 0xFFFFFF) };
+        const { assert!(colors::REVIEW <= 0xFFFFFF) };
     }
 
     #[test]
     fn test_each_color_is_unique() {
-        let all_colors = vec![
-            colors::SUCCESS,
+        let all_colors = [colors::SUCCESS,
             colors::ERROR,
             colors::INFO,
             colors::WARNING,
             colors::PURPLE,
-            colors::REVIEW,
-        ];
+            colors::REVIEW];
         let unique: std::collections::HashSet<_> = all_colors.iter().collect();
         assert_eq!(
             unique.len(),

@@ -1824,7 +1824,7 @@ use std::process;
         let skeleton = build_skeleton_chunk(
             &lines,
             &container,
-            &[container.clone()],
+            std::slice::from_ref(&container),
             Language::Rust,
             1,
             "empty_big.rs",

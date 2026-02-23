@@ -160,9 +160,9 @@ fn extract_number_before(line: &str, keyword: &str) -> Option<u32> {
     num_str.parse().ok()
 }
 
-fn parse_detekt_line(
-    line: &str,
-) -> Option<(String, Option<u32>, Option<u32>, String, Option<String>)> {
+type LintMatch = (String, Option<u32>, Option<u32>, String, Option<String>);
+
+fn parse_detekt_line(line: &str) -> Option<LintMatch> {
     // Format: "path/File.kt:10:5: Description [RuleName]"
     let parts: Vec<&str> = line.splitn(4, ':').collect();
     if parts.len() < 4 {
@@ -189,9 +189,7 @@ fn parse_detekt_line(
     Some((file, line_num, col, message, code))
 }
 
-fn parse_ktlint_line(
-    line: &str,
-) -> Option<(String, Option<u32>, Option<u32>, String, Option<String>)> {
+fn parse_ktlint_line(line: &str) -> Option<LintMatch> {
     // Format: "path/File.kt:10:5: Description (rule-name)"
     let parts: Vec<&str> = line.splitn(4, ':').collect();
     if parts.len() < 4 {
@@ -687,8 +685,8 @@ mod tests {
     #[test]
     fn test_extract_xml_attr_val_floating_point() {
         assert_eq!(
-            extract_xml_attr_val(r#"<counter missed="3.14"/>"#, "missed"),
-            Some(3.14)
+            extract_xml_attr_val(r#"<counter missed="3.25"/>"#, "missed"),
+            Some(3.25)
         );
     }
 
