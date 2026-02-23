@@ -506,11 +506,11 @@ fn init_logging(
 }
 
 fn format_interval_compact(ms: u64) -> String {
-    if ms % 3_600_000 == 0 {
+    if ms.is_multiple_of(3_600_000) {
         format!("{}h", ms / 3_600_000)
-    } else if ms % 60_000 == 0 {
+    } else if ms.is_multiple_of(60_000) {
         format!("{}m", ms / 60_000)
-    } else if ms % 1_000 == 0 {
+    } else if ms.is_multiple_of(1_000) {
         format!("{}s", ms / 1_000)
     } else {
         format!("{}ms", ms)
@@ -535,6 +535,7 @@ fn print_startup_ok(message: impl AsRef<str>) {
     println!("  [ok] {}", message.as_ref());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_startup_banner_and_status(
     config: &Config,
     config_path: &str,
