@@ -377,19 +377,6 @@ pub struct Config {
     /// Dashboard display configuration.
     #[serde(default)]
     pub dashboard: DashboardConfig,
-    /// Optional tenant identifier for multi-tenant deployments.
-    /// Defaults to "default" when absent (single-tenant mode).
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// Optional PostgreSQL database URL for cloud deployments.
-    /// When set, uses PostgresBackend instead of SQLite.
-    #[serde(default)]
-    pub database_url: Option<String>,
-    /// Optional Redis URL for caching (e.g., "redis://localhost:6379").
-    /// When set alongside database_url, single-row reads are cached and writes
-    /// invalidate the cache. Ignored when database_url is not set.
-    #[serde(default)]
-    pub redis_url: Option<String>,
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -446,9 +433,6 @@ impl Default for Config {
             evaluation: EvaluationConfig::default(),
             storage_dir: default_storage_dir(),
             dashboard: DashboardConfig::default(),
-            tenant_id: None,
-            database_url: None,
-            redis_url: None,
         }
     }
 }

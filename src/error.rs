@@ -126,20 +126,6 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-#[cfg(feature = "postgres")]
-impl From<tokio_postgres::Error> for Error {
-    fn from(e: tokio_postgres::Error) -> Self {
-        Error::Database(e.to_string())
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl From<deadpool_postgres::PoolError> for Error {
-    fn from(e: deadpool_postgres::PoolError) -> Self {
-        Error::Database(e.to_string())
-    }
-}
-
 /// Result type alias for the application.
 pub type Result<T> = std::result::Result<T, Error>;
 

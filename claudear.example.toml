@@ -41,17 +41,6 @@ bind_address = "127.0.0.1"
 # General-purpose storage directory for user uploads (default: "./storage")
 storage_dir = "./storage"
 
-# Optional: Tenant identifier for multi-tenant deployments (default: "default")
-# tenant_id = ""
-
-# Optional: PostgreSQL database URL for cloud deployments
-# When set, uses PostgresBackend instead of SQLite
-# database_url = "postgresql://user:pass@host:5432/claudear"
-
-# Optional: Redis URL for caching (requires database_url)
-# When set alongside database_url, single-row reads are cached and writes invalidate the cache
-# redis_url = "redis://localhost:6379"
-
 # GitHub organizations to track
 # Repositories from these orgs will be indexed for issue-to-repo inference
 known_orgs = [
