@@ -19,10 +19,90 @@ const DASHBOARD_DIR = join(ROOT, 'dashboard');
 const DIST_DIR = join(DASHBOARD_DIR, 'dist');
 const OUTPUT_DIR = join(ROOT, 'assets', 'screenshots');
 const WEBSITE_SCREENSHOTS_DIR = join(ROOT, 'website', 'assets', 'screenshots');
-const WEBSITE_LINKED_SCREENSHOTS = new Set(['overview', 'analytics', 'telemetry']);
+const WEBSITE_LINKED_SCREENSHOTS = new Set([
+  'overview',
+  'analytics',
+  'telemetry',
+  'attempts',
+  'issues',
+  'prs',
+  'errors',
+  'regressions',
+  'repos',
+  'inference',
+  'activity',
+]);
+const WEBP_QUALITY = Number.parseInt(process.env.SCREENSHOT_WEBP_QUALITY ?? '88', 10);
+const WEBP_METHOD = Number.parseInt(process.env.SCREENSHOT_WEBP_METHOD ?? '6', 10);
 
 await mkdir(OUTPUT_DIR, { recursive: true });
 await mkdir(WEBSITE_SCREENSHOTS_DIR, { recursive: true });
+
+function ensureCwebpAvailable() {
+  try {
+    const probe = Bun.spawnSync(['cwebp', '-version'], {
+      stdout: 'ignore',
+      stderr: 'ignore',
+    });
+    if (probe.exitCode === 0) return;
+  } catch {
+    // handled below
+  }
+
+  console.error(
+    'Missing `cwebp` (libwebp) on PATH. Install it first (e.g. `brew install webp`) to generate optimized website screenshots.',
+  );
+  process.exit(1);
+}
+
+function assertWebpSettings() {
+  if (Number.isNaN(WEBP_QUALITY) || WEBP_QUALITY < 0 || WEBP_QUALITY > 100) {
+    throw new Error(`SCREENSHOT_WEBP_QUALITY must be between 0 and 100 (got "${process.env.SCREENSHOT_WEBP_QUALITY}")`);
+  }
+  if (Number.isNaN(WEBP_METHOD) || WEBP_METHOD < 0 || WEBP_METHOD > 6) {
+    throw new Error(`SCREENSHOT_WEBP_METHOD must be between 0 and 6 (got "${process.env.SCREENSHOT_WEBP_METHOD}")`);
+  }
+}
+
+function encodeWebp(inputPngPath: string, outputWebpPath: string) {
+  const proc = Bun.spawnSync(
+    [
+      'cwebp',
+      '-quiet',
+      '-q',
+      String(WEBP_QUALITY),
+      '-m',
+      String(WEBP_METHOD),
+      '-mt',
+      '-af',
+      inputPngPath,
+      '-o',
+      outputWebpPath,
+    ],
+    {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
+
+  if (proc.exitCode !== 0) {
+    const stderr = new TextDecoder().decode(proc.stderr).trim();
+    throw new Error(`cwebp failed for ${inputPngPath}: ${stderr || `exit code ${proc.exitCode}`}`);
+  }
+}
+
+async function unlinkIfExists(path: string) {
+  try {
+    await unlink(path);
+  } catch (err) {
+    if (!(err instanceof Error) || !('code' in err) || (err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw err;
+    }
+  }
+}
+
+assertWebpSettings();
+ensureCwebpAvailable();
 
 // ── 1. Build dashboard ──────────────────────────────────────────────────
 
@@ -143,32 +223,33 @@ function failIfUnmatchedApiRoutes(context: string) {
 async function linkWebsiteScreenshot(name: string) {
   if (!WEBSITE_LINKED_SCREENSHOTS.has(name)) return;
 
-  const sourcePath = join(OUTPUT_DIR, `${name}.png`);
-  const linkPath = join(WEBSITE_SCREENSHOTS_DIR, `${name}.png`);
+  const sourcePath = join(OUTPUT_DIR, `${name}.webp`);
+  const linkPath = join(WEBSITE_SCREENSHOTS_DIR, `${name}.webp`);
   const targetFromWebsiteDir = relative(dirname(linkPath), sourcePath);
 
-  try {
-    await unlink(linkPath);
-  } catch (err) {
-    if (!(err instanceof Error) || !('code' in err) || (err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw err;
-    }
-  }
+  await unlinkIfExists(linkPath);
+  // Remove legacy PNG links so the website only points at WebP outputs.
+  await unlinkIfExists(join(WEBSITE_SCREENSHOTS_DIR, `${name}.png`));
 
   await symlink(targetFromWebsiteDir, linkPath);
   console.log(`  Linked ${linkPath} -> ${targetFromWebsiteDir}`);
 }
 
 async function pruneManagedWebsiteScreenshots(targetNames: string[]) {
-  const managedTargetFiles = new Set(targetNames.map((name) => `${name}.png`));
-  const linkedFiles = new Set([...WEBSITE_LINKED_SCREENSHOTS].map((name) => `${name}.png`));
+  const managedNames = new Set(targetNames);
 
   for (const entry of await readdir(WEBSITE_SCREENSHOTS_DIR)) {
-    if (!entry.endsWith('.png')) continue;
-    if (!managedTargetFiles.has(entry)) continue;
-    if (linkedFiles.has(entry)) continue;
-    await unlink(join(WEBSITE_SCREENSHOTS_DIR, entry));
-    console.log(`  Removed stale website screenshot ${join(WEBSITE_SCREENSHOTS_DIR, entry)}`);
+    const match = entry.match(/^(.*)\.(png|webp)$/);
+    if (!match) continue;
+
+    const [, name, ext] = match;
+    if (!managedNames.has(name)) continue;
+
+    const shouldKeep = ext === 'webp' && WEBSITE_LINKED_SCREENSHOTS.has(name);
+    if (shouldKeep) continue;
+
+    await unlinkIfExists(join(WEBSITE_SCREENSHOTS_DIR, entry));
+    console.log(`  Removed unused website screenshot link ${join(WEBSITE_SCREENSHOTS_DIR, entry)}`);
   }
 }
 
@@ -244,25 +325,32 @@ try {
     }
 
     const outPath = join(OUTPUT_DIR, `${target.name}.png`);
+    const webpOutPath = join(OUTPUT_DIR, `${target.name}.webp`);
     const newBytes = await page.screenshot({ fullPage: false });
     const newHash = Bun.hash(newBytes);
+    let pngChanged = true;
 
     const existing = Bun.file(outPath);
     if (await existing.exists()) {
       const oldHash = Bun.hash(new Uint8Array(await existing.arrayBuffer()));
       if (oldHash === newHash) {
-        console.log(`  Skipped ${target.name} (unchanged)`);
-        continue;
+        pngChanged = false;
+        console.log(`  PNG unchanged for ${target.name}`);
       }
     }
 
-    await Bun.write(outPath, newBytes);
-    console.log(`  Saved ${outPath}`);
+    if (pngChanged) {
+      await Bun.write(outPath, newBytes);
+      console.log(`  Saved ${outPath}`);
+    }
+
+    encodeWebp(outPath, webpOutPath);
+    console.log(`  Saved optimized ${webpOutPath}`);
     await linkWebsiteScreenshot(target.name);
   }
 
   await pruneManagedWebsiteScreenshots(targets.map((t) => t.name));
-  console.log(`\nDone! ${targets.length} screenshots saved to ${OUTPUT_DIR}`);
+  console.log(`\nDone! ${targets.length} screenshots saved to ${OUTPUT_DIR} (.png + optimized .webp)`);
 } finally {
   // ── 5. Cleanup ────────────────────────────────────────────────────────
   console.log('[4/4] Cleaning up...');
