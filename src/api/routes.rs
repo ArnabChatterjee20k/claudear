@@ -2469,7 +2469,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            work_dir: "/tmp/repos".into(),
+            workspace: "/tmp/repos".into(),
             known_orgs: vec!["test-org".to_string()],
             auto_discover_paths: vec![],
             poll_interval_ms: 300_000,
@@ -3597,7 +3597,7 @@ mod tests {
 
         // Write a temp config file
         let config_path = std::env::temp_dir().join("claudear_test_config.toml");
-        std::fs::write(&config_path, "# test config\nwork_dir = \"/tmp\"\n").unwrap();
+        std::fs::write(&config_path, "# test config\nworkspace = \"/tmp\"\n").unwrap();
 
         let indexing_rx = test_indexing_rx(&tracker);
         let router = create_api_router(config, tracker.clone(), config_path.clone(), indexing_rx)
@@ -3611,7 +3611,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(resp["content"].as_str().unwrap().contains("work_dir"));
+        assert!(resp["content"].as_str().unwrap().contains("workspace"));
         assert!(resp["path"].is_null(), "path field should not be exposed");
 
         // Cleanup
@@ -4739,7 +4739,7 @@ mod tests {
 
     #[test]
     fn test_redact_secrets_no_secrets() {
-        let content = "work_dir = \"/tmp/repos\"\npoll_interval_ms = 300000\n";
+        let content = "workspace = \"/tmp/repos\"\npoll_interval_ms = 300000\n";
         let redacted = redact_secrets(content);
         assert!(!redacted.contains("[REDACTED]"));
         assert!(redacted.contains("/tmp/repos"));
@@ -5150,10 +5150,10 @@ mod tests {
     #[test]
     fn test_config_response_serialization() {
         let resp = ConfigResponse {
-            content: "work_dir = \"/tmp\"".to_string(),
+            content: "workspace = \"/tmp\"".to_string(),
         };
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("work_dir"));
+        assert!(json.contains("workspace"));
         assert!(json.contains("content"));
     }
 
@@ -6324,7 +6324,7 @@ mod tests {
 
         // Verify file was written
         let saved = std::fs::read_to_string(&config_path).unwrap();
-        assert!(saved.contains("work_dir"));
+        assert!(saved.contains("workspace"));
 
         // Cleanup
         let _ = std::fs::remove_file(&config_path);

@@ -41,17 +41,17 @@ impl IndexedRepo {
 
     /// Create a repository discovered via GitHub API.
     ///
-    /// The path is set to `work_dir/{repo_name}` where repos will be cloned.
+    /// The path is set to `workspace/{repo_name}` where repos will be cloned.
     pub fn from_api(
         name: impl Into<String>,
         scm_url: impl Into<String>,
         default_branch: impl Into<String>,
-        work_dir: &Path,
+        workspace: &Path,
     ) -> Self {
         let name = name.into();
         // Extract repo name from full_name (org/repo)
         let repo_name = name.split('/').next_back().unwrap_or(&name);
-        let path = work_dir.join(repo_name);
+        let path = workspace.join(repo_name);
         Self {
             name,
             path,
@@ -185,7 +185,7 @@ impl RepoIndex {
     /// # Arguments
     /// * `known_orgs` - GitHub organization names to fetch repos from
     /// * `client` - GitHub API client with token configured
-    /// * `work_dir` - Directory where repos will be cloned to
+    /// * `workspace` - Directory where repos will be cloned to
     /// * `use_ssh` - Whether to use SSH URLs for cloning
     ///
     /// # Returns
@@ -193,7 +193,7 @@ impl RepoIndex {
     pub async fn build_from_github(
         known_orgs: &[String],
         client: &GitHubClient,
-        work_dir: &Path,
+        workspace: &Path,
         use_ssh: bool,
     ) -> Result<Self> {
         let mut index = Self::new();
@@ -213,7 +213,7 @@ impl RepoIndex {
                             &repo.full_name,
                             clone_url,
                             &repo.default_branch,
-                            work_dir,
+                            workspace,
                         );
 
                         tracing::debug!(
@@ -242,11 +242,11 @@ impl RepoIndex {
     /// Build an index from GitLab groups using any ScmProvider.
     ///
     /// Fetches repos from each group and creates IndexedRepo entries
-    /// pointing to the work_dir for cloning.
+    /// pointing to the workspace for cloning.
     pub async fn build_from_gitlab(
         groups: &[String],
         provider: &dyn ScmProvider,
-        work_dir: &Path,
+        workspace: &Path,
         use_ssh: bool,
     ) -> Result<Self> {
         let mut index = Self::new();
@@ -266,7 +266,7 @@ impl RepoIndex {
                             &repo.full_name,
                             clone_url,
                             &repo.default_branch,
-                            work_dir,
+                            workspace,
                         );
 
                         tracing::debug!(
@@ -306,7 +306,7 @@ impl RepoIndex {
     /// * `github_client` - Optional GitHub API client
     /// * `gitlab_provider` - Optional GitLab SCM provider
     /// * `gitlab_groups` - GitLab group names to discover
-    /// * `work_dir` - Directory where repos will be cloned to (for API discovery)
+    /// * `workspace` - Directory where repos will be cloned to (for API discovery)
     /// * `use_ssh` - Whether to use SSH URLs for cloning
     pub async fn build_with_fallback(
         known_orgs: &[String],
@@ -314,7 +314,7 @@ impl RepoIndex {
         github_client: Option<&GitHubClient>,
         gitlab_provider: Option<&dyn ScmProvider>,
         gitlab_groups: &[String],
-        work_dir: &Path,
+        workspace: &Path,
         use_ssh: bool,
     ) -> Result<Self> {
         // Strategy 1: Local filesystem scan (preferred when paths are configured)
@@ -330,13 +330,13 @@ impl RepoIndex {
                     "Building repo index from GitHub API (no auto_discover_paths configured)"
                 );
                 let mut index =
-                    Self::build_from_github(known_orgs, client, work_dir, use_ssh).await?;
+                    Self::build_from_github(known_orgs, client, workspace, use_ssh).await?;
 
                 // Also try GitLab if configured
                 if let Some(gl) = gitlab_provider {
                     if gl.is_enabled() && !gitlab_groups.is_empty() {
                         let gl_index =
-                            Self::build_from_gitlab(gitlab_groups, gl, work_dir, use_ssh).await?;
+                            Self::build_from_gitlab(gitlab_groups, gl, workspace, use_ssh).await?;
                         index.merge(gl_index);
                     }
                 }
@@ -349,7 +349,7 @@ impl RepoIndex {
         if let Some(gl) = gitlab_provider {
             if gl.is_enabled() && !gitlab_groups.is_empty() {
                 tracing::info!("Building repo index from GitLab API");
-                return Self::build_from_gitlab(gitlab_groups, gl, work_dir, use_ssh).await;
+                return Self::build_from_gitlab(gitlab_groups, gl, workspace, use_ssh).await;
             }
         }
 
@@ -803,54 +803,54 @@ mod tests {
 
     #[test]
     fn test_indexed_repo_from_api() {
-        let work_dir = PathBuf::from("/home/user/repos");
+        let workspace = PathBuf::from("/home/user/repos");
         let repo = IndexedRepo::from_api(
             "test-org/my-repo",
             "https://github.com/test-org/my-repo.git",
             "develop",
-            &work_dir,
+            &workspace,
         );
 
         assert_eq!(repo.name, "test-org/my-repo");
         assert_eq!(repo.scm_url, "https://github.com/test-org/my-repo.git");
         assert_eq!(repo.default_branch, "develop");
-        assert_eq!(repo.path, work_dir.join("my-repo"));
+        assert_eq!(repo.path, workspace.join("my-repo"));
         assert!(repo.files.is_empty());
     }
 
     #[test]
     fn test_indexed_repo_from_api_extracts_repo_name() {
-        let work_dir = PathBuf::from("/var/repos");
+        let workspace = PathBuf::from("/var/repos");
 
         // Test with full_name format "org/repo"
         let repo = IndexedRepo::from_api(
             "appwrite/console",
             "https://github.com/appwrite/console.git",
             "main",
-            &work_dir,
+            &workspace,
         );
-        assert_eq!(repo.path, work_dir.join("console"));
+        assert_eq!(repo.path, workspace.join("console"));
 
         // Test with simple name (no slash)
         let repo2 = IndexedRepo::from_api(
             "simple-repo",
             "https://github.com/org/simple-repo.git",
             "main",
-            &work_dir,
+            &workspace,
         );
-        assert_eq!(repo2.path, work_dir.join("simple-repo"));
+        assert_eq!(repo2.path, workspace.join("simple-repo"));
     }
 
     #[test]
     fn test_repo_index_add_api_repo() {
         let mut index = RepoIndex::new();
-        let work_dir = PathBuf::from("/repos");
+        let workspace = PathBuf::from("/repos");
 
         let repo = IndexedRepo::from_api(
             "test-org/test-repo",
             "https://github.com/test-org/test-repo.git",
             "main",
-            &work_dir,
+            &workspace,
         );
         index.add_repo(repo);
 
@@ -1193,20 +1193,20 @@ mod tests {
             ),
         ];
         let provider = MockScmProvider::with_repos(repos);
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
         let groups = vec!["mygroup".to_string()];
 
-        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &workspace, false)
             .await
             .unwrap();
 
         assert_eq!(index.len(), 2);
         let repo_a = index.get("mygroup/repo-a").unwrap();
-        assert_eq!(repo_a.path, work_dir.join("repo-a"));
+        assert_eq!(repo_a.path, workspace.join("repo-a"));
         assert_eq!(repo_a.default_branch, "main");
 
         let repo_b = index.get("mygroup/repo-b").unwrap();
-        assert_eq!(repo_b.path, work_dir.join("repo-b"));
+        assert_eq!(repo_b.path, workspace.join("repo-b"));
         assert_eq!(repo_b.default_branch, "develop");
     }
 
@@ -1231,10 +1231,10 @@ mod tests {
         // different repos. Instead, we test that the method iterates groups
         // and collects repos from each call.
         let provider = MockScmProvider::with_repos(repos);
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
         let groups = vec!["group1".to_string(), "group2".to_string()];
 
-        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &workspace, false)
             .await
             .unwrap();
 
@@ -1249,10 +1249,10 @@ mod tests {
     #[tokio::test]
     async fn test_build_from_gitlab_empty_group() {
         let provider = MockScmProvider::with_repos(vec![]);
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
         let groups = vec!["empty-group".to_string()];
 
-        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &workspace, false)
             .await
             .unwrap();
 
@@ -1263,10 +1263,10 @@ mod tests {
     #[tokio::test]
     async fn test_build_from_gitlab_api_error() {
         let provider = MockScmProvider::with_error("403 Forbidden");
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
         let groups = vec!["forbidden-group".to_string()];
 
-        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &workspace, false)
             .await
             .unwrap();
 
@@ -1283,10 +1283,10 @@ mod tests {
             "main",
         )];
         let provider = MockScmProvider::with_repos(repos);
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
         let groups = vec!["team".to_string()];
 
-        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, true)
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &workspace, true)
             .await
             .unwrap();
 
@@ -1303,10 +1303,10 @@ mod tests {
             "main",
         )];
         let provider = MockScmProvider::with_repos(repos);
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
         let groups = vec!["team".to_string()];
 
-        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &workspace, false)
             .await
             .unwrap();
 
@@ -1668,30 +1668,30 @@ mod tests {
 
     #[test]
     fn test_indexed_repo_from_api_deep_org_path() {
-        let work_dir = PathBuf::from("/repos");
+        let workspace = PathBuf::from("/repos");
         let repo = IndexedRepo::from_api(
             "org/subgroup/project",
             "https://gitlab.com/org/subgroup/project.git",
             "main",
-            &work_dir,
+            &workspace,
         );
 
         // next_back() on "org/subgroup/project" gives "project"
-        assert_eq!(repo.path, work_dir.join("project"));
+        assert_eq!(repo.path, workspace.join("project"));
         assert_eq!(repo.name, "org/subgroup/project");
     }
 
     #[test]
     fn test_indexed_repo_from_api_no_slash_in_name() {
-        let work_dir = PathBuf::from("/repos");
+        let workspace = PathBuf::from("/repos");
         let repo = IndexedRepo::from_api(
             "standalone",
             "https://github.com/org/standalone.git",
             "develop",
-            &work_dir,
+            &workspace,
         );
 
-        assert_eq!(repo.path, work_dir.join("standalone"));
+        assert_eq!(repo.path, workspace.join("standalone"));
         assert_eq!(repo.default_branch, "develop");
     }
 
@@ -1814,10 +1814,10 @@ mod tests {
     #[tokio::test]
     async fn test_build_from_gitlab_no_groups() {
         let provider = MockScmProvider::with_repos(vec![]);
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
         let groups: Vec<String> = vec![];
 
-        let index = RepoIndex::build_from_gitlab(&groups, &provider, &work_dir, false)
+        let index = RepoIndex::build_from_gitlab(&groups, &provider, &workspace, false)
             .await
             .unwrap();
 
@@ -1881,7 +1881,7 @@ mod tests {
         // No repos in temp, but this tests that strategy 1 is chosen
         let paths = vec![temp.path().to_string_lossy().to_string()];
         let orgs: Vec<String> = vec!["test-org".to_string()];
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
 
         let index = RepoIndex::build_with_fallback(
             &orgs,
@@ -1889,7 +1889,7 @@ mod tests {
             None, // no github
             None, // no gitlab
             &[],  // no groups
-            &work_dir,
+            &workspace,
             false,
         )
         .await
@@ -1908,7 +1908,7 @@ mod tests {
             "main",
         )];
         let provider = MockScmProvider::with_repos(repos);
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
         let groups = vec!["group".to_string()];
 
         let index = RepoIndex::build_with_fallback(
@@ -1917,7 +1917,7 @@ mod tests {
             None,            // no github
             Some(&provider), // gitlab available
             &groups,
-            &work_dir,
+            &workspace,
             false,
         )
         .await
@@ -1929,7 +1929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_with_fallback_empty_returns_empty() {
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
 
         let index = RepoIndex::build_with_fallback(
             &[],  // no orgs
@@ -1937,7 +1937,7 @@ mod tests {
             None, // no github
             None, // no gitlab
             &[],  // no groups
-            &work_dir,
+            &workspace,
             false,
         )
         .await
@@ -1955,7 +1955,7 @@ mod tests {
             "git@gitlab.com:group/repo.git",
             "main",
         )]);
-        let work_dir = PathBuf::from("/tmp/repos");
+        let workspace = PathBuf::from("/tmp/repos");
 
         let index = RepoIndex::build_with_fallback(
             &[],             // no orgs
@@ -1963,7 +1963,7 @@ mod tests {
             None,            // no github
             Some(&provider), // gitlab available but...
             &[],             // no groups => won't use gitlab
-            &work_dir,
+            &workspace,
             false,
         )
         .await
@@ -2019,17 +2019,17 @@ mod tests {
 
     #[test]
     fn test_indexed_repo_from_api_sets_branch() {
-        let work_dir = PathBuf::from("/repos");
+        let workspace = PathBuf::from("/repos");
         let repo = IndexedRepo::from_api(
             "org/myrepo",
             "https://github.com/org/myrepo.git",
             "develop",
-            &work_dir,
+            &workspace,
         );
 
         assert_eq!(repo.default_branch, "develop");
         assert_eq!(repo.scm_url, "https://github.com/org/myrepo.git");
-        assert_eq!(repo.path, work_dir.join("myrepo"));
+        assert_eq!(repo.path, workspace.join("myrepo"));
     }
 
     // ════════════════════════════════════════════════════════════

@@ -789,7 +789,6 @@ impl<H: JiraHttpClient + 'static> IssueSource for JiraSource<H> {
             ));
         }
 
-        tracing::info!(source = "jira", issue_id = %issue_id, "Resolved issue");
         Ok(())
     }
 
@@ -831,7 +830,6 @@ impl<H: JiraHttpClient + 'static> IssueSource for JiraSource<H> {
             ));
         }
 
-        tracing::info!(source = "jira", issue_id = %issue_id, "Added comment");
         Ok(())
     }
 
@@ -915,11 +913,6 @@ impl<H: JiraHttpClient + 'static> IssueSource for JiraSource<H> {
 
         let issue = Issue::new(&created.id, &created.key, title, &issue_url, "jira");
 
-        tracing::info!(
-            source = "jira",
-            issue_key = %created.key,
-            "Created issue"
-        );
         let _ = created.self_url; // suppress unused warning
         Ok(issue)
     }

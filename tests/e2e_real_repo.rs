@@ -302,7 +302,7 @@ fn make_linear_task(id: &str, short_id: &str) -> Issue {
 
 fn build_config(temp_dir: &TempDir) -> Config {
     Config {
-        work_dir: temp_dir.path().join("work"),
+        workspace: temp_dir.path().join("work"),
         db_path: temp_dir.path().join("e2e-tracker.db"),
         known_orgs: vec!["test-org".to_string()],
         ask: AskConfig {

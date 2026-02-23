@@ -12,6 +12,7 @@ use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, PrRecord, Sour
 
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
+#[cfg(feature = "redis")]
 use redis::AsyncCommands;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -74,10 +75,12 @@ impl From<CachedUser> for UserRow {
 pub struct PostgresBackend {
     pool: Pool,
     tenant_id: String,
+    #[cfg(feature = "redis")]
     cache: Option<redis::aio::ConnectionManager>,
 }
 
 impl PostgresBackend {
+    #[cfg(feature = "redis")]
     pub fn new(
         pool: Pool,
         tenant_id: String,
@@ -88,6 +91,11 @@ impl PostgresBackend {
             tenant_id,
             cache,
         }
+    }
+
+    #[cfg(not(feature = "redis"))]
+    pub fn new(pool: Pool, tenant_id: String) -> Self {
+        Self { pool, tenant_id }
     }
 
     // -----------------------------------------------------------------------
@@ -112,6 +120,7 @@ impl PostgresBackend {
     // Cache helpers – best-effort, failures logged + swallowed
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "redis")]
     fn cache_get<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
         let mut conn = self.cache.as_ref()?.clone();
         match self.block_on(async { conn.get::<_, Option<String>>(key).await }) {
@@ -130,6 +139,12 @@ impl PostgresBackend {
         }
     }
 
+    #[cfg(not(feature = "redis"))]
+    fn cache_get<T: DeserializeOwned>(&self, _key: &str) -> Option<T> {
+        None
+    }
+
+    #[cfg(feature = "redis")]
     fn cache_set<T: Serialize>(&self, key: &str, value: &T) {
         let Some(cache) = &self.cache else { return };
         let mut conn = cache.clone();
@@ -145,6 +160,10 @@ impl PostgresBackend {
         }
     }
 
+    #[cfg(not(feature = "redis"))]
+    fn cache_set<T: Serialize>(&self, _key: &str, _value: &T) {}
+
+    #[cfg(feature = "redis")]
     fn cache_del(&self, keys: &[&str]) {
         if keys.is_empty() {
             return;
@@ -162,7 +181,11 @@ impl PostgresBackend {
         }
     }
 
+    #[cfg(not(feature = "redis"))]
+    fn cache_del(&self, _keys: &[&str]) {}
+
     /// Delete all keys matching `pattern` using SCAN+DEL (never KEYS).
+    #[cfg(feature = "redis")]
     fn cache_del_pattern(&self, pattern: &str) {
         let Some(cache) = &self.cache else { return };
         let mut conn = cache.clone();
@@ -194,11 +217,15 @@ impl PostgresBackend {
         }
     }
 
+    #[cfg(not(feature = "redis"))]
+    fn cache_del_pattern(&self, _pattern: &str) {}
+
     // -----------------------------------------------------------------------
     // Invalidation helpers
     // -----------------------------------------------------------------------
 
     /// Invalidate all cache keys that could reference the given attempt.
+    #[cfg(feature = "redis")]
     fn invalidate_attempt_keys(
         &self,
         source: &str,
@@ -225,52 +252,14 @@ impl PostgresBackend {
         self.cache_del(&refs);
     }
 
-    /// Look up id + pr_url of an attempt (for cache invalidation after writes
-    /// that only receive source + issue_id).
-    fn lookup_attempt_meta(&self, source: &str, issue_id: &str) -> (Option<i64>, Option<String>) {
-        self.block_on(async {
-            let Ok(c) = self.client().await else {
-                return (None, None);
-            };
-            c.query_opt(
-                "SELECT id, pr_url FROM fix_attempts WHERE source = $1 AND issue_id = $2",
-                &[&source, &issue_id],
-            )
-            .await
-            .ok()
-            .flatten()
-            .map(|r| {
-                (
-                    Some(r.get::<_, i64>("id")),
-                    r.get::<_, Option<String>>("pr_url"),
-                )
-            })
-            .unwrap_or((None, None))
-        })
-    }
-
-    /// Look up source, issue_id, pr_url by attempt id.
-    fn lookup_attempt_meta_by_id(
+    #[cfg(not(feature = "redis"))]
+    fn invalidate_attempt_keys(
         &self,
-        attempt_id: i64,
-    ) -> Option<(String, String, Option<String>)> {
-        self.block_on(async {
-            let c = self.client().await.ok()?;
-            c.query_opt(
-                "SELECT source, issue_id, pr_url FROM fix_attempts WHERE id = $1",
-                &[&attempt_id],
-            )
-            .await
-            .ok()
-            .flatten()
-            .map(|r| {
-                (
-                    r.get::<_, String>("source"),
-                    r.get::<_, String>("issue_id"),
-                    r.get::<_, Option<String>>("pr_url"),
-                )
-            })
-        })
+        _source: &str,
+        _issue_id: &str,
+        _id: Option<i64>,
+        _pr_url: Option<&str>,
+    ) {
     }
 
     // -----------------------------------------------------------------------
@@ -383,13 +372,10 @@ impl FixAttemptTracker for PostgresBackend {
 
         let exists: bool = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            let row = c
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM fix_attempts WHERE source = $1 AND issue_id = $2 AND reset_at IS NULL)",
-                    &[&source, &issue_id],
-                )
-                .await
-                .map_err(db_err)?;
+            let stmt = c.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM fix_attempts WHERE source = $1 AND issue_id = $2 AND reset_at IS NULL)",
+            ).await.map_err(db_err)?;
+            let row = c.query_one(&stmt, &[&source, &issue_id]).await.map_err(db_err)?;
             Ok::<bool, crate::error::Error>(row.get(0))
         })?;
 
@@ -405,16 +391,19 @@ impl FixAttemptTracker for PostgresBackend {
 
         let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query_opt(
-                r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+            let stmt = c
+                .prepare_cached(
+                    r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
                           scm_pr_number, status, error_message, merged_at, resolved_at,
                           retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
                    FROM fix_attempts
                    WHERE source = $1 AND issue_id = $2"#,
-                &[&source, &issue_id],
-            )
-            .await
-            .map_err(db_err)
+                )
+                .await
+                .map_err(db_err)?;
+            c.query_opt(&stmt, &[&source, &issue_id])
+                .await
+                .map_err(db_err)
         })?;
 
         let attempt = row.as_ref().map(Self::row_to_fix_attempt);
@@ -432,18 +421,19 @@ impl FixAttemptTracker for PostgresBackend {
 
         let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query_opt(
-                r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+            let stmt = c
+                .prepare_cached(
+                    r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
                           scm_pr_number, status, error_message, merged_at, resolved_at,
                           retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
                    FROM fix_attempts
                    WHERE pr_url = $1
                    ORDER BY attempted_at DESC, id DESC
                    LIMIT 1"#,
-                &[&pr_url],
-            )
-            .await
-            .map_err(db_err)
+                )
+                .await
+                .map_err(db_err)?;
+            c.query_opt(&stmt, &[&pr_url]).await.map_err(db_err)
         })?;
 
         let attempt = row.as_ref().map(Self::row_to_fix_attempt);
@@ -461,16 +451,17 @@ impl FixAttemptTracker for PostgresBackend {
 
         let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query_opt(
-                r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+            let stmt = c
+                .prepare_cached(
+                    r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
                           scm_pr_number, status, error_message, merged_at, resolved_at,
                           retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
                    FROM fix_attempts
                    WHERE id = $1"#,
-                &[&id],
-            )
-            .await
-            .map_err(db_err)
+                )
+                .await
+                .map_err(db_err)?;
+            c.query_opt(&stmt, &[&id]).await.map_err(db_err)
         })?;
 
         let attempt = row.as_ref().map(Self::row_to_fix_attempt);
@@ -486,9 +477,10 @@ impl FixAttemptTracker for PostgresBackend {
             return Ok(Some(cached));
         }
 
-        let row = self.block_on(async {
-            let c = self.client().await.map_err(db_err)?;
-            c.query_opt(
+        let row =
+            self.block_on(async {
+                let c = self.client().await.map_err(db_err)?;
+                let stmt = c.prepare_cached(
                 r#"SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
                           title, description, author, head_branch, base_branch, status,
                           created_at, updated_at, merged_at, closed_at,
@@ -496,11 +488,9 @@ impl FixAttemptTracker for PostgresBackend {
                           time_to_first_review_mins, time_to_merge_mins, review_cycles,
                           files_changed, lines_added, lines_removed
                    FROM prs WHERE pr_url = $1"#,
-                &[&pr_url],
-            )
-            .await
-            .map_err(db_err)
-        })?;
+            ).await.map_err(db_err)?;
+                c.query_opt(&stmt, &[&pr_url]).await.map_err(db_err)
+            })?;
 
         let pr = row.as_ref().map(Self::row_to_pr_record);
         if let Some(ref p) = pr {
@@ -517,12 +507,10 @@ impl FixAttemptTracker for PostgresBackend {
 
         let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query_opt(
+            let stmt = c.prepare_cached(
                 "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE id = $1",
-                &[&id],
-            )
-            .await
-            .map_err(db_err)
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&id]).await.map_err(db_err)
         })?;
 
         let user = row.as_ref().map(Self::row_to_user);
@@ -540,12 +528,10 @@ impl FixAttemptTracker for PostgresBackend {
 
         let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query_opt(
+            let stmt = c.prepare_cached(
                 "SELECT id, email, password_hash, name, role, avatar_url, created_at, updated_at FROM users WHERE email = $1",
-                &[&email],
-            )
-            .await
-            .map_err(db_err)
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&email]).await.map_err(db_err)
         })?;
 
         let user = row.as_ref().map(Self::row_to_user);
@@ -563,16 +549,17 @@ impl FixAttemptTracker for PostgresBackend {
 
         let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query_opt(
-                r#"SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url,
+            let stmt = c
+                .prepare_cached(
+                    r#"SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url,
                           u.created_at, u.updated_at
                    FROM sessions s
                    JOIN users u ON s.user_id = u.id
                    WHERE s.id = $1 AND s.expires_at > NOW()"#,
-                &[&token],
-            )
-            .await
-            .map_err(db_err)
+                )
+                .await
+                .map_err(db_err)?;
+            c.query_opt(&stmt, &[&token]).await.map_err(db_err)
         })?;
 
         let user = row.as_ref().map(Self::row_to_user);
@@ -590,13 +577,10 @@ impl FixAttemptTracker for PostgresBackend {
 
         let val: Option<String> = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            let row = c
-                .query_opt(
-                    "SELECT cursor_value FROM question_channel_cursor WHERE channel = $1 AND cursor_key = $2",
-                    &[&channel, &cursor_key],
-                )
-                .await
-                .map_err(db_err)?;
+            let stmt = c.prepare_cached(
+                "SELECT cursor_value FROM question_channel_cursor WHERE channel = $1 AND cursor_key = $2",
+            ).await.map_err(db_err)?;
+            let row = c.query_opt(&stmt, &[&channel, &cursor_key]).await.map_err(db_err)?;
             Ok::<_, crate::error::Error>(row.map(|r| r.get("cursor_value")))
         })?;
 
@@ -612,50 +596,35 @@ impl FixAttemptTracker for PostgresBackend {
             return Ok(cached);
         }
 
-        let mut stats = FixAttemptStats::default();
-
-        // Overall counts by status
+        // Single query: per-source breakdown; derive overall totals in Rust.
         let rows = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query(
-                "SELECT status, COUNT(*)::bigint AS cnt FROM fix_attempts GROUP BY status",
-                &[],
-            )
-            .await
-            .map_err(db_err)
-        })?;
-
-        for row in &rows {
-            let status: String = row.get("status");
-            let count = row.get::<_, i64>("cnt") as usize;
-            stats.total += count;
-            match status.as_str() {
-                "pending" => stats.pending = count,
-                "success" => stats.success = count,
-                "failed" => stats.failed = count,
-                "merged" => stats.merged = count,
-                "closed" => stats.closed = count,
-                "cannot_fix" => stats.cannot_fix = count,
-                _ => {}
-            }
-        }
-
-        // Per-source breakdown
-        let rows = self.block_on(async {
-            let c = self.client().await.map_err(db_err)?;
-            c.query(
+            let stmt = c.prepare_cached(
                 "SELECT source, status, COUNT(*)::bigint AS cnt FROM fix_attempts GROUP BY source, status",
-                &[],
-            )
-            .await
-            .map_err(db_err)
+            ).await.map_err(db_err)?;
+            c.query(&stmt, &[]).await.map_err(db_err)
         })?;
 
+        let mut stats = FixAttemptStats::default();
         let mut by_source: HashMap<String, SourceStats> = HashMap::new();
         for row in &rows {
             let source: String = row.get("source");
             let status: String = row.get("status");
             let count = row.get::<_, i64>("cnt") as usize;
+
+            // Accumulate overall totals
+            stats.total += count;
+            match status.as_str() {
+                "pending" => stats.pending += count,
+                "success" => stats.success += count,
+                "failed" => stats.failed += count,
+                "merged" => stats.merged += count,
+                "closed" => stats.closed += count,
+                "cannot_fix" => stats.cannot_fix += count,
+                _ => {}
+            }
+
+            // Accumulate per-source
             let entry = by_source.entry(source).or_default();
             entry.total += count;
             match status.as_str() {
@@ -682,15 +651,20 @@ impl FixAttemptTracker for PostgresBackend {
             let Ok(c) = self.client().await else {
                 return HashSet::new();
             };
-            c.query(
-                "SELECT issue_id FROM fix_attempts WHERE source = $1 AND reset_at IS NULL",
-                &[&source],
-            )
-            .await
-            .unwrap_or_default()
-            .iter()
-            .map(|r| r.get::<_, String>("issue_id"))
-            .collect()
+            let Ok(stmt) = c
+                .prepare_cached(
+                    "SELECT issue_id FROM fix_attempts WHERE source = $1 AND reset_at IS NULL",
+                )
+                .await
+            else {
+                return HashSet::new();
+            };
+            c.query(&stmt, &[&source])
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| r.get::<_, String>("issue_id"))
+                .collect()
         })
     }
 
@@ -698,15 +672,16 @@ impl FixAttemptTracker for PostgresBackend {
         let status_str = status.to_string();
         let rows = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query(
-                r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+            let stmt = c
+                .prepare_cached(
+                    r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
                           scm_pr_number, status, error_message, merged_at, resolved_at,
                           retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
                    FROM fix_attempts WHERE status = $1"#,
-                &[&status_str],
-            )
-            .await
-            .map_err(db_err)
+                )
+                .await
+                .map_err(db_err)?;
+            c.query(&stmt, &[&status_str]).await.map_err(db_err)
         })?;
         Ok(rows.iter().map(Self::row_to_fix_attempt).collect())
     }
@@ -714,15 +689,16 @@ impl FixAttemptTracker for PostgresBackend {
     fn get_pending_prs(&self) -> Result<Vec<FixAttempt>> {
         let rows = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query(
-                r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+            let stmt = c
+                .prepare_cached(
+                    r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
                           scm_pr_number, status, error_message, merged_at, resolved_at,
                           retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
                    FROM fix_attempts WHERE status = 'success' AND pr_url IS NOT NULL"#,
-                &[],
-            )
-            .await
-            .map_err(db_err)
+                )
+                .await
+                .map_err(db_err)?;
+            c.query(&stmt, &[]).await.map_err(db_err)
         })?;
         Ok(rows.iter().map(Self::row_to_fix_attempt).collect())
     }
@@ -731,17 +707,18 @@ impl FixAttemptTracker for PostgresBackend {
         let max = max_retries as i32;
         let rows = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query(
-                r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+            let stmt = c
+                .prepare_cached(
+                    r#"SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
                           scm_pr_number, status, error_message, merged_at, resolved_at,
                           retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
                    FROM fix_attempts
                    WHERE status IN ('failed', 'closed')
                      AND COALESCE(retry_count, 0) < $1"#,
-                &[&max],
-            )
-            .await
-            .map_err(db_err)
+                )
+                .await
+                .map_err(db_err)?;
+            c.query(&stmt, &[&max]).await.map_err(db_err)
         })?;
         Ok(rows.iter().map(Self::row_to_fix_attempt).collect())
     }
@@ -775,63 +752,45 @@ impl FixAttemptTracker for PostgresBackend {
             Some(serde_json::to_string(labels).unwrap_or_default())
         };
 
-        // Check for existing non-cascade row
-        let existing: Option<(i64, Option<String>)> = self.block_on(async {
+        // Atomic upsert using the partial unique index on (source, issue_id) WHERE cascade_repo IS NULL.
+        // On conflict with a reset row (reset_at IS NOT NULL): update short_id, attempted_at, labels, clear reset_at.
+        // On conflict with a non-reset row: no-op (all fields keep their existing values).
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            let row = c
-                .query_opt(
-                    "SELECT id, reset_at::text FROM fix_attempts WHERE source = $1 AND issue_id = $2 AND cascade_repo IS NULL",
-                    &[&source, &issue_id],
-                )
+            let stmt = c.prepare_cached(
+                r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, issue_labels)
+                   VALUES ($1, $2, $3, 'pending', NOW(), $4)
+                   ON CONFLICT (source, issue_id) WHERE cascade_repo IS NULL
+                   DO UPDATE SET
+                       short_id = CASE WHEN fix_attempts.reset_at IS NOT NULL THEN EXCLUDED.short_id ELSE fix_attempts.short_id END,
+                       attempted_at = CASE WHEN fix_attempts.reset_at IS NOT NULL THEN NOW() ELSE fix_attempts.attempted_at END,
+                       issue_labels = CASE WHEN fix_attempts.reset_at IS NOT NULL THEN COALESCE(EXCLUDED.issue_labels, fix_attempts.issue_labels) ELSE fix_attempts.issue_labels END,
+                       reset_at = CASE WHEN fix_attempts.reset_at IS NOT NULL THEN NULL ELSE fix_attempts.reset_at END
+                   RETURNING id, pr_url, (xmax = 0) AS was_inserted"#,
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&source, &issue_id, &short_id, &labels_json])
                 .await
-                .map_err(db_err)?;
-            Ok::<_, crate::error::Error>(
-                row.map(|r| (r.get::<_, i64>("id"), r.get::<_, Option<String>>("reset_at"))),
-            )
+                .map_err(db_err)
         })?;
 
-        match existing {
-            None => {
-                self.block_on(async {
-                    let c = self.client().await.map_err(db_err)?;
-                    c.execute(
-                        r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, issue_labels)
-                           VALUES ($1, $2, $3, 'pending', NOW(), $4)"#,
-                        &[&source, &issue_id, &short_id, &labels_json],
-                    )
-                    .await
-                    .map_err(db_err)
-                })?;
+        if let Some(ref r) = row {
+            let was_inserted: bool = r.get("was_inserted");
+            if was_inserted {
                 tracing::info!(source, issue_id, "Fix attempt recorded");
-            }
-            Some((_id, Some(_reset_at))) => {
-                self.block_on(async {
-                    let c = self.client().await.map_err(db_err)?;
-                    c.execute(
-                        r#"UPDATE fix_attempts SET
-                             short_id = $1,
-                             attempted_at = NOW(),
-                             issue_labels = COALESCE($2, issue_labels),
-                             reset_at = NULL
-                           WHERE source = $3 AND issue_id = $4 AND cascade_repo IS NULL"#,
-                        &[&short_id, &labels_json, &source, &issue_id],
-                    )
-                    .await
-                    .map_err(db_err)
-                })?;
-                tracing::info!(source, issue_id, "Fix attempt updated (was in reset state)");
-            }
-            Some((_id, None)) => {
-                tracing::warn!(
+            } else {
+                tracing::info!(
                     source,
                     issue_id,
-                    "Attempt already exists and is not in reset state, skipping"
+                    "Fix attempt upserted (existing row updated)"
                 );
             }
+            self.invalidate_attempt_keys(
+                source,
+                issue_id,
+                Some(r.get("id")),
+                r.get::<_, Option<String>>("pr_url").as_deref(),
+            );
         }
-
-        let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
-        self.invalidate_attempt_keys(source, issue_id, id, pr_url.as_deref());
         Ok(())
     }
 
@@ -848,11 +807,17 @@ impl FixAttemptTracker for PostgresBackend {
 
         let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.query_opt(
-                r#"UPDATE fix_attempts
+            let stmt = c
+                .prepare_cached(
+                    r#"UPDATE fix_attempts
                    SET status = 'success', pr_url = $1, scm_repo = $2, scm_pr_number = $3
                    WHERE source = $4 AND issue_id = $5
                    RETURNING id"#,
+                )
+                .await
+                .map_err(db_err)?;
+            c.query_opt(
+                &stmt,
                 &[&pr_url, &scm_repo, &scm_pr_number, &source, &issue_id],
             )
             .await
@@ -872,81 +837,99 @@ impl FixAttemptTracker for PostgresBackend {
             "Marking fix attempt as failed"
         );
 
-        let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
-        self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                "UPDATE fix_attempts SET status = 'failed', error_message = $1 WHERE source = $2 AND issue_id = $3",
-                &[&error_message, &source, &issue_id],
-            )
-            .await
-            .map_err(db_err)
+            let stmt = c.prepare_cached(
+                "UPDATE fix_attempts SET status = 'failed', error_message = $1 WHERE source = $2 AND issue_id = $3 RETURNING id, pr_url",
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&error_message, &source, &issue_id])
+                .await
+                .map_err(db_err)
         })?;
 
-        self.invalidate_attempt_keys(source, issue_id, id, pr_url.as_deref());
+        if let Some(r) = row {
+            self.invalidate_attempt_keys(
+                source,
+                issue_id,
+                Some(r.get("id")),
+                r.get::<_, Option<String>>("pr_url").as_deref(),
+            );
+        }
         Ok(())
     }
 
     fn mark_merged(&self, source: &str, issue_id: &str) -> Result<()> {
         tracing::info!(source, issue_id, "Marking fix attempt as merged");
 
-        let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
-        self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                "UPDATE fix_attempts SET status = 'merged', merged_at = NOW() WHERE source = $1 AND issue_id = $2",
-                &[&source, &issue_id],
-            )
-            .await
-            .map_err(db_err)
+            let stmt = c.prepare_cached(
+                "UPDATE fix_attempts SET status = 'merged', merged_at = NOW() WHERE source = $1 AND issue_id = $2 RETURNING id, pr_url",
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&source, &issue_id]).await.map_err(db_err)
         })?;
 
-        self.invalidate_attempt_keys(source, issue_id, id, pr_url.as_deref());
+        if let Some(r) = row {
+            self.invalidate_attempt_keys(
+                source,
+                issue_id,
+                Some(r.get("id")),
+                r.get::<_, Option<String>>("pr_url").as_deref(),
+            );
+        }
         Ok(())
     }
 
     fn mark_closed(&self, source: &str, issue_id: &str) -> Result<()> {
         tracing::info!(source, issue_id, "Marking fix attempt as closed");
 
-        let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
-        self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                "UPDATE fix_attempts SET status = 'closed' WHERE source = $1 AND issue_id = $2",
-                &[&source, &issue_id],
-            )
-            .await
-            .map_err(db_err)
+            let stmt = c.prepare_cached(
+                "UPDATE fix_attempts SET status = 'closed' WHERE source = $1 AND issue_id = $2 RETURNING id, pr_url",
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&source, &issue_id]).await.map_err(db_err)
         })?;
 
-        self.invalidate_attempt_keys(source, issue_id, id, pr_url.as_deref());
+        if let Some(r) = row {
+            self.invalidate_attempt_keys(
+                source,
+                issue_id,
+                Some(r.get("id")),
+                r.get::<_, Option<String>>("pr_url").as_deref(),
+            );
+        }
         Ok(())
     }
 
     fn mark_resolved(&self, source: &str, issue_id: &str) -> Result<()> {
         tracing::info!(source, issue_id, "Marking fix attempt as resolved");
 
-        let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
-        self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                "UPDATE fix_attempts SET resolved_at = NOW() WHERE source = $1 AND issue_id = $2",
-                &[&source, &issue_id],
-            )
-            .await
-            .map_err(db_err)
+            let stmt = c.prepare_cached(
+                "UPDATE fix_attempts SET resolved_at = NOW() WHERE source = $1 AND issue_id = $2 RETURNING id, pr_url",
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&source, &issue_id]).await.map_err(db_err)
         })?;
 
-        self.invalidate_attempt_keys(source, issue_id, id, pr_url.as_deref());
+        if let Some(r) = row {
+            self.invalidate_attempt_keys(
+                source,
+                issue_id,
+                Some(r.get("id")),
+                r.get::<_, Option<String>>("pr_url").as_deref(),
+            );
+        }
         Ok(())
     }
 
     fn reset_attempt(&self, source: &str, issue_id: &str) -> Result<()> {
-        let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
-        self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                r#"UPDATE fix_attempts SET
+            let stmt = c
+                .prepare_cached(
+                    r#"UPDATE fix_attempts SET
                      status = 'pending',
                      retry_count = 0,
                      reset_at = NOW(),
@@ -957,33 +940,53 @@ impl FixAttemptTracker for PostgresBackend {
                      merged_at = NULL,
                      resolved_at = NULL,
                      attempted_at = NOW()
-                   WHERE source = $1 AND issue_id = $2"#,
-                &[&source, &issue_id],
-            )
-            .await
-            .map_err(db_err)
+                   WHERE source = $1 AND issue_id = $2
+                   RETURNING id, pr_url"#,
+                )
+                .await
+                .map_err(db_err)?;
+            c.query_opt(&stmt, &[&source, &issue_id])
+                .await
+                .map_err(db_err)
         })?;
 
-        self.invalidate_attempt_keys(source, issue_id, id, pr_url.as_deref());
+        if let Some(r) = row {
+            self.invalidate_attempt_keys(
+                source,
+                issue_id,
+                Some(r.get("id")),
+                r.get::<_, Option<String>>("pr_url").as_deref(),
+            );
+        }
         Ok(())
     }
 
     fn increment_retry(&self, source: &str, issue_id: &str) -> Result<()> {
-        let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
-        self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                r#"UPDATE fix_attempts
+            let stmt = c
+                .prepare_cached(
+                    r#"UPDATE fix_attempts
                    SET retry_count = COALESCE(retry_count, 0) + 1,
                        last_retry_at = NOW()
-                   WHERE source = $1 AND issue_id = $2"#,
-                &[&source, &issue_id],
-            )
-            .await
-            .map_err(db_err)
+                   WHERE source = $1 AND issue_id = $2
+                   RETURNING id, pr_url"#,
+                )
+                .await
+                .map_err(db_err)?;
+            c.query_opt(&stmt, &[&source, &issue_id])
+                .await
+                .map_err(db_err)
         })?;
 
-        self.invalidate_attempt_keys(source, issue_id, id, pr_url.as_deref());
+        if let Some(r) = row {
+            self.invalidate_attempt_keys(
+                source,
+                issue_id,
+                Some(r.get("id")),
+                r.get::<_, Option<String>>("pr_url").as_deref(),
+            );
+        }
         Ok(())
     }
 
@@ -995,28 +998,31 @@ impl FixAttemptTracker for PostgresBackend {
             "Marking fix attempt as cannot_fix"
         );
 
-        let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
-        self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                "UPDATE fix_attempts SET status = 'cannot_fix', error_message = $1 WHERE source = $2 AND issue_id = $3",
-                &[&reason, &source, &issue_id],
-            )
-            .await
-            .map_err(db_err)
+            let stmt = c.prepare_cached(
+                "UPDATE fix_attempts SET status = 'cannot_fix', error_message = $1 WHERE source = $2 AND issue_id = $3 RETURNING id, pr_url",
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&reason, &source, &issue_id]).await.map_err(db_err)
         })?;
 
-        self.invalidate_attempt_keys(source, issue_id, id, pr_url.as_deref());
+        if let Some(r) = row {
+            self.invalidate_attempt_keys(
+                source,
+                issue_id,
+                Some(r.get("id")),
+                r.get::<_, Option<String>>("pr_url").as_deref(),
+            );
+        }
         Ok(())
     }
 
     fn prepare_for_retry(&self, source: &str, issue_id: &str) -> Result<()> {
-        let (id, pr_url) = self.lookup_attempt_meta(source, issue_id);
-
-        let rows_affected = self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                r#"UPDATE fix_attempts SET
+            let stmt = c
+                .prepare_cached(
+                    r#"UPDATE fix_attempts SET
                      status = 'pending',
                      retry_count = COALESCE(retry_count, 0) + 1,
                      last_retry_at = NOW(),
@@ -1026,23 +1032,34 @@ impl FixAttemptTracker for PostgresBackend {
                      error_message = NULL,
                      attempted_at = NOW()
                    WHERE source = $1 AND issue_id = $2
-                     AND status IN ('failed', 'closed')"#,
-                &[&source, &issue_id],
-            )
-            .await
-            .map_err(db_err)
+                     AND status IN ('failed', 'closed')
+                   RETURNING id, pr_url"#,
+                )
+                .await
+                .map_err(db_err)?;
+            c.query_opt(&stmt, &[&source, &issue_id])
+                .await
+                .map_err(db_err)
         })?;
 
-        if rows_affected == 0 {
-            tracing::warn!(source, issue_id, "prepare_for_retry: no rows updated");
-            return Err(crate::error::Error::Storage(format!(
-                "Attempt {}/{} not in retryable state (failed/closed)",
-                source, issue_id
-            )));
+        match row {
+            Some(r) => {
+                self.invalidate_attempt_keys(
+                    source,
+                    issue_id,
+                    Some(r.get("id")),
+                    r.get::<_, Option<String>>("pr_url").as_deref(),
+                );
+                Ok(())
+            }
+            None => {
+                tracing::warn!(source, issue_id, "prepare_for_retry: no rows updated");
+                Err(crate::error::Error::Storage(format!(
+                    "Attempt {}/{} not in retryable state (failed/closed)",
+                    source, issue_id
+                )))
+            }
         }
-
-        self.invalidate_attempt_keys(source, issue_id, id, pr_url.as_deref());
-        Ok(())
     }
 
     fn record_cascade_attempt(
@@ -1053,52 +1070,48 @@ impl FixAttemptTracker for PostgresBackend {
         parent_attempt_id: i64,
         cascade_repo: &str,
     ) -> Result<i64> {
-        // Check if cascade already exists
-        let existing_id: Option<i64> = self.block_on(async {
+        let (id, was_existing) = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
+            // Check if cascade already exists
+            let s1 = c.prepare_cached(
+                "SELECT id FROM fix_attempts WHERE source = $1 AND issue_id = $2 AND cascade_repo = $3",
+            ).await.map_err(db_err)?;
+            let existing = c.query_opt(&s1, &[&source, &issue_id, &cascade_repo]).await.map_err(db_err)?;
+
+            if let Some(row) = existing {
+                return Ok::<(i64, bool), crate::error::Error>((row.get::<_, i64>("id"), true));
+            }
+
+            let s2 = c.prepare_cached(
+                r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, parent_attempt_id, cascade_repo)
+                       VALUES ($1, $2, $3, 'pending', NOW(), $4, $5)
+                       RETURNING id"#,
+            ).await.map_err(db_err)?;
             let row = c
-                .query_opt(
-                    "SELECT id FROM fix_attempts WHERE source = $1 AND issue_id = $2 AND cascade_repo = $3",
-                    &[&source, &issue_id, &cascade_repo],
-                )
+                .query_one(&s2, &[&source, &issue_id, &short_id, &parent_attempt_id, &cascade_repo])
                 .await
                 .map_err(db_err)?;
-            Ok::<_, crate::error::Error>(row.map(|r| r.get::<_, i64>("id")))
+            Ok((row.get("id"), false))
         })?;
 
-        if let Some(id) = existing_id {
+        if was_existing {
             tracing::info!(
                 source,
                 issue_id,
                 cascade_repo,
                 "Cascade attempt already exists, skipping"
             );
-            return Ok(id);
+        } else {
+            tracing::info!(
+                source,
+                issue_id,
+                cascade_repo,
+                parent_attempt_id,
+                attempt_id = id,
+                "Recorded cascade fix attempt"
+            );
+            self.invalidate_attempt_keys(source, issue_id, Some(id), None);
         }
-
-        let id: i64 = self.block_on(async {
-            let c = self.client().await.map_err(db_err)?;
-            let row = c
-                .query_one(
-                    r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, parent_attempt_id, cascade_repo)
-                       VALUES ($1, $2, $3, 'pending', NOW(), $4, $5)
-                       RETURNING id"#,
-                    &[&source, &issue_id, &short_id, &parent_attempt_id, &cascade_repo],
-                )
-                .await
-                .map_err(db_err)?;
-            Ok::<i64, crate::error::Error>(row.get("id"))
-        })?;
-
-        tracing::info!(
-            source,
-            issue_id,
-            cascade_repo,
-            parent_attempt_id,
-            attempt_id = id,
-            "Recorded cascade fix attempt"
-        );
-        self.invalidate_attempt_keys(source, issue_id, Some(id), None);
         Ok(id)
     }
 
@@ -1109,19 +1122,23 @@ impl FixAttemptTracker for PostgresBackend {
         scm_repo: &str,
         pr_number: i64,
     ) -> Result<()> {
-        let meta = self.lookup_attempt_meta_by_id(attempt_id);
-
-        self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                "UPDATE fix_attempts SET pr_url = $1, scm_repo = $2, scm_pr_number = $3, status = 'success' WHERE id = $4",
-                &[&pr_url, &scm_repo, &pr_number, &attempt_id],
-            )
-            .await
-            .map_err(db_err)
+            let stmt = c.prepare_cached(
+                r#"WITH old AS (SELECT source, issue_id, pr_url FROM fix_attempts WHERE id = $4)
+                   UPDATE fix_attempts SET pr_url = $1, scm_repo = $2, scm_pr_number = $3, status = 'success'
+                   WHERE id = $4
+                   RETURNING source, issue_id, (SELECT pr_url FROM old) AS old_pr_url"#,
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&pr_url, &scm_repo, &pr_number, &attempt_id])
+                .await
+                .map_err(db_err)
         })?;
 
-        if let Some((source, issue_id, old_pr)) = meta {
+        if let Some(r) = row {
+            let source: String = r.get("source");
+            let issue_id: String = r.get("issue_id");
+            let old_pr: Option<String> = r.get("old_pr_url");
             self.invalidate_attempt_keys(&source, &issue_id, Some(attempt_id), Some(pr_url));
             if let Some(ref old) = old_pr {
                 if old != pr_url {
@@ -1133,20 +1150,21 @@ impl FixAttemptTracker for PostgresBackend {
     }
 
     fn mark_cascade_failed(&self, attempt_id: i64, error: &str) -> Result<()> {
-        let meta = self.lookup_attempt_meta_by_id(attempt_id);
-
-        self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                "UPDATE fix_attempts SET status = 'failed', error_message = $1 WHERE id = $2",
-                &[&error, &attempt_id],
-            )
-            .await
-            .map_err(db_err)
+            let stmt = c.prepare_cached(
+                "UPDATE fix_attempts SET status = 'failed', error_message = $1 WHERE id = $2 RETURNING source, issue_id, pr_url",
+            ).await.map_err(db_err)?;
+            c.query_opt(&stmt, &[&error, &attempt_id]).await.map_err(db_err)
         })?;
 
-        if let Some((source, issue_id, pr_url)) = meta {
-            self.invalidate_attempt_keys(&source, &issue_id, Some(attempt_id), pr_url.as_deref());
+        if let Some(r) = row {
+            self.invalidate_attempt_keys(
+                &r.get::<_, String>("source"),
+                &r.get::<_, String>("issue_id"),
+                Some(attempt_id),
+                r.get::<_, Option<String>>("pr_url").as_deref(),
+            );
         }
         Ok(())
     }
@@ -1158,9 +1176,8 @@ impl FixAttemptTracker for PostgresBackend {
     fn upsert_pr(&self, pr: &PrRecord) -> Result<i64> {
         let id: i64 = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            let row = c
-                .query_one(
-                    r#"INSERT INTO prs (
+            let stmt = c.prepare_cached(
+                r#"INSERT INTO prs (
                         pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
                         title, description, author, head_branch, base_branch, status,
                         created_at, updated_at, merged_at, closed_at,
@@ -1197,6 +1214,10 @@ impl FixAttemptTracker for PostgresBackend {
                         lines_added = COALESCE(EXCLUDED.lines_added, prs.lines_added),
                         lines_removed = COALESCE(EXCLUDED.lines_removed, prs.lines_removed)
                     RETURNING id"#,
+            ).await.map_err(db_err)?;
+            let row = c
+                .query_one(
+                    &stmt,
                     &[
                         &pr.pr_url, &pr.scm_repo, &pr.pr_number, &pr.attempt_id,
                         &pr.issue_id, &pr.issue_source, &pr.title, &pr.description,
@@ -1228,17 +1249,20 @@ impl FixAttemptTracker for PostgresBackend {
 
         self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                r#"UPDATE prs SET
+            let stmt = c
+                .prepare_cached(
+                    r#"UPDATE prs SET
                     status = $1,
                     updated_at = $2,
                     merged_at = COALESCE($3, merged_at),
                     closed_at = COALESCE($4, closed_at)
                   WHERE pr_url = $5"#,
-                &[&status, &now, &merged_at, &closed_at, &pr_url],
-            )
-            .await
-            .map_err(db_err)
+                )
+                .await
+                .map_err(db_err)?;
+            c.execute(&stmt, &[&status, &now, &merged_at, &closed_at, &pr_url])
+                .await
+                .map_err(db_err)
         })?;
 
         tracing::info!(pr_url, status, "PR status updated");
@@ -1253,13 +1277,10 @@ impl FixAttemptTracker for PostgresBackend {
     fn create_user(&self, email: &str, password_hash: &str, name: &str, role: &str) -> Result<i64> {
         let id: i64 = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            let row = c
-                .query_one(
-                    "INSERT INTO users (email, password_hash, name, role) VALUES ($1, $2, $3, $4) RETURNING id",
-                    &[&email, &password_hash, &name, &role],
-                )
-                .await
-                .map_err(db_err)?;
+            let stmt = c.prepare_cached(
+                "INSERT INTO users (email, password_hash, name, role) VALUES ($1, $2, $3, $4) RETURNING id",
+            ).await.map_err(db_err)?;
+            let row = c.query_one(&stmt, &[&email, &password_hash, &name, &role]).await.map_err(db_err)?;
             Ok::<i64, crate::error::Error>(row.get("id"))
         })?;
 
@@ -1317,18 +1338,21 @@ impl FixAttemptTracker for PostgresBackend {
         sets.push("updated_at = NOW()".to_string());
         let sql = format!("UPDATE users SET {} WHERE id = ${idx}", sets.join(", "));
 
-        // Need old email for invalidation
-        let old_email: Option<String> = self.block_on(async {
+        // Combine old-email lookup + UPDATE in a single block_on / connection checkout
+        let (old_email, rows_affected) = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            let row = c
-                .query_opt("SELECT email FROM users WHERE id = $1", &[&id])
+
+            // Fetch old email for cache invalidation
+            let s = c
+                .prepare_cached("SELECT email FROM users WHERE id = $1")
                 .await
                 .map_err(db_err)?;
-            Ok::<_, crate::error::Error>(row.map(|r| r.get("email")))
-        })?;
+            let old_email: Option<String> = c
+                .query_opt(&s, &[&id])
+                .await
+                .map_err(db_err)?
+                .map(|r| r.get("email"));
 
-        let rows_affected = self.block_on(async {
-            let c = self.client().await.map_err(db_err)?;
             let mut params: Vec<PgParam<'_>> = Vec::new();
             if let Some(ref v) = e_owned {
                 params.push(v);
@@ -1346,7 +1370,8 @@ impl FixAttemptTracker for PostgresBackend {
                 params.push(v);
             }
             params.push(&id);
-            c.execute(&*sql, &params).await.map_err(db_err)
+            let affected = c.execute(&*sql, &params).await.map_err(db_err)?;
+            Ok::<_, crate::error::Error>((old_email, affected))
         })?;
 
         let t = &self.tenant_id;
@@ -1365,32 +1390,25 @@ impl FixAttemptTracker for PostgresBackend {
     }
 
     fn delete_user(&self, id: i64) -> Result<bool> {
-        let email: Option<String> = self.block_on(async {
+        let row = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            let row = c
-                .query_opt("SELECT email FROM users WHERE id = $1", &[&id])
+            let stmt = c
+                .prepare_cached("DELETE FROM users WHERE id = $1 RETURNING email")
                 .await
                 .map_err(db_err)?;
-            Ok::<_, crate::error::Error>(row.map(|r| r.get("email")))
-        })?;
-
-        let rows_affected = self.block_on(async {
-            let c = self.client().await.map_err(db_err)?;
-            c.execute("DELETE FROM users WHERE id = $1", &[&id])
-                .await
-                .map_err(db_err)
+            c.query_opt(&stmt, &[&id]).await.map_err(db_err)
         })?;
 
         let t = &self.tenant_id;
         let mut del_keys = vec![format!("{t}:user:id:{id}")];
-        if let Some(ref e) = email {
-            del_keys.push(format!("{t}:user:email:{e}"));
+        if let Some(ref r) = row {
+            del_keys.push(format!("{t}:user:email:{}", r.get::<_, String>("email")));
         }
         let refs: Vec<&str> = del_keys.iter().map(|s| s.as_str()).collect();
         self.cache_del(&refs);
         self.cache_del_pattern(&format!("{t}:session:*"));
 
-        Ok(rows_affected > 0)
+        Ok(row.is_some())
     }
 
     // -----------------------------------------------------------------------
@@ -1401,12 +1419,15 @@ impl FixAttemptTracker for PostgresBackend {
         let token = generate_session_token();
         self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
-                "INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, $3)",
-                &[&token, &user_id, &expires_at],
-            )
-            .await
-            .map_err(db_err)
+            let stmt = c
+                .prepare_cached(
+                    "INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, $3)",
+                )
+                .await
+                .map_err(db_err)?;
+            c.execute(&stmt, &[&token, &user_id, &expires_at])
+                .await
+                .map_err(db_err)
         })?;
         Ok(token)
     }
@@ -1414,9 +1435,11 @@ impl FixAttemptTracker for PostgresBackend {
     fn delete_session(&self, token: &str) -> Result<()> {
         self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute("DELETE FROM sessions WHERE id = $1", &[&token])
+            let stmt = c
+                .prepare_cached("DELETE FROM sessions WHERE id = $1")
                 .await
-                .map_err(db_err)
+                .map_err(db_err)?;
+            c.execute(&stmt, &[&token]).await.map_err(db_err)
         })?;
 
         self.cache_del(&[&format!("{}:session:{}", self.tenant_id, token)]);
@@ -1426,9 +1449,11 @@ impl FixAttemptTracker for PostgresBackend {
     fn cleanup_expired_sessions(&self) -> Result<usize> {
         let rows_affected = self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute("DELETE FROM sessions WHERE expires_at <= NOW()", &[])
+            let stmt = c
+                .prepare_cached("DELETE FROM sessions WHERE expires_at <= NOW()")
                 .await
-                .map_err(db_err)
+                .map_err(db_err)?;
+            c.execute(&stmt, &[]).await.map_err(db_err)
         })?;
 
         if rows_affected > 0 {
@@ -1440,9 +1465,11 @@ impl FixAttemptTracker for PostgresBackend {
     fn delete_user_sessions(&self, user_id: i64) -> Result<()> {
         self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute("DELETE FROM sessions WHERE user_id = $1", &[&user_id])
+            let stmt = c
+                .prepare_cached("DELETE FROM sessions WHERE user_id = $1")
                 .await
-                .map_err(db_err)
+                .map_err(db_err)?;
+            c.execute(&stmt, &[&user_id]).await.map_err(db_err)
         })?;
 
         self.cache_del_pattern(&format!("{}:session:*", self.tenant_id));
@@ -1461,16 +1488,14 @@ impl FixAttemptTracker for PostgresBackend {
     ) -> Result<()> {
         self.block_on(async {
             let c = self.client().await.map_err(db_err)?;
-            c.execute(
+            let stmt = c.prepare_cached(
                 r#"INSERT INTO question_channel_cursor (channel, cursor_key, cursor_value, updated_at)
                    VALUES ($1, $2, $3, NOW())
                    ON CONFLICT(channel, cursor_key) DO UPDATE SET
                        cursor_value = EXCLUDED.cursor_value,
                        updated_at = EXCLUDED.updated_at"#,
-                &[&channel, &cursor_key, &cursor_value],
-            )
-            .await
-            .map_err(db_err)
+            ).await.map_err(db_err)?;
+            c.execute(&stmt, &[&channel, &cursor_key, &cursor_value]).await.map_err(db_err)
         })?;
 
         self.cache_del(&[&format!(

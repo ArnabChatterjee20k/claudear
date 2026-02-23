@@ -20,7 +20,7 @@ path = "src/lib.rs"
 [features]
 default = ["sqlite"]
 sqlite = ["dep:rusqlite"]
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:redis"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 
 [dependencies]
 # Async runtime

@@ -35,6 +35,9 @@ impl Notifier for ConsoleNotifier {
             "\n[{}] Processing: {} - {}",
             issue.source, issue.short_id, issue.title
         );
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            println!("  Trigger: {}", reason);
+        }
         Ok(())
     }
 
@@ -63,6 +66,9 @@ impl Notifier for ConsoleNotifier {
                 "[{}] Success: {} - PR: {}",
                 issue.source, issue.short_id, pr_url
             );
+        }
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            println!("  Trigger: {}", reason);
         }
         Ok(())
     }
@@ -107,6 +113,9 @@ impl Notifier for ConsoleNotifier {
             );
         } else {
             eprintln!("[{}] Failed: {} - {}", issue.source, issue.short_id, error);
+        }
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            eprintln!("  Trigger: {}", reason);
         }
         Ok(())
     }

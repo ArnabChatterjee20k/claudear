@@ -185,6 +185,9 @@ pub struct CreateMessageParams {
     /// Embeds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embeds: Option<Vec<MessageEmbed>>,
+    /// Reference to another message (for replies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_reference: Option<DiscordMessageReference>,
 }
 
 impl CreateMessageParams {
@@ -200,6 +203,7 @@ impl CreateMessageParams {
             content,
             tts: None,
             embeds: None,
+            message_reference: None,
         }
     }
 
@@ -215,7 +219,18 @@ impl CreateMessageParams {
             content,
             tts: None,
             embeds: Some(vec![embed]),
+            message_reference: None,
         }
+    }
+
+    /// Set this message as a reply to another message.
+    pub fn replying_to(mut self, message_id: impl Into<String>) -> Self {
+        self.message_reference = Some(DiscordMessageReference {
+            message_id: Some(message_id.into()),
+            channel_id: None,
+            guild_id: None,
+        });
+        self
     }
 }
 

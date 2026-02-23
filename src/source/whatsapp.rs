@@ -5,10 +5,12 @@
 //! messages via webhooks so this source drains a push-based buffer.
 
 use super::IssueSource;
+use crate::ask_reply_inbox;
 use crate::config::WhatsAppConfig;
 use crate::error::{Error, Result};
 use crate::types::{Issue, MatchPriority, MatchResult};
 use async_trait::async_trait;
+use chrono::{TimeZone, Utc};
 use std::sync::RwLock;
 
 /// A single WhatsApp message received from the Cloud API webhook.
@@ -22,6 +24,8 @@ pub struct WhatsAppMessage {
     pub text: String,
     /// Unix timestamp string from the webhook payload.
     pub timestamp: String,
+    /// Optional message ID being replied to (webhook `context.id`).
+    pub context_message_id: Option<String>,
 }
 
 /// WhatsApp source that converts webhook-delivered messages into issues.
@@ -45,6 +49,22 @@ impl WhatsAppSource {
 
     /// Push an incoming webhook message into the buffer for later processing.
     pub fn push_message(&self, msg: WhatsAppMessage) {
+        if !msg.text.trim().is_empty() {
+            let replied_at = msg
+                .timestamp
+                .parse::<i64>()
+                .ok()
+                .and_then(|secs| Utc.timestamp_opt(secs, 0).single())
+                .unwrap_or_else(Utc::now);
+            ask_reply_inbox::record_whatsapp_message(ask_reply_inbox::WhatsAppInboundMessage {
+                message_id: msg.id.clone(),
+                from: msg.from.clone(),
+                text: msg.text.clone(),
+                replied_at,
+                context_message_id: msg.context_message_id.clone(),
+            });
+        }
+
         let mut buf = self.buffer.write().unwrap_or_else(|e| e.into_inner());
         buf.push(msg);
     }
@@ -114,13 +134,6 @@ impl IssueSource for WhatsAppSource {
                 issue
             })
             .collect();
-
-        if !issues.is_empty() {
-            tracing::info!(
-                count = issues.len(),
-                "WhatsApp source fetched new issues from buffer"
-            );
-        }
 
         Ok(issues)
     }
@@ -237,6 +250,7 @@ impl IssueSource for WhatsAppSource {
             from: phone_number_id,
             text: content,
             timestamp: chrono::Utc::now().timestamp().to_string(),
+            context_message_id: None,
         };
 
         let issue = Self::message_to_issue(&msg);
@@ -257,6 +271,9 @@ mod tests {
         WhatsAppConfig {
             phone_number_id: Some("123456789".to_string()),
             access_token: Some("test-token".into()),
+            business_account_id: None,
+            app_secret: None,
+            webhook_verify_token: None,
             to_numbers: vec!["+1234567890".to_string()],
             source_enabled: true,
             listen_phone_number_id: None,
@@ -270,6 +287,7 @@ mod tests {
             from: from.to_string(),
             text: text.to_string(),
             timestamp: "1700000000".to_string(),
+            context_message_id: None,
         }
     }
 

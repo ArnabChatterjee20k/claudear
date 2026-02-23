@@ -255,6 +255,7 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
             },
             tts: None,
             embeds,
+            message_reference: None,
         }
     }
 
@@ -312,6 +313,31 @@ pub(crate) fn build_start_message(issue: &Issue, mention: Option<String>) -> Dis
     let url = truncate_string(&issue.url, MAX_URL_LENGTH);
     let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
 
+    let mut fields = vec![
+        DiscordField {
+            name: "Source".to_string(),
+            value: source,
+            inline: Some(true),
+        },
+        DiscordField {
+            name: "Priority".to_string(),
+            value: issue.priority.to_string(),
+            inline: Some(true),
+        },
+        DiscordField {
+            name: "Status".to_string(),
+            value: issue.status.to_string(),
+            inline: Some(true),
+        },
+    ];
+    if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+        fields.push(DiscordField {
+            name: "Trigger".to_string(),
+            value: reason,
+            inline: Some(false),
+        });
+    }
+
     DiscordMessage {
         content: mention.map(|m| m.to_string()),
         embeds: Some(vec![DiscordEmbed {
@@ -319,23 +345,7 @@ pub(crate) fn build_start_message(issue: &Issue, mention: Option<String>) -> Dis
             description: Some(title),
             url: Some(url),
             color: Some(0x3498db), // Blue
-            fields: Some(vec![
-                DiscordField {
-                    name: "Source".to_string(),
-                    value: source,
-                    inline: Some(true),
-                },
-                DiscordField {
-                    name: "Priority".to_string(),
-                    value: issue.priority.to_string(),
-                    inline: Some(true),
-                },
-                DiscordField {
-                    name: "Status".to_string(),
-                    value: issue.status.to_string(),
-                    inline: Some(true),
-                },
-            ]),
+            fields: Some(fields),
             footer: Some(DiscordFooter {
                 text: "Claudear".to_string(),
             }),
@@ -383,6 +393,13 @@ pub(crate) fn build_success_message(
         fields.push(DiscordField {
             name: "Changes".to_string(),
             value: truncate_string(&changelog, 1000),
+            inline: Some(false),
+        });
+    }
+    if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+        fields.push(DiscordField {
+            name: "Trigger".to_string(),
+            value: reason,
             inline: Some(false),
         });
     }
@@ -457,6 +474,26 @@ pub(crate) fn build_failed_message(
     let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
     let error_display = truncate_string(error, 1000);
 
+    let mut fields = vec![
+        DiscordField {
+            name: "Source".to_string(),
+            value: format!("{} {}", emoji, source),
+            inline: Some(true),
+        },
+        DiscordField {
+            name: "Error".to_string(),
+            value: error_display,
+            inline: Some(false),
+        },
+    ];
+    if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+        fields.push(DiscordField {
+            name: "Trigger".to_string(),
+            value: reason,
+            inline: Some(false),
+        });
+    }
+
     DiscordMessage {
         content: mention.map(|m| m.to_string()),
         embeds: Some(vec![DiscordEmbed {
@@ -464,18 +501,7 @@ pub(crate) fn build_failed_message(
             description: Some(title),
             url: Some(url),
             color: Some(0xe74c3c), // Red
-            fields: Some(vec![
-                DiscordField {
-                    name: "Source".to_string(),
-                    value: format!("{} {}", emoji, source),
-                    inline: Some(true),
-                },
-                DiscordField {
-                    name: "Error".to_string(),
-                    value: error_display,
-                    inline: Some(false),
-                },
-            ]),
+            fields: Some(fields),
             footer: Some(DiscordFooter {
                 text: "Claudear".to_string(),
             }),
@@ -4567,5 +4593,48 @@ mod tests {
         let fields = embed.fields.as_ref().unwrap();
         let status_field = fields.iter().find(|f| f.name == "Status").unwrap();
         assert!(status_field.value.contains("resolved after final check"));
+    }
+
+    #[test]
+    fn test_build_start_message_with_trigger_reason() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        issue.set_metadata("trigger_reason", "Retry attempt 2: timeout error");
+        let msg = build_start_message(&issue, None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        let trigger = fields.iter().find(|f| f.name == "Trigger").unwrap();
+        assert_eq!(trigger.value, "Retry attempt 2: timeout error");
+        assert_eq!(trigger.inline, Some(false));
+    }
+
+    #[test]
+    fn test_build_start_message_without_trigger_reason() {
+        let issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        let msg = build_start_message(&issue, None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields.iter().all(|f| f.name != "Trigger"));
+    }
+
+    #[test]
+    fn test_build_success_message_with_trigger_reason() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        issue.set_metadata("trigger_reason", "Review feedback received");
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        let trigger = fields.iter().find(|f| f.name == "Trigger").unwrap();
+        assert_eq!(trigger.value, "Review feedback received");
+    }
+
+    #[test]
+    fn test_build_failed_message_with_trigger_reason() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        issue.set_metadata("trigger_reason", "Manual trigger");
+        let msg = build_failed_message(&issue, "some error", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        let trigger = fields.iter().find(|f| f.name == "Trigger").unwrap();
+        assert_eq!(trigger.value, "Manual trigger");
     }
 }

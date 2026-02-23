@@ -80,6 +80,7 @@ RUN mkdir -p dashboard/dist
 RUN cargo build --release --bin claudear && rm -rf src
 
 COPY src ./src
+COPY migrations ./migrations
 
 COPY --from=dashboard /app/dashboard/dist ./dashboard/dist
 RUN touch src/main.rs src/lib.rs && cargo build --release --bin claudear

@@ -463,6 +463,11 @@ pub(crate) fn build_start_message(issue: &Issue, mention: Option<String>) -> Sla
             ]),
         },
     ];
+    if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+        blocks.push(SlackBlock::Context {
+            elements: vec![SlackText::mrkdwn(format!("*Trigger:* {}", reason))],
+        });
+    }
     if let Some(ref m) = mention {
         blocks.push(SlackBlock::Context {
             elements: vec![SlackText::mrkdwn(m.clone())],
@@ -528,6 +533,11 @@ pub(crate) fn build_success_message(
         blocks.push(SlackBlock::Section {
             text: SlackText::mrkdwn(format!("*Changes:*\n{}", truncate_string(&changelog, 1000))),
             fields: None,
+        });
+    }
+    if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+        blocks.push(SlackBlock::Context {
+            elements: vec![SlackText::mrkdwn(format!("*Trigger:* {}", reason))],
         });
     }
     if let Some(ref m) = mention {
@@ -625,6 +635,11 @@ pub(crate) fn build_failed_message(
             fields: None,
         },
     ];
+    if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+        blocks.push(SlackBlock::Context {
+            elements: vec![SlackText::mrkdwn(format!("*Trigger:* {}", reason))],
+        });
+    }
     if let Some(ref m) = mention {
         blocks.push(SlackBlock::Context {
             elements: vec![SlackText::mrkdwn(m.clone())],
@@ -4487,5 +4502,76 @@ mod tests {
         let notifier6 =
             SlackNotifier::with_http_client(config_mixed, MockSlackHttpClient::success());
         assert!(!notifier6.has_bot_channel());
+    }
+
+    #[test]
+    fn test_build_start_message_with_trigger_reason() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        issue.set_metadata("trigger_reason", "Retry attempt 2: timeout error");
+        let msg = build_start_message(&issue, None);
+        let blocks = msg.blocks.as_ref().unwrap();
+        let trigger_block = blocks.iter().find(|b| {
+            if let SlackBlock::Context { elements } = b {
+                elements
+                    .iter()
+                    .any(|e| e.kind == "mrkdwn" && e.text.contains("*Trigger:*"))
+            } else {
+                false
+            }
+        });
+        assert!(trigger_block.is_some());
+    }
+
+    #[test]
+    fn test_build_start_message_without_trigger_reason() {
+        let issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        let msg = build_start_message(&issue, None);
+        let blocks = msg.blocks.as_ref().unwrap();
+        let trigger_block = blocks.iter().find(|b| {
+            if let SlackBlock::Context { elements } = b {
+                elements
+                    .iter()
+                    .any(|e| e.kind == "mrkdwn" && e.text.contains("*Trigger:*"))
+            } else {
+                false
+            }
+        });
+        assert!(trigger_block.is_none());
+    }
+
+    #[test]
+    fn test_build_success_message_with_trigger_reason() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        issue.set_metadata("trigger_reason", "Review feedback received");
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let blocks = msg.blocks.as_ref().unwrap();
+        let trigger_block = blocks.iter().find(|b| {
+            if let SlackBlock::Context { elements } = b {
+                elements
+                    .iter()
+                    .any(|e| e.kind == "mrkdwn" && e.text.contains("*Trigger:*"))
+            } else {
+                false
+            }
+        });
+        assert!(trigger_block.is_some());
+    }
+
+    #[test]
+    fn test_build_failed_message_with_trigger_reason() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        issue.set_metadata("trigger_reason", "Manual trigger");
+        let msg = build_failed_message(&issue, "some error", None);
+        let blocks = msg.blocks.as_ref().unwrap();
+        let trigger_block = blocks.iter().find(|b| {
+            if let SlackBlock::Context { elements } = b {
+                elements
+                    .iter()
+                    .any(|e| e.kind == "mrkdwn" && e.text.contains("*Trigger:*"))
+            } else {
+                false
+            }
+        });
+        assert!(trigger_block.is_some());
     }
 }

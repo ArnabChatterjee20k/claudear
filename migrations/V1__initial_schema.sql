@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS discord_threads (
 
 CREATE INDEX IF NOT EXISTS idx_discord_threads_pr ON discord_threads(pr_url);
 CREATE INDEX IF NOT EXISTS idx_discord_threads_active ON discord_threads(is_active);
+CREATE INDEX IF NOT EXISTS idx_discord_threads_channel ON discord_threads(channel_id);
 
 CREATE TABLE IF NOT EXISTS pr_review_states (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +100,6 @@ CREATE TABLE IF NOT EXISTS repositories (
     last_indexed_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_repositories_name ON repositories(name);
 
 CREATE TABLE IF NOT EXISTS repository_dependencies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS repository_dependencies (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(upstream_id, downstream_id)
 );
+CREATE INDEX IF NOT EXISTS idx_repository_dependencies_downstream ON repository_dependencies(downstream_id);
 
 -- ============================================================
 -- Analytics Tables
@@ -332,7 +333,6 @@ CREATE TABLE IF NOT EXISTS repo_files (
 );
 CREATE INDEX IF NOT EXISTS idx_repo_files_path ON repo_files(file_path);
 CREATE INDEX IF NOT EXISTS idx_repo_files_type ON repo_files(file_type);
-CREATE INDEX IF NOT EXISTS idx_repo_files_repo ON repo_files(repo_id);
 
 -- ============================================================
 -- Inference Tracking Tables
@@ -400,6 +400,7 @@ CREATE INDEX IF NOT EXISTS idx_prs_status ON prs(status);
 CREATE INDEX IF NOT EXISTS idx_prs_repo ON prs(scm_repo);
 CREATE INDEX IF NOT EXISTS idx_prs_attempt ON prs(attempt_id);
 CREATE INDEX IF NOT EXISTS idx_prs_issue ON prs(issue_source, issue_id);
+CREATE INDEX IF NOT EXISTS idx_prs_created ON prs(created_at DESC);
 
 -- ============================================================
 -- Regression Tracking Tables
@@ -455,7 +456,6 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -521,7 +521,6 @@ CREATE TABLE IF NOT EXISTS repo_knowledge (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(repo, knowledge_key, knowledge_value)
 );
-CREATE INDEX IF NOT EXISTS idx_repo_knowledge_repo ON repo_knowledge(repo);
 CREATE INDEX IF NOT EXISTS idx_repo_knowledge_key ON repo_knowledge(repo, knowledge_key);
 
 CREATE TABLE IF NOT EXISTS review_patterns (
@@ -535,7 +534,6 @@ CREATE TABLE IF NOT EXISTS review_patterns (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_review_patterns_repo ON review_patterns(scm_repo);
 CREATE INDEX IF NOT EXISTS idx_review_patterns_category ON review_patterns(scm_repo, category);
 
 CREATE TABLE IF NOT EXISTS strategy_fingerprints (
@@ -564,7 +562,6 @@ CREATE TABLE IF NOT EXISTS issue_clusters (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_issue_clusters_source ON issue_clusters(source, status);
-CREATE INDEX IF NOT EXISTS idx_issue_clusters_key ON issue_clusters(cluster_key);
 
 CREATE TABLE IF NOT EXISTS issue_cluster_members (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -573,7 +570,6 @@ CREATE TABLE IF NOT EXISTS issue_cluster_members (
     arrived_at TEXT NOT NULL,
     UNIQUE(cluster_id, issue_id)
 );
-CREATE INDEX IF NOT EXISTS idx_issue_cluster_members_cluster ON issue_cluster_members(cluster_id);
 
 -- ============================================================
 -- Prioritisation Engine Tables
@@ -593,7 +589,6 @@ CREATE TABLE IF NOT EXISTS content_clusters (
     UNIQUE(cluster_key, source)
 );
 CREATE INDEX IF NOT EXISTS idx_content_clusters_source ON content_clusters(source, status);
-CREATE INDEX IF NOT EXISTS idx_content_clusters_key ON content_clusters(cluster_key);
 
 CREATE TABLE IF NOT EXISTS severity_scores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -609,7 +604,7 @@ CREATE TABLE IF NOT EXISTS severity_scores (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(source, issue_id)
 );
-CREATE INDEX IF NOT EXISTS idx_severity_scores_source ON severity_scores(source);
+CREATE INDEX IF NOT EXISTS idx_severity_scores_source_score ON severity_scores(source, score DESC);
 
 CREATE TABLE IF NOT EXISTS suppression_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -638,7 +633,6 @@ CREATE TABLE IF NOT EXISTS code_symbols (
     end_line INTEGER NOT NULL,
     signature TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_code_symbols_repo ON code_symbols(repo_id);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(symbol_name);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_kind ON code_symbols(symbol_kind);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_file ON code_symbols(repo_id, file_path);
@@ -656,7 +650,6 @@ CREATE TABLE IF NOT EXISTS code_chunks (
     context_text TEXT NOT NULL,
     file_hash TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_code_chunks_repo ON code_chunks(repo_id);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_file ON code_chunks(repo_id, file_path);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_symbol ON code_chunks(symbol_name);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_hash ON code_chunks(repo_id, file_path, file_hash);
@@ -694,7 +687,6 @@ CREATE TABLE IF NOT EXISTS cross_repo_correlations (
     window_hours INTEGER NOT NULL DEFAULT 24,
     UNIQUE(repo_a, repo_b)
 );
-CREATE INDEX IF NOT EXISTS idx_cross_repo_correlations_repos ON cross_repo_correlations(repo_a, repo_b);
 
 CREATE TABLE IF NOT EXISTS code_complexity (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -711,7 +703,6 @@ CREATE TABLE IF NOT EXISTS code_complexity (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(repo_id, file_path)
 );
-CREATE INDEX IF NOT EXISTS idx_code_complexity_repo ON code_complexity(repo_id);
 
 CREATE TABLE IF NOT EXISTS eval_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

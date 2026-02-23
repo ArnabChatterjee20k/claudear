@@ -24,10 +24,10 @@ use crate::types::{
 use crate::users::UserRegistry;
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::Json,
-    routing::{get, post},
+    response::{IntoResponse, Json},
+    routing::get,
     Router,
 };
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
@@ -37,6 +37,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tower::limit::ConcurrencyLimitLayer;
+
+#[cfg(test)]
+use axum::routing::post;
 
 /// Maximum time a processing entry can remain in the set before automatic cleanup (1 hour).
 /// This prevents unbounded memory growth if a task fails to clean up properly.
@@ -64,6 +67,16 @@ struct AppState {
     /// Tracks currently processing webhooks with timestamps for TTL-based cleanup.
     /// Key: processing key (source:issue_id), Value: timestamp when processing started.
     processing: RwLock<HashMap<String, Instant>>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WebhookVerifyQuery {
+    #[serde(rename = "hub.mode")]
+    hub_mode: Option<String>,
+    #[serde(rename = "hub.verify_token")]
+    hub_verify_token: Option<String>,
+    #[serde(rename = "hub.challenge")]
+    hub_challenge: Option<String>,
 }
 
 /// HTTP server for webhooks.
@@ -210,7 +223,9 @@ impl WebhookServer {
             .route("/health", get(health_handler))
             .route(
                 "/webhook/:source",
-                post(webhook_handler).layer(concurrency_layer),
+                get(webhook_verify_handler)
+                    .post(webhook_handler)
+                    .layer(concurrency_layer),
             )
             .layer(DefaultBodyLimit::max(512 * 1024)) // 512 KB body size limit
             // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
@@ -236,7 +251,7 @@ impl WebhookServer {
 
         tracing::info!("Webhook server listening on {}", addr);
         tracing::info!(
-            work_dir = ?state.config.work_dir,
+            workspace = ?state.config.workspace,
             known_orgs = state.config.known_orgs.len(),
             "Repository configuration"
         );
@@ -286,6 +301,59 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
     }))
 }
 
+async fn webhook_verify_handler(
+    State(state): State<Arc<AppState>>,
+    Path(source_name): Path<String>,
+    Query(query): Query<WebhookVerifyQuery>,
+) -> impl IntoResponse {
+    if source_name != "whatsapp" {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            Json(json!({ "error": "GET verification not supported for this source" })),
+        )
+            .into_response();
+    }
+
+    let expected_owned = state
+        .config
+        .notifiers
+        .whatsapp
+        .webhook_verify_token
+        .as_ref()
+        .map(|s| s.expose().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+
+    let Some(expected) = expected_owned else {
+        tracing::error!(
+            source = "whatsapp",
+            "WHATSAPP_WEBHOOK_VERIFY_TOKEN not configured; cannot verify webhook"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Webhook verify token not configured" })),
+        )
+            .into_response();
+    };
+
+    if query.hub_mode.as_deref() != Some("subscribe")
+        || query.hub_verify_token.as_deref() != Some(expected.as_str())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Invalid verify token" })),
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, query.hub_challenge.unwrap_or_default()).into_response()
+}
+
 async fn webhook_handler(
     State(state): State<Arc<AppState>>,
     Path(source_name): Path<String>,
@@ -321,6 +389,7 @@ async fn webhook_handler(
     let has_signature = header_map.contains_key("x-signature")
         || header_map.contains_key("sentry-hook-signature")
         || header_map.contains_key("linear-signature")
+        || header_map.contains_key("x-slack-signature")
         || header_map.contains_key("x-hub-signature-256");
     let activity = ActivityLogEntry::new(
         "webhook_received",
@@ -349,6 +418,30 @@ async fn webhook_handler(
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "Invalid signature" })),
         );
+    }
+
+    // Slack URL verification challenge must return the challenge body immediately.
+    if source_name == "slack" {
+        let slack_payload: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "Invalid JSON" })),
+                );
+            }
+        };
+        if slack_payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == "url_verification")
+        {
+            let challenge = slack_payload
+                .get("challenge")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            return (StatusCode::OK, Json(json!({ "challenge": challenge })));
+        }
     }
 
     // Webhook delivery ID idempotency: prevent redelivered webhooks from
@@ -776,7 +869,7 @@ async fn process_issue(
         }
 
         // Create per-issue worktree
-        let wt_path = worktree_path(&state.config.work_dir, repo_name, &issue.short_id);
+        let wt_path = worktree_path(&state.config.workspace, repo_name, &issue.short_id);
         if let Err(e) = GitOps::create_worktree(
             &project_dir,
             &wt_path,
@@ -832,7 +925,7 @@ async fn process_issue(
     // Use the per-issue worktree as the effective working directory for Claude.
     // Fall back to project_dir only when no repo was resolved (no worktree attempted).
     let effective_project_dir = if let Some(repo_name) = resolution.repo_name() {
-        let wt = worktree_path(&state.config.work_dir, repo_name, &issue.short_id);
+        let wt = worktree_path(&state.config.workspace, repo_name, &issue.short_id);
         if !wt.exists() {
             let err = format!("Worktree disappeared after creation: {:?}", wt);
             tracing::error!(short_id = %issue.short_id, error = %err);
@@ -1372,7 +1465,7 @@ async fn process_issue(
 
     // Cleanup worktree
     if let Some(repo_name) = resolution.repo_name() {
-        let wt_path = worktree_path(&state.config.work_dir, repo_name, &issue.short_id);
+        let wt_path = worktree_path(&state.config.workspace, repo_name, &issue.short_id);
         if wt_path.exists() {
             if let Err(e) = GitOps::remove_worktree(&project_dir, &wt_path).await {
                 tracing::warn!(
@@ -1678,7 +1771,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            work_dir: std::path::PathBuf::from("/tmp/repos"),
+            workspace: std::path::PathBuf::from("/tmp/repos"),
             known_orgs: vec!["test-org".to_string()],
             auto_discover_paths: vec![],
             poll_interval_ms: 60000,
@@ -2648,7 +2741,7 @@ mod tests {
         );
 
         assert_eq!(server.port, config.webhook_port);
-        assert_eq!(server.config.work_dir, config.work_dir);
+        assert_eq!(server.config.workspace, config.workspace);
     }
 
     #[tokio::test]
@@ -4488,7 +4581,7 @@ mod tests {
     #[test]
     fn test_webhook_server_new_preserves_config_fields() {
         let mut config = test_config();
-        config.work_dir = std::path::PathBuf::from("/custom/work_dir");
+        config.workspace = std::path::PathBuf::from("/custom/workspace");
         config.known_orgs = vec!["org-a".to_string(), "org-b".to_string()];
         config.webhook_port = 9999;
         config.max_issues_per_cycle = 42;
@@ -4509,8 +4602,8 @@ mod tests {
 
         assert_eq!(server.port, 9999);
         assert_eq!(
-            server.config.work_dir,
-            std::path::PathBuf::from("/custom/work_dir")
+            server.config.workspace,
+            std::path::PathBuf::from("/custom/workspace")
         );
         assert_eq!(server.config.known_orgs.len(), 2);
         assert_eq!(server.config.max_issues_per_cycle, 42);

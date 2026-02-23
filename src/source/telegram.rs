@@ -4,10 +4,12 @@
 //! long-polling endpoint with cursor-based offset tracking.
 
 use super::IssueSource;
+use crate::ask_reply_inbox;
 use crate::config::TelegramConfig;
 use crate::error::{Error, Result};
 use crate::types::{Issue, MatchPriority, MatchResult};
 use async_trait::async_trait;
+use chrono::{TimeZone, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -39,6 +41,20 @@ struct TelegramMessage {
     #[serde(default)]
     from: Option<TelegramUser>,
     chat: TelegramChat,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    date: Option<i64>,
+    #[serde(default)]
+    reply_to_message: Option<TelegramReplyMessage>,
+}
+
+/// Minimal Telegram reply-to message object for ask-loop matching.
+#[derive(Debug, Clone, Deserialize)]
+struct TelegramReplyMessage {
+    message_id: i64,
+    #[serde(default)]
+    from: Option<TelegramUser>,
     #[serde(default)]
     text: Option<String>,
 }
@@ -170,6 +186,39 @@ impl TelegramSource {
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
         cache.insert(msg.message_id.to_string(), msg.clone());
     }
+
+    /// Publish inbound Telegram messages to the shared ask-reply inbox.
+    fn record_ask_reply_candidate(&self, msg: &TelegramMessage) {
+        let text = match msg.text.as_ref() {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => return,
+        };
+
+        let from = match msg.from.as_ref() {
+            Some(v) if !v.is_bot => v,
+            _ => return,
+        };
+
+        let replied_at = msg
+            .date
+            .and_then(|secs| Utc.timestamp_opt(secs, 0).single())
+            .unwrap_or_else(Utc::now);
+
+        ask_reply_inbox::record_telegram_message(ask_reply_inbox::TelegramInboundMessage {
+            message_id: msg.message_id,
+            chat_id: msg.chat.id,
+            responder_id: Some(from.id.to_string()),
+            responder_username: from.username.clone(),
+            text,
+            replied_at,
+            reply_to_message_id: msg.reply_to_message.as_ref().map(|m| m.message_id),
+            reply_to_text: msg.reply_to_message.as_ref().and_then(|m| m.text.clone()),
+            reply_to_is_bot: msg
+                .reply_to_message
+                .as_ref()
+                .and_then(|m| m.from.as_ref().map(|u| u.is_bot)),
+        });
+    }
 }
 
 #[async_trait]
@@ -236,10 +285,6 @@ impl IssueSource for TelegramSource {
 
         // First poll (cursor was None): seed and return empty.
         if last_id.is_none() {
-            tracing::info!(
-                update_id = ?updates.last().map(|u| u.update_id),
-                "Telegram source seeded cursor"
-            );
             return Ok(vec![]);
         }
 
@@ -249,6 +294,7 @@ impl IssueSource for TelegramSource {
         let issues: Vec<Issue> = updates
             .iter()
             .filter_map(|u| u.message.as_ref())
+            .inspect(|msg| self.record_ask_reply_candidate(msg))
             // Skip bot messages.
             .filter(|msg| msg.from.as_ref().map_or(true, |user| !user.is_bot))
             // Skip messages without text.
@@ -260,10 +306,6 @@ impl IssueSource for TelegramSource {
                 Self::message_to_issue(msg)
             })
             .collect();
-
-        if !issues.is_empty() {
-            tracing::info!(count = issues.len(), "Telegram source fetched new issues");
-        }
 
         Ok(issues)
     }
@@ -396,6 +438,8 @@ mod tests {
             }),
             chat: TelegramChat { id: -1001234567890 },
             text: Some(text.to_string()),
+            date: Some(1_700_000_000),
+            reply_to_message: None,
         }
     }
 
@@ -587,6 +631,8 @@ mod tests {
             from: None,
             chat: TelegramChat { id: -1001234567890 },
             text: Some("Anonymous message".to_string()),
+            date: Some(1_700_000_000),
+            reply_to_message: None,
         };
         let issue = TelegramSource::message_to_issue(&msg);
         assert_eq!(issue.id, "99");
@@ -601,6 +647,8 @@ mod tests {
             from: None,
             chat: TelegramChat { id: 100 },
             text: None,
+            date: Some(1_700_000_000),
+            reply_to_message: None,
         };
         let issue = TelegramSource::message_to_issue(&msg);
         assert_eq!(issue.title, "");
@@ -760,6 +808,8 @@ mod tests {
             }),
             chat: TelegramChat { id: -1001234567890 },
             text: None,
+            date: Some(1_700_000_000),
+            reply_to_message: None,
         };
 
         let has_text =
@@ -780,6 +830,8 @@ mod tests {
             }),
             chat: TelegramChat { id: -1009999999999 },
             text: Some("hello".to_string()),
+            date: Some(1_700_000_000),
+            reply_to_message: None,
         };
 
         let listen: Option<i64> = Some(-1001234567890);
@@ -929,6 +981,8 @@ mod tests {
             }),
             chat: TelegramChat { id: -1001234567890 },
             text: Some("hello".to_string()),
+            date: Some(1_700_000_000),
+            reply_to_message: None,
         };
         let issue = TelegramSource::message_to_issue(&msg);
         assert!(issue.get_metadata::<String>("author_username").is_none());
@@ -1109,6 +1163,8 @@ mod tests {
             }),
             chat: TelegramChat { id: 12345 },
             text: Some("DM message".to_string()),
+            date: Some(1_700_000_000),
+            reply_to_message: None,
         };
         let issue = TelegramSource::message_to_issue(&msg);
         assert_eq!(issue.url, "");

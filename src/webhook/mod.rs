@@ -3,20 +3,28 @@
 mod configurator;
 mod github;
 mod gitlab;
+mod jira;
 mod linear;
 mod linear_api;
 mod sentry;
 mod sentry_api;
 mod server;
+mod slack;
+mod telegram;
+mod whatsapp;
 
 pub use configurator::{print_setup_result, WebhookConfigurator, WebhookSetupResult};
 pub use github::GitHubWebhookHandler;
 pub use gitlab::{GitLabIssueWebhookHandler, GitLabMrWebhookHandler};
+pub use jira::JiraWebhookHandler;
 pub use linear::LinearWebhookHandler;
 pub use linear_api::{LinearApiClient, WebhookRegistration};
 pub use sentry::SentryWebhookHandler;
 pub use sentry_api::{SentryApiClient, SentryWebhookRegistration};
 pub use server::WebhookServer;
+pub use slack::SlackWebhookHandler;
+pub use telegram::TelegramWebhookHandler;
+pub use whatsapp::WhatsAppWebhookHandler;
 
 use crate::error::Result;
 use crate::types::{Issue, MatchResult};

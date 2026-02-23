@@ -1,11 +1,16 @@
 //! Webhook auto-configuration orchestrator.
 
-use crate::config::{Config, LinearConfig, SentryConfig};
+use crate::config::{
+    Config, GitHubConfig, GitLabConfig, JiraConfig, LinearConfig, SentryConfig, SlackSourceConfig,
+    TelegramConfig, WhatsAppConfig,
+};
 use crate::env_writer::update_env_file;
 use crate::error::{Error, Result};
 use crate::webhook::linear_api::LinearApiClient;
 use crate::webhook::sentry_api::SentryApiClient;
+use serde::Deserialize;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Result of webhook auto-configuration.
 #[derive(Debug, Default)]
@@ -27,7 +32,39 @@ pub struct WebhookSetupResult {
     pub warnings: Vec<String>,
 }
 
-/// Orchestrates webhook auto-configuration for Linear and Sentry.
+#[derive(Debug, Deserialize)]
+struct GitHubHookListItem {
+    #[serde(default)]
+    config: GitHubHookConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GitHubHookConfig {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitLabHookListItem {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramApiResponse {
+    ok: bool,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackApiOkResponse {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Orchestrates webhook auto-configuration for supported webhook services.
 pub struct WebhookConfigurator {
     config: Config,
     env_path: std::path::PathBuf,
@@ -49,7 +86,9 @@ impl WebhookConfigurator {
     /// Run the webhook auto-configuration.
     ///
     /// This will:
-    /// 1. Create webhooks for enabled sources (Linear, Sentry)
+    /// 1. Create webhooks for enabled auto-configurable services
+    ///    (Linear, Sentry, GitHub, GitLab, Jira, Telegram, Slack, WhatsApp)
+    /// 2. Emit notes for enabled services that currently require manual setup
     /// 2. Write the returned secrets to the .env file
     ///
     /// # Arguments
@@ -60,22 +99,28 @@ impl WebhookConfigurator {
 
         let mut result = WebhookSetupResult::default();
         let mut env_updates: HashMap<String, String> = HashMap::new();
+        let mut configured_any = false;
+        let mut attempted_auto_config = false;
+        let mut failure_warnings: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
 
         // Configure Linear webhook
         if let Some(linear_config) = self.config.linear() {
             if linear_config.enabled {
+                attempted_auto_config = true;
                 match self.configure_linear(linear_config, base_url).await {
                     Ok((webhook_id, secret)) => {
                         result.linear_configured = true;
                         result.linear_webhook_id = Some(webhook_id);
                         result.linear_secret = Some(secret.clone());
                         env_updates.insert("LINEAR_WEBHOOK_SECRET".to_string(), secret);
+                        configured_any = true;
                         tracing::info!("Linear webhook configured successfully");
                     }
                     Err(e) => {
                         let warning = format!("Failed to configure Linear webhook: {}", e);
                         tracing::warn!("{}", warning);
-                        result.warnings.push(warning);
+                        failure_warnings.push(warning);
                     }
                 }
             }
@@ -84,6 +129,7 @@ impl WebhookConfigurator {
         // Configure Sentry webhooks
         if let Some(ref sentry_config) = self.config.issues.sentry {
             if sentry_config.enabled {
+                attempted_auto_config = true;
                 match self.configure_sentry(sentry_config, base_url).await {
                     Ok((count, secret)) => {
                         result.sentry_configured = true;
@@ -92,14 +138,261 @@ impl WebhookConfigurator {
                             result.sentry_secret = Some(s.clone());
                             env_updates.insert("SENTRY_CLIENT_SECRET".to_string(), s);
                         }
+                        configured_any = true;
                         tracing::info!("Sentry webhooks configured for {} project(s)", count);
                     }
                     Err(e) => {
                         let warning = format!("Failed to configure Sentry webhooks: {}", e);
                         tracing::warn!("{}", warning);
-                        result.warnings.push(warning);
+                        failure_warnings.push(warning);
                     }
                 }
+            }
+        }
+
+        // Configure Jira issue webhooks (/webhook/jira)
+        if let Some(jira_config) = self.config.jira() {
+            if jira_config.enabled {
+                if !jira_config.base_url.trim().is_empty() && !jira_config.api_token.is_empty() {
+                    attempted_auto_config = true;
+                    match self.configure_jira(jira_config, base_url).await {
+                        Ok(created) => {
+                            configured_any = true;
+                            let note = if created {
+                                "Jira issue webhook configured".to_string()
+                            } else {
+                                "Jira issue webhook already configured".to_string()
+                            };
+                            tracing::info!("{}", note);
+                            notes.push(note);
+                        }
+                        Err(e) => {
+                            let warning = format!("Failed to configure Jira webhook: {}", e);
+                            tracing::warn!("{}", warning);
+                            failure_warnings.push(warning);
+                        }
+                    }
+                } else if jira_config.base_url.trim().is_empty() {
+                    notes.push(
+                        "Jira is enabled but jira.base_url is empty; skipping Jira webhook auto-setup."
+                            .to_string(),
+                    );
+                } else {
+                    notes.push(
+                        "Jira is enabled but jira.api_token is empty; skipping Jira webhook auto-setup."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        // Configure Telegram webhook (/webhook/telegram)
+        if self.config.notifiers.telegram.source_enabled {
+            let telegram_config = &self.config.notifiers.telegram;
+            let has_bot_token = telegram_config
+                .bot_token
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty());
+            if has_bot_token {
+                attempted_auto_config = true;
+                match self.configure_telegram(telegram_config, base_url).await {
+                    Ok(generated_secret) => {
+                        configured_any = true;
+                        if let Some(secret) = generated_secret {
+                            env_updates.insert("TELEGRAM_WEBHOOK_SECRET".to_string(), secret);
+                        }
+                        notes.push("Telegram webhook configured (Bot API setWebhook)".to_string());
+                    }
+                    Err(e) => {
+                        let warning = format!("Failed to configure Telegram webhook: {}", e);
+                        tracing::warn!("{}", warning);
+                        failure_warnings.push(warning);
+                    }
+                }
+            } else {
+                notes.push(
+                    "Telegram source is enabled but telegram.bot_token is missing; skipping Telegram webhook auto-setup."
+                        .to_string(),
+                );
+            }
+        }
+
+        // Configure Slack Events API webhook (manifest API -> /webhook/slack)
+        if let Some(slack_config) = self.config.issues.slack.as_ref() {
+            let has_app_id = slack_config
+                .app_id
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_manifest_token = slack_config
+                .app_config_token
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty());
+            let has_signing_secret = slack_config
+                .signing_secret
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty());
+
+            if has_app_id && has_manifest_token && has_signing_secret {
+                attempted_auto_config = true;
+                match self.configure_slack(slack_config, base_url).await {
+                    Ok(updated) => {
+                        configured_any = true;
+                        let note = if updated {
+                            "Slack Events API callback configured via apps.manifest.update"
+                                .to_string()
+                        } else {
+                            "Slack Events API callback already configured".to_string()
+                        };
+                        tracing::info!("{}", note);
+                        notes.push(note);
+                    }
+                    Err(e) => {
+                        let warning = format!("Failed to configure Slack webhook: {}", e);
+                        tracing::warn!("{}", warning);
+                        failure_warnings.push(warning);
+                    }
+                }
+            } else {
+                let mut missing = Vec::new();
+                if !has_app_id {
+                    missing.push("slack.app_id");
+                }
+                if !has_manifest_token {
+                    missing.push("slack.app_config_token");
+                }
+                if !has_signing_secret {
+                    missing.push("slack.signing_secret");
+                }
+                notes.push(format!(
+                    "Slack source is configured, but webhook auto-setup requires {}.",
+                    missing.join(", ")
+                ));
+            }
+        }
+
+        // Configure WhatsApp webhook subscription (WABA subscribed_apps -> /webhook/whatsapp)
+        if self.config.notifiers.whatsapp.source_enabled {
+            let wa = &self.config.notifiers.whatsapp;
+            let has_access_token = wa
+                .access_token
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty());
+            let has_business_account_id = wa
+                .business_account_id
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_app_secret = wa
+                .app_secret
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty());
+
+            if has_access_token && has_business_account_id && has_app_secret {
+                attempted_auto_config = true;
+                match self.configure_whatsapp(wa, base_url).await {
+                    Ok(generated_verify_token) => {
+                        configured_any = true;
+                        if let Some(token) = generated_verify_token {
+                            env_updates.insert("WHATSAPP_WEBHOOK_VERIFY_TOKEN".to_string(), token);
+                        }
+                        notes.push(
+                            "WhatsApp webhook subscription configured (WABA subscribed_apps)"
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        let warning = format!("Failed to configure WhatsApp webhook: {}", e);
+                        tracing::warn!("{}", warning);
+                        failure_warnings.push(warning);
+                    }
+                }
+            } else {
+                let mut missing = Vec::new();
+                if !has_access_token {
+                    missing.push("whatsapp.access_token");
+                }
+                if !has_business_account_id {
+                    missing.push("whatsapp.business_account_id");
+                }
+                if !has_app_secret {
+                    missing.push("whatsapp.app_secret");
+                }
+                notes.push(format!(
+                    "WhatsApp source is enabled, but webhook auto-setup requires {}.",
+                    missing.join(", ")
+                ));
+            }
+        }
+
+        // Configure GitLab issue webhooks (group hooks -> /webhook/gitlab)
+        if let Some(gitlab_config) = self.config.gitlab() {
+            if gitlab_config.enabled {
+                if !gitlab_config.groups.is_empty() && gitlab_config.token.is_some() {
+                    attempted_auto_config = true;
+                    match self.configure_gitlab(gitlab_config, base_url).await {
+                        Ok((group_count, generated_secret)) => {
+                            configured_any = true;
+                            if let Some(secret) = generated_secret {
+                                env_updates.insert("GITLAB_WEBHOOK_SECRET".to_string(), secret);
+                            }
+                            let note = format!(
+                                "GitLab issue webhooks configured for {} group(s)",
+                                group_count
+                            );
+                            tracing::info!("{}", note);
+                            notes.push(note);
+                        }
+                        Err(e) => {
+                            let warning = format!("Failed to configure GitLab webhooks: {}", e);
+                            tracing::warn!("{}", warning);
+                            failure_warnings.push(warning);
+                        }
+                    }
+                } else if gitlab_config.groups.is_empty() {
+                    notes.push(
+                        "GitLab is enabled but no groups are configured; skipping GitLab webhook auto-setup."
+                            .to_string(),
+                    );
+                } else if gitlab_config.token.is_none() {
+                    notes.push(
+                        "GitLab is enabled but no token is configured; skipping GitLab webhook auto-setup."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        // Configure GitHub review webhooks (repo hooks -> /webhook/github)
+        let github_config = self.config.github();
+        if !github_config.repos.is_empty() && github_config.token.is_some() {
+            attempted_auto_config = true;
+            match self.configure_github(github_config, base_url).await {
+                Ok((repo_count, generated_secret)) => {
+                    configured_any = true;
+                    if let Some(secret) = generated_secret {
+                        env_updates.insert("GITHUB_WEBHOOK_SECRET".to_string(), secret);
+                    }
+                    let note = format!(
+                        "GitHub review webhooks configured for {} repo(s)",
+                        repo_count
+                    );
+                    tracing::info!("{}", note);
+                    notes.push(note);
+                }
+                Err(e) => {
+                    let warning = format!("Failed to configure GitHub webhooks: {}", e);
+                    tracing::warn!("{}", warning);
+                    failure_warnings.push(warning);
+                }
+            }
+        } else if !github_config.repos.is_empty() && github_config.token.is_none() {
+            if self.config.github_app().is_configured() {
+                notes.push(
+                    "GitHub repos are configured but no PAT is set; GitHub App webhook setup is managed separately (manifest/app settings) and is not auto-configured here yet.".to_string(),
+                );
+            } else {
+                notes.push(
+                    "GitHub repos are configured but no GitHub token is available; skipping GitHub webhook auto-setup.".to_string(),
+                );
             }
         }
 
@@ -109,20 +402,817 @@ impl WebhookConfigurator {
             update_env_file(&self.env_path, &env_updates)?;
         }
 
-        if !result.linear_configured && !result.sentry_configured {
-            if result.warnings.is_empty() {
-                return Err(Error::config(
-                    "No webhook sources are enabled. Enable Linear or Sentry in your configuration."
-                ));
-            } else {
+        result.warnings.extend(failure_warnings.clone());
+        result.warnings.extend(notes);
+
+        if !configured_any {
+            if attempted_auto_config && !failure_warnings.is_empty() {
                 return Err(Error::config(format!(
                     "Failed to configure any webhooks: {}",
+                    failure_warnings.join("; ")
+                )));
+            }
+            if !attempted_auto_config && result.warnings.is_empty() {
+                return Err(Error::config(
+                    "No webhook sources are enabled. Enable Linear, Sentry, GitHub (with repos), GitLab (with groups), Jira, Telegram source, Slack source, or WhatsApp source in your configuration."
+                ));
+            }
+            if !attempted_auto_config {
+                return Err(Error::config(format!(
+                    "No auto-configurable webhook services are enabled. {}",
                     result.warnings.join("; ")
                 )));
             }
         }
 
         Ok(result)
+    }
+
+    async fn configure_github(
+        &self,
+        config: &GitHubConfig,
+        base_url: &str,
+    ) -> Result<(usize, Option<String>)> {
+        let token = config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token is required for webhook auto-setup"))?
+            .expose()
+            .to_string();
+        if token.is_empty() {
+            return Err(Error::config(
+                "GitHub token is required for webhook auto-setup",
+            ));
+        }
+        if config.repos.is_empty() {
+            return Err(Error::config(
+                "GitHub repos must be configured for webhook auto-setup",
+            ));
+        }
+
+        let callback_url = format!("{}/webhook/github", base_url.trim_end_matches('/'));
+        let secret = config
+            .webhook_secret
+            .as_ref()
+            .map(|s| s.expose().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "ghwh_{}{}",
+                    Uuid::new_v4().simple(),
+                    Uuid::new_v4().simple()
+                )
+            });
+        let generated_secret = config
+            .webhook_secret
+            .as_ref()
+            .map(|s| s.expose().is_empty())
+            .unwrap_or(true)
+            .then(|| secret.clone());
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let mut configured_count = 0usize;
+        let mut repo_failures: Vec<String> = Vec::new();
+
+        for repo in &config.repos {
+            match self
+                .ensure_github_repo_webhook(&client, &token, repo, &callback_url, &secret)
+                .await
+            {
+                Ok(_) => configured_count += 1,
+                Err(e) => repo_failures.push(format!("{} ({})", repo, e)),
+            }
+        }
+
+        if configured_count == 0 {
+            return Err(Error::api(format!(
+                "GitHub webhook setup failed for all repos: {}",
+                repo_failures.join("; ")
+            )));
+        }
+
+        if !repo_failures.is_empty() {
+            tracing::warn!(
+                "GitHub webhook setup partially succeeded: configured {} repo(s), failed for {}",
+                configured_count,
+                repo_failures.join("; ")
+            );
+        }
+
+        Ok((configured_count, generated_secret))
+    }
+
+    async fn configure_jira(&self, config: &JiraConfig, base_url: &str) -> Result<bool> {
+        let callback_url = format!("{}/webhook/jira", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let auth_header = Self::jira_auth_header(config);
+
+        if self
+            .ensure_jira_webhook(&client, &auth_header, &config.base_url, &callback_url)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    async fn configure_telegram(
+        &self,
+        config: &TelegramConfig,
+        base_url: &str,
+    ) -> Result<Option<String>> {
+        let token = config
+            .bot_token
+            .as_ref()
+            .ok_or_else(|| Error::config("Telegram bot_token is required for webhook auto-setup"))?
+            .expose()
+            .trim()
+            .to_string();
+        if token.is_empty() {
+            return Err(Error::config(
+                "Telegram bot_token is required for webhook auto-setup",
+            ));
+        }
+
+        let callback_url = format!("{}/webhook/telegram", base_url.trim_end_matches('/'));
+        let secret = std::env::var("TELEGRAM_WEBHOOK_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "tgwh_{}{}",
+                    Uuid::new_v4().simple(),
+                    Uuid::new_v4().simple()
+                )
+            });
+        let generated_secret = std::env::var("TELEGRAM_WEBHOOK_SECRET")
+            .ok()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+            .then(|| secret.clone());
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let url = format!("https://api.telegram.org/bot{}/setWebhook", token);
+        let payload = serde_json::json!({
+            "url": callback_url,
+            "allowed_updates": ["message"],
+            "secret_token": secret,
+        });
+        let resp = client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("Telegram setWebhook request failed: {}", e)))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::api(format!(
+                "Telegram setWebhook returned {}: {}",
+                status, body
+            )));
+        }
+
+        let parsed: TelegramApiResponse = serde_json::from_str(&body).map_err(|e| {
+            Error::api(format!(
+                "Failed to parse Telegram setWebhook response: {}",
+                e
+            ))
+        })?;
+        if !parsed.ok {
+            return Err(Error::api(format!(
+                "Telegram setWebhook failed: {}",
+                parsed
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            )));
+        }
+
+        Ok(generated_secret)
+    }
+
+    async fn configure_slack(&self, config: &SlackSourceConfig, base_url: &str) -> Result<bool> {
+        let app_id = config
+            .app_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::config("Slack app_id is required for webhook auto-setup"))?;
+        let app_config_token = config
+            .app_config_token
+            .as_ref()
+            .map(|s| s.expose().trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::config("Slack app_config_token is required for webhook auto-setup")
+            })?;
+
+        let callback_url = format!("{}/webhook/slack", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let export_resp = client
+            .post("https://slack.com/api/apps.manifest.export")
+            .header("Authorization", format!("Bearer {}", app_config_token))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "app_id": app_id }))
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("Slack apps.manifest.export request failed: {}", e)))?;
+        let export_status = export_resp.status();
+        let export_body = export_resp.text().await.unwrap_or_default();
+        if !export_status.is_success() {
+            return Err(Error::api(format!(
+                "Slack apps.manifest.export returned {}: {}",
+                export_status, export_body
+            )));
+        }
+
+        let export_json: serde_json::Value = serde_json::from_str(&export_body)
+            .map_err(|e| Error::api(format!("Failed to parse Slack export response: {}", e)))?;
+        let ok_resp: SlackApiOkResponse = serde_json::from_value(export_json.clone())
+            .map_err(|e| Error::api(format!("Failed to parse Slack ok/error fields: {}", e)))?;
+        if !ok_resp.ok {
+            return Err(Error::api(format!(
+                "Slack apps.manifest.export failed: {}",
+                ok_resp.error.unwrap_or_else(|| "unknown error".to_string())
+            )));
+        }
+
+        let mut manifest = match export_json.get("manifest") {
+            Some(serde_json::Value::Object(obj)) => serde_json::Value::Object(obj.clone()),
+            Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
+                .map_err(|e| Error::api(format!("Failed to parse Slack manifest JSON: {}", e)))?,
+            _ => {
+                return Err(Error::api(
+                    "Slack apps.manifest.export response missing manifest".to_string(),
+                ))
+            }
+        };
+
+        let changed = Self::ensure_slack_events_subscription(&mut manifest, &callback_url)?;
+        if !changed {
+            return Ok(false);
+        }
+
+        let update_resp = client
+            .post("https://slack.com/api/apps.manifest.update")
+            .header("Authorization", format!("Bearer {}", app_config_token))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "app_id": app_id,
+                "manifest": serde_json::to_string(&manifest)
+                    .map_err(|e| Error::api(format!("Failed to serialize Slack manifest: {}", e)))?
+            }))
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("Slack apps.manifest.update request failed: {}", e)))?;
+        let update_status = update_resp.status();
+        let update_body = update_resp.text().await.unwrap_or_default();
+        if !update_status.is_success() {
+            return Err(Error::api(format!(
+                "Slack apps.manifest.update returned {}: {}",
+                update_status, update_body
+            )));
+        }
+
+        let update_json: SlackApiOkResponse = serde_json::from_str(&update_body)
+            .map_err(|e| Error::api(format!("Failed to parse Slack update response: {}", e)))?;
+        if !update_json.ok {
+            return Err(Error::api(format!(
+                "Slack apps.manifest.update failed: {}",
+                update_json
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string())
+            )));
+        }
+
+        Ok(true)
+    }
+
+    async fn configure_whatsapp(
+        &self,
+        config: &WhatsAppConfig,
+        base_url: &str,
+    ) -> Result<Option<String>> {
+        let access_token = config
+            .access_token
+            .as_ref()
+            .map(|s| s.expose().trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::config("WhatsApp access_token is required for webhook auto-setup")
+            })?;
+        let business_account_id = config
+            .business_account_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::config("WhatsApp business_account_id is required for webhook auto-setup")
+            })?;
+
+        let callback_url = format!("{}/webhook/whatsapp", base_url.trim_end_matches('/'));
+        let verify_token = config
+            .webhook_verify_token
+            .as_ref()
+            .map(|s| s.expose().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "wawv_{}{}",
+                    Uuid::new_v4().simple(),
+                    Uuid::new_v4().simple()
+                )
+            });
+        let generated_verify_token = config
+            .webhook_verify_token
+            .as_ref()
+            .map(|s| s.expose().trim().is_empty())
+            .unwrap_or(true)
+            .then(|| verify_token.clone());
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let url = format!(
+            "https://graph.facebook.com/v21.0/{}/subscribed_apps",
+            business_account_id
+        );
+
+        let resp = client
+            .post(&url)
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({
+                "override_callback_uri": callback_url,
+                "verify_token": verify_token,
+            }))
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("WhatsApp subscribed_apps request failed: {}", e)))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::api(format!(
+                "WhatsApp subscribed_apps returned {}: {}",
+                status, body
+            )));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::api(format!("Failed to parse WhatsApp response: {}", e)))?;
+        if parsed
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+        {
+            return Ok(generated_verify_token);
+        }
+
+        Err(Error::api(format!(
+            "WhatsApp subscribed_apps failed: {}",
+            body
+        )))
+    }
+
+    async fn configure_gitlab(
+        &self,
+        config: &GitLabConfig,
+        base_url: &str,
+    ) -> Result<(usize, Option<String>)> {
+        let token = config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitLab token is required for webhook auto-setup"))?
+            .expose()
+            .to_string();
+        if token.is_empty() {
+            return Err(Error::config(
+                "GitLab token is required for webhook auto-setup",
+            ));
+        }
+
+        let groups: Vec<&str> = config
+            .groups
+            .iter()
+            .map(|g| g.trim())
+            .filter(|g| !g.is_empty())
+            .collect();
+        if groups.is_empty() {
+            return Err(Error::config(
+                "GitLab groups must be configured for webhook auto-setup",
+            ));
+        }
+
+        let callback_url = format!("{}/webhook/gitlab", base_url.trim_end_matches('/'));
+        let secret = config
+            .webhook_secret
+            .as_ref()
+            .map(|s| s.expose().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "glwh_{}{}",
+                    Uuid::new_v4().simple(),
+                    Uuid::new_v4().simple()
+                )
+            });
+        let generated_secret = config
+            .webhook_secret
+            .as_ref()
+            .map(|s| s.expose().is_empty())
+            .unwrap_or(true)
+            .then(|| secret.clone());
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let mut configured_count = 0usize;
+        let mut group_failures: Vec<String> = Vec::new();
+
+        for group in groups {
+            match self
+                .ensure_gitlab_group_webhook(
+                    &client,
+                    &token,
+                    &config.base_url,
+                    group,
+                    &callback_url,
+                    &secret,
+                )
+                .await
+            {
+                Ok(_) => configured_count += 1,
+                Err(e) => group_failures.push(format!("{} ({})", group, e)),
+            }
+        }
+
+        if configured_count == 0 {
+            return Err(Error::api(format!(
+                "GitLab webhook setup failed for all groups: {}",
+                group_failures.join("; ")
+            )));
+        }
+
+        if !group_failures.is_empty() {
+            tracing::warn!(
+                "GitLab webhook setup partially succeeded: configured {} group(s), failed for {}",
+                configured_count,
+                group_failures.join("; ")
+            );
+        }
+
+        Ok((configured_count, generated_secret))
+    }
+
+    fn ensure_slack_events_subscription(
+        manifest: &mut serde_json::Value,
+        callback_url: &str,
+    ) -> Result<bool> {
+        let root = manifest
+            .as_object_mut()
+            .ok_or_else(|| Error::api("Slack manifest is not a JSON object"))?;
+
+        let settings = root
+            .entry("settings")
+            .or_insert_with(|| serde_json::json!({}));
+        if !settings.is_object() {
+            *settings = serde_json::json!({});
+        }
+        let settings_obj = settings
+            .as_object_mut()
+            .ok_or_else(|| Error::api("Slack manifest.settings is not an object"))?;
+
+        let event_subs = settings_obj
+            .entry("event_subscriptions")
+            .or_insert_with(|| serde_json::json!({}));
+        if !event_subs.is_object() {
+            *event_subs = serde_json::json!({});
+        }
+        let event_subs_obj = event_subs
+            .as_object_mut()
+            .ok_or_else(|| Error::api("Slack manifest.settings.event_subscriptions invalid"))?;
+
+        let mut changed = false;
+        if event_subs_obj.get("request_url").and_then(|v| v.as_str()) != Some(callback_url) {
+            event_subs_obj.insert(
+                "request_url".to_string(),
+                serde_json::Value::String(callback_url.to_string()),
+            );
+            changed = true;
+        }
+
+        let bot_events = event_subs_obj
+            .entry("bot_events")
+            .or_insert_with(|| serde_json::json!([]));
+        if !bot_events.is_array() {
+            *bot_events = serde_json::json!([]);
+            changed = true;
+        }
+        let arr = bot_events.as_array_mut().ok_or_else(|| {
+            Error::api("Slack manifest.settings.event_subscriptions.bot_events invalid")
+        })?;
+
+        for event in [
+            "message.channels",
+            "message.groups",
+            "message.im",
+            "message.mpim",
+        ] {
+            if !arr.iter().any(|v| v.as_str() == Some(event)) {
+                arr.push(serde_json::Value::String(event.to_string()));
+                changed = true;
+            }
+        }
+
+        Ok(changed)
+    }
+
+    async fn ensure_jira_webhook(
+        &self,
+        client: &reqwest::Client,
+        auth_header: &str,
+        jira_base_url: &str,
+        callback_url: &str,
+    ) -> Result<bool> {
+        let hooks_url = format!(
+            "{}/rest/webhooks/1.0/webhook",
+            jira_base_url.trim_end_matches('/')
+        );
+
+        let list_resp = client
+            .get(&hooks_url)
+            .header("Authorization", auth_header)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("Jira list webhooks request failed: {}", e)))?;
+
+        if list_resp.status().is_success() {
+            let body = list_resp.text().await.unwrap_or_default();
+            let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                Error::api(format!("Failed to parse Jira webhook list response: {}", e))
+            })?;
+            let exists = parsed.as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("url")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|u| u == callback_url)
+                })
+            });
+            if exists {
+                return Ok(false);
+            }
+        } else {
+            let status = list_resp.status();
+            let body = list_resp.text().await.unwrap_or_default();
+            return Err(Error::api(format!(
+                "Jira list webhooks returned {}: {}",
+                status, body
+            )));
+        }
+
+        let payload = serde_json::json!({
+            "name": "claudear",
+            "url": callback_url,
+            "events": ["jira:issue_created", "jira:issue_updated"],
+            "excludeBody": false
+        });
+
+        let create_resp = client
+            .post(&hooks_url)
+            .header("Authorization", auth_header)
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("Jira create webhook request failed: {}", e)))?;
+
+        if create_resp.status().is_success() {
+            return Ok(true);
+        }
+
+        let status = create_resp.status();
+        let body = create_resp.text().await.unwrap_or_default();
+        if status.as_u16() == 400
+            && (body.contains("already exists")
+                || body.contains("already registered")
+                || body.contains(callback_url))
+        {
+            return Ok(false);
+        }
+
+        Err(Error::api(format!(
+            "Jira create webhook returned {}: {}",
+            status, body
+        )))
+    }
+
+    async fn ensure_github_repo_webhook(
+        &self,
+        client: &reqwest::Client,
+        token: &str,
+        repo: &str,
+        callback_url: &str,
+        secret: &str,
+    ) -> Result<()> {
+        let hooks_url = format!("https://api.github.com/repos/{}/hooks", repo);
+        let list_resp = client
+            .get(&hooks_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "claudear")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("GitHub list hooks request failed: {}", e)))?;
+
+        if !list_resp.status().is_success() {
+            let status = list_resp.status();
+            let body = list_resp.text().await.unwrap_or_default();
+            return Err(Error::api(format!(
+                "GitHub list hooks returned {}: {}",
+                status, body
+            )));
+        }
+
+        let hooks: Vec<GitHubHookListItem> = list_resp
+            .json()
+            .await
+            .map_err(|e| Error::api(format!("Failed to parse GitHub hooks response: {}", e)))?;
+
+        if hooks
+            .iter()
+            .any(|h| h.config.url.as_deref().is_some_and(|u| u == callback_url))
+        {
+            return Ok(());
+        }
+
+        let payload = serde_json::json!({
+            "name": "web",
+            "active": true,
+            "events": ["pull_request_review", "pull_request_review_comment"],
+            "config": {
+                "url": callback_url,
+                "content_type": "json",
+                "secret": secret,
+                "insecure_ssl": "0"
+            }
+        });
+
+        let create_resp = client
+            .post(&hooks_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "claudear")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("GitHub create hook request failed: {}", e)))?;
+
+        if create_resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = create_resp.status();
+        let body = create_resp.text().await.unwrap_or_default();
+        if status.as_u16() == 422
+            && (body.contains("Hook already exists") || body.contains("already exists"))
+        {
+            return Ok(());
+        }
+
+        Err(Error::api(format!(
+            "GitHub create hook returned {}: {}",
+            status, body
+        )))
+    }
+
+    async fn ensure_gitlab_group_webhook(
+        &self,
+        client: &reqwest::Client,
+        token: &str,
+        gitlab_base_url: &str,
+        group: &str,
+        callback_url: &str,
+        secret: &str,
+    ) -> Result<()> {
+        let encoded_group: String =
+            url::form_urlencoded::byte_serialize(group.as_bytes()).collect();
+        let hooks_url = format!(
+            "{}/api/v4/groups/{}/hooks",
+            gitlab_base_url.trim_end_matches('/'),
+            encoded_group
+        );
+
+        let list_resp = client
+            .get(&hooks_url)
+            .header("PRIVATE-TOKEN", token)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("GitLab list hooks request failed: {}", e)))?;
+
+        if !list_resp.status().is_success() {
+            let status = list_resp.status();
+            let body = list_resp.text().await.unwrap_or_default();
+            return Err(Error::api(format!(
+                "GitLab list hooks returned {}: {}",
+                status, body
+            )));
+        }
+
+        let hooks: Vec<GitLabHookListItem> = list_resp
+            .json()
+            .await
+            .map_err(|e| Error::api(format!("Failed to parse GitLab hooks response: {}", e)))?;
+
+        if hooks
+            .iter()
+            .any(|h| h.url.as_deref().is_some_and(|u| u == callback_url))
+        {
+            return Ok(());
+        }
+
+        let payload = serde_json::json!({
+            "url": callback_url,
+            "token": secret,
+            "issues_events": true,
+            "enable_ssl_verification": true
+        });
+
+        let create_resp = client
+            .post(&hooks_url)
+            .header("PRIVATE-TOKEN", token)
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("GitLab create hook request failed: {}", e)))?;
+
+        if create_resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = create_resp.status();
+        let body = create_resp.text().await.unwrap_or_default();
+        if (status.as_u16() == 400 || status.as_u16() == 409)
+            && (body.contains("already been taken")
+                || body.contains("Hook already exists")
+                || body.contains("has already been taken"))
+        {
+            return Ok(());
+        }
+
+        Err(Error::api(format!(
+            "GitLab create hook returned {}: {}",
+            status, body
+        )))
+    }
+
+    fn jira_auth_header(config: &JiraConfig) -> String {
+        if config.auth_mode.eq_ignore_ascii_case("bearer") {
+            format!("Bearer {}", config.api_token.expose())
+        } else {
+            let credentials = format!("{}:{}", config.email, config.api_token.expose());
+            let encoded = {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
+            };
+            format!("Basic {}", encoded)
+        }
     }
 
     async fn configure_linear(
@@ -205,7 +1295,61 @@ impl WebhookConfigurator {
             .as_ref()
             .is_some_and(|c| c.enabled && c.client_secret.is_none());
 
-        linear_needs || sentry_needs
+        let github = self.config.github();
+        let github_needs =
+            !github.repos.is_empty() && github.token.is_some() && github.webhook_secret.is_none();
+
+        let gitlab_needs = self.config.gitlab().is_some_and(|c| {
+            c.enabled && !c.groups.is_empty() && c.token.is_some() && c.webhook_secret.is_none()
+        });
+
+        let jira_needs = self
+            .config
+            .jira()
+            .is_some_and(|c| c.enabled && !c.base_url.trim().is_empty() && !c.api_token.is_empty());
+
+        let telegram_needs = self.config.notifiers.telegram.source_enabled
+            && self
+                .config
+                .notifiers
+                .telegram
+                .bot_token
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty());
+
+        let slack_needs = self.config.issues.slack.as_ref().is_some_and(|c| {
+            c.app_id.as_ref().is_some_and(|v| !v.trim().is_empty())
+                && c.app_config_token
+                    .as_ref()
+                    .is_some_and(|s| !s.expose().trim().is_empty())
+                && c.signing_secret
+                    .as_ref()
+                    .is_some_and(|s| !s.expose().trim().is_empty())
+        });
+
+        let whatsapp = &self.config.notifiers.whatsapp;
+        let whatsapp_needs = whatsapp.source_enabled
+            && whatsapp
+                .access_token
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty())
+            && whatsapp
+                .business_account_id
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty())
+            && whatsapp
+                .app_secret
+                .as_ref()
+                .is_some_and(|s| !s.expose().trim().is_empty());
+
+        linear_needs
+            || sentry_needs
+            || github_needs
+            || gitlab_needs
+            || jira_needs
+            || telegram_needs
+            || slack_needs
+            || whatsapp_needs
     }
 }
 
@@ -236,7 +1380,7 @@ pub fn print_setup_result(result: &WebhookSetupResult) {
     }
 
     if !result.warnings.is_empty() {
-        println!("Warnings:");
+        println!("Warnings / Notes:");
         for warning in &result.warnings {
             println!("  - {}", warning);
         }
@@ -267,7 +1411,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            work_dir: "/tmp/repos".into(),
+            workspace: "/tmp/repos".into(),
             known_orgs: vec!["test-org".to_string()],
             auto_discover_paths: vec![],
             poll_interval_ms: 300_000,
@@ -611,7 +1755,7 @@ mod tests {
     fn test_configurator_new_preserves_all_config_fields() {
         let mut config = test_config();
         config.webhook_port = 5555;
-        config.work_dir = "/custom/dir".into();
+        config.workspace = "/custom/dir".into();
         config.issues.linear = Some(crate::config::LinearConfig {
             enabled: true,
             api_key: "key-123".into(),
@@ -623,7 +1767,7 @@ mod tests {
 
         assert_eq!(configurator.config.webhook_port, 5555);
         assert_eq!(
-            configurator.config.work_dir,
+            configurator.config.workspace,
             std::path::PathBuf::from("/custom/dir")
         );
         assert!(configurator.config.issues.linear.is_some());
@@ -757,6 +1901,58 @@ mod tests {
             configurator.needs_configuration(),
             "Only Sentry enabled without secret should need config"
         );
+    }
+
+    #[test]
+    fn test_needs_configuration_github_repos_no_webhook_secret() {
+        let mut config = test_config();
+        config.scm.github.token = Some("ghp_test".into());
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.webhook_secret = None;
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_github_repos_with_webhook_secret() {
+        let mut config = test_config();
+        config.scm.github.token = Some("ghp_test".into());
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.webhook_secret = Some("gh-secret".into());
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_gitlab_groups_no_webhook_secret() {
+        let mut config = test_config();
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: true,
+            token: Some("glpat_test".into()),
+            groups: vec!["group/subgroup".to_string()],
+            webhook_secret: None,
+            ..Default::default()
+        });
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_gitlab_groups_with_webhook_secret() {
+        let mut config = test_config();
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: true,
+            token: Some("glpat_test".into()),
+            groups: vec!["group/subgroup".to_string()],
+            webhook_secret: Some("gl-secret".into()),
+            ..Default::default()
+        });
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
     }
 
     #[test]
@@ -1201,6 +2397,49 @@ mod tests {
             "Error should mention no sources are enabled, got: {}",
             err_msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_configure_slack_source_only_returns_manual_setup_note() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            bot_token: Some("xoxb-test".into()),
+            channel_id: Some("C123".to_string()),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-slack-manual.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(
+            result.is_err(),
+            "configure should error without auto-configurable sources"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("No auto-configurable webhook services are enabled"));
+        assert!(err_msg.contains("Slack source is configured"));
+    }
+
+    #[tokio::test]
+    async fn test_configure_jira_enabled_attempts_auto_setup() {
+        let mut config = test_config();
+        config.issues.jira = Some(crate::config::JiraConfig {
+            enabled: true,
+            base_url: "https://example.atlassian.net".to_string(),
+            api_token: "jira-token".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-jira-manual.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(
+            result.is_err(),
+            "configure should error when Jira API setup fails"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to configure any webhooks"));
+        assert!(err_msg.contains("Jira"));
     }
 
     #[tokio::test]

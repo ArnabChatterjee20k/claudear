@@ -29,7 +29,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     let repo2 = ctx.repo2.context("S3 requires a second repo (repo2)")?;
 
     let tmp_dir = tempfile::tempdir().context("create temp dir")?;
-    let work_dir = tmp_dir.path().join("workdir");
+    let workspace = tmp_dir.path().join("workdir");
     let repos_dir = tmp_dir.path().join("repos");
     let log_dir = tmp_dir.path().join("logs");
     let db_path = tmp_dir.path().join("s3.db");
@@ -60,7 +60,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     tracing::info!("S3-B: Starting daemon with merge + release cascade rules");
 
     // Configure BOTH merge and release cascade rules for the same upstream->downstream pair.
-    let mut builder = ConfigBuilder::new(&work_dir, &db_path, PORT)
+    let mut builder = ConfigBuilder::new(&workspace, &db_path, PORT)
         .claude_timeout(ctx.claude_timeout)
         .skip_permissions()
         .retry(0)
@@ -128,7 +128,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         daemon::start_process(&binary, &config_path, PORT, &log_dir, "s3")?
     };
 
-    daemon::wait_healthy(PORT, Duration::from_secs(30)).await?;
+    daemon::wait_healthy(&handle, PORT, Duration::from_secs(30)).await?;
 
     let db = E2eDb::new(if ctx.use_docker {
         DbAccess::docker(

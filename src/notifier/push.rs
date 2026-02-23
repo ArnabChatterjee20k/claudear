@@ -128,10 +128,13 @@ impl Notifier for PushNotifier {
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
         let emoji = crate::notifier::get_source_emoji(&issue.source);
         let title = format!("{} Processing: {}", emoji, issue.short_id);
-        let message = format!(
+        let mut message = format!(
             "{}\n\nSource: {}\nPriority: {}\nStatus: {}",
             issue.title, issue.source, issue.priority, issue.status
         );
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            message.push_str(&format!("\nTrigger: {}", reason));
+        }
 
         self.send_push(
             &title,
@@ -145,6 +148,10 @@ impl Notifier for PushNotifier {
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
+        let trigger_suffix = issue
+            .get_metadata::<String>("trigger_reason")
+            .map(|r| format!("\nTrigger: {}", r))
+            .unwrap_or_default();
         if issue
             .get_metadata::<String>("cascade_downstream_repo")
             .is_some()
@@ -156,7 +163,10 @@ impl Notifier for PushNotifier {
                 .get_metadata::<String>("cascade_downstream_repo")
                 .unwrap_or_default();
             let title = format!("\u{1F517} Cascade PR: {}", issue.short_id);
-            let message = format!("{} -> {}\n\nPR URL: {}", upstream, downstream, pr_url);
+            let message = format!(
+                "{} -> {}\n\nPR URL: {}{}",
+                upstream, downstream, pr_url, trigger_suffix
+            );
             self.send_push(
                 &title,
                 &message,
@@ -168,7 +178,7 @@ impl Notifier for PushNotifier {
             .await
         } else if issue.get_metadata::<bool>("is_pr_update").unwrap_or(false) {
             let title = format!("\u{270F}\u{FE0F} PR Updated: {}", issue.short_id);
-            let message = format!("{}\n\nPR URL: {}", issue.title, pr_url);
+            let message = format!("{}\n\nPR URL: {}{}", issue.title, pr_url, trigger_suffix);
             self.send_push(
                 &title,
                 &message,
@@ -180,7 +190,7 @@ impl Notifier for PushNotifier {
             .await
         } else {
             let title = format!("\u{2705} PR Created: {}", issue.short_id);
-            let message = format!("{}\n\nPR URL: {}", issue.title, pr_url);
+            let message = format!("{}\n\nPR URL: {}{}", issue.title, pr_url, trigger_suffix);
             self.send_push(
                 &title,
                 &message,
@@ -226,14 +236,18 @@ impl Notifier for PushNotifier {
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
+        let trigger_suffix = issue
+            .get_metadata::<String>("trigger_reason")
+            .map(|r| format!("\nTrigger: {}", r))
+            .unwrap_or_default();
         if issue
             .get_metadata::<bool>("regression_detected")
             .unwrap_or(false)
         {
             let title = format!("\u{1F4C9} Regression Detected: {}", issue.short_id);
             let message = format!(
-                "A previously fixed issue has regressed.\n\n{}\n\nRetry scheduled.",
-                error
+                "A previously fixed issue has regressed.\n\n{}\n\nRetry scheduled.{}",
+                error, trigger_suffix
             );
             self.send_push(
                 &title,
@@ -252,7 +266,10 @@ impl Notifier for PushNotifier {
                 .get_metadata::<String>("cascade_downstream_repo")
                 .unwrap_or_default();
             let title = format!("\u{26A0}\u{FE0F} Cascade Failed: {}", issue.short_id);
-            let message = format!("Failed to adapt {}\n\nError: {}", downstream, error);
+            let message = format!(
+                "Failed to adapt {}\n\nError: {}{}",
+                downstream, error, trigger_suffix
+            );
             self.send_push(
                 &title,
                 &message,
@@ -264,7 +281,7 @@ impl Notifier for PushNotifier {
             .await
         } else {
             let title = format!("\u{274C} Failed: {}", issue.short_id);
-            let message = format!("{}\n\nError: {}", issue.title, error);
+            let message = format!("{}\n\nError: {}{}", issue.title, error, trigger_suffix);
             self.send_push(
                 &title,
                 &message,
@@ -1024,6 +1041,24 @@ mod tests {
         ];
 
         let result = notifier.notify_urgent_issues(&issues).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_with_trigger_reason() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Retry attempt 2: timeout");
+        // With disabled config (no api_token), notify_start builds the message but send_push returns Ok early
+        let result = notifier.notify_start(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_without_trigger_reason() {
+        let notifier = PushNotifier::new(disabled_config(), empty_registry());
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let result = notifier.notify_start(&issue).await;
         assert!(result.is_ok());
     }
 }

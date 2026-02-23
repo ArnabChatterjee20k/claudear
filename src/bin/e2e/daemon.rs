@@ -129,6 +129,12 @@ pub fn start_docker(
         .args(["volume", "create", vol])
         .output();
 
+    // Remove any stale container with the same name from a previous run
+    let container_name = format!("claudear-e2e-{}", label);
+    let _ = Command::new("docker")
+        .args(["rm", "-f", &container_name])
+        .output();
+
     // Build docker args dynamically
     let mut args = vec![
         "run".to_string(),
@@ -243,18 +249,99 @@ pub fn stop(handle: &mut DaemonHandle) {
     }
 }
 
+fn tail_text_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+fn log_tail(path: &Path, max_lines: usize) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let tail = tail_text_lines(&content, max_lines);
+            if tail.trim().is_empty() {
+                "<log file is empty>".to_string()
+            } else {
+                tail
+            }
+        }
+        Err(e) => format!("<failed to read log {}: {}>", path.display(), e),
+    }
+}
+
+fn docker_state(container_id: &str) -> Option<String> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}",
+            container_id,
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn docker_logs_tail(container_id: &str, max_lines: usize) -> Option<String> {
+    let output = Command::new("docker")
+        .args(["logs", "--tail", &max_lines.to_string(), container_id])
+        .output()
+        .ok()?;
+
+    let mut combined = String::new();
+    if !output.stdout.is_empty() {
+        combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+
+    let trimmed = combined.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn health_timeout_diagnostics(handle: &DaemonHandle) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("log_tail:\n{}", log_tail(handle.log_path(), 80)));
+
+    if let DaemonHandle::Docker { container_id, .. } = handle {
+        if let Some(state) = docker_state(container_id) {
+            parts.push(format!("docker_state: {}", state));
+        }
+        if let Some(logs) = docker_logs_tail(container_id, 80) {
+            parts.push(format!("docker_logs_tail:\n{}", logs));
+        }
+    }
+
+    parts.join("\n\n")
+}
+
 /// Wait for the daemon's health endpoint to respond.
-pub async fn wait_healthy(port: u16, timeout: Duration) -> Result<()> {
+pub async fn wait_healthy(handle: &DaemonHandle, port: u16, timeout: Duration) -> Result<()> {
     let url = format!("http://127.0.0.1:{}/api/health", port);
     let client = reqwest::Client::new();
     let start = std::time::Instant::now();
 
     loop {
         if start.elapsed() > timeout {
+            let diagnostics = health_timeout_diagnostics(handle);
             bail!(
-                "Daemon on port {} did not become healthy within {:?}",
+                "Daemon on port {} did not become healthy within {:?}\n\n{}",
                 port,
-                timeout
+                timeout,
+                diagnostics
             );
         }
 

@@ -169,10 +169,7 @@ impl IssueSource for DiscordSource {
                 if let Some(latest) = messages.first() {
                     let mut lock = self.last_seen_id.write().unwrap_or_else(|e| e.into_inner());
                     *lock = Some(latest.id.clone());
-                    tracing::info!(
-                        message_id = %latest.id,
-                        "Discord source seeded cursor"
-                    );
+                    tracing::info!(message_id = %latest.id, "Discord source seeded cursor");
                 }
                 Ok(vec![])
             }
@@ -199,14 +196,6 @@ impl IssueSource for DiscordSource {
                     .filter(|msg| !msg.content.trim().is_empty())
                     .map(|msg| self.message_to_issue(msg))
                     .collect();
-
-                if !issues.is_empty() {
-                    tracing::info!(
-                        count = issues.len(),
-                        channel_id = %channel_id,
-                        "Discord source fetched new issues"
-                    );
-                }
 
                 Ok(issues)
             }

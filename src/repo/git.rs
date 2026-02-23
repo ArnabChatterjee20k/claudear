@@ -406,12 +406,12 @@ impl GitOps {
 
 /// Compute the worktree path for a given issue.
 ///
-/// Returns `work_dir/{short_repo_name}-worktrees/{issue_short_id}`.
-pub fn worktree_path(work_dir: &Path, repo_name: &str, issue_short_id: &str) -> PathBuf {
+/// Returns `workspace/{short_repo_name}-worktrees/{issue_short_id}`.
+pub fn worktree_path(workspace: &Path, repo_name: &str, issue_short_id: &str) -> PathBuf {
     let raw_short_name = repo_name.split('/').next_back().unwrap_or(repo_name);
     let short_name = raw_short_name.replace(['/', '\\', '\0'], "_");
     let sanitized_id = issue_short_id.replace(['/', '\\', '.', '\0'], "_");
-    work_dir
+    workspace
         .join(format!("{}-worktrees", short_name))
         .join(sanitized_id)
 }
@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_worktree_path_complex_work_dir() {
+    fn test_worktree_path_complex_workspace() {
         let p = worktree_path(
             Path::new("/var/lib/claudear/workspaces"),
             "myorg/backend",

@@ -30,7 +30,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         .context("S2 requires an ask backend")?;
 
     let tmp_dir = tempfile::tempdir().context("create temp dir")?;
-    let work_dir = tmp_dir.path().join("workdir");
+    let workspace = tmp_dir.path().join("workdir");
     let repos_dir = tmp_dir.path().join("repos");
     let log_dir = tmp_dir.path().join("logs");
     let db_path = tmp_dir.path().join("s2.db");
@@ -41,7 +41,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     tracing::info!("Cloning repo for daemon discovery");
     ctx.clone_repo(ctx.repo, &repos_dir)?;
 
-    let mut builder = ConfigBuilder::new(&work_dir, &db_path, PORT)
+    let mut builder = ConfigBuilder::new(&workspace, &db_path, PORT)
         .claude_timeout(ctx.claude_timeout)
         .skip_permissions()
         .instructions(ASK_INSTRUCTIONS)
@@ -144,7 +144,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         daemon::start_process(&binary, &config_path, PORT, &log_dir, "s2")?
     };
 
-    daemon::wait_healthy(PORT, Duration::from_secs(30)).await?;
+    daemon::wait_healthy(&handle, PORT, Duration::from_secs(30)).await?;
 
     let db = E2eDb::new(if ctx.use_docker {
         DbAccess::docker(
@@ -374,7 +374,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         daemon::start_process(&binary, &config_path, PORT, &log_dir, "s2")?
     };
 
-    daemon::wait_healthy(PORT, Duration::from_secs(30)).await?;
+    daemon::wait_healthy(&handle, PORT, Duration::from_secs(30)).await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // The retry will also trigger an ask question (same instructions). Poll for it

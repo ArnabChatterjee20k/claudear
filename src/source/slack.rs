@@ -209,10 +209,7 @@ impl IssueSource for SlackSource {
                 if let Some(latest) = messages.first() {
                     let mut lock = self.last_seen_ts.write().unwrap_or_else(|e| e.into_inner());
                     *lock = Some(latest.ts.clone());
-                    tracing::info!(
-                        message_ts = %latest.ts,
-                        "Slack source seeded cursor"
-                    );
+                    tracing::info!(ts = %latest.ts, "Slack source seeded cursor");
                 }
                 Ok(vec![])
             }
@@ -239,14 +236,6 @@ impl IssueSource for SlackSource {
                     .filter(|msg| !msg.text.trim().is_empty())
                     .map(|msg| self.message_to_issue(msg, &channel_id))
                     .collect();
-
-                if !issues.is_empty() {
-                    tracing::info!(
-                        count = issues.len(),
-                        channel_id = %channel_id,
-                        "Slack source fetched new issues"
-                    );
-                }
 
                 Ok(issues)
             }

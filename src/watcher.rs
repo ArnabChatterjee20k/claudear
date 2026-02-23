@@ -25,7 +25,7 @@ use crate::types::{
     RegressionWatch,
 };
 use crate::users::UserRegistry;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -77,6 +77,8 @@ pub struct Watcher {
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     /// Last seen release tag per upstream repo (for release-triggered cascades).
     last_seen_releases: RwLock<HashMap<String, String>>,
+    /// Transient watcher pause for provider rate limits (clears on restart).
+    rate_limit_pause_until: RwLock<Option<DateTime<Utc>>>,
 }
 
 impl Watcher {
@@ -104,6 +106,7 @@ impl Watcher {
             active_processing: AtomicUsize::new(0),
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             last_seen_releases: RwLock::new(HashMap::new()),
+            rate_limit_pause_until: RwLock::new(None),
         }
     }
 
@@ -213,7 +216,7 @@ impl Watcher {
             github_client,
             None, // gitlab_provider
             &[],  // gitlab_groups
-            &config.work_dir,
+            &config.workspace,
             config.github().use_ssh,
         )
         .await?;
@@ -269,7 +272,7 @@ impl Watcher {
             github_client,
             None, // gitlab_provider
             &[],  // gitlab_groups
-            &config.work_dir,
+            &config.workspace,
             config.github().use_ssh,
         )
         .await?;
@@ -350,6 +353,8 @@ impl Watcher {
 
     /// Start the watcher with polling.
     pub async fn start(&self, interval_ms: Option<u64>) -> Result<()> {
+        self.clear_rate_limit_pause().await;
+
         let configured_poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
         let poll_interval = configured_poll_interval.max(1000);
         if configured_poll_interval < 1000 {
@@ -366,7 +371,7 @@ impl Watcher {
             "Starting Claude Watcher{}",
             if self.dry_run { " (DRY RUN)" } else { "" }
         );
-        tracing::info!("  Work dir: {:?}", self.config.work_dir);
+        tracing::info!("  Work dir: {:?}", self.config.workspace);
         tracing::info!("  Known orgs: {}", self.config.known_orgs.len());
         tracing::info!("  Poll interval: {}ms (global)", poll_interval);
         tracing::info!(
@@ -519,6 +524,9 @@ impl Watcher {
             base_timer.tick().await;
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
+            }
+            if self.is_rate_limit_paused().await {
+                continue;
             }
 
             // Poll each source whose interval has elapsed
@@ -894,6 +902,7 @@ impl Watcher {
                         &attempt.issue_id,
                         Some(feedback.to_string()),
                         existing_pr_branch.clone(),
+                        Some("Review feedback received".into()),
                     )
                     .await
                 {
@@ -1298,7 +1307,7 @@ impl Watcher {
 
         // Create a per-cascade worktree so concurrent cascades don't interfere
         let cascade_id = format!("cascade-{}", parent_attempt.short_id);
-        let wt_path = worktree_path(&self.config.work_dir, downstream_repo_name, &cascade_id);
+        let wt_path = worktree_path(&self.config.workspace, downstream_repo_name, &cascade_id);
         let effective_branch = rule
             .and_then(|r| r.target_branch.as_deref())
             .unwrap_or(&default_branch);
@@ -1581,6 +1590,10 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Run a single poll cycle.
     async fn poll(&self) -> Result<()> {
+        if self.is_rate_limit_paused().await {
+            return Ok(());
+        }
+
         let poll_started_at = std::time::Instant::now();
         tracing::info!("");
         tracing::info!(
@@ -1668,6 +1681,10 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Run housekeeping tasks: retries, cascades, and metrics.
     /// Called on the global timer, separate from per-source polling.
     async fn poll_housekeeping(&self) -> Result<()> {
+        if self.is_rate_limit_paused().await {
+            return Ok(());
+        }
+
         let housekeeping_started_at = std::time::Instant::now();
 
         // Process any ready retries
@@ -1835,8 +1852,38 @@ Create a PR with your changes.{custom_instructions}"#,
             // Prepare for retry (resets status to pending, clears PR info)
             retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
 
+            // Build trigger reason from attempt context
+            let trigger_reason = {
+                let reason_detail = if attempt.status == FixAttemptStatus::Closed {
+                    "PR closed without merge".to_string()
+                } else if let Some(ref err) = attempt.error_message {
+                    let truncated = if err.len() > 80 {
+                        format!("{}...", &err[..err.floor_char_boundary(77)])
+                    } else {
+                        err.clone()
+                    };
+                    truncated
+                } else {
+                    "previous failure".to_string()
+                };
+                format!(
+                    "Retry attempt {}: {}",
+                    attempt.retry_count + 1,
+                    reason_detail
+                )
+            };
+
             // Trigger the issue processing
-            match self.trigger_issue(&attempt.source, &attempt.issue_id).await {
+            match self
+                .trigger_issue_with_feedback(
+                    &attempt.source,
+                    &attempt.issue_id,
+                    None,
+                    None,
+                    Some(trigger_reason),
+                )
+                .await
+            {
                 Ok(()) => {
                     self.record_source_decision(
                         &attempt.source,
@@ -2155,7 +2202,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Poll a single source.
     async fn poll_source(&self, source: &Arc<dyn IssueSource>) -> Result<()> {
-        tracing::info!(source = source.name(), "Fetching issues...");
+        if self.is_rate_limit_paused().await {
+            return Ok(());
+        }
 
         let issues = source.fetch_issues().await?;
         tracing::info!(source = source.name(), count = issues.len(), "Found issues");
@@ -2452,6 +2501,14 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
+        if self.is_rate_limit_paused().await {
+            tracing::info!(
+                source = source.name(),
+                "Skipping queued issues while watcher is paused for Claude rate limit"
+            );
+            return Ok(());
+        }
+
         // Process issues with rate limiting (per-source limit, clamped to 1 to avoid deadlock).
         let configured_source_max_concurrent = self.config.max_concurrent_for(source.name());
         let source_max_concurrent = configured_source_max_concurrent.max(1);
@@ -2465,10 +2522,24 @@ Create a PR with your changes.{custom_instructions}"#,
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
+            if self.is_rate_limit_paused().await {
+                tracing::info!(
+                    source = source.name(),
+                    "Stopping source batch early due to Claude rate-limit pause"
+                );
+                break;
+            }
 
             // Wait for concurrency slot (per-source limit)
             while self.active_processing_for_source(source.name()).await >= source_max_concurrent {
                 if !self.is_running.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                if self.is_rate_limit_paused().await {
+                    tracing::info!(
+                        source = source.name(),
+                        "Stopping source batch while waiting for slot due to Claude rate-limit pause"
+                    );
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2552,6 +2623,14 @@ Create a PR with your changes.{custom_instructions}"#,
         review_feedback: Option<String>,
         existing_pr_branch: Option<String>,
     ) -> bool {
+        if self.is_rate_limit_paused().await {
+            tracing::info!(
+                short_id = %issue.short_id,
+                "Skipping issue processing while watcher is paused for Claude rate limit"
+            );
+            return false;
+        }
+
         let processing_started_at = std::time::Instant::now();
         let processing_key = format!("{}:{}", source.name(), issue.id);
 
@@ -2734,7 +2813,7 @@ Create a PR with your changes.{custom_instructions}"#,
             // Create per-issue worktree.
             // For review reruns, check out the actual PR branch so Claude can push
             // to it.  For initial runs, use detached HEAD (Claude creates a new branch).
-            let wt_path = worktree_path(&self.config.work_dir, repo_name, &issue.short_id);
+            let wt_path = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
             let wt_result = if let Some(ref branch) = existing_pr_branch {
                 GitOps::create_worktree_on_branch(&project_dir, &wt_path, branch, &checkout_ref)
                     .await
@@ -2814,7 +2893,7 @@ Create a PR with your changes.{custom_instructions}"#,
         // Use the per-issue worktree as the effective working directory for Claude.
         // Fall back to project_dir only when no repo was resolved (no worktree attempted).
         let effective_project_dir = if let Some(repo_name) = resolution.repo_name() {
-            let wt = worktree_path(&self.config.work_dir, repo_name, &issue.short_id);
+            let wt = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
             if !wt.exists() {
                 let err = format!("Worktree disappeared after creation: {:?}", wt);
                 tracing::error!(short_id = %issue.short_id, error = %err);
@@ -3613,7 +3692,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // Cleanup worktree
         if let Some(repo_name) = resolution.repo_name() {
-            let wt_path = worktree_path(&self.config.work_dir, repo_name, &issue.short_id);
+            let wt_path = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
             if wt_path.exists() {
                 if let Err(e) = GitOps::remove_worktree(&project_dir, &wt_path).await {
                     tracing::warn!(
@@ -3652,6 +3731,13 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Route hard failures to the global notifier user (override per-issue assignee routing).
     async fn notify_failed_with_escalation(&self, issue: &Issue, error: &str) -> Result<()> {
+        let is_rate_limited = runner::is_rate_limit_error(error);
+        let rate_limit_pause_until = if is_rate_limited {
+            self.pause_until_rate_limit_reset(issue, error).await
+        } else {
+            None
+        };
+
         if runner::is_hard_error(error) {
             self.record_issue_decision(
                 issue,
@@ -3659,7 +3745,8 @@ Create a PR with your changes.{custom_instructions}"#,
                 format!("Escalating hard error for {}", issue.short_id),
                 json!({
                     "error": Self::truncate_error_for_activity(error),
-                    "rate_limited": runner::is_rate_limit_error(error),
+                    "rate_limited": is_rate_limited,
+                    "rate_limit_pause_until": rate_limit_pause_until.map(|t| t.to_rfc3339()),
                 }),
             );
             let mut global_issue = issue.clone();
@@ -3676,7 +3763,8 @@ Create a PR with your changes.{custom_instructions}"#,
             .with_issue(issue.id.clone(), issue.short_id.clone())
             .with_metadata(json!({
                 "hard_error": true,
-                "rate_limited": runner::is_rate_limit_error(error),
+                "rate_limited": is_rate_limited,
+                "rate_limit_pause_until": rate_limit_pause_until.map(|t| t.to_rfc3339()),
                 "error": Self::truncate_error_for_activity(error),
             }));
             self.tracker.record_activity(&activity).ok();
@@ -3685,6 +3773,223 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         self.notifier.notify_failed(issue, error).await
+    }
+
+    async fn clear_rate_limit_pause(&self) {
+        let mut pause_until = self.rate_limit_pause_until.write().await;
+        if pause_until.take().is_some() {
+            tracing::info!(
+                component = "watcher",
+                "Cleared transient rate-limit pause on watcher start"
+            );
+        }
+    }
+
+    async fn is_rate_limit_paused(&self) -> bool {
+        let now = Utc::now();
+        let mut pause_until = self.rate_limit_pause_until.write().await;
+        let expired_until = match *pause_until {
+            Some(until) if until > now => return true,
+            Some(until) => {
+                *pause_until = None;
+                Some(until)
+            }
+            None => None,
+        };
+        drop(pause_until);
+
+        if let Some(until) = expired_until {
+            tracing::info!(
+                component = "watcher",
+                reset_at = %until.to_rfc3339(),
+                "Claude rate-limit pause expired; resuming watcher"
+            );
+            let activity = ActivityLogEntry::new(
+                "watcher_resumed",
+                "Watcher resumed after Claude rate-limit pause",
+            )
+            .with_source("watcher".to_string())
+            .with_metadata(json!({
+                "reason": "claude_rate_limit",
+                "resumed_at": now.to_rfc3339(),
+                "previous_pause_until": until.to_rfc3339(),
+            }));
+            self.tracker.record_activity(&activity).ok();
+        }
+
+        false
+    }
+
+    async fn pause_until_rate_limit_reset(
+        &self,
+        issue: &Issue,
+        error: &str,
+    ) -> Option<DateTime<Utc>> {
+        let now = Utc::now();
+        let parsed_reset = Self::extract_rate_limit_reset_time(error, now);
+        let fallback_reset = now + chrono::Duration::minutes(15);
+        let pause_target = parsed_reset.unwrap_or(fallback_reset);
+        let reset_time_parsed = parsed_reset.is_some();
+
+        let mut pause_until = self.rate_limit_pause_until.write().await;
+        let previous = *pause_until;
+        let effective_until = match previous {
+            Some(current) if current >= pause_target => current,
+            _ => {
+                *pause_until = Some(pause_target);
+                pause_target
+            }
+        };
+        let changed = previous != Some(effective_until);
+        drop(pause_until);
+
+        if changed {
+            tracing::warn!(
+                component = "watcher",
+                short_id = %issue.short_id,
+                pause_until = %effective_until.to_rfc3339(),
+                reset_time_parsed,
+                "Pausing watcher after Claude rate limit"
+            );
+
+            self.record_issue_decision(
+                issue,
+                "watcher_rate_limit_pause",
+                format!(
+                    "Pausing watcher due to Claude rate limit for {}",
+                    issue.short_id
+                ),
+                json!({
+                    "pause_until": effective_until.to_rfc3339(),
+                    "reset_time_parsed": reset_time_parsed,
+                    "error": Self::truncate_error_for_activity(error),
+                }),
+            );
+
+            let activity = ActivityLogEntry::new(
+                "watcher_paused",
+                format!(
+                    "Watcher paused due to Claude rate limit until {}",
+                    effective_until.to_rfc3339()
+                ),
+            )
+            .with_source("watcher".to_string())
+            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .with_metadata(json!({
+                "reason": "claude_rate_limit",
+                "pause_until": effective_until.to_rfc3339(),
+                "reset_time_parsed": reset_time_parsed,
+                "fallback_minutes": if reset_time_parsed { None::<u32> } else { Some(15) },
+            }));
+            self.tracker.record_activity(&activity).ok();
+        }
+
+        Some(effective_until)
+    }
+
+    fn extract_rate_limit_reset_time(error: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        Self::extract_rate_limit_reset_from_resets_at(error)
+            .or_else(|| Self::extract_rate_limit_reset_from_banner_utc(error, now))
+            .or_else(|| Self::extract_rate_limit_reset_from_retry_after(error, now))
+    }
+
+    fn extract_rate_limit_reset_from_resets_at(error: &str) -> Option<DateTime<Utc>> {
+        let key = "\"resetsAt\"";
+        let mut start = 0usize;
+
+        while let Some(offset) = error[start..].find(key) {
+            let idx = start + offset + key.len();
+            let after_key = &error[idx..];
+            if let Some(colon) = after_key.find(':') {
+                let after_colon = after_key[colon + 1..].trim_start();
+                if let Some(after_quote) = after_colon.strip_prefix('"') {
+                    if let Some(end_quote) = after_quote.find('"') {
+                        let value = &after_quote[..end_quote];
+                        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) {
+                            return Some(parsed.with_timezone(&Utc));
+                        }
+                    }
+                }
+            }
+            start = idx;
+        }
+
+        None
+    }
+
+    fn extract_rate_limit_reset_from_banner_utc(
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        // Example banner: "You've hit your limit · resets 6am (UTC)"
+        let lower = error.to_ascii_lowercase();
+        let idx = lower.find("resets")?;
+        let mut tail = lower[idx + "resets".len()..].trim_start();
+
+        let hour_end = tail.find(|c: char| !c.is_ascii_digit())?;
+        let hour_12: u32 = tail[..hour_end].parse().ok()?;
+        if hour_12 == 0 || hour_12 > 12 {
+            return None;
+        }
+        tail = &tail[hour_end..];
+
+        let mut minute: u32 = 0;
+        if let Some(rest) = tail.strip_prefix(':') {
+            let minute_end = rest.find(|c: char| !c.is_ascii_digit())?;
+            minute = rest[..minute_end].parse().ok()?;
+            tail = &rest[minute_end..];
+        }
+        if minute > 59 {
+            return None;
+        }
+
+        tail = tail.trim_start();
+        let meridiem = if let Some(rest) = tail.strip_prefix("am") {
+            tail = rest;
+            "am"
+        } else if let Some(rest) = tail.strip_prefix("pm") {
+            tail = rest;
+            "pm"
+        } else {
+            return None;
+        };
+
+        tail = tail.trim_start();
+        if !tail.starts_with("(utc)") {
+            return None;
+        }
+
+        let mut hour_24 = hour_12 % 12;
+        if meridiem == "pm" {
+            hour_24 += 12;
+        }
+
+        let date = now.date_naive();
+        let mut reset =
+            DateTime::<Utc>::from_naive_utc_and_offset(date.and_hms_opt(hour_24, minute, 0)?, Utc);
+        if reset <= now {
+            reset += chrono::Duration::days(1);
+        }
+        Some(reset)
+    }
+
+    fn extract_rate_limit_reset_from_retry_after(
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let lower = error.to_ascii_lowercase();
+        let idx = lower.find("retry-after")?;
+        let tail = &lower[idx + "retry-after".len()..];
+        let digits_start = tail.find(|c: char| c.is_ascii_digit())?;
+        let digit_slice = &tail[digits_start..];
+        let digits_end = digit_slice
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digit_slice.len());
+        let seconds: i64 = digit_slice[..digits_end].parse().ok()?;
+        if seconds <= 0 {
+            return None;
+        }
+        Some(now + chrono::Duration::seconds(seconds))
     }
 
     fn truncate_error_for_activity(error: &str) -> String {
@@ -4015,7 +4320,7 @@ Create a PR with your changes.{custom_instructions}"#,
                         &knowledge,
                         &instructions,
                     );
-                    let agent_md_path = self.config.work_dir.join(repo).join("AGENT.md");
+                    let agent_md_path = self.config.workspace.join(repo).join("AGENT.md");
                     if let Some(parent) = agent_md_path.parent() {
                         if parent.exists() {
                             if let Err(e) = std::fs::write(&agent_md_path, &agent_md) {
@@ -4120,8 +4425,14 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Manually trigger processing for a specific issue.
     pub async fn trigger_issue(&self, source_name: &str, issue_id: &str) -> Result<()> {
-        self.trigger_issue_with_feedback(source_name, issue_id, None, None)
-            .await
+        self.trigger_issue_with_feedback(
+            source_name,
+            issue_id,
+            None,
+            None,
+            Some("Manual trigger".into()),
+        )
+        .await
     }
 
     /// Manually trigger processing for a specific issue with optional review feedback context.
@@ -4131,6 +4442,7 @@ Create a PR with your changes.{custom_instructions}"#,
         issue_id: &str,
         review_feedback: Option<String>,
         existing_pr_branch: Option<String>,
+        trigger_reason: Option<String>,
     ) -> Result<()> {
         let source = self
             .sources
@@ -4145,8 +4457,12 @@ Create a PR with your changes.{custom_instructions}"#,
             "Manually triggering issue"
         );
 
-        let issue = source.get_issue(issue_id).await?;
+        let mut issue = source.get_issue(issue_id).await?;
         let match_result = MatchResult::matched("Manual trigger", MatchPriority::Urgent);
+
+        if let Some(reason) = trigger_reason {
+            issue.set_metadata("trigger_reason", reason);
+        }
 
         let started = self
             .process_issue(
@@ -4373,6 +4689,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_extract_rate_limit_reset_from_resets_at_json() {
+        let msg = r#"Claude rate limit hit: {"type":"rate_limit_event","resetsAt":"2026-02-23T06:00:00Z"}"#;
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-23T06:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_same_day() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T04:11:25Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit · resets 6am (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-23T06:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_next_day_when_past_reset() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T23:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit · resets 6am (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-24T06:00:00+00:00");
+    }
+
     #[async_trait]
     impl Notifier for MockNotifier {
         fn name(&self) -> &str {
@@ -4517,7 +4860,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            work_dir: std::path::PathBuf::from("/tmp/repos"),
+            workspace: std::path::PathBuf::from("/tmp/repos"),
             known_orgs: vec!["test-org".to_string()],
             auto_discover_paths: vec![],
             poll_interval_ms: 60000,
@@ -7847,7 +8190,13 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, sources, false);
 
         let result = watcher
-            .trigger_issue_with_feedback("nonexistent", "123", Some("feedback".to_string()), None)
+            .trigger_issue_with_feedback(
+                "nonexistent",
+                "123",
+                Some("feedback".to_string()),
+                None,
+                None,
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Unknown source"));
@@ -7863,7 +8212,7 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, vec![source], false);
 
         let result = watcher
-            .trigger_issue_with_feedback("mock", "nonexistent", None, None)
+            .trigger_issue_with_feedback("mock", "nonexistent", None, None, None)
             .await;
         assert!(result.is_err());
     }
@@ -10867,7 +11216,7 @@ mod tests {
         });
 
         // Verify the watcher was created successfully with a non-Claude agent
-        assert!(watcher.config.work_dir.to_str().is_some());
+        assert!(watcher.config.workspace.to_str().is_some());
     }
 
     #[test]
@@ -10938,6 +11287,6 @@ mod tests {
             agent,
         });
 
-        assert!(watcher.config.work_dir.to_str().is_some());
+        assert!(watcher.config.workspace.to_str().is_some());
     }
 }

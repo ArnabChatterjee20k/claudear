@@ -636,7 +636,6 @@ impl<H: SentryHttpClient + 'static> IssueSource for SentrySource<H> {
             ));
         }
 
-        tracing::info!(source = "sentry", issue_id = %issue_id, "Resolved issue");
         Ok(())
     }
 

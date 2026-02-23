@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const CLAUDE_LOG_SUBDIR: &str = "claude";
@@ -726,6 +726,10 @@ The PR title should include the issue ID: {}
         let stderr_log_path = log_files.as_ref().map(|f| f.stderr.clone());
         let stdout_event_writer = event_writer.clone();
         let stderr_event_writer = event_writer.clone();
+        let (early_failure_tx, mut early_failure_rx) = mpsc::unbounded_channel::<String>();
+        let stdout_early_failure_tx = early_failure_tx.clone();
+        let stderr_early_failure_tx = early_failure_tx.clone();
+        drop(early_failure_tx);
 
         let stdout_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -762,6 +766,7 @@ The PR title should include the issue ID: {}
                 None => None,
             };
             let mut write_failed = false;
+            let mut signaled_rate_limit = false;
 
             loop {
                 let next_line = lines.next_line().await;
@@ -803,12 +808,68 @@ The PR title should include the issue ID: {}
                 // Parse NDJSON stream events; accumulate decoded text.
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
+                    if !signaled_rate_limit && ClaudeAgentRunner::is_rate_limit_error(trimmed) {
+                        signaled_rate_limit = true;
+                        let msg = format!(
+                            "Claude rate limit hit: {}",
+                            ClaudeAgentRunner::truncate(trimmed, EXECUTION_LOG_PREVIEW_LIMIT)
+                        );
+                        let _ = stdout_early_failure_tx.send(msg.clone());
+                        ClaudeAgentRunner::append_execution_event(
+                            &stdout_event_writer,
+                            label_stdout.as_str(),
+                            "rate_limit_detected_live",
+                            json!({
+                                "source": "stdout_line",
+                                "line_number": line_number,
+                                "message": ClaudeAgentRunner::truncate(trimmed, 500),
+                            }),
+                        )
+                        .await;
+                        tracing::warn!(
+                            component = "claude",
+                            label = label_stdout.as_str(),
+                            line_number,
+                            "Detected Claude rate-limit output in stdout stream; requesting early termination"
+                        );
+                    }
+
                     match serde_json::from_str::<StreamEvent>(trimmed) {
                         Ok(StreamEvent::Assistant { message }) => {
                             if let Some(msg) = message {
                                 for block in &msg.content {
                                     match block {
                                         CliContentBlock::Text { ref text } => {
+                                            if !signaled_rate_limit
+                                                && ClaudeAgentRunner::is_rate_limit_error(text)
+                                            {
+                                                signaled_rate_limit = true;
+                                                let msg = format!(
+                                                    "Claude rate limit hit: {}",
+                                                    ClaudeAgentRunner::truncate(
+                                                        text,
+                                                        EXECUTION_LOG_PREVIEW_LIMIT
+                                                    )
+                                                );
+                                                let _ = stdout_early_failure_tx.send(msg);
+                                                ClaudeAgentRunner::append_execution_event(
+                                                    &stdout_event_writer,
+                                                    label_stdout.as_str(),
+                                                    "rate_limit_detected_live",
+                                                    json!({
+                                                        "source": "assistant_text",
+                                                        "line_number": line_number,
+                                                        "message": ClaudeAgentRunner::truncate(text, 500),
+                                                    }),
+                                                )
+                                                .await;
+                                                tracing::warn!(
+                                                    component = "claude",
+                                                    label = label_stdout.as_str(),
+                                                    line_number,
+                                                    "Detected Claude rate-limit banner in assistant text; requesting early termination"
+                                                );
+                                            }
                                             text_output.push_str(text);
                                             if let Some(file) = writer.as_mut() {
                                                 if !write_failed
@@ -947,6 +1008,7 @@ The PR title should include the issue ID: {}
                 None => None,
             };
             let mut write_failed = false;
+            let mut signaled_rate_limit = false;
 
             loop {
                 let next_line = lines.next_line().await;
@@ -992,6 +1054,32 @@ The PR title should include the issue ID: {}
                         "{}",
                         line
                     );
+
+                    if !signaled_rate_limit && ClaudeAgentRunner::is_rate_limit_error(&line) {
+                        signaled_rate_limit = true;
+                        let msg = format!(
+                            "Claude rate limit hit: {}",
+                            ClaudeAgentRunner::truncate(&line, EXECUTION_LOG_PREVIEW_LIMIT)
+                        );
+                        let _ = stderr_early_failure_tx.send(msg);
+                        ClaudeAgentRunner::append_execution_event(
+                            &stderr_event_writer,
+                            label_stderr.as_str(),
+                            "rate_limit_detected_live",
+                            json!({
+                                "source": "stderr_line",
+                                "line_number": line_number,
+                                "message": ClaudeAgentRunner::truncate(&line, 500),
+                            }),
+                        )
+                        .await;
+                        tracing::warn!(
+                            component = "claude",
+                            label = label_stderr.as_str(),
+                            line_number,
+                            "Detected Claude rate-limit output in stderr stream; requesting early termination"
+                        );
+                    }
                 }
 
                 if let Some(file) = writer.as_mut() {
@@ -1035,13 +1123,25 @@ The PR title should include the issue ID: {}
         enum WaitOutcome {
             Exited(std::result::Result<std::process::ExitStatus, std::io::Error>),
             TimedOut,
+            EarlyFailure(String),
         }
 
-        let outcome = tokio::select! {
-            result = child.wait() => WaitOutcome::Exited(result),
-            _ = tokio::time::sleep(timeout_duration) => WaitOutcome::TimedOut,
+        let timeout_sleep = tokio::time::sleep(timeout_duration);
+        tokio::pin!(timeout_sleep);
+
+        let outcome = loop {
+            tokio::select! {
+                result = child.wait() => break WaitOutcome::Exited(result),
+                _ = &mut timeout_sleep => break WaitOutcome::TimedOut,
+                maybe_msg = early_failure_rx.recv() => {
+                    if let Some(msg) = maybe_msg {
+                        break WaitOutcome::EarlyFailure(msg);
+                    }
+                }
+            }
         };
 
+        let mut forced_failure_msg: Option<String> = None;
         let (status, timed_out) = match outcome {
             WaitOutcome::Exited(Ok(status)) => {
                 Self::append_execution_event(
@@ -1159,6 +1259,78 @@ The PR title should include the issue ID: {}
                     used_qa_ids: Vec::new(),
                 });
             }
+            WaitOutcome::EarlyFailure(msg) => {
+                forced_failure_msg = Some(msg.clone());
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "subprocess_early_failure",
+                    json!({
+                        "reason": msg,
+                    }),
+                )
+                .await;
+                tracing::error!(
+                    component = "claude",
+                    label = label,
+                    "Early failure detected from Claude stream; terminating subprocess"
+                );
+
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "kill_requested_after_early_failure",
+                    json!({}),
+                )
+                .await;
+                if let Err(e) = child.kill().await {
+                    Self::append_execution_event(
+                        &event_writer,
+                        label,
+                        "kill_failed_after_early_failure",
+                        json!({
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .await;
+                    tracing::warn!(
+                        component = "claude",
+                        label = label,
+                        error = %e,
+                        "Failed to kill Claude subprocess after early failure signal"
+                    );
+                }
+
+                let status = match child.wait().await {
+                    Ok(status) => status,
+                    Err(e) => {
+                        Self::append_execution_event(
+                            &event_writer,
+                            label,
+                            "wait_failed_after_early_failure",
+                            json!({
+                                "error": e.to_string(),
+                            }),
+                        )
+                        .await;
+                        return Err(Error::runner(format!(
+                            "Failed to wait for claude after early failure: {}",
+                            e
+                        )));
+                    }
+                };
+
+                Self::append_execution_event(
+                    &event_writer,
+                    label,
+                    "subprocess_terminated_after_early_failure",
+                    json!({
+                        "exit_code": status.code(),
+                    }),
+                )
+                .await;
+                (status, false)
+            }
         };
 
         let stdout_result = match stdout_handle.await {
@@ -1247,6 +1419,9 @@ The PR title should include the issue ID: {}
         if !status.success() {
             result_success = false;
         }
+        if forced_failure_msg.is_some() {
+            result_success = false;
+        }
 
         if let Some(ref url) = pr_url {
             tracing::info!(
@@ -1266,7 +1441,9 @@ The PR title should include the issue ID: {}
             .await;
         }
 
-        let failure_msg = if status.success() {
+        let failure_msg = if let Some(msg) = forced_failure_msg.clone() {
+            Some(msg)
+        } else if status.success() {
             None
         } else {
             Some(Self::compose_failure_message(
@@ -4090,8 +4267,12 @@ mod tests {
 
     #[test]
     fn test_build_prompt_uses_template_renderer_when_template_exists() {
-        let tmp_dir = std::env::temp_dir().join("claudear_test_build_prompt_template");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "claudear_test_build_prompt_template_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
 
         // Create an AGENT.md file so the template path is used
         std::fs::write(
@@ -4104,29 +4285,34 @@ mod tests {
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(&issue, "error context here", &tmp_dir);
 
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
         // When AGENT.md exists, the template renderer is used and
         // the prompt should contain the agent instructions
         assert!(
             prompt.contains("Custom Agent") || prompt.contains("Follow these rules"),
             "Prompt should contain AGENT.md content when template exists"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_build_prompt_for_issue_with_template() {
-        let tmp_dir = std::env::temp_dir().join("claudear_test_build_prompt_for_issue_tpl");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "claudear_test_build_prompt_for_issue_tpl_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(tmp_dir.join("AGENT.md"), "# Agent v2").unwrap();
 
         let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "sentry");
         let from_public = runner.build_prompt_for_issue(&issue, "ctx", &tmp_dir);
         let from_private = runner.build_prompt(&issue, "ctx", &tmp_dir);
-        assert_eq!(from_public, from_private);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        assert_eq!(from_public, from_private);
     }
 
     #[test]
@@ -4619,8 +4805,12 @@ mod tests {
 
     #[test]
     fn test_build_prompt_for_github_issue_with_template() {
-        let tmp_dir = std::env::temp_dir().join("claudear_test_gh_tpl");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "claudear_test_gh_tpl_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(tmp_dir.join("AGENT.md"), "# GitHub Agent").unwrap();
 
         let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
@@ -4632,17 +4822,22 @@ mod tests {
             "github",
         );
         let prompt = runner.build_prompt(&issue, "Please add test coverage", &tmp_dir);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
         assert!(!prompt.is_empty());
         // Should contain AGENT.md content since it exists
         assert!(prompt.contains("GitHub Agent"));
-
-        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_build_prompt_for_sentry_issue_with_template() {
-        let tmp_dir = std::env::temp_dir().join("claudear_test_sentry_tpl");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "claudear_test_sentry_tpl_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(tmp_dir.join("AGENT.md"), "# Sentry Handler").unwrap();
 
         let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
@@ -4654,10 +4849,11 @@ mod tests {
             "sentry",
         );
         let prompt = runner.build_prompt(&issue, "Stack trace...", &tmp_dir);
-        assert!(!prompt.is_empty());
-        assert!(prompt.contains("Sentry Handler"));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        assert!(!prompt.is_empty());
+        assert!(prompt.contains("Sentry Handler"));
     }
 
     #[test]

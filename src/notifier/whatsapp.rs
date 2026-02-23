@@ -1,12 +1,16 @@
 //! WhatsApp notifier via WhatsApp Business Cloud API.
 
 use super::Notifier;
+use crate::ask_reply_inbox;
 use crate::config::WhatsAppConfig;
 use crate::error::{Error, Result};
 use crate::http::HttpResponse;
-use crate::types::{AskDelivery, AskRequest, Issue};
+use crate::types::{AskDelivery, AskReply, AskRequest, Issue};
 use crate::users::UserRegistry;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
+use std::collections::HashSet;
 
 /// Trait for HTTP client used by WhatsApp notifier.
 #[async_trait]
@@ -22,6 +26,17 @@ pub trait WhatsAppHttpClient: Send + Sync {
 /// Real HTTP client using reqwest.
 pub struct ReqwestWhatsAppClient {
     client: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhatsAppSendMessageResponse {
+    #[serde(default)]
+    messages: Vec<WhatsAppSendMessageResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhatsAppSendMessageResult {
+    id: String,
 }
 
 impl ReqwestWhatsAppClient {
@@ -122,11 +137,24 @@ impl<H: WhatsAppHttpClient> WhatsAppNotifier<H> {
         self.config.to_numbers.clone()
     }
 
-    async fn send_message(&self, body: &str, issue: Option<&Issue>) -> Result<()> {
+    fn extract_reply_text(content: &str) -> Option<String> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    async fn send_message_with_ids(
+        &self,
+        body: &str,
+        issue: Option<&Issue>,
+    ) -> Result<Vec<String>> {
         let (phone_number_id, access_token) =
             match (&self.config.phone_number_id, &self.config.access_token) {
                 (Some(pid), Some(token)) => (pid, token.expose()),
-                _ => return Ok(()),
+                _ => return Ok(Vec::new()),
             };
 
         let url = format!(
@@ -142,6 +170,8 @@ impl<H: WhatsAppHttpClient> WhatsAppNotifier<H> {
         };
 
         let recipients = self.resolve_recipients(issue);
+
+        let mut sent_message_ids = Vec::new();
 
         for to_number in &recipients {
             let payload = serde_json::json!({
@@ -161,8 +191,22 @@ impl<H: WhatsAppHttpClient> WhatsAppNotifier<H> {
                     format!("WhatsApp API error: {}", response.body),
                 ));
             }
+
+            if let Ok(parsed) = serde_json::from_str::<WhatsAppSendMessageResponse>(&response.body)
+            {
+                if let Some(first) = parsed.messages.into_iter().next() {
+                    if !first.id.trim().is_empty() {
+                        sent_message_ids.push(first.id);
+                    }
+                }
+            }
         }
 
+        Ok(sent_message_ids)
+    }
+
+    async fn send_message(&self, body: &str, issue: Option<&Issue>) -> Result<()> {
+        let _ = self.send_message_with_ids(body, issue).await?;
         Ok(())
     }
 }
@@ -180,15 +224,18 @@ impl<H: WhatsAppHttpClient + 'static> Notifier for WhatsAppNotifier<H> {
     }
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
-        let body = format!(
+        let mut body = format!(
             "[Claudear] Processing {} from {} - {}",
             issue.short_id, issue.source, issue.title
         );
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            body.push_str(&format!("\nTrigger: {}", reason));
+        }
         self.send_message(&body, Some(issue)).await
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
-        let body = if issue
+        let mut body = if issue
             .get_metadata::<String>("cascade_downstream_repo")
             .is_some()
         {
@@ -204,6 +251,9 @@ impl<H: WhatsAppHttpClient + 'static> Notifier for WhatsAppNotifier<H> {
         } else {
             format!("[Claudear] PR Created for {}: {}", issue.short_id, pr_url)
         };
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            body.push_str(&format!("\nTrigger: {}", reason));
+        }
         self.send_message(&body, Some(issue)).await
     }
 
@@ -229,7 +279,7 @@ impl<H: WhatsAppHttpClient + 'static> Notifier for WhatsAppNotifier<H> {
             error.to_string()
         };
 
-        let body = if issue
+        let mut body = if issue
             .get_metadata::<bool>("regression_detected")
             .unwrap_or(false)
         {
@@ -248,6 +298,9 @@ impl<H: WhatsAppHttpClient + 'static> Notifier for WhatsAppNotifier<H> {
         } else {
             format!("[Claudear] FAILED {}: {}", issue.short_id, short_error)
         };
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            body.push_str(&format!("\nTrigger: {}", reason));
+        }
         self.send_message(&body, Some(issue)).await
     }
 
@@ -293,12 +346,74 @@ impl<H: WhatsAppHttpClient + 'static> Notifier for WhatsAppNotifier<H> {
             "[Claudear] Human input needed for {}: {}",
             issue.short_id, request.question.question
         );
-        self.send_message(&body, Some(issue)).await?;
+        let message_ids = self.send_message_with_ids(&body, Some(issue)).await?;
+        for message_id in &message_ids {
+            ask_reply_inbox::remember_ask_delivery_id(
+                "whatsapp",
+                &request.correlation_id,
+                message_id.clone(),
+            );
+        }
         Ok(Some(AskDelivery {
             channel: "whatsapp".to_string(),
             target: None,
-            message_id: None,
+            message_id: message_ids.first().cloned(),
         }))
+    }
+
+    async fn poll_question_replies(
+        &self,
+        request: &AskRequest,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<AskReply>> {
+        if !self.config.source_enabled {
+            return Ok(Vec::new());
+        }
+
+        let ask_ids: HashSet<String> =
+            ask_reply_inbox::ask_delivery_ids("whatsapp", &request.correlation_id)
+                .into_iter()
+                .collect();
+        let configured_senders: HashSet<String> = self.config.to_numbers.iter().cloned().collect();
+        let allow_single_sender_fallback = configured_senders.len() == 1;
+
+        let mut replies = Vec::new();
+        for msg in ask_reply_inbox::whatsapp_messages_since(since) {
+            let is_reply_to_known_ask = msg
+                .context_message_id
+                .as_ref()
+                .map(|id| ask_ids.contains(id))
+                .unwrap_or(false);
+
+            let is_single_sender_fallback = !is_reply_to_known_ask
+                && allow_single_sender_fallback
+                && msg.context_message_id.is_none()
+                && configured_senders.contains(&msg.from);
+
+            if !is_reply_to_known_ask && !is_single_sender_fallback {
+                continue;
+            }
+
+            let answer = match Self::extract_reply_text(&msg.text) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            replies.push(AskReply {
+                correlation_id: request.correlation_id.clone(),
+                channel: "whatsapp".to_string(),
+                responder: Some(msg.from),
+                answer,
+                replied_at: msg.replied_at,
+            });
+        }
+
+        replies.sort_by_key(|r| r.replied_at);
+        Ok(replies)
+    }
+
+    fn supports_replies(&self) -> bool {
+        self.is_enabled() && self.config.source_enabled
     }
 }
 
@@ -376,6 +491,9 @@ mod tests {
         WhatsAppConfig {
             phone_number_id: None,
             access_token: None,
+            business_account_id: None,
+            app_secret: None,
+            webhook_verify_token: None,
             to_numbers: vec![],
             source_enabled: false,
             listen_phone_number_id: None,
@@ -387,6 +505,9 @@ mod tests {
         WhatsAppConfig {
             phone_number_id: Some("123456789".to_string()),
             access_token: Some("access_token_xyz".into()),
+            business_account_id: None,
+            app_secret: None,
+            webhook_verify_token: None,
             to_numbers: vec!["+15559876543".to_string()],
             source_enabled: false,
             listen_phone_number_id: None,
@@ -398,6 +519,9 @@ mod tests {
         WhatsAppConfig {
             phone_number_id: Some("123456789".to_string()),
             access_token: Some("access_token_xyz".into()),
+            business_account_id: None,
+            app_secret: None,
+            webhook_verify_token: None,
             to_numbers: vec![
                 "+15551111111".to_string(),
                 "+15552222222".to_string(),
@@ -413,6 +537,9 @@ mod tests {
         WhatsAppConfig {
             phone_number_id: None,
             access_token: Some("token".into()),
+            business_account_id: None,
+            app_secret: None,
+            webhook_verify_token: None,
             to_numbers: vec!["+0987654321".to_string()],
             source_enabled: false,
             listen_phone_number_id: None,
@@ -424,6 +551,9 @@ mod tests {
         WhatsAppConfig {
             phone_number_id: Some("pid".to_string()),
             access_token: None,
+            business_account_id: None,
+            app_secret: None,
+            webhook_verify_token: None,
             to_numbers: vec!["+0987654321".to_string()],
             source_enabled: false,
             listen_phone_number_id: None,
@@ -435,6 +565,9 @@ mod tests {
         WhatsAppConfig {
             phone_number_id: Some("pid".to_string()),
             access_token: Some("token".into()),
+            business_account_id: None,
+            app_secret: None,
+            webhook_verify_token: None,
             to_numbers: vec![],
             source_enabled: false,
             listen_phone_number_id: None,
@@ -915,6 +1048,9 @@ mod tests {
         let config = WhatsAppConfig {
             phone_number_id: Some("pid".to_string()),
             access_token: Some("token".into()),
+            business_account_id: None,
+            app_secret: None,
+            webhook_verify_token: None,
             to_numbers: vec!["+1111".to_string(), "+2222".to_string()],
             source_enabled: false,
             listen_phone_number_id: None,
@@ -1039,7 +1175,70 @@ mod tests {
             .unwrap();
         assert_eq!(delivery.channel, "whatsapp");
         assert!(delivery.target.is_none());
-        assert!(delivery.message_id.is_none());
+        assert_eq!(delivery.message_id.as_deref(), Some("wamid.xxx"));
+    }
+
+    #[test]
+    fn test_supports_replies_requires_source_enabled() {
+        let notifier =
+            WhatsAppNotifier::with_http_client(enabled_config(), MockWhatsAppClient::success());
+        assert!(!notifier.supports_replies());
+
+        let mut cfg = enabled_config();
+        cfg.source_enabled = true;
+        let notifier = WhatsAppNotifier::with_http_client(cfg, MockWhatsAppClient::success());
+        assert!(notifier.supports_replies());
+    }
+
+    #[tokio::test]
+    async fn test_poll_question_replies_matches_reply_context() {
+        crate::ask_reply_inbox::clear_for_tests();
+
+        let mut cfg = enabled_config();
+        cfg.source_enabled = true;
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(cfg, mock);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-wa-reply".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which branch?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+
+        notifier.ask_question(&issue, &request).await.unwrap();
+
+        let now = chrono::Utc::now();
+        crate::ask_reply_inbox::record_whatsapp_message(
+            crate::ask_reply_inbox::WhatsAppInboundMessage {
+                message_id: "wamid.reply".to_string(),
+                from: "+15559876543".to_string(),
+                text: "Use feature/ask-loop".to_string(),
+                replied_at: now,
+                context_message_id: Some("wamid.xxx".to_string()),
+            },
+        );
+
+        let replies = notifier
+            .poll_question_replies(&request, now - chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].channel, "whatsapp");
+        assert_eq!(replies[0].responder.as_deref(), Some("+15559876543"));
+        assert_eq!(replies[0].answer, "Use feature/ask-loop");
     }
 
     #[tokio::test]
@@ -1483,6 +1682,9 @@ mod tests {
         let config = WhatsAppConfig {
             phone_number_id: Some("pid".to_string()),
             access_token: Some("token".into()),
+            business_account_id: None,
+            app_secret: None,
+            webhook_verify_token: None,
             to_numbers: vec![],
             source_enabled: false,
             listen_phone_number_id: None,
@@ -1592,5 +1794,28 @@ mod tests {
         let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
         let result = notifier.notify_status("test").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_with_trigger_reason() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Retry attempt 1: connection error");
+        notifier.notify_start(&issue).await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(text.contains("Trigger: Retry attempt 1: connection error"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_without_trigger_reason() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        notifier.notify_start(&issue).await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(!text.contains("Trigger:"));
     }
 }

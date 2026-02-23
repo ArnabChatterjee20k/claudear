@@ -193,10 +193,13 @@ impl Notifier for EmailNotifier {
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
         let subject = format!("[Claudear] Processing: {}", issue.short_id);
-        let body = format!(
+        let mut body = format!(
             "Claudear is now processing an issue.\n\n{}\n\nYou will receive another notification when processing completes.",
             Self::format_issue_info(issue)
         );
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            body.push_str(&format!("\n\nTrigger reason: {}", reason));
+        }
         self.send_email(&subject, &body, Some(issue)).await
     }
 
@@ -235,6 +238,11 @@ impl Notifier for EmailNotifier {
                     pr_url
                 ),
             )
+        };
+        let body = if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            format!("{}\n\nTrigger reason: {}", body, reason)
+        } else {
+            body
         };
         self.send_email(&subject, &body, Some(issue)).await
     }
@@ -301,6 +309,11 @@ impl Notifier for EmailNotifier {
                     error
                 ),
             )
+        };
+        let body = if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            format!("{}\n\nTrigger reason: {}", body, reason)
+        } else {
+            body
         };
         self.send_email(&subject, &body, Some(issue)).await
     }
@@ -2548,5 +2561,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(delivery.target.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_with_trigger_reason() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Retry attempt 2: timeout");
+        // With no transport, notify_start builds the body (including trigger_reason) but returns Ok
+        let result = notifier.notify_start(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_without_trigger_reason() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let result = notifier.notify_start(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_format_issue_info_does_not_include_trigger_reason() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Retry attempt 2: timeout");
+        let info = EmailNotifier::format_issue_info(&issue);
+        // format_issue_info only has issue fields; trigger_reason is appended by notify_start
+        assert!(!info.contains("Trigger"));
+        assert!(info.contains("LIN-1"));
     }
 }

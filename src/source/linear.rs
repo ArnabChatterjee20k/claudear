@@ -616,12 +616,6 @@ impl<H: LinearHttpClient + 'static> IssueSource for LinearSource<H> {
             return Err(Error::source("linear", "Failed to update issue state"));
         }
 
-        tracing::info!(
-            source = "linear",
-            issue_id = %issue_id,
-            state = %done_state.name,
-            "Resolved issue"
-        );
         Ok(())
     }
 
@@ -658,7 +652,6 @@ impl<H: LinearHttpClient + 'static> IssueSource for LinearSource<H> {
             return Err(Error::source("linear", "Failed to create comment"));
         }
 
-        tracing::info!(source = "linear", issue_id = %issue_id, "Added comment to issue");
         Ok(())
     }
 
@@ -756,11 +749,6 @@ impl<H: LinearHttpClient + 'static> IssueSource for LinearSource<H> {
             "linear",
         );
 
-        tracing::info!(
-            source = "linear",
-            issue_id = %created.identifier,
-            "Created issue"
-        );
         Ok(issue)
     }
 

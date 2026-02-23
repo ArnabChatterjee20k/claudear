@@ -284,6 +284,12 @@ pub struct SlackSourceConfig {
     pub poll_interval_ms: Option<u64>,
     /// Slack user ID (e.g., bot's own user ID for reply detection).
     pub user_id: Option<String>,
+    /// Slack signing secret for verifying Events API webhook requests.
+    pub signing_secret: Option<SecretValue>,
+    /// Slack app ID used for apps.manifest.export/update auto-configuration.
+    pub app_id: Option<String>,
+    /// Slack app configuration token used for manifest API calls.
+    pub app_config_token: Option<SecretValue>,
 }
 
 /// Slack notifier-only configuration (for outbound notifications).
@@ -308,7 +314,7 @@ pub struct SlackNotifierConfig {
 pub struct Config {
     /// Working directory for cloning repositories.
     /// Repositories will be cloned into subdirectories of this path.
-    pub work_dir: PathBuf,
+    pub workspace: PathBuf,
     /// Known organizations to scan for repositories.
     /// Repos from these orgs will be discovered automatically.
     #[serde(default)]
@@ -421,7 +427,7 @@ impl Default for DashboardConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            work_dir: PathBuf::new(),
+            workspace: PathBuf::new(),
             known_orgs: Vec::new(),
             auto_discover_paths: Vec::new(),
             poll_interval_ms: 300_000,
@@ -1004,6 +1010,12 @@ pub struct WhatsAppConfig {
     pub phone_number_id: Option<String>,
     /// Meta Graph API access token.
     pub access_token: Option<SecretValue>,
+    /// WhatsApp Business Account (WABA) ID used for webhook subscription setup.
+    pub business_account_id: Option<String>,
+    /// Meta app secret for verifying webhook signatures.
+    pub app_secret: Option<SecretValue>,
+    /// Verify token used for WhatsApp webhook callback challenge.
+    pub webhook_verify_token: Option<SecretValue>,
     /// Default recipient phone numbers.
     pub to_numbers: Vec<String>,
     /// Enable WhatsApp as an issue source.
@@ -1606,12 +1618,12 @@ impl Config {
 
     /// Validate minimal configuration needed for loading.
     ///
-    /// Only validates `work_dir` is set. Repository validation is done
+    /// Only validates `workspace` is set. Repository validation is done
     /// in `validate()` for commands that actually need repositories.
     fn validate_project_config(&self) -> Result<()> {
-        if self.work_dir.as_os_str().is_empty() {
+        if self.workspace.as_os_str().is_empty() {
             return Err(Error::config(
-                "'work_dir' is required - path where repositories will be cloned",
+                "'workspace' is required - path where repositories will be cloned",
             ));
         }
 
@@ -1738,7 +1750,7 @@ impl Config {
         // Core settings
         if let Ok(v) = env::var("WORK_DIR") {
             if !v.is_empty() {
-                self.work_dir = v.into();
+                self.workspace = v.into();
             }
         }
         if let Ok(v) = env::var("KNOWN_ORGS") {
@@ -1932,6 +1944,21 @@ impl Config {
                 src.workspace = val;
             }
         }
+        if let Ok(v) = env::var("SLACK_SIGNING_SECRET") {
+            if let Some(ref mut src) = self.issues.slack {
+                src.signing_secret = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
+            }
+        }
+        if let Ok(v) = env::var("SLACK_APP_ID") {
+            if let Some(ref mut src) = self.issues.slack {
+                src.app_id = Some(v).filter(|s| !s.is_empty());
+            }
+        }
+        if let Ok(v) = env::var("SLACK_APP_CONFIG_TOKEN") {
+            if let Some(ref mut src) = self.issues.slack {
+                src.app_config_token = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
+            }
+        }
         if let Some(v) = env::var("SLACK_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1939,6 +1966,71 @@ impl Config {
             if let Some(ref mut src) = self.issues.slack {
                 src.poll_interval_ms = Some(v);
             }
+        }
+
+        // WhatsApp notifier/source
+        if let Ok(v) = env::var("WHATSAPP_PHONE_NUMBER_ID") {
+            self.notifiers.whatsapp.phone_number_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("WHATSAPP_ACCESS_TOKEN") {
+            self.notifiers.whatsapp.access_token =
+                Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
+        }
+        if let Ok(v) = env::var("WHATSAPP_BUSINESS_ACCOUNT_ID") {
+            self.notifiers.whatsapp.business_account_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("WHATSAPP_APP_SECRET") {
+            self.notifiers.whatsapp.app_secret =
+                Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
+        }
+        if let Ok(v) = env::var("WHATSAPP_WEBHOOK_VERIFY_TOKEN") {
+            self.notifiers.whatsapp.webhook_verify_token =
+                Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
+        }
+        if let Ok(v) = env::var("WHATSAPP_TO_NUMBERS") {
+            if !v.is_empty() {
+                self.notifiers.whatsapp.to_numbers =
+                    v.split(',').map(|s| s.trim().to_string()).collect();
+            }
+        }
+        if let Ok(v) = env::var("WHATSAPP_SOURCE_ENABLED") {
+            self.notifiers.whatsapp.source_enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = env::var("WHATSAPP_LISTEN_PHONE_NUMBER_ID") {
+            self.notifiers.whatsapp.listen_phone_number_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Some(v) = env::var("WHATSAPP_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.notifiers.whatsapp.poll_interval_ms = Some(v);
+        }
+
+        // Telegram notifier/source
+        if let Ok(v) = env::var("TELEGRAM_BOT_TOKEN") {
+            self.notifiers.telegram.bot_token =
+                Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
+        }
+        if let Ok(v) = env::var("TELEGRAM_CHAT_ID") {
+            self.notifiers.telegram.chat_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("TELEGRAM_TO_CHAT_IDS") {
+            if !v.is_empty() {
+                self.notifiers.telegram.to_chat_ids =
+                    v.split(',').map(|s| s.trim().to_string()).collect();
+            }
+        }
+        if let Ok(v) = env::var("TELEGRAM_SOURCE_ENABLED") {
+            self.notifiers.telegram.source_enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = env::var("TELEGRAM_LISTEN_CHAT_ID") {
+            self.notifiers.telegram.listen_chat_id = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Some(v) = env::var("TELEGRAM_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.notifiers.telegram.poll_interval_ms = Some(v);
         }
 
         // Email
@@ -2940,14 +3032,14 @@ mod tests {
     fn test_from_toml_minimal() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 known_orgs = ["appwrite", "utopia-php"]
 
 [issues.linear]
 api_key = "lin_test_key"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
-            assert_eq!(config.work_dir, PathBuf::from("/tmp/repos"));
+            assert_eq!(config.workspace, PathBuf::from("/tmp/repos"));
             assert_eq!(config.known_orgs, vec!["appwrite", "utopia-php"]);
             assert!(config.issues.linear.is_some());
             assert_eq!(
@@ -2962,7 +3054,7 @@ api_key = "lin_test_key"
         // Wrap in with_env to prevent env var interference from parallel tests
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/path/to/repos"
+workspace = "/path/to/repos"
 known_orgs = ["appwrite", "utopia-php"]
 auto_discover_paths = ["~/Local", "~/Projects"]
 poll_interval_ms = 600000
@@ -3028,7 +3120,7 @@ client_secret = "client_secret"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
 
-            assert_eq!(config.work_dir, PathBuf::from("/path/to/repos"));
+            assert_eq!(config.workspace, PathBuf::from("/path/to/repos"));
             assert_eq!(config.known_orgs, vec!["appwrite", "utopia-php"]);
             assert_eq!(config.auto_discover_paths, vec!["~/Local", "~/Projects"]);
             assert_eq!(config.poll_interval_ms, 600000);
@@ -3073,7 +3165,7 @@ client_secret = "client_secret"
     /// Helper to create a minimal valid config TOML for tests.
     fn test_config_toml() -> &'static str {
         r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 known_orgs = ["appwrite"]
 
 [issues.linear]
@@ -3111,7 +3203,7 @@ api_key = "test_key"
     fn test_from_toml_invalid_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = /tmp/repos
+workspace = /tmp/repos
 this is not valid toml [[[
 "#;
             let result = Config::from_toml(toml_str);
@@ -3125,7 +3217,7 @@ this is not valid toml [[[
 
         with_env(&[], || {
             let config = Config::load(file.path()).unwrap();
-            assert_eq!(config.work_dir, PathBuf::from("/tmp/repos"));
+            assert_eq!(config.workspace, PathBuf::from("/tmp/repos"));
             assert_eq!(config.known_orgs, vec!["appwrite"]);
             assert!(config.issues.linear.is_some());
         });
@@ -3141,7 +3233,7 @@ this is not valid toml [[[
     }
 
     #[test]
-    fn test_load_missing_work_dir() {
+    fn test_load_missing_workspace() {
         let toml_str = r#"
 known_orgs = ["appwrite"]
 "#;
@@ -3150,7 +3242,7 @@ known_orgs = ["appwrite"]
         with_env(&[], || {
             let result = Config::load(file.path());
             assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("work_dir"));
+            assert!(result.unwrap_err().to_string().contains("workspace"));
         });
     }
 
@@ -3158,7 +3250,7 @@ known_orgs = ["appwrite"]
     fn test_load_without_known_orgs_succeeds() {
         // Config can load without known_orgs and auto_discover_paths
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.linear]
 api_key = "test_key"
@@ -3175,22 +3267,22 @@ api_key = "test_key"
     }
 
     #[test]
-    fn test_env_override_work_dir() {
+    fn test_env_override_workspace() {
         let toml_str = r#"
-work_dir = "/toml/path"
+workspace = "/toml/path"
 "#;
         let file = create_temp_toml(toml_str);
 
         with_env(&[("WORK_DIR", "/env/path")], || {
             let config = Config::load(file.path()).unwrap();
-            assert_eq!(config.work_dir, PathBuf::from("/env/path"));
+            assert_eq!(config.workspace, PathBuf::from("/env/path"));
         });
     }
 
     #[test]
     fn test_env_override_known_orgs() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 known_orgs = ["toml-org"]
 "#;
         let file = create_temp_toml(toml_str);
@@ -3204,7 +3296,7 @@ known_orgs = ["toml-org"]
     #[test]
     fn test_env_override_auto_discover_paths() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 auto_discover_paths = ["~/toml/path"]
 "#;
         let file = create_temp_toml(toml_str);
@@ -3224,7 +3316,7 @@ auto_discover_paths = ["~/toml/path"]
     #[test]
     fn test_env_override_core_settings() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 poll_interval_ms = 100000
 webhook_port = 3000
 
@@ -3251,7 +3343,7 @@ api_key = "lin_key"
     #[test]
     fn test_env_override_linear_api_key() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.linear]
 api_key = "toml_key"
@@ -3270,7 +3362,7 @@ api_key = "toml_key"
     #[test]
     fn test_env_creates_linear_config_when_missing() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -3287,7 +3379,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_sentry() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.sentry]
 auth_token = "toml_token"
@@ -3312,7 +3404,7 @@ org_slug = "toml-org"
     #[test]
     fn test_env_creates_sentry_config_when_missing() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -3335,7 +3427,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_discord() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [notifiers.discord]
 webhook_url = "https://toml.webhook"
@@ -3357,7 +3449,7 @@ api_key = "key"
     #[test]
     fn test_env_override_github() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [scm.github]
 token = "toml_token"
@@ -3604,7 +3696,7 @@ api_key = "key"
     fn test_per_source_config_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 max_issues_per_cycle = 5
 max_concurrent = 8
 
@@ -3631,7 +3723,7 @@ max_concurrent = 6
     fn test_per_source_config_partial_override() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 max_issues_per_cycle = 5
 max_concurrent = 8
 
@@ -3713,7 +3805,7 @@ max_concurrent = 6
         // Hold env mutex: from_toml reads env vars which can race with other tests
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 poll_interval_ms = 300000
 
 [issues.discord]
@@ -3744,7 +3836,7 @@ poll_interval_ms = 120000
                 ("DISCORD_SOURCE_ENABLED", "1"),
             ],
             || {
-                let config = Config::from_toml("work_dir = \"/tmp\"").unwrap();
+                let config = Config::from_toml("workspace = \"/tmp\"").unwrap();
                 assert_eq!(config.poll_interval_ms_for("discord"), 15_000);
                 // Global unchanged
                 assert_eq!(config.poll_interval_ms_for("unknown"), 300_000);
@@ -3935,7 +4027,7 @@ poll_interval_ms = 120000
     fn test_config_toml_roundtrip() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 known_orgs = ["appwrite", "utopia-php"]
 auto_discover_paths = ["~/Local"]
 poll_interval_ms = 500000
@@ -3949,7 +4041,7 @@ trigger_labels = ["label1", "label2"]
             let serialized = toml::to_string(&config).unwrap();
             let deserialized: Config = toml::from_str(&serialized).unwrap();
 
-            assert_eq!(config.work_dir, deserialized.work_dir);
+            assert_eq!(config.workspace, deserialized.workspace);
             assert_eq!(config.known_orgs, deserialized.known_orgs);
             assert_eq!(config.auto_discover_paths, deserialized.auto_discover_paths);
             assert_eq!(config.poll_interval_ms, deserialized.poll_interval_ms);
@@ -4056,7 +4148,7 @@ github_search_repos = ["org/repo1", "org/repo2"]
     fn test_config_regression_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/test"
+workspace = "/tmp/test"
 
 [regression]
 enabled = false
@@ -4168,7 +4260,7 @@ monitoring_duration_hours = 12
     fn test_github_app_config_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/test"
+workspace = "/tmp/test"
 
 [scm.github.app]
 app_id = 12345
@@ -4208,7 +4300,7 @@ base_url = "https://example.com"
     #[test]
     fn test_env_override_github_app() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4293,7 +4385,7 @@ work_dir = "/tmp/repos"
     fn test_agent_provider_config_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/test"
+workspace = "/tmp/test"
 
 [agent.providers.claude]
 model = "sonnet"
@@ -4328,7 +4420,7 @@ skip_permissions = false
     fn test_claude_config_toml_defaults() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/test"
+workspace = "/tmp/test"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
             assert!(config
@@ -4362,7 +4454,7 @@ work_dir = "/tmp/test"
     #[test]
     fn test_env_override_claude_model() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4378,7 +4470,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_claude_instructions() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4398,7 +4490,7 @@ work_dir = "/tmp/repos"
         fs::write(&instructions_path, "File content.").unwrap();
 
         let config_path = dir.path().join("claudear.toml");
-        fs::write(&config_path, "work_dir = \"/tmp/repos\"\n").unwrap();
+        fs::write(&config_path, "workspace = \"/tmp/repos\"\n").unwrap();
 
         with_env(
             &[("CLAUDE_INSTRUCTIONS_FILE", "my-instructions.md")],
@@ -4424,7 +4516,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_claude_permissions() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4440,7 +4532,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_claude_skip_permissions() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4459,7 +4551,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_claude_skip_permissions_true() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent.providers.claude]
 skip_permissions = false
@@ -4486,7 +4578,7 @@ skip_permissions = false
             fs::write(&instructions_path, "Be helpful and concise.").unwrap();
 
             let toml_str = format!(
-                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"{}\"",
+                "workspace = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"{}\"",
                 instructions_path.display()
             );
             let config = Config::from_toml(&toml_str).unwrap();
@@ -4503,7 +4595,7 @@ skip_permissions = false
             fs::write(&instructions_path, "Write tests first.").unwrap();
 
             let toml_str =
-                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"my-instructions.md\"";
+                "workspace = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"my-instructions.md\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, Some("Write tests first.".to_string()));
@@ -4517,7 +4609,7 @@ skip_permissions = false
             let instructions_path = dir.path().join("base.md");
             fs::write(&instructions_path, "Base instructions from file.").unwrap();
 
-            let toml_str = "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"base.md\"\ninstructions = \"Plus inline.\"";
+            let toml_str = "workspace = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"base.md\"\ninstructions = \"Plus inline.\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(
@@ -4532,7 +4624,7 @@ skip_permissions = false
         with_env(&[], || {
             let dir = tempfile::tempdir().unwrap();
 
-            let toml_str = "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions = \"Just inline.\"";
+            let toml_str = "workspace = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions = \"Just inline.\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, Some("Just inline.".to_string()));
@@ -4544,7 +4636,7 @@ skip_permissions = false
         with_env(&[], || {
             let dir = tempfile::tempdir().unwrap();
 
-            let toml_str = "work_dir = \"/tmp/repos\"";
+            let toml_str = "workspace = \"/tmp/repos\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, None);
@@ -4557,7 +4649,7 @@ skip_permissions = false
             let dir = tempfile::tempdir().unwrap();
 
             let toml_str =
-                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"nonexistent.md\"";
+                "workspace = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"nonexistent.md\"";
             let config = Config::from_toml(toml_str).unwrap();
             let result = config.resolve_instructions_file(dir.path());
             assert!(result.is_err());
@@ -4573,7 +4665,7 @@ skip_permissions = false
             fs::write(&instructions_path, "").unwrap();
 
             let toml_str =
-                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"empty.md\"";
+                "workspace = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"empty.md\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             assert_eq!(resolved, None);
@@ -4586,7 +4678,7 @@ skip_permissions = false
         let instructions_path = dir.path().join("my-instructions.md");
         fs::write(&instructions_path, "Instructions from file.").unwrap();
 
-        let toml_str = "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"my-instructions.md\"\ninstructions = \"And inline.\"";
+        let toml_str = "workspace = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"my-instructions.md\"\ninstructions = \"And inline.\"";
         let config_path = dir.path().join("claudear.toml");
         fs::write(&config_path, toml_str).unwrap();
 
@@ -4733,7 +4825,7 @@ to_numbers = ["jake", "+9876543210"]
     #[test]
     fn test_env_override_imap_settings() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4770,7 +4862,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_ask_config() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4802,7 +4894,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_sms_settings() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4838,7 +4930,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_push_settings() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4865,7 +4957,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_retry_settings() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -4887,7 +4979,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_linear_trigger_labels_and_states() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.linear]
 api_key = "toml_key"
@@ -4921,7 +5013,7 @@ api_key = "toml_key"
     #[test]
     fn test_env_override_linear_enabled_flag() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.linear]
 api_key = "key"
@@ -4938,7 +5030,7 @@ enabled = true
     #[test]
     fn test_env_override_linear_trigger_assignee() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.linear]
 api_key = "key"
@@ -4955,7 +5047,7 @@ api_key = "key"
     #[test]
     fn test_env_override_linear_trigger_assignee_empty() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.linear]
 api_key = "key"
@@ -4974,7 +5066,7 @@ trigger_assignee = "Previous Value"
     #[test]
     fn test_env_override_sentry_detailed() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.sentry]
 auth_token = "toml_token"
@@ -5016,7 +5108,7 @@ org_slug = "toml-org"
     #[test]
     fn test_env_override_additional_core_settings() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -5044,7 +5136,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_empty_values_ignored() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [notifiers.discord]
 webhook_url = "https://keep-this.url"
@@ -5064,7 +5156,7 @@ api_key = "keep_key"
             || {
                 let config = Config::load(file.path()).unwrap();
                 // Empty WORK_DIR should not override
-                assert_eq!(config.work_dir, PathBuf::from("/tmp/repos"));
+                assert_eq!(config.workspace, PathBuf::from("/tmp/repos"));
                 // Empty KNOWN_ORGS should not override
                 assert!(config.known_orgs.is_empty());
                 // Empty DISCORD_WEBHOOK_URL should set to None
@@ -5081,7 +5173,7 @@ api_key = "keep_key"
     #[test]
     fn test_env_override_github_webhook_secret_and_review_trigger() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -5104,7 +5196,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_email_smtp_settings() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -5171,7 +5263,7 @@ work_dir = "/tmp/repos"
     fn test_cascade_config_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/test"
+workspace = "/tmp/test"
 
 [cascade]
 enabled = true
@@ -5188,7 +5280,7 @@ max_depth = 3
     fn test_cascade_config_with_rules() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/test"
+workspace = "/tmp/test"
 
 [cascade]
 enabled = true
@@ -5293,7 +5385,7 @@ version_update = false
     #[test]
     fn test_env_override_discord_bot_and_channel() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -5319,7 +5411,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_github_app_private_key_path() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -5496,7 +5588,7 @@ cluster_window_minutes = 60
     fn test_config_without_learning_section() {
         // A minimal Config TOML without any [learning] section should still work
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 known_orgs = ["test-org"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
@@ -5509,7 +5601,7 @@ known_orgs = ["test-org"]
     #[test]
     fn test_config_with_learning_section() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 known_orgs = ["test-org"]
 
 [learning]
@@ -5581,7 +5673,7 @@ auto_agent_md = false
     #[test]
     fn test_config_zero_poll_interval() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 poll_interval_ms = 0
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
@@ -5591,7 +5683,7 @@ poll_interval_ms = 0
     #[test]
     fn test_config_zero_max_issues_per_cycle() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 max_issues_per_cycle = 0
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
@@ -5601,7 +5693,7 @@ max_issues_per_cycle = 0
     #[test]
     fn test_config_zero_max_concurrent() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 max_concurrent = 0
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
@@ -5609,18 +5701,18 @@ max_concurrent = 0
     }
 
     #[test]
-    fn test_config_empty_work_dir() {
+    fn test_config_empty_workspace() {
         let toml_str = r#"
-work_dir = ""
+workspace = ""
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.work_dir, PathBuf::from(""));
+        assert_eq!(config.workspace, PathBuf::from(""));
     }
 
     #[test]
     fn test_config_empty_known_orgs() {
         let toml_str = r#"
-work_dir = "/tmp"
+workspace = "/tmp"
 known_orgs = []
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
@@ -5648,7 +5740,7 @@ max_retries = 0
     fn test_config_unknown_fields_ignored() {
         // TOML with unknown fields - toml crate by default rejects unknown fields with serde
         let toml_str = r#"
-work_dir = "/tmp"
+workspace = "/tmp"
 unknown_field = "should be ignored"
 another_unknown = 42
 "#;
@@ -5798,7 +5890,7 @@ hourly_engineer_rate = 100.0
     fn test_config_dashboard_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [dashboard]
 max_plan_monthly_cost = 100.0
@@ -5853,7 +5945,7 @@ enabled = false
     fn test_config_code_index_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [code_index]
 enabled = false
@@ -5945,7 +6037,7 @@ custom_test_cmd = "npm test"
     fn test_config_evaluation_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [evaluation]
 enabled = true
@@ -5982,7 +6074,7 @@ fail_on_regression = true
     fn test_prioritisation_config_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [prioritisation]
 enabled = false
@@ -6121,7 +6213,7 @@ cosmetic_paths = ["docs"]
     #[test]
     fn test_env_override_slack_settings() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -6192,7 +6284,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_discord_source_enabled() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -6328,7 +6420,7 @@ max_concurrent = 3
     #[test]
     fn test_env_override_gitlab() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -6370,7 +6462,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_override_gitlab_enabled_flag() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [scm.gitlab]
 enabled = true
@@ -6541,7 +6633,7 @@ poll_interval_ms = 60000
     #[test]
     fn test_env_override_jira() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -6588,7 +6680,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_creates_jira_config_when_missing() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -6605,7 +6697,7 @@ work_dir = "/tmp/repos"
     #[test]
     fn test_env_creates_gitlab_config_when_missing() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
@@ -6930,7 +7022,7 @@ similarity_threshold = 0.75
     fn test_config_storage_dir_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 storage_dir = "/custom/storage"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
@@ -6963,15 +7055,15 @@ storage_dir = "/custom/storage"
     }
 
     #[test]
-    fn test_config_default_work_dir_empty() {
+    fn test_config_default_workspace_empty() {
         let config = Config::default();
-        assert!(config.work_dir.as_os_str().is_empty());
+        assert!(config.workspace.as_os_str().is_empty());
     }
 
     #[test]
     fn test_env_override_linear_poll_interval_ms() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.linear]
 api_key = "key"
@@ -6990,7 +7082,7 @@ api_key = "key"
     #[test]
     fn test_env_override_sentry_poll_interval_ms() {
         let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.sentry]
 auth_token = "tok"
@@ -7011,7 +7103,7 @@ org_slug = "org"
     fn test_linear_trigger_assignee_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [issues.linear]
 api_key = "key"
@@ -7029,7 +7121,7 @@ trigger_assignee = "Alice"
     fn test_from_toml_empty() {
         with_env(&[], || {
             let config = Config::from_toml("").unwrap();
-            assert!(config.work_dir.as_os_str().is_empty());
+            assert!(config.workspace.as_os_str().is_empty());
             assert_eq!(config.poll_interval_ms, 300_000);
             assert!(config.issues.linear.is_none());
             assert!(config.issues.sentry.is_none());
@@ -7060,7 +7152,7 @@ cross_repo_window_hours = 48
     fn test_agent_provider_instructions_file_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent.providers.claude]
 instructions_file = "my-instructions.md"
@@ -7146,7 +7238,7 @@ instructions_file = "my-instructions.md"
     fn test_github_use_ssh_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [scm.github]
 token = "ghp_test"
@@ -7161,7 +7253,7 @@ use_ssh = true
     fn test_slack_config_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [notifiers.slack]
 bot_token = "xoxb-token"
@@ -7208,7 +7300,7 @@ poll_interval_ms = 30000
     fn test_discord_config_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [notifiers.discord]
 webhook_url = "https://discord.com/wh"
@@ -7264,7 +7356,7 @@ poll_interval_ms = 25000
             fs::write(&instructions_path, "   \n\n  \t  \n").unwrap();
 
             let toml_str =
-                "work_dir = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"whitespace.md\"";
+                "workspace = \"/tmp/repos\"\n\n[agent.providers.claude]\ninstructions_file = \"whitespace.md\"";
             let config = Config::from_toml(toml_str).unwrap();
             let resolved = config.resolve_instructions_file(dir.path()).unwrap();
             // Whitespace-only file should be treated as empty
@@ -7365,7 +7457,7 @@ poll_interval_ms = 25000
     fn test_experiment_config_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent]
 default_provider = "claude"
@@ -7401,7 +7493,7 @@ weight = 0.3
     fn test_multiple_provider_configs_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent.providers.claude]
 model = "opus"
@@ -7430,7 +7522,7 @@ sandbox = "network-off"
     fn test_agent_timeout_from_toml() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent]
 timeout_secs = 3600
@@ -7444,7 +7536,7 @@ timeout_secs = 3600
     fn test_experiment_config_disabled() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [[agent.experiments]]
 name = "inactive"
@@ -7477,7 +7569,7 @@ providers = []
     fn test_env_override_claude_model_over_toml() {
         with_env(&[("CLAUDE_MODEL", "opus")], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent.providers.claude]
 model = "sonnet"
@@ -7495,7 +7587,7 @@ model = "sonnet"
     fn test_env_override_claude_timeout() {
         with_env(&[("CLAUDE_TIMEOUT_SECS", "7200")], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent]
 timeout_secs = 3600
@@ -7509,7 +7601,7 @@ timeout_secs = 3600
     fn test_env_override_skip_permissions() {
         with_env(&[("CLAUDE_SKIP_PERMISSIONS", "true")], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
             assert!(
@@ -7526,7 +7618,7 @@ work_dir = "/tmp/repos"
     fn test_agent_config_multiple_experiments() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [[agent.experiments]]
 name = "exp-a"
@@ -7553,7 +7645,7 @@ providers = []
     fn test_agent_config_default_provider_custom() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent]
 default_provider = "codex"
@@ -7574,7 +7666,7 @@ binary = "codex"
     fn test_provider_config_with_extra_fields() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent.providers.claude]
 model = "opus"
@@ -7639,7 +7731,7 @@ custom_value = "hello"
     fn test_provider_config_all_fields() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent.providers.codex]
 model = "o3"
@@ -7672,7 +7764,7 @@ permissions = ["Read", "Write"]
     fn test_multiple_providers_in_config() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent]
 default_provider = "claude"
@@ -7700,7 +7792,7 @@ api_url = "https://ai.google.dev"
     fn test_experiment_default_strategy() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [[agent.experiments]]
 name = "test-exp"
@@ -7716,7 +7808,7 @@ providers = []
     fn test_experiment_provider_weight_default() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [[agent.experiments]]
 name = "test-exp"
@@ -7740,7 +7832,7 @@ name = "claude"
     fn test_empty_agent_section_uses_defaults() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 
 [agent]
 "#;
@@ -7755,7 +7847,7 @@ work_dir = "/tmp/repos"
     fn test_no_agent_section_uses_defaults() {
         with_env(&[], || {
             let toml_str = r#"
-work_dir = "/tmp/repos"
+workspace = "/tmp/repos"
 "#;
             let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(config.agent.default_provider, "claude");

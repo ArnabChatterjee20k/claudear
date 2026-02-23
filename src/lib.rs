@@ -27,6 +27,7 @@
 
 pub mod api;
 pub mod api_events;
+pub(crate) mod ask_reply_inbox;
 pub mod config;
 pub mod discord;
 pub mod env_writer;
@@ -55,6 +56,7 @@ pub mod scm;
 pub mod secret;
 pub mod source;
 pub mod storage;
+pub mod telemetry;
 pub mod templates;
 pub mod types;
 pub mod users;
@@ -160,30 +162,31 @@ pub async fn build_app(
     let issue_embedding_service = build_embedding_service(&tracker);
 
     // Agent runner
-    let agent: Arc<dyn runner::AgentRunner> = Arc::new(runner::ClaudeAgentRunner::new(
-        runner::ClaudeRunnerConfig {
-            timeout_secs: config.agent.timeout_secs,
-            model: config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.model.clone()),
-            instructions: config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.instructions.clone()),
-            permissions: config
-                .agent
-                .default_provider_config()
-                .map(|p| p.permissions.clone())
-                .unwrap_or_default(),
-            skip_permissions: config
-                .agent
-                .default_provider_config()
-                .map(|p| p.skip_permissions)
-                .unwrap_or(false),
-        },
-        tracker.clone(),
-    ));
+    let agent: Arc<dyn runner::AgentRunner> =
+        telemetry::InstrumentedRunner::wrap(Arc::new(runner::ClaudeAgentRunner::new(
+            runner::ClaudeRunnerConfig {
+                timeout_secs: config.agent.timeout_secs,
+                model: config
+                    .agent
+                    .default_provider_config()
+                    .and_then(|p| p.model.clone()),
+                instructions: config
+                    .agent
+                    .default_provider_config()
+                    .and_then(|p| p.instructions.clone()),
+                permissions: config
+                    .agent
+                    .default_provider_config()
+                    .map(|p| p.permissions.clone())
+                    .unwrap_or_default(),
+                skip_permissions: config
+                    .agent
+                    .default_provider_config()
+                    .map(|p| p.skip_permissions)
+                    .unwrap_or(false),
+            },
+            tracker.clone(),
+        )));
 
     Ok(AppComponents {
         config,
@@ -203,45 +206,46 @@ pub async fn build_app(
 
 fn build_notifier(config: &Config, user_registry: UserRegistry) -> Arc<dyn notifier::Notifier> {
     use notifier::*;
+    use telemetry::InstrumentedNotifier;
 
     let mut composite = CompositeNotifier::new();
-    composite.add(Arc::new(ConsoleNotifier::new()));
+    composite.add(InstrumentedNotifier::wrap(Arc::new(ConsoleNotifier::new())));
 
     let discord_notifier = DiscordNotifier::new(config.discord_merged(), user_registry.clone());
     if discord_notifier.is_enabled() {
-        composite.add(Arc::new(discord_notifier));
+        composite.add(InstrumentedNotifier::wrap(Arc::new(discord_notifier)));
     }
 
     let slack_notifier = SlackNotifier::new(config.slack_merged(), user_registry.clone());
     if slack_notifier.is_enabled() {
-        composite.add(Arc::new(slack_notifier));
+        composite.add(InstrumentedNotifier::wrap(Arc::new(slack_notifier)));
     }
 
     if let Ok(email_notifier) = EmailNotifier::new(config.email().clone(), user_registry.clone()) {
         if email_notifier.is_enabled() {
-            composite.add(Arc::new(email_notifier));
+            composite.add(InstrumentedNotifier::wrap(Arc::new(email_notifier)));
         }
     }
 
     let sms_notifier = SmsNotifier::new(config.sms().clone(), user_registry.clone());
     if sms_notifier.is_enabled() {
-        composite.add(Arc::new(sms_notifier));
+        composite.add(InstrumentedNotifier::wrap(Arc::new(sms_notifier)));
     }
 
     let push_notifier = PushNotifier::new(config.push_config().clone(), user_registry.clone());
     if push_notifier.is_enabled() {
-        composite.add(Arc::new(push_notifier));
+        composite.add(InstrumentedNotifier::wrap(Arc::new(push_notifier)));
     }
 
     let whatsapp_notifier =
         WhatsAppNotifier::new(config.notifiers.whatsapp.clone(), user_registry.clone());
     if whatsapp_notifier.is_enabled() {
-        composite.add(Arc::new(whatsapp_notifier));
+        composite.add(InstrumentedNotifier::wrap(Arc::new(whatsapp_notifier)));
     }
 
     let telegram_notifier = TelegramNotifier::new(config.notifiers.telegram.clone(), user_registry);
     if telegram_notifier.is_enabled() {
-        composite.add(Arc::new(telegram_notifier));
+        composite.add(InstrumentedNotifier::wrap(Arc::new(telegram_notifier)));
     }
 
     Arc::new(composite)
@@ -307,6 +311,9 @@ fn build_sources(config: &Config) -> Vec<Arc<dyn source::IssueSource>> {
     }
 
     sources
+        .into_iter()
+        .map(telemetry::InstrumentedSource::wrap)
+        .collect()
 }
 
 fn build_review_watcher(
@@ -322,7 +329,7 @@ fn build_review_watcher(
         return None;
     }
 
-    let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
+    let provider: Arc<dyn ScmProvider> = telemetry::InstrumentedScm::wrap(Arc::new(github_client));
     let review_watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
 
     if let Ok(states) = tracker.get_active_pr_review_states() {

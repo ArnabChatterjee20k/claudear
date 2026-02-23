@@ -26,7 +26,7 @@ pub async fn run(ctx: &ScenarioContext<'_>) -> Result<()> {
 
 async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> Result<()> {
     let tmp_dir = tempfile::tempdir().context("create temp dir")?;
-    let work_dir = tmp_dir.path().join("workdir");
+    let workspace = tmp_dir.path().join("workdir");
     let repos_dir = tmp_dir.path().join("repos");
     let log_dir = tmp_dir.path().join("logs");
     let db_path = tmp_dir.path().join("s1.db");
@@ -43,7 +43,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     // the message will be permanently skipped.
     let cursor_based_source = matches!(ctx.source_name, "discord" | "slack");
 
-    let mut builder = ConfigBuilder::new(&work_dir, &db_path, PORT)
+    let mut builder = ConfigBuilder::new(&workspace, &db_path, PORT)
         .claude_timeout(ctx.claude_timeout)
         .skip_permissions()
         .retry(1)
@@ -156,7 +156,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             daemon::start_process(&binary, &config_path, PORT, &log_dir, "s1")?
         };
 
-        daemon::wait_healthy(PORT, Duration::from_secs(30)).await?;
+        daemon::wait_healthy(&handle, PORT, Duration::from_secs(30)).await?;
 
         db = E2eDb::new(if ctx.use_docker {
             DbAccess::docker(
@@ -222,7 +222,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             daemon::start_process(&binary, &config_path, PORT, &log_dir, "s1")?
         };
 
-        daemon::wait_healthy(PORT, Duration::from_secs(30)).await?;
+        daemon::wait_healthy(&handle, PORT, Duration::from_secs(30)).await?;
 
         db = E2eDb::new(if ctx.use_docker {
             DbAccess::docker(

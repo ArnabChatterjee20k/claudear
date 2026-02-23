@@ -1,17 +1,23 @@
 //! Telegram notifier via Telegram Bot API.
 
 use super::Notifier;
+use crate::ask_reply_inbox;
 use crate::config::TelegramConfig;
 use crate::error::{Error, Result};
 use crate::http::HttpResponse;
-use crate::types::{AskDelivery, AskRequest, Issue};
+use crate::types::{AskDelivery, AskReply, AskRequest, Issue};
 use crate::users::UserRegistry;
 use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
+use serde::Deserialize;
+use std::collections::HashSet;
+use std::sync::RwLock;
 
 /// Trait for HTTP client used by Telegram notifier.
 #[async_trait]
 pub trait TelegramHttpClient: Send + Sync {
     async fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<HttpResponse>;
+    async fn get_json(&self, url: &str) -> Result<HttpResponse>;
 }
 
 /// Real HTTP client using reqwest.
@@ -47,6 +53,77 @@ impl TelegramHttpClient for ReqwestTelegramClient {
 
         Ok(HttpResponse { status, body })
     }
+
+    async fn get_json(&self, url: &str) -> Result<HttpResponse> {
+        let response = self.client.get(url).send().await?;
+
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+
+        Ok(HttpResponse { status, body })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramSendMessageApiResponse {
+    ok: bool,
+    #[serde(default)]
+    result: Option<TelegramSendMessageResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramSendMessageResult {
+    message_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramGetUpdatesResponse {
+    ok: bool,
+    #[serde(default)]
+    result: Vec<TelegramUpdateItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramUpdateItem {
+    update_id: i64,
+    #[serde(default)]
+    message: Option<TelegramInboundApiMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TelegramInboundApiMessage {
+    message_id: i64,
+    chat: TelegramInboundApiChat,
+    #[serde(default)]
+    from: Option<TelegramInboundApiUser>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    date: Option<i64>,
+    #[serde(default)]
+    reply_to_message: Option<TelegramInboundApiReplyMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TelegramInboundApiReplyMessage {
+    message_id: i64,
+    #[serde(default)]
+    from: Option<TelegramInboundApiUser>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TelegramInboundApiUser {
+    id: i64,
+    is_bot: bool,
+    #[serde(default)]
+    username: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TelegramInboundApiChat {
+    id: i64,
 }
 
 /// Telegram notifier that sends notifications via Telegram Bot API.
@@ -54,6 +131,7 @@ pub struct TelegramNotifier<H: TelegramHttpClient = ReqwestTelegramClient> {
     config: TelegramConfig,
     http: H,
     user_registry: UserRegistry,
+    reply_last_update_id: RwLock<Option<i64>>,
 }
 
 impl TelegramNotifier<ReqwestTelegramClient> {
@@ -63,6 +141,7 @@ impl TelegramNotifier<ReqwestTelegramClient> {
             config,
             http: ReqwestTelegramClient::new(),
             user_registry,
+            reply_last_update_id: RwLock::new(None),
         }
     }
 }
@@ -74,6 +153,7 @@ impl<H: TelegramHttpClient> TelegramNotifier<H> {
             config,
             http,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            reply_last_update_id: RwLock::new(None),
         }
     }
 
@@ -87,6 +167,7 @@ impl<H: TelegramHttpClient> TelegramNotifier<H> {
             config,
             http,
             user_registry,
+            reply_last_update_id: RwLock::new(None),
         }
     }
 
@@ -112,10 +193,190 @@ impl<H: TelegramHttpClient> TelegramNotifier<H> {
         recipients
     }
 
-    async fn send_message(&self, text: &str, issue: Option<&Issue>) -> Result<()> {
+    fn extract_reply_text(content: &str) -> Option<String> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    fn poll_chat_ids(&self) -> HashSet<i64> {
+        let mut ids = HashSet::new();
+        for raw in self
+            .config
+            .listen_chat_id
+            .iter()
+            .chain(self.config.chat_id.iter())
+            .chain(self.config.to_chat_ids.iter())
+        {
+            if let Ok(id) = raw.parse::<i64>() {
+                ids.insert(id);
+            }
+        }
+        ids
+    }
+
+    fn reply_matches_request(
+        &self,
+        request: &AskRequest,
+        msg: &ask_reply_inbox::TelegramInboundMessage,
+    ) -> bool {
+        let poll_chat_ids = self.poll_chat_ids();
+        if !poll_chat_ids.is_empty() && !poll_chat_ids.contains(&msg.chat_id) {
+            return false;
+        }
+
+        let ask_ids: HashSet<i64> =
+            ask_reply_inbox::ask_delivery_ids("telegram", &request.correlation_id)
+                .into_iter()
+                .filter_map(|id| id.parse::<i64>().ok())
+                .collect();
+
+        let is_reply_to_known_ask = msg
+            .reply_to_message_id
+            .map(|id| ask_ids.contains(&id))
+            .unwrap_or(false);
+
+        let ask_prefix = format!("Human input needed for {}", request.short_id);
+        let is_reply_to_matching_ask_text = msg
+            .reply_to_text
+            .as_deref()
+            .map(|text| text.contains(&ask_prefix))
+            .unwrap_or(false)
+            && msg.reply_to_is_bot.unwrap_or(true);
+
+        is_reply_to_known_ask || is_reply_to_matching_ask_text
+    }
+
+    fn collect_replies_from_inbox(
+        &self,
+        request: &AskRequest,
+        since: DateTime<Utc>,
+    ) -> Vec<AskReply> {
+        let mut replies = Vec::new();
+
+        for msg in ask_reply_inbox::telegram_messages_since(since) {
+            if !self.reply_matches_request(request, &msg) {
+                continue;
+            }
+
+            let answer = match Self::extract_reply_text(&msg.text) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            replies.push(AskReply {
+                correlation_id: request.correlation_id.clone(),
+                channel: "telegram".to_string(),
+                responder: msg.responder_id.or(msg.responder_username),
+                answer,
+                replied_at: msg.replied_at,
+            });
+        }
+
+        replies.sort_by_key(|r| r.replied_at);
+        replies
+    }
+
+    fn record_inbound_message_for_replies(msg: &TelegramInboundApiMessage) {
+        let from = match msg.from.as_ref() {
+            Some(user) if !user.is_bot => user,
+            _ => return,
+        };
+        let text = match msg.text.as_ref() {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => return,
+        };
+
+        let replied_at = msg
+            .date
+            .and_then(|secs| Utc.timestamp_opt(secs, 0).single())
+            .unwrap_or_else(Utc::now);
+
+        ask_reply_inbox::record_telegram_message(ask_reply_inbox::TelegramInboundMessage {
+            message_id: msg.message_id,
+            chat_id: msg.chat.id,
+            responder_id: Some(from.id.to_string()),
+            responder_username: from.username.clone(),
+            text,
+            replied_at,
+            reply_to_message_id: msg.reply_to_message.as_ref().map(|m| m.message_id),
+            reply_to_text: msg.reply_to_message.as_ref().and_then(|m| m.text.clone()),
+            reply_to_is_bot: msg
+                .reply_to_message
+                .as_ref()
+                .and_then(|m| m.from.as_ref().map(|u| u.is_bot)),
+        });
+    }
+
+    async fn ingest_updates_into_reply_inbox(&self) -> Result<()> {
         let bot_token = match &self.config.bot_token {
             Some(token) => token.expose(),
             None => return Ok(()),
+        };
+
+        let mut url = format!(
+            "https://api.telegram.org/bot{}/getUpdates?timeout=0",
+            bot_token
+        );
+        if let Some(last_id) = *self
+            .reply_last_update_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            url.push_str(&format!("&offset={}", last_id + 1));
+        }
+
+        let response = self.http.get_json(&url).await?;
+        if response.status < 200 || response.status >= 300 {
+            return Err(Error::notifier(
+                "telegram",
+                format!("Telegram getUpdates error: {}", response.body),
+            ));
+        }
+
+        let parsed: TelegramGetUpdatesResponse =
+            serde_json::from_str(&response.body).map_err(|e| {
+                Error::notifier(
+                    "telegram",
+                    format!("Failed to parse getUpdates response: {}", e),
+                )
+            })?;
+
+        if !parsed.ok {
+            return Err(Error::notifier(
+                "telegram",
+                "Telegram getUpdates returned ok=false",
+            ));
+        }
+
+        if let Some(last) = parsed.result.last() {
+            let mut lock = self
+                .reply_last_update_id
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            *lock = Some(last.update_id);
+        }
+
+        for update in parsed.result {
+            if let Some(msg) = update.message.as_ref() {
+                Self::record_inbound_message_for_replies(msg);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_message_with_ids(
+        &self,
+        text: &str,
+        issue: Option<&Issue>,
+    ) -> Result<Vec<String>> {
+        let bot_token = match &self.config.bot_token {
+            Some(token) => token.expose(),
+            None => return Ok(Vec::new()),
         };
 
         let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
@@ -128,6 +389,8 @@ impl<H: TelegramHttpClient> TelegramNotifier<H> {
         };
 
         let recipients = self.resolve_recipients(issue);
+
+        let mut sent_ids = Vec::new();
 
         for chat_id in &recipients {
             let body = serde_json::json!({
@@ -144,8 +407,23 @@ impl<H: TelegramHttpClient> TelegramNotifier<H> {
                     format!("Telegram API error: {}", response.body),
                 ));
             }
+
+            if let Ok(parsed) =
+                serde_json::from_str::<TelegramSendMessageApiResponse>(&response.body)
+            {
+                if parsed.ok {
+                    if let Some(result) = parsed.result {
+                        sent_ids.push(result.message_id.to_string());
+                    }
+                }
+            }
         }
 
+        Ok(sent_ids)
+    }
+
+    async fn send_message(&self, text: &str, issue: Option<&Issue>) -> Result<()> {
+        let _ = self.send_message_with_ids(text, issue).await?;
         Ok(())
     }
 }
@@ -162,15 +440,18 @@ impl<H: TelegramHttpClient + 'static> Notifier for TelegramNotifier<H> {
     }
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
-        let body = format!(
+        let mut body = format!(
             "[Claudear] Processing {} from {} - {}",
             issue.short_id, issue.source, issue.title
         );
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            body.push_str(&format!("\nTrigger: {}", reason));
+        }
         self.send_message(&body, Some(issue)).await
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
-        let body = if issue
+        let mut body = if issue
             .get_metadata::<String>("cascade_downstream_repo")
             .is_some()
         {
@@ -186,6 +467,9 @@ impl<H: TelegramHttpClient + 'static> Notifier for TelegramNotifier<H> {
         } else {
             format!("[Claudear] PR Created for {}: {}", issue.short_id, pr_url)
         };
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            body.push_str(&format!("\nTrigger: {}", reason));
+        }
         self.send_message(&body, Some(issue)).await
     }
 
@@ -211,7 +495,7 @@ impl<H: TelegramHttpClient + 'static> Notifier for TelegramNotifier<H> {
             error.to_string()
         };
 
-        let body = if issue
+        let mut body = if issue
             .get_metadata::<bool>("regression_detected")
             .unwrap_or(false)
         {
@@ -230,6 +514,9 @@ impl<H: TelegramHttpClient + 'static> Notifier for TelegramNotifier<H> {
         } else {
             format!("[Claudear] FAILED {}: {}", issue.short_id, short_error)
         };
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            body.push_str(&format!("\nTrigger: {}", reason));
+        }
         self.send_message(&body, Some(issue)).await
     }
 
@@ -275,12 +562,34 @@ impl<H: TelegramHttpClient + 'static> Notifier for TelegramNotifier<H> {
             "[Claudear] Human input needed for {}: {}",
             issue.short_id, request.question.question
         );
-        self.send_message(&body, Some(issue)).await?;
+        let message_ids = self.send_message_with_ids(&body, Some(issue)).await?;
+        for message_id in &message_ids {
+            ask_reply_inbox::remember_ask_delivery_id(
+                "telegram",
+                &request.correlation_id,
+                message_id.clone(),
+            );
+        }
         Ok(Some(AskDelivery {
             channel: "telegram".to_string(),
             target: None,
-            message_id: None,
+            message_id: message_ids.first().cloned(),
         }))
+    }
+
+    async fn poll_question_replies(
+        &self,
+        request: &AskRequest,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<AskReply>> {
+        if !self.config.source_enabled {
+            self.ingest_updates_into_reply_inbox().await?;
+        }
+        Ok(self.collect_replies_from_inbox(request, since))
+    }
+
+    fn supports_replies(&self) -> bool {
+        self.is_enabled()
     }
 }
 
@@ -296,20 +605,32 @@ mod tests {
 
     /// Mock Telegram HTTP client for testing.
     struct MockTelegramClient {
-        response_status: u16,
-        response_body: String,
+        post_response_status: u16,
+        post_response_body: String,
+        get_response_status: u16,
+        get_response_body: String,
         call_count: AtomicUsize,
         last_calls: Mutex<Vec<(String, serde_json::Value)>>,
+        get_calls: Mutex<Vec<String>>,
     }
 
     impl MockTelegramClient {
         fn new(status: u16, body: &str) -> Self {
             Self {
-                response_status: status,
-                response_body: body.to_string(),
+                post_response_status: status,
+                post_response_body: body.to_string(),
+                get_response_status: status,
+                get_response_body: body.to_string(),
                 call_count: AtomicUsize::new(0),
                 last_calls: Mutex::new(Vec::new()),
+                get_calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_get_response(mut self, status: u16, body: &str) -> Self {
+            self.get_response_status = status;
+            self.get_response_body = body.to_string();
+            self
         }
 
         fn success() -> Self {
@@ -327,6 +648,10 @@ mod tests {
         fn get_last_calls(&self) -> Vec<(String, serde_json::Value)> {
             self.last_calls.lock().unwrap().clone()
         }
+
+        fn get_get_calls(&self) -> Vec<String> {
+            self.get_calls.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -339,8 +664,17 @@ mod tests {
                 .push((url.to_string(), body.clone()));
 
             Ok(HttpResponse {
-                status: self.response_status,
-                body: self.response_body.clone(),
+                status: self.post_response_status,
+                body: self.post_response_body.clone(),
+            })
+        }
+
+        async fn get_json(&self, url: &str) -> Result<HttpResponse> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.get_calls.lock().unwrap().push(url.to_string());
+            Ok(HttpResponse {
+                status: self.get_response_status,
+                body: self.get_response_body.clone(),
             })
         }
     }
@@ -1021,7 +1355,139 @@ mod tests {
             .unwrap();
         assert_eq!(delivery.channel, "telegram");
         assert!(delivery.target.is_none());
-        assert!(delivery.message_id.is_none());
+        assert_eq!(delivery.message_id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn test_supports_replies_enabled_when_notifier_enabled() {
+        let notifier =
+            TelegramNotifier::with_http_client(enabled_config(), MockTelegramClient::success());
+        assert!(notifier.supports_replies());
+    }
+
+    #[tokio::test]
+    async fn test_poll_question_replies_via_get_updates_matches_reply_to_ask() {
+        crate::ask_reply_inbox::clear_for_tests();
+
+        let updates = r#"{
+            "ok": true,
+            "result": [
+                {
+                    "update_id": 1001,
+                    "message": {
+                        "message_id": 77,
+                        "date": 1700000001,
+                        "chat": { "id": 987654321 },
+                        "from": { "id": 999, "is_bot": false, "username": "alice" },
+                        "text": "Use feature/telegram-replies",
+                        "reply_to_message": {
+                            "message_id": 42,
+                            "from": { "id": 111, "is_bot": true, "username": "claudear_bot" },
+                            "text": "[Claudear] Human input needed for LIN-1: Which branch?"
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let mock = MockTelegramClient::success().with_get_response(200, updates);
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-tg-reply".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which branch?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+
+        notifier.ask_question(&issue, &request).await.unwrap();
+
+        let replies = notifier
+            .poll_question_replies(
+                &request,
+                chrono::Utc
+                    .timestamp_opt(1_700_000_000, 0)
+                    .single()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].channel, "telegram");
+        assert_eq!(replies[0].responder.as_deref(), Some("999"));
+        assert_eq!(replies[0].answer, "Use feature/telegram-replies");
+
+        let get_calls = notifier.http.get_get_calls();
+        assert_eq!(get_calls.len(), 1);
+        assert!(get_calls[0].contains("/getUpdates"));
+    }
+
+    #[tokio::test]
+    async fn test_poll_question_replies_uses_shared_inbox_when_source_enabled() {
+        crate::ask_reply_inbox::clear_for_tests();
+
+        let mut cfg = enabled_config();
+        cfg.source_enabled = true;
+        let mock =
+            MockTelegramClient::success().with_get_response(200, r#"{"ok": true, "result": []}"#);
+        let notifier = TelegramNotifier::with_http_client(cfg, mock);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-tg-inbox".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which branch?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+
+        notifier.ask_question(&issue, &request).await.unwrap();
+
+        let now = chrono::Utc::now();
+        crate::ask_reply_inbox::record_telegram_message(
+            crate::ask_reply_inbox::TelegramInboundMessage {
+                message_id: 88,
+                chat_id: 987654321,
+                responder_id: Some("321".to_string()),
+                responder_username: Some("jake".to_string()),
+                text: "Use main".to_string(),
+                replied_at: now,
+                reply_to_message_id: Some(42),
+                reply_to_text: Some(
+                    "[Claudear] Human input needed for LIN-1: Which branch?".to_string(),
+                ),
+                reply_to_is_bot: Some(true),
+            },
+        );
+
+        let replies = notifier
+            .poll_question_replies(&request, now - chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].answer, "Use main");
+        assert!(notifier.http.get_get_calls().is_empty());
     }
 
     #[tokio::test]
@@ -1632,5 +2098,40 @@ mod tests {
         notifier.notify_status("test").await.unwrap();
 
         assert_eq!(notifier.http.get_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_with_trigger_reason() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Retry attempt 2: timeout");
+        notifier.notify_start(&issue).await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        assert!(text.contains("Trigger: Retry attempt 2: timeout"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_without_trigger_reason() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        notifier.notify_start(&issue).await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        assert!(!text.contains("Trigger:"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_with_trigger_reason() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Manual trigger");
+        notifier.notify_failed(&issue, "some error").await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        assert!(text.contains("Trigger: Manual trigger"));
     }
 }

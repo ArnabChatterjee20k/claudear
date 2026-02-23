@@ -27,12 +27,22 @@ pub trait E2eAsk: Send + Sync {
 pub struct DiscordAsk {
     client: claudear::DiscordClient,
     channel_id: String,
+    webhook_url: Option<String>,
+    http: reqwest::Client,
 }
 
 impl DiscordAsk {
     pub fn new(bot_token: String, channel_id: String) -> Result<Self> {
         let client = claudear::DiscordClient::new(&bot_token).context("create Discord client")?;
-        Ok(Self { client, channel_id })
+        let webhook_url = std::env::var("CLAUDEAR_E2E_DISCORD_WEBHOOK_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        Ok(Self {
+            client,
+            channel_id,
+            webhook_url,
+            http: reqwest::Client::new(),
+        })
     }
 }
 
@@ -43,6 +53,32 @@ impl E2eAsk for DiscordAsk {
     }
 
     async fn post_issue_message(&self, content: &str) -> Result<String> {
+        // Prefer webhook: messages via webhook have webhook_id set, so the daemon's
+        // Discord source won't filter them as bot messages.
+        if let Some(ref webhook_url) = self.webhook_url {
+            let body = serde_json::json!({ "content": content });
+            let resp = self
+                .http
+                .post(format!("{}?wait=true", webhook_url))
+                .json(&body)
+                .send()
+                .await
+                .context("Discord webhook post")?;
+
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                bail!("Discord webhook error: {}", body);
+            }
+
+            let json: serde_json::Value = resp.json().await.context("parse webhook response")?;
+            return json
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .context("no id in Discord webhook response");
+        }
+
+        // Fallback: bot token (message will have author.bot=true — will be filtered)
         let params = claudear::discord::CreateMessageParams::text(content);
         let msg = self
             .client
@@ -83,14 +119,11 @@ impl E2eAsk for DiscordAsk {
     }
 
     async fn reply_to_question(&self, question_id: &str, answer: &str) -> Result<()> {
-        let params = claudear::discord::CreateMessageParams::text(answer);
-        // Send as a reply in the channel. The bot detects replies via Discord's native
-        // reply feature. For simplicity, we send in the same channel.
+        let params = claudear::discord::CreateMessageParams::text(answer).replying_to(question_id);
         self.client
             .send_message(&self.channel_id, params)
             .await
             .context("send Discord reply")?;
-        let _ = question_id; // referenced for context
         Ok(())
     }
 }

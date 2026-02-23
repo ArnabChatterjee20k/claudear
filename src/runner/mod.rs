@@ -58,6 +58,11 @@ pub trait AgentRunner: Send + Sync {
 
 /// Best-effort detection for rate limit failures (generic, not provider-specific).
 pub fn is_rate_limit_error(message: &str) -> bool {
+    // Claude Code streams `rate_limit_event` JSON with `"status":"allowed"` as
+    // informational notifications. These are NOT actual rate limit errors.
+    if message.contains("rate_limit_event") && message.contains("\"status\":\"allowed\"") {
+        return false;
+    }
     let lower = message.to_lowercase();
     is_rate_limit_error_lower(&lower)
 }
@@ -67,6 +72,7 @@ fn is_rate_limit_error_lower(lower: &str) -> bool {
     [
         "rate limit",
         "ratelimit",
+        "hit your limit",
         "too many requests",
         "429",
         "quota exceeded",
@@ -171,6 +177,13 @@ mod tests {
     #[test]
     fn test_is_rate_limit_error_try_again_later() {
         assert!(is_rate_limit_error("Please try again later"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_claude_limit_banner() {
+        assert!(is_rate_limit_error(
+            "You've hit your limit · resets 6am (UTC)"
+        ));
     }
 
     #[test]

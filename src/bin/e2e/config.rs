@@ -13,9 +13,9 @@ pub struct ConfigBuilder {
 }
 
 impl ConfigBuilder {
-    pub fn new(work_dir: &Path, db_path: &Path, port: u16) -> Self {
+    pub fn new(workspace: &Path, db_path: &Path, port: u16) -> Self {
         let mut config = Config::default();
-        config.work_dir = work_dir.to_path_buf();
+        config.workspace = workspace.to_path_buf();
         config.db_path = db_path.to_path_buf();
         config.webhook_port = port;
         config.poll_interval_ms = 5_000; // Fast polling for E2E
@@ -47,10 +47,10 @@ impl ConfigBuilder {
         Self { config }
     }
 
-    /// Override paths for Docker container (db, work_dir, repos, bind address).
+    /// Override paths for Docker container (db, workspace, repos, bind address).
     pub fn docker_paths(mut self) -> Self {
         self.config.db_path = std::path::PathBuf::from("/app/data/claudear.db");
-        self.config.work_dir = std::path::PathBuf::from("/app/project");
+        self.config.workspace = std::path::PathBuf::from("/app/project");
         self.config.bind_address = "0.0.0.0".to_string();
         self
     }

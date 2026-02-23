@@ -837,7 +837,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            work_dir: "/tmp/repos".into(),
+            workspace: "/tmp/repos".into(),
             known_orgs: vec!["test-org".to_string()],
             auto_discover_paths: vec![],
             poll_interval_ms: 300_000,

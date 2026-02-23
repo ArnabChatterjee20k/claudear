@@ -183,15 +183,23 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
     }
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
-        let body = format!(
+        let mut body = format!(
             "[Claudear] Processing {} from {} - {}",
             issue.short_id, issue.source, issue.title
         );
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            let truncated = if reason.len() > 50 {
+                format!("{}...", &reason[..reason.floor_char_boundary(47)])
+            } else {
+                reason
+            };
+            body.push_str(&format!("\nTrigger: {}", truncated));
+        }
         self.send_sms(&body, Some(issue)).await
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
-        let body = if issue
+        let mut body = if issue
             .get_metadata::<String>("cascade_downstream_repo")
             .is_some()
         {
@@ -207,6 +215,14 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
         } else {
             format!("[Claudear] PR Created for {}: {}", issue.short_id, pr_url)
         };
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            let truncated = if reason.len() > 50 {
+                format!("{}...", &reason[..reason.floor_char_boundary(47)])
+            } else {
+                reason
+            };
+            body.push_str(&format!("\nTrigger: {}", truncated));
+        }
         self.send_sms(&body, Some(issue)).await
     }
 
@@ -232,7 +248,7 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
             error.to_string()
         };
 
-        let body = if issue
+        let mut body = if issue
             .get_metadata::<bool>("regression_detected")
             .unwrap_or(false)
         {
@@ -251,6 +267,14 @@ impl<H: SmsHttpClient + 'static> Notifier for SmsNotifier<H> {
         } else {
             format!("[Claudear] FAILED {}: {}", issue.short_id, short_error)
         };
+        if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
+            let truncated = if reason.len() > 50 {
+                format!("{}...", &reason[..reason.floor_char_boundary(47)])
+            } else {
+                reason
+            };
+            body.push_str(&format!("\nTrigger: {}", truncated));
+        }
         self.send_sms(&body, Some(issue)).await
     }
 
@@ -1331,5 +1355,33 @@ mod tests {
         let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
         assert!(body.contains("REGRESSION"));
         assert!(body.contains("..."));
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_with_trigger_reason() {
+        let mock = MockSmsClient::new(201, "OK");
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata(
+            "trigger_reason",
+            "Retry attempt 3: PR closed without merge by the maintainer",
+        );
+        notifier.notify_start(&issue).await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(body.contains("Trigger: "));
+        assert!(body.contains("..."));
+        assert!(!body.contains("maintainer"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_start_without_trigger_reason() {
+        let mock = MockSmsClient::new(201, "OK");
+        let notifier = SmsNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        notifier.notify_start(&issue).await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let body = &calls[0].3.iter().find(|(k, _)| k == "Body").unwrap().1;
+        assert!(!body.contains("Trigger:"));
     }
 }
