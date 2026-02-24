@@ -75,71 +75,205 @@
       </div>
       <article class="markdown max-w-[780px]" data-docs-markdown>
         <h2 id="the-fix-pipeline"><a class="anchor-link" href="#the-fix-pipeline" aria-label="Link to The fix pipeline">#</a>The fix pipeline</h2>
-        <p>Every issue Claudear picks up moves through a state machine. The path from detection to resolution looks like this:</p>
+        <p>Every issue Claudear picks up moves through a state machine:</p>
         <div style="overflow-x:auto;margin:1.5em 0">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 260" style="max-width:820px;width:100%;height:auto" role="img" aria-label="Fix pipeline state diagram">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 230" style="max-width:760px;width:100%;height:auto" role="img" aria-label="Fix pipeline state diagram">
             <defs>
-              <marker id="arrow" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 3.5 L0 7z" fill="#71717A"/></marker>
-              <marker id="arrow-green" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 3.5 L0 7z" fill="#22C55E"/></marker>
-              <marker id="arrow-amber" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 3.5 L0 7z" fill="#F59E0B"/></marker>
-              <marker id="arrow-red" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 3.5 L0 7z" fill="#EF4444"/></marker>
+              <marker id="a"  viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#71717A"/></marker>
+              <marker id="ag" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#22C55E"/></marker>
+              <marker id="ay" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#F59E0B"/></marker>
+              <marker id="ar" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#EF4444"/></marker>
             </defs>
-            <!-- Nodes -->
-            <!-- Pending -->
-            <rect x="16" y="40" width="110" height="42" rx="8" fill="#111113" stroke="#27272A" stroke-width="1.5"/>
-            <text x="71" y="66" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#A1A1AA">Pending</text>
-            <!-- Success -->
-            <rect x="196" y="40" width="110" height="42" rx="8" fill="#111113" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.4"/>
-            <text x="251" y="66" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#22C55E">Success</text>
-            <!-- Merged -->
-            <rect x="376" y="40" width="110" height="42" rx="8" fill="#111113" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.4"/>
-            <text x="431" y="66" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#22C55E">Merged</text>
-            <!-- Resolved -->
-            <rect x="556" y="40" width="110" height="42" rx="8" fill="rgba(34,197,94,0.08)" stroke="#22C55E" stroke-width="1.5"/>
-            <text x="611" y="66" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="600" fill="#22C55E">Resolved</text>
-            <!-- Closed -->
-            <rect x="376" y="150" width="110" height="42" rx="8" fill="#111113" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.4"/>
-            <text x="431" y="176" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#F59E0B">Closed</text>
-            <!-- Failed -->
-            <rect x="196" y="150" width="110" height="42" rx="8" fill="#111113" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.4"/>
-            <text x="251" y="176" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#EF4444">Failed</text>
-            <!-- Cannot Fix -->
-            <rect x="196" y="210" width="110" height="42" rx="8" fill="rgba(239,68,68,0.06)" stroke="#EF4444" stroke-width="1.5"/>
-            <text x="251" y="236" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" font-weight="600" fill="#EF4444">Cannot Fix</text>
-
-            <!-- Edges — happy path -->
-            <line x1="126" y1="61" x2="193" y2="61" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#arrow-green)"/>
-            <line x1="306" y1="61" x2="373" y2="61" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#arrow-green)"/>
-            <line x1="486" y1="61" x2="553" y2="61" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#arrow-green)"/>
-
-            <!-- Pending → Failed -->
-            <line x1="71" y1="82" x2="71" y2="163" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.4" marker-end="url(#arrow-red)"/>
-            <path d="M71 163 L193 171" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.4" fill="none" marker-end="url(#arrow-red)"/>
-
-            <!-- Success → Closed -->
-            <line x1="251" y1="82" x2="251" y2="120" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.4"/>
-            <path d="M251 120 L431 120 L431 147" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.4" fill="none" marker-end="url(#arrow-amber)"/>
-
-            <!-- Closed → retry (back to Pending) -->
-            <path d="M376 171 L340 171 L340 130 L50 130 L50 58 L13 58" stroke="#71717A" stroke-width="1.2" stroke-dasharray="5,4" stroke-opacity="0.5" fill="none" marker-end="url(#arrow)"/>
-            <text x="185" y="123" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="10" fill="#71717A" font-style="italic">retry</text>
-
-            <!-- Failed → retry (back to Pending) -->
-            <path d="M196 171 L160 171 L160 130" stroke="#71717A" stroke-width="1.2" stroke-dasharray="5,4" stroke-opacity="0.5" fill="none"/>
-            <!-- (joins the Closed retry path above at y=130) -->
-
-            <!-- Failed → Cannot Fix -->
-            <line x1="251" y1="192" x2="251" y2="207" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.35" marker-end="url(#arrow-red)"/>
-            <text x="290" y="203" font-family="Inter,system-ui,sans-serif" font-size="10" fill="#71717A" font-style="italic">exhausted</text>
+            <!-- Row 0: happy path -->
+            <rect x="20"  y="20" width="100" height="36" rx="6" fill="#111113" stroke="#27272A" stroke-width="1.5"/>
+            <text x="70"  y="43" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" font-weight="500" fill="#A1A1AA">Pending</text>
+            <rect x="160" y="20" width="110" height="36" rx="6" fill="#111113" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="215" y="43" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" font-weight="500" fill="#60A5FA">Processing</text>
+            <rect x="310" y="20" width="100" height="36" rx="6" fill="#111113" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="360" y="43" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" font-weight="500" fill="#22C55E">Success</text>
+            <rect x="450" y="20" width="100" height="36" rx="6" fill="#111113" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="500" y="43" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" font-weight="500" fill="#22C55E">Merged</text>
+            <rect x="590" y="20" width="100" height="36" rx="6" fill="rgba(34,197,94,0.08)" stroke="#22C55E" stroke-width="1.5"/>
+            <text x="640" y="43" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" font-weight="600" fill="#22C55E">Resolved</text>
+            <!-- Row 1: error states -->
+            <rect x="160" y="100" width="110" height="36" rx="6" fill="#111113" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="215" y="123" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" font-weight="500" fill="#EF4444">Failed</text>
+            <rect x="310" y="100" width="100" height="36" rx="6" fill="#111113" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="360" y="123" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" font-weight="500" fill="#F59E0B">Closed</text>
+            <!-- Row 2: terminal -->
+            <rect x="160" y="180" width="110" height="36" rx="6" fill="rgba(239,68,68,0.06)" stroke="#EF4444" stroke-width="1.5"/>
+            <text x="215" y="203" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="600" fill="#EF4444">Cannot Fix</text>
+            <!-- Happy path arrows -->
+            <line x1="120" y1="38" x2="157" y2="38" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#ag)"/>
+            <line x1="270" y1="38" x2="307" y2="38" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#ag)"/>
+            <line x1="410" y1="38" x2="447" y2="38" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#ag)"/>
+            <line x1="550" y1="38" x2="587" y2="38" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#ag)"/>
+            <!-- Error paths -->
+            <line x1="215" y1="56" x2="215" y2="97"  stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.45" marker-end="url(#ar)"/>
+            <line x1="360" y1="56" x2="360" y2="97"  stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.45" marker-end="url(#ay)"/>
+            <line x1="215" y1="136" x2="215" y2="177" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.35" marker-end="url(#ar)"/>
+            <text x="248" y="161" font-family="Inter,system-ui,sans-serif" font-size="10" fill="#71717A" font-style="italic">exhausted</text>
+            <!-- Retry loops -->
+            <path d="M160 118 L10 118 L10 38 L17 38" stroke="#71717A" stroke-width="1.2" stroke-dasharray="5,4" stroke-opacity="0.45" fill="none" marker-end="url(#a)"/>
+            <text x="85" y="112" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="10" fill="#71717A" font-style="italic">retry</text>
+            <path d="M310 118 L295 118 L295 150 L10 150 L10 38" stroke="#71717A" stroke-width="1.2" stroke-dasharray="5,4" stroke-opacity="0.45" fill="none"/>
+            <text x="152" y="144" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="10" fill="#71717A" font-style="italic">retry</text>
           </svg>
         </div>
         <ul>
-          <li><strong>Pending</strong> &mdash; issue picked up and queued for processing</li>
-          <li><strong>Success</strong> &mdash; AI created a pull request</li>
-          <li><strong>Merged</strong> &mdash; the PR was merged</li>
-          <li><strong>Closed</strong> &mdash; the PR was closed without merging (triggers retry)</li>
-          <li><strong>Failed</strong> &mdash; the attempt failed (triggers retry)</li>
+          <li><strong>Pending</strong> &mdash; issue queued for processing</li>
+          <li><strong>Processing</strong> &mdash; AI agent actively working on a fix</li>
+          <li><strong>Success</strong> &mdash; pull request created</li>
+          <li><strong>Merged</strong> &mdash; PR merged into main</li>
+          <li><strong>Resolved</strong> &mdash; issue resolved (auto or manual)</li>
+          <li><strong>Closed</strong> &mdash; PR closed without merging (triggers retry)</li>
+          <li><strong>Failed</strong> &mdash; attempt failed (triggers retry with exponential backoff)</li>
           <li><strong>Cannot Fix</strong> &mdash; retry budget exhausted; flagged for manual review</li>
+        </ul>
+
+        <h3 id="review-pipeline">Review pipeline</h3>
+        <p>After a PR is created, Claudear watches for code reviews and addresses feedback automatically:</p>
+        <div style="overflow-x:auto;margin:1.5em 0">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 70" style="max-width:680px;width:100%;height:auto" role="img" aria-label="Review pipeline">
+            <defs>
+              <marker id="rvg" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#22C55E"/></marker>
+              <marker id="rvb" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#60A5FA"/></marker>
+            </defs>
+            <rect x="20"  y="18" width="110" height="36" rx="6" fill="#111113" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="75"  y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#60A5FA">Watching PR</text>
+            <rect x="175" y="18" width="130" height="36" rx="6" fill="#111113" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="240" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#F59E0B">Review Received</text>
+            <rect x="350" y="18" width="120" height="36" rx="6" fill="#111113" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="410" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#60A5FA">Addressing</text>
+            <rect x="515" y="18" width="130" height="36" rx="6" fill="#111113" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="580" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#22C55E">Update Pushed</text>
+            <line x1="130" y1="36" x2="172" y2="36" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#rvb)"/>
+            <line x1="305" y1="36" x2="347" y2="36" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#rvb)"/>
+            <line x1="470" y1="36" x2="512" y2="36" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#rvg)"/>
+          </svg>
+        </div>
+        <ul>
+          <li><strong>Watching PR</strong> &mdash; polling for new reviews and comments on the open PR</li>
+          <li><strong>Review Received</strong> &mdash; changes requested or inline comments detected</li>
+          <li><strong>Addressing</strong> &mdash; AI agent processes feedback and generates updated code</li>
+          <li><strong>Update Pushed</strong> &mdash; new commit pushed to the PR branch (returns to watching)</li>
+        </ul>
+
+        <h3 id="ask-pipeline">Ask pipeline</h3>
+        <p>When the AI agent encounters a blocking question during processing, it asks a human for input:</p>
+        <div style="overflow-x:auto;margin:1.5em 0">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 150" style="max-width:680px;width:100%;height:auto" role="img" aria-label="Ask pipeline">
+            <defs>
+              <marker id="aqg" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#22C55E"/></marker>
+              <marker id="aqb" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#60A5FA"/></marker>
+              <marker id="aqy" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#F59E0B"/></marker>
+            </defs>
+            <!-- Row 0: happy path -->
+            <rect x="20"  y="18" width="130" height="36" rx="6" fill="#111113" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="85"  y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#60A5FA">Question Asked</text>
+            <rect x="195" y="18" width="140" height="36" rx="6" fill="#111113" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="265" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#F59E0B">Awaiting Reply</text>
+            <rect x="380" y="18" width="120" height="36" rx="6" fill="#111113" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="440" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#22C55E">Answered</text>
+            <rect x="545" y="18" width="110" height="36" rx="6" fill="rgba(34,197,94,0.08)" stroke="#22C55E" stroke-width="1.5"/>
+            <text x="600" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="600" fill="#22C55E">Continue</text>
+            <!-- Row 1: timeout -->
+            <rect x="380" y="98" width="120" height="36" rx="6" fill="#111113" stroke="#71717A" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="440" y="121" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#71717A">Timeout</text>
+            <!-- Arrows -->
+            <line x1="150" y1="36" x2="192" y2="36" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#aqb)"/>
+            <line x1="335" y1="36" x2="377" y2="36" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#aqg)"/>
+            <line x1="500" y1="36" x2="542" y2="36" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#aqg)"/>
+            <!-- Awaiting Reply → Timeout -->
+            <path d="M265 54 L265 116 L377 116" stroke="#71717A" stroke-width="1.5" stroke-opacity="0.4" fill="none" marker-end="url(#aqy)"/>
+            <!-- Timeout → Continue (best effort) -->
+            <path d="M500 116 L525 116 L525 54 L545 42" stroke="#71717A" stroke-width="1.2" stroke-dasharray="5,4" stroke-opacity="0.4" fill="none"/>
+            <text x="555" y="85" font-family="Inter,system-ui,sans-serif" font-size="10" fill="#71717A" font-style="italic">best effort</text>
+          </svg>
+        </div>
+        <ul>
+          <li><strong>Question Asked</strong> &mdash; question sent to your configured notification channels</li>
+          <li><strong>Awaiting Reply</strong> &mdash; polling for human response (configurable timeout)</li>
+          <li><strong>Answered</strong> &mdash; reply received, answer incorporated into context</li>
+          <li><strong>Timeout</strong> &mdash; no reply received; continues with best-effort context if enabled, otherwise fails</li>
+          <li><strong>Continue</strong> &mdash; agent resumes processing with the new context</li>
+        </ul>
+
+        <h3 id="regression-pipeline">Regression pipeline</h3>
+        <p>After a fix is merged, Claudear monitors for regressions over a 24-hour window:</p>
+        <div style="overflow-x:auto;margin:1.5em 0">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 150" style="max-width:680px;width:100%;height:auto" role="img" aria-label="Regression pipeline">
+            <defs>
+              <marker id="rgg" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#22C55E"/></marker>
+              <marker id="rgb" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#60A5FA"/></marker>
+              <marker id="rgr" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#EF4444"/></marker>
+            </defs>
+            <!-- Row 0: happy path -->
+            <rect x="20"  y="18" width="140" height="36" rx="6" fill="#111113" stroke="#27272A" stroke-width="1.5"/>
+            <text x="90"  y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#A1A1AA">Awaiting Release</text>
+            <rect x="205" y="18" width="120" height="36" rx="6" fill="#111113" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="265" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#60A5FA">Monitoring</text>
+            <rect x="370" y="18" width="110" height="36" rx="6" fill="rgba(34,197,94,0.08)" stroke="#22C55E" stroke-width="1.5"/>
+            <text x="425" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="600" fill="#22C55E">Resolved</text>
+            <!-- Row 1: regressed -->
+            <rect x="370" y="98" width="110" height="36" rx="6" fill="rgba(239,68,68,0.06)" stroke="#EF4444" stroke-width="1.5"/>
+            <text x="425" y="121" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="600" fill="#EF4444">Regressed</text>
+            <rect x="530" y="98" width="120" height="36" rx="6" fill="#111113" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="590" y="121" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#EF4444">New Fix Attempt</text>
+            <!-- Arrows -->
+            <line x1="160" y1="36" x2="202" y2="36" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#rgb)"/>
+            <line x1="325" y1="36" x2="367" y2="36" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#rgg)"/>
+            <!-- Monitoring → Regressed -->
+            <path d="M265 54 L265 116 L367 116" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.4" fill="none" marker-end="url(#rgr)"/>
+            <!-- Regressed → New Fix Attempt -->
+            <line x1="480" y1="116" x2="527" y2="116" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.4" marker-end="url(#rgr)"/>
+          </svg>
+        </div>
+        <ul>
+          <li><strong>Awaiting Release</strong> &mdash; waiting for a release that includes the fix commit</li>
+          <li><strong>Monitoring</strong> &mdash; release detected; hourly regression checks for 24 hours</li>
+          <li><strong>Resolved</strong> &mdash; monitoring complete with no regression detected</li>
+          <li><strong>Regressed</strong> &mdash; regression detected during monitoring; triggers a new fix attempt</li>
+        </ul>
+
+        <h3 id="cascade-pipeline">Cascade pipeline</h3>
+        <p>When a fix is merged or released, Claudear can automatically propagate changes to downstream repositories:</p>
+        <div style="overflow-x:auto;margin:1.5em 0">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 540 150" style="max-width:540px;width:100%;height:auto" role="img" aria-label="Cascade pipeline">
+            <defs>
+              <marker id="csg" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#22C55E"/></marker>
+              <marker id="csb" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#60A5FA"/></marker>
+              <marker id="csr" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#EF4444"/></marker>
+              <marker id="csa" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0 0 L10 3.5 L0 7z" fill="#71717A"/></marker>
+            </defs>
+            <!-- Row 0: happy path -->
+            <rect x="20"  y="18" width="140" height="36" rx="6" fill="#111113" stroke="#27272A" stroke-width="1.5"/>
+            <text x="90"  y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#A1A1AA">Merge / Release</text>
+            <rect x="205" y="18" width="110" height="36" rx="6" fill="#111113" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="260" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#60A5FA">In Progress</text>
+            <rect x="360" y="18" width="110" height="36" rx="6" fill="rgba(34,197,94,0.08)" stroke="#22C55E" stroke-width="1.5"/>
+            <text x="415" y="41" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="600" fill="#22C55E">Completed</text>
+            <!-- Row 1: failure and skipped (side by side, both below In Progress) -->
+            <rect x="160" y="98" width="100" height="36" rx="6" fill="#111113" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="210" y="121" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#EF4444">Failed</text>
+            <rect x="310" y="98" width="100" height="36" rx="6" fill="#111113" stroke="#71717A" stroke-width="1.5" stroke-opacity="0.5"/>
+            <text x="360" y="121" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" font-weight="500" fill="#71717A">Skipped</text>
+            <!-- Happy path arrows -->
+            <line x1="160" y1="36" x2="202" y2="36" stroke="#60A5FA" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#csb)"/>
+            <line x1="315" y1="36" x2="357" y2="36" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#csg)"/>
+            <!-- In Progress → Failed (down-left) -->
+            <path d="M230 54 L230 78 L210 78 L210 95" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.4" fill="none" marker-end="url(#csr)"/>
+            <!-- Merge/Release → Skipped (down-right) -->
+            <path d="M90 54 L90 78 L360 78 L360 95" stroke="#71717A" stroke-width="1.2" stroke-dasharray="5,4" stroke-opacity="0.4" fill="none" marker-end="url(#csa)"/>
+            <text x="225" y="73" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="10" fill="#71717A" font-style="italic">rule mismatch / depth limit</text>
+          </svg>
+        </div>
+        <ul>
+          <li><strong>Merge / Release</strong> &mdash; upstream PR merged or new release published</li>
+          <li><strong>In Progress</strong> &mdash; generating cascade fix PR in downstream repository</li>
+          <li><strong>Completed</strong> &mdash; cascade PR created successfully</li>
+          <li><strong>Failed</strong> &mdash; cascade fix generation failed</li>
+          <li><strong>Skipped</strong> &mdash; cascade rule didn't match or depth limit exceeded</li>
         </ul>
 
         <h2 id="retries"><a class="anchor-link" href="#retries" aria-label="Link to Retries">#</a>Retries</h2>
@@ -159,7 +293,7 @@ claudear prs list
 claudear prs monitor --continuous</code></pre>
 
         <h2 id="ai-questions"><a class="anchor-link" href="#ai-questions" aria-label="Link to AI questions">#</a>AI questions</h2>
-        <p>When the AI needs clarification, it sends questions through Discord, Slack, or email. Reply and the fix resumes. Configure timeout and <code>best_effort_on_timeout</code> in <code>[ask]</code>. Claudear remembers previous answers so the same question is not asked twice.</p>
+        <p>When the AI needs clarification, it sends questions through your configured notification channels. Reply and the fix resumes. Configure timeout and <code>best_effort_on_timeout</code> in <code>[ask]</code>. Claudear remembers previous answers so the same question is not asked twice.</p>
 
         <h2 id="workflows"><a class="anchor-link" href="#workflows" aria-label="Link to Day-to-day workflows">#</a>Day-to-day workflows</h2>
         <div class="workflow-grid">

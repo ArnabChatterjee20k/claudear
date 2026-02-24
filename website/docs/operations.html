@@ -239,7 +239,7 @@ docker compose down</code></pre>
         <h2 id="tips-for-production"><a class="anchor-link" href="#tips-for-production" aria-label="Link to Tips for production">#</a>Tips for production</h2>
         <ul>
           <li><strong>Log rotation</strong> &mdash; set up log rotation or use <code>--log-dir</code> with daily rotation to avoid unbounded disk usage</li>
-          <li><strong>Reply-capable notifications</strong> &mdash; use a reply-capable notification channel (Discord or Slack) so you can answer AI questions directly from chat</li>
+          <li><strong>Reply-capable notifications</strong> &mdash; use a reply-capable notification channel so you can answer AI questions directly from chat</li>
           <li><strong>Health monitoring</strong> &mdash; monitor the <code>/api/health</code> endpoint with your existing uptime checker or alerting tool</li>
           <li><strong>Concurrency</strong> &mdash; start with conservative <code>max_concurrent</code> (1&ndash;2) and increase as needed once you are confident in the pipeline</li>
         </ul>
