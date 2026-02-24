@@ -1699,6 +1699,9 @@ impl AgentRunner for ClaudeAgentRunner {
 mod tests {
     use super::*;
 
+    /// Mutex to serialize tests that manipulate process-global env vars.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_parse_cli_assistant_text_event() {
         let line =
@@ -2926,6 +2929,7 @@ mod tests {
 
     #[test]
     fn test_resolve_log_root_default_without_env_var() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Remove the env var if it happens to be set
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         std::env::remove_var("CLAUDEAR_LOG_DIR");
@@ -2941,6 +2945,7 @@ mod tests {
 
     #[test]
     fn test_resolve_log_root_with_env_var() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         std::env::set_var("CLAUDEAR_LOG_DIR", "/tmp/custom-logs");
 
@@ -2957,6 +2962,7 @@ mod tests {
 
     #[test]
     fn test_resolve_log_root_private_matches_public() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // The private method ClaudeAgentRunner::resolve_log_root() should match
         // the public function resolve_log_root() since they share the same logic.
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
@@ -3014,6 +3020,7 @@ mod tests {
 
     #[test]
     fn test_create_execution_log_files_produces_valid_paths() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         let tmp_dir = std::env::temp_dir().join("claudear_test_exec_logs");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
@@ -3045,6 +3052,7 @@ mod tests {
 
     #[test]
     fn test_create_execution_log_files_sanitizes_label_in_filenames() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         let tmp_dir = std::env::temp_dir().join("claudear_test_sanitize_logs");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
@@ -3958,6 +3966,7 @@ mod tests {
 
     #[test]
     fn test_create_execution_log_files_includes_date_in_path() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         let tmp_dir = std::env::temp_dir().join("claudear_test_date_in_path");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
@@ -3986,6 +3995,7 @@ mod tests {
 
     #[test]
     fn test_create_execution_log_files_includes_pid_in_stem() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         let tmp_dir = std::env::temp_dir().join("claudear_test_pid_stem");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
@@ -4013,6 +4023,7 @@ mod tests {
 
     #[test]
     fn test_create_execution_log_files_all_three_share_same_stem_prefix() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         let tmp_dir = std::env::temp_dir().join("claudear_test_shared_stem");
         std::env::set_var("CLAUDEAR_LOG_DIR", tmp_dir.to_str().unwrap());
@@ -4789,6 +4800,7 @@ mod tests {
 
     #[test]
     fn test_resolve_log_root_with_empty_env_var() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         std::env::set_var("CLAUDEAR_LOG_DIR", "");
 
@@ -5062,6 +5074,7 @@ more output"#;
 
     #[test]
     fn test_resolve_log_root_falls_back_to_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         std::env::remove_var("CLAUDEAR_LOG_DIR");
 
@@ -5079,6 +5092,7 @@ more output"#;
 
     #[test]
     fn test_resolve_log_root_with_custom_dir() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
         std::env::set_var("CLAUDEAR_LOG_DIR", "/tmp/custom-logs");
 

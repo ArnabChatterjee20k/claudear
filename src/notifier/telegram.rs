@@ -1367,7 +1367,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_question_replies_via_get_updates_matches_reply_to_ask() {
-        crate::ask_reply_inbox::clear_for_tests();
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
 
         let updates = r#"{
             "ok": true,
@@ -1435,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_question_replies_uses_shared_inbox_when_source_enabled() {
-        crate::ask_reply_inbox::clear_for_tests();
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
 
         let mut cfg = enabled_config();
         cfg.source_enabled = true;

@@ -1192,7 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_question_replies_matches_reply_context() {
-        crate::ask_reply_inbox::clear_for_tests();
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
 
         let mut cfg = enabled_config();
         cfg.source_enabled = true;

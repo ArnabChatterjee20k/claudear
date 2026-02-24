@@ -135,7 +135,10 @@ pub(crate) fn whatsapp_messages_since(since: DateTime<Utc>) -> Vec<WhatsAppInbou
 }
 
 #[cfg(test)]
-pub(crate) fn clear_for_tests() {
-    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
-    *guard = InboxState::default();
+pub(crate) fn clear_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state_guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    *state_guard = InboxState::default();
+    guard
 }
