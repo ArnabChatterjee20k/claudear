@@ -6,7 +6,7 @@ services:
       args:
         APP_VERSION: ${APP_VERSION:-0.1.0}
         # Dashboard Sentry config (baked into static JS assets at build time)
-        SENTRY_DSN: ${SENTRY_DSN:-}
+        SENTRY_DSN: ${SENTRY_DSN_DASHBOARD:-}
         SENTRY_RELEASE: ${SENTRY_RELEASE:-}
         SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
     container_name: claudear-app
@@ -37,7 +37,7 @@ services:
       SENTRY_CLIENT_SECRET: ${SENTRY_CLIENT_SECRET:-}
 
       # Backend Sentry error monitoring (read at runtime by the Rust process)
-      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_DSN: ${SENTRY_DSN_BACKEND:-}
       SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
       SENTRY_RELEASE: ${SENTRY_RELEASE:-}
 

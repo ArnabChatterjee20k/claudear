@@ -26,7 +26,7 @@ jobs:
             asset_name: claudear-macos-arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set version from tag
         id: version
@@ -80,7 +80,7 @@ jobs:
     name: Publish Docker Image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set version from tag
         id: version
@@ -121,7 +121,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             APP_VERSION=${{ steps.version.outputs.version }}
-            SENTRY_DSN=${{ secrets.SENTRY_DASHBOARD_DSN }}
+            SENTRY_DSN=${{ secrets.SENTRY_DSN_DASHBOARD }}
             SENTRY_ENVIRONMENT=production
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -132,7 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref_name, '-') }}  # Skip prereleases
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Get version
         id: version
@@ -188,7 +188,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             arch: arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set version from tag
         id: version
@@ -242,7 +242,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref_name, '-') }}  # Skip prereleases
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install APT repository tools
         run: |

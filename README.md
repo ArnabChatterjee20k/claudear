@@ -156,7 +156,7 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - Per-user notification channel preferences
 
 ### Analytics Dashboard
-- Real-time web UI (React + TypeScript + Tailwind)
+- Live web UI (React + TypeScript + Tailwind)
 - Stats overview: total attempts, success rate, merge rate
 - Status breakdown, source-by-source metrics, recent attempt history
 - Retryable issues view with one-click retry
@@ -173,7 +173,7 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - Unix socket communication with configurable timeout
 
 ### Webhooks
-- Real-time event processing from Linear, Sentry, and GitHub
+- Real-time event processing from all configured sources (Linear, Sentry, GitHub, GitLab, Jira, Slack, Discord, Telegram, WhatsApp)
 - HMAC-SHA256 signature verification
 - One-command auto-configuration: `claudear webhook --setup --base-url <url>`
 
@@ -431,7 +431,7 @@ claudear poll --port 8080
 
 ### Webhook Mode
 
-Real-time event processing via webhooks from Linear, Sentry, and GitHub.
+Real-time event processing via webhooks from all configured sources.
 
 ```bash
 # Start webhook server
@@ -503,7 +503,7 @@ claudear dashboard --dashboard-dir ./dashboard/dist
 ```
 
 **What the dashboard shows:**
-- Real-time statistics: total attempts, success rate, merge rate
+- Live statistics: total attempts, success rate, merge rate
 - Status breakdown: pending, success, merged, closed, failed, cannot fix
 - Source-by-source metrics (Linear, Sentry, Discord, GitHub)
 - Recent attempt history with direct PR links
@@ -654,9 +654,9 @@ Map team members across services so notifications go to the right person.
 
 ```toml
 [users.jake]
-linear_name = "Jake Barnwell"
-github_username = "jakebarnby"
-sentry_username = "jake"
+linear_names = "Jake Barnwell"
+github_usernames = "jakebarnby"
+sentry_usernames = "jake"
 discord_id = "123456789012345678"
 email = "jake@example.com"
 push_user_key = "pushover_user_key"
