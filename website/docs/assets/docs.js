@@ -342,6 +342,177 @@
     }
   }
 
+  function highlightXml() {
+    markdown.querySelectorAll('code.language-xml, code.language-html, code.language-svg').forEach(code => {
+      const raw = code.textContent || '';
+      const frag = document.createDocumentFragment();
+
+      function span(cls, text) {
+        const s = document.createElement('span');
+        s.className = cls;
+        s.textContent = text;
+        return s;
+      }
+
+      let rest = raw;
+      while (rest.length) {
+        // Comment: <!-- ... -->
+        const cm = rest.match(/^<!--[\s\S]*?-->/);
+        if (cm) {
+          frag.appendChild(span('hl-comment', cm[0]));
+          rest = rest.slice(cm[0].length);
+          continue;
+        }
+
+        // CDATA
+        const cdata = rest.match(/^<!\[CDATA\[[\s\S]*?\]\]>/);
+        if (cdata) {
+          frag.appendChild(span('hl-string', cdata[0]));
+          rest = rest.slice(cdata[0].length);
+          continue;
+        }
+
+        // Processing instruction: <?...?>
+        const pi = rest.match(/^<\?[\s\S]*?\?>/);
+        if (pi) {
+          frag.appendChild(span('hl-comment', pi[0]));
+          rest = rest.slice(pi[0].length);
+          continue;
+        }
+
+        // Opening/closing/self-closing tag
+        const tag = rest.match(/^<\/?[A-Za-z][A-Za-z0-9_:.-]*/);
+        if (tag) {
+          frag.appendChild(span('hl-tag', tag[0]));
+          rest = rest.slice(tag[0].length);
+          // Parse attributes until > or />
+          while (rest.length && !rest.startsWith('>') && !rest.startsWith('/>')) {
+            const ws = rest.match(/^\s+/);
+            if (ws) { frag.appendChild(document.createTextNode(ws[0])); rest = rest.slice(ws[0].length); continue; }
+            const attr = rest.match(/^[A-Za-z_:][A-Za-z0-9_:.-]*/);
+            if (attr) {
+              frag.appendChild(span('hl-attr', attr[0]));
+              rest = rest.slice(attr[0].length);
+              const eq = rest.match(/^\s*=\s*/);
+              if (eq) {
+                frag.appendChild(span('hl-operator', eq[0]));
+                rest = rest.slice(eq[0].length);
+                const dq = rest.match(/^"[^"]*"/);
+                if (dq) { frag.appendChild(span('hl-string', dq[0])); rest = rest.slice(dq[0].length); continue; }
+                const sq = rest.match(/^'[^']*'/);
+                if (sq) { frag.appendChild(span('hl-string', sq[0])); rest = rest.slice(sq[0].length); continue; }
+                const uq = rest.match(/^[^\s>\/]+/);
+                if (uq) { frag.appendChild(span('hl-string', uq[0])); rest = rest.slice(uq[0].length); continue; }
+              }
+              continue;
+            }
+            frag.appendChild(document.createTextNode(rest[0]));
+            rest = rest.slice(1);
+          }
+          // Close bracket
+          if (rest.startsWith('/>')) { frag.appendChild(span('hl-tag', '/>')); rest = rest.slice(2); }
+          else if (rest.startsWith('>')) { frag.appendChild(span('hl-tag', '>')); rest = rest.slice(1); }
+          continue;
+        }
+
+        // Text content until next tag
+        const text = rest.match(/^[^<]+/);
+        if (text) {
+          frag.appendChild(document.createTextNode(text[0]));
+          rest = rest.slice(text[0].length);
+          continue;
+        }
+
+        frag.appendChild(document.createTextNode(rest[0]));
+        rest = rest.slice(1);
+      }
+
+      code.textContent = '';
+      code.appendChild(frag);
+    });
+  }
+
+  function highlightIni() {
+    markdown.querySelectorAll('code.language-ini, code.language-properties, code.language-env').forEach(code => {
+      const raw = code.textContent || '';
+      const frag = document.createDocumentFragment();
+
+      function span(cls, text) {
+        const s = document.createElement('span');
+        s.className = cls;
+        s.textContent = text;
+        return s;
+      }
+
+      function tokenizeIniValue(val, frag) {
+        let rest = val;
+        while (rest.length) {
+          const ws = rest.match(/^\s+/);
+          if (ws) { frag.appendChild(document.createTextNode(ws[0])); rest = rest.slice(ws[0].length); continue; }
+          // Inline comment
+          if (rest.startsWith(';') || rest.startsWith('#')) {
+            frag.appendChild(span('hl-comment', rest)); return;
+          }
+          // Double-quoted string
+          const dq = rest.match(/^"([^"\\]|\\.)*"/);
+          if (dq) { frag.appendChild(span('hl-string', dq[0])); rest = rest.slice(dq[0].length); continue; }
+          // Single-quoted string
+          const sq = rest.match(/^'[^']*'/);
+          if (sq) { frag.appendChild(span('hl-string', sq[0])); rest = rest.slice(sq[0].length); continue; }
+          // Boolean (must check before generic word)
+          const bl = rest.match(/^(true|false|yes|no|on|off)\b/i);
+          if (bl) { frag.appendChild(span('hl-bool', bl[0])); rest = rest.slice(bl[0].length); continue; }
+          // Number
+          const nm = rest.match(/^-?[0-9]+(\.[0-9]+)?/);
+          if (nm) { frag.appendChild(span('hl-number', nm[0])); rest = rest.slice(nm[0].length); continue; }
+          // Any other word
+          const word = rest.match(/^[^\s;#"']+/);
+          if (word) { frag.appendChild(span('hl-string', word[0])); rest = rest.slice(word[0].length); continue; }
+          frag.appendChild(document.createTextNode(rest[0])); rest = rest.slice(1);
+        }
+      }
+
+      raw.split('\n').forEach((line, i) => {
+        if (i > 0) frag.appendChild(document.createTextNode('\n'));
+        const trimmed = line.trimStart();
+
+        // Full-line comment (; or #)
+        if (trimmed.startsWith(';') || trimmed.startsWith('#')) {
+          frag.appendChild(span('hl-comment', line));
+          return;
+        }
+
+        // Section header: [section]
+        const sec = line.match(/^(\s*)(\[[^\]]*\])\s*(;.*|#.*)?$/);
+        if (sec) {
+          if (sec[1]) frag.appendChild(document.createTextNode(sec[1]));
+          frag.appendChild(span('hl-section', sec[2]));
+          if (sec[3]) {
+            frag.appendChild(document.createTextNode(' '));
+            frag.appendChild(span('hl-comment', sec[3]));
+          }
+          return;
+        }
+
+        // Key = value
+        const kv = line.match(/^(\s*)([A-Za-z0-9_.-]+)(\s*[=:]\s*)(.*)/);
+        if (kv) {
+          if (kv[1]) frag.appendChild(document.createTextNode(kv[1]));
+          frag.appendChild(span('hl-key', kv[2]));
+          frag.appendChild(span('hl-operator', kv[3]));
+          tokenizeIniValue(kv[4], frag);
+          return;
+        }
+
+        // Fallback
+        frag.appendChild(document.createTextNode(line));
+      });
+
+      code.textContent = '';
+      code.appendChild(frag);
+    });
+  }
+
   function initScrollTop() {
     const btn = document.querySelector('[data-scroll-top]');
     if (!btn) return;
@@ -687,6 +858,8 @@
   enhanceCodeBlocks();
   highlightToml();
   highlightBash();
+  highlightXml();
+  highlightIni();
   initScrollTop();
   initTocFilter();
   initActiveToc();

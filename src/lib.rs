@@ -79,8 +79,8 @@ pub use gitlab::GitLabClient;
 pub use housekeeping::HousekeepingWorker;
 pub use scm::{
     CodeReview, InlineReviewComment, OrgRepo, PostReviewAction, PrInfo, PrMonitor, PrReview,
-    PrReviewComment, PrReviewState, PrStatus, PrStatusUpdate, PrSummary, RemoteRepo,
-    ReviewComment, ReviewEvent, ReviewUser, ReviewWatcher, ScmProvider, ScmRelease,
+    PrReviewComment, PrReviewState, PrStatus, PrStatusUpdate, PrSummary, RemoteRepo, ReviewComment,
+    ReviewEvent, ReviewUser, ReviewWatcher, ScmProvider, ScmRelease,
 };
 pub use secret::SecretValue;
 // Backward-compat alias

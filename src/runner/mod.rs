@@ -409,9 +409,7 @@ mod tests {
             r#"{"cache_creation_input_tokens":429}"#
         ));
         // With space after colon
-        assert!(!is_rate_limit_error(
-            r#"{"tokens": 429}"#
-        ));
+        assert!(!is_rate_limit_error(r#"{"tokens": 429}"#));
         // But plain "status:429" (no quote before colon) IS a rate limit
         assert!(is_rate_limit_error("status:429"));
         // And real HTTP 429 in JSON error messages should still match

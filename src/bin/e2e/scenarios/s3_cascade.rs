@@ -169,7 +169,10 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             .await
             .unwrap_or_default();
         if branch.is_empty() {
-            tracing::warn!(pr_number = pr_number_1, "PR branch is empty — repo-1 PR may not exist on SCM");
+            tracing::warn!(
+                pr_number = pr_number_1,
+                "PR branch is empty — repo-1 PR may not exist on SCM"
+            );
         } else {
             tracing::info!(pr_number = pr_number_1, branch = %branch, "Repo-1 PR verified on SCM");
         }
@@ -234,7 +237,10 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             .await
             .unwrap_or_default();
         if branch.is_empty() {
-            tracing::warn!(pr_number = merge_cascade_pr_number, "PR branch is empty — merge-cascade PR may not exist on SCM");
+            tracing::warn!(
+                pr_number = merge_cascade_pr_number,
+                "PR branch is empty — merge-cascade PR may not exist on SCM"
+            );
         } else {
             tracing::info!(pr_number = merge_cascade_pr_number, branch = %branch, "Merge-cascade PR verified on SCM");
         }

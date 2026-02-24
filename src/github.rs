@@ -906,8 +906,7 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
         body: &str,
         comments: &[InlineReviewComment],
     ) -> Result<()> {
-        GitHubClient::post_review_with_comments(self, project, number, action, body, comments)
-            .await
+        GitHubClient::post_review_with_comments(self, project, number, action, body, comments).await
     }
 
     async fn list_open_prs(&self, project: &str) -> Result<Vec<PrSummary>> {

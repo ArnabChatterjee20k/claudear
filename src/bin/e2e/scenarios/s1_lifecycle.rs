@@ -470,9 +470,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
 
     db.assert_min_count(
         "fix_attempts",
-        &format!(
-            "SELECT COUNT(*) FROM fix_attempts WHERE issue_id = '{esc_id}'"
-        ),
+        &format!("SELECT COUNT(*) FROM fix_attempts WHERE issue_id = '{esc_id}'"),
         1,
     )?;
 
@@ -485,27 +483,19 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     )?;
 
     // PR reviews should be recorded for the review steps
-    db.assert_min_count(
-        "pr_reviews",
-        "SELECT COUNT(*) FROM pr_reviews",
-        1,
-    )?;
+    db.assert_min_count("pr_reviews", "SELECT COUNT(*) FROM pr_reviews", 1)?;
 
     // Regression watch was created (verified above, but also check the table)
     db.assert_min_count(
         "regression_watches for issue",
-        &format!(
-            "SELECT COUNT(*) FROM regression_watches WHERE issue_id = '{esc_id}'"
-        ),
+        &format!("SELECT COUNT(*) FROM regression_watches WHERE issue_id = '{esc_id}'"),
         1,
     )?;
 
     // Issues table should have the issue stored
     db.assert_min_count(
         "issues table",
-        &format!(
-            "SELECT COUNT(*) FROM issues WHERE issue_id = '{esc_id}'"
-        ),
+        &format!("SELECT COUNT(*) FROM issues WHERE issue_id = '{esc_id}'"),
         1,
     )?;
 
