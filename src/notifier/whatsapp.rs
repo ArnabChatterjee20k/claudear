@@ -1191,6 +1191,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // single-threaded tokio test; mutex serializes global inbox access
     async fn test_poll_question_replies_matches_reply_context() {
         let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
 
