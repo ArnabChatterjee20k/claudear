@@ -1724,7 +1724,7 @@ impl Config {
     /// Environment variables take precedence over TOML values.
     fn apply_env_overrides(&mut self) {
         // Core settings
-        if let Ok(v) = env::var("WORK_DIR") {
+        if let Ok(v) = env::var("WORKSPACE") {
             if !v.is_empty() {
                 self.workspace = v.into();
             }
@@ -2853,7 +2853,7 @@ mod tests {
 
     // All environment variables that Config reads
     const CONFIG_ENV_VARS: &[&str] = &[
-        "WORK_DIR",
+        "WORKSPACE",
         "KNOWN_ORGS",
         "AUTO_DISCOVER_PATHS",
         "POLL_INTERVAL_MS",
@@ -3249,7 +3249,7 @@ workspace = "/toml/path"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("WORK_DIR", "/env/path")], || {
+        with_env(&[("WORKSPACE", "/env/path")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(config.workspace, PathBuf::from("/env/path"));
         });
@@ -5128,14 +5128,14 @@ api_key = "keep_key"
 
         with_env(
             &[
-                ("WORK_DIR", ""),
+                ("WORKSPACE", ""),
                 ("KNOWN_ORGS", ""),
                 ("DISCORD_WEBHOOK_URL", ""),
                 ("LINEAR_API_KEY", ""),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                // Empty WORK_DIR should not override
+                // Empty WORKSPACE should not override
                 assert_eq!(config.workspace, PathBuf::from("/tmp/repos"));
                 // Empty KNOWN_ORGS should not override
                 assert!(config.known_orgs.is_empty());

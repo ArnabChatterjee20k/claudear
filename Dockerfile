@@ -112,7 +112,7 @@ COPY --from=builder /app/target/release/claudear /usr/local/bin/claudear
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN adduser --disabled-password --uid 1000 --gecos "" appuser \
-    && mkdir -p /app/data /app/repos /home/appuser/.cache/fastembed /home/appuser/.claude \
+    && mkdir -p /app/data /app/repos /app/workspace /home/appuser/.cache/fastembed /home/appuser/.claude \
     && chown -R appuser:appuser /app /home/appuser/.cache /home/appuser/.claude
 
 COPY --from=claude --chown=appuser:appuser /home/appuser/.local /home/appuser/.local
@@ -125,7 +125,7 @@ RUN git config --global user.name "${GIT_USER_NAME}" \
 
 ENV PATH="/home/appuser/.local/bin:${PATH}"
 
-ENV PROJECT_DIR=/app/project
+ENV WORKSPACE=/app/workspace
 ENV DATA_DIR=/app/data
 ENV REPOS_DIR=/app/repos
 ENV EMBEDDING_CACHE_DIR=/home/appuser/.cache/fastembed

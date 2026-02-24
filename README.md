@@ -13,7 +13,7 @@
 
 Claudear watches your issue trackers and error monitoring services, automatically spawning [Claude Code](https://docs.anthropic.com/en/docs/claude-code) agents to fix issues and open pull requests: no human in the loop required (unless Claude has a question for you).
 
-Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out which repo the issue belongs to, clones it, runs Claude Code with your project's conventions, opens a PR, monitors the PR through merge, auto-resolves the source issue, and learns from the outcome to get smarter over time.
+Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comments. It figures out which repo the issue belongs to, clones it, runs Claude Code (or Codex) with your project's conventions, opens a PR, monitors the PR through merge, auto-resolves the source issue, and learns from the outcome to get smarter over time.
 
 ---
 
@@ -43,7 +43,10 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
   - [User Registry](#user-registry)
 - [Fix Attempt Lifecycle](#fix-attempt-lifecycle)
 - [AI Feedback Loop](#ai-feedback-loop)
+  - [Embedding-Based Learning](#embedding-based-learning)
+  - [Continuous Learning Pipeline](#continuous-learning-pipeline)
 - [Custom Prompt Templates](#custom-prompt-templates)
+  - [A/B Experiments](#ab-experiments)
 - [Running as a Service](#running-as-a-service)
 - [Docker](#docker)
 - [CI/CD](#cicd)
@@ -55,23 +58,24 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 ## How It Works
 
 ```
- Issue filed on Linear       Sentry escalation        Discord message       GitHub review comment
-        |                          |                        |                        |
-        +----------+---------------+------------+-----------+                        |
-                   |                            |                                    |
-                   v                            v                                    v
+ Linear   Sentry   Jira   GitLab   Discord   Slack   Telegram   WhatsApp   GitHub Reviews
+   |        |       |       |         |        |        |          |             |
+   +--------+-------+-------+---------+--------+--------+----------+-------------+
+                                      |
+                                      v
           ┌──────────────────────────────────────────────────────────────────────────────┐
           |                              Claudear Watcher                                |
           |                                                                              |
           |   1. Detect new issue (poll or webhook)                                      |
-          |   2. Infer target repository from stack traces, file paths, context          |
-          |   3. Clone repo, spawn Claude Code agent with project conventions            |
-          |   4. Claude fixes the issue, creates a PR                                    |
-          |   5. Notify you (Discord / Email / SMS / Push)                               |
-          |   6. Monitor PR through merge                                                |
-          |   7. Auto-resolve issue on source when PR merges                             |
+          |   2. Prioritise by severity, frequency, blast radius, and clustering         |
+          |   3. Infer target repository from stack traces, file paths, context          |
+          |   4. Clone repo, spawn Claude Code / Codex agent with project conventions    |
+          |   5. Self-evaluate the fix (tests, lint, static analysis, coverage)          |
+          |   6. Create a PR, notify you (Discord / Slack / Email / SMS / Push / ...)    |
+          |   7. Monitor PR through merge, auto-resolve issue on source                  |
           |   8. Watch for regressions for 24 hours                                      |
-          |   9. Learn from outcome to improve future fixes                              |
+          |   9. Extract learnings from outcomes, diffs, and reviews                     |
+          |  10. Cascade fixes through downstream dependency repos                       |
           └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -80,16 +84,17 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 ## Features
 
 ### Issue Sources
-- **Linear**: Trigger on labels (`auto-implement`, `claude`) or states (`backlog`, `todo`), with team/project filtering
+- **Linear**: Trigger on labels (`auto-implement`, `claude`) or states (`backlog`, `todo`), with team/project filtering and assignee triggers
 - **Sentry**: Process top escalating errors by event count, time period, and escalation threshold
-- **Jira**: JQL-based issue filtering with label and status support
-- **GitHub Issues**: Monitor issues across repositories
-- **GitLab**: Fetch issues from GitLab groups and projects
+- **Jira**: JQL-based issue filtering with label, status, issue type, and assignee support (Cloud + Server/DC)
+- **GitHub Issues**: Monitor issues across repositories with label and state triggers
+- **GitLab**: Fetch issues from GitLab groups and projects with label and state triggers
 - **Discord**: Process messages and threads from Discord channels as issues
 - **Slack**: Poll Slack channels for messages as issues
 - **WhatsApp**: Receive WhatsApp messages via Cloud API webhooks
 - **Telegram**: Poll Telegram chats via Bot API
-- **GitHub Review Comments**: Respond to PR review comments tagged with `/claudear`
+- **GitHub Review Comments**: Respond to PR review comments tagged with `@claudear`
+- **GitLab MR Comments**: Respond to MR review comments tagged with `@claudear`
 - Per-source rate limiting, concurrent processing controls, and configurable poll intervals
 
 ### Intelligent Repository Routing
@@ -99,9 +104,11 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - Full-text file index across all repositories for fast context lookups
 
 ### Autonomous Fix Pipeline
-- Spawns real Claude Code processes with full tool access (read, edit, bash, etc.)
+- Spawns real Claude Code or Codex processes with full tool access (read, edit, bash, etc.)
+- Multi-provider support: Claude Code (primary), OpenAI Codex, with Gemini and Copilot planned
+- A/B experiment infrastructure: test providers against each other with weighted routing
 - Configurable model selection: Sonnet, Opus, Haiku, or any model ID
-- Project-specific `AGENT.md` files customize Claude's coding conventions per repo
+- Project-specific `AGENT.md` files customize coding conventions per repo
 - Global instructions and tool permissions via `claudear.toml`
 - Configurable execution timeout (default 6 hours)
 
@@ -112,9 +119,10 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 
 ### Human Q&A Loop
 - When Claude is blocked on ambiguity, it asks a question via your notification channels
-- Claudear fans out the question to all enabled notifiers (Discord, Email, etc.)
-- First reply wins: Claude resumes immediately with the answer
+- Claudear fans out the question to all enabled notifiers (Discord, Slack, Email, etc.)
+- Reply-capable channels: Discord, Slack, and Email — first reply wins
 - Q&A pairs are stored and reused via embedding-based semantic matching so the same question is never asked twice
+- Scoped matching (source+repo at 0.82 threshold) with global fallback (0.88 threshold)
 - Configurable timeouts with best-effort continuation
 
 ### AI Feedback Loop
@@ -123,6 +131,37 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - Finds similar past issues and extracts patterns from successes and failures
 - Enhances future prompts with learnings from past outcomes
 - Supported models: Nomic, MiniLM, BGE
+
+### Prioritisation Engine
+- Composite severity scoring from multiple signals: severity (30%), frequency (25%), regression risk (20%), blast radius (15%), clustering (10%)
+- Blast radius classification: 5 tiers from critical (auth/payment) to cosmetic (docs)
+- Content clustering: groups similar issues by error type, culprit, and title similarity
+- Suppression rules: skip known-noisy issues with pattern matching (contains, regex) before they consume processing slots
+- Configurable weights and path patterns per tier
+
+### Self-Evaluation
+- Before/after comparison of tests, lint, static analysis, and code coverage
+- Auto-detects project tooling or accepts custom commands
+- Posts evaluation results as PR comments
+- Optionally fails fix attempts on quality regressions
+- Per-tool and total timeout configuration
+
+### Continuous Learning
+- Extracts learnings from Claude's execution logs automatically
+- Analyzes PR diffs on merge to extract coding patterns
+- Promotes repeated Q&A answers to standing instructions (configurable threshold)
+- Accumulates per-repository knowledge from successful fixes
+- Classifies reviewer feedback patterns and promotes common fixes
+- Tracks Claude's problem-solving strategies per issue type
+- Scores fix quality based on merge velocity
+- Detects clusters of correlated issues within configurable time windows
+- Cross-repo failure correlation detection
+- Optionally auto-generates `AGENT.md` from accumulated knowledge
+
+### Code Indexing
+- Tree-sitter based parsing for 12+ languages (Rust, JS, TS, Python, Go, Java, C, C++, Ruby, PHP, Swift, Kotlin)
+- Semantic search across all repositories via embeddings
+- Configurable file size limits and batch sizes
 
 ### PR Lifecycle Management
 - Monitors PRs through merge/close with configurable poll intervals
@@ -141,24 +180,27 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 - Semantic versioning support
 
 ### Notifications
-- **Discord**: Webhook messages + bot reply polling for Q&A
+- **Discord**: Webhook messages + bot reply polling for Q&A, rich embeds, thread tracking
+- **Slack**: Bot API messages + reply polling for Q&A, webhook alternative
 - **Email**: SMTP sending + IMAP reply polling for Q&A
 - **SMS**: Twilio integration
-- **Push**: Pushover notifications
+- **Push**: Pushover notifications with priority levels
 - **WhatsApp**: WhatsApp Business Cloud API
-- **Telegram**: Telegram Bot API
+- **Telegram**: Telegram Bot API with HTML formatting
 - **Console**: Always-on logging
 - Mix and match any combination of channels
 
 ### User Registry
-- Map team members across Linear, GitHub, Sentry, Discord, Email, SMS, Push
+- Map team members across Linear, GitHub, Sentry, Jira, GitLab, Discord, Slack, Email, SMS, Push, WhatsApp, Telegram
 - Route notifications to the person assigned to the issue
 - Per-user notification channel preferences
 
 ### Analytics Dashboard
 - Live web UI (React + TypeScript + Tailwind)
-- Stats overview: total attempts, success rate, merge rate
+- Stats overview: total attempts, success rate, merge rate, cost estimates
 - Status breakdown, source-by-source metrics, recent attempt history
+- PR analytics: review metrics, merge rates, rejection analysis
+- Cost estimation with configurable engineer hourly rate for ROI calculation
 - Retryable issues view with one-click retry
 - Embedded in the release binary: no separate deployment needed
 
@@ -183,18 +225,18 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 |----------|------------|----------|-------|
 | **Issue Sources** | Linear | REST API | Labels, states, team/project filters |
 | | Sentry | REST API | Escalating errors, event thresholds |
-| | Jira | REST API | JQL queries, labels, status filters |
+| | Jira | REST API | JQL queries, labels, status filters (Cloud + Server/DC) |
 | | GitHub Issues | REST API | Cross-repo monitoring |
 | | GitLab | REST API | Group and project issues |
 | | Discord | Bot API | Channel messages and threads |
 | | Slack | Bot API | Channel message polling |
 | | WhatsApp | Cloud API | Webhook-fed message buffer |
 | | Telegram | Bot API | `getUpdates` long-polling |
-| **SCM** | GitHub | REST + Git | PRs, review comments, webhooks |
-| | GitLab | REST + Git | PRs, issue resolution |
+| **SCM** | GitHub | REST + Git | PRs, review comments, webhooks, App auth |
+| | GitLab | REST + Git | MRs, issue resolution, review comments |
 | **Notifications** | Console | stdout | Always-on logging |
-| | Discord | Webhook | Rich embeds, reply-based Q&A |
-| | Slack | Webhook | Messages, reply-based Q&A |
+| | Discord | Webhook + Bot | Rich embeds, reply-based Q&A, thread tracking |
+| | Slack | Bot API + Webhook | Messages, reply-based Q&A |
 | | Email | SMTP + IMAP | Send + reply polling for Q&A |
 | | SMS | Twilio API | Text message alerts |
 | | Push | Pushover API | Mobile push notifications |
@@ -208,50 +250,50 @@ Point it at Linear, Sentry, Discord, or GitHub review comments. It figures out w
 | **Embeddings** | Nomic | ONNX | Default model, local inference |
 | | MiniLM | ONNX | Lightweight alternative |
 | | BGE | ONNX | BAAI general embedding |
+| **Code Indexing** | Tree-sitter | Local | 12+ languages, semantic search |
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                               Claudear                                   │
-├──────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐                │
-│  │  Linear  │  │  Sentry  │  │ Discord  │  │  GitHub  │  ← Sources     │
-│  │  Source  │  │  Source  │  │  Source  │  │ Webhooks │                 │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘                │
-│       │             │             │             │                       │
-│       └──────┬──────┴──────┬──────┴──────┬──────┘                       │
-│              │             │             │                              │
-│              ▼             ▼             ▼                              │
-│       ┌─────────────────────────────────────┐     ┌──────────────┐     │
-│       │             Watcher                 │────>│  Repo Index  │     │
-│       │  (polls, webhooks, matches,         │     │  (inference,  │     │
-│       │   coordinates, rate-limits)         │     │  discovery)   │     │
-│       └────────────────┬────────────────────┘     └──────────────┘     │
-│                        │                                               │
-│    ┌───────────────────┼───────────────────────┬───────────────┐       │
-│    │                   │               │       │               │       │
-│    ▼                   ▼               ▼       ▼               ▼       │
-│ ┌─────────┐    ┌─────────┐    ┌─────────┐ ┌─────────┐ ┌───────────┐  │
-│ │ Claude  │    │ SQLite  │    │Notifiers│ │   PR    │ │ Feedback  │  │
-│ │ Runner  │    │ Tracker │    │(Discord,│ │ Monitor │ │ Analyzer  │  │
-│ │         │    │         │    │Email,..)│ │         │ │(embeddings)│  │
-│ └─────────┘    └─────────┘    └─────────┘ └─────────┘ └───────────┘  │
-│                                                                        │
-│ ┌─────────────┐ ┌──────────────┐ ┌──────────────┐ ┌────────────┐     │
-│ │  Regression │ │   Release    │ │     IPC      │ │  Cascade   │     │
-│ │  Monitor    │ │   Tracker    │ │ (daemon ctl) │ │  Engine    │     │
-│ └─────────────┘ └──────────────┘ └──────────────┘ └────────────┘     │
-│                                                                        │
-│ ┌──────────────────────────────────────────────────────────────────┐   │
-│ │                     Dashboard (React + Tailwind)                 │   │
-│ │     Stats · Attempts · Retries · Sources · Reports · Config     │   │
-│ └──────────────────────────────────────────────────────────────────┘   │
-│                                                                        │
-└──────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                  Claudear                                    │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────┐ ┌────────┐ ┌──────┐ ┌────────┐ ┌─────────┐ ┌───────┐          │
+│  │ Linear │ │ Sentry │ │ Jira │ │ GitLab │ │ Discord │ │ Slack │ ← Sources│
+│  └───┬────┘ └───┬────┘ └──┬───┘ └───┬────┘ └────┬────┘ └──┬────┘          │
+│      │          │         │         │           │         │                │
+│      └────┬─────┴────┬────┴────┬────┴─────┬─────┴────┬────┘                │
+│           │          │         │          │          │                      │
+│           ▼          ▼         ▼          ▼          ▼                      │
+│    ┌──────────────────────────────────────────────────────┐                 │
+│    │                    Watcher                           │                 │
+│    │  (polls, webhooks, prioritises, matches, rate-limits)│                 │
+│    └───────────────────────┬──────────────────────────────┘                 │
+│                            │                                                │
+│    ┌───────────┬───────────┼──────────┬──────────┬───────────┐             │
+│    │           │           │          │          │           │             │
+│    ▼           ▼           ▼          ▼          ▼           ▼             │
+│ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌──────────┐     │
+│ │Prioriti│ │  Agent │ │Notifier│ │   PR   │ │  Self  │ │  Repo    │     │
+│ │-sation │ │ Runner │ │(Discord│ │Monitor │ │  Eval  │ │  Index   │     │
+│ │ Engine │ │(Claude,│ │ Slack, │ │        │ │(tests, │ │(tree-sit,│     │
+│ │        │ │ Codex) │ │Email..)│ │        │ │ lint)  │ │inference)│     │
+│ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └──────────┘     │
+│                                                                            │
+│ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌──────────┐     │
+│ │Learning│ │Regress-│ │Release │ │Cascade │ │  IPC   │ │ SQLite + │     │
+│ │ System │ │  ion   │ │Tracker │ │ Engine │ │(daemon)│ │Vectorlite│     │
+│ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └──────────┘     │
+│                                                                            │
+│ ┌──────────────────────────────────────────────────────────────────────┐   │
+│ │                     Dashboard (React + Tailwind)                     │   │
+│ │  Stats · Analytics · PRs · Attempts · Retries · Reports · Config    │   │
+│ └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -299,7 +341,7 @@ docker pull ghcr.io/abnegate/claudear:latest
 ```bash
 # 1. Create your config file
 cp claudear.example.toml claudear.toml
-# Edit claudear.toml with your Linear API key, GitHub token, etc.
+# Edit claudear.toml with your API keys (issues.linear.api_key, scm.github.token, etc.)
 
 # 2. Seed existing issues (so Claudear doesn't process old issues)
 claudear seed
@@ -335,14 +377,18 @@ All config values can be overridden with environment variables, useful for keepi
 
 | Variable | Config Path |
 |----------|-------------|
-| `LINEAR_API_KEY` | `linear.api_key` |
-| `SENTRY_AUTH_TOKEN` | `sentry.auth_token` |
-| `GITHUB_TOKEN` | `github.token` |
-| `LINEAR_WEBHOOK_SECRET` | `linear.webhook_secret` |
-| `SENTRY_CLIENT_SECRET` | `sentry.client_secret` |
-| `GITHUB_WEBHOOK_SECRET` | `github.webhook_secret` |
+| `LINEAR_API_KEY` | `issues.linear.api_key` |
+| `SENTRY_AUTH_TOKEN` | `issues.sentry.auth_token` |
+| `GITHUB_TOKEN` | `scm.github.token` |
+| `GITLAB_TOKEN` | `scm.gitlab.token` |
+| `JIRA_API_TOKEN` | `issues.jira.api_token` |
+| `LINEAR_WEBHOOK_SECRET` | `issues.linear.webhook_secret` |
+| `SENTRY_CLIENT_SECRET` | `issues.sentry.client_secret` |
+| `GITHUB_WEBHOOK_SECRET` | `scm.github.webhook_secret` |
+| `GITLAB_WEBHOOK_SECRET` | `scm.gitlab.webhook_secret` |
 | `EMBEDDING_MODEL` | Embedding model (`nomic`, `minilm`, `bge`) |
 | `EMBEDDING_CACHE_DIR` | Embedding model cache directory |
+| `SENTRY_DSN` | Sentry DSN for backend error reporting |
 
 ### Minimal Configuration
 
@@ -353,7 +399,7 @@ known_orgs = ["your-github-org"]
 
 auto_discover_paths = ["~/projects"]
 
-[linear]
+[issues.linear]
 api_key = "lin_api_xxxx"
 ```
 
@@ -367,24 +413,35 @@ api_key = "lin_api_xxxx"
 | `poll_interval_ms` | Polling interval in milliseconds (default: 300000 = 5 min) |
 | `db_path` | SQLite database path (default: `./claudear.db`) |
 | `webhook_port` | Webhook server port (default: 3100) |
+| `bind_address` | HTTP server bind address (default: `127.0.0.1`, use `0.0.0.0` for Docker) |
 | `max_issues_per_cycle` | Max issues per poll cycle (default: 5) |
 | `max_concurrent` | Max concurrent issue processing (default: 1) |
 | `processing_delay_ms` | Delay between processing issues in ms (default: 5000) |
-| `claude_timeout_secs` | Claude process timeout (default: 21600 = 6 hours) |
-| `claude` | Claude model, instructions, permissions (see [Custom Prompt Templates](#custom-prompt-templates)) |
-| `embeddings` | Embedding model config (nomic, minilm, bge) |
-| `linear` | Linear API key, trigger labels/states, team/project filters, rate limits |
-| `sentry` | Sentry auth token, org slug, project filters, escalation thresholds |
-| `github` | GitHub token, PR poll interval, auto-resolve on merge, review trigger tag |
-| `github_app` | GitHub App authentication (App ID, private key, installation ID) |
-| `discord` | Discord webhook URL, bot token, channel ID for Q&A |
-| `email` | SMTP sending + IMAP reply polling |
-| `sms` | Twilio account SID, auth token, phone numbers |
-| `push` | Pushover API token, user key, priority |
+| `agent` | Agent provider config, model, instructions, permissions, A/B experiments (see [Custom Prompt Templates](#custom-prompt-templates)) |
+| `issues.linear` | Linear API key, trigger labels/states/assignees, team/project filters, rate limits |
+| `issues.sentry` | Sentry auth token, org slug, project filters, escalation thresholds |
+| `issues.jira` | Jira base URL, auth, project keys, JQL filters, issue types |
+| `issues.discord` | Discord bot token, listen channel ID |
+| `issues.slack` | Slack bot token, listen channel ID |
+| `scm.github` | GitHub token, PR poll interval, auto-resolve on merge, review trigger tag |
+| `scm.github.app` | GitHub App authentication (App ID, private key, installation ID) |
+| `scm.gitlab` | GitLab token, base URL, groups, MR poll interval, review trigger tag |
+| `notifiers.discord` | Discord webhook URL, bot token, channel ID for Q&A |
+| `notifiers.slack` | Slack bot token, channel ID, webhook URL for Q&A |
+| `notifiers.email` | SMTP sending + IMAP reply polling |
+| `notifiers.sms` | Twilio account SID, auth token, phone numbers |
+| `notifiers.push` | Pushover API token, user key, priority |
+| `notifiers.whatsapp` | WhatsApp phone number ID, access token, recipient numbers |
+| `notifiers.telegram` | Telegram bot token, chat ID, recipient chat IDs |
 | `ask` | Human Q&A loop: timeout, poll interval, max rounds, semantic thresholds |
 | `retry` | Max retries, base delay, max delay (exponential backoff) |
 | `regression` | Check interval, monitoring duration, event thresholds |
-| `cascade` | Enable/disable cascading, max depth |
+| `cascade` | Enable/disable cascading, max depth, per-dependency rules |
+| `learning` | Continuous learning: log extraction, diff analysis, Q&A promotion, repo knowledge |
+| `prioritisation` | Composite scoring weights, blast radius paths, clustering, suppression rules |
+| `code_index` | Tree-sitter code indexing: enable, file size limits, batch size |
+| `evaluation` | Self-evaluation: test/lint/coverage deltas, timeouts, custom commands |
+| `dashboard` | Dashboard display: cost estimation, engineer hourly rate |
 | `users` | User registry mapping across services |
 
 See [`claudear.example.toml`](claudear.example.toml) for a fully documented example with every option.
@@ -534,10 +591,23 @@ claudear dashboard --dashboard-dir ./dashboard/dist
 | `GET /api/health` | Health check |
 | `GET /api/stats` | Statistics |
 | `GET /api/stats/overview` | Full dashboard data |
+| `GET /api/analytics/summary` | Analytics summary |
 | `GET /api/attempts` | List attempts (with filtering) |
 | `GET /api/attempts/:id` | Single attempt detail |
+| `GET /api/attempts/:id/full` | Full attempt with execution log |
 | `GET /api/sources` | Source information |
 | `GET /api/retries` | Retryable issues |
+| `POST /api/retries/:id/process` | Trigger retry |
+| `GET /api/prs` | List tracked PRs |
+| `GET /api/prs/analytics` | PR review analytics |
+| `GET /api/activity` | Activity log |
+| `GET /api/repos` | List repositories |
+| `GET /api/repos/stats` | Repository statistics |
+| `GET /api/repos/dependencies` | Dependency graph |
+| `GET /api/inference/stats` | Inference success rates |
+| `GET /api/regressions` | Regression checks |
+| `GET /api/telemetry/overview` | Telemetry overview |
+| `GET /api/telemetry/cost-analysis` | Cost analysis |
 
 ### Scheduled Reports
 
@@ -593,13 +663,14 @@ When Claude encounters ambiguity that requires human input, it emits a structure
 
 **How it works:**
 1. Question is fanned out to all enabled notification channels
-2. Discord and Email support reply polling (first reply wins)
+2. Discord, Slack, and Email support reply polling (first reply wins)
 3. Claude resumes immediately with the answer
 4. Q&A pairs are stored and reused via semantic matching (source+repo scoped, then global fallback)
 5. If timeout is reached and `ask.best_effort_on_timeout=true`, Claude continues with an explicit uncertainty note
 
 **Requirements for reply channels:**
-- **Discord**: `discord.bot_token` + `discord.channel_id`
+- **Discord**: `notifiers.discord.bot_token` + `notifiers.discord.channel_id`
+- **Slack**: `notifiers.slack.bot_token` + `notifiers.slack.channel_id`
 - **Email**: IMAP fields (`imap_host`, `imap_port`, `imap_username`, `imap_password`)
 
 ### Inference Analytics
@@ -657,10 +728,15 @@ Map team members across services so notifications go to the right person.
 linear_names = "Jake Barnwell"
 github_usernames = "jakebarnby"
 sentry_usernames = "jake"
+jira_usernames = "jake.barnby"
+gitlab_usernames = "jakebarnby"
 discord_id = "123456789012345678"
+slack_id = "U0123456789"
 email = "jake@example.com"
 push_user_key = "pushover_user_key"
 sms_number = "+1234567890"
+whatsapp_number = "+1234567890"
+telegram_chat_id = "123456789"
 ```
 
 When an issue is assigned to a user, Claudear routes notifications to their configured channels.
@@ -703,15 +779,28 @@ When an issue is assigned to a user, Claudear routes notifications to their conf
 
 ## AI Feedback Loop
 
-Claudear learns from every fix attempt to improve future performance.
+Claudear learns from every fix attempt to improve future performance through multiple feedback channels.
 
+### Embedding-Based Learning
 1. **Track Outcomes**: Every attempt result (merged, closed, failed) is recorded
 2. **Generate Embeddings**: Issue content is vectorized locally using fastembed (ONNX Runtime)
 3. **Find Similar Issues**: When a new issue arrives, similar past issues are retrieved
 4. **Extract Patterns**: Keywords and strategies from successful fixes are extracted
-5. **Enhance Prompts**: Future Claude prompts are augmented with learnings from similar past issues
+5. **Enhance Prompts**: Future prompts are augmented with learnings from similar past issues
 
 All embedding computation runs locally. No external API calls. Supported models: `nomic`, `minilm`, `bge`.
+
+### Continuous Learning Pipeline
+- **Execution Log Analysis**: Auto-extracts learnings from Claude's tool use logs
+- **PR Diff Analysis**: Analyzes what changed in merged PRs to extract coding patterns
+- **Q&A Knowledge Promotion**: Repeated Q&A answers are promoted to standing instructions
+- **Per-Repo Knowledge**: Accumulates repository-specific knowledge from successful fixes
+- **Review Feedback Classification**: Learns from code review comments on PRs
+- **Strategy Fingerprinting**: Tracks how Claude approaches different issue types
+- **Quality Scoring**: Scores fix quality based on merge velocity
+- **Cluster Detection**: Detects correlated issues within configurable time windows
+- **Cross-Repo Correlation**: Identifies failure patterns across repository boundaries
+- **Auto AGENT.md**: Optionally generates `AGENT.md` from accumulated knowledge
 
 ---
 
@@ -742,7 +831,14 @@ Create an `AGENT.md` file in any repository root. Claudear prepends this to all 
 ### Global: claudear.toml
 
 ```toml
-[claude]
+[agent]
+# Default provider to use ("claude", "codex", etc.)
+default_provider = "claude"
+
+# Agent process execution timeout in seconds (default: 21600 = 6 hours)
+timeout_secs = 21600
+
+[agent.providers.claude]
 # Model selection
 model = "sonnet"   # sonnet, opus, haiku, or full model ID
 
@@ -757,6 +853,25 @@ permissions = ["Bash(git *)", "Read", "Edit"]
 
 # Skip all permission prompts (default: true)
 skip_permissions = true
+```
+
+### A/B Experiments
+
+Test different providers or configurations against each other:
+
+```toml
+[[agent.experiments]]
+name = "claude-vs-codex"
+enabled = true
+strategy = "weighted_random"   # "weighted_random" or "fallback"
+
+[[agent.experiments.providers]]
+name = "claude"
+weight = 0.8
+
+[[agent.experiments.providers]]
+name = "codex"
+weight = 0.2
 ```
 
 ---
@@ -848,7 +963,7 @@ docker build -t claudear .
 docker run -d \
   -p 3100:3100 \
   -v $(pwd)/claudear.toml:/app/claudear.toml \
-  -v $(pwd):/app/project \
+  -v $(pwd):/app/workspace \
   -v claudear-data:/app/data \
   claudear
 
@@ -856,7 +971,7 @@ docker run -d \
 docker run -d \
   -p 3100:3100 \
   -v $(pwd)/claudear.toml:/app/claudear.toml \
-  -v $(pwd):/app/project \
+  -v $(pwd):/app/workspace \
   -v claudear-data:/app/data \
   -e LINEAR_API_KEY=your-key \
   -e GITHUB_TOKEN=your-token \
@@ -872,6 +987,8 @@ The Docker image:
 - Persists embedding model cache between restarts
 - Supports both `ANTHROPIC_API_KEY` and OAuth login for Claude authentication
 - Health check on `/api/health` every 30 seconds
+
+> **Note**: SQLite WAL mode is incompatible with Docker Desktop's VirtioFS bind mounts. Use Docker named volumes (e.g., `claudear-data:/app/data`) instead of bind mounts for the database directory.
 
 ---
 
@@ -941,6 +1058,8 @@ make check              # Format + lint + test
 - `CLAUDEAR_E2E_LINEAR_TEAM_ID`
 - `CLAUDEAR_E2E_GITHUB_REPO` (format: `owner/repo`)
 - `CLAUDEAR_E2E_GITHUB_TOKEN`
+- `CLAUDEAR_E2E_DISCORD_BOT_TOKEN` (for Discord scenarios)
+- `CLAUDEAR_E2E_DISCORD_CHANNEL_ID` (for Discord scenarios)
 - `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`
 
 ### Dashboard
@@ -962,6 +1081,7 @@ make dashboard-test     # Run tests
 | `make test` | Run Rust tests |
 | `make test-all` | Run Rust + dashboard tests |
 | `make test-prod-e2e` | Run production E2E smoke test |
+| `make test-prod-e2e-docker` | Run E2E smoke test via Docker |
 | `make lint` | Run clippy linter |
 | `make fmt` | Format code |
 | `make check` | Format + lint + test |

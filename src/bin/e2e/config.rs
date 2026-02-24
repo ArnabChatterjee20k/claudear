@@ -50,7 +50,7 @@ impl ConfigBuilder {
     /// Override paths for Docker container (db, workspace, repos, bind address).
     pub fn docker_paths(mut self) -> Self {
         self.config.db_path = std::path::PathBuf::from("/app/data/claudear.db");
-        self.config.workspace = std::path::PathBuf::from("/app/project");
+        self.config.workspace = std::path::PathBuf::from("/app/workspace");
         self.config.bind_address = "0.0.0.0".to_string();
         self
     }

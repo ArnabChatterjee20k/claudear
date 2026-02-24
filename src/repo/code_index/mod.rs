@@ -93,97 +93,97 @@ impl CodeIndexer {
             "Starting code indexing"
         );
 
-        // --- Parallel phase (Issue #2) ---
-        // Read, hash-check, parse, and chunk files concurrently using rayon.
-        // The tracker calls (hash_matches, delete_code_data_for_file) are behind
-        // a Mutex, so they are safe to call from rayon threads.
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let repo_path_owned = repo_path.to_path_buf();
-        let tracker = Arc::clone(&self.tracker);
-        let file_results: Vec<FileProcessResult> = files
-            .par_iter()
-            .map(|(path, language)| {
-                let rel_path = path
-                    .strip_prefix(&repo_path_owned)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
-
-                // Read file content.
-                let content = match std::fs::read_to_string(path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(file = %rel_path, error = %e, "Failed to read file");
-                        return FileProcessResult::Failed(());
-                    }
-                };
-
-                // Compute hash for incremental detection.
-                let file_hash = sha256_hex(&content);
-
-                // Check if file is already indexed with this hash.
-                match tracker.code_chunk_hash_matches(repo_id, &rel_path, &file_hash) {
-                    Ok(true) => return FileProcessResult::Skipped(rel_path),
-                    Err(e) => {
-                        tracing::debug!(file = %rel_path, error = %e, "Hash check failed");
-                        return FileProcessResult::Failed(());
-                    }
-                    Ok(false) => {}
-                }
-
-                // Delete old data for this file before re-indexing.
-                if let Err(e) = tracker.delete_code_data_for_file(repo_id, &rel_path) {
-                    tracing::debug!(file = %rel_path, error = %e, "Failed to delete old data");
-                    return FileProcessResult::Failed(());
-                }
-
-                // Parse and chunk.
-                match chunker::chunk_file(&content, *language, repo_id, &rel_path, &file_hash) {
-                    Ok((symbols, chunks)) => FileProcessResult::Parsed {
-                        rel_path,
-                        symbols,
-                        chunks,
-                    },
-                    Err(e) => {
-                        tracing::debug!(file = %rel_path, error = %e, "Failed to parse file");
-                        FileProcessResult::Failed(())
-                    }
-                }
-            })
-            .collect();
-
-        // --- Sequential phase ---
-        // Accumulate results from the parallel phase.
         let mut seen_paths: Vec<String> = Vec::with_capacity(files.len());
         let mut pending_chunks: Vec<types::CodeChunk> = Vec::new();
         let mut pending_symbols: Vec<types::CodeSymbol> = Vec::new();
 
-        for result in file_results {
-            match result {
-                FileProcessResult::Parsed {
-                    rel_path,
-                    symbols,
-                    chunks,
-                } => {
-                    stats.files_processed += 1;
-                    stats.symbols_extracted += symbols.len();
-                    stats.chunks_created += chunks.len();
-                    pending_symbols.extend(symbols);
-                    pending_chunks.extend(chunks);
-                    seen_paths.push(rel_path);
-                }
-                FileProcessResult::Skipped(rel_path) => {
-                    stats.files_skipped += 1;
-                    seen_paths.push(rel_path);
-                }
-                FileProcessResult::Failed(_) => {
-                    stats.files_failed += 1;
-                }
-            }
+        for file_group in files.chunks(parallelism) {
+            let tracker = Arc::clone(&self.tracker);
+            let rpo = &repo_path_owned;
+            let file_results: Vec<FileProcessResult> = file_group
+                .par_iter()
+                .map(|(path, language)| {
+                    let rel_path = path
+                        .strip_prefix(rpo)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .to_string();
 
-            // Flush batch if large enough.
-            if pending_chunks.len() >= self.batch_size {
-                self.flush_batch(&mut pending_symbols, &mut pending_chunks, &mut stats)
-                    .await?;
+                    // Read file content.
+                    let content = match std::fs::read_to_string(path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(file = %rel_path, error = %e, "Failed to read file");
+                            return FileProcessResult::Failed(());
+                        }
+                    };
+
+                    // Compute hash for incremental detection.
+                    let file_hash = sha256_hex(&content);
+
+                    // Check if file is already indexed with this hash.
+                    match tracker.code_chunk_hash_matches(repo_id, &rel_path, &file_hash) {
+                        Ok(true) => return FileProcessResult::Skipped(rel_path),
+                        Err(e) => {
+                            tracing::debug!(file = %rel_path, error = %e, "Hash check failed");
+                            return FileProcessResult::Failed(());
+                        }
+                        Ok(false) => {}
+                    }
+
+                    // Delete old data for this file before re-indexing.
+                    if let Err(e) = tracker.delete_code_data_for_file(repo_id, &rel_path) {
+                        tracing::debug!(file = %rel_path, error = %e, "Failed to delete old data");
+                        return FileProcessResult::Failed(());
+                    }
+
+                    // Parse and chunk.
+                    match chunker::chunk_file(&content, *language, repo_id, &rel_path, &file_hash) {
+                        Ok((symbols, chunks)) => FileProcessResult::Parsed {
+                            rel_path,
+                            symbols,
+                            chunks,
+                        },
+                        Err(e) => {
+                            tracing::debug!(file = %rel_path, error = %e, "Failed to parse file");
+                            FileProcessResult::Failed(())
+                        }
+                    }
+                })
+                .collect();
+
+            for result in file_results {
+                match result {
+                    FileProcessResult::Parsed {
+                        rel_path,
+                        symbols,
+                        chunks,
+                    } => {
+                        stats.files_processed += 1;
+                        stats.symbols_extracted += symbols.len();
+                        stats.chunks_created += chunks.len();
+                        pending_symbols.extend(symbols);
+                        pending_chunks.extend(chunks);
+                        seen_paths.push(rel_path);
+                    }
+                    FileProcessResult::Skipped(rel_path) => {
+                        stats.files_skipped += 1;
+                        seen_paths.push(rel_path);
+                    }
+                    FileProcessResult::Failed(_) => {
+                        stats.files_failed += 1;
+                    }
+                }
+
+                // Flush batch if large enough.
+                if pending_chunks.len() >= self.batch_size {
+                    self.flush_batch(&mut pending_symbols, &mut pending_chunks, &mut stats)
+                        .await?;
+                }
             }
         }
 

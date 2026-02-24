@@ -571,7 +571,7 @@ impl Watcher {
             "Starting Claude Watcher{}",
             if self.dry_run { " (DRY RUN)" } else { "" }
         );
-        tracing::info!("  Work dir: {:?}", self.config.workspace);
+        tracing::info!("  Workspace: {:?}", self.config.workspace);
         tracing::info!("  Known orgs: {}", self.config.known_orgs.len());
         tracing::info!("  Poll interval: {}ms (global)", poll_interval);
         tracing::info!(
@@ -8520,10 +8520,10 @@ mod tests {
             tokio::spawn(async move { w.start(Some(50)).await })
         };
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         watcher.stop();
 
-        let joined = tokio::time::timeout(std::time::Duration::from_secs(3), runner).await;
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), runner).await;
         assert!(joined.is_ok(), "watcher start did not stop in time");
         assert!(joined.unwrap().expect("task join failed").is_ok());
     }

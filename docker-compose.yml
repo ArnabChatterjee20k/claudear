@@ -15,8 +15,8 @@ services:
       # Data directory (SQLite database stored here)
       DATA_DIR: /app/data
 
-      # Project directory (mounted)
-      PROJECT_DIR: /app/project
+      # Workspace directory (mounted)
+      WORKSPACE: /app/workspace
 
       # Webhook port
       WEBHOOK_PORT: 3100
@@ -61,7 +61,7 @@ services:
       EMAIL_TO: ${EMAIL_TO:-}
     volumes:
       - ./data:/app/data
-      - ${PROJECT_DIR:-.}:/app/project:ro
+      - ${WORKSPACE:-.}:/app/workspace:ro
       - ./claudear.toml:/app/claudear.toml:ro
       # Cache embedding models between container restarts
       - embedding_cache:/home/appuser/.cache/fastembed
