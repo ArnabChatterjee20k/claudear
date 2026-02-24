@@ -9,7 +9,7 @@ use crate::config::ConfigBuilder;
 use crate::db::{DbAccess, E2eDb};
 use crate::{daemon, wait};
 use anyhow::{Context, Result};
-use claudear::scm::PostReviewAction;
+use claudear::scm::{InlineReviewComment, PostReviewAction};
 use std::time::Duration;
 
 const PORT: u16 = 3150;
@@ -268,11 +268,30 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
 
     tracing::info!(pr_url = %pr_url, pr_number, "PR created");
 
+    // Verify PR exists on the SCM
+    {
+        let branch = ctx
+            .scm
+            .get_pr_branch(ctx.repo, pr_number)
+            .await
+            .unwrap_or_default();
+        if branch.is_empty() {
+            tracing::warn!(pr_number, "PR branch is empty — PR may not exist on SCM");
+        } else {
+            tracing::info!(pr_number, branch = %branch, "PR verified on SCM");
+        }
+    }
+
     tracing::info!("S1-E: Posting review comment");
 
     if let Some(reviewer_token) = ctx.reviewer_token {
         // Build a reviewer SCM client
         let reviewer_scm = build_reviewer_scm(ctx.scm_name, reviewer_token)?;
+
+        // Snapshot execution count before posting review
+        let exec_count_before = db
+            .count("SELECT COUNT(*) FROM claude_executions")
+            .unwrap_or(0);
 
         reviewer_scm
             .post_review(
@@ -284,8 +303,102 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             .await
             .context("post review comment")?;
 
+        // Wait for Claudear to process the review and spawn a new execution
+        tracing::info!("S1-E: Waiting for Claudear to process review comment");
+        wait::wait_for(
+            "new claude_execution after review comment",
+            ctx.timeout(),
+            ctx.poll_interval(),
+            || async {
+                Ok(db
+                    .count("SELECT COUNT(*) FROM claude_executions")
+                    .unwrap_or(0)
+                    > exec_count_before)
+            },
+        )
+        .await?;
+
+        tracing::info!("S1-E2: Posting review with inline comments (no @claudear tag)");
+
+        let exec_count_before = db
+            .count("SELECT COUNT(*) FROM claude_executions")
+            .unwrap_or(0);
+
+        // Post a review with file-level inline comments that do NOT contain
+        // the trigger tag. These should still be processed because inline
+        // comments (pull_request_review_id is set) bypass the trigger filter.
+        reviewer_scm
+            .post_review_with_comments(
+                ctx.repo,
+                pr_number,
+                PostReviewAction::Comment,
+                "",
+                &[InlineReviewComment {
+                    path: "README.md".to_string(),
+                    body: "Consider making this section more descriptive.".to_string(),
+                    position: None, // defaults to position 1 in the diff
+                }],
+            )
+            .await
+            .context("post review with inline comments")?;
+
+        tracing::info!("S1-E2: Waiting for Claudear to process inline comment review");
+        wait::wait_for(
+            "new claude_execution after inline comment review",
+            ctx.timeout(),
+            ctx.poll_interval(),
+            || async {
+                Ok(db
+                    .count("SELECT COUNT(*) FROM claude_executions")
+                    .unwrap_or(0)
+                    > exec_count_before)
+            },
+        )
+        .await?;
+
+        tracing::info!("S1-E3: Posting review with inline comments (with @claudear tag)");
+
+        let exec_count_before = db
+            .count("SELECT COUNT(*) FROM claude_executions")
+            .unwrap_or(0);
+
+        // Post a review with inline comments that DO contain the trigger tag.
+        // These are actionable via both paths: pull_request_review_id bypass
+        // AND trigger match.
+        reviewer_scm
+            .post_review_with_comments(
+                ctx.repo,
+                pr_number,
+                PostReviewAction::Comment,
+                "",
+                &[InlineReviewComment {
+                    path: "README.md".to_string(),
+                    body: "@claudear please also add the author name.".to_string(),
+                    position: None,
+                }],
+            )
+            .await
+            .context("post review with inline comments (with trigger)")?;
+
+        tracing::info!("S1-E3: Waiting for Claudear to process triggered inline comment review");
+        wait::wait_for(
+            "new claude_execution after triggered inline comment review",
+            ctx.timeout(),
+            ctx.poll_interval(),
+            || async {
+                Ok(db
+                    .count("SELECT COUNT(*) FROM claude_executions")
+                    .unwrap_or(0)
+                    > exec_count_before)
+            },
+        )
+        .await?;
+
         tracing::info!("S1-F: Posting request_changes review");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let exec_count_before = db
+            .count("SELECT COUNT(*) FROM claude_executions")
+            .unwrap_or(0);
 
         match reviewer_scm
             .post_review(
@@ -297,8 +410,20 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             .await
         {
             Ok(()) => {
-                // Wait for the agent to process the review feedback
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                // Wait for Claudear to process the changes request
+                tracing::info!("S1-F: Waiting for Claudear to process requested changes");
+                wait::wait_for(
+                    "new claude_execution after request_changes",
+                    ctx.timeout(),
+                    ctx.poll_interval(),
+                    || async {
+                        Ok(db
+                            .count("SELECT COUNT(*) FROM claude_executions")
+                            .unwrap_or(0)
+                            > exec_count_before)
+                    },
+                )
+                .await?;
             }
             Err(e) => {
                 // GitHub returns 422 when requesting changes on your own PR
@@ -340,18 +465,47 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     .await?;
 
     tracing::info!("S1-J: Verifying learning tables");
+
+    let esc_id = issue_id.replace('\'', "''");
+
     db.assert_min_count(
         "fix_attempts",
         &format!(
-            "SELECT COUNT(*) FROM fix_attempts WHERE issue_id = '{}'",
-            issue_id.replace('\'', "''")
+            "SELECT COUNT(*) FROM fix_attempts WHERE issue_id = '{esc_id}'"
         ),
         1,
     )?;
 
+    // We expect at least 5 executions: initial PR + review comment + inline
+    // comment (no trigger) + inline comment (with trigger) + request_changes.
     db.assert_min_count(
         "claude_executions",
         "SELECT COUNT(*) FROM claude_executions",
+        5,
+    )?;
+
+    // PR reviews should be recorded for the review steps
+    db.assert_min_count(
+        "pr_reviews",
+        "SELECT COUNT(*) FROM pr_reviews",
+        1,
+    )?;
+
+    // Regression watch was created (verified above, but also check the table)
+    db.assert_min_count(
+        "regression_watches for issue",
+        &format!(
+            "SELECT COUNT(*) FROM regression_watches WHERE issue_id = '{esc_id}'"
+        ),
+        1,
+    )?;
+
+    // Issues table should have the issue stored
+    db.assert_min_count(
+        "issues table",
+        &format!(
+            "SELECT COUNT(*) FROM issues WHERE issue_id = '{esc_id}'"
+        ),
         1,
     )?;
 

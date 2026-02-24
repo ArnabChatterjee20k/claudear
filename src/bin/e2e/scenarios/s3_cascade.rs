@@ -161,6 +161,20 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
 
     tracing::info!(pr_url = %pr_url_1, pr_number = pr_number_1, "PR created on repo-1");
 
+    // Verify PR exists on the SCM
+    {
+        let branch = ctx
+            .scm
+            .get_pr_branch(ctx.repo, pr_number_1)
+            .await
+            .unwrap_or_default();
+        if branch.is_empty() {
+            tracing::warn!(pr_number = pr_number_1, "PR branch is empty — repo-1 PR may not exist on SCM");
+        } else {
+            tracing::info!(pr_number = pr_number_1, branch = %branch, "Repo-1 PR verified on SCM");
+        }
+    }
+
     tracing::info!("S3-E: Merging PR on repo-1");
     ctx.scm
         .merge_pr(ctx.repo, pr_number_1)
@@ -211,6 +225,20 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         pr_number = merge_cascade_pr_number,
         "Merge-cascade PR created on repo-2"
     );
+
+    // Verify merge-cascade PR exists on the SCM
+    {
+        let branch = ctx
+            .scm
+            .get_pr_branch(repo2, merge_cascade_pr_number)
+            .await
+            .unwrap_or_default();
+        if branch.is_empty() {
+            tracing::warn!(pr_number = merge_cascade_pr_number, "PR branch is empty — merge-cascade PR may not exist on SCM");
+        } else {
+            tracing::info!(pr_number = merge_cascade_pr_number, branch = %branch, "Merge-cascade PR verified on SCM");
+        }
+    }
 
     // Merge the cascade PR
     tracing::info!("S3-G: Merging merge-cascade PR on repo-2");

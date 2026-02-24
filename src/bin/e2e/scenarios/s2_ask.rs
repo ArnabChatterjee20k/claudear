@@ -104,22 +104,17 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         _ => {}
     }
 
-    // Configure notifier for the ask backend
-    match ctx.ask_name {
-        "slack" => {
-            if let (Ok(bot_token), Ok(channel_id)) = (
-                std::env::var("CLAUDEAR_E2E_SLACK_BOT_TOKEN"),
-                std::env::var("CLAUDEAR_E2E_SLACK_CHANNEL_ID"),
-            ) {
-                builder = builder.slack_notifier(&bot_token, &channel_id);
-            }
+    // Configure notifier for the ask backend.
+    // Discord: no explicit notifier config needed — discord_merged() pulls bot_token
+    // + channel_id from issues.discord, so send() uses the bot path automatically.
+    // This matches the real-world pattern: webhook posts issues, bot sends notifications.
+    if ctx.ask_name == "slack" {
+        if let (Ok(bot_token), Ok(channel_id)) = (
+            std::env::var("CLAUDEAR_E2E_SLACK_BOT_TOKEN"),
+            std::env::var("CLAUDEAR_E2E_SLACK_CHANNEL_ID"),
+        ) {
+            builder = builder.slack_notifier(&bot_token, &channel_id);
         }
-        "discord" => {
-            if let Ok(webhook_url) = std::env::var("CLAUDEAR_E2E_DISCORD_WEBHOOK_URL") {
-                builder = builder.discord_notifier(&webhook_url);
-            }
-        }
-        _ => {}
     }
 
     let config_path = builder.write_to(tmp_dir.path(), "s2")?;
@@ -166,6 +161,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     let issue_msg_content =
         "[E2E-S2] Please add a hello world comment to README.md in the test repo";
     let issue_msg_id = ask.post_issue_message(issue_msg_content).await?;
+    let t_issue_posted = std::time::Instant::now();
     tracing::info!(msg_id = %issue_msg_id, "Posted issue message");
 
     tracing::info!("S2-C: Waiting for detection");
@@ -194,12 +190,14 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         .await
         .context("poll for ask question")?;
 
+    let t_question_detected = std::time::Instant::now();
     tracing::info!(question_id = %question_id, "Got ask question");
 
     tracing::info!("S2-E: Replying to question");
     ask.reply_to_question(&question_id, "none")
         .await
         .context("reply to question")?;
+    let t_reply_sent = std::time::Instant::now();
 
     tracing::info!("S2-F: Waiting for PR");
 
@@ -243,7 +241,36 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         cleanup.track_branch(ctx.repo, &pr_branch);
     }
 
+    let t_pr_created = std::time::Instant::now();
     tracing::info!(pr_url = %pr_url, pr_number, "PR created");
+
+    // Verify PR exists on the SCM
+    if pr_branch.is_empty() {
+        tracing::warn!(pr_number, "PR branch is empty — PR may not exist on SCM");
+    } else {
+        tracing::info!(pr_number, branch = %pr_branch, "PR verified on SCM");
+    }
+
+    // Verify timestamp ordering: issue posted < question < reply < PR
+    assert!(
+        t_issue_posted < t_question_detected,
+        "T1 (issue posted) must precede T2 (question detected)"
+    );
+    assert!(
+        t_question_detected < t_reply_sent,
+        "T2 (question detected) must precede T3 (reply sent)"
+    );
+    assert!(
+        t_reply_sent < t_pr_created,
+        "T3 (reply sent) must precede T4 (PR created)"
+    );
+    tracing::info!(
+        t1_issue_ms = t_issue_posted.elapsed().as_millis() as u64,
+        t2_question_ms = t_question_detected.elapsed().as_millis() as u64,
+        t3_reply_ms = t_reply_sent.elapsed().as_millis() as u64,
+        t4_pr_ms = t_pr_created.elapsed().as_millis() as u64,
+        "Timestamp ordering verified: T1 < T2 < T3 < T4"
+    );
 
     // Discord/Slack sources don't have native labels, but regression watch
     // creation checks is_bug() which requires the "bug" label.
@@ -324,6 +351,44 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         source_name
     ))?;
 
+    // Verify DB state after regression simulation: status='failed', retry_count=0, no PR
+    {
+        let status = db.query(&format!(
+            "SELECT status FROM fix_attempts WHERE source='{}' AND issue_id='{esc_msg_id}' LIMIT 1",
+            source_name
+        ))?;
+        let status = status.trim();
+        assert!(
+            status == "failed",
+            "Expected status='failed' after regression sim, got '{}'",
+            status
+        );
+
+        let retry_count = db.query(&format!(
+            "SELECT retry_count FROM fix_attempts WHERE source='{}' AND issue_id='{esc_msg_id}' LIMIT 1",
+            source_name
+        ))?;
+        let retry_count = retry_count.trim();
+        assert!(
+            retry_count == "0",
+            "Expected retry_count=0 after regression sim, got '{}'",
+            retry_count
+        );
+
+        let pr_check = db.query(&format!(
+            "SELECT COALESCE(pr_url, '') FROM fix_attempts WHERE source='{}' AND issue_id='{esc_msg_id}' LIMIT 1",
+            source_name
+        ))?;
+        let pr_check = pr_check.trim();
+        assert!(
+            pr_check.is_empty(),
+            "Expected pr_url=NULL after regression sim, got '{}'",
+            pr_check
+        );
+
+        tracing::info!("DB state verified: status=failed, retry_count=0, pr_url=NULL");
+    }
+
     // 8. Reset main on GitHub to pre-merge state (remove squash-merged changes)
     //    This prevents merge conflicts when Claude creates the retry PR.
     //    Using a revert commit would leave history that confuses Claude into thinking
@@ -377,7 +442,26 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     };
 
     daemon::wait_healthy(&handle, PORT, Duration::from_secs(30)).await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Wait for repo discovery to confirm bind mount is working
+    tracing::info!("Waiting for repo discovery after restart");
+    wait::wait_for_log_message(
+        handle.log_path(),
+        "Scanning for repositories",
+        Duration::from_secs(60),
+    )
+    .await
+    .context("wait for repo scanning after restart")?;
+
+    // Wait for the retry manager to find our failed attempt
+    tracing::info!("Waiting for retry manager to pick up failed attempt");
+    wait::wait_for_log_message(
+        handle.log_path(),
+        "Processing ready retries",
+        Duration::from_secs(60),
+    )
+    .await
+    .context("wait for retry processing after restart")?;
 
     // The retry will also trigger an ask question (same instructions). Poll for it
     // and reply before waiting for the retry PR.
@@ -421,6 +505,23 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     let retry_pr_url = retry_pr_url.trim().to_string();
 
     if !retry_pr_url.is_empty() {
+        // Verify retry DB state: retry_count >= 1 and new PR differs from original
+        let retry_count_str = db.query(&format!(
+            "SELECT retry_count FROM fix_attempts WHERE source='{}' AND issue_id='{esc_msg_id}' LIMIT 1",
+            source_name
+        ))?;
+        let retry_count_val: u32 = retry_count_str.trim().parse().unwrap_or(0);
+        assert!(
+            retry_count_val >= 1,
+            "Expected retry_count >= 1 after retry, got {}",
+            retry_count_val
+        );
+        assert_ne!(
+            retry_pr_url, pr_url,
+            "Retry PR URL should differ from original"
+        );
+        tracing::info!(retry_count = retry_count_val, "Retry DB state verified");
+
         let retry_pr_number = ctx
             .scm
             .parse_pr_number(&retry_pr_url)
@@ -428,8 +529,14 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
 
         cleanup.track_pr(ctx.repo, retry_pr_number);
 
-        if let Ok(branch) = ctx.scm.get_pr_branch(ctx.repo, retry_pr_number).await {
-            cleanup.track_branch(ctx.repo, &branch);
+        let retry_pr_branch = ctx
+            .scm
+            .get_pr_branch(ctx.repo, retry_pr_number)
+            .await
+            .unwrap_or_default();
+        if !retry_pr_branch.is_empty() {
+            cleanup.track_branch(ctx.repo, &retry_pr_branch);
+            tracing::info!(pr_number = retry_pr_number, branch = %retry_pr_branch, "Retry PR verified on SCM");
         }
 
         tracing::info!(retry_pr_url = %retry_pr_url, retry_pr_number, "Retry PR created");

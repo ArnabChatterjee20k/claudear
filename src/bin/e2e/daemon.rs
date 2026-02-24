@@ -114,7 +114,7 @@ fn get_keychain_oauth_token() -> Option<String> {
 /// When `reset_volume` is true the named volume is destroyed and recreated so
 /// the daemon starts with a clean database.  Pass `false` when restarting
 /// mid-scenario to preserve DB state.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn start_docker(
     image: &str,
     config_path: &Path,
@@ -238,6 +238,32 @@ pub fn start_docker(
                 .stderr(log_stderr)
                 .status();
         });
+    }
+
+    // Verify repos bind mount is accessible inside the container
+    if repos_dir.is_some() {
+        let check = Command::new("docker")
+            .args(["exec", &container_id, "test", "-d", "/app/repos"])
+            .output();
+        match check {
+            Ok(output) if !output.status.success() => {
+                tracing::warn!(
+                    container = %container_id,
+                    repos_dir = ?repos_dir,
+                    "Repos bind mount verification failed: /app/repos not accessible inside container"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    container = %container_id,
+                    error = %e,
+                    "Failed to verify repos bind mount"
+                );
+            }
+            _ => {
+                tracing::info!(container = %container_id, "Verified /app/repos mount");
+            }
+        }
     }
 
     tracing::info!(container = %container_id, port, label, "Started Docker container");
