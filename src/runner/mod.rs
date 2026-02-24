@@ -58,9 +58,13 @@ pub trait AgentRunner: Send + Sync {
 
 /// Best-effort detection for rate limit failures (generic, not provider-specific).
 pub fn is_rate_limit_error(message: &str) -> bool {
-    // Claude Code streams `rate_limit_event` JSON with `"status":"allowed"` as
-    // informational notifications. These are NOT actual rate limit errors.
-    if message.contains("rate_limit_event") && message.contains("\"status\":\"allowed\"") {
+    // Claude Code streams `rate_limit_event` JSON with informational statuses
+    // ("allowed", "allowed_warning") that are NOT actual rate limit errors.
+    // Only "exceeded" or similar would be a real block.
+    if message.contains("rate_limit_event")
+        && (message.contains("\"status\":\"allowed\"")
+            || message.contains("\"status\":\"allowed_warning\""))
+    {
         return false;
     }
     let lower = message.to_lowercase();
@@ -88,11 +92,11 @@ fn is_rate_limit_error_lower(lower: &str) -> bool {
     contains_standalone_429(lower)
 }
 
-/// Check if "429" appears as a standalone token, not embedded in a longer
-/// alphanumeric/hex sequence (e.g. UUIDs like `4299-a2e5`).
+/// Check if "429" appears as a standalone HTTP status code token, not embedded
+/// in a longer alphanumeric/hex sequence (e.g. UUIDs like `4299-a2e5`) and not
+/// as a JSON numeric value (e.g. `"tokens":429`).
 fn contains_standalone_429(s: &str) -> bool {
     let bytes = s.as_bytes();
-    let _needle = b"429";
     let mut start = 0;
     while start + 3 <= bytes.len() {
         if let Some(pos) = s[start..].find("429") {
@@ -100,7 +104,24 @@ fn contains_standalone_429(s: &str) -> bool {
             let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
             let after_ok = abs + 3 >= bytes.len() || !bytes[abs + 3].is_ascii_alphanumeric();
             if before_ok && after_ok {
-                return true;
+                // Reject JSON numeric values like `"tokens":429` or `"tokens": 429`.
+                // We look for `"<key>":429` or `"<key>": 429` — the `"` before the
+                // colon distinguishes JSON from plain text like `status:429`.
+                let is_json_value = {
+                    // Find the colon position: immediately before 429 or with a space gap.
+                    let colon_pos = if abs > 0 && bytes[abs - 1] == b':' {
+                        Some(abs - 1)
+                    } else if abs > 1 && bytes[abs - 1] == b' ' && bytes[abs - 2] == b':' {
+                        Some(abs - 2)
+                    } else {
+                        None
+                    };
+                    // Only reject if the colon is preceded by `"` (JSON key end).
+                    colon_pos.is_some_and(|cp| cp > 0 && bytes[cp - 1] == b'"')
+                };
+                if !is_json_value {
+                    return true;
+                }
             }
             start = abs + 1;
         } else {
@@ -374,6 +395,43 @@ mod tests {
     fn test_429_in_claude_stream_json() {
         // Real false positive from Claude Code NDJSON stream
         let json = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_xyz","type":"tool_result","content":"ok"}]},"session_id":"1a814bc2-22af-42a1-906a-9c3e03e9dd8c","uuid":"26355e0a-810a-4299-a2e5-4cea5f762d2e","tool_use_result":"ok"}"#;
+        assert!(!is_rate_limit_error(json));
+    }
+
+    #[test]
+    fn test_429_not_in_json_token_counts() {
+        // Real false positive: Claude Code streams JSON with token counts that
+        // happen to be 429 (e.g. "cache_creation_input_tokens":429).
+        assert!(!is_rate_limit_error(
+            r#"{"input_tokens":429,"output_tokens":100}"#
+        ));
+        assert!(!is_rate_limit_error(
+            r#"{"cache_creation_input_tokens":429}"#
+        ));
+        // With space after colon
+        assert!(!is_rate_limit_error(
+            r#"{"tokens": 429}"#
+        ));
+        // But plain "status:429" (no quote before colon) IS a rate limit
+        assert!(is_rate_limit_error("status:429"));
+        // And real HTTP 429 in JSON error messages should still match
+        assert!(is_rate_limit_error(
+            r#"{"error":"HTTP 429 Too Many Requests"}"#
+        ));
+    }
+
+    #[test]
+    fn test_rate_limit_event_allowed_warning_not_error() {
+        // Claude Code streams rate_limit_event with "allowed_warning" when approaching
+        // the limit but still allowed. This is informational, NOT an actual error.
+        let json = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1772096400,"rateLimitType":"seven_day","utilization":0.81,"isUsingOverage":false,"surpassedThreshold":0.75},"uuid":"addd358a-c64f-48cd-b9a2-97af382e0fd6","session_id":"f450b721-71e2-4d8f-8a2d-07827df35f1d"}"#;
+        assert!(!is_rate_limit_error(json));
+    }
+
+    #[test]
+    fn test_rate_limit_event_allowed_not_error() {
+        // "allowed" status is also informational
+        let json = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","utilization":0.5}}"#;
         assert!(!is_rate_limit_error(json));
     }
 }
