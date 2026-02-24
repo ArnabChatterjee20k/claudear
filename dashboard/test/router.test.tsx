@@ -1,3 +1,4 @@
+import { type JSX } from "react";
 import { describe, test, expect, afterEach } from "bun:test";
 import { render, screen, cleanup, act } from "@testing-library/react";
 import { Router, RouterProvider, useRouter } from "../src/router";

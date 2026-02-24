@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, type JSX } from 'react'
 import { Router, RouterProvider } from './router'
 import { AppShell } from './components/layout/app-shell'
 import { AuthProvider, useAuth } from './lib/auth'

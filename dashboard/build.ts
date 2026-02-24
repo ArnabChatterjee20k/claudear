@@ -49,7 +49,7 @@ for (const file of readdirSync(assetsDir)) {
 const tailwindResult = Bun.spawnSync({
   cmd: [
     "bunx",
-    "tailwindcss",
+    "@tailwindcss/cli",
     "-i",
     join(srcdir, "src/index.css"),
     "-o",

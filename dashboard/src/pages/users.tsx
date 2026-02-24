@@ -36,6 +36,7 @@ export default function UsersPage() {
 
   return (
     <div className="space-y-6">
+      <title>Users — Claudear</title>
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-bold">Users</h2>
         <button

@@ -48,6 +48,28 @@ if (!("ResizeObserver" in globalThis)) {
   globalThis.ResizeObserver = ResizeObserverStub as unknown as typeof ResizeObserver;
 }
 
+// Stub WebSocket so tests don't attempt real connections (happy-dom v20+ throws on failure).
+class WebSocketStub extends EventTarget {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+  readonly CONNECTING = 0;
+  readonly OPEN = 1;
+  readonly CLOSING = 2;
+  readonly CLOSED = 3;
+  readyState = WebSocketStub.CONNECTING;
+  url: string;
+  onopen: ((ev: Event) => void) | null = null;
+  onclose: ((ev: CloseEvent) => void) | null = null;
+  onmessage: ((ev: MessageEvent) => void) | null = null;
+  onerror: ((ev: Event) => void) | null = null;
+  close() { this.readyState = WebSocketStub.CLOSED; this.onclose?.(new CloseEvent("close")); }
+  send() {}
+  constructor(url: string | URL) { super(); this.url = String(url); }
+}
+globalThis.WebSocket = WebSocketStub as unknown as typeof WebSocket;
+
 // happy-dom does not update window.location when pushState/replaceState are called.
 // Patch them so the router (and tests) can read window.location.pathname after navigation.
 const origPush = window.history.pushState.bind(window.history);

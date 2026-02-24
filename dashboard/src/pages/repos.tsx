@@ -71,7 +71,7 @@ function IndexingProgressBar({ progress }: { progress: IndexingProgress }) {
 function useIndexingProgress() {
   const [progress, setProgress] = useState<IndexingProgress | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>()
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
   const mountedRef = useRef(true)
   const lastStatusRef = useRef<string | null>(null)
 
@@ -135,6 +135,16 @@ export default function ReposPage() {
     fetchDependencies,
     { refreshInterval: 60000 },
   )
+
+  const reposData = Array.isArray(repos) ? repos : null
+  const depsData = Array.isArray(deps) ? deps : null
+  const statsData =
+    stats &&
+    typeof stats === 'object' &&
+    typeof (stats as Partial<IndexStats>).repo_count === 'number' &&
+    typeof (stats as Partial<IndexStats>).file_count === 'number'
+      ? stats
+      : null
 
   const indexingProgress = useIndexingProgress()
 
@@ -219,25 +229,25 @@ export default function ReposPage() {
         <StatsGridSkeleton count={3} className="md:grid-cols-3" />
       )}
 
-      {stats && (
+      {statsData && (
         <div className="grid gap-4 md:grid-cols-3">
           <StatsCard
             title="Total Repos"
-            value={stats.repo_count}
+            value={statsData.repo_count}
             icon={<Database className="h-4 w-4 text-primary" />}
             description="Indexed repositories"
           />
           <StatsCard
             title="Files Indexed"
-            value={formatNumber(stats.file_count)}
+            value={formatNumber(statsData.file_count)}
             icon={<FileText className="h-4 w-4 text-green-500" />}
             description="Total indexed files"
           />
           <StatsCard
             title="Last Indexed At"
             value={
-              stats.last_indexed_at
-                ? formatDate(stats.last_indexed_at)
+              statsData.last_indexed_at
+                ? formatDate(statsData.last_indexed_at)
                 : '--'
             }
             icon={<Clock className="h-4 w-4 text-yellow-500" />}
@@ -251,10 +261,10 @@ export default function ReposPage() {
           activeTab === 'repos' ? (
             <>
               {reposLoading && <BlockSkeleton className="h-48 w-full" />}
-              {repos && (
+              {reposData && (
                 <DataTable
                   columns={repoColumns}
-                  data={repos}
+                  data={reposData}
                   keyFn={row => row.id}
                   emptyMessage="No repositories indexed yet"
                   onRowClick={row => setSelectedRepo(row)}
@@ -264,10 +274,10 @@ export default function ReposPage() {
           ) : (
             <>
               {depsLoading && <BlockSkeleton className="h-32 w-full" />}
-              {deps && (
+              {depsData && (
                 <DataTable
                   columns={depColumns}
-                  data={deps}
+                  data={depsData}
                   keyFn={row => row.id}
                   emptyMessage="No dependencies found. Dependencies are discovered when indexed repos import or depend on each other."
                 />

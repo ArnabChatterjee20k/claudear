@@ -38,14 +38,13 @@ export default function ExperimentsPage() {
   const [savingEdit, setSavingEdit] = useState(false)
   const [deactivatingId, setDeactivatingId] = useState<number | null>(null)
 
+  const experiments = Array.isArray(data) ? data : []
   const groups: Record<string, PromptExperiment[]> = {}
-  if (data) {
-    for (const exp of data) {
-      if (!groups[exp.experiment_name]) {
-        groups[exp.experiment_name] = []
-      }
-      groups[exp.experiment_name].push(exp)
+  for (const exp of experiments) {
+    if (!groups[exp.experiment_name]) {
+      groups[exp.experiment_name] = []
     }
+    groups[exp.experiment_name].push(exp)
   }
 
   const groupNames = Object.keys(groups).sort()
@@ -273,7 +272,7 @@ export default function ExperimentsPage() {
 
       {isLoading && <CardStackSkeleton count={3} itemClassName="h-48 w-full" />}
 
-      {data && groupNames.length === 0 && (
+      {Array.isArray(data) && groupNames.length === 0 && (
         <EmptyState message="No experiments recorded yet" />
       )}
 

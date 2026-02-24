@@ -60,7 +60,7 @@ export default function ActivityPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Activity Log" description="Real-time event stream" />
+      <PageHeader title="Activity Log" description="Live event stream" />
 
       <div className="flex items-center gap-4">
         <Select

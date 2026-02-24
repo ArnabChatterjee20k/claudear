@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, createContext, useContext } from 'react'
+import { useState, useEffect, useCallback, createContext, useContext, type JSX } from 'react'
 import { Sentry } from './lib/sentry'
 
 const RouterContext = createContext<{ path: string; navigate: (path: string) => void }>({
@@ -34,7 +34,7 @@ export function useRouter() {
 
 export function RouterProvider({ children }: { children: React.ReactNode }) {
   const value = useHistory()
-  return <RouterContext.Provider value={value}>{children}</RouterContext.Provider>
+  return <RouterContext value={value}>{children}</RouterContext>
 }
 
 export function Router({
