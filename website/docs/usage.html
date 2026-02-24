@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Usage &amp; Workflows · Claudear Docs</title>
-  <meta name="description" content="Daemon control, polling, webhooks, manual triggers, retries, reports, and diagnostics.">
+  <title>How it works · Claudear Docs</title>
+  <meta name="description" content="The fix lifecycle, retries, AI questions, and day-to-day workflows.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -46,152 +46,178 @@
   <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
     <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
       <nav>
-        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Start</div>
-        <a href="./index.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Overview</a>
-        <a href="./getting-started.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Getting Started</a>
-        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Core</div>
-        <a href="./configuration.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
-        <a href="./usage.html" class="block text-[13px] text-heading bg-accent/10 border border-accent/20 px-2 py-1.5 rounded-md mb-0.5 transition-colors">Usage</a>
-        <a href="./integrations.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Integrations</a>
-        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Product</div>
-        <a href="./dashboard.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
-        <a href="./operations.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Operations</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Get started</div>
+        <a href="./index.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Quickstart</a>
+        <a href="./getting-started.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Recipes</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Guides</div>
+        <a href="./integrations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Connect your tools</a>
+        <a href="./usage.html" class="text-heading bg-accent/10 border border-accent/20 block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">How it works</a>
+        <a href="./regression.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Regressions</a>
+        <a href="./cascading.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Cascading</a>
+        <a href="./learning.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Learning</a>
+        <a href="./prioritisation.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Prioritisation</a>
+        <a href="./repositories.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Repositories</a>
+        <a href="./dashboard.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Production</div>
+        <a href="./operations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Deploy</a>
+        <a href="./configuration.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
         <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Reference</div>
-        <a href="./cli-reference.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI Reference</a>
-        <a href="./development.html" class="block text-[13px] text-body hover:text-heading hover:bg-white/[0.03] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
+        <a href="./cli-reference.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI commands</a>
+        <a href="./development.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
       </nav>
     </aside>
 
     <main class="flex-1 min-w-0 px-8 py-8 lg:px-12 lg:py-10">
       <div class="mb-8">
-        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Core</p>
-        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">Usage &amp; Workflows</h1>
-        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">Daemon control, polling, webhooks, manual triggers, retries, reports, and diagnostics.</p>
+        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Guides</p>
+        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">How it works</h1>
+        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">The fix lifecycle, retries, AI questions, and day-to-day workflows.</p>
       </div>
       <article class="markdown max-w-[780px]" data-docs-markdown>
-        <h2 id="commands-at-a-glance"><a class="anchor-link" href="#commands-at-a-glance" aria-label="Link to Commands at a glance">#</a>Commands at a glance</h2>
-        <table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody><tr><td><code>claudear start</code></td><td>Start the watcher daemon with all configured services</td></tr><tr><td><code>claudear stop</code></td><td>Stop the running watcher daemon</td></tr><tr><td><code>claudear status</code></td><td>Show the status of the running daemon</td></tr><tr><td><code>claudear pause</code></td><td>Pause the running watcher (stops processing new issues)</td></tr><tr><td><code>claudear resume</code></td><td>Resume a paused watcher</td></tr><tr><td><code>claudear activity</code></td><td>Show recent activity from the daemon</td></tr><tr><td><code>claudear seed</code></td><td>Mark all existing issues as seen (run this first!)</td></tr><tr><td><code>claudear dry-run</code></td><td>Show what would be processed without running Claude</td></tr><tr><td><code>claudear poll</code></td><td>Start polling all enabled sources (foreground, no daemon)</td></tr><tr><td><code>claudear webhook</code></td><td>Start webhook server for real-time events</td></tr><tr><td><code>claudear trigger</code></td><td>Manually trigger a fix for an issue</td></tr><tr><td><code>claudear reset</code></td><td>Reset a failed attempt to allow retry</td></tr><tr><td><code>claudear stats</code></td><td>Show statistics about fix attempts</td></tr><tr><td><code>claudear sources</code></td><td>List configured sources</td></tr><tr><td><code>claudear dashboard</code></td><td>Start the dashboard API server</td></tr><tr><td><code>claudear repos</code></td><td>Repository management commands</td></tr><tr><td><code>claudear prs</code></td><td>Pull request management commands</td></tr><tr><td><code>claudear retries</code></td><td>Retry management commands</td></tr><tr><td><code>claudear inference</code></td><td>Inference analytics and management</td></tr><tr><td><code>claudear report</code></td><td>Report generation and scheduling</td></tr><tr><td><code>claudear diag</code></td><td>Diagnostic commands for debugging</td></tr><tr><td><code>claudear users</code></td><td>User management commands</td></tr></tbody></table>
+        <h2 id="the-fix-pipeline"><a class="anchor-link" href="#the-fix-pipeline" aria-label="Link to The fix pipeline">#</a>The fix pipeline</h2>
+        <p>Every issue Claudear picks up moves through a state machine. The path from detection to resolution looks like this:</p>
+        <div style="overflow-x:auto;margin:1.5em 0">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 260" style="max-width:820px;width:100%;height:auto" role="img" aria-label="Fix pipeline state diagram">
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 3.5 L0 7z" fill="#71717A"/></marker>
+              <marker id="arrow-green" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 3.5 L0 7z" fill="#22C55E"/></marker>
+              <marker id="arrow-amber" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 3.5 L0 7z" fill="#F59E0B"/></marker>
+              <marker id="arrow-red" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 3.5 L0 7z" fill="#EF4444"/></marker>
+            </defs>
+            <!-- Nodes -->
+            <!-- Pending -->
+            <rect x="16" y="40" width="110" height="42" rx="8" fill="#111113" stroke="#27272A" stroke-width="1.5"/>
+            <text x="71" y="66" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#A1A1AA">Pending</text>
+            <!-- Success -->
+            <rect x="196" y="40" width="110" height="42" rx="8" fill="#111113" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.4"/>
+            <text x="251" y="66" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#22C55E">Success</text>
+            <!-- Merged -->
+            <rect x="376" y="40" width="110" height="42" rx="8" fill="#111113" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.4"/>
+            <text x="431" y="66" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#22C55E">Merged</text>
+            <!-- Resolved -->
+            <rect x="556" y="40" width="110" height="42" rx="8" fill="rgba(34,197,94,0.08)" stroke="#22C55E" stroke-width="1.5"/>
+            <text x="611" y="66" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="600" fill="#22C55E">Resolved</text>
+            <!-- Closed -->
+            <rect x="376" y="150" width="110" height="42" rx="8" fill="#111113" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.4"/>
+            <text x="431" y="176" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#F59E0B">Closed</text>
+            <!-- Failed -->
+            <rect x="196" y="150" width="110" height="42" rx="8" fill="#111113" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.4"/>
+            <text x="251" y="176" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" font-weight="500" fill="#EF4444">Failed</text>
+            <!-- Cannot Fix -->
+            <rect x="196" y="210" width="110" height="42" rx="8" fill="rgba(239,68,68,0.06)" stroke="#EF4444" stroke-width="1.5"/>
+            <text x="251" y="236" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" font-weight="600" fill="#EF4444">Cannot Fix</text>
 
-        <h2 id="running-claudear"><a class="anchor-link" href="#running-claudear" aria-label="Link to Running Claudear">#</a>Running Claudear</h2>
-        <p>The recommended way to run Claudear is as a background daemon. It watches your configured sources, processes new issues automatically, and stays running until you tell it to stop.</p>
-        <pre><code class="language-bash"># Start with polling + webhooks + dashboard
-claudear start --poll --port 3100
+            <!-- Edges — happy path -->
+            <line x1="126" y1="61" x2="193" y2="61" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#arrow-green)"/>
+            <line x1="306" y1="61" x2="373" y2="61" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#arrow-green)"/>
+            <line x1="486" y1="61" x2="553" y2="61" stroke="#22C55E" stroke-width="1.5" stroke-opacity="0.5" marker-end="url(#arrow-green)"/>
 
-# Custom poll interval
-claudear start --poll --poll-interval 60000
+            <!-- Pending → Failed -->
+            <line x1="71" y1="82" x2="71" y2="163" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.4" marker-end="url(#arrow-red)"/>
+            <path d="M71 163 L193 171" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.4" fill="none" marker-end="url(#arrow-red)"/>
 
-# Worker-like mode (no webhooks/dashboard)
-claudear start --poll --no-webhooks --no-dashboard</code></pre>
-        <h3 id="control-commands"><a class="anchor-link" href="#control-commands" aria-label="Link to Control commands">#</a>Control commands</h3>
-        <p>Once the daemon is running, you can check on it and control it without restarting:</p>
-        <pre><code class="language-bash">claudear status
-claudear pause
-claudear resume
-claudear activity
-claudear activity 50
-claudear stop</code></pre>
+            <!-- Success → Closed -->
+            <line x1="251" y1="82" x2="251" y2="120" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.4"/>
+            <path d="M251 120 L431 120 L431 147" stroke="#F59E0B" stroke-width="1.5" stroke-opacity="0.4" fill="none" marker-end="url(#arrow-amber)"/>
 
-        <h2 id="foreground-polling"><a class="anchor-link" href="#foreground-polling" aria-label="Link to Foreground polling">#</a>Foreground polling</h2>
-        <p>Runs in your terminal: useful for testing and debugging your setup.</p>
-        <pre><code class="language-bash">claudear poll
-claudear poll 60000
-claudear poll --port 8080</code></pre>
+            <!-- Closed → retry (back to Pending) -->
+            <path d="M376 171 L340 171 L340 130 L50 130 L50 58 L13 58" stroke="#71717A" stroke-width="1.2" stroke-dasharray="5,4" stroke-opacity="0.5" fill="none" marker-end="url(#arrow)"/>
+            <text x="185" y="123" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="10" fill="#71717A" font-style="italic">retry</text>
 
-        <h2 id="webhooks"><a class="anchor-link" href="#webhooks" aria-label="Link to Webhooks">#</a>Webhooks</h2>
-        <p>Webhooks let Claudear react to events instantly instead of waiting for the next poll. You can start a standalone webhook server, or use <code>--setup-webhooks</code> to automatically register webhooks with your providers and start listening.</p>
-        <pre><code class="language-bash">claudear webhook
-claudear webhook --setup-webhooks --base-url https://my-server.example.com:3100</code></pre>
+            <!-- Failed → retry (back to Pending) -->
+            <path d="M196 171 L160 171 L160 130" stroke="#71717A" stroke-width="1.2" stroke-dasharray="5,4" stroke-opacity="0.5" fill="none"/>
+            <!-- (joins the Closed retry path above at y=130) -->
 
-        <h2 id="triggering-fixes-manually"><a class="anchor-link" href="#triggering-fixes-manually" aria-label="Link to Triggering fixes manually">#</a>Triggering fixes manually</h2>
-        <p>Sometimes you want to kick off a fix for a specific issue, or retry one that failed. You can do both from the CLI:</p>
-        <pre><code class="language-bash"># Trigger a fix manually
-claudear trigger linear abc123-def456
-claudear trigger sentry 12345678
+            <!-- Failed → Cannot Fix -->
+            <line x1="251" y1="192" x2="251" y2="207" stroke="#EF4444" stroke-width="1.5" stroke-opacity="0.35" marker-end="url(#arrow-red)"/>
+            <text x="290" y="203" font-family="Inter,system-ui,sans-serif" font-size="10" fill="#71717A" font-style="italic">exhausted</text>
+          </svg>
+        </div>
+        <ul>
+          <li><strong>Pending</strong> &mdash; issue picked up and queued for processing</li>
+          <li><strong>Success</strong> &mdash; AI created a pull request</li>
+          <li><strong>Merged</strong> &mdash; the PR was merged</li>
+          <li><strong>Closed</strong> &mdash; the PR was closed without merging (triggers retry)</li>
+          <li><strong>Failed</strong> &mdash; the attempt failed (triggers retry)</li>
+          <li><strong>Cannot Fix</strong> &mdash; retry budget exhausted; flagged for manual review</li>
+        </ul>
 
-# Reset failed attempt for retry
-claudear reset sentry 12345678
-
-# Visibility helpers
-claudear stats
-claudear sources</code></pre>
-
-        <h2 id="managing-prs-and-retries"><a class="anchor-link" href="#managing-prs-and-retries" aria-label="Link to Managing PRs and retries">#</a>Managing PRs and retries</h2>
-        <p>Track the pull requests Claudear has created, and manage the retry queue for issues that need another attempt.</p>
-        <pre><code class="language-bash"># PR tracking
-claudear prs list
-claudear prs monitor
-claudear prs monitor --continuous
-
-# Retry queues
+        <h2 id="retries"><a class="anchor-link" href="#retries" aria-label="Link to Retries">#</a>Retries</h2>
+        <p>When a fix fails or the PR is closed, Claudear retries with exponential backoff. Configure <code>max_retries</code>, <code>base_delay_ms</code>, and <code>max_delay_ms</code> in <code>[retry]</code>.</p>
+        <pre><code class="language-bash"># List pending retries
 claudear retries list
+
+# Process all due retries now
 claudear retries process</code></pre>
 
-        <h2 id="dashboard"><a class="anchor-link" href="#dashboard" aria-label="Link to Dashboard">#</a>Dashboard</h2>
-        <p>Launch the web dashboard to monitor everything visually.</p>
-        <pre><code class="language-bash">claudear dashboard
-claudear dashboard 8080
-claudear dashboard --dashboard-dir ./dashboard/dist</code></pre>
+        <h2 id="pr-monitoring"><a class="anchor-link" href="#pr-monitoring" aria-label="Link to PR monitoring">#</a>PR monitoring</h2>
+        <p>Claudear polls PR status. When a PR merges, it auto-closes the issue if <code>auto_resolve_on_merge = true</code>.</p>
+        <pre><code class="language-bash"># Show all tracked PRs
+claudear prs list
 
-        <h2 id="reports"><a class="anchor-link" href="#reports" aria-label="Link to Reports">#</a>Reports</h2>
-        <p>Generate summary reports of what Claudear has been doing. Preview them locally, send them to your configured notification channels, or set up a recurring schedule.</p>
-        <pre><code class="language-bash">claudear report preview daily
-claudear report preview weekly
-claudear report send daily
-claudear report schedule --daily --hour 9
-claudear report schedule --daily --weekly --hour 9</code></pre>
+# Continuous monitoring loop
+claudear prs monitor --continuous</code></pre>
 
-        <h2 id="repository-management"><a class="anchor-link" href="#repository-management" aria-label="Link to Repository management">#</a>Repository management</h2>
-        <p>Claudear can discover your repos, track dependencies between them, and show what would be affected by changes.</p>
-        <pre><code class="language-bash">claudear repos discover
-claudear repos discover --paths ~/projects ~/work --save
-claudear repos list
-claudear repos index
-claudear repos stats
-claudear repos sync
-claudear repos search "auth middleware"
-claudear repos link my-lib my-app --dep-type npm
-claudear repos graph
-claudear repos graph --root my-lib
-claudear repos cascade my-lib</code></pre>
+        <h2 id="ai-questions"><a class="anchor-link" href="#ai-questions" aria-label="Link to AI questions">#</a>AI questions</h2>
+        <p>When the AI needs clarification, it sends questions through Discord, Slack, or email. Reply and the fix resumes. Configure timeout and <code>best_effort_on_timeout</code> in <code>[ask]</code>. Claudear remembers previous answers so the same question is not asked twice.</p>
 
-        <h2 id="analytics"><a class="anchor-link" href="#analytics" aria-label="Link to Analytics">#</a>Analytics</h2>
-        <p>See how Claudear is performing: which repos it targets, how confident its decisions are, and whether its choices are correct. You can also provide feedback to help improve future results.</p>
-        <pre><code class="language-bash">claudear inference stats
-claudear inference history
-claudear inference history --limit 50
-claudear inference feedback 42 --correct
-claudear inference feedback 43 --actual-repo my-other-repo</code></pre>
+        <h2 id="workflows"><a class="anchor-link" href="#workflows" aria-label="Link to Day-to-day workflows">#</a>Day-to-day workflows</h2>
+        <div class="workflow-grid">
+          <div class="workflow-card">
+            <h4>Check what's happening</h4>
+            <p><code>claudear status</code>, <code>claudear activity</code>, or open the <a href="./dashboard.html">dashboard</a>.</p>
+          </div>
+          <div class="workflow-card">
+            <h4>Trigger a manual fix</h4>
+            <p><code>claudear trigger linear ABC-123</code> or <code>claudear trigger sentry 12345</code></p>
+          </div>
+          <div class="workflow-card">
+            <h4>Retry a failed fix</h4>
+            <p><code>claudear reset sentry 12345</code> or <code>claudear retries process</code></p>
+          </div>
+          <div class="workflow-card">
+            <h4>Generate a report</h4>
+            <p><code>claudear report preview daily</code> or <code>claudear report send weekly</code></p>
+          </div>
+        </div>
 
-        <h2 id="troubleshooting"><a class="anchor-link" href="#troubleshooting" aria-label="Link to Troubleshooting">#</a>Troubleshooting</h2>
-        <p>If something is not working as expected, these commands help you diagnose the problem. <code>dry-run</code> shows exactly what Claudear would process without actually running any fixes.</p>
-        <pre><code class="language-bash">claudear diag db
-claudear diag release-graph
-claudear diag release-check owner/repo 42 --target owner/target-repo
-claudear diag release-path owner/source-repo owner/target-repo
-claudear dry-run</code></pre>
-
-        <h2 id="getting-started-sequence"><a class="anchor-link" href="#getting-started-sequence" aria-label="Link to Getting started sequence">#</a>Getting started sequence</h2>
-        <ol>
-        <li>Run <code>claudear seed</code> to mark existing issues as seen (so Claudear doesn't re-process your backlog)</li>
-        <li>Run <code>claudear dry-run</code> to preview what would be processed</li>
-        <li>Start the daemon: <code>claudear start --poll</code></li>
-        <li>Enable webhooks for instant response times</li>
-        <li>Turn on reports, regression monitoring, and advanced features as needed</li>
-        </ol>
-        <h3 id="pause-stop"><a class="anchor-link" href="#pause-stop" aria-label="Link to Pause and stop">#</a>Pause and stop</h3>
-        <ul>
-        <li><code>claudear pause</code>: stops picking up new work, keeps the process running so you can resume later</li>
-        <li><code>claudear stop</code>: shuts down the daemon completely</li>
-        </ul>
+        <h2 id="advanced-features"><a class="anchor-link" href="#advanced-features" aria-label="Link to Advanced features">#</a>Advanced features</h2>
+        <div class="recipe-grid">
+          <a href="./regression.html" class="recipe-card group">
+            <h4>Regression monitoring</h4>
+            <p>Watch for errors reappearing after a fix is merged.</p>
+            <span class="text-accent text-xs font-medium group-hover:translate-x-0.5 transition-transform inline-block">&rarr;</span>
+          </a>
+          <a href="./cascading.html" class="recipe-card group">
+            <h4>Cascading fixes</h4>
+            <p>Propagate fixes across dependent repositories automatically.</p>
+            <span class="text-accent text-xs font-medium group-hover:translate-x-0.5 transition-transform inline-block">&rarr;</span>
+          </a>
+          <a href="./learning.html" class="recipe-card group">
+            <h4>Learning from results</h4>
+            <p>Extract knowledge from diffs, Q&amp;A, and reviews to improve future fixes.</p>
+            <span class="text-accent text-xs font-medium group-hover:translate-x-0.5 transition-transform inline-block">&rarr;</span>
+          </a>
+          <a href="./prioritisation.html" class="recipe-card group">
+            <h4>Issue prioritisation</h4>
+            <p>Rank issues by severity, frequency, blast radius, and more.</p>
+            <span class="text-accent text-xs font-medium group-hover:translate-x-0.5 transition-transform inline-block">&rarr;</span>
+          </a>
+          <a href="./repositories.html" class="recipe-card group">
+            <h4>Repository management</h4>
+            <p>Discover, index, search, and manage repo dependencies.</p>
+            <span class="text-accent text-xs font-medium group-hover:translate-x-0.5 transition-transform inline-block">&rarr;</span>
+          </a>
+        </div>
       </article>
-      <div class="grid grid-cols-2 gap-4 mt-12 max-w-[780px]">
-        <a href="./configuration.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
-          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
-          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Configuration</span>
-        </a>
+      <div class="docs-page-nav grid grid-cols-2 gap-4 pt-12 max-w-[780px]">
         <a href="./integrations.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Connect your tools</span>
+        </a>
+        <a href="./dashboard.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
           <span class="text-[11px] uppercase tracking-wider text-muted">Next</span>
-          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Integrations</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Dashboard</span>
         </a>
       </div>
       <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
@@ -208,20 +234,12 @@ claudear dry-run</code></pre>
       </div>
       <div class="toc-scroll">
         <ul class="toc-list">
-        <li class="toc-item" data-toc-text="commands at a glance"><a class="toc-link" data-toc-link href="#commands-at-a-glance" data-target-id="commands-at-a-glance"><span class="toc-link-label">Commands at a glance</span></a></li>
-        <li class="toc-item" data-toc-text="running claudear"><a class="toc-link" data-toc-link href="#running-claudear" data-target-id="running-claudear"><span class="toc-link-label">Running Claudear</span></a></li>
-        <li class="toc-item" data-toc-text="control commands"><a class="toc-link toc-link-sub" data-toc-link href="#control-commands" data-target-id="control-commands"><span class="toc-link-label">Control commands</span></a></li>
-        <li class="toc-item" data-toc-text="foreground polling"><a class="toc-link" data-toc-link href="#foreground-polling" data-target-id="foreground-polling"><span class="toc-link-label">Foreground polling</span></a></li>
-        <li class="toc-item" data-toc-text="webhooks"><a class="toc-link" data-toc-link href="#webhooks" data-target-id="webhooks"><span class="toc-link-label">Webhooks</span></a></li>
-        <li class="toc-item" data-toc-text="triggering fixes manually"><a class="toc-link" data-toc-link href="#triggering-fixes-manually" data-target-id="triggering-fixes-manually"><span class="toc-link-label">Triggering fixes manually</span></a></li>
-        <li class="toc-item" data-toc-text="managing prs and retries"><a class="toc-link" data-toc-link href="#managing-prs-and-retries" data-target-id="managing-prs-and-retries"><span class="toc-link-label">Managing PRs and retries</span></a></li>
-        <li class="toc-item" data-toc-text="dashboard"><a class="toc-link" data-toc-link href="#dashboard" data-target-id="dashboard"><span class="toc-link-label">Dashboard</span></a></li>
-        <li class="toc-item" data-toc-text="reports"><a class="toc-link" data-toc-link href="#reports" data-target-id="reports"><span class="toc-link-label">Reports</span></a></li>
-        <li class="toc-item" data-toc-text="repository management"><a class="toc-link" data-toc-link href="#repository-management" data-target-id="repository-management"><span class="toc-link-label">Repository management</span></a></li>
-        <li class="toc-item" data-toc-text="analytics"><a class="toc-link" data-toc-link href="#analytics" data-target-id="analytics"><span class="toc-link-label">Analytics</span></a></li>
-        <li class="toc-item" data-toc-text="troubleshooting"><a class="toc-link" data-toc-link href="#troubleshooting" data-target-id="troubleshooting"><span class="toc-link-label">Troubleshooting</span></a></li>
-        <li class="toc-item" data-toc-text="getting started sequence"><a class="toc-link" data-toc-link href="#getting-started-sequence" data-target-id="getting-started-sequence"><span class="toc-link-label">Getting started sequence</span></a></li>
-        <li class="toc-item" data-toc-text="pause and stop"><a class="toc-link toc-link-sub" data-toc-link href="#pause-stop" data-target-id="pause-stop"><span class="toc-link-label">Pause and stop</span></a></li>
+        <li class="toc-item" data-toc-text="the fix pipeline"><a class="toc-link" data-toc-link href="#the-fix-pipeline" data-target-id="the-fix-pipeline"><span class="toc-link-label">The fix pipeline</span></a></li>
+        <li class="toc-item" data-toc-text="retries"><a class="toc-link" data-toc-link href="#retries" data-target-id="retries"><span class="toc-link-label">Retries</span></a></li>
+        <li class="toc-item" data-toc-text="pr monitoring"><a class="toc-link" data-toc-link href="#pr-monitoring" data-target-id="pr-monitoring"><span class="toc-link-label">PR monitoring</span></a></li>
+        <li class="toc-item" data-toc-text="ai questions"><a class="toc-link" data-toc-link href="#ai-questions" data-target-id="ai-questions"><span class="toc-link-label">AI questions</span></a></li>
+        <li class="toc-item" data-toc-text="day-to-day workflows"><a class="toc-link" data-toc-link href="#workflows" data-target-id="workflows"><span class="toc-link-label">Day-to-day workflows</span></a></li>
+        <li class="toc-item" data-toc-text="advanced features"><a class="toc-link" data-toc-link href="#advanced-features" data-target-id="advanced-features"><span class="toc-link-label">Advanced features</span></a></li>
         </ul>
         <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
       </div>
@@ -232,7 +250,10 @@ claudear dry-run</code></pre>
     </aside>
   </div>
 
-  <button class="fixed right-5 bottom-5 z-40 opacity-0 pointer-events-none translate-y-2 border border-white/[0.08] rounded-full bg-bg/90 text-body px-3 py-2 text-xs font-mono cursor-pointer backdrop-blur-lg transition-all duration-150 hover:text-heading hover:border-accent/25" type="button" data-scroll-top style="display:none">Top</button>
+  <button class="scroll-top-btn" type="button" data-scroll-top aria-label="Scroll to top">Top</button>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>lucide.createIcons();</script>
+  <script src="./assets/docs-search-index.js"></script>
   <script src="./assets/docs.js"></script>
 </body>
 </html>

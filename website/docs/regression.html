@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Regression monitoring · Claudear Docs</title>
+  <meta name="description" content="Detect when a merged fix regresses — Sentry event matching, similarity thresholds, and configuration.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090B', card: '#111113', border: '#27272A',
+            accent: '#22C55E', 'accent-dim': '#16a34a',
+            link: '#60A5FA', heading: '#FAFAFA', body: '#A1A1AA', muted: '#71717A',
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="stylesheet" href="./assets/docs.css">
+</head>
+<body id="top" class="bg-bg text-heading font-sans">
+  <div class="fixed inset-0 z-0 pointer-events-none opacity-[0.03]" style="background-image:radial-gradient(circle,#FAFAFA 0.5px,transparent 0.5px);background-size:24px 24px" aria-hidden="true"></div>
+
+  <header class="sticky top-0 z-50 border-b border-white/[0.06] bg-bg/90 backdrop-blur-xl">
+    <div class="max-w-[1400px] mx-auto h-14 px-5 flex items-center justify-between">
+      <a class="font-mono font-bold text-lg tracking-tight text-heading no-underline flex items-center" href="../index.html">claudear<span class="w-2.5 h-[18px] ml-1 rounded-[1px] bg-accent inline-block" aria-hidden="true"></span></a>
+      <nav class="flex items-center gap-1.5 text-[13px]">
+        <a href="../index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Home</a>
+        <a href="./index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Docs</a>
+        <a href="https://github.com/abnegate/claudear" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">GitHub</a>
+        <a href="https://github.com/abnegate/claudear/releases" class="bg-accent text-[#041108] font-semibold px-3 py-1.5 rounded-md hover:bg-accent-dim transition-colors">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
+    <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
+      <nav>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Get started</div>
+        <a href="./index.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Quickstart</a>
+        <a href="./getting-started.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Recipes</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Guides</div>
+        <a href="./integrations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Connect your tools</a>
+        <a href="./usage.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">How it works</a>
+        <a href="./regression.html" class="text-heading bg-accent/10 border border-accent/20 block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Regressions</a>
+        <a href="./cascading.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Cascading</a>
+        <a href="./learning.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Learning</a>
+        <a href="./prioritisation.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Prioritisation</a>
+        <a href="./repositories.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Repositories</a>
+        <a href="./dashboard.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Production</div>
+        <a href="./operations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Deploy</a>
+        <a href="./configuration.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Reference</div>
+        <a href="./cli-reference.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI commands</a>
+        <a href="./development.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
+      </nav>
+    </aside>
+
+    <main class="flex-1 min-w-0 px-8 py-8 lg:px-12 lg:py-10">
+      <div class="mb-8">
+        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Guides</p>
+        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">Regression monitoring</h1>
+        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">Detect when a merged fix regresses — Sentry event matching, similarity thresholds, and configuration.</p>
+      </div>
+      <article class="markdown max-w-[780px]" data-docs-markdown>
+        <h2 id="what-it-does"><a class="anchor-link" href="#what-it-does" aria-label="Link to What it does">#</a>What it does</h2>
+        <p>After a fix is merged, Claudear watches for the error to reappear in Sentry. If the same (or a semantically similar) error surfaces above a configurable threshold, it is flagged as a <strong>regression</strong> and a new fix attempt is queued automatically.</p>
+        <p>This closes the loop: instead of assuming a merge means the problem is solved, Claudear validates the outcome in production.</p>
+
+        <h2 id="how-it-works"><a class="anchor-link" href="#how-it-works" aria-label="Link to How it works">#</a>How it works</h2>
+        <ol>
+          <li><strong>Monitoring window opens</strong> &mdash; when a PR merges and the issue is marked resolved, Claudear starts a timer (<code>monitoring_duration_hours</code>).</li>
+          <li><strong>Periodic checks</strong> &mdash; every <code>check_interval_hours</code>, Claudear queries Sentry for new events matching the original error.</li>
+          <li><strong>Similarity matching</strong> &mdash; events are compared using semantic similarity. If the similarity score exceeds <code>similarity_threshold</code> (default 0.75) and the event count exceeds <code>sentry_event_threshold</code>, it's flagged.</li>
+          <li><strong>Regression created</strong> &mdash; the regression is recorded in the database and visible on the Dashboard <strong>Regressions</strong> page. A new fix attempt is queued.</li>
+        </ol>
+
+        <h2 id="configuration"><a class="anchor-link" href="#configuration" aria-label="Link to Configuration">#</a>Configuration</h2>
+        <p>All settings live under <code>[regression]</code> in your <code>claudear.toml</code>. See the <a href="./configuration.html#advanced-features">full reference</a> for every option.</p>
+        <pre><code class="language-toml">[regression]
+# Enable/disable regression monitoring (default: true)
+enabled = true
+
+# How often to check for regressions in hours (default: 1)
+check_interval_hours = 1
+
+# Monitoring window after release in hours (default: 24)
+monitoring_duration_hours = 24
+
+# Minimum Sentry event count to flag (default: 1)
+sentry_event_threshold = 1
+
+# Semantic similarity threshold (default: 0.75)
+similarity_threshold = 0.75
+
+# Repos that indicate releases are live
+target_repos = []
+
+# Optional: GitHub token override for regression search
+# Falls back to scm.github.token when empty
+github_token = ""
+
+# Optional: Repos to search for similar issues
+github_search_repos = []</code></pre>
+
+        <h2 id="cli-commands"><a class="anchor-link" href="#cli-commands" aria-label="Link to CLI commands">#</a>CLI commands</h2>
+        <pre><code class="language-bash"># List all regressions
+claudear regressions list
+
+# Run a regression check now
+claudear regressions check</code></pre>
+
+        <h2 id="tips"><a class="anchor-link" href="#tips" aria-label="Link to Tips">#</a>Tips</h2>
+        <div class="mt-2 p-4 rounded-lg border border-accent/20 bg-accent/5">
+          <ul class="text-[13px] text-body leading-relaxed mb-0">
+            <li>Start with a generous <code>monitoring_duration_hours</code> (e.g. 48) and tighten once you trust your deploy pipeline.</li>
+            <li>If you get false positives, raise <code>similarity_threshold</code> towards 0.85.</li>
+            <li>Use <code>target_repos</code> to scope monitoring to repos that actually deploy to production.</li>
+            <li>The <a href="./dashboard.html">Dashboard</a> Regressions page shows all flagged regressions with their similarity scores.</li>
+          </ul>
+        </div>
+      </article>
+      <div class="docs-page-nav grid grid-cols-2 gap-4 pt-12 max-w-[780px]">
+        <a href="./usage.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">How it works</span>
+        </a>
+        <a href="./cascading.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Next</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Cascading fixes</span>
+        </a>
+      </div>
+      <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
+    </main>
+
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="what it does"><a class="toc-link" data-toc-link href="#what-it-does" data-target-id="what-it-does"><span class="toc-link-label">What it does</span></a></li>
+        <li class="toc-item" data-toc-text="how it works"><a class="toc-link" data-toc-link href="#how-it-works" data-target-id="how-it-works"><span class="toc-link-label">How it works</span></a></li>
+        <li class="toc-item" data-toc-text="configuration"><a class="toc-link" data-toc-link href="#configuration" data-target-id="configuration"><span class="toc-link-label">Configuration</span></a></li>
+        <li class="toc-item" data-toc-text="cli commands"><a class="toc-link" data-toc-link href="#cli-commands" data-target-id="cli-commands"><span class="toc-link-label">CLI commands</span></a></li>
+        <li class="toc-item" data-toc-text="tips"><a class="toc-link" data-toc-link href="#tips" data-target-id="tips"><span class="toc-link-label">Tips</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
+  </div>
+
+  <button class="scroll-top-btn" type="button" data-scroll-top aria-label="Scroll to top">Top</button>
+  <script src="./assets/docs-search-index.js"></script>
+  <script src="./assets/docs.js"></script>
+</body>
+</html>

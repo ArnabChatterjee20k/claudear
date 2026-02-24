@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Repository management · Claudear Docs</title>
+  <meta name="description" content="Repo discovery, code indexing with tree-sitter, self-evaluation, and dependency graphs.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090B', card: '#111113', border: '#27272A',
+            accent: '#22C55E', 'accent-dim': '#16a34a',
+            link: '#60A5FA', heading: '#FAFAFA', body: '#A1A1AA', muted: '#71717A',
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="stylesheet" href="./assets/docs.css">
+</head>
+<body id="top" class="bg-bg text-heading font-sans">
+  <div class="fixed inset-0 z-0 pointer-events-none opacity-[0.03]" style="background-image:radial-gradient(circle,#FAFAFA 0.5px,transparent 0.5px);background-size:24px 24px" aria-hidden="true"></div>
+
+  <header class="sticky top-0 z-50 border-b border-white/[0.06] bg-bg/90 backdrop-blur-xl">
+    <div class="max-w-[1400px] mx-auto h-14 px-5 flex items-center justify-between">
+      <a class="font-mono font-bold text-lg tracking-tight text-heading no-underline flex items-center" href="../index.html">claudear<span class="w-2.5 h-[18px] ml-1 rounded-[1px] bg-accent inline-block" aria-hidden="true"></span></a>
+      <nav class="flex items-center gap-1.5 text-[13px]">
+        <a href="../index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Home</a>
+        <a href="./index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Docs</a>
+        <a href="https://github.com/abnegate/claudear" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">GitHub</a>
+        <a href="https://github.com/abnegate/claudear/releases" class="bg-accent text-[#041108] font-semibold px-3 py-1.5 rounded-md hover:bg-accent-dim transition-colors">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
+    <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
+      <nav>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Get started</div>
+        <a href="./index.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Quickstart</a>
+        <a href="./getting-started.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Recipes</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Guides</div>
+        <a href="./integrations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Connect your tools</a>
+        <a href="./usage.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">How it works</a>
+        <a href="./regression.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Regressions</a>
+        <a href="./cascading.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Cascading</a>
+        <a href="./learning.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Learning</a>
+        <a href="./prioritisation.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Prioritisation</a>
+        <a href="./repositories.html" class="text-heading bg-accent/10 border border-accent/20 block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Repositories</a>
+        <a href="./dashboard.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Production</div>
+        <a href="./operations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Deploy</a>
+        <a href="./configuration.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Reference</div>
+        <a href="./cli-reference.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI commands</a>
+        <a href="./development.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
+      </nav>
+    </aside>
+
+    <main class="flex-1 min-w-0 px-8 py-8 lg:px-12 lg:py-10">
+      <div class="mb-8">
+        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Guides</p>
+        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">Repository management</h1>
+        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">Repo discovery, code indexing with tree-sitter, self-evaluation, and dependency graphs.</p>
+      </div>
+      <article class="markdown max-w-[780px]" data-docs-markdown>
+        <h2 id="discovery-and-indexing"><a class="anchor-link" href="#discovery-and-indexing" aria-label="Link to Discovery and indexing">#</a>Discovery and indexing</h2>
+        <p>Claudear can auto-discover repositories from your GitHub/GitLab organisations and index them for fast issue routing. Set <code>known_orgs</code> and <code>auto_discover_paths</code> in your core config, then run:</p>
+        <pre><code class="language-bash"># Discover repos from configured orgs
+claudear repos discover
+
+# Index all discovered repos
+claudear repos index
+
+# Sync repos (fetch + re-index)
+claudear repos sync</code></pre>
+
+        <h2 id="code-indexing"><a class="anchor-link" href="#code-indexing" aria-label="Link to Code indexing">#</a>Code indexing</h2>
+        <p>Code indexing uses <strong>tree-sitter</strong> to parse source files and generate embeddings for semantic search. This powers Claudear's ability to route issues to the correct repo and find relevant code when generating fixes.</p>
+        <pre><code class="language-toml">[code_index]
+# Enable tree-sitter code indexing (default: true)
+enabled = true
+
+# Maximum file size to index in KB (default: 1024)
+max_file_size_kb = 1024
+
+# Embedding batch size (default: 32)
+batch_size = 32</code></pre>
+
+        <h2 id="self-evaluation"><a class="anchor-link" href="#self-evaluation" aria-label="Link to Self-evaluation">#</a>Self-evaluation</h2>
+        <p>Before submitting a PR, Claudear can run before/after comparisons on tests, linting, static analysis, and coverage. If the fix introduces regressions, the attempt is flagged.</p>
+        <pre><code class="language-toml">[evaluation]
+# Enable evaluation (default: false, opt-in)
+enabled = false
+
+# Run test before/after comparison (default: true)
+test_delta = true
+
+# Run lint before/after comparison (default: true)
+lint_delta = true
+
+# Run static analysis before/after (default: true)
+static_analysis_delta = true
+
+# Run coverage before/after (default: false, slowest)
+coverage_delta = false
+
+# Timeout per tool in seconds (default: 300)
+tool_timeout_secs = 300
+
+# Total timeout in seconds (default: 900)
+total_timeout_secs = 900
+
+# Post results as PR comment (default: true)
+post_pr_comment = true
+
+# Fail attempt on regression (default: false)
+fail_on_regression = false</code></pre>
+
+        <h2 id="dashboard-config"><a class="anchor-link" href="#dashboard-config" aria-label="Link to Dashboard config">#</a>Dashboard config</h2>
+        <p>Cost estimation and display settings for the web dashboard:</p>
+        <pre><code class="language-toml">[dashboard]
+# Monthly Claude Max plan cost for per-fix estimates (default: 0.0)
+max_plan_monthly_cost = 0.0
+
+# Hourly engineer rate for cost-savings calculation (default: 75.0)
+hourly_engineer_rate = 75.0</code></pre>
+
+        <h2 id="dependency-graphs"><a class="anchor-link" href="#dependency-graphs" aria-label="Link to Dependency graphs">#</a>Dependency graphs</h2>
+        <p>Claudear auto-detects inter-repo dependencies by scanning package manifests (<code>package.json</code>, <code>composer.json</code>) for packages belonging to your <code>known_orgs</code>. The graph is built on first run and refreshed automatically in the background, so new dependencies are picked up without manual intervention.</p>
+        <p>These relationships power <a href="./cascading.html">cascading fixes</a> and issue routing. For dependencies that can't be inferred from manifests (e.g. git submodules or cross-org repos), use <code>claudear repos link</code> to declare them manually.</p>
+        <pre><code class="language-bash"># View the auto-detected dependency graph
+claudear repos graph
+
+# Search across indexed repos
+claudear repos search "authentication middleware"
+
+# Show repo stats
+claudear repos stats</code></pre>
+
+        <h2 id="cli-commands"><a class="anchor-link" href="#cli-commands" aria-label="Link to CLI commands">#</a>CLI commands</h2>
+        <p>Full repo management commands:</p>
+        <pre><code class="language-bash">claudear repos discover    # Discover repos from orgs
+claudear repos index       # Index all repos
+claudear repos search      # Semantic search across repos
+claudear repos graph       # Show auto-detected dependency graph
+claudear repos link        # Manually declare a dependency (override)
+claudear repos stats       # Show indexing statistics
+claudear repos sync        # Fetch and re-index</code></pre>
+      </article>
+      <div class="docs-page-nav grid grid-cols-2 gap-4 pt-12 max-w-[780px]">
+        <a href="./prioritisation.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Prioritisation</span>
+        </a>
+        <a href="./dashboard.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Next</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Dashboard</span>
+        </a>
+      </div>
+      <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
+    </main>
+
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="discovery and indexing"><a class="toc-link" data-toc-link href="#discovery-and-indexing" data-target-id="discovery-and-indexing"><span class="toc-link-label">Discovery and indexing</span></a></li>
+        <li class="toc-item" data-toc-text="code indexing"><a class="toc-link" data-toc-link href="#code-indexing" data-target-id="code-indexing"><span class="toc-link-label">Code indexing</span></a></li>
+        <li class="toc-item" data-toc-text="self-evaluation"><a class="toc-link" data-toc-link href="#self-evaluation" data-target-id="self-evaluation"><span class="toc-link-label">Self-evaluation</span></a></li>
+        <li class="toc-item" data-toc-text="dashboard config"><a class="toc-link" data-toc-link href="#dashboard-config" data-target-id="dashboard-config"><span class="toc-link-label">Dashboard config</span></a></li>
+        <li class="toc-item" data-toc-text="dependency graphs"><a class="toc-link" data-toc-link href="#dependency-graphs" data-target-id="dependency-graphs"><span class="toc-link-label">Dependency graphs</span></a></li>
+        <li class="toc-item" data-toc-text="cli commands"><a class="toc-link" data-toc-link href="#cli-commands" data-target-id="cli-commands"><span class="toc-link-label">CLI commands</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
+  </div>
+
+  <button class="scroll-top-btn" type="button" data-scroll-top aria-label="Scroll to top">Top</button>
+  <script src="./assets/docs-search-index.js"></script>
+  <script src="./assets/docs.js"></script>
+</body>
+</html>

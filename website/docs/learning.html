@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Learning from results · Claudear Docs</title>
+  <meta name="description" content="How Claudear extracts knowledge from diffs, Q&amp;A, and review comments to improve future fixes.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: '#09090B', card: '#111113', border: '#27272A',
+            accent: '#22C55E', 'accent-dim': '#16a34a',
+            link: '#60A5FA', heading: '#FAFAFA', body: '#A1A1AA', muted: '#71717A',
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="stylesheet" href="./assets/docs.css">
+</head>
+<body id="top" class="bg-bg text-heading font-sans">
+  <div class="fixed inset-0 z-0 pointer-events-none opacity-[0.03]" style="background-image:radial-gradient(circle,#FAFAFA 0.5px,transparent 0.5px);background-size:24px 24px" aria-hidden="true"></div>
+
+  <header class="sticky top-0 z-50 border-b border-white/[0.06] bg-bg/90 backdrop-blur-xl">
+    <div class="max-w-[1400px] mx-auto h-14 px-5 flex items-center justify-between">
+      <a class="font-mono font-bold text-lg tracking-tight text-heading no-underline flex items-center" href="../index.html">claudear<span class="w-2.5 h-[18px] ml-1 rounded-[1px] bg-accent inline-block" aria-hidden="true"></span></a>
+      <nav class="flex items-center gap-1.5 text-[13px]">
+        <a href="../index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Home</a>
+        <a href="./index.html" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">Docs</a>
+        <a href="https://github.com/abnegate/claudear" class="text-body hover:text-heading px-2.5 py-1.5 rounded-md transition-colors">GitHub</a>
+        <a href="https://github.com/abnegate/claudear/releases" class="bg-accent text-[#041108] font-semibold px-3 py-1.5 rounded-md hover:bg-accent-dim transition-colors">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="relative z-10 max-w-[1400px] mx-auto flex xl:grid xl:grid-cols-[260px_1fr_280px] min-h-[calc(100vh-56px)]">
+    <aside class="hidden lg:block w-[260px] shrink-0 border-r border-border sticky top-14 h-[calc(100vh-56px)] overflow-y-auto py-6 px-4">
+      <nav>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 px-2">Get started</div>
+        <a href="./index.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Quickstart</a>
+        <a href="./getting-started.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Recipes</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Guides</div>
+        <a href="./integrations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Connect your tools</a>
+        <a href="./usage.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">How it works</a>
+        <a href="./regression.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Regressions</a>
+        <a href="./cascading.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Cascading</a>
+        <a href="./learning.html" class="text-heading bg-accent/10 border border-accent/20 block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Learning</a>
+        <a href="./prioritisation.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Prioritisation</a>
+        <a href="./repositories.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[12px] pl-5 pr-2 py-1.5 rounded-md mb-0.5 transition-colors">Repositories</a>
+        <a href="./dashboard.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Dashboard</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Production</div>
+        <a href="./operations.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Deploy</a>
+        <a href="./configuration.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Configuration</a>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-muted mb-2 mt-5 px-2">Reference</div>
+        <a href="./cli-reference.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">CLI commands</a>
+        <a href="./development.html" class="text-body hover:text-heading hover:bg-white/[0.03] block text-[13px] px-2 py-1.5 rounded-md mb-0.5 transition-colors">Development</a>
+      </nav>
+    </aside>
+
+    <main class="flex-1 min-w-0 px-8 py-8 lg:px-12 lg:py-10">
+      <div class="mb-8">
+        <p class="text-[11px] font-bold uppercase tracking-wider text-accent mb-2">Guides</p>
+        <h1 class="font-mono font-bold text-3xl tracking-tight mb-3">Learning from results</h1>
+        <p class="text-body text-[15px] max-w-[680px] leading-relaxed">How Claudear extracts knowledge from diffs, Q&amp;A, and review comments to improve future fixes.</p>
+      </div>
+      <article class="markdown max-w-[780px]" data-docs-markdown>
+        <h2 id="what-it-does"><a class="anchor-link" href="#what-it-does" aria-label="Link to What it does">#</a>What it does</h2>
+        <p>Claudear analyses the outcomes of every fix: PR diffs, review comments, Q&amp;A answers, and execution logs. Over time it builds per-repo knowledge that makes future fixes faster and more accurate.</p>
+
+        <h2 id="knowledge-sources"><a class="anchor-link" href="#knowledge-sources" aria-label="Link to Knowledge sources">#</a>Knowledge sources</h2>
+        <p>The learning system draws from multiple signals:</p>
+        <ul>
+          <li><strong>PR diffs</strong> &mdash; analyses what changed in merged PRs to learn patterns and conventions (<code>diff_analysis</code>).</li>
+          <li><strong>Q&amp;A answers</strong> &mdash; when the same question is answered consistently, the answer is promoted to standing instructions (<code>qa_promotion</code>).</li>
+          <li><strong>Review feedback</strong> &mdash; classifies reviewer comments to detect recurring patterns like "always add tests" or "use our custom error type" (<code>review_classification</code>).</li>
+          <li><strong>Execution logs</strong> &mdash; extracts learnings from Claude's execution logs to understand what approaches work (<code>auto_extract_learnings</code>).</li>
+          <li><strong>Strategy fingerprinting</strong> &mdash; tracks how Claude approaches different classes of fixes (<code>strategy_fingerprinting</code>).</li>
+          <li><strong>Quality scoring</strong> &mdash; scores fix quality based on merge velocity and review feedback (<code>quality_scoring</code>).</li>
+        </ul>
+
+        <h2 id="auto-agent-md"><a class="anchor-link" href="#auto-agent-md" aria-label="Link to Auto AGENT.md">#</a>Auto AGENT.md</h2>
+        <p>When <code>auto_agent_md = true</code>, Claudear auto-generates an <code>AGENT.md</code> file in each repo from accumulated knowledge. This file is included in Claude's system prompt on future fix attempts, giving it repo-specific context without manual curation.</p>
+
+        <h2 id="cluster-detection"><a class="anchor-link" href="#cluster-detection" aria-label="Link to Cluster detection">#</a>Cluster detection</h2>
+        <p>The learning system also detects clusters of correlated issues appearing within a time window. When issues are related (e.g. a deploy broke multiple endpoints), they are grouped so the AI can address the root cause rather than treating each symptom independently.</p>
+
+        <h2 id="configuration"><a class="anchor-link" href="#configuration" aria-label="Link to Configuration">#</a>Configuration</h2>
+        <p>All settings live under <code>[learning]</code>. See the <a href="./configuration.html#advanced-features">full reference</a> for every option.</p>
+        <pre><code class="language-toml">[learning]
+# Auto-extract learnings from execution logs (default: true)
+auto_extract_learnings = true
+
+# Analyse PR diffs on merge (default: true)
+diff_analysis = true
+
+# Promote repeated Q&A answers to instructions (default: true)
+qa_promotion = true
+qa_promotion_threshold = 2
+
+# Accumulate per-repo knowledge (default: true)
+repo_knowledge = true
+
+# Classify review feedback patterns (default: true)
+review_classification = true
+review_promotion_threshold = 3
+
+# Track fix strategy patterns (default: true)
+strategy_fingerprinting = true
+
+# Score fix quality (default: true)
+quality_scoring = true
+
+# Cluster correlated issues (default: true)
+cluster_detection = true
+cluster_window_minutes = 30
+min_cluster_size = 3
+
+# Auto-generate AGENT.md from knowledge (default: false)
+auto_agent_md = false</code></pre>
+
+        <h2 id="cli-commands"><a class="anchor-link" href="#cli-commands" aria-label="Link to CLI commands">#</a>CLI commands</h2>
+        <pre><code class="language-bash"># Show what Claudear has learned about a repo
+claudear learn show org/my-repo</code></pre>
+        <p>The <a href="./dashboard.html">Dashboard</a> <strong>Learning</strong> page shows accumulated knowledge per repo in a browsable format.</p>
+      </article>
+      <div class="docs-page-nav grid grid-cols-2 gap-4 pt-12 max-w-[780px]">
+        <a href="./cascading.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Previous</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Cascading fixes</span>
+        </a>
+        <a href="./prioritisation.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
+          <span class="text-[11px] uppercase tracking-wider text-muted">Next</span>
+          <span class="block text-sm text-heading mt-1 group-hover:text-accent transition-colors">Prioritisation</span>
+        </a>
+      </div>
+      <footer class="mt-16 pt-6 border-t border-border text-muted text-xs">Claudear documentation</footer>
+    </main>
+
+    <aside class="toc-panel hidden xl:flex" aria-label="On this page">
+      <div class="toc-header">
+        <h2>On this page</h2>
+        <p>Jump to any section.</p>
+      </div>
+      <div class="toc-search-wrap">
+        <input type="search" class="toc-search" data-toc-filter="desktop" placeholder="Filter headings..." aria-label="Filter headings">
+      </div>
+      <div class="toc-scroll">
+        <ul class="toc-list">
+        <li class="toc-item" data-toc-text="what it does"><a class="toc-link" data-toc-link href="#what-it-does" data-target-id="what-it-does"><span class="toc-link-label">What it does</span></a></li>
+        <li class="toc-item" data-toc-text="knowledge sources"><a class="toc-link" data-toc-link href="#knowledge-sources" data-target-id="knowledge-sources"><span class="toc-link-label">Knowledge sources</span></a></li>
+        <li class="toc-item" data-toc-text="auto agent.md"><a class="toc-link" data-toc-link href="#auto-agent-md" data-target-id="auto-agent-md"><span class="toc-link-label">Auto AGENT.md</span></a></li>
+        <li class="toc-item" data-toc-text="cluster detection"><a class="toc-link" data-toc-link href="#cluster-detection" data-target-id="cluster-detection"><span class="toc-link-label">Cluster detection</span></a></li>
+        <li class="toc-item" data-toc-text="configuration"><a class="toc-link" data-toc-link href="#configuration" data-target-id="configuration"><span class="toc-link-label">Configuration</span></a></li>
+        <li class="toc-item" data-toc-text="cli commands"><a class="toc-link" data-toc-link href="#cli-commands" data-target-id="cli-commands"><span class="toc-link-label">CLI commands</span></a></li>
+        </ul>
+        <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
+      </div>
+      <div class="toc-footer">
+        <a href="#top">Back to top</a>
+        <a href="https://github.com/abnegate/claudear">Repo</a>
+      </div>
+    </aside>
+  </div>
+
+  <button class="scroll-top-btn" type="button" data-scroll-top aria-label="Scroll to top">Top</button>
+  <script src="./assets/docs-search-index.js"></script>
+  <script src="./assets/docs.js"></script>
+</body>
+</html>
