@@ -123,6 +123,20 @@ pub trait ScmProvider: Send + Sync {
         ))
     }
 
+    /// Post a review with file-level inline comments on a PR/MR.
+    async fn post_review_with_comments(
+        &self,
+        _project: &str,
+        _number: i64,
+        _action: PostReviewAction,
+        _body: &str,
+        _comments: &[InlineReviewComment],
+    ) -> Result<()> {
+        Err(crate::error::Error::Other(
+            "post_review_with_comments not supported by this SCM provider".into(),
+        ))
+    }
+
     /// List open PRs/MRs for a project.
     async fn list_open_prs(&self, _project: &str) -> Result<Vec<PrSummary>> {
         Err(crate::error::Error::Other(
@@ -211,6 +225,17 @@ pub enum PostReviewAction {
     RequestChanges,
     /// Approve the PR.
     Approve,
+}
+
+/// An inline comment to attach to a review.
+#[derive(Debug, Clone)]
+pub struct InlineReviewComment {
+    /// The relative path of the file to comment on.
+    pub path: String,
+    /// The body text of the comment.
+    pub body: String,
+    /// The relative position in the diff. Defaults to 1 (first diff line).
+    pub position: Option<i64>,
 }
 
 /// Summary of an open PR/MR for listing.

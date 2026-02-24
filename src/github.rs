@@ -3,8 +3,8 @@
 use crate::config::GitHubConfig;
 use crate::error::{Error, Result};
 use crate::scm::{
-    CodeReview, PostReviewAction, PrSummary, RemoteRepo, ReviewComment, ReviewUser, ScmProvider,
-    ScmRelease,
+    CodeReview, InlineReviewComment, PostReviewAction, PrSummary, RemoteRepo, ReviewComment,
+    ReviewUser, ScmProvider, ScmRelease,
 };
 use crate::secret::OptionalSecretExt;
 use async_trait::async_trait;
@@ -486,6 +486,62 @@ impl<H: HttpClient> GitHubClient<H> {
         Ok(())
     }
 
+    /// Post a review with file-level inline comments.
+    pub async fn post_review_with_comments(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        action: PostReviewAction,
+        body_text: &str,
+        comments: &[InlineReviewComment],
+    ) -> Result<()> {
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let url = format!(
+            "https://api.github.com/repos/{}/pulls/{}/reviews",
+            repo, pr_number
+        );
+        let headers = self.build_headers(token);
+
+        let event = match action {
+            PostReviewAction::Comment => "COMMENT",
+            PostReviewAction::RequestChanges => "REQUEST_CHANGES",
+            PostReviewAction::Approve => "APPROVE",
+        };
+
+        let comments_json: Vec<_> = comments
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "path": c.path,
+                    "body": c.body,
+                    "position": c.position.unwrap_or(1)
+                })
+            })
+            .collect();
+
+        let body = serde_json::json!({
+            "event": event,
+            "body": body_text,
+            "comments": comments_json,
+        })
+        .to_string();
+
+        let response = self.http.post(&url, headers, &body).await?;
+        if !response.is_success() {
+            return Err(Error::Other(format!(
+                "Failed to post review with comments on {}/pull/{}: {}",
+                repo, pr_number, response.body
+            )));
+        }
+        Ok(())
+    }
+
     /// List open PRs for a repository.
     pub async fn list_open_prs(&self, repo: &str) -> Result<Vec<PrSummary>> {
         let token = self
@@ -842,6 +898,18 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
         GitHubClient::post_review(self, project, number, action, body).await
     }
 
+    async fn post_review_with_comments(
+        &self,
+        project: &str,
+        number: i64,
+        action: PostReviewAction,
+        body: &str,
+        comments: &[InlineReviewComment],
+    ) -> Result<()> {
+        GitHubClient::post_review_with_comments(self, project, number, action, body, comments)
+            .await
+    }
+
     async fn list_open_prs(&self, project: &str) -> Result<Vec<PrSummary>> {
         GitHubClient::list_open_prs(self, project).await
     }
@@ -887,7 +955,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Mock HTTP client for testing.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     pub struct MockHttpClient {
         responses: Mutex<HashMap<String, HttpResponse>>,
         requests: Mutex<Vec<(String, Vec<(String, String)>)>>,
