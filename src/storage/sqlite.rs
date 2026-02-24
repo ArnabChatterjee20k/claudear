@@ -179,7 +179,7 @@ impl SqliteTracker {
     // All schema DDL now lives in migrations/V1__initial_schema.sql.
     // The legacy inline init is preserved below under #[cfg(any())] so it
     // never compiles but can be referenced during review.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     #[cfg(any())]
     fn _init_legacy(&self) -> Result<()> {
         let conn = self.acquire_lock()?;
@@ -3808,7 +3808,6 @@ impl FixAttemptTracker for SqliteTracker {
     }
 
     /// Record an inference attempt.
-    #[allow(clippy::too_many_arguments)]
     fn record_inference_attempt(
         &self,
         issue_id: &str,

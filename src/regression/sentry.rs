@@ -23,11 +23,11 @@ pub struct SentryRegressionConfig {
 /// Sentry API response for issue events.
 #[derive(Debug, Deserialize)]
 struct SentryIssue {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     id: String,
     #[serde(rename = "shortId")]
     short_id: String,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     title: String,
     count: String,
     status: String,

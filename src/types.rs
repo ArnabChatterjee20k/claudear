@@ -2372,7 +2372,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+    #[expect(clippy::field_reassign_with_default)]
     fn test_fix_attempt_stats_with_data() {
         let mut stats = FixAttemptStats::default();
         stats.total = 100;
@@ -2396,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+    #[expect(clippy::field_reassign_with_default)]
     fn test_source_stats_with_data() {
         let mut stats = SourceStats::default();
         stats.total = 50;

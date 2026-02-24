@@ -115,7 +115,7 @@ struct JiraFields {
     created: Option<String>,
     updated: Option<String>,
     resolution: Option<JiraResolution>,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     comment: Option<JiraCommentContainer>,
 }
 
@@ -129,14 +129,14 @@ struct JiraStatus {
 #[derive(Debug, Deserialize)]
 struct JiraStatusCategory {
     key: String,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     name: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct JiraPriority {
     name: String,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     id: Option<String>,
 }
 
@@ -166,7 +166,7 @@ struct JiraResolution {
 
 #[derive(Debug, Deserialize)]
 struct JiraCommentContainer {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     comments: Option<Vec<serde_json::Value>>,
 }
 
@@ -178,7 +178,7 @@ struct JiraTransitionsResponse {
 #[derive(Debug, Deserialize)]
 struct JiraTransition {
     id: String,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     name: String,
     to: JiraTransitionTarget,
 }
@@ -1014,7 +1014,7 @@ mod tests {
             );
         }
 
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         pub fn get_requests(&self) -> Vec<(String, String)> {
             self.requests.lock().unwrap().clone()
         }

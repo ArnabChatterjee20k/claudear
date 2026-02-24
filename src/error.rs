@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unnecessary_literal_unwrap)]
+    #[expect(clippy::unnecessary_literal_unwrap)]
     fn test_result_unwrap_or() {
         let ok_result: Result<i32> = Ok(42);
         assert_eq!(ok_result.unwrap_or(0), 42);

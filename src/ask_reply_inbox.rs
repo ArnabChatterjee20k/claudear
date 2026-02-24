@@ -11,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 /// Normalized inbound Telegram message used for ask-reply matching.
 #[derive(Debug, Clone)]
 pub(crate) struct TelegramInboundMessage {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub message_id: i64,
     pub chat_id: i64,
     pub responder_id: Option<String>,
@@ -26,7 +26,7 @@ pub(crate) struct TelegramInboundMessage {
 /// Normalized inbound WhatsApp message used for ask-reply matching.
 #[derive(Debug, Clone)]
 pub(crate) struct WhatsAppInboundMessage {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub message_id: String,
     pub from: String,
     pub text: String,

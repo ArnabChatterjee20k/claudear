@@ -244,7 +244,7 @@ impl IssueSource for DiscordSource {
         // which bypasses the is_bot_message filter. This makes them appear as
         // user-posted messages to the daemon's poll_issues.
         if let Some(ref webhook_url) = self.config.webhook_url {
-            let url = format!("{}?wait=true", webhook_url);
+            let url = format!("{}?wait=true", webhook_url.expose());
             let http = reqwest::Client::new();
             let resp = http
                 .post(&url)

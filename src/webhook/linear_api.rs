@@ -1717,13 +1717,13 @@ mod tests {
     #[test]
     fn test_delete_webhook_with_errors_response() {
         #[derive(Debug, Deserialize)]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         struct DeleteResponse {
             #[serde(rename = "webhookDelete")]
             webhook_delete: DeleteResult,
         }
         #[derive(Debug, Deserialize)]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         struct DeleteResult {
             success: bool,
         }

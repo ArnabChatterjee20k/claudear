@@ -695,7 +695,7 @@ mod tests {
             );
         }
 
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         pub fn get_requests(&self) -> Vec<(String, String)> {
             self.requests.lock().unwrap().clone()
         }

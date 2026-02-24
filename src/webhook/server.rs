@@ -118,7 +118,7 @@ impl WebhookServer {
     }
 
     /// Create a new webhook server with optional GitHub review webhook handling.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new_with_github(
         config: Config,
         handlers: WebhookHandlerRegistry,

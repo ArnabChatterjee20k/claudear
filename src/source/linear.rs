@@ -544,7 +544,7 @@ impl<H: LinearHttpClient + 'static> IssueSource for LinearSource<H> {
             nodes: Vec<WorkflowState>,
         }
         #[derive(Debug, Deserialize)]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         struct WorkflowState {
             id: String,
             name: String,
@@ -926,7 +926,6 @@ mod tests {
             );
         }
 
-        #[allow(dead_code)]
         pub fn get_requests(&self) -> Vec<(String, serde_json::Value)> {
             self.requests.lock().unwrap().clone()
         }

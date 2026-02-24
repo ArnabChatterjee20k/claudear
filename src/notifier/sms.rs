@@ -340,7 +340,7 @@ mod tests {
     }
 
     /// Mock SMS HTTP client for testing.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     struct MockSmsClient {
         response_status: u16,
         response_body: String,
@@ -370,7 +370,7 @@ mod tests {
             self.call_count.load(Ordering::SeqCst)
         }
 
-        #[allow(clippy::type_complexity)]
+        #[expect(clippy::type_complexity)]
         fn get_last_calls(&self) -> Vec<(String, String, String, Vec<(String, String)>)> {
             self.last_calls.lock().unwrap().clone()
         }

@@ -1430,7 +1430,7 @@ mod tests {
             self.last_post_calls.lock().unwrap().last().cloned()
         }
 
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         fn get_last_get_call(&self) -> Option<(String, Option<String>)> {
             self.last_get_calls.lock().unwrap().last().cloned()
         }

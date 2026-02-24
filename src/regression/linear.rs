@@ -42,7 +42,7 @@ impl Default for LinearRegressionConfig {
 /// GitHub issue search result.
 #[derive(Debug, Clone, Deserialize)]
 struct GitHubSearchResult {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     total_count: i64,
     items: Vec<GitHubIssue>,
 }
@@ -50,13 +50,13 @@ struct GitHubSearchResult {
 /// A GitHub issue.
 #[derive(Debug, Clone, Deserialize)]
 struct GitHubIssue {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     id: i64,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     number: i64,
     title: String,
     body: Option<String>,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     state: String,
     html_url: String,
     created_at: String,

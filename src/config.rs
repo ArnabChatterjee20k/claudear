@@ -3459,7 +3459,7 @@ api_key = "key"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_with_linear() {
         let mut config = Config::default();
         config.issues.linear = Some(LinearConfig {
@@ -3471,7 +3471,7 @@ api_key = "key"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_with_sentry() {
         let mut config = Config::default();
         config.issues.sentry = Some(SentryConfig {
@@ -3484,7 +3484,7 @@ api_key = "key"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_sentry_missing_org_slug() {
         let mut config = Config::default();
         config.issues.sentry = Some(SentryConfig {
@@ -3502,7 +3502,7 @@ api_key = "key"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_disabled_sources_fail() {
         let mut config = Config::default();
         config.issues.linear = Some(LinearConfig {
@@ -3514,7 +3514,7 @@ api_key = "key"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_empty_api_key_fails() {
         let mut config = Config::default();
         config.issues.linear = Some(LinearConfig {
@@ -6533,7 +6533,7 @@ poll_interval_ms = 60000
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_with_jira() {
         let mut config = Config::default();
         config.issues.jira = Some(JiraConfig {
@@ -6548,7 +6548,7 @@ poll_interval_ms = 60000
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_jira_missing_base_url() {
         let mut config = Config::default();
         config.issues.jira = Some(JiraConfig {
@@ -6564,7 +6564,7 @@ poll_interval_ms = 60000
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_jira_invalid_auth_mode() {
         let mut config = Config::default();
         config.issues.jira = Some(JiraConfig {
@@ -6580,7 +6580,7 @@ poll_interval_ms = 60000
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_jira_basic_auth_missing_email() {
         let mut config = Config::default();
         config.issues.jira = Some(JiraConfig {
@@ -6596,7 +6596,7 @@ poll_interval_ms = 60000
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_jira_bearer_auth_no_email_required() {
         let mut config = Config::default();
         config.issues.jira = Some(JiraConfig {
@@ -6728,7 +6728,7 @@ sms_number = "+1111111111"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_with_gitlab() {
         let mut config = Config::default();
         config.scm.gitlab = Some(GitLabConfig {
@@ -6740,7 +6740,7 @@ sms_number = "+1111111111"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_with_slack_source() {
         let mut config = Config::default();
         config.issues.slack = Some(SlackSourceConfig {
@@ -6751,7 +6751,7 @@ sms_number = "+1111111111"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_with_discord_source() {
         let mut config = Config::default();
         config.issues.discord = Some(DiscordSourceConfig {
@@ -6762,7 +6762,7 @@ sms_number = "+1111111111"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_slack_source_without_bot_token() {
         let mut config = Config::default();
         config.issues.slack = Some(SlackSourceConfig {
@@ -6773,7 +6773,7 @@ sms_number = "+1111111111"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_discord_source_without_bot_token() {
         let mut config = Config::default();
         config.issues.discord = Some(DiscordSourceConfig {
@@ -6784,7 +6784,7 @@ sms_number = "+1111111111"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_prioritisation_skipped_when_disabled() {
         let mut config = Config::default();
         config.issues.linear = Some(LinearConfig {
@@ -6800,7 +6800,7 @@ sms_number = "+1111111111"
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
+
     fn test_validation_prioritisation_checked_when_enabled() {
         let mut config = Config::default();
         config.issues.linear = Some(LinearConfig {

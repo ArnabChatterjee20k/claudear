@@ -418,7 +418,7 @@ impl<C: crate::github::HttpClient> ReleaseTracker<C> {
     /// 1. Find the first release in source repo after the fix was merged
     /// 2. Fetch the lock file from target release
     /// 3. Check if the package version includes the fix version
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn verify_lock_file(
         &self,
         watch: &RegressionWatch,

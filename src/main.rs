@@ -535,7 +535,7 @@ fn print_startup_ok(message: impl AsRef<str>) {
     println!("  [ok] {}", message.as_ref());
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn print_startup_banner_and_status(
     config: &Config,
     config_path: &str,
