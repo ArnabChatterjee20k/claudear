@@ -3954,7 +3954,7 @@ Create a PR with your changes.{custom_instructions}"#,
         let now = Utc::now();
         let parsed_reset = Self::extract_rate_limit_reset_time(error, now);
         let fallback_reset = now + chrono::Duration::minutes(15);
-        let pause_target = parsed_reset.unwrap_or(fallback_reset);
+        let pause_target = parsed_reset.unwrap_or(fallback_reset) + chrono::Duration::minutes(1);
         let reset_time_parsed = parsed_reset.is_some();
 
         let mut pause_until = self.rate_limit_pause_until.write().await;
