@@ -141,22 +141,36 @@ impl EmbeddingClient {
 
     /// Generate embeddings for multiple texts.
     ///
-    /// Uses `spawn_blocking` because ONNX inference is CPU-bound.
+    /// Processes texts in sub-batches to bound ONNX runtime peak memory.
+    /// The runtime allocates attention tensors proportional to
+    /// `batch × seq_len × hidden_dim` — large batches can OOM.
     pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let model = self.model.clone();
-        let texts_owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
+        /// Max texts per ONNX inference call.  Keeps peak memory from
+        /// attention tensors manageable (~35 MB per layer for 4 × 1500 × 768).
+        const SUB_BATCH: usize = 4;
 
-        tokio::task::spawn_blocking(move || {
-            let mut model = model
-                .lock()
-                .map_err(|e| Error::Other(format!("Embedding model lock poisoned: {}", e)))?;
+        let mut all_embeddings = Vec::with_capacity(texts.len());
 
-            model
-                .embed(texts_owned, None)
-                .map_err(|e| Error::Other(format!("Failed to generate embeddings: {}", e)))
-        })
-        .await
-        .map_err(|e| Error::Other(format!("Embedding batch task panicked: {}", e)))?
+        for sub in texts.chunks(SUB_BATCH) {
+            let model = self.model.clone();
+            let sub_owned: Vec<String> = sub.iter().map(|s| s.to_string()).collect();
+
+            let mut batch_result = tokio::task::spawn_blocking(move || {
+                let mut model = model
+                    .lock()
+                    .map_err(|e| Error::Other(format!("Embedding model lock poisoned: {}", e)))?;
+
+                model
+                    .embed(sub_owned, None)
+                    .map_err(|e| Error::Other(format!("Failed to generate embeddings: {}", e)))
+            })
+            .await
+            .map_err(|e| Error::Other(format!("Embedding batch task panicked: {}", e)))??;
+
+            all_embeddings.append(&mut batch_result);
+        }
+
+        Ok(all_embeddings)
     }
 
     /// Check if the embedding model is available.
