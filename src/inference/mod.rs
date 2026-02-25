@@ -574,13 +574,14 @@ impl RepoInferrer {
         use crate::repo::GitOps;
         use futures::stream::{self, StreamExt};
 
-        // Partition repos into those needing cloning vs those already on disk but unindexed
-        let (repos_to_clone, repos_to_index): (Vec<_>, Vec<_>) = {
+        // Partition repos into those needing cloning, those needing indexing, and those
+        // already on disk + indexed that just need a pull to stay up to date on restart.
+        let (repos_to_clone, repos_to_index, repos_to_pull): (Vec<_>, Vec<_>, Vec<_>) = {
             let index = self
                 .index
                 .read()
                 .map_err(|e| crate::error::Error::Other(format!("index RwLock poisoned: {}", e)))?;
-            let (mut to_clone, mut to_index) = (Vec::new(), Vec::new());
+            let (mut to_clone, mut to_index, mut to_pull) = (Vec::new(), Vec::new(), Vec::new());
             for r in index.list() {
                 if !r.path.exists() {
                     to_clone.push((
@@ -591,9 +592,11 @@ impl RepoInferrer {
                     ));
                 } else if r.files.is_empty() {
                     to_index.push(r.name.clone());
+                } else {
+                    to_pull.push((r.name.clone(), r.path.clone(), r.scm_url.clone()));
                 }
             }
-            (to_clone, to_index)
+            (to_clone, to_index, to_pull)
         };
 
         // Clone missing repos
@@ -647,6 +650,30 @@ impl RepoInferrer {
             tracing::info!(
                 count = repos_to_index.len(),
                 "Finished indexing existing repositories"
+            );
+        }
+
+        // Fetch repos that are already cloned and indexed so they're up to date on restart
+        if !repos_to_pull.is_empty() {
+            tracing::info!(
+                count = repos_to_pull.len(),
+                "Fetching existing repositories to update"
+            );
+
+            let pull_results: Vec<_> = stream::iter(repos_to_pull)
+                .map(|(name, path, scm_url)| async move {
+                    if let Err(e) = GitOps::ensure_repo_fetched(&path, &scm_url).await {
+                        tracing::warn!(repo = %name, error = %e, "Failed to fetch repository");
+                    }
+                    name
+                })
+                .buffer_unordered(parallelism)
+                .collect()
+                .await;
+
+            tracing::info!(
+                count = pull_results.len(),
+                "Finished fetching existing repositories"
             );
         }
 
