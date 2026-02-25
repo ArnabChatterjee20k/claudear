@@ -113,6 +113,20 @@ impl EmbeddingClient {
         Self::new(EmbeddingConfig::from_env())
     }
 
+    /// Ensure the default embedding model is downloaded and cached.
+    ///
+    /// Call once (single-threaded) before parallel test runs so that
+    /// concurrent `EmbeddingClient::new()` calls never race to download.
+    /// Returns `Ok(())` if the model is ready, `Err` if the download failed.
+    pub fn warmup() -> Result<()> {
+        let config = EmbeddingConfig {
+            show_download_progress: false,
+            ..EmbeddingConfig::default()
+        };
+        let _client = Self::new(config)?;
+        Ok(())
+    }
+
     /// Generate embedding for text.
     ///
     /// Uses `spawn_blocking` because ONNX inference is CPU-bound and would
@@ -251,6 +265,15 @@ pub struct EmbeddingResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_warmup_downloads_model() {
+        // Pre-downloads the ONNX model single-threaded so parallel tests
+        // don't race.  Runs as a dedicated CI step before the test suite.
+        if let Err(e) = EmbeddingClient::warmup() {
+            eprintln!("Embedding warmup failed (model may be unavailable): {e}");
+        }
+    }
 
     #[test]
     fn test_cosine_similarity_identical() {

@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
+  FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
 
 jobs:
   check:
@@ -55,6 +56,15 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      - name: Cache fastembed model
+        uses: actions/cache@v5
+        with:
+          path: /home/runner/.cache/fastembed
+          key: fastembed-nomic-v15
+
+      - name: Warmup embedding model
+        run: cargo test --all-features --lib feedback::embeddings::tests::test_warmup_downloads_model -- --exact --nocapture
 
       - name: Run tests
         run: cargo test --all-features
@@ -163,6 +173,15 @@ jobs:
           key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-coverage-
+
+      - name: Cache fastembed model
+        uses: actions/cache@v5
+        with:
+          path: /home/runner/.cache/fastembed
+          key: fastembed-nomic-v15
+
+      - name: Warmup embedding model
+        run: cargo test --all-features --lib feedback::embeddings::tests::test_warmup_downloads_model -- --exact --nocapture
 
       - name: Generate coverage report
         run: cargo tarpaulin --out Xml --all-features
