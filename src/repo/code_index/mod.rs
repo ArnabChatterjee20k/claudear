@@ -417,9 +417,12 @@ mod tests {
     /// cannot be downloaded (common in CI).  Tests that need an
     /// `Arc<EmbeddingClient>` should early-return when this returns `None`.
     fn try_embedding_client() -> Option<Arc<crate::feedback::EmbeddingClient>> {
-        crate::feedback::EmbeddingClient::new(Default::default())
-            .ok()
-            .map(Arc::new)
+        crate::feedback::EmbeddingClient::new(crate::feedback::EmbeddingConfig {
+            pool_size: 1, // single instance is sufficient for tests
+            ..Default::default()
+        })
+        .ok()
+        .map(Arc::new)
     }
 
     #[test]

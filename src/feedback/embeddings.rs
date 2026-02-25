@@ -4,6 +4,7 @@
 
 use crate::error::{Error, Result};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Configuration for the embedding service.
@@ -15,6 +16,14 @@ pub struct EmbeddingConfig {
     pub show_download_progress: bool,
     /// Custom cache directory (uses system default if None).
     pub cache_dir: Option<String>,
+    /// Number of model instances in the pool (defaults to available CPUs).
+    pub pool_size: usize,
+}
+
+fn default_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
 }
 
 impl Default for EmbeddingConfig {
@@ -23,6 +32,7 @@ impl Default for EmbeddingConfig {
             model: EmbeddingModel::NomicEmbedTextV15,
             show_download_progress: true,
             cache_dir: None,
+            pool_size: default_pool_size(),
         }
     }
 }
@@ -42,10 +52,17 @@ impl EmbeddingConfig {
 
         let cache_dir = std::env::var("EMBEDDING_CACHE_DIR").ok();
 
+        let pool_size = std::env::var("EMBEDDING_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(default_pool_size);
+
         Self {
             model,
             show_download_progress: true,
             cache_dir,
+            pool_size,
         }
     }
 
@@ -55,23 +72,26 @@ impl EmbeddingConfig {
             model: EmbeddingModel::AllMiniLML6V2,
             show_download_progress: true,
             cache_dir: None,
+            pool_size: default_pool_size(),
         }
     }
 }
 
 /// Client for generating embeddings using fastembed.
 ///
-/// Thread-safe wrapper around the TextEmbedding model.
+/// Uses a pool of `TextEmbedding` model instances for concurrent inference.
+/// Sub-batch size is determined dynamically from available system memory.
 pub struct EmbeddingClient {
-    model: Arc<Mutex<TextEmbedding>>,
+    pool: Vec<Arc<Mutex<TextEmbedding>>>,
+    next: AtomicUsize,
     dimension: usize,
     model_name: String,
 }
 
 impl EmbeddingClient {
-    /// Create a new embedding client.
+    /// Create a new embedding client with a pool of model instances.
     ///
-    /// This will download the model on first use if not cached.
+    /// The first model load may download weights; subsequent loads use cache.
     pub fn new(config: EmbeddingConfig) -> Result<Self> {
         let dimension = match config.model {
             EmbeddingModel::NomicEmbedTextV15 => 768,
@@ -84,28 +104,69 @@ impl EmbeddingClient {
         };
 
         let model_name = format!("{:?}", config.model);
+        let pool_size = config.pool_size.max(1);
 
-        let mut init_options = InitOptions::new(config.model)
-            .with_show_download_progress(config.show_download_progress);
+        let mut pool = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let mut init_options = InitOptions::new(config.model.clone())
+                .with_show_download_progress(config.show_download_progress);
 
-        if let Some(cache_dir) = config.cache_dir {
-            init_options = init_options.with_cache_dir(cache_dir.into());
+            if let Some(ref cache_dir) = config.cache_dir {
+                init_options = init_options.with_cache_dir(cache_dir.into());
+            }
+
+            let model = TextEmbedding::try_new(init_options).map_err(|e| {
+                Error::Other(format!("Failed to initialize embedding model: {}", e))
+            })?;
+            pool.push(Arc::new(Mutex::new(model)));
         }
 
-        let model = TextEmbedding::try_new(init_options)
-            .map_err(|e| Error::Other(format!("Failed to initialize embedding model: {}", e)))?;
-
         tracing::info!(
-            "Initialized embedding model: {} ({}d)",
+            "Initialized embedding model: {} ({}d, pool_size={})",
             model_name,
-            dimension
+            dimension,
+            pool_size,
         );
 
         Ok(Self {
-            model: Arc::new(Mutex::new(model)),
+            pool,
+            next: AtomicUsize::new(0),
             dimension,
             model_name,
         })
+    }
+
+    /// Round-robin acquire a model instance from the pool.
+    fn acquire(&self) -> Arc<Mutex<TextEmbedding>> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        self.pool[idx].clone()
+    }
+
+    /// Compute sub-batch size based on available system memory.
+    ///
+    /// Uses 66% of available RAM as a budget.  Falls back to 32 if sysinfo
+    /// reports 0.  Respects `EMBEDDING_SUB_BATCH` env var for manual override.
+    fn compute_sub_batch(dimension: usize) -> usize {
+        if let Some(val) = std::env::var("EMBEDDING_SUB_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+        {
+            return val;
+        }
+
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let available_mb = sys.available_memory() / (1024 * 1024);
+
+        if available_mb == 0 {
+            return 32;
+        }
+
+        // Conservative per-text memory estimate for ONNX attention tensors.
+        let mb_per_text: u64 = if dimension >= 768 { 10 } else { 5 };
+        let budget_mb = available_mb * 2 / 3;
+        (budget_mb / mb_per_text).clamp(4, 256) as usize
     }
 
     /// Create with default configuration from environment.
@@ -121,18 +182,19 @@ impl EmbeddingClient {
     pub fn warmup() -> Result<()> {
         let config = EmbeddingConfig {
             show_download_progress: false,
+            pool_size: 1, // only need one for warmup
             ..EmbeddingConfig::default()
         };
         let _client = Self::new(config)?;
         Ok(())
     }
 
-    /// Generate embedding for text.
+    /// Generate embedding for a single text.
     ///
     /// Uses `spawn_blocking` because ONNX inference is CPU-bound and would
     /// otherwise block a tokio worker thread.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let model = self.model.clone();
+        let model = self.acquire();
         let text = text.to_string();
 
         tokio::task::spawn_blocking(move || {
@@ -153,23 +215,21 @@ impl EmbeddingClient {
         .map_err(|e| Error::Other(format!("Embedding task panicked: {}", e)))?
     }
 
-    /// Generate embeddings for multiple texts.
+    /// Generate embeddings for multiple texts concurrently.
     ///
-    /// Processes texts in sub-batches to bound ONNX runtime peak memory.
-    /// The runtime allocates attention tensors proportional to
-    /// `batch × seq_len × hidden_dim` — large batches can OOM.
+    /// Splits texts into sub-batches (sized by available memory) and spawns
+    /// them onto the blocking pool.  Mutex contention naturally limits
+    /// concurrency to `pool_size` simultaneous ONNX calls.
     pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        /// Max texts per ONNX inference call.  Keeps peak memory from
-        /// attention tensors manageable (~35 MB per layer for 4 × 1500 × 768).
-        const SUB_BATCH: usize = 4;
+        let sub_batch = Self::compute_sub_batch(self.dimension);
 
-        let mut all_embeddings = Vec::with_capacity(texts.len());
+        let mut handles = Vec::new();
 
-        for sub in texts.chunks(SUB_BATCH) {
-            let model = self.model.clone();
+        for sub in texts.chunks(sub_batch) {
+            let model = self.acquire();
             let sub_owned: Vec<String> = sub.iter().map(|s| s.to_string()).collect();
 
-            let mut batch_result = tokio::task::spawn_blocking(move || {
+            handles.push(tokio::task::spawn_blocking(move || {
                 let mut model = model
                     .lock()
                     .map_err(|e| Error::Other(format!("Embedding model lock poisoned: {}", e)))?;
@@ -177,10 +237,14 @@ impl EmbeddingClient {
                 model
                     .embed(sub_owned, None)
                     .map_err(|e| Error::Other(format!("Failed to generate embeddings: {}", e)))
-            })
-            .await
-            .map_err(|e| Error::Other(format!("Embedding batch task panicked: {}", e)))??;
+            }));
+        }
 
+        let mut all_embeddings = Vec::with_capacity(texts.len());
+        for handle in handles {
+            let mut batch_result = handle
+                .await
+                .map_err(|e| Error::Other(format!("Embedding batch task panicked: {}", e)))??;
             all_embeddings.append(&mut batch_result);
         }
 

@@ -1415,11 +1415,13 @@ mod tests {
     #[test]
     fn test_with_http_client_and_embeddings_sets_fields_correctly() {
         let config = create_config();
-        let embedding_client =
-            match EmbeddingClient::new(crate::feedback::EmbeddingConfig::default()) {
-                Ok(c) => Arc::new(c),
-                Err(_) => return, // Skip if model unavailable (CI race)
-            };
+        let embedding_client = match EmbeddingClient::new(crate::feedback::EmbeddingConfig {
+            pool_size: 1,
+            ..Default::default()
+        }) {
+            Ok(c) => Arc::new(c),
+            Err(_) => return, // Skip if model unavailable (CI race)
+        };
         let original_emb = vec![0.1, 0.2, 0.3];
 
         let checker = LinearRegressionChecker::with_http_client_and_embeddings(
@@ -2285,7 +2287,10 @@ mod tests {
     #[tokio::test]
     async fn test_check_regression_with_embedding_client_shows_semantic_method() {
         let config = create_config();
-        let emb_client = match EmbeddingClient::new(crate::feedback::EmbeddingConfig::default()) {
+        let emb_client = match EmbeddingClient::new(crate::feedback::EmbeddingConfig {
+            pool_size: 1,
+            ..Default::default()
+        }) {
             Ok(c) => Arc::new(c),
             Err(_) => return, // Skip if model unavailable (CI race)
         };
