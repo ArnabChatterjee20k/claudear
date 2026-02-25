@@ -144,11 +144,11 @@ impl SqliteTracker {
             -- Don't wait for fsync on every commit (safe with WAL)
             PRAGMA synchronous = NORMAL;
 
-            -- 64MB cache (default is 2MB) - keeps hot pages in RAM
-            PRAGMA cache_size = -65536;
+            -- 16MB cache (default is 2MB) - keeps hot pages in RAM
+            PRAGMA cache_size = -16384;
 
-            -- Memory-map up to 256MB of the DB file for faster BLOB access
-            PRAGMA mmap_size = 268435456;
+            -- Memory-map up to 64MB of the DB file for faster BLOB access
+            PRAGMA mmap_size = 67108864;
 
             -- Store temp tables in memory
             PRAGMA temp_store = MEMORY;
@@ -10065,7 +10065,7 @@ mod tests {
         let cache_size: i64 = conn
             .query_row("PRAGMA cache_size", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(cache_size, -65536, "Expected cache_size=-65536 (64MB)");
+        assert_eq!(cache_size, -16384, "Expected cache_size=-16384 (16MB)");
 
         // Verify temp_store is MEMORY (2)
         let temp_store: i32 = conn
