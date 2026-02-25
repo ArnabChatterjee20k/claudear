@@ -4,8 +4,11 @@ use super::types::{Language, SymbolKind};
 use tree_sitter::Language as TsLanguage;
 
 /// Get the tree-sitter grammar for a language.
-pub fn ts_language(lang: Language) -> TsLanguage {
-    match lang {
+///
+/// Returns `None` for languages without a compatible tree-sitter grammar
+/// (e.g. Dart has no crate compatible with tree-sitter 0.26).
+pub fn ts_language(lang: Language) -> Option<TsLanguage> {
+    Some(match lang {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
@@ -19,7 +22,9 @@ pub fn ts_language(lang: Language) -> TsLanguage {
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         Language::Swift => tree_sitter_swift::LANGUAGE.into(),
         Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
-    }
+        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Language::Dart => return None,
+    })
 }
 
 /// Classify a tree-sitter node type into a `SymbolKind` for the given language.
@@ -38,6 +43,8 @@ pub fn classify_node(lang: Language, node_type: &str) -> Option<SymbolKind> {
         Language::Php => classify_php(node_type),
         Language::Swift => classify_swift(node_type),
         Language::Kotlin => classify_kotlin(node_type),
+        Language::CSharp => classify_csharp(node_type),
+        Language::Dart => classify_dart(node_type),
     }
 }
 
@@ -55,6 +62,8 @@ pub fn name_field(lang: Language, node_type: &str) -> Option<&'static str> {
         Language::Php => php_name_field(node_type),
         Language::Swift => swift_name_field(node_type),
         Language::Kotlin => kotlin_name_field(node_type),
+        Language::CSharp => csharp_name_field(node_type),
+        Language::Dart => dart_name_field(node_type),
     }
 }
 
@@ -75,6 +84,11 @@ pub fn is_container(lang: Language, node_type: &str) -> bool {
         Language::Php => matches!(node_type, "class_declaration"),
         Language::Swift => matches!(node_type, "class_declaration" | "protocol_declaration"),
         Language::Kotlin => matches!(node_type, "class_declaration"),
+        Language::CSharp => matches!(
+            node_type,
+            "class_declaration" | "struct_declaration" | "namespace_declaration"
+        ),
+        Language::Dart => matches!(node_type, "class_definition" | "mixin_declaration"),
     }
 }
 
@@ -297,6 +311,61 @@ fn kotlin_name_field(node_type: &str) -> Option<&'static str> {
     }
 }
 
+fn classify_csharp(node_type: &str) -> Option<SymbolKind> {
+    match node_type {
+        "class_declaration" => Some(SymbolKind::Class),
+        "method_declaration" | "constructor_declaration" => Some(SymbolKind::Method),
+        "interface_declaration" => Some(SymbolKind::Interface),
+        "enum_declaration" => Some(SymbolKind::Enum),
+        "struct_declaration" => Some(SymbolKind::Struct),
+        "namespace_declaration" => Some(SymbolKind::Module),
+        "property_declaration" => Some(SymbolKind::Constant),
+        _ => None,
+    }
+}
+
+fn csharp_name_field(node_type: &str) -> Option<&'static str> {
+    match node_type {
+        "class_declaration"
+        | "method_declaration"
+        | "constructor_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "struct_declaration"
+        | "namespace_declaration"
+        | "property_declaration" => Some("name"),
+        _ => None,
+    }
+}
+
+fn classify_dart(node_type: &str) -> Option<SymbolKind> {
+    match node_type {
+        "function_signature"
+        | "method_signature"
+        | "getter_signature"
+        | "setter_signature"
+        | "constructor_signature" => Some(SymbolKind::Function),
+        "class_definition" => Some(SymbolKind::Class),
+        "enum_declaration" => Some(SymbolKind::Enum),
+        "mixin_declaration" => Some(SymbolKind::Class),
+        _ => None,
+    }
+}
+
+fn dart_name_field(node_type: &str) -> Option<&'static str> {
+    match node_type {
+        "function_signature"
+        | "method_signature"
+        | "getter_signature"
+        | "setter_signature"
+        | "constructor_signature"
+        | "class_definition"
+        | "enum_declaration"
+        | "mixin_declaration" => Some("name"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,12 +389,15 @@ mod tests {
             Language::Php,
             Language::Swift,
             Language::Kotlin,
+            Language::CSharp,
         ];
         let mut failed = Vec::new();
         for lang in all_langs {
-            let mut parser = tree_sitter::Parser::new();
-            if parser.set_language(&ts_language(lang)).is_err() {
-                failed.push(lang);
+            if let Some(ts_lang) = ts_language(lang) {
+                let mut parser = tree_sitter::Parser::new();
+                if parser.set_language(&ts_lang).is_err() {
+                    failed.push(lang);
+                }
             }
         }
         // Core languages must always work
@@ -346,6 +418,16 @@ mod tests {
                 lang
             );
         }
+    }
+
+    #[test]
+    fn test_ts_language_returns_none_for_dart() {
+        assert!(ts_language(Language::Dart).is_none());
+    }
+
+    #[test]
+    fn test_ts_language_returns_some_for_csharp() {
+        assert!(ts_language(Language::CSharp).is_some());
     }
 
     #[test]
@@ -979,6 +1061,19 @@ mod tests {
         assert!(!is_container(Language::Kotlin, "function_declaration"));
         assert!(!is_container(Language::Kotlin, "interface_declaration"));
         assert!(!is_container(Language::Kotlin, "object_declaration"));
+
+        // CSharp
+        assert!(is_container(Language::CSharp, "class_declaration"));
+        assert!(is_container(Language::CSharp, "struct_declaration"));
+        assert!(is_container(Language::CSharp, "namespace_declaration"));
+        assert!(!is_container(Language::CSharp, "method_declaration"));
+        assert!(!is_container(Language::CSharp, "interface_declaration"));
+
+        // Dart
+        assert!(is_container(Language::Dart, "class_definition"));
+        assert!(is_container(Language::Dart, "mixin_declaration"));
+        assert!(!is_container(Language::Dart, "function_signature"));
+        assert!(!is_container(Language::Dart, "enum_declaration"));
     }
 
     #[test]
@@ -1013,5 +1108,138 @@ mod tests {
     #[test]
     fn test_classify_python_unknown() {
         assert_eq!(classify_node(Language::Python, "unknown_node"), None);
+    }
+
+    #[test]
+    fn test_classify_csharp_nodes() {
+        assert_eq!(
+            classify_node(Language::CSharp, "class_declaration"),
+            Some(SymbolKind::Class)
+        );
+        assert_eq!(
+            classify_node(Language::CSharp, "method_declaration"),
+            Some(SymbolKind::Method)
+        );
+        assert_eq!(
+            classify_node(Language::CSharp, "constructor_declaration"),
+            Some(SymbolKind::Method)
+        );
+        assert_eq!(
+            classify_node(Language::CSharp, "interface_declaration"),
+            Some(SymbolKind::Interface)
+        );
+        assert_eq!(
+            classify_node(Language::CSharp, "enum_declaration"),
+            Some(SymbolKind::Enum)
+        );
+        assert_eq!(
+            classify_node(Language::CSharp, "struct_declaration"),
+            Some(SymbolKind::Struct)
+        );
+        assert_eq!(
+            classify_node(Language::CSharp, "namespace_declaration"),
+            Some(SymbolKind::Module)
+        );
+        assert_eq!(
+            classify_node(Language::CSharp, "property_declaration"),
+            Some(SymbolKind::Constant)
+        );
+        assert_eq!(classify_node(Language::CSharp, "unknown_node"), None);
+    }
+
+    #[test]
+    fn test_name_field_csharp() {
+        assert_eq!(
+            name_field(Language::CSharp, "class_declaration"),
+            Some("name")
+        );
+        assert_eq!(
+            name_field(Language::CSharp, "method_declaration"),
+            Some("name")
+        );
+        assert_eq!(
+            name_field(Language::CSharp, "constructor_declaration"),
+            Some("name")
+        );
+        assert_eq!(
+            name_field(Language::CSharp, "interface_declaration"),
+            Some("name")
+        );
+        assert_eq!(
+            name_field(Language::CSharp, "enum_declaration"),
+            Some("name")
+        );
+        assert_eq!(
+            name_field(Language::CSharp, "struct_declaration"),
+            Some("name")
+        );
+        assert_eq!(
+            name_field(Language::CSharp, "namespace_declaration"),
+            Some("name")
+        );
+        assert_eq!(
+            name_field(Language::CSharp, "property_declaration"),
+            Some("name")
+        );
+        assert_eq!(name_field(Language::CSharp, "unknown_node"), None);
+    }
+
+    #[test]
+    fn test_classify_dart_nodes() {
+        assert_eq!(
+            classify_node(Language::Dart, "function_signature"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(
+            classify_node(Language::Dart, "method_signature"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(
+            classify_node(Language::Dart, "getter_signature"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(
+            classify_node(Language::Dart, "setter_signature"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(
+            classify_node(Language::Dart, "constructor_signature"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(
+            classify_node(Language::Dart, "class_definition"),
+            Some(SymbolKind::Class)
+        );
+        assert_eq!(
+            classify_node(Language::Dart, "enum_declaration"),
+            Some(SymbolKind::Enum)
+        );
+        assert_eq!(
+            classify_node(Language::Dart, "mixin_declaration"),
+            Some(SymbolKind::Class)
+        );
+        assert_eq!(classify_node(Language::Dart, "unknown_node"), None);
+    }
+
+    #[test]
+    fn test_name_field_dart() {
+        assert_eq!(
+            name_field(Language::Dart, "function_signature"),
+            Some("name")
+        );
+        assert_eq!(name_field(Language::Dart, "method_signature"), Some("name"));
+        assert_eq!(name_field(Language::Dart, "getter_signature"), Some("name"));
+        assert_eq!(name_field(Language::Dart, "setter_signature"), Some("name"));
+        assert_eq!(
+            name_field(Language::Dart, "constructor_signature"),
+            Some("name")
+        );
+        assert_eq!(name_field(Language::Dart, "class_definition"), Some("name"));
+        assert_eq!(name_field(Language::Dart, "enum_declaration"), Some("name"));
+        assert_eq!(
+            name_field(Language::Dart, "mixin_declaration"),
+            Some("name")
+        );
+        assert_eq!(name_field(Language::Dart, "unknown_node"), None);
     }
 }

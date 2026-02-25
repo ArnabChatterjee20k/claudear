@@ -57,7 +57,9 @@ pub struct RepoStyleSummary {
 pub fn analyze_file(source: &str, language: Language) -> FileStyleAnalysis {
     let mut analysis = FileStyleAnalysis::default();
 
-    let ts_lang = languages::ts_language(language);
+    let Some(ts_lang) = languages::ts_language(language) else {
+        return analysis;
+    };
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&ts_lang).is_err() {
         return analysis;
@@ -334,6 +336,11 @@ fn is_function_node(language: Language, node_type: &str) -> bool {
         Language::Php => matches!(node_type, "function_definition" | "method_declaration"),
         Language::Swift => matches!(node_type, "function_declaration"),
         Language::Kotlin => matches!(node_type, "function_declaration"),
+        Language::CSharp => matches!(node_type, "method_declaration" | "constructor_declaration"),
+        Language::Dart => matches!(
+            node_type,
+            "function_signature" | "method_signature" | "getter_signature" | "setter_signature"
+        ),
     }
 }
 
@@ -357,6 +364,17 @@ fn is_type_node(language: Language, node_type: &str) -> bool {
         Language::Php => matches!(node_type, "class_declaration" | "interface_declaration"),
         Language::Swift => matches!(node_type, "class_declaration" | "protocol_declaration"),
         Language::Kotlin => matches!(node_type, "class_declaration" | "interface_declaration"),
+        Language::CSharp => matches!(
+            node_type,
+            "class_declaration"
+                | "struct_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+        ),
+        Language::Dart => matches!(
+            node_type,
+            "class_definition" | "enum_declaration" | "mixin_declaration"
+        ),
     }
 }
 
@@ -469,6 +487,8 @@ fn find_body(node: tree_sitter::Node, language: Language) -> Option<tree_sitter:
         Language::Php => "body",
         Language::Swift => "body",
         Language::Kotlin => "body",
+        Language::CSharp => "body",
+        Language::Dart => "body",
     };
     node.child_by_field_name(body_field)
 }

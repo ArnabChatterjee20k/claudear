@@ -7,9 +7,12 @@ use tree_sitter::{Parser, Tree};
 
 /// Parse a source file into a tree-sitter AST.
 pub fn parse_file(source: &str, language: Language) -> Result<Tree> {
+    let ts_lang = ts_language(language).ok_or_else(|| {
+        crate::error::Error::Other(format!("No tree-sitter grammar available for {}", language))
+    })?;
     let mut parser = Parser::new();
     parser
-        .set_language(&ts_language(language))
+        .set_language(&ts_lang)
         .map_err(|e| crate::error::Error::Other(format!("Failed to set language: {}", e)))?;
 
     parser

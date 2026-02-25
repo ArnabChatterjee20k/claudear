@@ -57,7 +57,13 @@ pub struct RepoComplexity {
 pub fn analyze_file(source: &str, language: Language, file_path: &str) -> FileComplexity {
     let total_lines = source.lines().count() as u32;
 
-    let ts_lang = languages::ts_language(language);
+    let Some(ts_lang) = languages::ts_language(language) else {
+        return FileComplexity {
+            file_path: file_path.to_string(),
+            total_lines,
+            ..Default::default()
+        };
+    };
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&ts_lang).is_err() {
         return FileComplexity {
@@ -350,6 +356,11 @@ fn is_function_node(language: Language, node_type: &str) -> bool {
         Language::Php => matches!(node_type, "function_definition" | "method_declaration"),
         Language::Swift => matches!(node_type, "function_declaration"),
         Language::Kotlin => matches!(node_type, "function_declaration"),
+        Language::CSharp => matches!(node_type, "method_declaration" | "constructor_declaration"),
+        Language::Dart => matches!(
+            node_type,
+            "function_signature" | "method_signature" | "getter_signature" | "setter_signature"
+        ),
     }
 }
 

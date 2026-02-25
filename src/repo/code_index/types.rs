@@ -19,6 +19,8 @@ pub enum Language {
     Php,
     Swift,
     Kotlin,
+    CSharp,
+    Dart,
 }
 
 impl Language {
@@ -38,6 +40,8 @@ impl Language {
             Self::Php => "PHP",
             Self::Swift => "Swift",
             Self::Kotlin => "Kotlin",
+            Self::CSharp => "C#",
+            Self::Dart => "Dart",
         }
     }
 
@@ -57,6 +61,8 @@ impl Language {
             "php" => Some(Self::Php),
             "swift" => Some(Self::Swift),
             "kt" | "kts" => Some(Self::Kotlin),
+            "cs" => Some(Self::CSharp),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }
@@ -208,6 +214,8 @@ mod tests {
         assert_eq!(Language::from_extension("swift"), Some(Language::Swift));
         assert_eq!(Language::from_extension("kt"), Some(Language::Kotlin));
         assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
+        assert_eq!(Language::from_extension("cs"), Some(Language::CSharp));
+        assert_eq!(Language::from_extension("dart"), Some(Language::Dart));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -234,6 +242,8 @@ mod tests {
         assert_eq!(Language::Rust.to_string(), "Rust");
         assert_eq!(Language::Cpp.to_string(), "C++");
         assert_eq!(Language::TypeScript.to_string(), "TypeScript");
+        assert_eq!(Language::CSharp.to_string(), "C#");
+        assert_eq!(Language::Dart.to_string(), "Dart");
     }
 
     #[test]
