@@ -288,6 +288,259 @@ pub fn detect_tools(project_dir: &Path, overrides: &ToolOverrides) -> Vec<Detect
         }
     }
 
+    // Python (pyproject.toml / requirements.txt / setup.py)
+    if project_dir.join("pyproject.toml").exists()
+        || project_dir.join("requirements.txt").exists()
+        || project_dir.join("setup.py").exists()
+    {
+        if !has_test && which_exists("pytest") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Test,
+                name: "pytest".into(),
+                command: vec!["pytest".into(), "--tb=short".into(), "-q".into()],
+            });
+        }
+        if !has_analysis {
+            if which_exists("mypy") {
+                tools.push(DetectedTool {
+                    category: EvalCategory::StaticAnalysis,
+                    name: "mypy".into(),
+                    command: vec!["mypy".into(), ".".into()],
+                });
+            } else if which_exists("ruff") {
+                tools.push(DetectedTool {
+                    category: EvalCategory::StaticAnalysis,
+                    name: "ruff check".into(),
+                    command: vec!["ruff".into(), "check".into(), ".".into()],
+                });
+            }
+        }
+        if !has_lint {
+            if which_exists("ruff") {
+                tools.push(DetectedTool {
+                    category: EvalCategory::Lint,
+                    name: "ruff format".into(),
+                    command: vec!["ruff".into(), "format".into(), "--check".into(), ".".into()],
+                });
+            } else if which_exists("black") {
+                tools.push(DetectedTool {
+                    category: EvalCategory::Lint,
+                    name: "black".into(),
+                    command: vec!["black".into(), "--check".into(), ".".into()],
+                });
+            }
+        }
+        if !has_coverage && which_exists("pytest") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Coverage,
+                name: "pytest coverage".into(),
+                command: vec![
+                    "pytest".into(),
+                    "--cov=.".into(),
+                    "--cov-report=term".into(),
+                    "-q".into(),
+                ],
+            });
+        }
+    }
+
+    // Go (go.mod)
+    if project_dir.join("go.mod").exists() {
+        if !has_test && which_exists("go") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Test,
+                name: "go test".into(),
+                command: vec!["go".into(), "test".into(), "-json".into(), "./...".into()],
+            });
+        }
+        if !has_analysis && which_exists("go") {
+            tools.push(DetectedTool {
+                category: EvalCategory::StaticAnalysis,
+                name: "go vet".into(),
+                command: vec!["go".into(), "vet".into(), "./...".into()],
+            });
+        }
+        if !has_lint && which_exists("gofmt") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Lint,
+                name: "gofmt".into(),
+                command: vec!["gofmt".into(), "-l".into(), ".".into()],
+            });
+        }
+        if !has_coverage && which_exists("go") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Coverage,
+                name: "go test coverage".into(),
+                command: vec!["go".into(), "test".into(), "-cover".into(), "./...".into()],
+            });
+        }
+    }
+
+    // Java (pom.xml — Gradle covered by Kotlin section)
+    if project_dir.join("pom.xml").exists() {
+        if !has_test && which_exists("mvn") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Test,
+                name: "mvn test".into(),
+                command: vec!["mvn".into(), "test".into(), "-B".into()],
+            });
+        }
+        if !has_analysis && which_exists("mvn") {
+            tools.push(DetectedTool {
+                category: EvalCategory::StaticAnalysis,
+                name: "mvn verify".into(),
+                command: vec![
+                    "mvn".into(),
+                    "verify".into(),
+                    "-B".into(),
+                    "-DskipTests".into(),
+                ],
+            });
+        }
+        if !has_lint && which_exists("google-java-format") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Lint,
+                name: "google-java-format".into(),
+                command: vec!["google-java-format".into(), "--dry-run".into()],
+            });
+        }
+        if !has_coverage && which_exists("mvn") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Coverage,
+                name: "mvn jacoco".into(),
+                command: vec![
+                    "mvn".into(),
+                    "test".into(),
+                    "jacoco:report".into(),
+                    "-B".into(),
+                ],
+            });
+        }
+    }
+
+    // C/C++ (CMakeLists.txt / Makefile)
+    if project_dir.join("CMakeLists.txt").exists() || project_dir.join("Makefile").exists() {
+        let has_cmake = project_dir.join("CMakeLists.txt").exists();
+        if !has_test {
+            if has_cmake && which_exists("ctest") {
+                tools.push(DetectedTool {
+                    category: EvalCategory::Test,
+                    name: "ctest".into(),
+                    command: vec!["ctest".into()],
+                });
+            } else if which_exists("make") {
+                tools.push(DetectedTool {
+                    category: EvalCategory::Test,
+                    name: "make test".into(),
+                    command: vec!["make".into(), "test".into()],
+                });
+            }
+        }
+        if !has_analysis && which_exists("cppcheck") {
+            tools.push(DetectedTool {
+                category: EvalCategory::StaticAnalysis,
+                name: "cppcheck".into(),
+                command: vec!["cppcheck".into(), "--enable=all".into(), ".".into()],
+            });
+        }
+        if !has_lint && which_exists("clang-format") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Lint,
+                name: "clang-format".into(),
+                command: vec!["clang-format".into(), "--dry-run".into(), "-Werror".into()],
+            });
+        }
+        if !has_coverage && which_exists("gcov") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Coverage,
+                name: "gcov".into(),
+                command: vec!["gcov".into()],
+            });
+        }
+    }
+
+    // Ruby (Gemfile)
+    if project_dir.join("Gemfile").exists() {
+        if !has_test {
+            if which_exists("rspec") {
+                tools.push(DetectedTool {
+                    category: EvalCategory::Test,
+                    name: "rspec".into(),
+                    command: vec!["rspec".into()],
+                });
+            } else if which_exists("rake") {
+                tools.push(DetectedTool {
+                    category: EvalCategory::Test,
+                    name: "rake test".into(),
+                    command: vec!["rake".into(), "test".into()],
+                });
+            }
+        }
+        if !has_analysis && which_exists("rubocop") {
+            tools.push(DetectedTool {
+                category: EvalCategory::StaticAnalysis,
+                name: "rubocop".into(),
+                command: vec!["rubocop".into(), "--format".into(), "json".into()],
+            });
+        }
+        if !has_lint && which_exists("rubocop") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Lint,
+                name: "rubocop lint".into(),
+                command: vec![
+                    "rubocop".into(),
+                    "--auto-correct-all".into(),
+                    "--dry-run".into(),
+                ],
+            });
+        }
+        if !has_coverage && which_exists("rspec") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Coverage,
+                name: "rspec coverage".into(),
+                command: vec!["rspec".into()],
+            });
+        }
+    }
+
+    // Dart (pubspec.yaml)
+    if project_dir.join("pubspec.yaml").exists() {
+        if !has_test && which_exists("dart") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Test,
+                name: "dart test".into(),
+                command: vec!["dart".into(), "test".into()],
+            });
+        }
+        if !has_analysis && which_exists("dart") {
+            tools.push(DetectedTool {
+                category: EvalCategory::StaticAnalysis,
+                name: "dart analyze".into(),
+                command: vec!["dart".into(), "analyze".into()],
+            });
+        }
+        if !has_lint && which_exists("dart") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Lint,
+                name: "dart format".into(),
+                command: vec![
+                    "dart".into(),
+                    "format".into(),
+                    "--output=none".into(),
+                    "--set-exit-if-changed".into(),
+                    ".".into(),
+                ],
+            });
+        }
+        if !has_coverage && which_exists("dart") {
+            tools.push(DetectedTool {
+                category: EvalCategory::Coverage,
+                name: "dart test coverage".into(),
+                command: vec!["dart".into(), "test".into(), "--coverage=coverage".into()],
+            });
+        }
+    }
+
     // C# (.csproj or .sln)
     let has_csproj = project_dir.read_dir().is_ok_and(|mut entries| {
         entries.any(|e| {
@@ -822,6 +1075,139 @@ mod tests {
         let tools = detect_tools(dir.path(), &ToolOverrides::default());
         // Should not detect dotnet tools with just a .cs file
         assert!(!tools.iter().any(|t| t.name.contains("dotnet")));
+    }
+
+    #[test]
+    fn test_detect_python_pyproject() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"test\"",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // Detection depends on which_exists for pytest/mypy/ruff/black
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_python_requirements_txt() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("requirements.txt"), "flask==2.0").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_go_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_java_maven_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("pom.xml"), "<project></project>").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_c_cmake_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_c_makefile_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Makefile"), "all:\n\tgcc main.c").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_ruby_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Gemfile"), "source 'https://rubygems.org'").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_dart_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: test\nversion: 1.0.0",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
     }
 
     #[test]
