@@ -1574,23 +1574,21 @@ Create a PR with your changes.{custom_instructions}"#,
                 }
                 let _ = self.notifier.notify_success(&cascade_issue, pr_url).await;
             } else {
-                // Cascade succeeded but no PR — treat as failure
-                let no_pr_error = if result.output.is_empty() {
+                // Cascade succeeded but no PR
+                let reason = if result.output.is_empty() {
                     "Cascade completed without creating a PR".to_string()
+                } else if result.output.chars().count() > 500 {
+                    let truncated: String = result.output.chars().take(497).collect();
+                    format!("{}...", truncated)
                 } else {
-                    let summary = if result.output.chars().count() > 500 {
-                        let truncated: String = result.output.chars().take(497).collect();
-                        format!("{}...", truncated)
-                    } else {
-                        result.output.clone()
-                    };
-                    format!("Cascade completed without creating a PR: {}", summary)
+                    result.output.clone()
                 };
                 tracing::warn!(
                     downstream = %downstream_repo_name,
+                    reason = %reason,
                     "Cascade succeeded but no PR URL"
                 );
-                self.tracker.mark_cascade_failed(attempt_id, &no_pr_error)?;
+                self.tracker.mark_cascade_failed(attempt_id, &format!("Cascade completed without creating a PR: {}", reason))?;
 
                 let mut cascade_issue = Issue::new(
                     &parent_attempt.issue_id,
@@ -1607,9 +1605,10 @@ Create a PR with your changes.{custom_instructions}"#,
                     "cascade_original_issue_short_id",
                     parent_attempt.short_id.clone(),
                 );
+                cascade_issue.set_metadata("completion_reason", reason);
                 let _ = self
                     .notifier
-                    .notify_failed(&cascade_issue, &no_pr_error)
+                    .notify_completed(&cascade_issue)
                     .await;
             }
         } else {
@@ -3698,27 +3697,22 @@ Create a PR with your changes.{custom_instructions}"#,
                             "used_qa_ids": claude_result.used_qa_ids,
                         }),
                     );
-                    let no_pr_error = if claude_result.output.is_empty() {
+                    let reason = if claude_result.output.is_empty() {
                         "No PR URL found in output".to_string()
+                    } else if claude_result.output.chars().count() > 500 {
+                        let truncated: String = claude_result.output.chars().take(497).collect();
+                        format!("{}...", truncated)
                     } else {
-                        let summary = if claude_result.output.chars().count() > 500 {
-                            let truncated: String = claude_result.output.chars().take(497).collect();
-                            format!("{}...", truncated)
-                        } else {
-                            claude_result.output.clone()
-                        };
-                        format!(
-                            "Claude completed without creating a PR: {}",
-                            summary,
-                        )
+                        claude_result.output.clone()
                     };
-                    tracing::info!(short_id = %issue.short_id, "No PR URL found in output");
+                    tracing::info!(short_id = %issue.short_id, reason = %reason, "Completed without PR");
+                    issue.set_metadata("completion_reason", reason.clone());
                     self.tracker.mark_failed(
                         source.name(),
                         &issue.id,
-                        &no_pr_error,
+                        &format!("Claude completed without creating a PR: {}", reason),
                     )?;
-                    self.notifier.notify_failed(&issue, &no_pr_error).await?;
+                    self.notifier.notify_completed(&issue).await?;
                     if let Some(id) = attempt_id {
                         let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, false);
                     }
@@ -3728,10 +3722,10 @@ Create a PR with your changes.{custom_instructions}"#,
                         self.record_feedback_outcome(&attempt, &issue, &last_prompt, Outcome::Failed).await;
                     }
 
-                    // Log processing_failed activity (no PR produced)
+                    // Log processing_completed activity (no PR produced)
                     let activity = ActivityLogEntry::new(
-                        "processing_failed",
-                        format!("Processing failed for {} (no PR)", issue.short_id),
+                        "processing_completed_no_pr",
+                        format!("Completed without PR for {}: {}", issue.short_id, reason),
                     )
                     .with_source(issue.source.clone())
                     .with_issue(issue.id.clone(), issue.short_id.clone())
@@ -6942,10 +6936,6 @@ mod tests {
         assert_eq!(config.max_depth, 0);
     }
 
-    // =========================================================================
-    // Tests for truncate_error_for_activity
-    // =========================================================================
-
     #[test]
     fn test_truncate_error_short_message() {
         let error = "short error";
@@ -6997,10 +6987,6 @@ mod tests {
         assert!(result.len() <= 500);
     }
 
-    // =========================================================================
-    // Tests for is_running() and active_count() public accessors
-    // =========================================================================
-
     #[test]
     fn test_is_running_accessor() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -7030,10 +7016,6 @@ mod tests {
         watcher.active_processing.fetch_sub(1, Ordering::SeqCst);
         assert_eq!(watcher.active_count(), 2);
     }
-
-    // =========================================================================
-    // Tests for active_processing_for_source
-    // =========================================================================
 
     #[tokio::test]
     async fn test_active_processing_for_source_empty() {
@@ -7085,10 +7067,6 @@ mod tests {
         assert_eq!(watcher.active_processing_for_source("test_source").await, 1);
     }
 
-    // =========================================================================
-    // Tests for refresh_repos and sync_repos_to_db with None values
-    // =========================================================================
-
     #[tokio::test]
     async fn test_refresh_repos_no_inferrer_returns_zero() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -7125,10 +7103,6 @@ mod tests {
         assert_eq!(result, 0);
     }
 
-    // =========================================================================
-    // Tests for check_reviews with no review_watcher
-    // =========================================================================
-
     #[tokio::test]
     async fn test_check_reviews_no_watcher_returns_ok() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -7141,10 +7115,6 @@ mod tests {
         let result = watcher.check_reviews().await;
         assert!(result.is_ok());
     }
-
-    // =========================================================================
-    // Tests for check_pr_merges_and_cascade with no github client
-    // =========================================================================
 
     #[tokio::test]
     async fn test_check_pr_merges_no_github_client() {
@@ -7164,10 +7134,6 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].metric_value, 0.0);
     }
-
-    // =========================================================================
-    // Tests for run_housekeeping_cycle
-    // =========================================================================
 
     #[tokio::test]
     async fn test_run_housekeeping_cycle_dry_run_skips_retries_and_cascades() {
@@ -7214,10 +7180,6 @@ mod tests {
         assert_eq!(active[0].metric_value, 0.0);
     }
 
-    // =========================================================================
-    // Tests for check_and_auto_close_prs
-    // =========================================================================
-
     #[tokio::test]
     async fn test_check_and_auto_close_prs_no_pending() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -7255,10 +7217,6 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // =========================================================================
-    // Tests for record_source_decision and record_issue_decision
-    // =========================================================================
-
     #[test]
     fn test_record_source_decision_does_not_panic() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -7293,10 +7251,6 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // Tests for record_error_pattern
-    // =========================================================================
-
     #[test]
     fn test_record_error_pattern_does_not_panic() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -7310,10 +7264,6 @@ mod tests {
         watcher.record_error_pattern("sentry", "SENTRY-99", "timeout after 300s");
         watcher.record_error_pattern("test", "T-1", "");
     }
-
-    // =========================================================================
-    // Tests for Watcher::new with tracker
-    // =========================================================================
 
     #[test]
     fn test_watcher_new_with_tracker() {
@@ -7345,10 +7295,6 @@ mod tests {
 
         assert!(!watcher.dry_run);
     }
-
-    // =========================================================================
-    // Tests for stop_and_drain
-    // =========================================================================
 
     #[tokio::test]
     async fn test_stop_and_drain_immediate_when_no_active() {
@@ -7389,10 +7335,6 @@ mod tests {
         assert!(!watcher.is_running());
         assert_eq!(watcher.active_count(), 0);
     }
-
-    // =========================================================================
-    // Tests for group_review_feedback_by_pr edge cases
-    // =========================================================================
 
     #[test]
     fn test_group_review_feedback_empty_events() {
@@ -7456,10 +7398,6 @@ mod tests {
         assert_eq!(grouped[1].2, 1); // 1 review for PR 2
     }
 
-    // =========================================================================
-    // Tests for is_terminal_attempt_status (additional edge cases)
-    // =========================================================================
-
     #[test]
     fn test_is_terminal_all_statuses() {
         let non_terminal = [
@@ -7488,10 +7426,6 @@ mod tests {
             );
         }
     }
-
-    // =========================================================================
-    // Tests for sort_by_priority advanced cases
-    // =========================================================================
 
     #[test]
     fn test_sort_by_priority_all_same_match_priority_different_issue_priority() {
@@ -7594,10 +7528,6 @@ mod tests {
         assert_eq!(issues[1].0.id, "second");
     }
 
-    // =========================================================================
-    // Tests for enhance_prompt_with_learning
-    // =========================================================================
-
     #[test]
     fn test_enhance_prompt_no_repo_returns_base() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -7627,10 +7557,6 @@ mod tests {
         // With no learning enabled and no data, should return base prompt
         assert_eq!(result, base);
     }
-
-    // =========================================================================
-    // Tests for processing set concurrent behavior
-    // =========================================================================
 
     #[tokio::test]
     async fn test_processing_set_concurrent_insertions() {
@@ -7682,10 +7608,6 @@ mod tests {
         let processing = watcher.processing.read().await;
         assert!(processing.contains("test:123"));
     }
-
-    // =========================================================================
-    // Tests for WatcherOptions fields propagation
-    // =========================================================================
 
     #[test]
     fn test_watcher_options_config_propagation() {
@@ -7745,10 +7667,6 @@ mod tests {
         assert_eq!(watcher.sources[1].name(), "source_b");
         assert_eq!(watcher.sources[2].name(), "source_c");
     }
-
-    // =========================================================================
-    // Tests for trigger_cascade with no relationships/config
-    // =========================================================================
 
     #[tokio::test]
     async fn test_trigger_cascade_no_relationships_returns_ok() {
@@ -8047,10 +7965,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
-    // Tests for get_cascade_depth
-    // =========================================================================
-
     #[test]
     fn test_get_cascade_depth_root() {
         use crate::types::{FixAttempt, FixAttemptStatus};
@@ -8119,10 +8033,6 @@ mod tests {
         assert_eq!(watcher.get_cascade_depth(&attempt), 1);
     }
 
-    // =========================================================================
-    // Tests for poll_source skipping in-flight issues
-    // =========================================================================
-
     #[tokio::test]
     async fn test_poll_source_skips_inflight_issues() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -8162,10 +8072,6 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].metric_value, 1.0); // Only new-1 matched
     }
-
-    // =========================================================================
-    // Tests for poll dry-run mode not processing issues
-    // =========================================================================
 
     #[tokio::test]
     async fn test_poll_dry_run_does_not_record_retries() {
@@ -8215,10 +8121,6 @@ mod tests {
         assert!(retries.is_empty(), "dry_run should skip retry processing");
     }
 
-    // =========================================================================
-    // Tests for MockSource additional coverage
-    // =========================================================================
-
     #[tokio::test]
     async fn test_mock_source_fetch_issues_returns_all() {
         let issues = vec![
@@ -8254,10 +8156,6 @@ mod tests {
         assert!(result.matches);
         assert_eq!(result.priority, MatchPriority::Urgent);
     }
-
-    // =========================================================================
-    // Tests for MockNotifier additional coverage
-    // =========================================================================
 
     #[tokio::test]
     async fn test_mock_notifier_all_methods_increment_count() {
@@ -8304,10 +8202,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // =========================================================================
-    // Tests for SeedResult
-    // =========================================================================
-
     #[test]
     fn test_seed_result_by_source_tracking() {
         let mut result = SeedResult {
@@ -8322,10 +8216,6 @@ mod tests {
         assert_eq!(*result.by_source.get("sentry").unwrap(), 4);
         assert!(!result.by_source.contains_key("jira"));
     }
-
-    // =========================================================================
-    // Tests for Watcher::new initialization state
-    // =========================================================================
 
     #[test]
     fn test_watcher_new_initializes_all_fields() {
@@ -8366,10 +8256,6 @@ mod tests {
         assert!(watcher.sources.is_empty());
     }
 
-    // =========================================================================
-    // Tests for trigger_issue_with_feedback
-    // =========================================================================
-
     #[tokio::test]
     async fn test_trigger_issue_with_feedback_unknown_source() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -8405,10 +8291,6 @@ mod tests {
             .await;
         assert!(result.is_err());
     }
-
-    // =========================================================================
-    // Tests for poll_source with max_issues_per_cycle limits
-    // =========================================================================
 
     #[tokio::test]
     async fn test_poll_source_respects_per_source_max_issues() {
@@ -8459,10 +8341,6 @@ mod tests {
         assert_eq!(queued[0].metric_value, 3.0); // Limited to 3
     }
 
-    // =========================================================================
-    // Tests for process_issue returning false when already processing
-    // =========================================================================
-
     #[tokio::test]
     async fn test_process_issue_returns_false_when_already_processing() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -8495,10 +8373,6 @@ mod tests {
             "process_issue should return false when issue already in-flight"
         );
     }
-
-    // =========================================================================
-    // Tests for cascade depth limit
-    // =========================================================================
 
     #[tokio::test]
     async fn test_trigger_cascade_depth_limit() {
@@ -8567,10 +8441,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
-    // Tests for start loop clamping
-    // =========================================================================
-
     #[tokio::test]
     async fn test_start_clamps_low_interval() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -8594,10 +8464,6 @@ mod tests {
         assert!(joined.unwrap().expect("task join failed").is_ok());
     }
 
-    // =========================================================================
-    // Tests for reset_attempt nonexistent
-    // =========================================================================
-
     #[test]
     fn test_reset_attempt_nonexistent_succeeds() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -8610,10 +8476,6 @@ mod tests {
         let result = watcher.reset_attempt("test", "nonexistent");
         assert!(result.is_ok());
     }
-
-    // =========================================================================
-    // Tests for poll_source with suppression rules
-    // =========================================================================
 
     #[tokio::test]
     async fn test_poll_source_applies_suppression_when_prioritisation_disabled() {
@@ -8675,10 +8537,6 @@ mod tests {
         assert_eq!(matched[0].metric_value, 0.0);
     }
 
-    // =========================================================================
-    // Additional coverage: enhance_prompt_with_learning with learning enabled
-    // =========================================================================
-
     #[test]
     fn test_enhance_prompt_with_learning_repo_knowledge_enabled_but_empty() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -8732,10 +8590,6 @@ mod tests {
         let result = watcher.enhance_prompt_with_learning(base, &issue, Some(""));
         assert_eq!(result, base);
     }
-
-    // =========================================================================
-    // Additional coverage: notify_failed_with_escalation
-    // =========================================================================
 
     #[tokio::test]
     async fn test_notify_failed_with_escalation_non_hard_error() {
@@ -8800,10 +8654,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
-    // Additional coverage: record_error_pattern with various error types
-    // =========================================================================
-
     #[test]
     fn test_record_error_pattern_various_error_types() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -8817,10 +8667,6 @@ mod tests {
         watcher.record_error_pattern("test", "4", "Repository resolution failed: no match");
         watcher.record_error_pattern("test", "5", "Failed to create worktree: git error");
     }
-
-    // =========================================================================
-    // Additional coverage: record_feedback_outcome_from_attempt
-    // =========================================================================
 
     #[tokio::test]
     async fn test_record_feedback_outcome_from_attempt_no_sqlite() {
@@ -8891,10 +8737,6 @@ mod tests {
             .await;
     }
 
-    // =========================================================================
-    // Additional coverage: record_feedback_outcome
-    // =========================================================================
-
     #[tokio::test]
     async fn test_record_feedback_outcome_stores_to_tracker() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -8935,10 +8777,6 @@ mod tests {
         let outcome = sqlite.get_feedback_outcome_by_attempt(attempt.id);
         assert!(outcome.is_ok());
     }
-
-    // =========================================================================
-    // Additional coverage: run_periodic_learning with all subsystems disabled
-    // =========================================================================
 
     #[tokio::test]
     async fn test_run_periodic_learning_all_disabled() {
@@ -9084,10 +8922,6 @@ mod tests {
 
         watcher.run_periodic_learning().await;
     }
-
-    // =========================================================================
-    // Additional coverage: run_post_merge_learning
-    // =========================================================================
 
     #[tokio::test]
     async fn test_run_post_merge_learning_all_disabled() {
@@ -9372,10 +9206,6 @@ mod tests {
         watcher.run_post_merge_learning(&attempt).await;
     }
 
-    // =========================================================================
-    // Additional coverage: get_cascade_depth with sqlite and chain
-    // =========================================================================
-
     #[test]
     fn test_get_cascade_depth_with_chain() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -9421,10 +9251,6 @@ mod tests {
         assert_eq!(watcher.get_cascade_depth(&child), 1);
         assert_eq!(watcher.get_cascade_depth(&grandchild), 2);
     }
-
-    // =========================================================================
-    // Additional coverage: trigger_cascade with max_depth = 0 (unlimited)
-    // =========================================================================
 
     #[tokio::test]
     async fn test_trigger_cascade_unlimited_depth() {
@@ -9499,10 +9325,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
-    // Additional coverage: check_and_auto_close_prs with terminal issue
-    // =========================================================================
-
     #[tokio::test]
     async fn test_check_and_auto_close_prs_with_terminal_issue() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -9539,10 +9361,6 @@ mod tests {
         assert_eq!(attempt.status, FixAttemptStatus::Closed);
     }
 
-    // =========================================================================
-    // Additional coverage: run_housekeeping_cycle non-dry-run with active processing
-    // =========================================================================
-
     #[tokio::test]
     async fn test_run_housekeeping_cycle_with_active_processing() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -9558,10 +9376,6 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].metric_value, 5.0);
     }
-
-    // =========================================================================
-    // Additional coverage: poll_source with prioritisation enabled
-    // =========================================================================
 
     #[tokio::test]
     async fn test_poll_source_with_prioritisation_enabled() {
@@ -9607,11 +9421,8 @@ mod tests {
         assert!(queued[0].metric_value >= 0.0);
     }
 
-    // =========================================================================
     // Additional coverage: process_issue with repo resolution skip (already
     // tested but verify cleanup)
-    // =========================================================================
-
     #[tokio::test]
     async fn test_process_issue_cleans_up_on_repo_skip() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -9642,10 +9453,6 @@ mod tests {
         assert_eq!(watcher.active_count(), 0);
     }
 
-    // =========================================================================
-    // Additional coverage: seed with labels
-    // =========================================================================
-
     #[tokio::test]
     async fn test_seed_preserves_issue_labels() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -9669,10 +9476,6 @@ mod tests {
         // Verify the issue was recorded
         assert!(tracker.has_attempted("mock", "labeled-1").unwrap());
     }
-
-    // =========================================================================
-    // Additional coverage: truncate_error edge cases
-    // =========================================================================
 
     #[test]
     fn test_truncate_error_exactly_at_boundary() {
@@ -9698,10 +9501,6 @@ mod tests {
         assert!(result.ends_with("..."));
         assert!(result.is_char_boundary(result.len()));
     }
-
-    // =========================================================================
-    // Additional coverage: stop_and_drain timeout
-    // =========================================================================
 
     #[tokio::test]
     async fn test_stop_and_drain_does_not_hang_forever() {
@@ -9729,10 +9528,6 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // Additional coverage: poll_source with all issues already attempted
-    // =========================================================================
-
     #[tokio::test]
     async fn test_poll_source_all_issues_already_attempted() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -9757,10 +9552,6 @@ mod tests {
         assert_eq!(queued[0].metric_value, 0.0);
     }
 
-    // =========================================================================
-    // Additional coverage: poll_source stops processing when is_running is false
-    // =========================================================================
-
     #[tokio::test]
     async fn test_poll_source_stops_when_not_running() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -9779,10 +9570,6 @@ mod tests {
         let result = watcher.poll_source(&source).await;
         assert!(result.is_ok());
     }
-
-    // =========================================================================
-    // Additional coverage: check_pr_merges_and_cascade records all lifecycle metrics
-    // =========================================================================
 
     #[tokio::test]
     async fn test_check_pr_merges_records_all_lifecycle_metrics() {
@@ -9819,10 +9606,6 @@ mod tests {
             );
         }
     }
-
-    // =========================================================================
-    // Additional coverage: watcher with all optional fields set
-    // =========================================================================
 
     #[test]
     fn test_watcher_new_with_all_optional_fields() {
@@ -9862,10 +9645,6 @@ mod tests {
         assert!(!watcher.is_running());
         assert_eq!(watcher.active_count(), 0);
     }
-
-    // =========================================================================
-    // Additional coverage: process_ready_retries skips inflight issue
-    // =========================================================================
 
     #[tokio::test]
     async fn test_process_ready_retries_skips_inflight() {
@@ -9927,10 +9706,6 @@ mod tests {
         assert_eq!(attempt.retry_count, 0);
     }
 
-    // =========================================================================
-    // Additional coverage: process_ready_retries stops when watcher not running
-    // =========================================================================
-
     #[tokio::test]
     async fn test_process_ready_retries_stops_when_not_running() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -9985,10 +9760,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
-    // Additional coverage: poll records pending_attempts and total_attempts
-    // =========================================================================
-
     #[tokio::test]
     async fn test_poll_records_stats_metrics() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -10009,10 +9780,6 @@ mod tests {
         assert_eq!(total.len(), 1);
         assert_eq!(total[0].metric_value, 2.0);
     }
-
-    // =========================================================================
-    // Additional coverage: group_review_feedback preserves insertion order
-    // =========================================================================
 
     #[test]
     fn test_group_review_feedback_preserves_insertion_order() {
@@ -10061,10 +9828,6 @@ mod tests {
         assert_eq!(grouped[1].0, "https://github.com/org/repo/pull/1");
         assert_eq!(grouped[1].2, 1); // 1 review for PR 1
     }
-
-    // =========================================================================
-    // Additional coverage: trigger_cascade with full_name vs short_name fallback
-    // =========================================================================
 
     #[tokio::test]
     async fn test_trigger_cascade_uses_short_name_fallback() {
@@ -10140,10 +9903,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
-    // Additional coverage: process_issue records attempt early
-    // =========================================================================
-
     #[tokio::test]
     async fn test_process_issue_records_attempt_early() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -10169,10 +9928,6 @@ mod tests {
         assert!(tracker.has_attempted("mock", "early-record").unwrap());
     }
 
-    // =========================================================================
-    // Additional coverage: poll with sources records source_count metric
-    // =========================================================================
-
     #[tokio::test]
     async fn test_poll_with_sources_records_source_count() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -10190,10 +9945,6 @@ mod tests {
         assert_eq!(source_count.len(), 1);
         assert_eq!(source_count[0].metric_value, 3.0);
     }
-
-    // =========================================================================
-    // Additional coverage: check_and_auto_close_prs with error in get_issue_status
-    // =========================================================================
 
     #[tokio::test]
     async fn test_check_and_auto_close_prs_issue_status_error() {
@@ -10220,10 +9971,6 @@ mod tests {
         let attempt = tracker.get_attempt("mock", "nonexistent").unwrap().unwrap();
         assert_eq!(attempt.status, FixAttemptStatus::Success);
     }
-
-    // =========================================================================
-    // Additional coverage: seed with issue that has metadata labels
-    // =========================================================================
 
     #[tokio::test]
     async fn test_seed_records_labels_from_metadata() {
@@ -10253,10 +10000,6 @@ mod tests {
         assert!(attempt.issue_labels.contains(&"bug".to_string()));
         assert!(attempt.issue_labels.contains(&"high-priority".to_string()));
     }
-
-    // =========================================================================
-    // Additional coverage: watcher config per-source overrides
-    // =========================================================================
 
     #[tokio::test]
     async fn test_poll_source_uses_per_source_max_issues() {
@@ -10308,10 +10051,6 @@ mod tests {
         assert_eq!(queued[0].metric_value, 2.0);
     }
 
-    // =========================================================================
-    // Additional coverage: process_ready_retries with empty retries
-    // =========================================================================
-
     #[tokio::test]
     async fn test_process_ready_retries_empty() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -10335,10 +10074,6 @@ mod tests {
         assert_eq!(executed.len(), 1);
         assert_eq!(executed[0].metric_value, 0.0);
     }
-
-    // =========================================================================
-    // Additional coverage: trigger_cascade with full owner/repo match
-    // =========================================================================
 
     #[tokio::test]
     async fn test_trigger_cascade_full_name_match() {
@@ -10415,10 +10150,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // =========================================================================
-    // Additional coverage: enhance_prompt_with_learning cluster detection path
-    // =========================================================================
-
     #[test]
     fn test_enhance_prompt_with_learning_cluster_detection_enabled() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -10456,10 +10187,6 @@ mod tests {
         assert_eq!(result, base);
     }
 
-    // =========================================================================
-    // Additional coverage: poll_source fetched metric with issues present
-    // =========================================================================
-
     #[tokio::test]
     async fn test_poll_source_fetched_metric_reflects_total_issues() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -10479,10 +10206,6 @@ mod tests {
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].metric_value, 3.0);
     }
-
-    // =========================================================================
-    // Additional coverage: batch_processed metric
-    // =========================================================================
 
     #[tokio::test]
     async fn test_poll_source_records_batch_processed_metric() {
@@ -10507,10 +10230,6 @@ mod tests {
         assert_eq!(batch[0].metric_value, 1.0);
     }
 
-    // =========================================================================
-    // Additional coverage: SeedResult
-    // =========================================================================
-
     #[test]
     fn test_seed_result_default_all_fields() {
         let result = SeedResult::default();
@@ -10534,10 +10253,6 @@ mod tests {
         assert_eq!(*result.by_source.get("linear").unwrap(), 5);
         assert_eq!(*result.by_source.get("jira").unwrap(), 3);
     }
-
-    // =========================================================================
-    // Additional coverage: Watcher::new feedback_analyzer initialization with sqlite
-    // =========================================================================
 
     #[test]
     fn test_watcher_new_feedback_analyzer_with_sqlite() {
@@ -10601,11 +10316,8 @@ mod tests {
         assert!(!watcher.is_running());
     }
 
-    // =========================================================================
     // Additional coverage: record_source_decision / record_issue_decision
     // with various values
-    // =========================================================================
-
     #[test]
     fn test_record_source_decision_with_complex_details() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -10652,10 +10364,6 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // Additional coverage: MockNotifier notify_closed (default trait impl)
-    // =========================================================================
-
     #[tokio::test]
     async fn test_mock_notifier_notify_closed_uses_default_impl() {
         let notifier = MockNotifier::new(true);
@@ -10669,10 +10377,6 @@ mod tests {
         // Default impl calls notify_status which increments call count
         assert_eq!(notifier.get_call_count(), 1);
     }
-
-    // =========================================================================
-    // Additional coverage: active_processing_for_source with empty string source
-    // =========================================================================
 
     #[tokio::test]
     async fn test_active_processing_for_source_empty_string() {
@@ -10688,10 +10392,6 @@ mod tests {
         // Empty source name prefix ":" should match ":issue1"
         assert_eq!(watcher.active_processing_for_source("").await, 1);
     }
-
-    // =========================================================================
-    // Additional coverage: poll_source batch_processed metric for dry run
-    // =========================================================================
 
     #[tokio::test]
     async fn test_poll_source_dry_run_does_not_record_batch_processed() {
@@ -10714,10 +10414,6 @@ mod tests {
         let batch = tracker.get_metrics("batch_processed", None, 10).unwrap();
         assert!(batch.is_empty());
     }
-
-    // =========================================================================
-    // Additional coverage: check_and_auto_close_prs non-terminal issue status
-    // =========================================================================
 
     #[tokio::test]
     async fn test_check_and_auto_close_prs_non_terminal_issue() {
@@ -10750,10 +10446,6 @@ mod tests {
         let attempt = tracker.get_attempt("mock", "open-1").unwrap().unwrap();
         assert_eq!(attempt.status, FixAttemptStatus::Success);
     }
-
-    // =========================================================================
-    // Additional coverage: process_ready_retries with processing delay
-    // =========================================================================
 
     #[tokio::test]
     async fn test_process_ready_retries_with_delay_between_items() {
@@ -10805,10 +10497,6 @@ mod tests {
         assert_eq!(a2.retry_count, 1);
     }
 
-    // =========================================================================
-    // Additional coverage: run_post_merge_learning with strategy_fingerprinting
-    // =========================================================================
-
     #[tokio::test]
     async fn test_run_post_merge_learning_strategy_fingerprinting_enabled() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -10849,10 +10537,6 @@ mod tests {
         watcher.run_post_merge_learning(&attempt).await;
     }
 
-    // =========================================================================
-    // Additional coverage: poll_source with both matched and unmatched issues
-    // =========================================================================
-
     #[tokio::test]
     async fn test_poll_source_metric_consistency() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -10879,10 +10563,6 @@ mod tests {
         // max_issues_per_cycle is 5 (default), so all 3 queued
         assert_eq!(queued[0].metric_value, 3.0);
     }
-
-    // =========================================================================
-    // Helper: create_test_watcher_with_sqlite
-    // =========================================================================
 
     fn create_test_watcher_with_sqlite(
         notifier: Arc<dyn Notifier>,
@@ -10911,10 +10591,6 @@ mod tests {
         })
     }
 
-    // =========================================================================
-    // 1. test_active_processing_for_source
-    // =========================================================================
-
     #[tokio::test]
     async fn test_active_processing_for_source() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -10933,10 +10609,6 @@ mod tests {
         assert_eq!(watcher.active_processing_for_source("source2").await, 1);
         assert_eq!(watcher.active_processing_for_source("source3").await, 0);
     }
-
-    // =========================================================================
-    // 2. test_record_source_decision
-    // =========================================================================
 
     #[test]
     fn test_record_source_decision() {
@@ -10958,10 +10630,6 @@ mod tests {
         assert_eq!(latest.activity_type, "decision");
         assert!(latest.message.contains("test_source"));
     }
-
-    // =========================================================================
-    // 3. test_record_issue_decision
-    // =========================================================================
 
     #[test]
     fn test_record_issue_decision() {
@@ -10986,10 +10654,6 @@ mod tests {
         assert_eq!(latest.issue_id.as_deref(), Some("123"));
     }
 
-    // =========================================================================
-    // 4. test_record_error_pattern
-    // =========================================================================
-
     #[test]
     fn test_record_error_pattern() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -11008,10 +10672,6 @@ mod tests {
             patterns.len()
         );
     }
-
-    // =========================================================================
-    // 5. test_truncate_error_boundary_cases
-    // =========================================================================
 
     #[test]
     fn test_truncate_error_boundary_cases() {
@@ -11049,10 +10709,6 @@ mod tests {
         assert!(result.len() <= 500);
     }
 
-    // =========================================================================
-    // 6. test_notify_failed_with_escalation_hard_error
-    // =========================================================================
-
     #[tokio::test]
     async fn test_notify_failed_with_escalation_hard_error() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -11084,10 +10740,6 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // 7. test_notify_failed_with_escalation_soft_error
-    // =========================================================================
-
     #[tokio::test]
     async fn test_notify_failed_with_escalation_soft_error() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -11116,10 +10768,6 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // 8. test_watcher_new_with_tracker_coverage
-    // =========================================================================
-
     #[test]
     fn test_watcher_new_with_tracker_coverage() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -11136,10 +10784,6 @@ mod tests {
         assert_eq!(watcher.sources.len(), 0);
     }
 
-    // =========================================================================
-    // 9. test_sync_repos_to_db_no_inferrer
-    // =========================================================================
-
     #[test]
     fn test_sync_repos_to_db_no_inferrer() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -11154,10 +10798,6 @@ mod tests {
         assert_eq!(result, 0);
     }
 
-    // =========================================================================
-    // 10. test_sync_repos_to_db_no_sqlite
-    // =========================================================================
-
     #[test]
     fn test_sync_repos_to_db_no_sqlite() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -11168,10 +10808,6 @@ mod tests {
         let result = watcher.sync_repos_to_db(false).unwrap();
         assert_eq!(result, 0);
     }
-
-    // =========================================================================
-    // 11. test_refresh_repos_no_inferrer
-    // =========================================================================
 
     #[tokio::test]
     async fn test_refresh_repos_no_inferrer() {
@@ -11186,10 +10822,6 @@ mod tests {
         assert_eq!(result, 0);
     }
 
-    // =========================================================================
-    // 12. test_build_inferrer_no_known_orgs
-    // =========================================================================
-
     #[tokio::test]
     async fn test_build_inferrer_no_known_orgs() {
         let mut config = test_config();
@@ -11198,10 +10830,6 @@ mod tests {
         let result = Watcher::build_inferrer(&config, None).await.unwrap();
         assert!(result.is_none(), "Expected None when known_orgs is empty");
     }
-
-    // =========================================================================
-    // 13. test_build_inferrer_no_discovery_method
-    // =========================================================================
 
     #[tokio::test]
     async fn test_build_inferrer_no_discovery_method() {
@@ -11216,10 +10844,6 @@ mod tests {
             "Expected None when no auto_discover_paths and no GitHub client"
         );
     }
-
-    // =========================================================================
-    // 14. test_get_cascade_depth_no_parent
-    // =========================================================================
 
     #[test]
     fn test_get_cascade_depth_no_parent() {
@@ -11250,10 +10874,6 @@ mod tests {
         assert_eq!(watcher.get_cascade_depth(&attempt), 0);
     }
 
-    // =========================================================================
-    // 15. test_record_feedback_outcome_from_attempt
-    // =========================================================================
-
     #[tokio::test]
     async fn test_record_feedback_outcome_from_attempt() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -11273,10 +10893,6 @@ mod tests {
         let outcome = sqlite.get_feedback_outcome_by_attempt(attempt.id);
         assert!(outcome.is_ok());
     }
-
-    // =========================================================================
-    // 16. test_run_periodic_learning_disabled
-    // =========================================================================
 
     #[tokio::test]
     async fn test_run_periodic_learning_disabled() {
@@ -11314,10 +10930,6 @@ mod tests {
         // No panic = success
     }
 
-    // =========================================================================
-    // 17. test_seed_empty_sources
-    // =========================================================================
-
     #[tokio::test]
     async fn test_seed_empty_sources() {
         let sqlite = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -11328,10 +10940,6 @@ mod tests {
         assert_eq!(result.total, 0);
         assert!(result.by_source.is_empty());
     }
-
-    // =========================================================================
-    // 18. test_seed_with_issues
-    // =========================================================================
 
     #[tokio::test]
     async fn test_seed_with_issues() {

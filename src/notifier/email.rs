@@ -260,13 +260,19 @@ impl Notifier for EmailNotifier {
                 ),
             )
         } else {
-            (
-                format!("[Claudear] Completed: {}", issue.short_id),
-                format!(
-                    "Claudear completed processing but no PR URL was captured.\n\n{}",
-                    Self::format_issue_info(issue)
-                ),
-            )
+            {
+                let reason = issue
+                    .get_metadata::<String>("completion_reason")
+                    .unwrap_or_else(|| "No PR URL was captured".to_string());
+                (
+                    format!("[Claudear] Completed: {}", issue.short_id),
+                    format!(
+                        "Claudear completed processing without creating a PR.\n\nReason: {}\n\n{}",
+                        reason,
+                        Self::format_issue_info(issue)
+                    ),
+                )
+            }
         };
         self.send_email(&subject, &body, Some(issue)).await
     }
@@ -1285,10 +1291,6 @@ mod tests {
         assert!(delivery.message_id.is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // Additional extract_email_address tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_extract_email_address_with_display_name_and_angle_brackets() {
         assert_eq!(
@@ -1335,10 +1337,6 @@ mod tests {
             Some("user@example.com")
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Additional sanitize_reply_text tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_sanitize_reply_text_preserves_multiline_answer() {
@@ -1419,10 +1417,6 @@ mod tests {
         assert!(result.len() <= 4000);
     }
 
-    // -----------------------------------------------------------------------
-    // extract_plain_body tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_extract_plain_body_simple() {
         let raw = b"From: user@example.com\r\nSubject: Test\r\nContent-Type: text/plain\r\n\r\nHello world";
@@ -1448,10 +1442,6 @@ mod tests {
         // Falls back to get_body() on the parent
         assert!(!body.is_empty() || body.is_empty()); // Shouldn't panic
     }
-
-    // -----------------------------------------------------------------------
-    // resolve_recipients edge cases
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_resolve_recipients_with_resolved_user_unknown_slug() {
@@ -1493,10 +1483,6 @@ mod tests {
         assert!(recipients.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // target_email_for_issue edge cases
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_target_email_for_issue_uses_resolved_user() {
         let mut users = std::collections::HashMap::new();
@@ -1520,10 +1506,6 @@ mod tests {
             Some("jake@resolved.com".to_string())
         );
     }
-
-    // -----------------------------------------------------------------------
-    // expected_reply_emails edge cases
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_expected_reply_emails_empty_to_addresses_no_target() {
@@ -1553,10 +1535,6 @@ mod tests {
         assert!(emails.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // supports_replies edge cases
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_supports_replies_false_when_empty_imap_username() {
         let config = EmailConfig {
@@ -1568,10 +1546,6 @@ mod tests {
         let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
         assert!(!notifier.supports_replies());
     }
-
-    // -----------------------------------------------------------------------
-    // poll_question_replies returns empty without IMAP config
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_poll_question_replies_no_imap_host() {
@@ -1769,10 +1743,6 @@ mod tests {
         assert!(replies.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // format_issue_info structure tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_format_issue_info_contains_priority_and_status() {
         let mut issue = Issue::new("1", "TEST-1", "Title", "https://url.com", "jira");
@@ -1795,10 +1765,6 @@ mod tests {
         assert!(lines[3].starts_with("Status:"));
         assert!(lines[4].starts_with("URL:"));
     }
-
-    // -----------------------------------------------------------------------
-    // ask_question content tests
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_ask_question_with_options_and_context() {
@@ -1835,10 +1801,6 @@ mod tests {
         assert_eq!(delivery.target.as_deref(), Some("user@example.com"));
     }
 
-    // -----------------------------------------------------------------------
-    // is_enabled with all conditions
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_is_enabled_true_when_all_set() {
         // We cannot easily create a fully enabled notifier without a real SMTP server,
@@ -1865,10 +1827,6 @@ mod tests {
         let result = EmailNotifier::new(config, empty_registry());
         assert!(result.is_ok());
     }
-
-    // -----------------------------------------------------------------------
-    // notify_success metadata dispatch paths (disabled transport = Ok)
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_success_cascade_pr_disabled() {
@@ -1906,10 +1864,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // -----------------------------------------------------------------------
-    // notify_completed metadata dispatch paths
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_completed_regression_resolved_disabled() {
         let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
@@ -1928,10 +1882,6 @@ mod tests {
         let result = notifier.notify_completed(&issue).await;
         assert!(result.is_ok());
     }
-
-    // -----------------------------------------------------------------------
-    // notify_failed metadata dispatch paths
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_failed_regression_detected_disabled() {
@@ -1963,10 +1913,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // -----------------------------------------------------------------------
-    // notify_merged and notify_closed (disabled)
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_merged_disabled() {
         let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
@@ -1988,10 +1934,6 @@ mod tests {
             .await;
         assert!(result.is_ok());
     }
-
-    // -----------------------------------------------------------------------
-    // ask_question with why, context, and options fields
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_ask_question_with_why_field() {
@@ -2092,10 +2034,6 @@ mod tests {
         assert_eq!(delivery.channel, "email");
     }
 
-    // -----------------------------------------------------------------------
-    // extract_plain_body with empty subparts
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_extract_plain_body_no_subparts() {
         let raw = b"From: user@example.com\r\nSubject: Test\r\nContent-Type: text/plain\r\n\r\nSimple body";
@@ -2121,10 +2059,6 @@ mod tests {
         assert!(body.contains("Plain text content"));
     }
 
-    // -----------------------------------------------------------------------
-    // notify_urgent_issues with many issues (>10 truncation)
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_urgent_issues_many_issues_disabled() {
         let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
@@ -2143,10 +2077,6 @@ mod tests {
         let result = notifier.notify_urgent_issues(&issues).await;
         assert!(result.is_ok());
     }
-
-    // -----------------------------------------------------------------------
-    // send_email returns Ok when no transport
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_send_email_no_transport_returns_ok() {
@@ -2172,10 +2102,6 @@ mod tests {
         assert!(notifier.notify_urgent_issues(&[]).await.is_ok());
     }
 
-    // -----------------------------------------------------------------------
-    // send_email returns Ok when no from_address
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_send_email_no_from_address_returns_ok() {
         let notifier = EmailNotifier::new(partial_config(), empty_registry()).unwrap();
@@ -2183,10 +2109,6 @@ mod tests {
         // Transport exists but no from_address, send_email returns Ok(())
         assert!(notifier.notify_start(&issue).await.is_ok());
     }
-
-    // -----------------------------------------------------------------------
-    // resolve_recipients with resolved user who has no entry in registry
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_resolve_recipients_resolved_user_not_in_registry() {
@@ -2200,10 +2122,6 @@ mod tests {
         let recipients = notifier.resolve_recipients(Some(&issue));
         assert_eq!(recipients, vec!["fallback@example.com".to_string()]);
     }
-
-    // -----------------------------------------------------------------------
-    // target_email_for_issue with resolved user
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_target_email_for_issue_with_resolved_user() {
@@ -2229,10 +2147,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // extract_email_address edge cases
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_extract_email_address_angle_brackets_with_spaces() {
         assert_eq!(
@@ -2249,20 +2163,12 @@ mod tests {
         assert!(result.is_some()); // It has @ so it returns Some
     }
 
-    // -----------------------------------------------------------------------
-    // sanitize_reply_text with token in middle of line
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_sanitize_reply_text_token_embedded_in_text_strips_line() {
         let body = "Start CLAUDEAR-Q:tok-embed End\nActual reply";
         let result = EmailNotifier::sanitize_reply_text(body).unwrap();
         assert_eq!(result, "Start CLAUDEAR-Q:tok-embed End\nActual reply");
     }
-
-    // -----------------------------------------------------------------------
-    // poll_question_replies with imap_use_tls = false returns empty
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_poll_question_replies_non_tls_returns_empty() {
@@ -2298,10 +2204,6 @@ mod tests {
         assert!(replies.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // ask_question with all fields filled
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_ask_question_all_fields_present() {
         let config = EmailConfig {
@@ -2336,10 +2238,6 @@ mod tests {
         assert_eq!(delivery.target.as_deref(), Some("user@example.com"));
         assert!(delivery.message_id.is_none());
     }
-
-    // -----------------------------------------------------------------------
-    // ask_question target email for resolved user
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_ask_question_target_from_resolved_user() {
@@ -2383,10 +2281,6 @@ mod tests {
             .unwrap();
         assert_eq!(delivery.target.as_deref(), Some("bob@company.com"));
     }
-
-    // -----------------------------------------------------------------------
-    // Additional extract_email_address tests (named per coverage spec)
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_extract_email_address_bracket_format() {
@@ -2433,10 +2327,6 @@ mod tests {
             Some("mixed@case.com")
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Additional sanitize_reply_text tests (named per coverage spec)
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_sanitize_reply_text_normal() {
@@ -2495,10 +2385,6 @@ mod tests {
         assert!(!result.contains("Content line 31"));
     }
 
-    // -----------------------------------------------------------------------
-    // format_issue_info test (named per coverage spec)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_format_issue_info_full_structure() {
         let mut issue = Issue::new(
@@ -2525,10 +2411,6 @@ mod tests {
         assert!(lines[3].starts_with("Status:"));
         assert!(lines[4].starts_with("URL:"));
     }
-
-    // -----------------------------------------------------------------------
-    // ask_question with no recipients returns None target
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_ask_question_no_recipients_returns_none_target() {

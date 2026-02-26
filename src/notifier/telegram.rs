@@ -483,7 +483,10 @@ impl<H: TelegramHttpClient + 'static> Notifier for TelegramNotifier<H> {
                 issue.short_id
             )
         } else {
-            format!("[Claudear] Completed {} (no PR URL)", issue.short_id)
+            let reason = issue
+                .get_metadata::<String>("completion_reason")
+                .unwrap_or_else(|| "no PR URL".to_string());
+            format!("[Claudear] Completed {}: {}", issue.short_id, reason)
         };
         self.send_message(&body, Some(issue)).await
     }

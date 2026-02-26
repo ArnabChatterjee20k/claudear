@@ -12,10 +12,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// HTTP abstraction
-// ---------------------------------------------------------------------------
-
 /// Trait for HTTP client used by Slack notifier.
 #[async_trait]
 pub trait SlackHttpClient: Send + Sync {
@@ -84,10 +80,6 @@ impl SlackHttpClient for ReqwestSlackHttpClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Block Kit types
-// ---------------------------------------------------------------------------
-
 /// A Slack Block Kit message payload.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SlackMessage {
@@ -143,10 +135,6 @@ impl SlackText {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Slack API response types
-// ---------------------------------------------------------------------------
-
 /// Response from Slack Web API methods.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct SlackApiResponse {
@@ -176,10 +164,6 @@ pub(crate) struct SlackApiMessage {
     pub(crate) thread_ts: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Constants & helpers
-// ---------------------------------------------------------------------------
-
 const SLACK_API_BASE: &str = "https://slack.com/api/";
 
 /// Maximum lengths for user-controlled fields to prevent unbounded memory allocation.
@@ -206,10 +190,6 @@ pub(crate) fn slack_ts_to_datetime(ts: &str) -> Option<DateTime<Utc>> {
     let nanos = (secs_f64.fract().abs() * 1_000_000_000.0).min(999_999_999.0) as u32;
     DateTime::from_timestamp(secs, nanos)
 }
-
-// ---------------------------------------------------------------------------
-// SlackNotifier
-// ---------------------------------------------------------------------------
 
 /// Slack notifier supporting both Incoming Webhooks and Bot Token API.
 pub struct SlackNotifier<H: SlackHttpClient = ReqwestSlackHttpClient> {
@@ -250,10 +230,6 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
             user_registry,
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Send helpers
-    // -----------------------------------------------------------------------
 
     /// Send a notification message.
     ///
@@ -361,10 +337,6 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
         Ok(api_resp.ts.unwrap_or_default())
     }
 
-    // -----------------------------------------------------------------------
-    // Bot channel check
-    // -----------------------------------------------------------------------
-
     fn has_bot_channel(&self) -> bool {
         self.config
             .bot_token
@@ -378,10 +350,6 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
                 .map(|v| !v.is_empty())
                 .unwrap_or(false)
     }
-
-    // -----------------------------------------------------------------------
-    // User mention helpers
-    // -----------------------------------------------------------------------
 
     fn get_user_mention(&self) -> Option<String> {
         self.config.user_id.as_ref().map(|id| format!("<@{}>", id))
@@ -427,10 +395,6 @@ impl<H: SlackHttpClient> SlackNotifier<H> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Message builders
-// ---------------------------------------------------------------------------
 
 /// Return the current UTC timestamp in RFC 3339 format.
 pub(crate) fn timestamp() -> String {
@@ -570,6 +534,11 @@ pub(crate) fn build_completed_message(issue: &Issue, mention: Option<String>) ->
         fallback = format!("{} {}", m, fallback);
     }
 
+    let reason = issue
+        .get_metadata::<String>("completion_reason")
+        .unwrap_or_else(|| "Claude completed but no PR URL was captured".to_string());
+    let reason_display = truncate_string(&reason, 500);
+
     let mut blocks = vec![
         SlackBlock::Header {
             text: SlackText::plain_text(format!("\u{2714}\u{FE0F} Completed: {}", short_id)),
@@ -578,9 +547,7 @@ pub(crate) fn build_completed_message(issue: &Issue, mention: Option<String>) ->
             text: SlackText::mrkdwn(format!("*<{}|{}>*", url, title)),
             fields: Some(vec![
                 SlackText::mrkdwn(format!("*Source:* {} {}", emoji, source)),
-                SlackText::mrkdwn(
-                    "*Note:* Claude completed but no PR URL was captured".to_string(),
-                ),
+                SlackText::mrkdwn(format!("*Reason:* {}", reason_display)),
             ]),
         },
     ];
@@ -1115,10 +1082,6 @@ pub(crate) fn build_ask_question_message(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Notifier trait implementation
-// ---------------------------------------------------------------------------
-
 #[async_trait]
 impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
     fn name(&self) -> &str {
@@ -1368,10 +1331,6 @@ impl<H: SlackHttpClient + 'static> Notifier for SlackNotifier<H> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,10 +1340,6 @@ mod tests {
     fn empty_registry() -> UserRegistry {
         UserRegistry::new(std::collections::HashMap::new())
     }
-
-    // -----------------------------------------------------------------------
-    // Mock HTTP client
-    // -----------------------------------------------------------------------
 
     /// Mock Slack HTTP client that records calls and returns configurable responses.
     struct MockSlackHttpClient {
@@ -1489,10 +1444,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Config helpers
-    // -----------------------------------------------------------------------
-
     fn webhook_config() -> SlackConfig {
         SlackConfig {
             webhook_url: Some("https://hooks.slack.com/services/T00/B00/xxx".into()),
@@ -1561,10 +1512,6 @@ mod tests {
             target_slack_id: target_slack_id.map(|s| s.to_string()),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Basic tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_notifier_name() {
@@ -1636,10 +1583,6 @@ mod tests {
         assert!(!notifier.is_enabled());
     }
 
-    // -----------------------------------------------------------------------
-    // Webhook send tests
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_send_webhook_success() {
         let mock = MockSlackHttpClient::success();
@@ -1680,10 +1623,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // -----------------------------------------------------------------------
-    // Bot API send tests
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_send_bot_api_success() {
         let mock = MockSlackHttpClient::success_api();
@@ -1713,10 +1652,6 @@ mod tests {
         let err_str = result.unwrap_err().to_string();
         assert!(err_str.contains("channel_not_found"));
     }
-
-    // -----------------------------------------------------------------------
-    // Notification message content tests
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_start_sends_blocks() {
@@ -1908,10 +1843,6 @@ mod tests {
         assert!(issue_blocks.len() <= 10);
     }
 
-    // -----------------------------------------------------------------------
-    // Disabled notifier tests
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_status_disabled() {
         let config = SlackConfig::default();
@@ -1927,10 +1858,6 @@ mod tests {
         let result = notifier.notify_start(&test_issue()).await;
         assert!(result.is_ok());
     }
-
-    // -----------------------------------------------------------------------
-    // User mention tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_user_mention() {
@@ -2058,10 +1985,6 @@ mod tests {
             Some("<@Ufallback>".to_string())
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Q&A tests
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_ask_question_sends_via_chat_post_message() {
@@ -2297,10 +2220,6 @@ mod tests {
         assert!(replies.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // supports_replies
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_supports_replies_true_when_both_set() {
         let notifier =
@@ -2328,10 +2247,6 @@ mod tests {
         let notifier = SlackNotifier::with_http_client(config, MockSlackHttpClient::success());
         assert!(!notifier.supports_replies());
     }
-
-    // -----------------------------------------------------------------------
-    // Expected reply user
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_expected_reply_user_id_prefers_request_target() {
@@ -2363,10 +2278,6 @@ mod tests {
         assert_eq!(notifier.expected_reply_user_id(&request), None);
     }
 
-    // -----------------------------------------------------------------------
-    // Extract reply text helpers
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_extract_reply_text() {
         let parsed =
@@ -2392,10 +2303,6 @@ mod tests {
             SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text("  yes  ").unwrap();
         assert_eq!(result, "yes");
     }
-
-    // -----------------------------------------------------------------------
-    // Truncation tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_truncate_string_short_unchanged() {
@@ -2445,10 +2352,6 @@ mod tests {
         assert!(result.ends_with("..."));
     }
 
-    // -----------------------------------------------------------------------
-    // slack_ts_to_datetime tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_slack_ts_to_datetime_valid() {
         let dt = slack_ts_to_datetime("1709123456.789012").unwrap();
@@ -2464,10 +2367,6 @@ mod tests {
     fn test_slack_ts_to_datetime_empty() {
         assert!(slack_ts_to_datetime("").is_none());
     }
-
-    // -----------------------------------------------------------------------
-    // Block Kit serialization
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_slack_text_mrkdwn() {
@@ -2546,19 +2445,11 @@ mod tests {
         assert_eq!(msg.thread_ts.as_deref(), Some("1709123400.000000"));
     }
 
-    // -----------------------------------------------------------------------
-    // ReqwestSlackHttpClient default
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_reqwest_slack_http_client_default() {
         let client = ReqwestSlackHttpClient::default();
         assert!(std::mem::size_of_val(&client) > 0);
     }
-
-    // -----------------------------------------------------------------------
-    // Additional message builder tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_start_message_without_mention() {
@@ -2959,10 +2850,6 @@ mod tests {
         assert!(context_line.len() <= 410); // 400 + "..." margin
     }
 
-    // -----------------------------------------------------------------------
-    // Slack message serialization tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_slack_message_with_all_fields_serialization() {
         let msg = SlackMessage {
@@ -3061,10 +2948,6 @@ mod tests {
         assert!(msg.thread_ts.is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // slack_ts_to_datetime edge cases
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_slack_ts_to_datetime_integer_only() {
         let dt = slack_ts_to_datetime("1709123456").unwrap();
@@ -3084,10 +2967,6 @@ mod tests {
         let dt = slack_ts_to_datetime("0.000000").unwrap();
         assert_eq!(dt.timestamp(), 0);
     }
-
-    // -----------------------------------------------------------------------
-    // Truncation edge cases
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_truncate_string_unicode_safety() {
@@ -3116,10 +2995,6 @@ mod tests {
         assert!(result.ends_with("..."));
         assert!(result.len() <= 4);
     }
-
-    // -----------------------------------------------------------------------
-    // Async send path tests
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_send_no_config_drops_message() {
@@ -3184,10 +3059,6 @@ mod tests {
         assert!(err.contains("parse"));
     }
 
-    // -----------------------------------------------------------------------
-    // Notify merged via bot API
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_merged_bot_api() {
         let mock = MockSlackHttpClient::success_api();
@@ -3202,10 +3073,6 @@ mod tests {
         let text = body["text"].as_str().unwrap();
         assert!(text.contains("PR Merged"));
     }
-
-    // -----------------------------------------------------------------------
-    // Notify report
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_report() {
@@ -3231,10 +3098,6 @@ mod tests {
         let result = notifier.notify_report(&report).await;
         assert!(result.is_ok());
     }
-
-    // -----------------------------------------------------------------------
-    // Poll replies edge cases
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_poll_returns_empty_without_channel_id() {
@@ -3405,10 +3268,6 @@ mod tests {
         assert!(replies.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // Bot channel empty string edge cases
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_send_with_empty_bot_token_and_channel_drops_message() {
         let config = SlackConfig {
@@ -3434,20 +3293,12 @@ mod tests {
         assert!(!notifier.has_bot_channel());
     }
 
-    // -----------------------------------------------------------------------
-    // timestamp function
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_timestamp_returns_rfc3339() {
         let ts = timestamp();
         // Should be parseable as RFC 3339
         assert!(chrono::DateTime::parse_from_rfc3339(&ts).is_ok());
     }
-
-    // -----------------------------------------------------------------------
-    // get_target_slack_id_for_issue edge cases
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_get_target_slack_id_for_issue_no_resolved_user() {
@@ -3528,10 +3379,6 @@ mod tests {
         assert_eq!(notifier.get_target_slack_id_for_issue(&issue), None);
     }
 
-    // -----------------------------------------------------------------------
-    // build_closed_message tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_build_closed_message_without_mention() {
         let issue = test_issue();
@@ -3559,10 +3406,6 @@ mod tests {
         let first_block_json = serde_json::to_string(&blocks[0]).unwrap();
         assert!(first_block_json.contains("<@U555>"));
     }
-
-    // -----------------------------------------------------------------------
-    // build_cascade_success_message tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_cascade_success_message_without_mention() {
@@ -3597,10 +3440,6 @@ mod tests {
         let first_block_json = serde_json::to_string(&blocks[0]).unwrap();
         assert!(first_block_json.contains("<@U777>"));
     }
-
-    // -----------------------------------------------------------------------
-    // build_cascade_failed_message tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_cascade_failed_message_without_mention() {
@@ -3656,10 +3495,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // build_regression_detected_message tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_build_regression_detected_message_without_mention() {
         let issue = test_issue();
@@ -3708,10 +3543,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // build_regression_resolved_message tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_build_regression_resolved_message_without_mention() {
         let issue = test_issue();
@@ -3734,10 +3565,6 @@ mod tests {
         assert!(first_block_json.contains("<@U222>"));
     }
 
-    // -----------------------------------------------------------------------
-    // Notifier trait dispatch: notify_success with cascade metadata
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_success_cascade_issue() {
         let mock = MockSlackHttpClient::success();
@@ -3755,10 +3582,6 @@ mod tests {
         assert!(text.contains("Cascade PR"));
     }
 
-    // -----------------------------------------------------------------------
-    // Notifier trait dispatch: notify_success with is_pr_update metadata
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_success_pr_update() {
         let mock = MockSlackHttpClient::success();
@@ -3775,10 +3598,6 @@ mod tests {
         assert!(text.contains("PR Updated"));
     }
 
-    // -----------------------------------------------------------------------
-    // Notifier trait dispatch: notify_completed with regression_resolved
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_completed_regression_resolved() {
         let mock = MockSlackHttpClient::success();
@@ -3792,10 +3611,6 @@ mod tests {
         let text = body["text"].as_str().unwrap();
         assert!(text.contains("Regression Resolved"));
     }
-
-    // -----------------------------------------------------------------------
-    // Notifier trait dispatch: notify_failed with regression_detected
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_failed_regression_detected() {
@@ -3811,10 +3626,6 @@ mod tests {
         assert!(text.contains("Regression Detected"));
     }
 
-    // -----------------------------------------------------------------------
-    // Notifier trait dispatch: notify_failed with cascade metadata
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_failed_cascade() {
         let mock = MockSlackHttpClient::success();
@@ -3829,10 +3640,6 @@ mod tests {
         let text = body["text"].as_str().unwrap();
         assert!(text.contains("Cascade Failed"));
     }
-
-    // -----------------------------------------------------------------------
-    // Notifier trait dispatch: notify_closed
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_closed_via_webhook() {
@@ -3861,10 +3668,6 @@ mod tests {
         assert!(url.contains("chat.postMessage"));
     }
 
-    // -----------------------------------------------------------------------
-    // build_success_message with is_pr_update metadata
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_build_success_message_pr_update() {
         let mut issue = test_issue();
@@ -3889,10 +3692,6 @@ mod tests {
         assert!(msg.text.starts_with("<@U_UPDATE>"));
     }
 
-    // -----------------------------------------------------------------------
-    // send_to_channel with empty channel_id
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_send_to_channel_returns_none_with_empty_channel_id() {
         let config = SlackConfig {
@@ -3908,10 +3707,6 @@ mod tests {
         assert!(delivery.is_some());
         assert!(delivery.unwrap().message_id.is_none());
     }
-
-    // -----------------------------------------------------------------------
-    // Webhook prefers over bot for send, but ask_question uses chat.postMessage
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_ask_question_returns_none_ts_when_no_bot() {
@@ -3929,10 +3724,6 @@ mod tests {
         assert!(d.message_id.is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // SlackNotifier::new (production constructor)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_slack_notifier_new_production_constructor() {
         let config = webhook_config();
@@ -3941,10 +3732,6 @@ mod tests {
         assert_eq!(notifier.name(), "slack");
         assert!(notifier.is_enabled());
     }
-
-    // -----------------------------------------------------------------------
-    // with_http_client_and_registry constructor
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_with_http_client_and_registry() {
@@ -3965,10 +3752,6 @@ mod tests {
         assert_eq!(notifier.name(), "slack");
         assert!(notifier.is_enabled());
     }
-
-    // -----------------------------------------------------------------------
-    // Poll question replies with non-threaded reply filtering
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_poll_non_threaded_reply_skips_bot_question_messages() {
@@ -4015,10 +3798,6 @@ mod tests {
         assert!(replies.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // notify_merged with user mention via webhook
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_merged_with_mention_webhook() {
         let mock = MockSlackHttpClient::success();
@@ -4034,10 +3813,6 @@ mod tests {
         assert!(text.contains("PR Merged"));
     }
 
-    // -----------------------------------------------------------------------
-    // notify_completed sends correct content via bot API
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_completed_via_bot_api() {
         let mock = MockSlackHttpClient::success_api();
@@ -4052,10 +3827,6 @@ mod tests {
         assert!(text.contains("Completed"));
     }
 
-    // -----------------------------------------------------------------------
-    // notify_failed sends correct content via bot API
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_failed_via_bot_api() {
         let mock = MockSlackHttpClient::success_api();
@@ -4068,10 +3839,6 @@ mod tests {
         let (url, _, _) = notifier.http.get_last_post_call().unwrap();
         assert!(url.contains("chat.postMessage"));
     }
-
-    // -----------------------------------------------------------------------
-    // notify_success sends correct content via bot API
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_success_via_bot_api() {
@@ -4087,10 +3854,6 @@ mod tests {
         let text = body["text"].as_str().unwrap();
         assert!(text.contains("PR Created"));
     }
-
-    // -----------------------------------------------------------------------
-    // build_report_message edge case: zero values
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_report_message_zero_values() {
@@ -4120,10 +3883,6 @@ mod tests {
         assert!(block_json.contains("Empty"));
     }
 
-    // -----------------------------------------------------------------------
-    // notify_status via bot API
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_status_via_bot_api() {
         let mock = MockSlackHttpClient::success_api();
@@ -4134,10 +3893,6 @@ mod tests {
         let (url, _, _) = notifier.http.get_last_post_call().unwrap();
         assert!(url.contains("chat.postMessage"));
     }
-
-    // -----------------------------------------------------------------------
-    // notify_report via bot API
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_report_via_bot_api() {
@@ -4166,10 +3921,6 @@ mod tests {
         assert!(url.contains("chat.postMessage"));
     }
 
-    // -----------------------------------------------------------------------
-    // notify_urgent_issues via bot API
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_notify_urgent_issues_via_bot_api() {
         let mock = MockSlackHttpClient::success_api();
@@ -4188,10 +3939,6 @@ mod tests {
         assert!(url.contains("chat.postMessage"));
     }
 
-    // -----------------------------------------------------------------------
-    // Poll with empty channel_id returns empty
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_poll_returns_empty_with_empty_channel_id() {
         let config = SlackConfig {
@@ -4208,10 +3955,6 @@ mod tests {
             .unwrap();
         assert!(replies.is_empty());
     }
-
-    // -----------------------------------------------------------------------
-    // Poll with no question messages in history returns empty
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_poll_no_question_messages() {
@@ -4240,10 +3983,6 @@ mod tests {
         assert!(replies.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // Poll with empty history messages returns empty
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_poll_empty_history() {
         let mock = MockSlackHttpClient::success_api();
@@ -4264,10 +4003,6 @@ mod tests {
             .unwrap();
         assert!(replies.is_empty());
     }
-
-    // -----------------------------------------------------------------------
-    // Additional truncate_string tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_truncate_string_within_limit() {
@@ -4332,10 +4067,6 @@ mod tests {
         assert!(result3.len() <= 7);
     }
 
-    // -----------------------------------------------------------------------
-    // Additional slack_ts_to_datetime tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_slack_ts_to_datetime_valid_fractional() {
         let dt = slack_ts_to_datetime("1709123456.789012").unwrap();
@@ -4359,10 +4090,6 @@ mod tests {
         assert_eq!(dt.timestamp_subsec_nanos(), 0);
     }
 
-    // -----------------------------------------------------------------------
-    // Additional extract_reply_text tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_extract_reply_text_normal() {
         let result = SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text("Use main branch");
@@ -4374,10 +4101,6 @@ mod tests {
         assert!(SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text("").is_none());
         assert!(SlackNotifier::<ReqwestSlackHttpClient>::extract_reply_text("   \t\n  ").is_none());
     }
-
-    // -----------------------------------------------------------------------
-    // Additional build message tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_start_message() {
@@ -4424,10 +4147,6 @@ mod tests {
         assert!(json.contains("Error"));
     }
 
-    // -----------------------------------------------------------------------
-    // get_source_emoji tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_get_source_emoji() {
         // Known sources get specific emoji
@@ -4445,10 +4164,6 @@ mod tests {
         assert_eq!(get_source_emoji(""), "\u{1F4CC}");
         assert_eq!(get_source_emoji("custom_source"), "\u{1F4CC}");
     }
-
-    // -----------------------------------------------------------------------
-    // has_bot_channel tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_has_bot_channel() {

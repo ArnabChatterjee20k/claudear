@@ -222,7 +222,10 @@ impl Notifier for PushNotifier {
             .await
         } else {
             let title = format!("\u{2714}\u{FE0F} Completed: {}", issue.short_id);
-            let message = format!("{}\n\nNo PR URL was captured.", issue.title);
+            let reason = issue
+                .get_metadata::<String>("completion_reason")
+                .unwrap_or_else(|| "No PR URL was captured".to_string());
+            let message = format!("{}\n\n{}", issue.title, reason);
             self.send_push(
                 &title,
                 &message,

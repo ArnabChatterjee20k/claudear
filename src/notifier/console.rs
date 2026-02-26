@@ -83,9 +83,12 @@ impl Notifier for ConsoleNotifier {
                 issue.source, issue.short_id
             );
         } else {
+            let reason = issue
+                .get_metadata::<String>("completion_reason")
+                .unwrap_or_else(|| "no PR URL found".to_string());
             println!(
-                "[{}] Completed: {} (no PR URL found)",
-                issue.source, issue.short_id
+                "[{}] Completed: {} - {}",
+                issue.source, issue.short_id, reason
             );
         }
         Ok(())

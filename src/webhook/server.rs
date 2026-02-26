@@ -1416,37 +1416,35 @@ async fn process_issue(
                 }));
                 state.tracker.record_activity(&activity).ok();
             } else {
-                let no_pr_error = if claude_result.output.is_empty() {
+                let reason = if claude_result.output.is_empty() {
                     "No PR URL found in output".to_string()
+                } else if claude_result.output.chars().count() > 500 {
+                    let truncated: String = claude_result.output.chars().take(497).collect();
+                    format!("{}...", truncated)
                 } else {
-                    let summary = if claude_result.output.chars().count() > 500 {
-                        let truncated: String = claude_result.output.chars().take(497).collect();
-                        format!("{}...", truncated)
-                    } else {
-                        claude_result.output.clone()
-                    };
-                    format!("Claude completed without creating a PR: {}", summary)
+                    claude_result.output.clone()
                 };
-                tracing::info!(short_id = %issue.short_id, "No PR URL found in output");
+                tracing::info!(short_id = %issue.short_id, reason = %reason, "Completed without PR");
+                issue.set_metadata("completion_reason", reason.clone());
                 state
                     .tracker
-                    .mark_failed(source_name, &issue.id, &no_pr_error)?;
+                    .mark_failed(source_name, &issue.id, &format!("Claude completed without creating a PR: {}", reason))?;
                 if let Some(id) = attempt_id {
                     let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
                 }
-                state.notifier.notify_failed(&issue, &no_pr_error).await?;
+                state.notifier.notify_completed(&issue).await?;
                 record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed).await;
 
                 // Log webhook processed without PR
                 let activity = ActivityLogEntry::new(
                     "webhook_processed",
-                    format!("Webhook processed: {} - no PR created", issue.short_id),
+                    format!("Webhook processed: {} - completed without PR: {}", issue.short_id, reason),
                 )
                 .with_source(source_name.to_string())
                 .with_issue(issue.id.clone(), issue.short_id.clone())
                 .with_metadata(json!({
                     "success": false,
-                    "reason": &no_pr_error
+                    "reason": &reason
                 }));
                 state.tracker.record_activity(&activity).ok();
             }
@@ -2895,10 +2893,6 @@ mod tests {
         assert_eq!(map.len(), 3);
     }
 
-    // ---------------------------------------------------------------
-    // truncate_error_for_activity tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_truncate_error_short_message() {
         let msg = "Something went wrong";
@@ -2946,10 +2940,6 @@ mod tests {
         // Validate it's valid UTF-8 by just using it
         assert!(result.len() <= 503); // 500 content + "..."
     }
-
-    // ---------------------------------------------------------------
-    // enhance_prompt_with_learning tests
-    // ---------------------------------------------------------------
 
     fn make_app_state_for_learning(learning: LearningConfig) -> AppState {
         let mut config = test_config();
@@ -3024,10 +3014,6 @@ mod tests {
         assert_eq!(result, base);
     }
 
-    // ---------------------------------------------------------------
-    // record_error_pattern tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_record_error_pattern_basic() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3085,10 +3071,6 @@ mod tests {
         // Should not panic even with empty error
         record_error_pattern(&state, "sentry", "issue-456", "");
     }
-
-    // ---------------------------------------------------------------
-    // Helper to build AppState for handler-level tests
-    // ---------------------------------------------------------------
 
     fn make_app_state(
         handlers: WebhookHandlerRegistry,
@@ -3175,10 +3157,6 @@ mod tests {
             suppression_regex_cache: None,
         })
     }
-
-    // ---------------------------------------------------------------
-    // Issue ID validation in webhook_handler
-    // ---------------------------------------------------------------
 
     /// Mock handler that returns an issue with a configurable ID
     struct CustomIdHandler {
@@ -3286,10 +3264,6 @@ mod tests {
             .unwrap()
             .contains("Invalid issue ID"));
     }
-
-    // ---------------------------------------------------------------
-    // Duplicate delivery idempotency tests
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_webhook_handler_duplicate_delivery_linear() {
@@ -3409,10 +3383,6 @@ mod tests {
             .contains("Duplicate delivery"));
     }
 
-    // ---------------------------------------------------------------
-    // Suppression rule tests
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_issue_suppressed_by_rule() {
         use crate::prioritisation::suppression::RegexCache;
@@ -3469,10 +3439,6 @@ mod tests {
         assert_eq!(response["rule"], "suppress-test");
     }
 
-    // ---------------------------------------------------------------
-    // Processing set capacity overflow tests
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_processing_set_ttl_cleanup_in_webhook_handler() {
         // Simulate stale entries being cleaned up when a new webhook arrives.
@@ -3502,10 +3468,6 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(response["status"], "accepted");
     }
-
-    // ---------------------------------------------------------------
-    // GitHub webhook handler tests
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_handle_github_webhook_no_handler_configured() {
@@ -3540,10 +3502,6 @@ mod tests {
         assert!(response["error"].as_str().unwrap().contains("Invalid JSON"));
     }
 
-    // ---------------------------------------------------------------
-    // webhook_handler routes to github handler for source_name == "github"
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_routes_github_to_dedicated_handler() {
         // When source_name is "github", the handler should route to
@@ -3566,10 +3524,6 @@ mod tests {
             .unwrap()
             .contains("not configured"));
     }
-
-    // ---------------------------------------------------------------
-    // Tower/axum integration tests using oneshot
-    // ---------------------------------------------------------------
 
     use axum::body::Body;
     use axum::http::Request;
@@ -3887,10 +3841,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // ---------------------------------------------------------------
-    // Health handler response field validation
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_health_handler_includes_github_webhook_enabled_field() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -3936,10 +3886,6 @@ mod tests {
         assert!(handler_names.contains(&"jira".to_string()));
     }
 
-    // ---------------------------------------------------------------
-    // Health endpoint via full router integration
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_health_with_processing_entries_oneshot() {
         let handlers = WebhookHandlerRegistry::new();
@@ -3965,10 +3911,6 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["processing_count"], 3);
     }
-
-    // ---------------------------------------------------------------
-    // WebhookServer builder method tests
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_webhook_server_set_review_watcher() {
@@ -4059,10 +4001,6 @@ mod tests {
         assert!(server.github_handler.is_none());
     }
 
-    // ---------------------------------------------------------------
-    // Signature detection header tests
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_detects_linear_signature_header() {
         // The webhook handler logs whether a signature header is present.
@@ -4128,10 +4066,6 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
     }
 
-    // ---------------------------------------------------------------
-    // Multiple sequential webhook requests (handler state isolation)
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_second_webhook_for_same_issue_returns_already_processing() {
         // First request gets accepted, second should report "Already processing"
@@ -4169,10 +4103,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
-    // Empty body tests
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_empty_body_is_invalid_json() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -4191,10 +4121,6 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(response["error"].as_str().unwrap().contains("Invalid JSON"));
     }
-
-    // ---------------------------------------------------------------
-    // Large payload handling
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_webhook_handler_large_json_payload() {
@@ -4219,10 +4145,6 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
     }
 
-    // ---------------------------------------------------------------
-    // Processing constants validation
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_processing_entry_ttl_is_one_hour() {
         assert_eq!(PROCESSING_ENTRY_TTL_SECS, 3600);
@@ -4232,10 +4154,6 @@ mod tests {
     fn test_max_processing_entries_is_1000() {
         assert_eq!(MAX_PROCESSING_ENTRIES, 1000);
     }
-
-    // ---------------------------------------------------------------
-    // notify_failed_with_escalation tests
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_failed_with_escalation_normal_error() {
@@ -4339,10 +4257,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ---------------------------------------------------------------
-    // WebhookHandlerRegistry additional tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_webhook_handler_registry_has() {
         let mut registry = WebhookHandlerRegistry::new();
@@ -4358,10 +4272,6 @@ mod tests {
         assert!(registry.get_all().is_empty());
         assert!(!registry.has("anything"));
     }
-
-    // ---------------------------------------------------------------
-    // Concurrent webhook handling via shared state
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_processing_set_isolation_between_sources() {
@@ -4405,10 +4315,6 @@ mod tests {
         assert_eq!(status_sentry, StatusCode::ACCEPTED);
         assert_eq!(resp_sentry["status"], "accepted");
     }
-
-    // ---------------------------------------------------------------
-    // Header conversion edge cases
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_header_conversion_filters_non_utf8() {
@@ -4460,10 +4366,6 @@ mod tests {
         assert_eq!(header_map.get("x-my-header"), Some(&"Value123".to_string()));
     }
 
-    // ---------------------------------------------------------------
-    // Router health endpoint JSON structure via full integration
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_health_full_json_structure() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -4514,10 +4416,6 @@ mod tests {
         assert_eq!(json["github_webhook_enabled"], true);
     }
 
-    // ---------------------------------------------------------------
-    // Webhook handler with sqlite tracker enabled (non-duplicate path)
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_with_sqlite_tracker_no_delivery_header() {
         // When there is a sqlite_tracker but no delivery header, the idempotency
@@ -4538,10 +4436,6 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(response["status"], "accepted");
     }
-
-    // ---------------------------------------------------------------
-    // Webhook duplicate delivery: linear-delivery takes priority
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_delivery_header_priority_linear_over_github() {
@@ -4578,10 +4472,6 @@ mod tests {
             .contains("Duplicate delivery"));
     }
 
-    // ---------------------------------------------------------------
-    // Processing key uniqueness between different issues
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_processing_key_different_issues() {
         let key1 = format!("{}:{}", "linear", "issue-1");
@@ -4592,10 +4482,6 @@ mod tests {
         assert_ne!(key1, key3);
         assert_ne!(key2, key3);
     }
-
-    // ---------------------------------------------------------------
-    // Processing map capacity overflow simulation
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_processing_map_overflow_cleanup() {
@@ -4622,10 +4508,6 @@ mod tests {
 
         assert_eq!(processing.len(), MAX_PROCESSING_ENTRIES / 2);
     }
-
-    // ---------------------------------------------------------------
-    // WebhookServer construction with sqlite_tracker
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_webhook_server_new_with_sqlite_tracker() {
@@ -4704,10 +4586,6 @@ mod tests {
         assert_eq!(server.config.max_issues_per_cycle, 42);
     }
 
-    // ---------------------------------------------------------------
-    // WebhookServer setter methods with actual values
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_webhook_server_set_review_watcher_with_value_then_clear() {
         let config = test_config();
@@ -4758,10 +4636,6 @@ mod tests {
         assert!(server.issue_embedding_service.is_none());
     }
 
-    // ---------------------------------------------------------------
-    // new_with_github preserves all fields
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_webhook_server_new_with_github_preserves_all_fields() {
         let mut config = test_config();
@@ -4791,10 +4665,6 @@ mod tests {
         assert!(server.issue_embedding_service.is_none());
         assert!(server.review_watcher.is_none());
     }
-
-    // ---------------------------------------------------------------
-    // AppState construction with all optional fields
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_app_state_with_sqlite_tracker() {
@@ -4830,10 +4700,6 @@ mod tests {
         assert!(state.inferrer.is_none());
         assert!(state.suppression_regex_cache.is_none());
     }
-
-    // ---------------------------------------------------------------
-    // Processing deduplication TTL retain with fresh entries
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_processing_retain_keeps_fresh_entries() {
@@ -4888,10 +4754,6 @@ mod tests {
         assert!(!processing.is_empty());
     }
 
-    // ---------------------------------------------------------------
-    // truncate_error_for_activity - additional boundary tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_truncate_error_exactly_499_chars() {
         let msg = "a".repeat(499);
@@ -4934,10 +4796,6 @@ mod tests {
         // Should not panic, must be valid UTF-8
         assert!(result.is_char_boundary(result.len()));
     }
-
-    // ---------------------------------------------------------------
-    // record_error_pattern with different error types
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_record_error_pattern_timeout() {
@@ -5011,10 +4869,6 @@ mod tests {
         record_error_pattern(&state, "linear", "issue-1", "Error B");
         record_error_pattern(&state, "linear", "issue-1", "Error C");
     }
-
-    // ---------------------------------------------------------------
-    // enhance_prompt_with_learning - repo provided but no data
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_enhance_prompt_with_empty_repo_name() {
@@ -5092,10 +4946,6 @@ mod tests {
         assert_eq!(result, base);
     }
 
-    // ---------------------------------------------------------------
-    // Health handler with github_handler Some
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_health_handler_with_github_and_handlers() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -5141,10 +4991,6 @@ mod tests {
             .collect();
         assert_eq!(handler_names.len(), 2);
     }
-
-    // ---------------------------------------------------------------
-    // handle_github_webhook edge cases
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_handle_github_webhook_valid_json_no_signature() {
@@ -5196,10 +5042,6 @@ mod tests {
             status
         );
     }
-
-    // ---------------------------------------------------------------
-    // notify_failed_with_escalation - additional error patterns
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_failed_with_escalation_empty_error() {
@@ -5270,10 +5112,6 @@ mod tests {
         assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
     }
 
-    // ---------------------------------------------------------------
-    // Router integration: body size limit
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_webhook_body_within_limit() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -5294,10 +5132,6 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
-
-    // ---------------------------------------------------------------
-    // Router integration: multiple handler registration
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_router_with_multiple_handlers_routes_correctly() {
@@ -5323,10 +5157,6 @@ mod tests {
         assert_eq!(json["status"], "ignored");
     }
 
-    // ---------------------------------------------------------------
-    // WebhookServer new delegates to new_with_github(None)
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_webhook_server_new_delegates_to_new_with_github_none() {
         let config = test_config();
@@ -5347,10 +5177,6 @@ mod tests {
         // new() should result in github_handler being None
         assert!(server.github_handler.is_none());
     }
-
-    // ---------------------------------------------------------------
-    // Processing set concurrent access patterns
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_rwlock_processing_map_concurrent_reads() {
@@ -5400,10 +5226,6 @@ mod tests {
         assert!(read.contains_key("key3"));
     }
 
-    // ---------------------------------------------------------------
-    // Webhook handler with x-signature header (generic signature header)
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_detects_x_signature_header() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -5424,10 +5246,6 @@ mod tests {
 
         assert_eq!(status, StatusCode::ACCEPTED);
     }
-
-    // ---------------------------------------------------------------
-    // Custom issue ID handler: valid IDs accepted
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_webhook_handler_accepts_valid_issue_ids() {
@@ -5492,10 +5310,6 @@ mod tests {
             .contains("Invalid issue ID"));
     }
 
-    // ---------------------------------------------------------------
-    // Accepted webhook inserts processing key
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_accepted_webhook_inserts_processing_key() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -5521,10 +5335,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
-    // make_app_state helper validates correct construction
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_make_app_state_helper() {
         let handlers = WebhookHandlerRegistry::new();
@@ -5544,10 +5354,6 @@ mod tests {
 
         assert!(state.sqlite_tracker.is_some());
     }
-
-    // ---------------------------------------------------------------
-    // Error response JSON format consistency
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_error_response_json_structure_unknown_source() {
@@ -5611,10 +5417,6 @@ mod tests {
         assert_eq!(resp["issue"], "TEST-42");
     }
 
-    // ---------------------------------------------------------------
-    // Router: DELETE and PUT methods return 405
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_delete_on_webhook_returns_method_not_allowed() {
         let handlers = WebhookHandlerRegistry::new();
@@ -5666,10 +5468,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    // ---------------------------------------------------------------
-    // Webhook handler with duplicate handlers (same name replaces)
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_webhook_handler_registry_register_same_name_replaces() {
         let mut registry = WebhookHandlerRegistry::new();
@@ -5680,10 +5478,6 @@ mod tests {
         assert_eq!(registry.get_all().len(), 1);
         assert!(registry.has("test"));
     }
-
-    // ---------------------------------------------------------------
-    // Processing key format edge cases
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_processing_key_with_special_characters_in_issue_id() {
@@ -5702,10 +5496,6 @@ mod tests {
         assert_eq!(key.len(), 7 + 200); // "sentry:" + 200 chars
     }
 
-    // ---------------------------------------------------------------
-    // make_app_state_with_github helper validates construction
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_make_app_state_with_github_none_handler() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -5723,10 +5513,6 @@ mod tests {
 
         assert!(state.github_handler.is_some());
     }
-
-    // ---------------------------------------------------------------
-    // Webhook handler routes github source before registry lookup
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_webhook_handler_github_source_bypasses_registry_even_with_handler() {
@@ -5777,10 +5563,6 @@ mod tests {
             .contains("not configured"));
     }
 
-    // ---------------------------------------------------------------
-    // Delivery header fallback chain: github then sentry
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_delivery_header_priority_github_over_sentry() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -5814,14 +5596,6 @@ mod tests {
             .unwrap()
             .contains("Duplicate delivery"));
     }
-
-    // ---------------------------------------------------------------
-    // Additional coverage tests
-    // ---------------------------------------------------------------
-
-    // ---------------------------------------------------------------
-    // handle_github_webhook: activity logging with signature header
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_handle_github_webhook_logs_has_signature_true() {
@@ -5870,10 +5644,6 @@ mod tests {
                 || status == StatusCode::INTERNAL_SERVER_ERROR,
         );
     }
-
-    // ---------------------------------------------------------------
-    // handle_github_webhook: various JSON payloads
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_handle_github_webhook_with_review_event_payload() {
@@ -5927,10 +5697,6 @@ mod tests {
         );
         assert!(response.get("status").is_some() || response.get("error").is_some());
     }
-
-    // ---------------------------------------------------------------
-    // notify_failed_with_escalation: various hard error strings
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_notify_failed_with_escalation_connection_reset() {
@@ -6224,10 +5990,6 @@ mod tests {
         assert!(issue.get_metadata::<String>("resolved_user").is_some());
     }
 
-    // ---------------------------------------------------------------
-    // record_feedback_outcome_from_attempt tests
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_record_feedback_outcome_no_attempt_in_tracker() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -6305,10 +6067,6 @@ mod tests {
         record_feedback_outcome_from_attempt(&state, "test", &issue, Outcome::Failed).await;
     }
 
-    // ---------------------------------------------------------------
-    // enhance_prompt_with_learning: with data in DB
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_enhance_prompt_all_learning_enabled_with_repo() {
         let learning = LearningConfig {
@@ -6339,10 +6097,6 @@ mod tests {
         // Whether or not extra context is added, the base prompt must be present
         assert!(result.contains(base));
     }
-
-    // ---------------------------------------------------------------
-    // record_error_pattern with very long error messages
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_record_error_pattern_very_long_message() {
@@ -6407,10 +6161,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
-    // truncate_error_for_activity: boundary precision tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_truncate_error_exactly_at_boundary_no_ellipsis() {
         let msg = "a".repeat(500);
@@ -6448,10 +6198,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // Webhook handler with sqlite_tracker + new delivery IDs
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_first_delivery_with_sqlite_tracker() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -6474,10 +6220,6 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(response["status"], "accepted");
     }
-
-    // ---------------------------------------------------------------
-    // Webhook handler with multiple signature headers simultaneously
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_webhook_handler_multiple_signature_headers() {
@@ -6502,10 +6244,6 @@ mod tests {
 
         assert_eq!(status, StatusCode::ACCEPTED);
     }
-
-    // ---------------------------------------------------------------
-    // Webhook handler: suppression rule that does NOT match
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_webhook_handler_suppression_rule_does_not_match() {
@@ -6564,10 +6302,6 @@ mod tests {
         assert_eq!(response["status"], "accepted");
     }
 
-    // ---------------------------------------------------------------
-    // Webhook handler: suppression with sqlite_tracker for recording
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_suppression_records_to_tracker() {
         use crate::prioritisation::suppression::RegexCache;
@@ -6623,10 +6357,6 @@ mod tests {
         assert_eq!(response["status"], "suppressed");
     }
 
-    // ---------------------------------------------------------------
-    // WebhookServer constructor and setter combinations
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_webhook_server_new_with_all_options() {
         let mut config = test_config();
@@ -6664,10 +6394,6 @@ mod tests {
         assert!(server.review_watcher.is_none());
     }
 
-    // ---------------------------------------------------------------
-    // Router integration: github source via full router
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_github_source_no_handler_oneshot() {
         let handlers = WebhookHandlerRegistry::new();
@@ -6689,10 +6415,6 @@ mod tests {
         assert!(json["error"].as_str().unwrap().contains("not configured"));
     }
 
-    // ---------------------------------------------------------------
-    // Router integration: multiple handlers with various responses
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_mixed_handlers_linear_accepted_oneshot() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -6712,10 +6434,6 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
-
-    // ---------------------------------------------------------------
-    // Webhook handler: accepted webhook records attempt
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_accepted_webhook_records_attempt_in_tracker() {
@@ -6739,10 +6457,6 @@ mod tests {
         // After acceptance, attempt should be recorded
         assert!(tracker.has_attempted("test", "1").unwrap());
     }
-
-    // ---------------------------------------------------------------
-    // handle_github_webhook: with non-JSON body variants
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_handle_github_webhook_empty_body() {
@@ -6776,10 +6490,6 @@ mod tests {
         assert!(response["error"].as_str().unwrap().contains("Invalid JSON"));
     }
 
-    // ---------------------------------------------------------------
-    // Webhook handler: JSON array body (not an object)
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_json_array_body() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -6801,10 +6511,6 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
     }
 
-    // ---------------------------------------------------------------
-    // Router: webhook with various content types
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_webhook_no_content_type_header() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -6824,10 +6530,6 @@ mod tests {
         // Axum webhook handler doesn't require content-type
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
-
-    // ---------------------------------------------------------------
-    // Webhook handler: concurrent processing of different sources
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_concurrent_webhook_different_sources_both_accepted() {
@@ -6858,10 +6560,6 @@ mod tests {
         assert_eq!(status2, StatusCode::ACCEPTED);
     }
 
-    // ---------------------------------------------------------------
-    // Processing set: verify cleanup happens after key insertion
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_processing_set_entry_exists_after_acceptance() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -6884,10 +6582,6 @@ mod tests {
         assert!(processing.contains_key("test:1"));
         assert_eq!(processing.len(), 1);
     }
-
-    // ---------------------------------------------------------------
-    // Config preservation through WebhookServer construction
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_webhook_server_config_claude_timeout() {
@@ -6929,10 +6623,6 @@ mod tests {
         assert_eq!(server.config.max_concurrent, 10);
     }
 
-    // ---------------------------------------------------------------
-    // Activity log entry creation patterns
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_activity_log_entry_webhook_received_format() {
         let source_name = "linear";
@@ -6963,10 +6653,6 @@ mod tests {
         assert!(activity.message.contains("sentry"));
     }
 
-    // ---------------------------------------------------------------
-    // make_app_state_for_learning helper with custom tracker data
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_enhance_prompt_with_learning_large_base_prompt() {
         let learning = LearningConfig {
@@ -6982,10 +6668,6 @@ mod tests {
         let result = enhance_prompt_with_learning(&state, &base, &issue, Some("my-repo"));
         assert!(result.contains(&base));
     }
-
-    // ---------------------------------------------------------------
-    // Router integration: suppression via full router
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_router_webhook_suppressed_oneshot() {
@@ -7045,10 +6727,6 @@ mod tests {
         assert_eq!(json["status"], "suppressed");
     }
 
-    // ---------------------------------------------------------------
-    // Router: duplicate delivery via full router
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_webhook_duplicate_delivery_oneshot() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -7082,10 +6760,6 @@ mod tests {
             .contains("Duplicate delivery"));
     }
 
-    // ---------------------------------------------------------------
-    // Router: path traversal issue ID via full router
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_webhook_path_traversal_id_oneshot() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -7107,10 +6781,6 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["error"].as_str().unwrap().contains("Invalid issue ID"));
     }
-
-    // ---------------------------------------------------------------
-    // Webhook handler: issue with metadata labels
-    // ---------------------------------------------------------------
 
     /// Mock handler that sets labels on the issue
     struct LabeledIssueHandler;
@@ -7165,10 +6835,6 @@ mod tests {
         assert_eq!(response["issue"], "LAB-1");
     }
 
-    // ---------------------------------------------------------------
-    // Webhook handler: issue with assignee metadata and user registry
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_accepted_with_sqlite_tracker() {
         let mut handlers = WebhookHandlerRegistry::new();
@@ -7187,10 +6853,6 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(response["status"], "accepted");
     }
-
-    // ---------------------------------------------------------------
-    // Health handler: processing entries reflect count accurately
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_health_handler_processing_count_matches_entries() {
@@ -7227,10 +6889,6 @@ mod tests {
         let Json(response) = health_handler(State(state)).await;
         assert_eq!(response["processing_count"], 7);
     }
-
-    // ---------------------------------------------------------------
-    // record_error_pattern: verify pattern storage
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_record_error_pattern_stores_source_and_issue() {
@@ -7273,10 +6931,6 @@ mod tests {
             "Compilation failed: undefined reference",
         );
     }
-
-    // ---------------------------------------------------------------
-    // WebhookServer: port defaults from config
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_webhook_server_default_port() {
@@ -7337,10 +6991,6 @@ mod tests {
         assert_eq!(server.port, 80);
     }
 
-    // ---------------------------------------------------------------
-    // Router: PATCH method returns 405
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_router_patch_on_webhook_returns_method_not_allowed() {
         let handlers = WebhookHandlerRegistry::new();
@@ -7375,10 +7025,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    // ---------------------------------------------------------------
-    // Webhook handler: unicode in source name
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_handler_nonexistent_source_with_special_chars() {
         let handlers = WebhookHandlerRegistry::new();
@@ -7399,10 +7045,6 @@ mod tests {
             .unwrap()
             .contains("Unknown source"));
     }
-
-    // ---------------------------------------------------------------
-    // Additional named coverage tests for truncate_error_for_activity
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_truncate_error_for_activity_short() {
@@ -7445,10 +7087,6 @@ mod tests {
         assert_eq!(result, "");
     }
 
-    // ---------------------------------------------------------------
-    // Additional named coverage test for record_error_pattern
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_record_error_pattern() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -7479,10 +7117,6 @@ mod tests {
         record_error_pattern(&state, "sentry", "SENTRY-200", "");
         record_error_pattern(&state, "jira", "JIRA-300", "a]b[c{d}e");
     }
-
-    // ---------------------------------------------------------------
-    // Additional named coverage tests for enhance_prompt_with_learning
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_enhance_prompt_with_learning_no_repo() {
@@ -7525,10 +7159,6 @@ mod tests {
         // In-memory tracker has no data, so prompt should be unchanged
         assert_eq!(result, base);
     }
-
-    // ================================================================
-    // set_code_search_service tests
-    // ================================================================
 
     #[test]
     fn test_webhook_server_set_code_search_service_none() {
@@ -7598,10 +7228,6 @@ mod tests {
         assert!(server.code_search_service.is_none());
     }
 
-    // ================================================================
-    // enhance_prompt_with_learning: cross-repo correlation tests
-    // ================================================================
-
     #[test]
     fn test_enhance_prompt_cross_repo_correlation_enabled_no_data() {
         let learning = LearningConfig {
@@ -7650,10 +7276,6 @@ mod tests {
         // In-memory tracker has no data for any system, so prompt should be unchanged
         assert_eq!(result, base);
     }
-
-    // ================================================================
-    // AppState code_search_service field tests
-    // ================================================================
 
     #[test]
     fn test_app_state_code_search_service_none_in_test_config() {

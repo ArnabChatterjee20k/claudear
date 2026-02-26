@@ -434,6 +434,11 @@ pub(crate) fn build_completed_message(issue: &Issue, mention: Option<String>) ->
     let url = truncate_string(&issue.url, MAX_URL_LENGTH);
     let source = truncate_string(&issue.source, MAX_SOURCE_LENGTH);
 
+    let reason = issue
+        .get_metadata::<String>("completion_reason")
+        .unwrap_or_else(|| "Claude completed but no PR URL was captured".to_string());
+    let reason_display = truncate_string(&reason, 1000);
+
     DiscordMessage {
         content: mention.map(|m| m.to_string()),
         embeds: Some(vec![DiscordEmbed {
@@ -448,8 +453,8 @@ pub(crate) fn build_completed_message(issue: &Issue, mention: Option<String>) ->
                     inline: Some(true),
                 },
                 DiscordField {
-                    name: "Note".to_string(),
-                    value: "Claude completed but no PR URL was captured".to_string(),
+                    name: "Reason".to_string(),
+                    value: reason_display,
                     inline: Some(false),
                 },
             ]),
@@ -2570,7 +2575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_notify_completed_has_note_field() {
+    async fn test_notify_completed_has_reason_field() {
         let mock = MockDiscordWebhookClient::success();
         let notifier = DiscordNotifier::with_http_client(enabled_config(), mock);
         let issue = Issue::new("1", "P-1", "Test", "https://example.com", "linear");
@@ -2579,8 +2584,8 @@ mod tests {
 
         let (_, body) = notifier.http.get_last_call().unwrap();
         let fields = body["embeds"][0]["fields"].as_array().unwrap();
-        let note_field = fields.iter().find(|f| f["name"] == "Note").unwrap();
-        assert!(note_field["value"]
+        let reason_field = fields.iter().find(|f| f["name"] == "Reason").unwrap();
+        assert!(reason_field["value"]
             .as_str()
             .unwrap()
             .contains("no PR URL was captured"));
@@ -3593,7 +3598,7 @@ mod tests {
         let fields = embed.fields.as_ref().unwrap();
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name, "Source");
-        assert_eq!(fields[1].name, "Note");
+        assert_eq!(fields[1].name, "Reason");
         assert!(fields[1].value.contains("no PR URL was captured"));
     }
 
