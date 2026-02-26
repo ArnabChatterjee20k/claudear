@@ -91,7 +91,9 @@ pub struct EmbeddingClient {
 impl EmbeddingClient {
     /// Create a new embedding client with a pool of model instances.
     ///
-    /// The first model load may download weights; subsequent loads use cache.
+    /// The first model is loaded and its actual memory footprint is measured
+    /// via the drop in available system memory.  The pool size is then capped
+    /// so that total model memory stays within 50% of available RAM.
     pub fn new(config: EmbeddingConfig) -> Result<Self> {
         let dimension = match config.model {
             EmbeddingModel::NomicEmbedTextV15 => 768,
@@ -104,10 +106,55 @@ impl EmbeddingClient {
         };
 
         let model_name = format!("{:?}", config.model);
-        let pool_size = config.pool_size.max(1);
+        let desired_pool_size = config.pool_size.max(1);
 
+        // --- Load first instance and measure its memory footprint -----------
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let mem_before = sys.available_memory();
+
+        let first_model = {
+            let mut init_options = InitOptions::new(config.model.clone())
+                .with_show_download_progress(config.show_download_progress);
+            if let Some(ref cache_dir) = config.cache_dir {
+                init_options = init_options.with_cache_dir(cache_dir.into());
+            }
+            TextEmbedding::try_new(init_options).map_err(|e| {
+                Error::Other(format!("Failed to initialize embedding model: {}", e))
+            })?
+        };
+
+        sys.refresh_memory();
+        let mem_after = sys.available_memory();
+        let per_instance_bytes = mem_before.saturating_sub(mem_after);
+
+        // --- Cap pool size to 50% of available RAM --------------------------
+        let pool_size = if per_instance_bytes > 0 {
+            // Budget: 50% of the memory that was available *before* we loaded
+            // the first instance (so the first instance counts against it).
+            let budget = mem_before / 2;
+            let max_instances = (budget / per_instance_bytes).max(1) as usize;
+            let capped = desired_pool_size.min(max_instances);
+            tracing::info!(
+                per_instance_mb = per_instance_bytes / (1024 * 1024),
+                available_mb = mem_before / (1024 * 1024),
+                budget_mb = budget / (1024 * 1024),
+                desired = desired_pool_size,
+                capped = capped,
+                "Measured ONNX model memory footprint"
+            );
+            capped
+        } else {
+            // Measurement was inconclusive (memory increased or stayed flat,
+            // e.g. due to page cache reclamation) — fall back to desired size.
+            desired_pool_size
+        };
+
+        // --- Load remaining instances ---------------------------------------
         let mut pool = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
+        pool.push(Arc::new(Mutex::new(first_model)));
+
+        for _ in 1..pool_size {
             let mut init_options = InitOptions::new(config.model.clone())
                 .with_show_download_progress(config.show_download_progress);
 
@@ -144,7 +191,7 @@ impl EmbeddingClient {
 
     /// Compute sub-batch size based on available system memory.
     ///
-    /// Uses 66% of available RAM as a budget.  Falls back to 32 if sysinfo
+    /// Uses 50% of available RAM as a budget.  Falls back to 32 if sysinfo
     /// reports 0.  Respects `EMBEDDING_SUB_BATCH` env var for manual override.
     fn compute_sub_batch(dimension: usize) -> usize {
         if let Some(val) = std::env::var("EMBEDDING_SUB_BATCH")
@@ -165,7 +212,7 @@ impl EmbeddingClient {
 
         // Conservative per-text memory estimate for ONNX attention tensors.
         let mb_per_text: u64 = if dimension >= 768 { 10 } else { 5 };
-        let budget_mb = available_mb * 2 / 3;
+        let budget_mb = available_mb / 2;
         (budget_mb / mb_per_text).clamp(4, 256) as usize
     }
 
