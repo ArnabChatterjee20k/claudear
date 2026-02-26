@@ -1242,16 +1242,14 @@ mod tests {
 
     #[test]
     fn test_build_code_search_query_sentry_basic() {
-        let issue =
-            crate::types::Issue::new("1", "SENTRY-1", "TypeError", "url", "sentry");
+        let issue = crate::types::Issue::new("1", "SENTRY-1", "TypeError", "url", "sentry");
         let query = super::build_code_search_query(&issue);
         assert_eq!(query, "TypeError");
     }
 
     #[test]
     fn test_build_code_search_query_sentry_with_all_metadata() {
-        let mut issue =
-            crate::types::Issue::new("1", "SENTRY-1", "TypeError", "url", "sentry");
+        let mut issue = crate::types::Issue::new("1", "SENTRY-1", "TypeError", "url", "sentry");
         issue.description = Some("Cannot read property 'x'".to_string());
         issue.set_metadata("error_type", "TypeError");
         issue.set_metadata("error_value", "Cannot read property 'x' of undefined");
@@ -1287,8 +1285,7 @@ mod tests {
 
     #[test]
     fn test_build_code_search_query_sentry_empty_culprit_excluded() {
-        let mut issue =
-            crate::types::Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        let mut issue = crate::types::Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
         issue.set_metadata("culprit", "");
 
         let query = super::build_code_search_query(&issue);
@@ -1298,8 +1295,7 @@ mod tests {
 
     #[test]
     fn test_build_code_search_query_sentry_with_description_no_metadata() {
-        let mut issue =
-            crate::types::Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        let mut issue = crate::types::Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
         issue.description = Some("Something went wrong".to_string());
 
         let query = super::build_code_search_query(&issue);

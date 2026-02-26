@@ -714,10 +714,9 @@ async fn build_watcher_deps(
     // Code search service for enriching issues with relevant code context
     let code_search_service = if config.code_index.enabled {
         match EmbeddingClient::new(EmbeddingConfig::default()) {
-            Ok(emb) => Some(Arc::new(claudear::repo::code_index::CodeSearchService::new(
-                tracker.clone(),
-                Arc::new(emb),
-            ))),
+            Ok(emb) => Some(Arc::new(
+                claudear::repo::code_index::CodeSearchService::new(tracker.clone(), Arc::new(emb)),
+            )),
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to create embedding client for code search");
                 None
@@ -2946,14 +2945,14 @@ async fn async_main() -> anyhow::Result<()> {
         let issue_embedding_service = build_issue_embedding_service(&tracker);
 
         let code_search_service = if config.code_index.enabled {
-            EmbeddingClient::new(EmbeddingConfig::default()).ok().map(
-                |emb| {
+            EmbeddingClient::new(EmbeddingConfig::default())
+                .ok()
+                .map(|emb| {
                     Arc::new(claudear::repo::code_index::CodeSearchService::new(
                         tracker.clone(),
                         Arc::new(emb),
                     ))
-                },
-            )
+                })
         } else {
             None
         };
@@ -3261,14 +3260,14 @@ async fn async_main() -> anyhow::Result<()> {
             let issue_embedding_service = build_issue_embedding_service(&tracker);
 
             let code_search_service = if config.code_index.enabled {
-                EmbeddingClient::new(EmbeddingConfig::default()).ok().map(
-                    |emb| {
+                EmbeddingClient::new(EmbeddingConfig::default())
+                    .ok()
+                    .map(|emb| {
                         Arc::new(claudear::repo::code_index::CodeSearchService::new(
                             tracker.clone(),
                             Arc::new(emb),
                         ))
-                    },
-                )
+                    })
             } else {
                 None
             };

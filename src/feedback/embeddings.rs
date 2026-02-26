@@ -119,9 +119,8 @@ impl EmbeddingClient {
             if let Some(ref cache_dir) = config.cache_dir {
                 init_options = init_options.with_cache_dir(cache_dir.into());
             }
-            TextEmbedding::try_new(init_options).map_err(|e| {
-                Error::Other(format!("Failed to initialize embedding model: {}", e))
-            })?
+            TextEmbedding::try_new(init_options)
+                .map_err(|e| Error::Other(format!("Failed to initialize embedding model: {}", e)))?
         };
 
         sys.refresh_memory();
