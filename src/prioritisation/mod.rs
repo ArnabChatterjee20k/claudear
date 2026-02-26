@@ -2443,10 +2443,6 @@ mod tests {
         assert!(result[0].match_result.matches);
     }
 
-    // ========================================================================
-    // Additional comprehensive tests (50+)
-    // ========================================================================
-
     // --- store_clusters helper function tests ---
 
     #[test]

@@ -112,11 +112,8 @@ pub use storage::{is_vectorlite_available, try_load_vectorlite, SqliteTracker};
 pub use types::*;
 pub use users::{ResolvedUser, UserRegistry};
 
-// ---------------------------------------------------------------------------
 // Composable startup: lets alternative binaries (e.g. SaaS) bring their own
 // storage backend while reusing all watcher / webhook / API logic.
-// ---------------------------------------------------------------------------
-
 use std::sync::Arc;
 
 /// Shared state assembled during startup, passed to `run_daemon` / `run_webhook_server`.

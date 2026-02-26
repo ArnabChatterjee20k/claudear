@@ -340,10 +340,6 @@ random text"#;
         assert_eq!(snap.skipped, 0);
     }
 
-    // -------------------------------------------------------
-    // parse_clippy: additional coverage
-    // -------------------------------------------------------
-
     #[test]
     fn test_parse_clippy_empty_input() {
         let snap = parse_clippy("", "");
@@ -500,10 +496,6 @@ random text"#;
         assert_eq!(snap.diagnostics.len(), 2);
     }
 
-    // -------------------------------------------------------
-    // parse_fmt: additional coverage
-    // -------------------------------------------------------
-
     #[test]
     fn test_parse_fmt_empty_input() {
         let snap = parse_fmt("", "");
@@ -581,10 +573,6 @@ random text"#;
         assert_eq!(snap.diagnostics[0].file, "src/main.rs");
     }
 
-    // -------------------------------------------------------
-    // parse_coverage: additional coverage
-    // -------------------------------------------------------
-
     #[test]
     fn test_parse_coverage_empty_input() {
         let snap = parse_coverage("", "");
@@ -648,10 +636,6 @@ random text"#;
         // "percent" key is missing, so line_coverage_pct should be None
         assert!(snap.line_coverage_pct.is_none());
     }
-
-    // -------------------------------------------------------
-    // extract_span: additional coverage
-    // -------------------------------------------------------
 
     #[test]
     fn test_extract_span_empty_spans_array() {

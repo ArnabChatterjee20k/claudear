@@ -1559,10 +1559,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ========================================================================
-    // Capturing mock for verifying request payloads
-    // ========================================================================
-
     /// Shared state for the capturing mock, held via Arc so tests can
     /// inspect captured requests after passing the mock to the manager.
     struct CapturedRequests {
@@ -1696,10 +1692,6 @@ mod tests {
         let client = DiscordClient::with_http_client("token", mock).unwrap();
         ThreadManager::with_client(client, "channel123", user_id)
     }
-
-    // ========================================================================
-    // Thread creation - content verification
-    // ========================================================================
 
     #[tokio::test]
     async fn test_create_pr_thread_name_format() {
@@ -1900,10 +1892,6 @@ mod tests {
 
         assert!(result.is_err());
     }
-
-    // ========================================================================
-    // Review notification - content verification
-    // ========================================================================
 
     #[tokio::test]
     async fn test_review_submitted_approved_embed_color() {
@@ -2170,10 +2158,6 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // Review comment - content verification
-    // ========================================================================
-
     #[tokio::test]
     async fn test_review_comment_with_file_path_embed() {
         let captured = CapturedRequests::new();
@@ -2268,10 +2252,6 @@ mod tests {
         assert!(description.ends_with("..."));
     }
 
-    // ========================================================================
-    // Agent started - content verification
-    // ========================================================================
-
     #[tokio::test]
     async fn test_agent_started_embed_content() {
         let captured = CapturedRequests::new();
@@ -2327,10 +2307,6 @@ mod tests {
         let content = body["content"].as_str().unwrap();
         assert!(content.starts_with("<@user789>"));
     }
-
-    // ========================================================================
-    // Agent completed - content verification
-    // ========================================================================
 
     #[tokio::test]
     async fn test_agent_completed_with_commit_url_embed() {
@@ -2422,10 +2398,6 @@ mod tests {
         assert_eq!(content, "<@user999> Agent completed review feedback");
     }
 
-    // ========================================================================
-    // Agent failed - content verification
-    // ========================================================================
-
     #[tokio::test]
     async fn test_agent_failed_embed_content() {
         let captured = CapturedRequests::new();
@@ -2508,10 +2480,6 @@ mod tests {
         assert!(content.starts_with("<@user111>"));
         assert!(content.contains("Agent failed"));
     }
-
-    // ========================================================================
-    // PR merged - content verification
-    // ========================================================================
 
     #[tokio::test]
     async fn test_pr_merged_embed_content() {
@@ -2630,10 +2598,6 @@ mod tests {
         assert_eq!(content, "<@user456> PR merged!");
     }
 
-    // ========================================================================
-    // PR closed - content verification
-    // ========================================================================
-
     #[tokio::test]
     async fn test_pr_closed_embed_content() {
         let captured = CapturedRequests::new();
@@ -2743,10 +2707,6 @@ mod tests {
         assert_eq!(content, "<@user123> PR closed without merging");
     }
 
-    // ========================================================================
-    // send_to_thread - content verification
-    // ========================================================================
-
     #[tokio::test]
     async fn test_send_to_thread_sends_correct_content() {
         let captured = CapturedRequests::new();
@@ -2787,10 +2747,6 @@ mod tests {
         assert!(err.contains("https://unknown/pr/999"));
     }
 
-    // ========================================================================
-    // user_mention() edge cases
-    // ========================================================================
-
     #[test]
     fn test_user_mention_with_numeric_id() {
         let mock = MockDiscordClient::new();
@@ -2818,10 +2774,6 @@ mod tests {
         assert!(mention.ends_with(">"));
         assert_eq!(mention, "<@12345>");
     }
-
-    // ========================================================================
-    // Thread state tracking
-    // ========================================================================
 
     #[tokio::test]
     async fn test_load_threads_overwrites_existing() {
@@ -2956,10 +2908,6 @@ mod tests {
         assert_eq!(active[0].pr_url, "https://pr/1");
     }
 
-    // ========================================================================
-    // Edge cases - unicode content
-    // ========================================================================
-
     #[tokio::test]
     async fn test_review_comment_with_unicode_content() {
         let captured = CapturedRequests::new();
@@ -3039,10 +2987,6 @@ mod tests {
         assert!(result.is_ok()); // Should not panic on char boundary
     }
 
-    // ========================================================================
-    // Edge cases - empty strings
-    // ========================================================================
-
     #[tokio::test]
     async fn test_agent_started_empty_description() {
         let captured = CapturedRequests::new();
@@ -3116,10 +3060,6 @@ mod tests {
             .await;
         assert!(result.is_ok());
     }
-
-    // ========================================================================
-    // Edge cases - various error scenarios
-    // ========================================================================
 
     #[tokio::test]
     async fn test_create_pr_thread_thread_creation_api_rate_limit() {
@@ -3203,10 +3143,6 @@ mod tests {
         assert!(posts[1].0.contains("thread-2"));
     }
 
-    // ========================================================================
-    // Exact color constant validation
-    // ========================================================================
-
     #[test]
     fn test_color_constants_are_valid_hex_colors() {
         // Discord colors must be in range 0x000000..=0xFFFFFF
@@ -3236,10 +3172,6 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // with_client constructor
-    // ========================================================================
-
     #[test]
     fn test_with_client_no_user_id() {
         let mock = MockDiscordClient::new();
@@ -3260,10 +3192,6 @@ mod tests {
         assert_eq!(manager.channel_id, "my-channel");
         assert_eq!(manager.user_id, Some("uid".to_string()));
     }
-
-    // ========================================================================
-    // Thread lifecycle: create, notify, merge/close
-    // ========================================================================
 
     #[tokio::test]
     async fn test_full_lifecycle_create_notify_merge() {
@@ -3374,10 +3302,6 @@ mod tests {
         assert!(!final_state.is_active);
     }
 
-    // ========================================================================
-    // Concurrent access (basic test)
-    // ========================================================================
-
     #[tokio::test]
     async fn test_concurrent_thread_state_reads() {
         let manager = ThreadManager::new("token", "channel", None).unwrap();
@@ -3398,10 +3322,6 @@ mod tests {
         assert!(r2.is_some());
         assert_eq!(r3.len(), 2);
     }
-
-    // ========================================================================
-    // Embed footer and timestamp verification
-    // ========================================================================
 
     #[tokio::test]
     async fn test_all_notification_embeds_have_claudear_footer() {
@@ -3453,10 +3373,6 @@ mod tests {
             assert!(timestamp.is_some(), "Post {} should have a timestamp", i);
         }
     }
-
-    // ========================================================================
-    // Thread name format edge cases
-    // ========================================================================
 
     #[tokio::test]
     async fn test_create_pr_thread_name_with_special_chars_in_issue() {
@@ -3515,10 +3431,6 @@ mod tests {
         let name = body["name"].as_str().unwrap();
         assert_eq!(name, "PR #99999: TEST-123 (linear)");
     }
-
-    // ========================================================================
-    // Verify issue fields propagate to embeds
-    // ========================================================================
 
     #[tokio::test]
     async fn test_create_pr_thread_propagates_issue_url_to_field() {
@@ -3582,10 +3494,6 @@ mod tests {
         assert_eq!(priority_field["value"].as_str().unwrap(), "critical");
     }
 
-    // ========================================================================
-    // Verify thread uses correct channel for API calls
-    // ========================================================================
-
     #[tokio::test]
     async fn test_thread_creation_uses_configured_channel() {
         let captured = CapturedRequests::new();
@@ -3612,10 +3520,6 @@ mod tests {
         let posts = captured.get_captured_posts();
         assert!(posts[0].0.contains("my-custom-channel/threads"));
     }
-
-    // ========================================================================
-    // Notification sends to correct thread ID
-    // ========================================================================
 
     #[tokio::test]
     async fn test_notifications_target_correct_thread_id() {
@@ -3646,10 +3550,6 @@ mod tests {
         assert!(posts[0].0.contains("specific-thread-id/messages"));
     }
 
-    // ========================================================================
-    // Review comment with empty file path
-    // ========================================================================
-
     #[tokio::test]
     async fn test_review_comment_with_empty_file_path() {
         let captured = CapturedRequests::new();
@@ -3675,10 +3575,6 @@ mod tests {
         assert_eq!(fields.len(), 2); // "By" + "File"
         assert_eq!(fields[1]["value"].as_str().unwrap(), "``");
     }
-
-    // ========================================================================
-    // Exactly 1000 char body (boundary test)
-    // ========================================================================
 
     #[tokio::test]
     async fn test_review_submitted_body_exactly_1000_chars_no_truncation() {
@@ -3784,12 +3680,9 @@ mod tests {
         assert!(!description.ends_with("..."));
     }
 
-    // ========================================================================
     // DiscordClient.http is pub(crate)-accessible for CapturingMockClient
     // via ThreadManager.client field visibility
     // Verify the thread types in create_thread call
-    // ========================================================================
-
     #[tokio::test]
     async fn test_create_pr_thread_uses_public_thread_type() {
         let captured = CapturedRequests::new();

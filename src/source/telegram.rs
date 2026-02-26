@@ -14,10 +14,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-// ---------------------------------------------------------------------------
-// Telegram Bot API response types
-// ---------------------------------------------------------------------------
-
 /// Top-level response envelope from the Telegram Bot API.
 #[derive(Debug, Deserialize)]
 struct TelegramResponse {
@@ -81,10 +77,6 @@ struct SendMessageResponse {
     #[serde(default)]
     result: Option<TelegramMessage>,
 }
-
-// ---------------------------------------------------------------------------
-// TelegramSource
-// ---------------------------------------------------------------------------
 
 /// Telegram chat polling source that converts messages into issues.
 pub struct TelegramSource {
@@ -405,10 +397,6 @@ impl IssueSource for TelegramSource {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,10 +436,6 @@ mod tests {
             message: Some(message),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Deserialization tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_deserialize_telegram_response_ok() {
@@ -534,10 +518,6 @@ mod tests {
         assert_eq!(resp.result.unwrap().message_id, 77);
     }
 
-    // -----------------------------------------------------------------------
-    // extract_title tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_extract_title_short() {
         assert_eq!(TelegramSource::extract_title("Short title"), "Short title");
@@ -564,10 +544,6 @@ mod tests {
         assert_eq!(TelegramSource::extract_title(""), "");
     }
 
-    // -----------------------------------------------------------------------
-    // message_url tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_message_url_supergroup() {
         let url = TelegramSource::message_url(-1001234567890, 42);
@@ -586,10 +562,6 @@ mod tests {
         let url = TelegramSource::message_url(-987654, 10);
         assert_eq!(url, "");
     }
-
-    // -----------------------------------------------------------------------
-    // message_to_issue tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_message_to_issue_basic() {
@@ -654,10 +626,6 @@ mod tests {
         assert_eq!(issue.description.as_deref(), Some(""));
     }
 
-    // -----------------------------------------------------------------------
-    // listen_chat_id tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_listen_chat_id_fallback() {
         let source = TelegramSource::new(make_config());
@@ -681,20 +649,12 @@ mod tests {
         assert!(source.listen_chat_id().is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // name / display_name tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_name_and_display_name() {
         let source = TelegramSource::new(make_config());
         assert_eq!(source.name(), "telegram");
         assert_eq!(source.display_name(), "Telegram Messages");
     }
-
-    // -----------------------------------------------------------------------
-    // matches_criteria tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_matches_criteria_always() {
@@ -704,10 +664,6 @@ mod tests {
         assert!(result.matches);
         assert_eq!(result.reason, "telegram_message");
     }
-
-    // -----------------------------------------------------------------------
-    // build_issue_context tests
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_build_issue_context_full() {
@@ -741,10 +697,6 @@ mod tests {
         assert!(!context.contains("URL:"));
     }
 
-    // -----------------------------------------------------------------------
-    // get_issue tests
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_get_issue_from_cache() {
         let source = TelegramSource::new(make_config());
@@ -767,10 +719,6 @@ mod tests {
         assert!(err.to_string().contains("telegram"));
         assert!(err.to_string().contains("999"));
     }
-
-    // -----------------------------------------------------------------------
-    // Filtering logic tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_bot_messages_filtered() {
@@ -848,10 +796,6 @@ mod tests {
         assert!(matches_chat(&msg));
     }
 
-    // -----------------------------------------------------------------------
-    // Seed / cursor tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_seed_behavior_initial_state() {
         let source = TelegramSource::new(make_config());
@@ -884,10 +828,6 @@ mod tests {
         assert_eq!(cache["1"].text.as_deref(), Some("second"));
     }
 
-    // -----------------------------------------------------------------------
-    // api_url tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_api_url_success() {
         let source = TelegramSource::new(make_config());
@@ -906,10 +846,6 @@ mod tests {
         let result = source.api_url("getUpdates");
         assert!(result.is_err());
     }
-
-    // -----------------------------------------------------------------------
-    // create_issue error paths (no network)
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_create_issue_no_chat_id() {

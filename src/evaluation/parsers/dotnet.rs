@@ -323,10 +323,6 @@ mod tests {
         assert_eq!(snap.errors, 0);
     }
 
-    // ---------------------------------------------------------------
-    // parse_analysis (MSBuild): additional coverage
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_parse_analysis_empty_input() {
         let snap = parse_analysis("", "");
@@ -406,10 +402,6 @@ mod tests {
         assert_eq!(d.message, "The variable 'x' is declared but never used");
     }
 
-    // ---------------------------------------------------------------
-    // parse_lint (dotnet format): additional coverage
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_parse_lint_empty_input() {
         let snap = parse_lint("", "");
@@ -477,10 +469,6 @@ mod tests {
         assert_eq!(snap.warnings, 0);
         assert!(snap.diagnostics.is_empty());
     }
-
-    // ---------------------------------------------------------------
-    // parse_coverage (Cobertura XML): additional coverage
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_parse_coverage_empty_input() {
@@ -551,10 +539,6 @@ mod tests {
         assert!((snap.branch_coverage_pct.unwrap() - 100.0).abs() < 0.01);
     }
 
-    // ---------------------------------------------------------------
-    // extract_dotnet_count: helper function tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_extract_dotnet_count_normal() {
         let line = "Passed!  - Failed:     0, Passed:    42, Skipped:     3, Total:    45";
@@ -588,10 +572,6 @@ mod tests {
             Some(10)
         );
     }
-
-    // ---------------------------------------------------------------
-    // parse_msbuild_diagnostic: helper function tests
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_parse_msbuild_diagnostic_error_full_format() {
@@ -672,10 +652,6 @@ mod tests {
         assert_eq!(diag.line, Some(42));
         assert_eq!(diag.column, None);
     }
-
-    // ---------------------------------------------------------------
-    // extract_xml_attr_val: helper function tests
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_extract_xml_attr_val_normal() {

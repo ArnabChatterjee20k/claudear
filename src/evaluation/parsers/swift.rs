@@ -352,10 +352,6 @@ Executed 2 tests, with 1 failures (0 unexpected) in 0.02 seconds"#;
         assert_eq!(snap.failed, 1);
     }
 
-    // ---------------------------------------------------------------
-    // parse_analysis (SwiftLint JSON): additional coverage
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_parse_analysis_empty_json_array() {
         let snap = parse_analysis("[]", "");
@@ -443,10 +439,6 @@ Executed 2 tests, with 1 failures (0 unexpected) in 0.02 seconds"#;
         assert!(snap.diagnostics.is_empty());
     }
 
-    // ---------------------------------------------------------------
-    // parse_lint: additional coverage
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_parse_lint_empty_input() {
         let snap = parse_lint("", "");
@@ -530,10 +522,6 @@ D.swift:4:4: warning: w3"#;
         assert_eq!(snap.diagnostics.len(), 1);
         assert_eq!(snap.diagnostics[0].file, "X.swift");
     }
-
-    // ---------------------------------------------------------------
-    // parse_coverage: additional coverage
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_parse_coverage_empty_input() {
@@ -640,10 +628,6 @@ D.swift:4:4: warning: w3"#;
         assert!((snap.line_coverage_pct.unwrap() - 99.0).abs() < 0.01);
     }
 
-    // ---------------------------------------------------------------
-    // extract_number_after: additional coverage
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_extract_number_after_basic() {
         assert_eq!(
@@ -693,10 +677,6 @@ D.swift:4:4: warning: w3"#;
     fn test_extract_number_after_empty_line() {
         assert_eq!(extract_number_after("", "Executed "), None);
     }
-
-    // ---------------------------------------------------------------
-    // extract_percentage: additional coverage
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_extract_percentage_integer() {

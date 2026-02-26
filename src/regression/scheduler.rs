@@ -742,10 +742,6 @@ mod tests {
         assert_eq!(checks.len(), 6);
     }
 
-    // ================================================================
-    // New comprehensive tests below
-    // ================================================================
-
     // --- MockChecker variant that returns errors ---
     struct FailingChecker;
 

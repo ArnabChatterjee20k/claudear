@@ -619,10 +619,6 @@ mod tests {
         assert_eq!(client.api_key, "lin_full_config_key");
     }
 
-    // ========================================================================
-    // Additional comprehensive tests
-    // ========================================================================
-
     // --- API URL constant ---
 
     #[test]

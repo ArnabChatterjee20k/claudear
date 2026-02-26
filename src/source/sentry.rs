@@ -3428,10 +3428,6 @@ mod tests {
         assert!(!context.contains("Stack Trace"));
     }
 
-    // ------------------------------------------------------------------
-    // Tests for extracted standalone functions (tarpaulin-traceable)
-    // ------------------------------------------------------------------
-
     #[test]
     fn test_format_sentry_context_basic() {
         let issue = Issue::new(

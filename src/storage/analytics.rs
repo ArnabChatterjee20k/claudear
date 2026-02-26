@@ -420,10 +420,6 @@ mod tests {
         assert_eq!(summary.success_rate, 0.0);
     }
 
-    // ================================================================
-    // classify_error: priority ordering and ambiguous keyword tests
-    // ================================================================
-
     #[test]
     fn test_classify_error_timeout_beats_test_failure() {
         // "test timeout" contains both "test" and "timeout".
@@ -554,10 +550,6 @@ mod tests {
         assert_eq!(classify_error("conflict detected"), "git_error");
     }
 
-    // ================================================================
-    // compute_error_hash: collision and edge case tests
-    // ================================================================
-
     #[test]
     fn test_compute_error_hash_http_status_codes_differ() {
         // "HTTP 404 Not Found" vs "HTTP 500 Internal Error"
@@ -684,10 +676,6 @@ mod tests {
             "Whitespace-only string should hash the same as empty string"
         );
     }
-
-    // ================================================================
-    // TrendAnalysis::new edge cases
-    // ================================================================
 
     #[test]
     fn test_trend_analysis_both_zero() {
@@ -850,10 +838,6 @@ mod tests {
         assert_eq!(trend.direction, TrendDirection::Down);
     }
 
-    // ================================================================
-    // TimePeriod methods
-    // ================================================================
-
     #[test]
     fn test_time_period_start_time_is_in_the_past() {
         let now = Utc::now();
@@ -901,10 +885,6 @@ mod tests {
         assert_eq!(TimePeriod::Week.duration().num_seconds(), 604800);
         assert_eq!(TimePeriod::Month.duration().num_seconds(), 2592000); // 30 * 86400
     }
-
-    // ================================================================
-    // AnalyticsService with seeded data
-    // ================================================================
 
     #[test]
     fn test_success_rate_with_mixed_attempts() {
@@ -1232,13 +1212,10 @@ mod tests {
         );
     }
 
-    // ================================================================
     // Additional coverage: classify_error nuance, compute_error_hash
     // digit-run collapsing, TrendAnalysis symmetry, TimePeriod
     // ordering, AnalyticsService metrics_by_source, and throughput
     // with specific period.
-    // ================================================================
-
     #[test]
     fn test_classify_error_network_without_connection() {
         assert_eq!(classify_error("network unreachable"), "network_error");

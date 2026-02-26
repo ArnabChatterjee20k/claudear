@@ -688,10 +688,6 @@ impl SqliteTracker {
             "#,
         )?;
 
-        // ============================================================
-        // Continuous Learning Tables
-        // ============================================================
-
         conn.execute_batch(
             r#"
             -- Diff analyses for merged PRs (System 2)
@@ -7497,10 +7493,6 @@ impl SqliteTracker {
     }
 }
 
-// ============================================================
-// Continuous Learning SqliteTracker implementations
-// ============================================================
-
 impl SqliteTracker {
     /// System 1: Update learnings text on a feedback outcome.
     pub fn update_feedback_learnings(&self, outcome_id: i64, learnings: &str) -> Result<()> {
@@ -10888,10 +10880,6 @@ mod tests {
         assert_eq!(success_count, 1);
     }
 
-    // ---------------------------------------------------------------
-    // Activity log operations
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_record_activity_returns_positive_id() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -11085,10 +11073,6 @@ mod tests {
         assert_eq!(activities.len(), 10);
     }
 
-    // ---------------------------------------------------------------
-    // PR review tracking
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_record_pr_review_and_retrieve() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -11156,10 +11140,6 @@ mod tests {
         let reviews = tracker.get_reviews_for_attempt(9999).unwrap();
         assert!(reviews.is_empty());
     }
-
-    // ---------------------------------------------------------------
-    // Embedding storage
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_store_and_retrieve_embedding() {
@@ -11320,10 +11300,6 @@ mod tests {
         assert_eq!(sentry.len(), 1);
     }
 
-    // ---------------------------------------------------------------
-    // Feedback outcomes
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_store_feedback_outcome_with_all_fields() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -11409,10 +11385,6 @@ mod tests {
         let outcomes = tracker.get_feedback_outcomes(None, 100).unwrap();
         assert!(outcomes.is_empty());
     }
-
-    // ---------------------------------------------------------------
-    // Q&A knowledge
-    // ---------------------------------------------------------------
 
     fn make_qa_entry(
         source: &str,
@@ -11626,10 +11598,6 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    // ---------------------------------------------------------------
-    // Experiment tracking
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_save_and_get_active_experiments() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -11700,10 +11668,6 @@ mod tests {
         let active = tracker.get_active_experiments().unwrap();
         assert!(active.is_empty());
     }
-
-    // ---------------------------------------------------------------
-    // Repository storage
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_upsert_and_get_repository() {
@@ -11881,10 +11845,6 @@ mod tests {
         assert_eq!(leaf_entry.unwrap().1, 2);
     }
 
-    // ---------------------------------------------------------------
-    // Execution logging
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_record_and_get_execution() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -11978,10 +11938,6 @@ mod tests {
         assert_eq!(timed_out, 1);
     }
 
-    // ---------------------------------------------------------------
-    // parse_pr_url helper
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_parse_pr_url_github_standard() {
         let result = SqliteTracker::parse_pr_url("https://github.com/owner/repo/pull/42");
@@ -12065,10 +12021,6 @@ mod tests {
             SqliteTracker::parse_pr_url("https://gitlab.com/org/repo/-/merge_requests/999999");
         assert_eq!(result, Some(("org/repo".to_string(), 999999)));
     }
-
-    // ---------------------------------------------------------------
-    // Attempt lifecycle
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_attempt_full_lifecycle_to_merged() {
@@ -12167,10 +12119,6 @@ mod tests {
         assert!(attempt.issue_labels.contains(&"high-priority".to_string()));
     }
 
-    // ---------------------------------------------------------------
-    // Error patterns
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_record_and_get_error_patterns() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -12232,10 +12180,6 @@ mod tests {
         assert!(patterns.is_empty());
     }
 
-    // ---------------------------------------------------------------
-    // Processing metrics
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_record_and_get_metric() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -12294,10 +12238,6 @@ mod tests {
         assert!((filtered[0].metric_value - 2.0).abs() < f64::EPSILON);
     }
 
-    // ---------------------------------------------------------------
-    // Similar issues
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_store_and_find_similar_issues() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -12343,10 +12283,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!((results[0].similarity_score - 0.9).abs() < f64::EPSILON);
     }
-
-    // ---------------------------------------------------------------
-    // Analytics summary and success rate
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_get_success_rate_empty() {
@@ -12397,10 +12333,6 @@ mod tests {
         assert_eq!(summary.total_processed, 0);
         assert!((summary.success_rate - 0.0).abs() < f64::EPSILON);
     }
-
-    // ---------------------------------------------------------------
-    // Pruning
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_prune_old_activities() {
@@ -12458,10 +12390,6 @@ mod tests {
         assert_eq!(deleted, 1);
     }
 
-    // ---------------------------------------------------------------
-    // Channel cursor
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_get_set_channel_cursor() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -12511,10 +12439,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
-    // get_attempt_by_id
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_get_attempt_by_id() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -12537,10 +12461,6 @@ mod tests {
         let result = tracker.get_attempt_by_id(99999).unwrap();
         assert!(result.is_none());
     }
-
-    // ---------------------------------------------------------------
-    // Embedding helper functions
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_embedding_to_blob_and_back() {
@@ -13662,10 +13582,6 @@ mod tests {
         assert!(id > 0);
     }
 
-    // ---------------------------------------------------------------
-    // Repository indexing operations
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_save_indexed_repo() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -13988,10 +13904,6 @@ mod tests {
         assert!(stats.last_indexed_at.is_some());
     }
 
-    // ---------------------------------------------------------------
-    // Direct dependants
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_get_direct_dependants() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -14033,10 +13945,6 @@ mod tests {
         assert_eq!(dependants.len(), 1);
         assert_eq!(dependants[0].downstream, "mid");
     }
-
-    // ---------------------------------------------------------------
-    // Inference tracking
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_record_inference_attempt() {
@@ -14345,10 +14253,6 @@ mod tests {
         assert_eq!(history[0].duration_ms, Some(100));
     }
 
-    // ---------------------------------------------------------------
-    // Webhook delivery deduplication
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_check_and_record_delivery_new() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -14482,10 +14386,6 @@ mod tests {
         assert_eq!(removed, 0);
     }
 
-    // ---------------------------------------------------------------
-    // get_execution_for_attempt (single execution)
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_get_execution_for_attempt_found() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -14550,10 +14450,6 @@ mod tests {
         let result = tracker.get_execution_for_attempt(99999, exec_id).unwrap();
         assert!(result.is_none());
     }
-
-    // ---------------------------------------------------------------
-    // Error patterns
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_record_error_pattern_and_retrieve() {
@@ -14677,10 +14573,6 @@ mod tests {
         assert_eq!(patterns[2].pattern_hash, "low");
     }
 
-    // ---------------------------------------------------------------
-    // Feedback outcome by attempt (happy path)
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_get_feedback_outcome_by_attempt_found() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -14718,10 +14610,6 @@ mod tests {
         assert_eq!(found.learnings, Some("Always validate inputs".to_string()));
         assert_eq!(found.keywords, vec!["login".to_string(), "fix".to_string()]);
     }
-
-    // ---------------------------------------------------------------
-    // Metrics batch recording
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_record_metrics_batch() {
@@ -14787,10 +14675,6 @@ mod tests {
         assert_eq!(throughput.len(), 1);
         assert!((throughput[0].metric_value - 42.0).abs() < f64::EPSILON);
     }
-
-    // ---------------------------------------------------------------
-    // Metric counts since
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_get_metric_counts_since() {
@@ -14876,10 +14760,6 @@ mod tests {
             .unwrap();
         assert!(counts.is_empty());
     }
-
-    // ---------------------------------------------------------------
-    // Metric sums since
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_get_metric_sums_since() {
@@ -14971,10 +14851,6 @@ mod tests {
         let sums = tracker.get_metric_sums_since(&["cost"], since).unwrap();
         assert!((sums.get("cost").copied().unwrap_or(0.0) - 25.0).abs() < f64::EPSILON);
     }
-
-    // ---------------------------------------------------------------
-    // Metric sums by source since
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_get_metric_sums_by_source_since() {
@@ -15105,10 +14981,6 @@ mod tests {
             .unwrap_or(0.0);
         assert!((val - 7.0).abs() < f64::EPSILON);
     }
-
-    // ====================================================================
-    // PR record tests
-    // ====================================================================
 
     fn make_pr_record(pr_url: &str, repo: &str, number: i64) -> crate::types::PrRecord {
         crate::types::PrRecord::new(pr_url, repo, number)
@@ -15332,10 +15204,6 @@ mod tests {
         assert!(fetched.closed_at.is_none());
     }
 
-    // ====================================================================
-    // PR analytics detail tests
-    // ====================================================================
-
     #[test]
     fn test_get_avg_time_to_pr_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -15507,10 +15375,6 @@ mod tests {
         assert!((savings.hours_saved - 0.0).abs() < f64::EPSILON);
     }
 
-    // ====================================================================
-    // list_attempts / count_attempts tests
-    // ====================================================================
-
     #[test]
     fn test_list_attempts_no_filter() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -15655,10 +15519,6 @@ mod tests {
         assert!(result_empty.is_empty());
     }
 
-    // ====================================================================
-    // Cascade attempt tests
-    // ====================================================================
-
     #[test]
     fn test_record_cascade_attempt() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -15739,10 +15599,6 @@ mod tests {
         assert_eq!(updated.error_message.as_deref(), Some("build failed"));
     }
 
-    // ====================================================================
-    // Diagnostic counts tests
-    // ====================================================================
-
     #[test]
     fn test_get_diagnostic_counts_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -15782,10 +15638,6 @@ mod tests {
         assert_eq!(*counts.fix_attempts_by_status.get("failed").unwrap(), 1);
         assert_eq!(counts.recent_fix_attempts.len(), 2);
     }
-
-    // ====================================================================
-    // Content cluster tests
-    // ====================================================================
 
     #[test]
     fn test_store_and_get_content_cluster() {
@@ -15900,10 +15752,6 @@ mod tests {
         assert!(active.is_empty());
     }
 
-    // ====================================================================
-    // Severity score and suppression tests
-    // ====================================================================
-
     #[test]
     fn test_store_severity_score() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -15979,10 +15827,6 @@ mod tests {
             .record_suppression("sentry", "issue-1", "flaky", "reason")
             .unwrap();
     }
-
-    // ====================================================================
-    // Issue listing / counting tests
-    // ====================================================================
 
     #[test]
     fn test_list_issues_no_filter() {
@@ -16154,10 +15998,6 @@ mod tests {
         assert_eq!(tracker.count_issues(Some("other")).unwrap(), 0);
     }
 
-    // ====================================================================
-    // Batch operations tests
-    // ====================================================================
-
     #[test]
     fn test_store_similar_issues_batch() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -16211,10 +16051,6 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ====================================================================
-    // Indexing progress tests
-    // ====================================================================
-
     #[test]
     fn test_indexing_progress_lifecycle() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -16267,10 +16103,6 @@ mod tests {
         assert_eq!(updated.total_repos, 3);
     }
 
-    // ====================================================================
-    // delete_user_sessions test
-    // ====================================================================
-
     #[test]
     fn test_delete_user_sessions() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -16299,10 +16131,6 @@ mod tests {
         let session_user = tracker.get_session_user(&token).unwrap();
         assert!(session_user.is_none());
     }
-
-    // ====================================================================
-    // get_all_regression_watches test
-    // ====================================================================
 
     #[test]
     fn test_get_all_regression_watches() {
@@ -16352,10 +16180,6 @@ mod tests {
         let all = tracker.get_all_regression_watches().unwrap();
         assert!(all.is_empty());
     }
-
-    // ====================================================================
-    // get_active_clusters test
-    // ====================================================================
 
     #[test]
     fn test_get_active_clusters() {
@@ -16407,10 +16231,6 @@ mod tests {
         let linear = tracker.get_active_clusters("linear").unwrap();
         assert!(linear.is_empty());
     }
-
-    // ====================================================================
-    // get_activity_type_counts_since test
-    // ====================================================================
 
     #[test]
     fn test_get_activity_type_counts_since() {
@@ -16468,10 +16288,6 @@ mod tests {
         let counts = tracker.get_activity_type_counts_since(since).unwrap();
         assert!(counts.is_empty());
     }
-
-    // ====================================================================
-    // normalize_signal / complexity_to_hours helper tests
-    // ====================================================================
 
     #[test]
     fn test_normalize_signal_below_min() {
@@ -16531,10 +16347,6 @@ mod tests {
         assert!((complexity_to_hours(0.9) - 8.0).abs() < f64::EPSILON);
         assert!((complexity_to_hours(1.0) - 8.0).abs() < f64::EPSILON);
     }
-
-    // ====================================================================
-    // Code indexing tests
-    // ====================================================================
 
     #[test]
     fn test_get_or_create_repo_id() {
@@ -16939,10 +16751,6 @@ mod tests {
         assert_eq!(keep_count, 1);
     }
 
-    // ====================================================================
-    // get_repo_knowledge / get_review_patterns / get_successful_strategies
-    // ====================================================================
-
     #[test]
     fn test_get_repo_knowledge_all() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -17084,10 +16892,6 @@ mod tests {
         assert!(strategies.is_empty());
     }
 
-    // ====================================================================
-    // update_experiment_stats with time_to_merge
-    // ====================================================================
-
     #[test]
     fn test_update_experiment_stats_with_time_to_merge() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -17159,10 +16963,6 @@ mod tests {
         assert_eq!(updated.success_count, 0);
     }
 
-    // ====================================================================
-    // store_embeddings_batch test
-    // ====================================================================
-
     #[test]
     fn test_store_embeddings_batch() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -17213,10 +17013,6 @@ mod tests {
         tracker.store_embeddings_batch(&[]).unwrap();
     }
 
-    // ====================================================================
-    // get_all_embeddings pagination and source filter
-    // ====================================================================
-
     #[test]
     fn test_get_all_embeddings_no_filter() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -17250,10 +17046,6 @@ mod tests {
         assert_eq!(paged2.len(), 1);
     }
 
-    // ====================================================================
-    // parse_language helper test
-    // ====================================================================
-
     #[test]
     fn test_parse_language_all_known() {
         use crate::repo::code_index::Language;
@@ -17277,10 +17069,6 @@ mod tests {
         use crate::repo::code_index::Language;
         assert_eq!(parse_language("UnknownLang"), Language::Rust);
     }
-
-    // ====================================================================
-    // sync_repo_files test
-    // ====================================================================
 
     #[test]
     fn test_sync_repo_files() {
@@ -17332,10 +17120,6 @@ mod tests {
         assert_eq!(stored.file_count, 0);
     }
 
-    // ====================================================================
-    // list_recent_attempts delegator test
-    // ====================================================================
-
     #[test]
     fn test_list_recent_attempts() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -17348,10 +17132,6 @@ mod tests {
         let recent = tracker.list_recent_attempts(3).unwrap();
         assert_eq!(recent.len(), 3);
     }
-
-    // ====================================================================
-    // get_metrics with time filters test
-    // ====================================================================
 
     #[test]
     fn test_get_metrics_with_name_filter() {
@@ -17404,10 +17184,6 @@ mod tests {
         assert_eq!(all.len(), 1);
     }
 
-    // ====================================================================
-    // store_code_complexity test
-    // ====================================================================
-
     #[test]
     fn test_store_code_complexity_upsert() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -17436,10 +17212,6 @@ mod tests {
             .unwrap();
     }
 
-    // ====================================================================
-    // search_code_chunks edge cases
-    // ====================================================================
-
     #[test]
     fn test_search_code_chunks_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -17456,19 +17228,11 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ====================================================================
-    // save_code_chunk_embeddings empty test
-    // ====================================================================
-
     #[test]
     fn test_save_code_chunk_embeddings_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker.save_code_chunk_embeddings(&[], "test").unwrap();
     }
-
-    // ====================================================================
-    // get_cost_estimate plan_estimate path
-    // ====================================================================
 
     #[test]
     fn test_get_cost_estimate_plan_estimate() {
@@ -17491,10 +17255,6 @@ mod tests {
         assert!(estimate.total_cost > 0.0);
     }
 
-    // ====================================================================
-    // upsert_pr with issue linkage
-    // ====================================================================
-
     #[test]
     fn test_upsert_pr_with_issue_linkage() {
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -17514,10 +17274,6 @@ mod tests {
         assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
         assert_eq!(fetched.issue_id.as_deref(), Some("ISSUE-1"));
     }
-
-    // ====================================================================
-    // upsert_pr COALESCE behavior - existing values preserved when excluded is NULL
-    // ====================================================================
 
     #[test]
     fn test_upsert_pr_coalesce_preserves_existing_values() {

@@ -1056,10 +1056,6 @@ impl ErrorPattern {
     }
 }
 
-// ============================================================
-// Prioritisation types
-// ============================================================
-
 /// Composite severity score produced by the prioritisation engine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SeverityScore {
@@ -1659,10 +1655,6 @@ impl RegressionCheck {
         }
     }
 }
-
-// ============================================================
-// Continuous Learning Types
-// ============================================================
 
 /// Category of file changes in a diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

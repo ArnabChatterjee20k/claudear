@@ -3404,13 +3404,10 @@ mod tests {
         }
     }
 
-    // ================================================================
     // Additional coverage: type serialization, Display impls,
     // ReviewEvent edge cases, PrReviewState JSON, ReviewWatcher
     // state management, comment_is_after_cursor boundary cases,
     // and compare_timestamps with sub-second precision.
-    // ================================================================
-
     #[test]
     fn code_review_serde_round_trip_full() {
         let review = CodeReview {
@@ -3890,14 +3887,11 @@ mod tests {
         assert!(timestamp_at_or_after("", ""));
     }
 
-    // ================================================================
     // Additional coverage: ReviewWatcher constructors, check_for_pr
     // with active/disabled, PrMonitor with_regression_tracking,
     // empty trigger filter, standalone inline comments, cursor
     // advancement for comments, multiple interleaved reviews,
     // comment_is_after_cursor same-timestamp-same-id edge case.
-    // ================================================================
-
     mod review_watcher_extended_tests {
         use crate::error::Result;
         use crate::scm::{
@@ -5157,12 +5151,9 @@ mod tests {
         assert_eq!(cloned.side.as_deref(), Some("LEFT"));
     }
 
-    // ================================================================
     // Additional coverage: record_review_to_db, tracker
     // persistence, check_pr_reviews with sqlite, PrMonitor
     // activity log recording, and ReviewWatcher persistence paths.
-    // ================================================================
-
     mod sqlite_persistence_tests {
         use crate::error::Result;
         use crate::scm::{

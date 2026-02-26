@@ -3177,10 +3177,6 @@ mod tests {
         assert!(result.reason.contains("label"));
     }
 
-    // ------------------------------------------------------------------
-    // Tests for extracted standalone functions (tarpaulin-traceable)
-    // ------------------------------------------------------------------
-
     #[test]
     fn test_format_linear_context_basic() {
         let issue = Issue::new(
@@ -3997,10 +3993,6 @@ mod tests {
         let client = ReqwestLinearClient::default();
         assert!(std::mem::size_of_val(&client) > 0);
     }
-
-    // ------------------------------------------------------------------
-    // Additional coverage: deserialization edge cases and pure functions
-    // ------------------------------------------------------------------
 
     #[test]
     fn test_graphql_response_data_only_no_errors_key() {

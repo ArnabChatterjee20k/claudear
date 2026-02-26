@@ -438,10 +438,6 @@ mod tests {
         assert_eq!(snap.passed, 1);
     }
 
-    // ---------------------------------------------------------------
-    // parse_analysis (ESLint JSON) edge cases
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_parse_analysis_empty_array() {
         let snap = parse_analysis("[]", "");
@@ -659,10 +655,6 @@ mod tests {
         assert!(snap.diagnostics.is_empty());
     }
 
-    // ---------------------------------------------------------------
-    // parse_lint (Prettier) edge cases
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_parse_lint_empty_input() {
         let snap = parse_lint("", "");
@@ -769,10 +761,6 @@ mod tests {
         assert_eq!(snap.warnings, 1);
         assert_eq!(snap.diagnostics[0].file, "src/indented.js");
     }
-
-    // ---------------------------------------------------------------
-    // parse_coverage edge cases
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_parse_coverage_empty_string() {

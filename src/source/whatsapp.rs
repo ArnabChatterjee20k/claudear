@@ -291,10 +291,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // extract_title tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_extract_title_short() {
         assert_eq!(WhatsAppSource::extract_title("Short title"), "Short title");
@@ -328,10 +324,6 @@ mod tests {
         assert_eq!(title.len(), 100);
         assert!(!title.ends_with("..."));
     }
-
-    // ---------------------------------------------------------------
-    // message_to_issue tests
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_message_to_issue_basic() {
@@ -369,10 +361,6 @@ mod tests {
         assert_eq!(issue.short_id, "WA-ab");
     }
 
-    // ---------------------------------------------------------------
-    // push_message / buffer tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_push_message_adds_to_buffer() {
         let source = WhatsAppSource::new(make_config());
@@ -404,10 +392,6 @@ mod tests {
         assert_eq!(buf[0].id, "a");
         assert_eq!(buf[1].id, "b");
     }
-
-    // ---------------------------------------------------------------
-    // fetch_issues tests
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_fetch_issues_empty_buffer() {
@@ -473,10 +457,6 @@ mod tests {
         assert_eq!(batch3[0].id, "2");
     }
 
-    // ---------------------------------------------------------------
-    // matches_criteria tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_matches_criteria_always_matches() {
         let source = WhatsAppSource::new(make_config());
@@ -494,10 +474,6 @@ mod tests {
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
     }
-
-    // ---------------------------------------------------------------
-    // build_issue_context tests
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_build_issue_context_full() {
@@ -534,10 +510,6 @@ mod tests {
         assert!(!context.contains("Author Phone:"));
     }
 
-    // ---------------------------------------------------------------
-    // get_issue tests
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_get_issue_from_cache() {
         let source = WhatsAppSource::new(make_config());
@@ -562,10 +534,6 @@ mod tests {
         assert!(err.to_string().contains("nonexistent"));
     }
 
-    // ---------------------------------------------------------------
-    // name / display_name tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_name() {
         let source = WhatsAppSource::new(make_config());
@@ -577,10 +545,6 @@ mod tests {
         let source = WhatsAppSource::new(make_config());
         assert_eq!(source.display_name(), "WhatsApp Messages");
     }
-
-    // ---------------------------------------------------------------
-    // listen_phone_number_id tests
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_listen_phone_number_id_fallback() {
@@ -605,10 +569,6 @@ mod tests {
         assert_eq!(source.listen_phone_number_id(), None);
     }
 
-    // ---------------------------------------------------------------
-    // Constructor / initial state tests
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_new_empty_buffer() {
         let source = WhatsAppSource::new(make_config());
@@ -620,10 +580,6 @@ mod tests {
         let source = WhatsAppSource::new(make_config());
         assert!(source.cache.read().unwrap().is_empty());
     }
-
-    // ---------------------------------------------------------------
-    // WhatsAppMessage clone / debug tests
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_whatsapp_message_clone() {
@@ -642,10 +598,6 @@ mod tests {
         assert!(debug_str.contains("WhatsAppMessage"));
         assert!(debug_str.contains("hello"));
     }
-
-    // ---------------------------------------------------------------
-    // create_issue error cases (no network)
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_create_issue_no_phone_number_id() {

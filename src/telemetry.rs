@@ -19,10 +19,6 @@ use chrono::{DateTime, Utc};
 use std::path::Path;
 use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
-// Helper macro: pass-through methods with zero instrumentation.
-// ---------------------------------------------------------------------------
-
 macro_rules! delegate {
     (fn $method:ident(&self $(, $arg:ident: $ty:ty)*) -> $ret:ty) => {
         fn $method(&self $(, $arg: $ty)*) -> $ret {
@@ -35,10 +31,6 @@ macro_rules! delegate {
         }
     };
 }
-
-// ===========================================================================
-// InstrumentedSource
-// ===========================================================================
 
 pub struct InstrumentedSource {
     inner: Arc<dyn IssueSource>,
@@ -134,10 +126,6 @@ impl IssueSource for InstrumentedSource {
         }
     }
 }
-
-// ===========================================================================
-// InstrumentedNotifier
-// ===========================================================================
 
 pub struct InstrumentedNotifier {
     inner: Arc<dyn Notifier>,
@@ -301,10 +289,6 @@ impl Notifier for InstrumentedNotifier {
     }
 }
 
-// ===========================================================================
-// InstrumentedScm
-// ===========================================================================
-
 pub struct InstrumentedScm {
     inner: Arc<dyn ScmProvider>,
 }
@@ -446,10 +430,6 @@ impl ScmProvider for InstrumentedScm {
         }
     }
 }
-
-// ===========================================================================
-// InstrumentedRunner
-// ===========================================================================
 
 pub struct InstrumentedRunner {
     inner: Arc<dyn AgentRunner>,

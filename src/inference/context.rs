@@ -795,10 +795,6 @@ mod tests {
             .any(|f| f.contains("router.ts") || f.contains("server.js")));
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Empty and None field handling
-    // ===================================================================
-
     #[test]
     fn test_sentry_all_metadata_none() {
         // Sentry issue with no metadata at all — should not panic
@@ -878,10 +874,6 @@ mod tests {
         assert!(context.raw_text.contains("TitleOnly"));
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Culprit parsing edge cases
-    // ===================================================================
-
     #[test]
     fn test_culprit_with_multiple_in_keywords() {
         // "file in function in extra" — split(" in ") produces 3 parts
@@ -956,10 +948,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: looks_like_path edge cases
-    // ===================================================================
-
     #[test]
     fn test_looks_like_path_backslash() {
         assert!(
@@ -1011,10 +999,6 @@ mod tests {
         // contains('/') is true → short-circuits to true
         assert!(looks_like_path("./src/main.rs"));
     }
-
-    // ===================================================================
-    // Bug-hunting tests: normalize_project_name edge cases
-    // ===================================================================
 
     #[test]
     fn test_normalize_project_name_empty() {
@@ -1071,10 +1055,6 @@ mod tests {
             );
         }
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Special characters and unicode
-    // ===================================================================
 
     #[test]
     fn test_extract_from_text_with_unicode_title() {
@@ -1156,10 +1136,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Deduplication correctness
-    // ===================================================================
-
     #[test]
     fn test_deduplication_preserves_all_unique_items() {
         let mut context = IssueContext::new();
@@ -1222,10 +1198,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: is_empty edge cases
-    // ===================================================================
-
     #[test]
     fn test_is_empty_with_only_repos() {
         let mut context = IssueContext::new();
@@ -1266,10 +1238,6 @@ mod tests {
             "raw_text alone should not make context non-empty"
         );
     }
-
-    // ===================================================================
-    // Bug-hunting tests: from_issue dispatch
-    // ===================================================================
 
     #[test]
     fn test_from_issue_uses_sentry_for_sentry_source() {
@@ -1334,10 +1302,6 @@ mod tests {
         // Empty source should fall through to generic
         assert!(!context.raw_text.is_empty());
     }
-
-    // ===================================================================
-    // Bug-hunting tests: extract_from_text path regex edge cases
-    // ===================================================================
 
     #[test]
     fn test_extract_paths_all_supported_extensions() {
@@ -1461,10 +1425,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Repository reference extraction
-    // ===================================================================
-
     #[test]
     fn test_extract_repo_reference() {
         let mut context = IssueContext::new();
@@ -1499,10 +1459,6 @@ mod tests {
             "app/ paths should be filtered from repos"
         );
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Class and error type extraction
-    // ===================================================================
 
     #[test]
     fn test_extract_class_names_various_suffixes() {
@@ -1569,10 +1525,6 @@ mod tests {
             "lowercase error types should not be matched"
         );
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Stacktrace extraction edge cases
-    // ===================================================================
 
     #[test]
     fn test_stacktrace_java_format() {
@@ -1723,10 +1675,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Vendor package extraction edge cases
-    // ===================================================================
-
     #[test]
     fn test_vendor_node_scoped_package() {
         let mut context = IssueContext::new();
@@ -1782,10 +1730,6 @@ mod tests {
 
         assert!(context.repos.is_empty());
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Code block extraction
-    // ===================================================================
 
     #[test]
     fn test_code_block_with_language_tag() {
@@ -1854,10 +1798,6 @@ mod tests {
             "Should not extract paths outside code blocks"
         );
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Sentry full pipeline integration
-    // ===================================================================
 
     #[test]
     fn test_sentry_full_context_assembly() {
@@ -1945,10 +1885,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Linear full pipeline integration
-    // ===================================================================
-
     #[test]
     fn test_linear_with_labels() {
         let mut issue = create_test_issue("linear", "Fix routing bug", "Router is broken");
@@ -2020,10 +1956,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Context composition and raw_text
-    // ===================================================================
-
     #[test]
     fn test_sentry_raw_text_includes_title_description_message() {
         let mut issue = create_test_issue("sentry", "MyTitle", "MyDescription");
@@ -2057,10 +1989,6 @@ mod tests {
         assert!(context.raw_text.contains("GenericTitle"));
         assert!(context.raw_text.contains("GenericDescription"));
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Very long inputs / boundary conditions
-    // ===================================================================
 
     #[test]
     fn test_very_long_description() {
@@ -2141,10 +2069,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Sentry project name edge cases
-    // ===================================================================
-
     #[test]
     fn test_sentry_project_with_numbers() {
         let mut issue = create_test_issue("sentry", "Error", "");
@@ -2173,10 +2097,6 @@ mod tests {
             "Should add repo:name keyword"
         );
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Culprit vendor package extraction
-    // ===================================================================
 
     #[test]
     fn test_culprit_with_vendor_path() {
@@ -2219,10 +2139,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Node.js scoped package handling
-    // ===================================================================
-
     #[test]
     fn test_node_scoped_package_produces_two_repo_entries() {
         let mut context = IssueContext::new();
@@ -2242,10 +2158,6 @@ mod tests {
             context.repos
         );
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Filename metadata with vendor path
-    // ===================================================================
 
     #[test]
     fn test_sentry_filename_with_vendor_path() {
@@ -2269,10 +2181,6 @@ mod tests {
             "Should extract vendor package from filename metadata"
         );
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Regex anchoring and boundary behavior
-    // ===================================================================
 
     #[test]
     fn test_path_regex_requires_word_boundary_at_end() {
@@ -2315,10 +2223,6 @@ mod tests {
             "Pluralized error type should not match due to word boundary"
         );
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Context building with real-world-like data
-    // ===================================================================
 
     #[test]
     fn test_real_world_sentry_issue() {
@@ -2401,10 +2305,6 @@ mod tests {
         assert!(context.keywords.iter().any(|k| k == "TypeError"));
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Whitespace and formatting variations
-    // ===================================================================
-
     #[test]
     fn test_extract_text_with_only_whitespace() {
         let mut context = IssueContext::new();
@@ -2427,10 +2327,6 @@ mod tests {
         assert!(context.filenames.iter().any(|f| f.contains("main.rs")));
         assert!(context.filenames.iter().any(|f| f.contains("utils.py")));
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Path with special characters
-    // ===================================================================
 
     #[test]
     fn test_path_with_hyphens_and_underscores() {
@@ -2467,10 +2363,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Bug-hunting tests: Default trait implementation
-    // ===================================================================
-
     #[test]
     fn test_issue_context_default() {
         let context = IssueContext::default();
@@ -2494,10 +2386,6 @@ mod tests {
         assert_eq!(new_ctx.repos, default_ctx.repos);
         assert_eq!(new_ctx.raw_text, default_ctx.raw_text);
     }
-
-    // ===================================================================
-    // Bug-hunting tests: Clone behavior
-    // ===================================================================
 
     #[test]
     fn test_issue_context_clone() {

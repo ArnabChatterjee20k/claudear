@@ -1336,10 +1336,6 @@ version = "1.32.0"
         assert!(result.unwrap_err().to_string().contains("Unsupported"));
     }
 
-    // ---------------------------------------------------------------
-    // 1. npm_package_path_matches (tested indirectly via check_npm_lock)
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_npm_scoped_package_matches() {
         let lock = r#"{
@@ -1410,10 +1406,6 @@ version = "1.32.0"
         .unwrap());
     }
 
-    // ---------------------------------------------------------------
-    // 2. yarn_header_matches_package (tested via check_yarn_lock)
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_yarn_scoped_package_matches() {
         let lock = r#"
@@ -1483,12 +1475,9 @@ version = "1.32.0"
         .unwrap());
     }
 
-    // ---------------------------------------------------------------
     // 3. split_version_parts / compare_relaxed_versions
     //    (tested via compare_versions / check_lock_file_version
     //     with non-semver versions)
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_version_with_prerelease_text() {
         // "1.0.0-alpha" vs "1.0.0-beta": alpha < beta lexicographically
@@ -1616,10 +1605,6 @@ version = "1.32.0"
         .unwrap());
     }
 
-    // ---------------------------------------------------------------
-    // 4. compare_numeric_strings (tested indirectly)
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_large_numbers_no_overflow() {
         // Numbers larger than u64::MAX (18446744073709551615)
@@ -1680,10 +1665,6 @@ version = "1.32.0"
         )
         .unwrap());
     }
-
-    // ---------------------------------------------------------------
-    // 5. API error paths
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_get_releases_non_200_returns_error() {
@@ -1781,10 +1762,6 @@ version = "1.32.0"
         assert!(result.is_none());
     }
 
-    // ---------------------------------------------------------------
-    // 6. get_file_at_ref
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_get_file_at_ref_success_base64() {
         // "Hello, World!" base64-encoded is "SGVsbG8sIFdvcmxkIQ=="
@@ -1845,10 +1822,6 @@ version = "1.32.0"
         let err = result.unwrap_err().to_string();
         assert!(err.contains("500"));
     }
-
-    // ---------------------------------------------------------------
-    // 7. Lock file edge cases
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_composer_lock_empty_packages_array() {
@@ -2012,10 +1985,6 @@ version = "1.0.200"
         )
         .unwrap());
     }
-
-    // ---------------------------------------------------------------
-    // 8. check_composer_lock_version legacy method
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_check_composer_lock_version_legacy_delegates() {

@@ -447,10 +447,6 @@ mod tests {
         assert!(context.contains("pull/42"));
     }
 
-    // ---------------------------------------------------------------
-    // build_embedding_text edge cases
-    // ---------------------------------------------------------------
-
     fn make_issue(title: &str) -> Issue {
         Issue {
             id: "123".to_string(),
@@ -604,10 +600,6 @@ mod tests {
         assert_eq!(text, "Numeric stack");
     }
 
-    // ---------------------------------------------------------------
-    // format_similar_issues_context edge cases
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_format_similar_issues_context_empty() {
         let context = format_similar_issues_context(&[]);
@@ -744,10 +736,6 @@ mod tests {
         let context = format_similar_issues_context(&similar);
         assert!(context.contains("0%"));
     }
-
-    // ---------------------------------------------------------------
-    // IssueEmbeddingConfig defaults
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_config_default_min_similarity() {

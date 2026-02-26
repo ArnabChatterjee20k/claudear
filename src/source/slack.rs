@@ -629,10 +629,6 @@ mod tests {
         assert!(source.last_seen_ts.read().unwrap().is_none());
     }
 
-    // ---------------------------------------------------------------
-    // last_seen_ts RwLock state management
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_last_seen_ts_write_and_read() {
         let source = SlackSource::new(make_config());
@@ -679,10 +675,6 @@ mod tests {
         assert_eq!(*r2, Some("42.0".to_string()));
     }
 
-    // ---------------------------------------------------------------
-    // resolve_issue and add_comment (default trait no-ops)
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_resolve_issue_returns_ok() {
         let source = SlackSource::new(make_config());
@@ -696,10 +688,6 @@ mod tests {
         let result = source.add_comment("some-issue-id", "a comment").await;
         assert!(result.is_ok());
     }
-
-    // ---------------------------------------------------------------
-    // is_terminal_status (default trait impl)
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_is_terminal_status_terminal_values() {
@@ -734,10 +722,6 @@ mod tests {
         assert!(!source.is_terminal_status("something_random"));
     }
 
-    // ---------------------------------------------------------------
-    // get_issue_status (default trait impl delegates to get_issue)
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_get_issue_status_propagates_not_found() {
         let source = SlackSource::new(make_config());
@@ -745,10 +729,6 @@ mod tests {
         let result = source.get_issue_status("nonexistent").await;
         assert!(result.is_err());
     }
-
-    // ---------------------------------------------------------------
-    // get_issue error details
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn test_get_issue_error_contains_issue_id() {
@@ -762,10 +742,6 @@ mod tests {
             err_msg
         );
     }
-
-    // ---------------------------------------------------------------
-    // extract_title edge cases
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_extract_title_empty_string() {
@@ -810,10 +786,6 @@ mod tests {
         // lines() yields empty string for "\n"
         assert_eq!(SlackSource::extract_title("\n"), "");
     }
-
-    // ---------------------------------------------------------------
-    // message_to_issue edge cases
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_message_to_issue_bot_message_no_author() {
@@ -861,10 +833,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
-    // build_issue_context edge cases
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn test_build_issue_context_no_description() {
         let source = SlackSource::new(make_config());
@@ -898,10 +866,6 @@ mod tests {
         assert!(!context.contains("Message:"));
     }
 
-    // ---------------------------------------------------------------
-    // matches_criteria details
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_matches_criteria_returns_normal_priority() {
         let source = SlackSource::new(make_config());
@@ -922,10 +886,6 @@ mod tests {
         assert!(source.matches_criteria(&issue2).matches);
     }
 
-    // ---------------------------------------------------------------
-    // listen_channel_id edge cases
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_listen_channel_id_both_none() {
         let mut config = make_config();
@@ -944,10 +904,6 @@ mod tests {
         assert_eq!(source.listen_channel_id(), Some("C_LISTEN"));
     }
 
-    // ---------------------------------------------------------------
-    // message_url edge cases
-    // ---------------------------------------------------------------
-
     #[test]
     fn test_message_url_timestamp_no_dot() {
         let source = SlackSource::new(make_config());
@@ -961,10 +917,6 @@ mod tests {
         let url = source.message_url("C111", "1.2.3");
         assert_eq!(url, "https://myworkspace.slack.com/archives/C111/p123");
     }
-
-    // ---------------------------------------------------------------
-    // is_bot_message edge cases
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_is_bot_message_no_bot_id_no_user() {
@@ -1009,10 +961,6 @@ mod tests {
         };
         assert!(!SlackSource::is_bot_message(&msg));
     }
-
-    // ---------------------------------------------------------------
-    // SlackHistoryResponse deserialization
-    // ---------------------------------------------------------------
 
     #[test]
     fn test_history_response_deserialize_ok() {
@@ -1060,14 +1008,11 @@ mod tests {
         assert_eq!(msg.text, ""); // #[serde(default)]
     }
 
-    // ================================================================
     // Additional coverage: SlackHistoryResponse and SlackMessage
     // deserialization edge cases, extract_title boundary behavior,
     // listen_channel_id ordering, message_url formatting,
     // is_bot_message with various field combinations, and
     // message_to_issue with diverse inputs.
-    // ================================================================
-
     #[test]
     fn test_history_response_deserialize_multiple_messages() {
         let json = r#"{
@@ -1387,10 +1332,6 @@ mod tests {
             );
         }
     }
-
-    // ------------------------------------------------------------------
-    // Additional coverage: deserialization, config defaults, helper logic
-    // ------------------------------------------------------------------
 
     #[test]
     fn test_slack_config_default() {

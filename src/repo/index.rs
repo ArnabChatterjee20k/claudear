@@ -1082,10 +1082,6 @@ mod tests {
         assert!(repo.find_files("anything").is_empty());
     }
 
-    // ---------------------------------------------------------------
-    // MockScmProvider and build_from_gitlab tests
-    // ---------------------------------------------------------------
-
     use crate::error::Result as CrateResult;
     use crate::scm::{CodeReview, PrInfo, PrStatus, RemoteRepo, ReviewComment, ScmProvider};
     use async_trait::async_trait;
