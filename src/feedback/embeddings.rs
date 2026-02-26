@@ -91,10 +91,12 @@ pub struct EmbeddingClient {
 impl EmbeddingClient {
     /// Create a new embedding client with a pool of model instances.
     ///
-    /// The first model is loaded and its actual memory footprint is measured
-    /// via the drop in available system memory.  The pool size is then capped
-    /// so that total model memory stays within 70% of available RAM, with a
-    /// floor of `nproc` instances to ensure adequate parallelism.
+    /// The first model is loaded, a warmup inference is run to establish
+    /// ONNX Runtime arena buffers, and the resulting memory footprint is
+    /// measured.  A 3× multiplier is applied to account for inference-time
+    /// arena growth (attention matrices, activations).  The pool size is
+    /// then capped so that estimated total memory stays within 60% of
+    /// available RAM.
     pub fn new(config: EmbeddingConfig) -> Result<Self> {
         let dimension = match config.model {
             EmbeddingModel::NomicEmbedTextV15 => 768,
@@ -114,7 +116,7 @@ impl EmbeddingClient {
         sys.refresh_memory();
         let mem_before = sys.available_memory();
 
-        let first_model = {
+        let mut first_model = {
             let mut init_options = InitOptions::new(config.model.clone())
                 .with_show_download_progress(config.show_download_progress);
             if let Some(ref cache_dir) = config.cache_dir {
@@ -124,21 +126,34 @@ impl EmbeddingClient {
                 .map_err(|e| Error::Other(format!("Failed to initialize embedding model: {}", e)))?
         };
 
+        // Run a warmup inference so the ONNX Runtime arena is allocated before
+        // we measure memory.  Without this, per_instance only captures model
+        // weights and misses the arena buffers.
+        let _ = first_model.embed(vec!["warmup"], None);
+
         sys.refresh_memory();
         let mem_after = sys.available_memory();
-        let per_instance_bytes = mem_before.saturating_sub(mem_after);
+        let per_instance_loaded = mem_before.saturating_sub(mem_after);
 
-        // --- Pool size: min(desired, RAM budget) with nproc as default --------
+        // ONNX Runtime uses arena allocation that grows with
+        // batch_size × sequence_length² (attention matrices) and is never
+        // released.  The warmup above only allocates a minimal arena for a
+        // single short text.  Apply a 3× multiplier to account for realistic
+        // inference workloads (batch=8-32 texts of 1000-2000 tokens each).
+        let per_instance_bytes = per_instance_loaded.saturating_mul(3);
+
+        // --- Pool size: min(desired, RAM budget) ----------------------------
         let nproc = default_pool_size();
         let pool_size = if per_instance_bytes > 0 {
-            // Budget: 70% of the memory that was available *before* we loaded
+            // Budget: 60% of the memory that was available *before* we loaded
             // the first instance (so the first instance counts against it).
-            let budget = mem_before * 7 / 10;
+            let budget = mem_before * 6 / 10;
             let max_from_memory = (budget / per_instance_bytes).max(1) as usize;
             // Cap at the requested pool size (or nproc if not explicitly set).
             let capped = max_from_memory.min(desired_pool_size);
             tracing::info!(
-                per_instance_mb = per_instance_bytes / (1024 * 1024),
+                per_instance_mb = per_instance_loaded / (1024 * 1024),
+                estimated_with_arena_mb = per_instance_bytes / (1024 * 1024),
                 available_mb = mem_before / (1024 * 1024),
                 budget_mb = budget / (1024 * 1024),
                 nproc = nproc,
@@ -214,11 +229,14 @@ impl EmbeddingClient {
             return 32;
         }
 
-        // Per-text memory estimate for ONNX inference (attention scores,
-        // Q/K/V tensors, FFN intermediates, and runtime buffers).
-        let mb_per_text: u64 = if dimension >= 768 { 30 } else { 15 };
+        // Per-text memory estimate for ONNX inference.  Attention matrices
+        // dominate: heads × seq² × 4 bytes.  For 768-dim BERT-like models
+        // (12 heads) processing ~1000-2000 token code chunks, attention alone
+        // is 50-200 MB per text.  The estimate below is conservative so the
+        // sub-batch stays small enough to prevent arena over-allocation.
+        let mb_per_text: u64 = if dimension >= 768 { 100 } else { 40 };
         let budget_mb = available_mb / 2;
-        (budget_mb / mb_per_text).clamp(4, 64) as usize
+        (budget_mb / mb_per_text).clamp(4, 16) as usize
     }
 
     /// Create with default configuration from environment.
