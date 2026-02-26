@@ -23,7 +23,10 @@ pub fn ts_language(lang: Language) -> Option<TsLanguage> {
         Language::Swift => tree_sitter_swift::LANGUAGE.into(),
         Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
         Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
-        Language::Dart => return None,
+        Language::Json => tree_sitter_json::LANGUAGE.into(),
+        Language::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+        Language::Lua => tree_sitter_lua::LANGUAGE.into(),
+        Language::Dart | Language::Dockerfile => return None,
     })
 }
 
@@ -45,6 +48,10 @@ pub fn classify_node(lang: Language, node_type: &str) -> Option<SymbolKind> {
         Language::Kotlin => classify_kotlin(node_type),
         Language::CSharp => classify_csharp(node_type),
         Language::Dart => classify_dart(node_type),
+        Language::Json => None,  // data format, no symbols
+        Language::Yaml => None,  // data format, no symbols
+        Language::Lua => classify_lua(node_type),
+        Language::Dockerfile => None,  // no tree-sitter grammar
     }
 }
 
@@ -64,6 +71,8 @@ pub fn name_field(lang: Language, node_type: &str) -> Option<&'static str> {
         Language::Kotlin => kotlin_name_field(node_type),
         Language::CSharp => csharp_name_field(node_type),
         Language::Dart => dart_name_field(node_type),
+        Language::Lua => lua_name_field(node_type),
+        Language::Json | Language::Yaml | Language::Dockerfile => None,
     }
 }
 
@@ -89,6 +98,7 @@ pub fn is_container(lang: Language, node_type: &str) -> bool {
             "class_declaration" | "struct_declaration" | "namespace_declaration"
         ),
         Language::Dart => matches!(node_type, "class_definition" | "mixin_declaration"),
+        Language::Lua | Language::Json | Language::Yaml | Language::Dockerfile => false,
     }
 }
 
@@ -366,6 +376,24 @@ fn dart_name_field(node_type: &str) -> Option<&'static str> {
     }
 }
 
+fn classify_lua(node_type: &str) -> Option<SymbolKind> {
+    match node_type {
+        "function_declaration" | "local_function" | "function_definition_statement" => {
+            Some(SymbolKind::Function)
+        }
+        _ => None,
+    }
+}
+
+fn lua_name_field(node_type: &str) -> Option<&'static str> {
+    match node_type {
+        "function_declaration" | "local_function" | "function_definition_statement" => {
+            Some("name")
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +418,9 @@ mod tests {
             Language::Swift,
             Language::Kotlin,
             Language::CSharp,
+            Language::Json,
+            Language::Yaml,
+            Language::Lua,
         ];
         let mut failed = Vec::new();
         for lang in all_langs {
@@ -423,6 +454,30 @@ mod tests {
     #[test]
     fn test_ts_language_returns_none_for_dart() {
         assert!(ts_language(Language::Dart).is_none());
+    }
+
+    #[test]
+    fn test_ts_language_returns_none_for_dockerfile() {
+        assert!(ts_language(Language::Dockerfile).is_none());
+    }
+
+    #[test]
+    fn test_classify_lua_nodes() {
+        assert_eq!(
+            classify_node(Language::Lua, "function_declaration"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(
+            classify_node(Language::Lua, "local_function"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(classify_node(Language::Lua, "unknown_node"), None);
+    }
+
+    #[test]
+    fn test_classify_json_yaml_returns_none() {
+        assert_eq!(classify_node(Language::Json, "object"), None);
+        assert_eq!(classify_node(Language::Yaml, "block_mapping"), None);
     }
 
     #[test]
@@ -1241,5 +1296,225 @@ mod tests {
             Some("name")
         );
         assert_eq!(name_field(Language::Dart, "unknown_node"), None);
+    }
+
+    #[test]
+    fn test_classify_lua_all_arms() {
+        assert_eq!(
+            classify_node(Language::Lua, "function_declaration"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(
+            classify_node(Language::Lua, "local_function"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(
+            classify_node(Language::Lua, "function_definition_statement"),
+            Some(SymbolKind::Function)
+        );
+        assert_eq!(classify_node(Language::Lua, "if_statement"), None);
+        assert_eq!(classify_node(Language::Lua, "assignment_statement"), None);
+        assert_eq!(classify_node(Language::Lua, "return_statement"), None);
+    }
+
+    #[test]
+    fn test_name_field_lua() {
+        assert_eq!(
+            name_field(Language::Lua, "function_declaration"),
+            Some("name")
+        );
+        assert_eq!(name_field(Language::Lua, "local_function"), Some("name"));
+        assert_eq!(
+            name_field(Language::Lua, "function_definition_statement"),
+            Some("name")
+        );
+        assert_eq!(name_field(Language::Lua, "if_statement"), None);
+        assert_eq!(name_field(Language::Lua, "unknown_node"), None);
+    }
+
+    #[test]
+    fn test_is_container_lua() {
+        assert!(!is_container(Language::Lua, "function_declaration"));
+        assert!(!is_container(Language::Lua, "local_function"));
+        assert!(!is_container(Language::Lua, "table_constructor"));
+    }
+
+    #[test]
+    fn test_ts_language_returns_some_for_lua() {
+        let ts_lang = ts_language(Language::Lua);
+        assert!(ts_lang.is_some(), "Lua should have a tree-sitter grammar");
+        let mut parser = tree_sitter::Parser::new();
+        assert!(parser.set_language(&ts_lang.unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_classify_json_all_node_types_return_none() {
+        // JSON is a data format — no node type should produce a symbol
+        for node_type in [
+            "object",
+            "array",
+            "pair",
+            "string",
+            "number",
+            "true",
+            "false",
+            "null",
+            "document",
+        ] {
+            assert_eq!(
+                classify_node(Language::Json, node_type),
+                None,
+                "JSON node '{}' should classify as None",
+                node_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_name_field_json_returns_none() {
+        assert_eq!(name_field(Language::Json, "object"), None);
+        assert_eq!(name_field(Language::Json, "pair"), None);
+        assert_eq!(name_field(Language::Json, "string"), None);
+    }
+
+    #[test]
+    fn test_is_container_json() {
+        assert!(!is_container(Language::Json, "object"));
+        assert!(!is_container(Language::Json, "array"));
+    }
+
+    #[test]
+    fn test_ts_language_returns_some_for_json() {
+        let ts_lang = ts_language(Language::Json);
+        assert!(ts_lang.is_some(), "JSON should have a tree-sitter grammar");
+        let mut parser = tree_sitter::Parser::new();
+        assert!(parser.set_language(&ts_lang.unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_classify_yaml_all_node_types_return_none() {
+        for node_type in [
+            "stream",
+            "document",
+            "block_mapping",
+            "block_mapping_pair",
+            "block_sequence",
+            "block_sequence_item",
+            "flow_mapping",
+            "flow_sequence",
+            "plain_scalar",
+            "double_quote_scalar",
+            "block_scalar",
+        ] {
+            assert_eq!(
+                classify_node(Language::Yaml, node_type),
+                None,
+                "YAML node '{}' should classify as None",
+                node_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_name_field_yaml_returns_none() {
+        assert_eq!(name_field(Language::Yaml, "block_mapping"), None);
+        assert_eq!(name_field(Language::Yaml, "block_mapping_pair"), None);
+        assert_eq!(name_field(Language::Yaml, "plain_scalar"), None);
+    }
+
+    #[test]
+    fn test_is_container_yaml() {
+        assert!(!is_container(Language::Yaml, "block_mapping"));
+        assert!(!is_container(Language::Yaml, "document"));
+    }
+
+    #[test]
+    fn test_ts_language_returns_some_for_yaml() {
+        let ts_lang = ts_language(Language::Yaml);
+        assert!(ts_lang.is_some(), "YAML should have a tree-sitter grammar");
+        let mut parser = tree_sitter::Parser::new();
+        assert!(parser.set_language(&ts_lang.unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_classify_dockerfile_returns_none() {
+        assert_eq!(classify_node(Language::Dockerfile, "FROM"), None);
+        assert_eq!(classify_node(Language::Dockerfile, "RUN"), None);
+        assert_eq!(classify_node(Language::Dockerfile, "COPY"), None);
+        assert_eq!(classify_node(Language::Dockerfile, "WORKDIR"), None);
+    }
+
+    #[test]
+    fn test_name_field_dockerfile_returns_none() {
+        assert_eq!(name_field(Language::Dockerfile, "FROM"), None);
+        assert_eq!(name_field(Language::Dockerfile, "RUN"), None);
+    }
+
+    #[test]
+    fn test_is_container_dockerfile() {
+        assert!(!is_container(Language::Dockerfile, "FROM"));
+        assert!(!is_container(Language::Dockerfile, "stage"));
+    }
+
+    #[test]
+    fn test_is_container_all_new_languages_return_false() {
+        let new_langs = [
+            Language::Lua,
+            Language::Json,
+            Language::Yaml,
+            Language::Dockerfile,
+        ];
+        for lang in new_langs {
+            // No node type should be a container for data formats / Lua
+            for node_type in ["class", "module", "object", "table", "block"] {
+                assert!(
+                    !is_container(lang, node_type),
+                    "{:?} should not have containers, but '{}' was true",
+                    lang,
+                    node_type
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_ts_language_all_grammars_parseable() {
+        // Verify every language with a grammar can actually create a parser
+        let langs_with_grammars = [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Python,
+            Language::Go,
+            Language::Java,
+            Language::C,
+            Language::Cpp,
+            Language::Ruby,
+            Language::Php,
+            Language::Swift,
+            Language::Kotlin,
+            Language::CSharp,
+            Language::Json,
+            Language::Yaml,
+            Language::Lua,
+        ];
+        for lang in langs_with_grammars {
+            let ts_lang =
+                ts_language(lang).unwrap_or_else(|| panic!("{:?} should have a grammar", lang));
+            let mut parser = tree_sitter::Parser::new();
+            assert!(
+                parser.set_language(&ts_lang).is_ok(),
+                "{:?} grammar failed to load into parser",
+                lang
+            );
+        }
+    }
+
+    #[test]
+    fn test_ts_language_none_variants() {
+        // Languages without tree-sitter support
+        assert!(ts_language(Language::Dart).is_none());
+        assert!(ts_language(Language::Dockerfile).is_none());
     }
 }

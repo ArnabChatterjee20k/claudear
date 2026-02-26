@@ -331,10 +331,17 @@ impl CodeIndexer {
 
             // Check language.
             let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if let Some(lang) = Language::from_extension(ext) {
-                    files.push((path.to_path_buf(), lang));
-                }
+            let lang = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(Language::from_extension)
+                .or_else(|| {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(Language::from_filename)
+                });
+            if let Some(lang) = lang {
+                files.push((path.to_path_buf(), lang));
             }
         }
 
@@ -531,10 +538,6 @@ mod tests {
         assert_ne!(hash, sha256_hex("hello world!"));
     }
 
-    // ================================================================
-    // sha256_hex: comprehensive edge cases and known-value tests
-    // ================================================================
-
     #[test]
     fn test_sha256_hex_empty_string() {
         let hash = sha256_hex("");
@@ -641,10 +644,6 @@ mod tests {
         assert_ne!(hash1, hash2, "Null byte should be included in hash");
     }
 
-    // ================================================================
-    // Constants
-    // ================================================================
-
     #[test]
     fn test_default_max_file_size_is_1mb() {
         assert_eq!(DEFAULT_MAX_FILE_SIZE, 1024 * 1024);
@@ -655,10 +654,6 @@ mod tests {
     fn test_default_batch_size_is_32() {
         assert_eq!(DEFAULT_BATCH_SIZE, 32);
     }
-
-    // ================================================================
-    // collect_source_files: tests using temp directories
-    // ================================================================
 
     #[test]
     fn test_collect_source_files_empty_directory() {
@@ -869,10 +864,6 @@ mod tests {
         assert_eq!(files.len(), 2, "Should find files in nested directories");
     }
 
-    // ================================================================
-    // CodeIndexer: constructor variants
-    // ================================================================
-
     #[test]
     fn test_code_indexer_new_defaults() {
         let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
@@ -924,10 +915,6 @@ mod tests {
         assert_eq!(indexer.batch_size, 1);
     }
 
-    // ================================================================
-    // CodeSearchService: constructor
-    // ================================================================
-
     #[test]
     fn test_code_search_service_new() {
         let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
@@ -937,10 +924,6 @@ mod tests {
         let _service = CodeSearchService::new(tracker, embedding_client);
         // Constructor should not panic
     }
-
-    // ================================================================
-    // collect_source_files with custom max_file_size
-    // ================================================================
 
     #[test]
     fn test_collect_source_files_custom_max_size() {
@@ -963,10 +946,6 @@ mod tests {
         assert_eq!(files.len(), 1, "Only files under 1KB should be collected");
         assert!(files[0].0.file_name().unwrap().to_string_lossy() == "small.rs");
     }
-
-    // ================================================================
-    // collect_source_files: file extension coverage
-    // ================================================================
 
     #[test]
     fn test_collect_source_files_all_supported_extensions() {
@@ -992,6 +971,11 @@ mod tests {
             ("test.swift", Language::Swift),
             ("test.kt", Language::Kotlin),
             ("test.kts", Language::Kotlin),
+            ("test.yaml", Language::Yaml),
+            ("test.yml", Language::Yaml),
+            ("test.json", Language::Json),
+            ("test.lua", Language::Lua),
+            ("Dockerfile", Language::Dockerfile),
         ];
 
         for (filename, _) in &extensions_and_languages {
@@ -1000,7 +984,7 @@ mod tests {
         // Also write unsupported extensions
         std::fs::write(dir.path().join("test.txt"), "text").unwrap();
         std::fs::write(dir.path().join("test.md"), "# markdown").unwrap();
-        std::fs::write(dir.path().join("test.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("test.xml"), "<root/>").unwrap();
 
         let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
         let Some(embedding_client) = try_embedding_client() else {
@@ -1027,10 +1011,6 @@ mod tests {
             );
         }
     }
-
-    // ================================================================
-    // format_code_search_context tests
-    // ================================================================
 
     fn make_chunk(
         file_path: &str,
@@ -1221,10 +1201,6 @@ mod tests {
         assert!(ctx.contains("Use them to understand the codebase"));
     }
 
-    // ================================================================
-    // build_code_search_query tests
-    // ================================================================
-
     #[test]
     fn test_build_code_search_query_default_source() {
         let issue = crate::types::Issue::new("1", "T-1", "Bug title", "url", "jira");
@@ -1330,5 +1306,202 @@ mod tests {
         let issue = crate::types::Issue::new("1", "S-1", "Error", "url", "sentry");
         let query = super::build_code_search_query(&issue);
         assert_eq!(query, "Error");
+    }
+
+    #[test]
+    fn test_collect_source_files_finds_yaml_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), "key: value").unwrap();
+        std::fs::write(dir.path().join("other.yml"), "other: true").unwrap();
+        std::fs::write(dir.path().join("readme.txt"), "text").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let files = indexer.collect_source_files(dir.path());
+        assert_eq!(files.len(), 2, "Should find 2 YAML files");
+        assert!(files.iter().all(|(_, lang)| *lang == Language::Yaml));
+    }
+
+    #[test]
+    fn test_collect_source_files_finds_json_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("readme.txt"), "text").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let files = indexer.collect_source_files(dir.path());
+        assert_eq!(files.len(), 2, "Should find 2 JSON files");
+        assert!(files.iter().all(|(_, lang)| *lang == Language::Json));
+    }
+
+    #[test]
+    fn test_collect_source_files_finds_lua_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("init.lua"), "print('hello')").unwrap();
+        std::fs::write(dir.path().join("config.lua"), "return {}").unwrap();
+        std::fs::write(dir.path().join("readme.txt"), "text").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let files = indexer.collect_source_files(dir.path());
+        assert_eq!(files.len(), 2, "Should find 2 Lua files");
+        assert!(files.iter().all(|(_, lang)| *lang == Language::Lua));
+    }
+
+    #[test]
+    fn test_collect_source_files_finds_dockerfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM rust:1.75").unwrap();
+        std::fs::write(dir.path().join("readme.txt"), "text").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let files = indexer.collect_source_files(dir.path());
+        assert_eq!(files.len(), 1, "Should find 1 Dockerfile");
+        assert_eq!(files[0].1, Language::Dockerfile);
+        assert!(
+            files[0]
+                .0
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("Dockerfile")
+        );
+    }
+
+    #[test]
+    fn test_collect_source_files_dockerfile_in_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("docker");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("Dockerfile"), "FROM node:18").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let files = indexer.collect_source_files(dir.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, Language::Dockerfile);
+    }
+
+    #[test]
+    fn test_collect_source_files_dockerfile_not_matched_for_similar_names() {
+        // Files like "Dockerfile.dev" have extension "dev", which doesn't match.
+        // And "dockerfile" (lowercase) isn't matched by from_filename.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM rust:1.75").unwrap();
+        std::fs::write(dir.path().join("Dockerfile.dev"), "FROM rust:1.75").unwrap();
+        std::fs::write(dir.path().join("dockerfile"), "FROM rust:1.75").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let files = indexer.collect_source_files(dir.path());
+        // Only "Dockerfile" (exact match) should be found
+        let dockerfiles: Vec<_> = files
+            .iter()
+            .filter(|(_, lang)| *lang == Language::Dockerfile)
+            .collect();
+        assert_eq!(
+            dockerfiles.len(),
+            1,
+            "Only exact 'Dockerfile' should match, got {:?}",
+            dockerfiles
+                .iter()
+                .map(|(p, _)| p.file_name().unwrap().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_collect_source_files_mixed_new_languages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.lua"), "print('hi')").unwrap();
+        std::fs::write(dir.path().join("config.yaml"), "key: val").unwrap();
+        std::fs::write(dir.path().join("data.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM alpine").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let files = indexer.collect_source_files(dir.path());
+        assert_eq!(files.len(), 5, "Should find all 5 files");
+
+        let langs: std::collections::HashSet<_> = files.iter().map(|(_, l)| *l).collect();
+        assert!(langs.contains(&Language::Lua));
+        assert!(langs.contains(&Language::Yaml));
+        assert!(langs.contains(&Language::Json));
+        assert!(langs.contains(&Language::Dockerfile));
+        assert!(langs.contains(&Language::Rust));
+    }
+
+    #[test]
+    fn test_format_code_search_context_new_language_fences() {
+        for (lang, expected_fence) in [
+            (Language::Yaml, "```yaml"),
+            (Language::Json, "```json"),
+            (Language::Lua, "```lua"),
+            (Language::Dockerfile, "```dockerfile"),
+        ] {
+            let chunk = make_chunk("test.x", None, "top_level", lang, 1, 5, "some code");
+            let results = vec![make_search_result(chunk, 0.75)];
+            let ctx = super::format_code_search_context(&results);
+            assert!(
+                ctx.contains(expected_fence),
+                "Expected fence '{}' for {:?}, got:\n{}",
+                expected_fence,
+                lang,
+                ctx
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_code_search_context_new_language_names() {
+        for (lang, expected_name) in [
+            (Language::Yaml, "YAML"),
+            (Language::Json, "JSON"),
+            (Language::Lua, "Lua"),
+            (Language::Dockerfile, "Dockerfile"),
+        ] {
+            let chunk = make_chunk("test.x", Some("sym"), "function", lang, 1, 5, "code");
+            let results = vec![make_search_result(chunk, 0.8)];
+            let ctx = super::format_code_search_context(&results);
+            assert!(
+                ctx.contains(&format!("**Language:** {}", expected_name)),
+                "Expected language name '{}' for {:?}, got:\n{}",
+                expected_name,
+                lang,
+                ctx
+            );
+        }
     }
 }

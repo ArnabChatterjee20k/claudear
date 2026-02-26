@@ -604,10 +604,6 @@ def main():
         }
     }
 
-    // -----------------------------------------------------------------------
-    // gather_leading_context tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_gather_leading_context_with_comments() {
         let lines = vec!["// This is a comment", "// Another comment", "fn foo() {}"];
@@ -659,10 +655,6 @@ def main():
         // Empty line at index 1 breaks the chain, so only index 2 comment is included
         assert_eq!(start, 2, "Empty line should break context gathering");
     }
-
-    // -----------------------------------------------------------------------
-    // is_top_level_container tests
-    // -----------------------------------------------------------------------
 
     fn make_symbol(kind: SymbolKind, parent: Option<&str>) -> CodeSymbol {
         CodeSymbol {
@@ -741,10 +733,6 @@ def main():
         )));
     }
 
-    // -----------------------------------------------------------------------
-    // mark_covered tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_mark_covered() {
         let mut covered = vec![false; 10];
@@ -759,10 +747,6 @@ def main():
         assert!(!covered[9]);
     }
 
-    // -----------------------------------------------------------------------
-    // collect_lines tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_collect_lines() {
         let lines = vec!["line0", "line1", "line2", "line3", "line4"];
@@ -775,10 +759,6 @@ def main():
         // End beyond bounds is clamped
         assert_eq!(collect_lines(&lines, 3, 100), "line3\nline4");
     }
-
-    // -----------------------------------------------------------------------
-    // split_oversized tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_split_oversized_within_limit() {
@@ -838,10 +818,6 @@ def main():
             assert!(c.chunk_text.len() >= MIN_CHUNK_CHARS);
         }
     }
-
-    // -----------------------------------------------------------------------
-    // build_context_text tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_context_text() {
@@ -909,14 +885,6 @@ def main():
         assert!(!ctx.contains("Symbol:"));
     }
 
-    // ===================================================================
-    // Additional tests for improved coverage
-    // ===================================================================
-
-    // -----------------------------------------------------------------------
-    // chunk_file: simple Rust function
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_chunk_file_simple_rust_function() {
         let src = r#"
@@ -949,10 +917,6 @@ pub fn add(a: i32, b: i32) -> i32 {
             "Leading doc comment should be included in the chunk text"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // chunk_file: struct with methods (small container path)
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_chunk_file_struct_with_methods() {
@@ -1000,20 +964,12 @@ impl Counter {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // chunk_file: empty source
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_chunk_file_empty_source_returns_empty() {
         let (symbols, chunks) = chunk_file("", Language::Rust, 1, "empty.rs", "e").unwrap();
         assert!(symbols.is_empty());
         assert!(chunks.is_empty());
     }
-
-    // -----------------------------------------------------------------------
-    // chunk_file: very small source below MIN thresholds
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_chunk_file_very_small_source_below_min() {
@@ -1044,10 +1000,6 @@ impl Counter {
             "A 2-line trivial function should be filtered out by MIN thresholds"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // chunk_file: multiple standalone functions
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_chunk_file_multiple_standalone_functions() {
@@ -1103,10 +1055,6 @@ pub fn gamma(z: i32) -> i32 {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // chunk_file: enum
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_chunk_file_enum() {
         let src = r#"
@@ -1132,10 +1080,6 @@ pub enum Direction {
         assert!(ec.chunk_text.contains("pub enum Direction"));
     }
 
-    // -----------------------------------------------------------------------
-    // chunk_file: trait
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_chunk_file_trait() {
         let src = r#"
@@ -1158,10 +1102,6 @@ pub trait Drawable {
         assert_eq!(tc.chunk_type, "class"); // Trait maps to "class" chunk_type
         assert!(tc.chunk_text.contains("pub trait Drawable"));
     }
-
-    // -----------------------------------------------------------------------
-    // chunk_file: top-level code (use/const statements not inside any symbol)
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_chunk_file_top_level_code() {
@@ -1190,10 +1130,6 @@ use std::process;
             assert!(tl.context_text.contains("Type: top_level"));
         }
     }
-
-    // -----------------------------------------------------------------------
-    // is_top_level_container: exhaustive SymbolKind coverage
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_is_top_level_container_all_kinds_exhaustive() {
@@ -1239,10 +1175,6 @@ use std::process;
         }
     }
 
-    // -----------------------------------------------------------------------
-    // mark_covered: boundary conditions
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_mark_covered_empty_array() {
         let mut covered: Vec<bool> = vec![];
@@ -1286,10 +1218,6 @@ use std::process;
         assert!(!covered[4]);
     }
 
-    // -----------------------------------------------------------------------
-    // collect_lines: additional boundary cases
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_collect_lines_empty_array() {
         let lines: Vec<&str> = vec![];
@@ -1314,10 +1242,6 @@ use std::process;
         let lines = vec!["a", "b", "c"];
         assert_eq!(collect_lines(&lines, 1, 1), "");
     }
-
-    // -----------------------------------------------------------------------
-    // gather_leading_context: additional patterns
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_gather_leading_context_python_comments() {
@@ -1398,10 +1322,6 @@ use std::process;
             "Should walk back through entire multi-line single-quote docstring"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // build_symbol_chunk: various SymbolKinds
-    // -----------------------------------------------------------------------
 
     fn make_symbol_with_lines(
         kind: SymbolKind,
@@ -1606,10 +1526,6 @@ use std::process;
         assert!(chunk.is_none(), "Should return None when end <= start");
     }
 
-    // -----------------------------------------------------------------------
-    // build_context_text: additional cases
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_build_context_text_all_chunk_types() {
         let types_and_names = vec![
@@ -1680,10 +1596,6 @@ use std::process;
         // Verify the truncation happened at a valid char boundary (no panic)
         assert!(ctx.is_char_boundary(ctx.len()));
     }
-
-    // -----------------------------------------------------------------------
-    // split_oversized: additional cases
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_split_oversized_empty_input() {
@@ -1814,10 +1726,6 @@ use std::process;
             );
         }
     }
-
-    // -----------------------------------------------------------------------
-    // build_skeleton_chunk tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_skeleton_chunk_basic() {
@@ -2000,10 +1908,6 @@ use std::process;
         );
     }
 
-    // -----------------------------------------------------------------------
-    // chunk_file: large container triggers skeleton + method split
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_chunk_file_large_impl_triggers_skeleton() {
         // Build a Rust source file with an impl block > LARGE_CLASS_LINES (100)
@@ -2037,10 +1941,6 @@ use std::process;
             "Large impl should produce individual method chunks"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // chunk_file: Rust file with mix of structs, enums, and functions
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_chunk_file_mixed_rust_symbols() {
@@ -2108,10 +2008,6 @@ pub fn format_shape(s: &Shape) -> String {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // chunk_file: whitespace-only source
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_chunk_file_whitespace_only() {
         let src = "   \n\n\n   \n";
@@ -2119,10 +2015,6 @@ pub fn format_shape(s: &Shape) -> String {
         assert!(symbols.is_empty());
         assert!(chunks.is_empty());
     }
-
-    // -----------------------------------------------------------------------
-    // chunk_file: function with doc comments and attributes together
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_chunk_file_function_with_attrs_and_docs() {
@@ -2160,10 +2052,6 @@ pub fn documented_fn(input: &str) -> String {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // chunk_file: verifies repo_id and file_hash propagation
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_chunk_file_metadata_propagation() {
         let src = r#"
@@ -2185,5 +2073,371 @@ pub fn helper(x: i32) -> i32 {
             assert_eq!(c.file_path, "meta.rs", "file_path should propagate");
             assert_eq!(c.language, Language::Rust, "language should propagate");
         }
+    }
+
+    #[test]
+    fn test_chunk_lua_single_function() {
+        let src = r#"
+-- A greeting function
+function greet(name)
+    local msg = "Hello, " .. name
+    print(msg)
+    return msg
+end
+"#;
+        let (symbols, chunks) =
+            chunk_file(src, Language::Lua, 1, "greet.lua", "lua_hash1").unwrap();
+
+        assert!(!symbols.is_empty(), "Should extract at least 1 symbol");
+        assert!(!chunks.is_empty(), "Should produce at least 1 chunk");
+
+        // All chunks should have correct metadata
+        for chunk in &chunks {
+            assert_eq!(chunk.language, Language::Lua);
+            assert_eq!(chunk.file_path, "greet.lua");
+            assert_eq!(chunk.file_hash, "lua_hash1");
+            assert!(chunk.context_text.contains("Language: Lua"));
+            assert!(chunk.context_text.contains("File: greet.lua"));
+        }
+    }
+
+    #[test]
+    fn test_chunk_lua_multiple_functions() {
+        let src = r#"
+-- Module configuration
+local M = {}
+
+function M.setup(opts)
+    M.config = opts or {}
+    M.config.enabled = M.config.enabled ~= false
+    return M
+end
+
+local function validate(input)
+    if type(input) ~= "string" then
+        return false, "expected string"
+    end
+    if #input == 0 then
+        return false, "empty string"
+    end
+    return true
+end
+
+function M.process(data)
+    local ok, err = validate(data)
+    if not ok then
+        error(err)
+    end
+    return string.upper(data)
+end
+
+return M
+"#;
+        let (symbols, chunks) =
+            chunk_file(src, Language::Lua, 1, "module.lua", "lua_hash2").unwrap();
+
+        // Should find multiple function symbols
+        let func_symbols: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.symbol_kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            func_symbols.len() >= 2,
+            "Expected at least 2 function symbols, got {}",
+            func_symbols.len()
+        );
+
+        // Should have chunks
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_lua_empty_file() {
+        let src = "";
+        let (symbols, chunks) =
+            chunk_file(src, Language::Lua, 1, "empty.lua", "empty_hash").unwrap();
+        assert!(symbols.is_empty());
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_lua_only_comments() {
+        let src = r#"
+-- This is a comment
+-- Another comment
+-- Yet another comment
+"#;
+        let (symbols, _chunks) =
+            chunk_file(src, Language::Lua, 1, "comments.lua", "ch").unwrap();
+        assert!(symbols.is_empty(), "Comments should not produce symbols");
+    }
+
+    #[test]
+    fn test_chunk_lua_metadata_propagation() {
+        let src = r#"
+function compute(x)
+    local result = x * 2
+    result = result + 1
+    return result
+end
+"#;
+        let repo_id = 99;
+        let file_hash = "lua_meta";
+        let (_, chunks) =
+            chunk_file(src, Language::Lua, repo_id, "compute.lua", file_hash).unwrap();
+
+        for c in &chunks {
+            assert_eq!(c.repo_id, repo_id);
+            assert_eq!(c.file_hash, file_hash);
+            assert_eq!(c.file_path, "compute.lua");
+            assert_eq!(c.language, Language::Lua);
+        }
+    }
+
+    #[test]
+    fn test_chunk_json_produces_top_level_chunk() {
+        let src = r#"
+{
+    "name": "my-project",
+    "version": "1.0.0",
+    "description": "A sample project",
+    "main": "index.js",
+    "scripts": {
+        "build": "tsc",
+        "test": "jest --coverage",
+        "lint": "eslint . --fix"
+    },
+    "dependencies": {
+        "express": "^4.18.0",
+        "lodash": "^4.17.21"
+    },
+    "devDependencies": {
+        "typescript": "^5.0.0",
+        "jest": "^29.0.0",
+        "eslint": "^8.0.0"
+    }
+}
+"#;
+        let (symbols, chunks) =
+            chunk_file(src, Language::Json, 1, "package.json", "json_hash").unwrap();
+
+        // JSON has no code symbols
+        assert!(
+            symbols.is_empty(),
+            "JSON should not produce symbols, got: {:?}",
+            symbols.iter().map(|s| &s.symbol_name).collect::<Vec<_>>()
+        );
+
+        // But it should still produce top-level chunks (for search)
+        if !chunks.is_empty() {
+            for c in &chunks {
+                assert_eq!(c.language, Language::Json);
+                assert_eq!(c.file_path, "package.json");
+                assert_eq!(c.chunk_type, "top_level");
+                assert!(c.context_text.contains("Language: JSON"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_json_empty_object() {
+        let src = "{}";
+        let (symbols, _chunks) =
+            chunk_file(src, Language::Json, 1, "empty.json", "h").unwrap();
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_json_no_symbols_but_preserves_metadata() {
+        let src = r#"
+{
+    "compilerOptions": {
+        "target": "ES2020",
+        "module": "commonjs",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "forceConsistentCasingInFileNames": true,
+        "outDir": "./dist",
+        "rootDir": "./src"
+    }
+}
+"#;
+        let (symbols, chunks) =
+            chunk_file(src, Language::Json, 7, "tsconfig.json", "ts_hash").unwrap();
+        assert!(symbols.is_empty());
+        for c in &chunks {
+            assert_eq!(c.repo_id, 7);
+            assert_eq!(c.file_hash, "ts_hash");
+        }
+    }
+
+    #[test]
+    fn test_chunk_yaml_produces_top_level_chunk() {
+        let src = r#"
+name: Build and Test
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - run: cargo test --all-features
+"#;
+        let (symbols, chunks) =
+            chunk_file(src, Language::Yaml, 1, "ci.yaml", "yaml_hash").unwrap();
+
+        assert!(symbols.is_empty(), "YAML should not produce symbols");
+
+        if !chunks.is_empty() {
+            for c in &chunks {
+                assert_eq!(c.language, Language::Yaml);
+                assert_eq!(c.file_path, "ci.yaml");
+                assert!(c.context_text.contains("Language: YAML"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_yaml_simple_config() {
+        let src = "key: value\n";
+        let (symbols, _chunks) =
+            chunk_file(src, Language::Yaml, 1, "config.yml", "h").unwrap();
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_yaml_docker_compose() {
+        let src = r#"
+version: "3.8"
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=postgres://localhost/mydb
+      - REDIS_URL=redis://localhost:6379
+    depends_on:
+      - db
+      - redis
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+volumes:
+  pgdata:
+"#;
+        let (symbols, chunks) =
+            chunk_file(src, Language::Yaml, 2, "docker-compose.yml", "dc_hash").unwrap();
+        assert!(symbols.is_empty());
+        for c in &chunks {
+            assert_eq!(c.repo_id, 2);
+            assert_eq!(c.language, Language::Yaml);
+        }
+    }
+
+    #[test]
+    fn test_chunk_dockerfile_returns_error() {
+        // Dockerfile has no tree-sitter grammar, so chunk_file (which calls parse_file)
+        // should return an error.
+        let src = r#"
+FROM rust:1.75-slim as builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+COPY --from=builder /app/target/release/app /usr/local/bin/
+EXPOSE 8080
+CMD ["app"]
+"#;
+        let result = chunk_file(src, Language::Dockerfile, 1, "Dockerfile", "df_hash");
+        assert!(
+            result.is_err(),
+            "Dockerfile chunking should fail (no grammar)"
+        );
+    }
+
+    #[test]
+    fn test_build_context_text_lua() {
+        let ctx = build_context_text(
+            "init.lua",
+            Language::Lua,
+            "function",
+            Some("setup"),
+            None,
+            "function setup(opts)",
+        );
+        assert!(ctx.contains("File: init.lua"));
+        assert!(ctx.contains("Language: Lua"));
+        assert!(ctx.contains("Symbol: setup (function)"));
+        assert!(ctx.contains("function setup(opts)"));
+    }
+
+    #[test]
+    fn test_build_context_text_json() {
+        let ctx = build_context_text(
+            "package.json",
+            Language::Json,
+            "top_level",
+            None,
+            None,
+            "",
+        );
+        assert!(ctx.contains("File: package.json"));
+        assert!(ctx.contains("Language: JSON"));
+    }
+
+    #[test]
+    fn test_build_context_text_yaml() {
+        let ctx = build_context_text(
+            "ci.yaml",
+            Language::Yaml,
+            "top_level",
+            None,
+            None,
+            "",
+        );
+        assert!(ctx.contains("File: ci.yaml"));
+        assert!(ctx.contains("Language: YAML"));
+    }
+
+    #[test]
+    fn test_build_context_text_dockerfile() {
+        let ctx = build_context_text(
+            "Dockerfile",
+            Language::Dockerfile,
+            "top_level",
+            None,
+            None,
+            "",
+        );
+        assert!(ctx.contains("File: Dockerfile"));
+        assert!(ctx.contains("Language: Dockerfile"));
     }
 }

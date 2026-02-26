@@ -341,6 +341,11 @@ fn is_function_node(language: Language, node_type: &str) -> bool {
             node_type,
             "function_signature" | "method_signature" | "getter_signature" | "setter_signature"
         ),
+        Language::Lua => matches!(
+            node_type,
+            "function_declaration" | "local_function" | "function_definition_statement"
+        ),
+        Language::Json | Language::Yaml | Language::Dockerfile => false,
     }
 }
 
@@ -375,6 +380,7 @@ fn is_type_node(language: Language, node_type: &str) -> bool {
             node_type,
             "class_definition" | "enum_declaration" | "mixin_declaration"
         ),
+        Language::Lua | Language::Json | Language::Yaml | Language::Dockerfile => false,
     }
 }
 
@@ -489,6 +495,8 @@ fn find_body(node: tree_sitter::Node, language: Language) -> Option<tree_sitter:
         Language::Kotlin => "body",
         Language::CSharp => "body",
         Language::Dart => "body",
+        Language::Lua => "body",
+        Language::Json | Language::Yaml | Language::Dockerfile => "body",
     };
     node.child_by_field_name(body_field)
 }
@@ -2190,5 +2198,369 @@ const THRESHOLD = 0.5;
             .iter()
             .any(|(name, _, _)| name == "style_early_returns");
         assert!(has_pattern2, "expected style_early_returns at 71%");
+    }
+
+    #[test]
+    fn test_analyze_lua_function_detection() {
+        let source = r#"
+function greet(name)
+    print("Hello, " .. name)
+end
+
+local function add(a, b)
+    return a + b
+end
+"#;
+        let analysis = analyze_file(source, Language::Lua);
+        assert!(
+            analysis.function_count >= 2,
+            "Lua should detect at least 2 functions, got {}",
+            analysis.function_count
+        );
+    }
+
+    #[test]
+    fn test_analyze_lua_function_naming_snake_case() {
+        let source = r#"
+function my_function()
+    return 1
+end
+
+local function another_function()
+    return 2
+end
+"#;
+        let analysis = analyze_file(source, Language::Lua);
+        assert!(
+            analysis.snake_case_functions >= 2,
+            "Expected at least 2 snake_case functions, got {}",
+            analysis.snake_case_functions
+        );
+    }
+
+    #[test]
+    fn test_analyze_lua_function_naming_camel_case() {
+        let source = r#"
+function myFunction()
+    return 1
+end
+
+local function anotherFunction()
+    return 2
+end
+"#;
+        let analysis = analyze_file(source, Language::Lua);
+        assert!(
+            analysis.camel_case_functions >= 2,
+            "Expected at least 2 camelCase functions, got {}",
+            analysis.camel_case_functions
+        );
+    }
+
+    #[test]
+    fn test_analyze_lua_empty_source() {
+        let source = "-- just a comment\n";
+        let analysis = analyze_file(source, Language::Lua);
+        assert_eq!(analysis.function_count, 0);
+        assert!(analysis.function_lengths.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_lua_function_lengths() {
+        let source = r#"
+function short()
+    return 1
+end
+
+function longer(x)
+    local result = 0
+    for i = 1, x do
+        result = result + i
+    end
+    return result
+end
+"#;
+        let analysis = analyze_file(source, Language::Lua);
+        assert_eq!(analysis.function_count, 2);
+        assert_eq!(analysis.function_lengths.len(), 2);
+        // The longer function should have more lines
+        let max_len = analysis.function_lengths.iter().max().copied().unwrap_or(0);
+        assert!(max_len > 3, "Expected longer function > 3 lines, got {}", max_len);
+    }
+
+    #[test]
+    fn test_analyze_json_returns_empty_analysis() {
+        let source = r#"{"key": "value", "number": 42, "nested": {"a": 1}}"#;
+        let analysis = analyze_file(source, Language::Json);
+        assert_eq!(analysis.function_count, 0);
+        assert_eq!(analysis.snake_case_functions, 0);
+        assert_eq!(analysis.camel_case_functions, 0);
+        assert_eq!(analysis.pascal_case_types, 0);
+        assert!(analysis.function_lengths.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_json_complex_structure() {
+        let source = r#"
+{
+    "scripts": {
+        "build": "tsc",
+        "test": "jest",
+        "lint": "eslint ."
+    },
+    "devDependencies": {
+        "typescript": "^5.0.0",
+        "jest": "^29.0.0"
+    }
+}
+"#;
+        let analysis = analyze_file(source, Language::Json);
+        assert_eq!(analysis.function_count, 0);
+        // Numbers in JSON should not count as magic numbers since there are no functions
+        assert_eq!(analysis.early_return_count, 0);
+    }
+
+    #[test]
+    fn test_analyze_yaml_returns_empty_analysis() {
+        let source = r#"
+name: CI Pipeline
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test
+"#;
+        let analysis = analyze_file(source, Language::Yaml);
+        assert_eq!(analysis.function_count, 0);
+        assert_eq!(analysis.snake_case_functions, 0);
+        assert!(analysis.function_lengths.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_yaml_kubernetes_manifest() {
+        let source = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  labels:
+    app: my-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+        - name: my-app
+          image: my-app:latest
+          ports:
+            - containerPort: 8080
+"#;
+        let analysis = analyze_file(source, Language::Yaml);
+        assert_eq!(analysis.function_count, 0);
+    }
+
+    #[test]
+    fn test_analyze_dockerfile_returns_empty_analysis() {
+        // Dockerfile has no tree-sitter grammar, so analysis should return defaults
+        let source = r#"
+FROM rust:1.75-slim as builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+RUN cargo build --release
+COPY src/ ./src/
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+COPY --from=builder /app/target/release/myapp /usr/local/bin/
+EXPOSE 8080
+CMD ["myapp"]
+"#;
+        let analysis = analyze_file(source, Language::Dockerfile);
+        assert_eq!(analysis.function_count, 0);
+        assert_eq!(analysis.snake_case_functions, 0);
+        assert_eq!(analysis.camel_case_functions, 0);
+        assert_eq!(analysis.pascal_case_types, 0);
+        assert_eq!(analysis.magic_number_count, 0);
+        assert!(analysis.function_lengths.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_lua_early_return() {
+        let source = r#"
+function validate(x)
+    if not x then
+        return false
+    end
+    return true
+end
+"#;
+        let analysis = analyze_file(source, Language::Lua);
+        assert_eq!(analysis.function_count, 1);
+        // The function has an early return in a conditional at the start
+        assert!(
+            analysis.early_return_count <= 1,
+            "Expected 0 or 1 early return, got {}",
+            analysis.early_return_count
+        );
+    }
+
+    #[test]
+    fn test_analyze_lua_magic_numbers() {
+        let source = r#"
+function calc(x)
+    local a = x * 42
+    local b = a + 100
+    return b / 3.14
+end
+"#;
+        let analysis = analyze_file(source, Language::Lua);
+        assert_eq!(analysis.function_count, 1);
+        // Should detect some magic numbers (42, 100, 3.14)
+        assert!(
+            analysis.magic_number_count >= 1,
+            "Expected at least 1 magic number, got {}",
+            analysis.magic_number_count
+        );
+    }
+
+    #[test]
+    fn test_analyze_lua_multiple_naming_styles() {
+        let source = r#"
+function snake_case_func()
+    return 1
+end
+
+function camelCaseFunc()
+    return 2
+end
+
+function PascalCaseFunc()
+    return 3
+end
+"#;
+        let analysis = analyze_file(source, Language::Lua);
+        assert_eq!(analysis.function_count, 3);
+        // Should detect different naming styles
+        assert!(analysis.snake_case_functions >= 1);
+        assert!(analysis.camel_case_functions >= 1);
+    }
+
+    #[test]
+    fn test_analyze_lua_no_type_nodes() {
+        // Lua has no type declarations, so pascal_case_types and other_case_types should be 0
+        let source = r#"
+function setup()
+    local MyTable = {}
+    return MyTable
+end
+"#;
+        let analysis = analyze_file(source, Language::Lua);
+        assert_eq!(
+            analysis.pascal_case_types, 0,
+            "Lua should have no type declarations"
+        );
+        assert_eq!(analysis.other_case_types, 0);
+    }
+
+    #[test]
+    fn test_aggregate_mixed_with_new_languages() {
+        let lua_analysis = analyze_file(
+            r#"
+function process(x)
+    if x > 0 then
+        return x * 2
+    end
+    return 0
+end
+
+function helper()
+    return 42
+end
+"#,
+            Language::Lua,
+        );
+
+        let json_analysis = analyze_file(
+            r#"{"scripts": {"build": "tsc", "test": "jest"}}"#,
+            Language::Json,
+        );
+
+        let yaml_analysis = analyze_file(
+            "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+            Language::Yaml,
+        );
+
+        let dockerfile_analysis = analyze_file(
+            "FROM rust:1.75\nWORKDIR /app\nRUN cargo build\n",
+            Language::Dockerfile,
+        );
+
+        let rust_analysis = analyze_file(
+            r#"
+fn main() {
+    println!("hello");
+}
+"#,
+            Language::Rust,
+        );
+
+        let summary = aggregate(&[
+            lua_analysis,
+            json_analysis,
+            yaml_analysis,
+            dockerfile_analysis,
+            rust_analysis,
+        ]);
+
+        // Should count functions from Lua and Rust only
+        assert!(
+            summary.total_functions >= 3,
+            "Expected at least 3 functions (2 Lua + 1 Rust), got {}",
+            summary.total_functions
+        );
+
+        // Average function length should be positive
+        assert!(summary.avg_function_length > 0.0);
+    }
+
+    #[test]
+    fn test_aggregate_only_data_formats() {
+        let json_analysis = analyze_file(r#"{"key": "value"}"#, Language::Json);
+        let yaml_analysis = analyze_file("key: value\n", Language::Yaml);
+
+        let summary = aggregate(&[json_analysis, yaml_analysis]);
+        assert_eq!(summary.total_functions, 0);
+        assert_eq!(summary.early_return_pct, 0.0);
+        assert_eq!(summary.avg_function_length, 0.0);
+    }
+
+    #[test]
+    fn test_analyze_json_does_not_track_const_let() {
+        // JSON should not detect const/let declarations
+        let source = r#"{"const": "value", "let": "other"}"#;
+        let analysis = analyze_file(source, Language::Json);
+        assert_eq!(analysis.const_declarations, 0);
+        assert_eq!(analysis.let_declarations, 0);
+    }
+
+    #[test]
+    fn test_analyze_yaml_does_not_track_error_handling() {
+        let source = "error: handling\nunwrap: true\nexpect: false\n";
+        let analysis = analyze_file(source, Language::Yaml);
+        assert_eq!(analysis.question_mark_ops, 0);
+        assert_eq!(analysis.unwrap_calls, 0);
+        assert_eq!(analysis.expect_calls, 0);
     }
 }

@@ -21,6 +21,10 @@ pub enum Language {
     Kotlin,
     CSharp,
     Dart,
+    Yaml,
+    Json,
+    Dockerfile,
+    Lua,
 }
 
 impl Language {
@@ -42,6 +46,10 @@ impl Language {
             Self::Kotlin => "Kotlin",
             Self::CSharp => "C#",
             Self::Dart => "Dart",
+            Self::Yaml => "YAML",
+            Self::Json => "JSON",
+            Self::Dockerfile => "Dockerfile",
+            Self::Lua => "Lua",
         }
     }
 
@@ -63,6 +71,17 @@ impl Language {
             "kt" | "kts" => Some(Self::Kotlin),
             "cs" => Some(Self::CSharp),
             "dart" => Some(Self::Dart),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "json" => Some(Self::Json),
+            "lua" => Some(Self::Lua),
+            _ => None,
+        }
+    }
+
+    /// Infer language from a filename (for extensionless files like `Dockerfile`).
+    pub fn from_filename(name: &str) -> Option<Self> {
+        match name {
+            "Dockerfile" => Some(Self::Dockerfile),
             _ => None,
         }
     }
@@ -216,6 +235,10 @@ mod tests {
         assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
         assert_eq!(Language::from_extension("cs"), Some(Language::CSharp));
         assert_eq!(Language::from_extension("dart"), Some(Language::Dart));
+        assert_eq!(Language::from_extension("yaml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("yml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("json"), Some(Language::Json));
+        assert_eq!(Language::from_extension("lua"), Some(Language::Lua));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -244,6 +267,124 @@ mod tests {
         assert_eq!(Language::TypeScript.to_string(), "TypeScript");
         assert_eq!(Language::CSharp.to_string(), "C#");
         assert_eq!(Language::Dart.to_string(), "Dart");
+        assert_eq!(Language::Yaml.to_string(), "YAML");
+        assert_eq!(Language::Json.to_string(), "JSON");
+        assert_eq!(Language::Dockerfile.to_string(), "Dockerfile");
+        assert_eq!(Language::Lua.to_string(), "Lua");
+    }
+
+    #[test]
+    fn test_language_from_filename() {
+        assert_eq!(
+            Language::from_filename("Dockerfile"),
+            Some(Language::Dockerfile)
+        );
+        assert_eq!(Language::from_filename("README.md"), None);
+    }
+
+    #[test]
+    fn test_language_from_filename_case_sensitive() {
+        // Only exact "Dockerfile" matches
+        assert_eq!(
+            Language::from_filename("Dockerfile"),
+            Some(Language::Dockerfile)
+        );
+        assert_eq!(Language::from_filename("dockerfile"), None);
+        assert_eq!(Language::from_filename("DOCKERFILE"), None);
+        assert_eq!(Language::from_filename("DockerFile"), None);
+    }
+
+    #[test]
+    fn test_language_from_filename_similar_names() {
+        // Files with "Dockerfile" as prefix + extension should NOT match
+        // (they have an extension so from_extension handles them, returning None)
+        assert_eq!(Language::from_filename("Dockerfile.dev"), None);
+        assert_eq!(Language::from_filename("Dockerfile.prod"), None);
+        assert_eq!(Language::from_filename("Makefile"), None);
+    }
+
+    #[test]
+    fn test_language_from_extension_yaml_aliases() {
+        assert_eq!(Language::from_extension("yaml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("yml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("YAML"), None); // case sensitive
+    }
+
+    #[test]
+    fn test_language_from_extension_all_new_extensions() {
+        assert_eq!(Language::from_extension("yaml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("yml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("json"), Some(Language::Json));
+        assert_eq!(Language::from_extension("lua"), Some(Language::Lua));
+    }
+
+    #[test]
+    fn test_language_as_str_new_languages() {
+        assert_eq!(Language::Yaml.as_str(), "YAML");
+        assert_eq!(Language::Json.as_str(), "JSON");
+        assert_eq!(Language::Dockerfile.as_str(), "Dockerfile");
+        assert_eq!(Language::Lua.as_str(), "Lua");
+    }
+
+    #[test]
+    fn test_language_serde_round_trip() {
+        // All language variants should serialize and deserialize correctly
+        let all_langs = [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Python,
+            Language::Go,
+            Language::Java,
+            Language::C,
+            Language::Cpp,
+            Language::Ruby,
+            Language::Php,
+            Language::Swift,
+            Language::Kotlin,
+            Language::CSharp,
+            Language::Dart,
+            Language::Yaml,
+            Language::Json,
+            Language::Dockerfile,
+            Language::Lua,
+        ];
+        for lang in all_langs {
+            let json = serde_json::to_string(&lang).unwrap();
+            let deserialized: Language = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                lang, deserialized,
+                "Round-trip failed for {:?}: serialized as {}",
+                lang, json
+            );
+        }
+    }
+
+    #[test]
+    fn test_language_serde_lowercase_names() {
+        // serde(rename_all = "lowercase") should produce lowercase JSON keys
+        let json = serde_json::to_string(&Language::Yaml).unwrap();
+        assert_eq!(json, r#""yaml""#);
+        let json = serde_json::to_string(&Language::Json).unwrap();
+        assert_eq!(json, r#""json""#);
+        let json = serde_json::to_string(&Language::Dockerfile).unwrap();
+        assert_eq!(json, r#""dockerfile""#);
+        let json = serde_json::to_string(&Language::Lua).unwrap();
+        assert_eq!(json, r#""lua""#);
+    }
+
+    #[test]
+    fn test_language_from_extension_returns_none_for_unknown() {
+        let unknown_exts = ["xml", "txt", "md", "toml", "ini", "cfg", "csv", "html", "css"];
+        for ext in unknown_exts {
+            assert_eq!(
+                Language::from_extension(ext),
+                None,
+                "Extension '{}' should return None",
+                ext
+            );
+        }
     }
 
     #[test]

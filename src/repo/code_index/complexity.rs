@@ -361,6 +361,11 @@ fn is_function_node(language: Language, node_type: &str) -> bool {
             node_type,
             "function_signature" | "method_signature" | "getter_signature" | "setter_signature"
         ),
+        Language::Lua => matches!(
+            node_type,
+            "function_declaration" | "local_function" | "function_definition_statement"
+        ),
+        Language::Json | Language::Yaml | Language::Dockerfile => false,
     }
 }
 
@@ -800,5 +805,381 @@ def fizzbuzz(n):
         assert!(agg.avg_file_size > 0.0);
         assert!(agg.p50_file_size > 0.0);
         assert!(agg.p50_file_size <= agg.p95_file_size);
+    }
+
+    #[test]
+    fn test_lua_simple_function() {
+        let source = r#"
+function greet(name)
+    print("Hello, " .. name)
+end
+"#;
+        let result = analyze_file(source, Language::Lua, "greet.lua");
+        assert_eq!(result.function_count, 1);
+        assert_eq!(result.functions[0].cyclomatic, 1);
+    }
+
+    #[test]
+    fn test_lua_branching_function() {
+        let source = r#"
+function classify(x)
+    if x > 0 then
+        if x > 100 then
+            return "big"
+        else
+            return "small"
+        end
+    else
+        return "negative"
+    end
+end
+"#;
+        let result = analyze_file(source, Language::Lua, "classify.lua");
+        assert_eq!(result.function_count, 1);
+        assert!(
+            result.functions[0].cyclomatic > 1,
+            "Expected cyclomatic > 1 for branching Lua function, got {}",
+            result.functions[0].cyclomatic
+        );
+    }
+
+    #[test]
+    fn test_lua_multiple_functions() {
+        let source = r#"
+function foo()
+    return 1
+end
+
+local function bar(x)
+    if x then
+        return true
+    end
+    return false
+end
+
+function baz()
+    return 3
+end
+"#;
+        let result = analyze_file(source, Language::Lua, "multi.lua");
+        assert_eq!(result.function_count, 3);
+    }
+
+    #[test]
+    fn test_lua_loop_complexity() {
+        let source = r#"
+function process(items)
+    for i = 1, #items do
+        if items[i] > 0 then
+            print(items[i])
+        end
+    end
+end
+"#;
+        let result = analyze_file(source, Language::Lua, "loop.lua");
+        assert_eq!(result.function_count, 1);
+        assert!(
+            result.functions[0].cyclomatic > 1,
+            "Expected cyclomatic > 1 for loop + branch, got {}",
+            result.functions[0].cyclomatic
+        );
+        assert!(
+            result.functions[0].max_nesting >= 1,
+            "Expected nesting >= 1, got {}",
+            result.functions[0].max_nesting
+        );
+    }
+
+    #[test]
+    fn test_lua_empty_file() {
+        let source = "-- just a comment\nlocal x = 42\n";
+        let result = analyze_file(source, Language::Lua, "empty.lua");
+        assert_eq!(result.function_count, 0);
+        assert!(result.functions.is_empty());
+        assert!(result.total_lines > 0);
+    }
+
+    #[test]
+    fn test_json_complexity_returns_no_functions() {
+        let source = r#"
+{
+    "name": "my-package",
+    "version": "1.0.0",
+    "scripts": {
+        "build": "tsc",
+        "test": "jest"
+    }
+}
+"#;
+        let result = analyze_file(source, Language::Json, "package.json");
+        assert_eq!(result.function_count, 0);
+        assert!(result.functions.is_empty());
+        assert!(result.total_lines > 0);
+        assert_eq!(result.avg_cyclomatic, 0.0);
+        assert_eq!(result.max_cyclomatic, 0.0);
+    }
+
+    #[test]
+    fn test_json_empty_object() {
+        let source = "{}";
+        let result = analyze_file(source, Language::Json, "empty.json");
+        assert_eq!(result.function_count, 0);
+        assert_eq!(result.total_lines, 1);
+    }
+
+    #[test]
+    fn test_yaml_complexity_returns_no_functions() {
+        let source = r#"
+name: CI
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test
+"#;
+        let result = analyze_file(source, Language::Yaml, "ci.yaml");
+        assert_eq!(result.function_count, 0);
+        assert!(result.functions.is_empty());
+        assert!(result.total_lines > 0);
+        assert_eq!(result.avg_cyclomatic, 0.0);
+    }
+
+    #[test]
+    fn test_yaml_simple_config() {
+        let source = "host: localhost\nport: 5432\n";
+        let result = analyze_file(source, Language::Yaml, "config.yml");
+        assert_eq!(result.function_count, 0);
+        assert_eq!(result.total_lines, 2);
+    }
+
+    #[test]
+    fn test_dockerfile_complexity_returns_no_functions() {
+        // Dockerfile has no tree-sitter grammar — should return basic file metrics only
+        let source = r#"
+FROM rust:1.75-slim as builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+COPY --from=builder /app/target/release/app /usr/local/bin/
+CMD ["app"]
+"#;
+        let result = analyze_file(source, Language::Dockerfile, "Dockerfile");
+        assert_eq!(result.function_count, 0);
+        assert!(result.functions.is_empty());
+        assert!(result.total_lines > 0);
+        assert_eq!(result.avg_cyclomatic, 0.0);
+        assert_eq!(result.max_cyclomatic, 0.0);
+        assert_eq!(result.avg_func_length, 0.0);
+    }
+
+    #[test]
+    fn test_aggregate_with_data_format_files() {
+        // Mixing real code files with data format files
+        let lua_file = analyze_file(
+            r#"
+function hello()
+    print("hello")
+end
+"#,
+            Language::Lua,
+            "hello.lua",
+        );
+
+        let json_file = analyze_file(
+            r#"{"key": "value"}"#,
+            Language::Json,
+            "config.json",
+        );
+
+        let yaml_file = analyze_file(
+            "key: value\n",
+            Language::Yaml,
+            "config.yaml",
+        );
+
+        let dockerfile = analyze_file(
+            "FROM rust:1.75\nRUN cargo build\n",
+            Language::Dockerfile,
+            "Dockerfile",
+        );
+
+        let agg = aggregate(&[lua_file, json_file, yaml_file, dockerfile]);
+        assert_eq!(agg.total_files, 4);
+        // Only the Lua file has functions
+        assert!(agg.total_functions >= 1);
+        assert!(agg.total_lines > 0);
+    }
+
+    #[test]
+    fn test_lua_deeply_nested_function() {
+        let source = r#"
+function deep(x)
+    if x > 0 then
+        for i = 1, x do
+            if i % 2 == 0 then
+                while i > 1 do
+                    i = i - 1
+                end
+            end
+        end
+    end
+end
+"#;
+        let result = analyze_file(source, Language::Lua, "deep.lua");
+        assert_eq!(result.function_count, 1);
+        assert!(
+            result.functions[0].max_nesting >= 2,
+            "Expected deep nesting >= 2, got {}",
+            result.functions[0].max_nesting
+        );
+        assert!(
+            result.functions[0].cyclomatic > 2,
+            "Expected cyclomatic > 2 for deeply nested code, got {}",
+            result.functions[0].cyclomatic
+        );
+    }
+
+    #[test]
+    fn test_lua_function_with_logical_operators() {
+        let source = r#"
+function check(a, b, c)
+    if a and b then
+        return true
+    end
+    if a or c then
+        return true
+    end
+    return false
+end
+"#;
+        let result = analyze_file(source, Language::Lua, "logical.lua");
+        assert_eq!(result.function_count, 1);
+        // if + and + if + or = at least 4 decision points on top of base 1
+        assert!(
+            result.functions[0].cyclomatic >= 3,
+            "Expected cyclomatic >= 3 with logical operators, got {}",
+            result.functions[0].cyclomatic
+        );
+    }
+
+    #[test]
+    fn test_lua_function_line_count() {
+        let source = r#"
+function short()
+    return 1
+end
+
+function medium(x)
+    local a = x + 1
+    local b = a * 2
+    local c = b - 3
+    local d = c / 4
+    return d
+end
+"#;
+        let result = analyze_file(source, Language::Lua, "lines.lua");
+        assert_eq!(result.function_count, 2);
+
+        let short = &result.functions[0];
+        let medium = &result.functions[1];
+        assert!(
+            medium.line_count > short.line_count,
+            "Medium function ({} lines) should be longer than short ({} lines)",
+            medium.line_count,
+            short.line_count
+        );
+        assert!(result.avg_func_length > 0.0);
+        assert!(result.max_func_length >= medium.line_count as f64);
+    }
+
+    #[test]
+    fn test_lua_local_function_complexity() {
+        let source = r#"
+local function process(items)
+    local results = {}
+    for _, item in ipairs(items) do
+        if item.valid then
+            if item.priority > 5 then
+                table.insert(results, item)
+            end
+        end
+    end
+    return results
+end
+"#;
+        let result = analyze_file(source, Language::Lua, "local.lua");
+        assert_eq!(result.function_count, 1);
+        assert!(
+            result.functions[0].cyclomatic > 1,
+            "Expected cyclomatic > 1, got {}",
+            result.functions[0].cyclomatic
+        );
+    }
+
+    #[test]
+    fn test_json_preserves_total_lines() {
+        let source = "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3\n}\n";
+        let result = analyze_file(source, Language::Json, "small.json");
+        assert_eq!(result.total_lines, 5);
+        assert_eq!(result.function_count, 0);
+        assert_eq!(result.avg_cyclomatic, 0.0);
+    }
+
+    #[test]
+    fn test_yaml_preserves_total_lines() {
+        let source = "a: 1\nb: 2\nc: 3\nd: 4\n";
+        let result = analyze_file(source, Language::Yaml, "small.yml");
+        assert_eq!(result.total_lines, 4);
+        assert_eq!(result.function_count, 0);
+    }
+
+    #[test]
+    fn test_dockerfile_preserves_total_lines() {
+        let source = "FROM alpine\nRUN echo hello\nCMD sleep 1\n";
+        let result = analyze_file(source, Language::Dockerfile, "Dockerfile");
+        assert_eq!(result.total_lines, 3);
+        assert_eq!(result.function_count, 0);
+    }
+
+    #[test]
+    fn test_data_format_complexity_all_zero() {
+        for (lang, src, path) in [
+            (Language::Json, r#"{"key": "value"}"#, "test.json"),
+            (Language::Yaml, "key: value\n", "test.yml"),
+            (Language::Dockerfile, "FROM alpine\n", "Dockerfile"),
+        ] {
+            let result = analyze_file(src, lang, path);
+            assert_eq!(
+                result.function_count, 0,
+                "{:?} should have 0 functions",
+                lang
+            );
+            assert_eq!(
+                result.avg_cyclomatic, 0.0,
+                "{:?} should have 0 avg cyclomatic",
+                lang
+            );
+            assert_eq!(
+                result.max_cyclomatic, 0.0,
+                "{:?} should have 0 max cyclomatic",
+                lang
+            );
+            assert_eq!(
+                result.avg_func_length, 0.0,
+                "{:?} should have 0 avg func length",
+                lang
+            );
+            assert_eq!(
+                result.avg_nesting, 0.0,
+                "{:?} should have 0 avg nesting",
+                lang
+            );
+        }
     }
 }

@@ -558,4 +558,526 @@ fun main(args: Array<String>) {
         assert_eq!(symbols[0].start_line, 1);
         assert_eq!(symbols[0].end_line, 1);
     }
+
+    #[test]
+    fn test_parse_lua_global_function() {
+        let src = r#"
+function greet(name)
+    print("Hello, " .. name)
+end
+"#;
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "greet.lua");
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].symbol_name, "greet");
+        assert_eq!(symbols[0].symbol_kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_lua_local_function() {
+        let src = r#"
+local function add(a, b)
+    return a + b
+end
+"#;
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "math.lua");
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].symbol_name, "add");
+        assert_eq!(symbols[0].symbol_kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_lua_multiple_functions() {
+        let src = r#"
+function setup()
+    print("setup")
+end
+
+local function helper(x)
+    return x * 2
+end
+
+function teardown()
+    print("teardown")
+end
+"#;
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "test.lua");
+
+        let names: Vec<&str> = symbols.iter().map(|s| s.symbol_name.as_str()).collect();
+        assert!(names.contains(&"setup"), "names = {:?}", names);
+        assert!(names.contains(&"helper"), "names = {:?}", names);
+        assert!(names.contains(&"teardown"), "names = {:?}", names);
+        assert_eq!(
+            symbols
+                .iter()
+                .filter(|s| s.symbol_kind == SymbolKind::Function)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_parse_lua_empty_file() {
+        let src = "-- just a comment\n";
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "empty.lua");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_lua_function_with_body() {
+        let src = r#"
+function factorial(n)
+    if n <= 1 then
+        return 1
+    end
+    return n * factorial(n - 1)
+end
+"#;
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "fact.lua");
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].symbol_name, "factorial");
+        assert!(symbols[0].start_line >= 1);
+        assert!(symbols[0].end_line > symbols[0].start_line);
+    }
+
+    #[test]
+    fn test_parse_lua_nested_functions() {
+        let src = r#"
+function outer()
+    local function inner()
+        return 42
+    end
+    return inner()
+end
+"#;
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "nested.lua");
+
+        let names: Vec<&str> = symbols.iter().map(|s| s.symbol_name.as_str()).collect();
+        assert!(names.contains(&"outer"), "names = {:?}", names);
+        assert!(names.contains(&"inner"), "names = {:?}", names);
+    }
+
+    #[test]
+    fn test_parse_json_produces_no_symbols() {
+        let src = r#"
+{
+    "name": "test-package",
+    "version": "1.0.0",
+    "dependencies": {
+        "express": "^4.18.0"
+    }
+}
+"#;
+        let tree = parse_file(src, Language::Json).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Json, 1, "package.json");
+        assert!(
+            symbols.is_empty(),
+            "JSON should not produce any symbols, got: {:?}",
+            symbols.iter().map(|s| &s.symbol_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_parse_json_empty_object() {
+        let src = "{}";
+        let tree = parse_file(src, Language::Json).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Json, 1, "empty.json");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_array() {
+        let src = r#"[1, 2, 3, "four", null, true]"#;
+        let tree = parse_file(src, Language::Json).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Json, 1, "array.json");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_nested_complex() {
+        let src = r#"
+{
+    "compilerOptions": {
+        "target": "ES2020",
+        "module": "commonjs",
+        "strict": true,
+        "paths": {
+            "@/*": ["./src/*"]
+        }
+    },
+    "include": ["src/**/*"],
+    "exclude": ["node_modules"]
+}
+"#;
+        let tree = parse_file(src, Language::Json).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Json, 1, "tsconfig.json");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yaml_produces_no_symbols() {
+        let src = r#"
+name: CI
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test
+"#;
+        let tree = parse_file(src, Language::Yaml).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Yaml, 1, "ci.yaml");
+        assert!(
+            symbols.is_empty(),
+            "YAML should not produce any symbols, got: {:?}",
+            symbols.iter().map(|s| &s.symbol_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_parse_yaml_simple_key_value() {
+        let src = "key: value\nother: 123\n";
+        let tree = parse_file(src, Language::Yaml).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Yaml, 1, "config.yml");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yaml_nested_structure() {
+        let src = r#"
+database:
+  host: localhost
+  port: 5432
+  credentials:
+    username: admin
+    password: secret
+  replicas:
+    - host: replica1
+      port: 5433
+    - host: replica2
+      port: 5434
+"#;
+        let tree = parse_file(src, Language::Yaml).unwrap();
+        let symbols =
+            extract_symbols(&tree, src.as_bytes(), Language::Yaml, 1, "database.yaml");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dockerfile_returns_error() {
+        let src = r#"
+FROM rust:1.75 as builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+"#;
+        let result = parse_file(src, Language::Dockerfile);
+        assert!(
+            result.is_err(),
+            "Dockerfile should fail to parse (no grammar available)"
+        );
+    }
+
+    #[test]
+    fn test_parse_lua_method_syntax() {
+        // Lua obj:method() syntax
+        let src = r#"
+local M = {}
+
+function M:init(config)
+    self.config = config
+    return self
+end
+
+function M:run()
+    print("running")
+end
+"#;
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "module.lua");
+        // These should still be detected as functions
+        assert!(
+            symbols.len() >= 2,
+            "Expected at least 2 functions from colon-syntax, got {} symbols: {:?}",
+            symbols.len(),
+            symbols.iter().map(|s| &s.symbol_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_parse_lua_varargs() {
+        let src = r#"
+function printf(fmt, ...)
+    print(string.format(fmt, ...))
+end
+"#;
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "varargs.lua");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].symbol_name, "printf");
+    }
+
+    #[test]
+    fn test_parse_lua_multiline_function() {
+        let src = r#"
+function create_matrix(rows, cols)
+    local matrix = {}
+    for i = 1, rows do
+        matrix[i] = {}
+        for j = 1, cols do
+            matrix[i][j] = 0
+        end
+    end
+    return matrix
+end
+"#;
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "matrix.lua");
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].symbol_name, "create_matrix");
+        // Function spans multiple lines
+        assert!(
+            symbols[0].end_line > symbols[0].start_line + 3,
+            "Expected multiline function, start={} end={}",
+            symbols[0].start_line,
+            symbols[0].end_line
+        );
+    }
+
+    #[test]
+    fn test_parse_lua_line_numbers() {
+        let src = "function foo() end\n";
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "test.lua");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].start_line, 1, "Lua line numbers should be 1-indexed");
+    }
+
+    #[test]
+    fn test_parse_lua_signature_extraction() {
+        let src = r#"
+function calculate(a, b, op)
+    if op == "add" then
+        return a + b
+    end
+    return 0
+end
+"#;
+        let tree = parse_file(src, Language::Lua).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "calc.lua");
+        assert_eq!(symbols.len(), 1);
+        // Signature should exist and contain the function name
+        if let Some(ref sig) = symbols[0].signature {
+            assert!(
+                sig.contains("calculate"),
+                "Signature should contain function name, got: {}",
+                sig
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_json_with_all_types() {
+        let src = r#"
+{
+    "string": "hello",
+    "number": 42,
+    "float": 3.14,
+    "boolean_true": true,
+    "boolean_false": false,
+    "null_value": null,
+    "array": [1, "two", null],
+    "nested": {
+        "deep": {
+            "value": "found"
+        }
+    }
+}
+"#;
+        let tree = parse_file(src, Language::Json).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Json, 1, "types.json");
+        assert!(symbols.is_empty(), "No JSON node types should produce symbols");
+    }
+
+    #[test]
+    fn test_parse_json_large_array() {
+        let items: Vec<String> = (0..50).map(|i| format!(r#"{{"id": {}, "name": "item{}"}}"#, i, i)).collect();
+        let src = format!("[\n{}\n]", items.join(",\n"));
+        let tree = parse_file(&src, Language::Json).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Json, 1, "large.json");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_tsconfig() {
+        let src = r#"
+{
+    "compilerOptions": {
+        "target": "ES2020",
+        "module": "commonjs",
+        "lib": ["ES2020", "DOM"],
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "forceConsistentCasingInFileNames": true,
+        "resolveJsonModule": true,
+        "declaration": true,
+        "declarationMap": true,
+        "sourceMap": true,
+        "outDir": "./dist",
+        "rootDir": "./src",
+        "paths": {
+            "@/*": ["./src/*"],
+            "@components/*": ["./src/components/*"]
+        }
+    },
+    "include": ["src/**/*", "tests/**/*"],
+    "exclude": ["node_modules", "dist"]
+}
+"#;
+        let tree = parse_file(src, Language::Json).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Json, 1, "tsconfig.json");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yaml_github_actions_complex() {
+        let src = r#"
+name: Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - uses: softprops/action-gh-release@v1
+        with:
+          files: target/${{ matrix.target }}/release/myapp
+"#;
+        let tree = parse_file(src, Language::Yaml).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Yaml, 1, "release.yml");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yaml_multiline_strings() {
+        let src = r#"
+description: |
+  This is a multiline
+  string value that spans
+  multiple lines.
+folded: >
+  This is a folded
+  string that will be
+  joined into one line.
+literal: |
+  fn main() {
+      println!("code in yaml");
+  }
+"#;
+        let tree = parse_file(src, Language::Yaml).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Yaml, 1, "multi.yaml");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yaml_anchors_and_aliases() {
+        let src = r#"
+defaults: &defaults
+  adapter: postgres
+  host: localhost
+
+development:
+  database: myapp_dev
+  <<: *defaults
+
+test:
+  database: myapp_test
+  <<: *defaults
+"#;
+        let tree = parse_file(src, Language::Yaml).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Yaml, 1, "db.yaml");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yaml_empty_document() {
+        let src = "---\n...\n";
+        let tree = parse_file(src, Language::Yaml).unwrap();
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Yaml, 1, "empty.yaml");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_all_grammar_languages_can_parse_empty_string() {
+        // Every language with a grammar should handle empty input gracefully
+        for lang in [
+            Language::Rust,
+            Language::TypeScript,
+            Language::JavaScript,
+            Language::Python,
+            Language::Go,
+            Language::Java,
+            Language::C,
+            Language::Cpp,
+            Language::Ruby,
+            Language::Php,
+            Language::Swift,
+            Language::Kotlin,
+            Language::CSharp,
+            Language::Json,
+            Language::Yaml,
+            Language::Lua,
+        ] {
+            let tree = parse_file("", lang).unwrap();
+            let symbols = extract_symbols(&tree, b"", lang, 1, "empty");
+            assert!(
+                symbols.is_empty(),
+                "{:?} should produce no symbols for empty input",
+                lang
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_grammar_languages_return_error() {
+        for lang in [Language::Dart, Language::Dockerfile] {
+            let result = parse_file("some content", lang);
+            assert!(
+                result.is_err(),
+                "{:?} should return error (no grammar)",
+                lang
+            );
+        }
+    }
 }
