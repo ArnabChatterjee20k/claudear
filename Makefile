@@ -17,7 +17,7 @@ endif
 .PHONY: all build build-release install uninstall clean test test-all test-prod-e2e lint fmt check \
         dashboard dashboard-build dashboard-dev dashboard-test \
         docker docker-build docker-up docker-down docker-logs docker-clean \
-        dev run help
+        dev dev-all run help
 
 # Default target
 all: build
@@ -149,6 +149,10 @@ docker-dev:
 ## dev: Run the CLI in development mode with hot reload
 dev:
 	$(CARGO) watch -x run
+
+## dev-all: Run API and dashboard dev servers concurrently with hot reload
+dev-all: dashboard
+	$(CARGO) watch -x run & cd dashboard && $(BUN) run dev & wait
 
 ## run: Run the CLI (debug build)
 run: build

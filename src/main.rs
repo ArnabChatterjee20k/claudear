@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use claudear::{
     api::ApiServer,
     config::Config,
-    feedback::{EmbeddingClient, EmbeddingConfig, IssueEmbeddingService},
+    feedback::{EmbeddingClient, IssueEmbeddingService},
     github::GitHubClient,
     housekeeping::HousekeepingWorker,
     ipc::{default_socket_path, is_daemon_running, print_response, IpcClient, IpcServer},
@@ -619,20 +619,17 @@ fn print_startup_banner_and_status(
 
 /// Build an `IssueEmbeddingService` for semantic dedup and context enrichment.
 ///
-/// Returns `None` if the embedding model fails to load, allowing graceful degradation.
+/// Returns `None` if no embedding client is provided, allowing graceful degradation.
 fn build_issue_embedding_service(
     tracker: &Arc<dyn FixAttemptTracker>,
+    embedding_client: Option<&Arc<EmbeddingClient>>,
 ) -> Option<Arc<IssueEmbeddingService>> {
-    match EmbeddingClient::new(EmbeddingConfig::default()) {
-        Ok(client) => Some(Arc::new(IssueEmbeddingService::with_defaults(
-            Arc::new(client),
+    embedding_client.map(|client| {
+        Arc::new(IssueEmbeddingService::with_defaults(
+            client.clone(),
             tracker.clone(),
-        ))),
-        Err(e) => {
-            tracing::warn!(error = %e, "Issue embedding service unavailable");
-            None
-        }
-    }
+        ))
+    })
 }
 
 /// Common dependencies needed to construct a [`Watcher`].
@@ -645,7 +642,7 @@ struct WatcherDeps {
     github_client: Option<GitHubClient>,
     relationships: Option<RepoRelationships>,
     inferrer: Option<claudear::inference::RepoInferrer>,
-    embedding_client: Option<EmbeddingClient>,
+    embedding_client: Option<Arc<EmbeddingClient>>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<claudear::repo::code_index::CodeSearchService>>,
@@ -708,20 +705,17 @@ async fn build_watcher_deps(
         None
     };
 
-    // Issue embedding service for semantic dedup
-    let issue_embedding_service = build_issue_embedding_service(tracker);
+    // Issue embedding service for semantic dedup (reuse shared embedding client)
+    let issue_embedding_service = build_issue_embedding_service(tracker, embedding_client.as_ref());
 
-    // Code search service for enriching issues with relevant code context
+    // Code search service for enriching issues with relevant code context (reuse shared embedding client)
     let code_search_service = if config.code_index.enabled {
-        match EmbeddingClient::new(EmbeddingConfig::default()) {
-            Ok(emb) => Some(Arc::new(
-                claudear::repo::code_index::CodeSearchService::new(tracker.clone(), Arc::new(emb)),
-            )),
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to create embedding client for code search");
-                None
-            }
-        }
+        embedding_client.as_ref().map(|emb| {
+            Arc::new(claudear::repo::code_index::CodeSearchService::new(
+                tracker.clone(),
+                emb.clone(),
+            ))
+        })
     } else {
         None
     };
@@ -2470,7 +2464,7 @@ async fn async_main() -> anyhow::Result<()> {
             notifier: notifier.clone(),
             tracker: tracker.clone(),
             inferrer: deps.inferrer.clone(),
-            embedding_client: deps.embedding_client,
+            embedding_client: deps.embedding_client.clone(),
             review_watcher: deps.review_watcher.clone(),
             issue_embedding_service: deps.issue_embedding_service.clone(),
             code_search_service: deps.code_search_service.clone(),
@@ -2586,6 +2580,7 @@ async fn async_main() -> anyhow::Result<()> {
         let ipc_future = ipc_server.start();
 
         let inferrer_clone = deps.inferrer.clone();
+        let embedding_client_clone = deps.embedding_client.clone();
         let github_webhook_handler_for_http = github_webhook_handler;
         let review_watcher_clone = deps.review_watcher.clone();
         let issue_embedding_service_clone = deps.issue_embedding_service.clone();
@@ -2611,6 +2606,7 @@ async fn async_main() -> anyhow::Result<()> {
                     github_webhook_handler_for_http,
                     agent_clone,
                 );
+                server.set_embedding_client(embedding_client_clone);
                 server.set_issue_embedding_service(issue_embedding_service_clone);
                 server.set_code_search_service(code_search_service_clone);
                 server.set_review_watcher(review_watcher_clone);
@@ -2942,17 +2938,16 @@ async fn async_main() -> anyhow::Result<()> {
         // Create ReviewWatcher for PR review tracking
         let review_watcher = create_review_watcher(&config, tracker.clone());
 
-        let issue_embedding_service = build_issue_embedding_service(&tracker);
+        let issue_embedding_service =
+            build_issue_embedding_service(&tracker, embedding_client.as_ref());
 
         let code_search_service = if config.code_index.enabled {
-            EmbeddingClient::new(EmbeddingConfig::default())
-                .ok()
-                .map(|emb| {
-                    Arc::new(claudear::repo::code_index::CodeSearchService::new(
-                        tracker.clone(),
-                        Arc::new(emb),
-                    ))
-                })
+            embedding_client.as_ref().map(|emb| {
+                Arc::new(claudear::repo::code_index::CodeSearchService::new(
+                    tracker.clone(),
+                    emb.clone(),
+                ))
+            })
         } else {
             None
         };
@@ -3171,7 +3166,7 @@ async fn async_main() -> anyhow::Result<()> {
                 notifier: notifier.clone(),
                 tracker: tracker.clone(),
                 inferrer: deps.inferrer.clone(),
-                embedding_client: deps.embedding_client,
+                embedding_client: deps.embedding_client.clone(),
                 review_watcher: deps.review_watcher.clone(),
                 issue_embedding_service: deps.issue_embedding_service.clone(),
                 code_search_service: deps.code_search_service.clone(),
@@ -3195,6 +3190,7 @@ async fn async_main() -> anyhow::Result<()> {
                 github_webhook_handler,
                 deps.agent,
             );
+            server.set_embedding_client(deps.embedding_client.clone());
             server.set_issue_embedding_service(deps.issue_embedding_service);
             server.set_code_search_service(deps.code_search_service);
             server.set_review_watcher(deps.review_watcher);
@@ -3257,17 +3253,16 @@ async fn async_main() -> anyhow::Result<()> {
             // Create ReviewWatcher for PR review tracking
             let review_watcher = create_review_watcher(&config, tracker.clone());
 
-            let issue_embedding_service = build_issue_embedding_service(&tracker);
+            let issue_embedding_service =
+                build_issue_embedding_service(&tracker, embedding_client.as_ref());
 
             let code_search_service = if config.code_index.enabled {
-                EmbeddingClient::new(EmbeddingConfig::default())
-                    .ok()
-                    .map(|emb| {
-                        Arc::new(claudear::repo::code_index::CodeSearchService::new(
-                            tracker.clone(),
-                            Arc::new(emb),
-                        ))
-                    })
+                embedding_client.as_ref().map(|emb| {
+                    Arc::new(claudear::repo::code_index::CodeSearchService::new(
+                        tracker.clone(),
+                        emb.clone(),
+                    ))
+                })
             } else {
                 None
             };

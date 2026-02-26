@@ -41,7 +41,7 @@ pub struct WatcherOptions {
     pub notifier: Arc<dyn Notifier>,
     pub tracker: Arc<dyn FixAttemptTracker>,
     pub inferrer: Option<RepoInferrer>,
-    pub embedding_client: Option<crate::feedback::EmbeddingClient>,
+    pub embedding_client: Option<Arc<crate::feedback::EmbeddingClient>>,
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
@@ -62,7 +62,7 @@ pub struct Watcher {
     notifier: Arc<dyn Notifier>,
     tracker: Arc<dyn FixAttemptTracker>,
     inferrer: Option<RepoInferrer>,
-    embedding_client: Option<crate::feedback::EmbeddingClient>,
+    embedding_client: Option<Arc<crate::feedback::EmbeddingClient>>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
@@ -248,7 +248,7 @@ impl Watcher {
         github_client: Option<&crate::github::GitHubClient>,
     ) -> Result<(
         Option<RepoInferrer>,
-        Option<crate::feedback::EmbeddingClient>,
+        Option<Arc<crate::feedback::EmbeddingClient>>,
     )> {
         use crate::feedback::{EmbeddingClient, EmbeddingConfig};
         use crate::inference::build_repo_embeddings;
@@ -308,7 +308,7 @@ impl Watcher {
                             config.known_orgs.clone(),
                             config.auto_discover_paths.clone(),
                         );
-                        Ok((Some(inferrer), Some(client)))
+                        Ok((Some(inferrer), Some(Arc::new(client))))
                     }
                     Err(e) => {
                         tracing::warn!("Failed to build repo embeddings: {}, falling back to file-based inference", e);
@@ -468,14 +468,11 @@ impl Watcher {
         // Tree-sitter code indexing for all repos on disk
         if self.config.code_index.enabled {
             if let Some(inferrer) = &self.inferrer {
-                match crate::feedback::EmbeddingClient::new(
-                    crate::feedback::EmbeddingConfig::default(),
-                ) {
-                    Ok(emb_client) => {
-                        let emb_client = Arc::new(emb_client);
+                if let Some(ref emb_client) = self.embedding_client {
+                    {
                         let code_indexer = crate::repo::code_index::CodeIndexer::with_config(
                             self.tracker.clone(),
-                            emb_client,
+                            emb_client.clone(),
                             self.config.code_index.max_file_size_kb,
                             self.config.code_index.batch_size,
                         );
@@ -527,9 +524,8 @@ impl Watcher {
                             );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to initialize embedding client for code indexing");
-                    }
+                } else {
+                    tracing::warn!("Embedding client not available for code indexing");
                 }
             }
         }
@@ -3265,7 +3261,7 @@ Create a PR with your changes.{custom_instructions}"#,
             if self.config.ask.enabled {
                 let preload_query = format!("{} {}", issue.title, context);
                 let preload_norm = normalize_text(&preload_query);
-                let preload_embedding = embed_text(self.embedding_client.as_ref(), &preload_query).await;
+                let preload_embedding = embed_text(self.embedding_client.as_deref(), &preload_query).await;
                 match find_reusable_qa(
                     self.tracker.as_ref(),
                     &self.config.ask,
@@ -3335,7 +3331,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
                 let question_norm = normalize_text(&blocking_question.question);
                 let question_embedding =
-                    embed_text(self.embedding_client.as_ref(), &blocking_question.question).await;
+                    embed_text(self.embedding_client.as_deref(), &blocking_question.question).await;
 
                 let reusable = match find_reusable_qa(
                     self.tracker.as_ref(),
@@ -3457,7 +3453,7 @@ Create a PR with your changes.{custom_instructions}"#,
                         question_embedding: question_embedding.clone(),
                         answer_text: reply.answer.clone(),
                         answer_norm: normalize_text(&reply.answer),
-                        answer_embedding: embed_text(self.embedding_client.as_ref(), &reply.answer).await,
+                        answer_embedding: embed_text(self.embedding_client.as_deref(), &reply.answer).await,
                         channel: reply.channel.clone(),
                         responder: reply.responder.clone(),
                         correlation_id: ask_request.correlation_id.clone(),
@@ -4258,7 +4254,7 @@ Create a PR with your changes.{custom_instructions}"#,
         if learning.qa_promotion {
             match crate::learning::QaPromoter::scan_and_promote(
                 self.tracker.as_ref(),
-                self.embedding_client.as_ref(),
+                self.embedding_client.as_deref(),
                 learning.qa_promotion_threshold,
                 0.8,
             ) {

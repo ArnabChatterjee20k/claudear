@@ -56,7 +56,7 @@ struct AppState {
     tracker: Arc<dyn FixAttemptTracker>,
     sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
     inferrer: Option<RepoInferrer>,
-    embedding_client: Option<crate::feedback::EmbeddingClient>,
+    embedding_client: Option<Arc<crate::feedback::EmbeddingClient>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
@@ -88,6 +88,7 @@ pub struct WebhookServer {
     tracker: Arc<dyn FixAttemptTracker>,
     sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
     inferrer: Option<RepoInferrer>,
+    embedding_client: Option<Arc<crate::feedback::EmbeddingClient>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
     review_watcher: Option<Arc<ReviewWatcher>>,
@@ -139,6 +140,7 @@ impl WebhookServer {
             tracker,
             sqlite_tracker,
             inferrer,
+            embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
             review_watcher: None,
@@ -166,6 +168,11 @@ impl WebhookServer {
         self.review_watcher = watcher;
     }
 
+    /// Set the embedding client (shared across the application).
+    pub fn set_embedding_client(&mut self, client: Option<Arc<crate::feedback::EmbeddingClient>>) {
+        self.embedding_client = client;
+    }
+
     /// Build a repository inferrer from config.
     ///
     /// Delegates to `Watcher::build_inferrer` to avoid code duplication.
@@ -179,7 +186,7 @@ impl WebhookServer {
     /// Start the server.
     pub async fn start(self) -> Result<()> {
         let bind_address = self.config.bind_address.clone();
-        let embedding_client = crate::feedback::EmbeddingClient::from_env().ok();
+        let embedding_client = self.embedding_client;
         let user_registry = UserRegistry::new(self.config.users.clone());
 
         // Initialize FeedbackAnalyzer and warm-start with DB outcomes
@@ -1046,7 +1053,7 @@ async fn process_issue(
             let preload_query = format!("{} {}", issue.title, context);
             let preload_norm = normalize_text(&preload_query);
             let preload_embedding =
-                embed_text(state.embedding_client.as_ref(), &preload_query).await;
+                embed_text(state.embedding_client.as_deref(), &preload_query).await;
             match find_reusable_qa(
                 state.tracker.as_ref(),
                 &state.config.ask,
@@ -1128,7 +1135,7 @@ async fn process_issue(
 
             let question_norm = normalize_text(&blocking_question.question);
             let question_embedding =
-                embed_text(state.embedding_client.as_ref(), &blocking_question.question).await;
+                embed_text(state.embedding_client.as_deref(), &blocking_question.question).await;
             let reusable = match find_reusable_qa(
                 state.tracker.as_ref(),
                 &state.config.ask,
@@ -1252,7 +1259,7 @@ async fn process_issue(
                     question_embedding: question_embedding.clone(),
                     answer_text: reply.answer.clone(),
                     answer_norm: normalize_text(&reply.answer),
-                    answer_embedding: embed_text(state.embedding_client.as_ref(), &reply.answer)
+                    answer_embedding: embed_text(state.embedding_client.as_deref(), &reply.answer)
                         .await,
                     channel: reply.channel.clone(),
                     responder: reply.responder.clone(),

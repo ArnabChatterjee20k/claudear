@@ -93,7 +93,8 @@ impl EmbeddingClient {
     ///
     /// The first model is loaded and its actual memory footprint is measured
     /// via the drop in available system memory.  The pool size is then capped
-    /// so that total model memory stays within 50% of available RAM.
+    /// so that total model memory stays within 70% of available RAM, with a
+    /// floor of `nproc` instances to ensure adequate parallelism.
     pub fn new(config: EmbeddingConfig) -> Result<Self> {
         let dimension = match config.model {
             EmbeddingModel::NomicEmbedTextV15 => 768,
@@ -127,18 +128,21 @@ impl EmbeddingClient {
         let mem_after = sys.available_memory();
         let per_instance_bytes = mem_before.saturating_sub(mem_after);
 
-        // --- Cap pool size to 50% of available RAM --------------------------
+        // --- Pool size: 70% of available RAM or nproc, whichever is higher ---
+        let nproc = default_pool_size();
         let pool_size = if per_instance_bytes > 0 {
-            // Budget: 50% of the memory that was available *before* we loaded
+            // Budget: 70% of the memory that was available *before* we loaded
             // the first instance (so the first instance counts against it).
-            let budget = mem_before / 2;
-            let max_instances = (budget / per_instance_bytes).max(1) as usize;
-            let capped = desired_pool_size.min(max_instances);
+            let budget = mem_before * 7 / 10;
+            let max_from_memory = (budget / per_instance_bytes).max(1) as usize;
+            // Use whichever is higher: memory-budget instances or nproc.
+            let capped = max_from_memory.max(nproc);
             tracing::info!(
                 per_instance_mb = per_instance_bytes / (1024 * 1024),
                 available_mb = mem_before / (1024 * 1024),
                 budget_mb = budget / (1024 * 1024),
-                desired = desired_pool_size,
+                nproc = nproc,
+                max_from_memory = max_from_memory,
                 capped = capped,
                 "Measured ONNX model memory footprint"
             );
@@ -209,10 +213,11 @@ impl EmbeddingClient {
             return 32;
         }
 
-        // Conservative per-text memory estimate for ONNX attention tensors.
-        let mb_per_text: u64 = if dimension >= 768 { 10 } else { 5 };
+        // Per-text memory estimate for ONNX inference (attention scores,
+        // Q/K/V tensors, FFN intermediates, and runtime buffers).
+        let mb_per_text: u64 = if dimension >= 768 { 30 } else { 15 };
         let budget_mb = available_mb / 2;
-        (budget_mb / mb_per_text).clamp(4, 256) as usize
+        (budget_mb / mb_per_text).clamp(4, 64) as usize
     }
 
     /// Create with default configuration from environment.

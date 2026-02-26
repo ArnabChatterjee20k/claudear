@@ -127,7 +127,7 @@ pub struct AppComponents {
     pub notifier: Arc<dyn notifier::Notifier>,
     pub user_registry: UserRegistry,
     pub inferrer: Option<RepoInferrer>,
-    pub embedding_client: Option<EmbeddingClient>,
+    pub embedding_client: Option<Arc<EmbeddingClient>>,
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub agent: Arc<dyn runner::AgentRunner>,
@@ -158,8 +158,8 @@ pub async fn build_app(
     // Review watcher
     let review_watcher = build_review_watcher(&config, tracker.clone());
 
-    // Issue embedding service
-    let issue_embedding_service = build_embedding_service(&tracker);
+    // Issue embedding service (reuse shared embedding client)
+    let issue_embedding_service = build_embedding_service(&tracker, embedding_client.as_ref());
 
     // Agent runner
     let agent: Arc<dyn runner::AgentRunner> =
@@ -338,12 +338,12 @@ fn build_review_watcher(
 
 fn build_embedding_service(
     tracker: &Arc<dyn storage::FixAttemptTracker>,
+    embedding_client: Option<&Arc<EmbeddingClient>>,
 ) -> Option<Arc<IssueEmbeddingService>> {
-    match EmbeddingClient::new(EmbeddingConfig::default()) {
-        Ok(client) => Some(Arc::new(IssueEmbeddingService::with_defaults(
-            Arc::new(client),
+    embedding_client.map(|client| {
+        Arc::new(IssueEmbeddingService::with_defaults(
+            client.clone(),
             tracker.clone(),
-        ))),
-        Err(_) => None,
-    }
+        ))
+    })
 }
