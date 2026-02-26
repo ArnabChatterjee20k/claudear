@@ -58,6 +58,7 @@ struct AppState {
     inferrer: Option<RepoInferrer>,
     embedding_client: Option<crate::feedback::EmbeddingClient>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     user_registry: UserRegistry,
@@ -88,6 +89,7 @@ pub struct WebhookServer {
     sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
     inferrer: Option<RepoInferrer>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
+    code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     github_handler: Option<GitHubWebhookHandler>,
     agent: Arc<dyn AgentRunner>,
@@ -138,6 +140,7 @@ impl WebhookServer {
             sqlite_tracker,
             inferrer,
             issue_embedding_service: None,
+            code_search_service: None,
             review_watcher: None,
             github_handler,
             agent,
@@ -148,6 +151,14 @@ impl WebhookServer {
     /// Set the issue embedding service for semantic dedup and context enrichment.
     pub fn set_issue_embedding_service(&mut self, service: Option<Arc<IssueEmbeddingService>>) {
         self.issue_embedding_service = service;
+    }
+
+    /// Set the code search service for enriching issues with relevant code context.
+    pub fn set_code_search_service(
+        &mut self,
+        service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
+    ) {
+        self.code_search_service = service;
     }
 
     /// Set the review watcher for PR review tracking.
@@ -207,6 +218,7 @@ impl WebhookServer {
             inferrer: self.inferrer,
             embedding_client,
             issue_embedding_service: self.issue_embedding_service,
+            code_search_service: self.code_search_service,
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             review_watcher: self.review_watcher,
             user_registry,
@@ -989,6 +1001,44 @@ async fn process_issue(
             }
         }
 
+        // Enrich context with relevant code from the repository
+        if state.config.code_index.enabled {
+            if let Some(ref code_search) = state.code_search_service {
+                let query = crate::repo::code_index::build_code_search_query(&issue);
+                let repo_id = resolution.repo_id();
+                match code_search.search(&query, repo_id, 5).await {
+                    Ok(results) if !results.is_empty() => {
+                        let activity = ActivityLogEntry::new(
+                            "decision",
+                            format!(
+                                "{} code snippets added to context for {}",
+                                results.len(),
+                                issue.short_id
+                            ),
+                        )
+                        .with_source(source_name.to_string())
+                        .with_issue(issue.id.clone(), issue.short_id.clone())
+                        .with_metadata(json!({
+                            "decision": "code_search_context_added",
+                            "details": { "snippet_count": results.len() }
+                        }));
+                        state.tracker.record_activity(&activity).ok();
+
+                        let metric = ProcessingMetric::new("code_search_context_added", 1.0)
+                            .with_source(source_name.to_string());
+                        state.tracker.record_metric(&metric).ok();
+
+                        context = format!(
+                            "{}\n{}",
+                            context,
+                            crate::repo::code_index::format_code_search_context(&results)
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let repo_scope = resolution.repo_name().map(|v| v.to_string());
         let mut used_qa_ids: Vec<i64> = Vec::new();
 
@@ -1637,6 +1687,23 @@ fn enhance_prompt_with_learning(
         }
     }
 
+    // Cross-repo correlation context
+    if learning.cross_repo_correlation {
+        match crate::learning::CrossRepoCorrelator::get_active_insights(
+            state.tracker.as_ref(),
+            3,
+            learning.cross_repo_window_hours * 2,
+        ) {
+            Ok(insights) if !insights.is_empty() => {
+                let ctx = crate::learning::CrossRepoCorrelator::format_context(&insights);
+                if !ctx.is_empty() {
+                    extra_context.push_str(&ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+
     if extra_context.is_empty() {
         return base_prompt.to_string();
     }
@@ -2073,6 +2140,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2113,6 +2181,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2151,6 +2220,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2223,6 +2293,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2270,6 +2341,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2339,6 +2411,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2418,6 +2491,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2469,6 +2543,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2521,6 +2596,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2569,6 +2645,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2639,6 +2716,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2764,6 +2842,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2883,6 +2962,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2957,6 +3037,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2985,6 +3066,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -3020,6 +3102,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -3048,6 +3131,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -3075,6 +3159,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -3355,6 +3440,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4162,6 +4248,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4194,6 +4281,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4228,6 +4316,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4390,6 +4479,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4716,6 +4806,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4857,6 +4948,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4898,6 +4990,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5019,6 +5112,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5118,6 +5212,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5151,6 +5246,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5648,6 +5744,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5846,6 +5943,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5884,6 +5982,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5918,6 +6017,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5952,6 +6052,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5986,6 +6087,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6023,6 +6125,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6056,6 +6159,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6093,6 +6197,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6133,6 +6238,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6172,6 +6278,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6246,6 +6353,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6275,6 +6383,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6425,6 +6534,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6485,6 +6595,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6903,6 +7014,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -7096,6 +7208,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -7128,6 +7241,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -7344,6 +7458,7 @@ mod tests {
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
+            code_search_service: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -7402,5 +7517,140 @@ mod tests {
         let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
         // In-memory tracker has no data, so prompt should be unchanged
         assert_eq!(result, base);
+    }
+
+    // ================================================================
+    // set_code_search_service tests
+    // ================================================================
+
+    #[test]
+    fn test_webhook_server_set_code_search_service_none() {
+        let config = test_config();
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
+
+        assert!(server.code_search_service.is_none());
+        server.set_code_search_service(None);
+        assert!(server.code_search_service.is_none());
+    }
+
+    #[test]
+    fn test_webhook_server_set_code_search_service_then_clear() {
+        let config = test_config();
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let mut server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
+
+        // Initially None
+        assert!(server.code_search_service.is_none());
+
+        // Set to None explicitly
+        server.set_code_search_service(None);
+        assert!(server.code_search_service.is_none());
+    }
+
+    #[test]
+    fn test_webhook_server_code_search_service_initially_none() {
+        let config = test_config();
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let server = WebhookServer::new_with_github(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            None,
+            test_agent(tracker),
+        );
+
+        assert!(server.code_search_service.is_none());
+    }
+
+    // ================================================================
+    // enhance_prompt_with_learning: cross-repo correlation tests
+    // ================================================================
+
+    #[test]
+    fn test_enhance_prompt_cross_repo_correlation_enabled_no_data() {
+        let learning = LearningConfig {
+            cross_repo_correlation: true,
+            ..Default::default()
+        };
+        let state = make_app_state_for_learning(learning);
+        let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        let base = "base prompt";
+        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        // In-memory tracker has no cross-repo insights, so prompt should be unchanged
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn test_enhance_prompt_cross_repo_correlation_disabled() {
+        let learning = LearningConfig {
+            cross_repo_correlation: false,
+            repo_knowledge: false,
+            qa_promotion: false,
+            strategy_fingerprinting: false,
+            cluster_detection: false,
+            ..Default::default()
+        };
+        let state = make_app_state_for_learning(learning);
+        let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        let base = "base prompt";
+        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn test_enhance_prompt_cross_repo_with_other_systems() {
+        let learning = LearningConfig {
+            repo_knowledge: true,
+            qa_promotion: true,
+            strategy_fingerprinting: true,
+            cluster_detection: true,
+            cross_repo_correlation: true,
+            ..Default::default()
+        };
+        let state = make_app_state_for_learning(learning);
+        let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
+        let base = "base prompt";
+        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        // In-memory tracker has no data for any system, so prompt should be unchanged
+        assert_eq!(result, base);
+    }
+
+    // ================================================================
+    // AppState code_search_service field tests
+    // ================================================================
+
+    #[test]
+    fn test_app_state_code_search_service_none_in_test_config() {
+        let state = make_app_state_for_learning(LearningConfig::default());
+        assert!(state.code_search_service.is_none());
     }
 }

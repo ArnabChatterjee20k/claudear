@@ -403,6 +403,102 @@ impl CodeSearchService {
     }
 }
 
+/// Build a search query for code search, tailored to the issue source.
+///
+/// For Sentry issues, includes error type, culprit, filename, and function metadata
+/// which are highly relevant for matching stack traces to code. For other sources,
+/// uses title + description.
+pub fn build_code_search_query(issue: &crate::types::Issue) -> String {
+    let mut parts = vec![issue.title.clone()];
+
+    match issue.source.as_str() {
+        "sentry" => {
+            // Sentry issues carry rich error metadata that maps well to code
+            if let Some(ref desc) = issue.description {
+                parts.push(desc.clone());
+            }
+            if let Some(v) = issue.get_metadata::<String>("error_type") {
+                parts.push(v);
+            }
+            if let Some(v) = issue.get_metadata::<String>("error_value") {
+                parts.push(v);
+            }
+            if let Some(v) = issue.get_metadata::<String>("culprit") {
+                if !v.is_empty() {
+                    parts.push(v);
+                }
+            }
+            if let Some(v) = issue.get_metadata::<String>("filename") {
+                parts.push(v);
+            }
+            if let Some(v) = issue.get_metadata::<String>("function") {
+                parts.push(v);
+            }
+        }
+        _ => {
+            if let Some(ref desc) = issue.description {
+                parts.push(desc.clone());
+            }
+        }
+    }
+
+    parts.join(" ")
+}
+
+/// Format code search results as a markdown context section for inclusion in prompts.
+pub fn format_code_search_context(results: &[CodeSearchResult]) -> String {
+    use std::fmt::Write;
+
+    if results.is_empty() {
+        return String::new();
+    }
+
+    let mut context = String::from("\n\n## Relevant Code from Repository\n\n");
+    context.push_str(
+        "The following code snippets were found to be semantically relevant to this issue. ",
+    );
+    context.push_str("Use them to understand the codebase and inform your approach:\n\n");
+
+    for (i, result) in results.iter().enumerate() {
+        let chunk = &result.chunk;
+        let _ = writeln!(
+            context,
+            "### {}. `{}` (Similarity: {:.0}%)",
+            i + 1,
+            chunk.file_path,
+            result.score * 100.0,
+        );
+
+        if let Some(ref symbol) = chunk.symbol_name {
+            let _ = writeln!(context, "**Symbol:** {} ({})", symbol, chunk.chunk_type);
+        }
+
+        let _ = writeln!(
+            context,
+            "**Lines:** {}-{} | **Language:** {}",
+            chunk.start_line,
+            chunk.end_line,
+            chunk.language.as_str(),
+        );
+
+        // Truncate very long snippets to keep context manageable
+        let code = if chunk.chunk_text.len() > 2000 {
+            format!("{}...\n(truncated)", &chunk.chunk_text[..2000])
+        } else {
+            chunk.chunk_text.clone()
+        };
+
+        let _ = writeln!(
+            context,
+            "```{}\n{}\n```\n",
+            chunk.language.as_str().to_lowercase(),
+            code
+        );
+    }
+
+    context
+}
+
 fn sha256_hex(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -930,5 +1026,313 @@ mod tests {
                 filename, expected_lang
             );
         }
+    }
+
+    // ================================================================
+    // format_code_search_context tests
+    // ================================================================
+
+    fn make_chunk(
+        file_path: &str,
+        symbol_name: Option<&str>,
+        chunk_type: &str,
+        language: Language,
+        start_line: usize,
+        end_line: usize,
+        chunk_text: &str,
+    ) -> CodeChunk {
+        CodeChunk {
+            id: None,
+            repo_id: 1,
+            file_path: file_path.to_string(),
+            chunk_type: chunk_type.to_string(),
+            symbol_name: symbol_name.map(|s| s.to_string()),
+            language,
+            start_line,
+            end_line,
+            chunk_text: chunk_text.to_string(),
+            context_text: String::new(),
+            file_hash: String::new(),
+            content_hash: None,
+        }
+    }
+
+    fn make_search_result(chunk: CodeChunk, score: f64) -> CodeSearchResult {
+        CodeSearchResult { chunk, score }
+    }
+
+    #[test]
+    fn test_format_code_search_context_empty() {
+        let result = super::format_code_search_context(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_code_search_context_single_result() {
+        let chunk = make_chunk(
+            "src/main.rs",
+            Some("main"),
+            "function",
+            Language::Rust,
+            1,
+            10,
+            "fn main() {\n    println!(\"hello\");\n}",
+        );
+        let results = vec![make_search_result(chunk, 0.95)];
+
+        let ctx = super::format_code_search_context(&results);
+
+        assert!(ctx.contains("## Relevant Code from Repository"));
+        assert!(ctx.contains("### 1. `src/main.rs` (Similarity: 95%)"));
+        assert!(ctx.contains("**Symbol:** main (function)"));
+        assert!(ctx.contains("**Lines:** 1-10 | **Language:** Rust"));
+        assert!(ctx.contains("```rust"));
+        assert!(ctx.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_multiple_results() {
+        let chunk1 = make_chunk(
+            "src/lib.rs",
+            Some("process"),
+            "function",
+            Language::Rust,
+            20,
+            40,
+            "fn process() {}",
+        );
+        let chunk2 = make_chunk(
+            "src/app.ts",
+            Some("App"),
+            "class",
+            Language::TypeScript,
+            1,
+            50,
+            "class App {}",
+        );
+        let results = vec![
+            make_search_result(chunk1, 0.88),
+            make_search_result(chunk2, 0.72),
+        ];
+
+        let ctx = super::format_code_search_context(&results);
+
+        assert!(ctx.contains("### 1. `src/lib.rs` (Similarity: 88%)"));
+        assert!(ctx.contains("### 2. `src/app.ts` (Similarity: 72%)"));
+        assert!(ctx.contains("**Symbol:** process (function)"));
+        assert!(ctx.contains("**Symbol:** App (class)"));
+        assert!(ctx.contains("```rust"));
+        assert!(ctx.contains("```typescript"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_no_symbol() {
+        let chunk = make_chunk(
+            "src/utils.py",
+            None,
+            "module",
+            Language::Python,
+            1,
+            5,
+            "import os",
+        );
+        let results = vec![make_search_result(chunk, 0.60)];
+
+        let ctx = super::format_code_search_context(&results);
+
+        assert!(ctx.contains("### 1. `src/utils.py` (Similarity: 60%)"));
+        // No symbol line should be present
+        assert!(!ctx.contains("**Symbol:**"));
+        assert!(ctx.contains("**Lines:** 1-5 | **Language:** Python"));
+        assert!(ctx.contains("```python"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_truncates_long_code() {
+        let long_code = "x".repeat(3000);
+        let chunk = make_chunk(
+            "src/big.rs",
+            Some("big_fn"),
+            "function",
+            Language::Rust,
+            1,
+            100,
+            &long_code,
+        );
+        let results = vec![make_search_result(chunk, 0.50)];
+
+        let ctx = super::format_code_search_context(&results);
+
+        assert!(ctx.contains("(truncated)"));
+        // The truncated code should be 2000 chars + "...\n(truncated)"
+        assert!(!ctx.contains(&"x".repeat(3000)));
+        assert!(ctx.contains(&"x".repeat(2000)));
+    }
+
+    #[test]
+    fn test_format_code_search_context_similarity_rounding() {
+        let chunk = make_chunk(
+            "src/test.go",
+            None,
+            "function",
+            Language::Go,
+            1,
+            1,
+            "func test() {}",
+        );
+        let results = vec![make_search_result(chunk, 0.8567)];
+
+        let ctx = super::format_code_search_context(&results);
+        // 0.8567 * 100 = 85.67, rounded to 86%
+        assert!(ctx.contains("Similarity: 86%"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_all_languages_lowercase_fence() {
+        for (lang, expected_fence) in [
+            (Language::Rust, "```rust"),
+            (Language::TypeScript, "```typescript"),
+            (Language::JavaScript, "```javascript"),
+            (Language::Python, "```python"),
+            (Language::Go, "```go"),
+            (Language::Java, "```java"),
+            (Language::Cpp, "```c++"),
+            (Language::C, "```c"),
+        ] {
+            let chunk = make_chunk("test.x", None, "function", lang, 1, 1, "code");
+            let results = vec![make_search_result(chunk, 0.5)];
+            let ctx = super::format_code_search_context(&results);
+            assert!(
+                ctx.contains(expected_fence),
+                "Expected fence '{}' for {:?}, got:\n{}",
+                expected_fence,
+                lang,
+                ctx
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_code_search_context_contains_header_text() {
+        let chunk = make_chunk("a.rs", None, "function", Language::Rust, 1, 1, "x");
+        let results = vec![make_search_result(chunk, 0.9)];
+        let ctx = super::format_code_search_context(&results);
+        assert!(ctx.contains("semantically relevant to this issue"));
+        assert!(ctx.contains("Use them to understand the codebase"));
+    }
+
+    // ================================================================
+    // build_code_search_query tests
+    // ================================================================
+
+    #[test]
+    fn test_build_code_search_query_default_source() {
+        let issue = crate::types::Issue::new("1", "T-1", "Bug title", "url", "jira");
+        let query = super::build_code_search_query(&issue);
+        assert_eq!(query, "Bug title");
+    }
+
+    #[test]
+    fn test_build_code_search_query_default_source_with_description() {
+        let mut issue = crate::types::Issue::new("1", "T-1", "Bug title", "url", "linear");
+        issue.description = Some("The login page crashes".to_string());
+        let query = super::build_code_search_query(&issue);
+        assert_eq!(query, "Bug title The login page crashes");
+    }
+
+    #[test]
+    fn test_build_code_search_query_sentry_basic() {
+        let issue =
+            crate::types::Issue::new("1", "SENTRY-1", "TypeError", "url", "sentry");
+        let query = super::build_code_search_query(&issue);
+        assert_eq!(query, "TypeError");
+    }
+
+    #[test]
+    fn test_build_code_search_query_sentry_with_all_metadata() {
+        let mut issue =
+            crate::types::Issue::new("1", "SENTRY-1", "TypeError", "url", "sentry");
+        issue.description = Some("Cannot read property 'x'".to_string());
+        issue.set_metadata("error_type", "TypeError");
+        issue.set_metadata("error_value", "Cannot read property 'x' of undefined");
+        issue.set_metadata("culprit", "app.js:main");
+        issue.set_metadata("filename", "src/app.js");
+        issue.set_metadata("function", "handleClick");
+
+        let query = super::build_code_search_query(&issue);
+
+        assert!(query.contains("TypeError"));
+        assert!(query.contains("Cannot read property 'x'"));
+        assert!(query.contains("Cannot read property 'x' of undefined"));
+        assert!(query.contains("app.js:main"));
+        assert!(query.contains("src/app.js"));
+        assert!(query.contains("handleClick"));
+    }
+
+    #[test]
+    fn test_build_code_search_query_sentry_partial_metadata() {
+        let mut issue =
+            crate::types::Issue::new("1", "SENTRY-1", "NullPointerException", "url", "sentry");
+        issue.set_metadata("error_type", "NullPointerException");
+        issue.set_metadata("filename", "com/app/Service.java");
+        // No error_value, culprit, or function
+
+        let query = super::build_code_search_query(&issue);
+
+        assert!(query.contains("NullPointerException"));
+        assert!(query.contains("com/app/Service.java"));
+        // Should not have extra spaces from missing fields
+        assert!(!query.contains("  "));
+    }
+
+    #[test]
+    fn test_build_code_search_query_sentry_empty_culprit_excluded() {
+        let mut issue =
+            crate::types::Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        issue.set_metadata("culprit", "");
+
+        let query = super::build_code_search_query(&issue);
+        // Empty culprit should not be included
+        assert_eq!(query, "Error");
+    }
+
+    #[test]
+    fn test_build_code_search_query_sentry_with_description_no_metadata() {
+        let mut issue =
+            crate::types::Issue::new("1", "SENTRY-1", "Error", "url", "sentry");
+        issue.description = Some("Something went wrong".to_string());
+
+        let query = super::build_code_search_query(&issue);
+        assert_eq!(query, "Error Something went wrong");
+    }
+
+    #[test]
+    fn test_build_code_search_query_discord_uses_default_path() {
+        let mut issue = crate::types::Issue::new("1", "D-1", "Help needed", "url", "discord");
+        issue.description = Some("My app crashes on startup".to_string());
+        let query = super::build_code_search_query(&issue);
+        assert_eq!(query, "Help needed My app crashes on startup");
+    }
+
+    #[test]
+    fn test_build_code_search_query_slack_uses_default_path() {
+        let mut issue = crate::types::Issue::new("1", "S-1", "Alert", "url", "slack");
+        issue.description = Some("High CPU usage".to_string());
+        let query = super::build_code_search_query(&issue);
+        assert_eq!(query, "Alert High CPU usage");
+    }
+
+    #[test]
+    fn test_build_code_search_query_no_description_non_sentry() {
+        let issue = crate::types::Issue::new("1", "T-1", "Title only", "url", "github");
+        let query = super::build_code_search_query(&issue);
+        assert_eq!(query, "Title only");
+    }
+
+    #[test]
+    fn test_build_code_search_query_sentry_no_description_no_metadata() {
+        let issue = crate::types::Issue::new("1", "S-1", "Error", "url", "sentry");
+        let query = super::build_code_search_query(&issue);
+        assert_eq!(query, "Error");
     }
 }

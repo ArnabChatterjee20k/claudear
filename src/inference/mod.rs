@@ -75,6 +75,14 @@ impl RepoResolution {
             RepoResolution::Skip { .. } => None,
         }
     }
+
+    /// Returns the database repo ID if resolved.
+    pub fn repo_id(&self) -> Option<i64> {
+        match self {
+            RepoResolution::Resolved { repo_id, .. } => *repo_id,
+            RepoResolution::Skip { .. } => None,
+        }
+    }
 }
 
 /// Resolve the target repository for an issue.
@@ -1357,6 +1365,7 @@ mod tests {
         assert_eq!(res.scm_url(), Some("https://github.com/org/repo"));
         assert_eq!(res.default_branch(), Some("main"));
         assert_eq!(res.repo_name(), Some("org/repo"));
+        assert_eq!(res.repo_id(), Some(42));
     }
 
     #[test]
@@ -1369,6 +1378,41 @@ mod tests {
         assert!(res.scm_url().is_none());
         assert!(res.default_branch().is_none());
         assert!(res.repo_name().is_none());
+        assert!(res.repo_id().is_none());
+    }
+
+    #[test]
+    fn test_repo_resolution_repo_id_some() {
+        let res = RepoResolution::Resolved {
+            project_dir: PathBuf::from("/path"),
+            repo_name: "org/repo".to_string(),
+            repo_id: Some(99),
+            scm_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+        };
+        assert_eq!(res.repo_id(), Some(99));
+    }
+
+    #[test]
+    fn test_repo_resolution_repo_id_none_when_resolved() {
+        let res = RepoResolution::Resolved {
+            project_dir: PathBuf::from("/path"),
+            repo_name: "org/repo".to_string(),
+            repo_id: None,
+            scm_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+        };
+        assert_eq!(res.repo_id(), None);
+        // is_resolved should still be true even without a repo_id
+        assert!(res.is_resolved());
+    }
+
+    #[test]
+    fn test_repo_resolution_repo_id_none_when_skipped() {
+        let res = RepoResolution::Skip {
+            reason: "test".to_string(),
+        };
+        assert_eq!(res.repo_id(), None);
     }
 
     #[test]

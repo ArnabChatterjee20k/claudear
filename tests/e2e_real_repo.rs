@@ -368,6 +368,7 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
         embedding_client: None,
         review_watcher: None,
         issue_embedding_service: None,
+        code_search_service: None,
         relationships: None,
         github_client: None,
         scm_provider: None,
