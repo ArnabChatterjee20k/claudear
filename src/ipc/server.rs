@@ -1,4 +1,7 @@
-//! IPC server implementation using Unix sockets.
+//! IPC server implementation.
+//!
+//! On Unix, uses Unix domain sockets.
+//! On Windows, uses TCP on localhost with a port file for discovery.
 
 use super::protocol::{
     ActivityEntry, ActivityType, IpcCommand, IpcData, IpcResponse, WatcherState,
@@ -19,6 +22,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(not(windows))]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
@@ -28,7 +34,7 @@ const DEFAULT_MAX_ACTIVITY_ENTRIES: usize = 10_000;
 /// Maximum number of concurrent IPC connections.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
-/// IPC server that listens on a Unix socket.
+/// IPC server that listens on a Unix socket (or TCP on Windows).
 pub struct IpcServer {
     socket_path: PathBuf,
     tracker: Arc<dyn FixAttemptTracker>,
@@ -237,7 +243,7 @@ impl IpcServer {
         // Clean up any stale files from previous runs
         cleanup_stale_files();
 
-        // Remove existing socket file if present
+        // Remove existing socket/port file if present
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)?;
         }
@@ -245,11 +251,23 @@ impl IpcServer {
         // Write PID file
         write_pid_file()?;
 
-        // Bind to socket
+        // Bind to socket (Unix) or TCP (Windows)
+        #[cfg(not(windows))]
         let listener = UnixListener::bind(&self.socket_path)?;
+        #[cfg(not(windows))]
         tracing::info!("IPC server listening on {:?}", self.socket_path);
 
-        // Set permissions (owner only)
+        #[cfg(windows)]
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        #[cfg(windows)]
+        {
+            let local_addr = listener.local_addr()?;
+            let port = local_addr.port();
+            super::write_port_file(port)?;
+            tracing::info!("IPC server listening on 127.0.0.1:{}", port);
+        }
+
+        // Set permissions (owner only) on Unix
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -316,8 +334,55 @@ impl IpcServer {
 }
 
 /// Handle a single IPC connection.
+#[cfg(not(windows))]
 async fn handle_connection(
     stream: UnixStream,
+    tracker: Arc<dyn FixAttemptTracker>,
+    sources: Vec<Arc<dyn IssueSource>>,
+    notifier: Arc<dyn Notifier>,
+    watcher: Option<Arc<Watcher>>,
+    state: Arc<ServerState>,
+    shutdown_tx: broadcast::Sender<()>,
+) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    while reader.read_line(&mut line).await? > 0 {
+        let command: IpcCommand = match serde_json::from_str(line.trim()) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                let response = IpcResponse::error(format!("Invalid command: {}", e));
+                let json = serde_json::to_string(&response)? + "\n";
+                writer.write_all(json.as_bytes()).await?;
+                line.clear();
+                continue;
+            }
+        };
+
+        let response = handle_command(
+            command,
+            &tracker,
+            &sources,
+            &notifier,
+            &watcher,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        let json = serde_json::to_string(&response)? + "\n";
+        writer.write_all(json.as_bytes()).await?;
+        line.clear();
+    }
+
+    Ok(())
+}
+
+/// Handle a single IPC connection (Windows: TCP stream).
+#[cfg(windows)]
+async fn handle_connection(
+    stream: TcpStream,
     tracker: Arc<dyn FixAttemptTracker>,
     sources: Vec<Arc<dyn IssueSource>>,
     notifier: Arc<dyn Notifier>,

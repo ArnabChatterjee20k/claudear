@@ -23,7 +23,7 @@ sqlite = ["dep:rusqlite"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full", "process", "signal"] }
+tokio = { version = "1", features = ["full", "process", "signal", "net"] }
 
 # HTTP server & client
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
@@ -161,6 +161,10 @@ openssl = { version = "0.10", features = ["vendored"] }
 # Process checking and IPC on Unix
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Process checking on Windows
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 # tempfile is used by both dev tests and the claudear-e2e binary
 [dependencies.tempfile]

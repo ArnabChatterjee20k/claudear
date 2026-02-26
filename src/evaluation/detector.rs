@@ -598,7 +598,12 @@ pub fn detect_tools(project_dir: &Path, overrides: &ToolOverrides) -> Vec<Detect
 }
 
 fn which_exists(binary: &str) -> bool {
-    std::process::Command::new("which")
+    #[cfg(not(windows))]
+    let cmd = "which";
+    #[cfg(windows)]
+    let cmd = "where";
+
+    std::process::Command::new(cmd)
         .arg(binary)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -878,8 +883,11 @@ mod tests {
 
     #[test]
     fn test_which_exists_for_known_binary() {
-        // "ls" should exist on all Unix systems
+        // Use a binary that exists on all platforms
+        #[cfg(not(windows))]
         assert!(which_exists("ls"));
+        #[cfg(windows)]
+        assert!(which_exists("cmd"));
     }
 
     #[test]
