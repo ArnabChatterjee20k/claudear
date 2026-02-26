@@ -70,7 +70,7 @@ jobs:
           key: fastembed-nomic-v15
 
       - name: Warmup embedding model
-        run: cargo tarpaulin --no-report --all-features -- feedback::embeddings::tests::test_warmup_downloads_model --exact --nocapture
+        run: cargo test --all-features -- feedback::embeddings::tests::test_warmup_downloads_model --exact --nocapture
 
       - name: Run tests
         run: cargo tarpaulin --out Xml --all-features

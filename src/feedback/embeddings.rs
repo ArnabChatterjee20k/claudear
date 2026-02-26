@@ -128,20 +128,21 @@ impl EmbeddingClient {
         let mem_after = sys.available_memory();
         let per_instance_bytes = mem_before.saturating_sub(mem_after);
 
-        // --- Pool size: 70% of available RAM or nproc, whichever is higher ---
+        // --- Pool size: min(desired, RAM budget) with nproc as default --------
         let nproc = default_pool_size();
         let pool_size = if per_instance_bytes > 0 {
             // Budget: 70% of the memory that was available *before* we loaded
             // the first instance (so the first instance counts against it).
             let budget = mem_before * 7 / 10;
             let max_from_memory = (budget / per_instance_bytes).max(1) as usize;
-            // Use whichever is higher: memory-budget instances or nproc.
-            let capped = max_from_memory.max(nproc);
+            // Cap at the requested pool size (or nproc if not explicitly set).
+            let capped = max_from_memory.min(desired_pool_size);
             tracing::info!(
                 per_instance_mb = per_instance_bytes / (1024 * 1024),
                 available_mb = mem_before / (1024 * 1024),
                 budget_mb = budget / (1024 * 1024),
                 nproc = nproc,
+                desired = desired_pool_size,
                 max_from_memory = max_from_memory,
                 capped = capped,
                 "Measured ONNX model memory footprint"
