@@ -116,6 +116,10 @@ fn store_clusters(tracker: &dyn FixAttemptTracker, clusters: &[ContentCluster]) 
 mod tests {
     use super::*;
     use crate::config::PrioritisationConfig;
+    use crate::storage::{
+        ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore, ExperimentStore,
+        KnowledgeStore, RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
+    };
     use crate::types::{
         IssuePriority, MatchPriority, MatchResult, SuppressionField, SuppressionMatchMode,
         SuppressionRule,
@@ -123,12 +127,15 @@ mod tests {
 
     /// Minimal no-op tracker for tests.
     struct NoOpTracker;
-    impl FixAttemptTracker for NoOpTracker {
+    impl AttemptTracker for NoOpTracker {
         fn has_attempted(&self, _: &str, _: &str) -> crate::error::Result<bool> {
             Ok(false)
         }
-        fn get_attempted_issue_ids(&self, _: &str) -> std::collections::HashSet<String> {
-            std::collections::HashSet::new()
+        fn get_attempted_issue_ids(
+            &self,
+            _: &str,
+        ) -> crate::error::Result<std::collections::HashSet<String>> {
+            Ok(std::collections::HashSet::new())
         }
         fn record_attempt(&self, _: &str, _: &str, _: &str) -> crate::error::Result<()> {
             Ok(())
@@ -201,6 +208,17 @@ mod tests {
             Ok(())
         }
     }
+    impl ActivityStore for NoOpTracker {}
+    impl KnowledgeStore for NoOpTracker {}
+    impl EmbeddingStore for NoOpTracker {}
+    impl RepoStore for NoOpTracker {}
+    impl UserStore for NoOpTracker {}
+    impl ChatStore for NoOpTracker {}
+    impl RegressionStore for NoOpTracker {}
+    impl ExperimentStore for NoOpTracker {}
+    impl EvaluationStore for NoOpTracker {}
+    impl WebhookStore for NoOpTracker {}
+    impl SimilarityStore for NoOpTracker {}
 
     fn make_candidate(
         id: &str,
@@ -646,12 +664,15 @@ mod tests {
             }
         }
 
-        impl FixAttemptTracker for ClusterTrackingTracker {
+        impl AttemptTracker for ClusterTrackingTracker {
             fn has_attempted(&self, _: &str, _: &str) -> crate::error::Result<bool> {
                 Ok(false)
             }
-            fn get_attempted_issue_ids(&self, _: &str) -> std::collections::HashSet<String> {
-                std::collections::HashSet::new()
+            fn get_attempted_issue_ids(
+                &self,
+                _: &str,
+            ) -> crate::error::Result<std::collections::HashSet<String>> {
+                Ok(std::collections::HashSet::new())
             }
             fn record_attempt(&self, _: &str, _: &str, _: &str) -> crate::error::Result<()> {
                 Ok(())
@@ -723,6 +744,11 @@ mod tests {
             fn prepare_for_retry(&self, _: &str, _: &str) -> crate::error::Result<()> {
                 Ok(())
             }
+        }
+
+        impl ActivityStore for ClusterTrackingTracker {}
+
+        impl KnowledgeStore for ClusterTrackingTracker {
             fn store_content_cluster(
                 &self,
                 cluster: &crate::types::ContentCluster,
@@ -731,6 +757,18 @@ mod tests {
                 Ok(1)
             }
         }
+
+        impl EmbeddingStore for ClusterTrackingTracker {}
+
+        impl RepoStore for ClusterTrackingTracker {}
+
+        impl UserStore for ClusterTrackingTracker {}
+        impl ChatStore for ClusterTrackingTracker {}
+        impl RegressionStore for ClusterTrackingTracker {}
+        impl ExperimentStore for ClusterTrackingTracker {}
+        impl EvaluationStore for ClusterTrackingTracker {}
+        impl WebhookStore for ClusterTrackingTracker {}
+        impl SimilarityStore for ClusterTrackingTracker {}
 
         let config = PrioritisationConfig {
             content_clustering: true,
@@ -2460,12 +2498,15 @@ mod tests {
         struct CountingTracker {
             count: Arc<AtomicU32>,
         }
-        impl FixAttemptTracker for CountingTracker {
+        impl AttemptTracker for CountingTracker {
             fn has_attempted(&self, _: &str, _: &str) -> crate::error::Result<bool> {
                 Ok(false)
             }
-            fn get_attempted_issue_ids(&self, _: &str) -> std::collections::HashSet<String> {
-                std::collections::HashSet::new()
+            fn get_attempted_issue_ids(
+                &self,
+                _: &str,
+            ) -> crate::error::Result<std::collections::HashSet<String>> {
+                Ok(std::collections::HashSet::new())
             }
             fn record_attempt(&self, _: &str, _: &str, _: &str) -> crate::error::Result<()> {
                 Ok(())
@@ -2537,6 +2578,9 @@ mod tests {
             fn prepare_for_retry(&self, _: &str, _: &str) -> crate::error::Result<()> {
                 Ok(())
             }
+        }
+        impl ActivityStore for CountingTracker {}
+        impl KnowledgeStore for CountingTracker {
             fn store_content_cluster(
                 &self,
                 _: &crate::types::ContentCluster,
@@ -2545,6 +2589,15 @@ mod tests {
                 Ok(1)
             }
         }
+        impl EmbeddingStore for CountingTracker {}
+        impl RepoStore for CountingTracker {}
+        impl UserStore for CountingTracker {}
+        impl ChatStore for CountingTracker {}
+        impl RegressionStore for CountingTracker {}
+        impl ExperimentStore for CountingTracker {}
+        impl EvaluationStore for CountingTracker {}
+        impl WebhookStore for CountingTracker {}
+        impl SimilarityStore for CountingTracker {}
 
         let count = Arc::new(AtomicU32::new(0));
         let tracker = CountingTracker {
@@ -2587,12 +2640,15 @@ mod tests {
     #[test]
     fn store_clusters_handles_error_gracefully() {
         struct FailingTracker;
-        impl FixAttemptTracker for FailingTracker {
+        impl AttemptTracker for FailingTracker {
             fn has_attempted(&self, _: &str, _: &str) -> crate::error::Result<bool> {
                 Ok(false)
             }
-            fn get_attempted_issue_ids(&self, _: &str) -> std::collections::HashSet<String> {
-                std::collections::HashSet::new()
+            fn get_attempted_issue_ids(
+                &self,
+                _: &str,
+            ) -> crate::error::Result<std::collections::HashSet<String>> {
+                Ok(std::collections::HashSet::new())
             }
             fn record_attempt(&self, _: &str, _: &str, _: &str) -> crate::error::Result<()> {
                 Ok(())
@@ -2664,6 +2720,9 @@ mod tests {
             fn prepare_for_retry(&self, _: &str, _: &str) -> crate::error::Result<()> {
                 Ok(())
             }
+        }
+        impl ActivityStore for FailingTracker {}
+        impl KnowledgeStore for FailingTracker {
             fn store_content_cluster(
                 &self,
                 _: &crate::types::ContentCluster,
@@ -2671,6 +2730,15 @@ mod tests {
                 Err(crate::error::Error::Storage("simulated failure".into()))
             }
         }
+        impl EmbeddingStore for FailingTracker {}
+        impl RepoStore for FailingTracker {}
+        impl UserStore for FailingTracker {}
+        impl ChatStore for FailingTracker {}
+        impl RegressionStore for FailingTracker {}
+        impl ExperimentStore for FailingTracker {}
+        impl EvaluationStore for FailingTracker {}
+        impl WebhookStore for FailingTracker {}
+        impl SimilarityStore for FailingTracker {}
 
         let tracker = FailingTracker;
         let clusters = vec![ContentCluster {

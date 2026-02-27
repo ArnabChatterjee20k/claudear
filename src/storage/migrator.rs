@@ -115,7 +115,6 @@ mod tests {
         let expected_tables = [
             "fix_attempts",
             "feedback_outcomes",
-            "discord_threads",
             "pr_review_states",
             "repositories",
             "repository_dependencies",
@@ -153,11 +152,14 @@ mod tests {
             "code_symbols",
             "code_chunks",
             "code_chunk_embeddings",
+            "code_index_metadata",
             "indexing_progress",
             "cross_repo_correlations",
             "code_complexity",
             "eval_snapshots",
             "eval_deltas",
+            "chat_sessions",
+            "chat_messages",
         ];
 
         for table in expected_tables {

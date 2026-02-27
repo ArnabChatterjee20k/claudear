@@ -111,7 +111,7 @@ impl Error {
     }
 
     pub fn io(msg: impl Into<String>) -> Self {
-        Self::Other(format!("IO error: {}", msg.into()))
+        Self::Io(std::io::Error::other(msg.into()))
     }
 
     pub fn database(msg: impl Into<String>) -> Self {
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn test_error_io_helper() {
         let err = Error::io("permission denied");
-        assert!(matches!(err, Error::Other(_)));
+        assert!(matches!(err, Error::Io(_)));
         assert!(err.to_string().contains("IO error"));
         assert!(err.to_string().contains("permission denied"));
     }

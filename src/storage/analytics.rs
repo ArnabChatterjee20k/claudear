@@ -332,7 +332,7 @@ pub fn classify_error(error_message: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::SqliteTracker;
+    use crate::storage::{AttemptTracker, SqliteTracker};
 
     #[test]
     fn test_time_period_duration() {
@@ -888,7 +888,6 @@ mod tests {
 
     #[test]
     fn test_success_rate_with_mixed_attempts() {
-        use crate::storage::FixAttemptTracker;
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // Record 4 attempts: 2 success, 1 failed, 1 merged
@@ -933,7 +932,6 @@ mod tests {
 
     #[test]
     fn test_success_rate_all_failures() {
-        use crate::storage::FixAttemptTracker;
         let tracker = SqliteTracker::in_memory().unwrap();
 
         for i in 0..5 {
@@ -1155,7 +1153,6 @@ mod tests {
 
     #[test]
     fn test_analytics_summary_with_data() {
-        use crate::storage::FixAttemptTracker;
         let tracker = SqliteTracker::in_memory().unwrap();
 
         tracker

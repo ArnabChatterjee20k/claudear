@@ -56,23 +56,6 @@ CREATE INDEX IF NOT EXISTS idx_feedback_outcomes_outcome ON feedback_outcomes(ou
 CREATE INDEX IF NOT EXISTS idx_feedback_outcomes_attempt ON feedback_outcomes(attempt_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_source_issue ON feedback_outcomes(source, issue_id);
 
-CREATE TABLE IF NOT EXISTS discord_threads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id TEXT NOT NULL UNIQUE,
-    thread_name TEXT NOT NULL,
-    channel_id TEXT NOT NULL,
-    pr_url TEXT NOT NULL,
-    issue_id TEXT NOT NULL,
-    source TEXT NOT NULL,
-    is_active INTEGER DEFAULT 1,
-    last_message_id TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_discord_threads_pr ON discord_threads(pr_url);
-CREATE INDEX IF NOT EXISTS idx_discord_threads_active ON discord_threads(is_active);
-CREATE INDEX IF NOT EXISTS idx_discord_threads_channel ON discord_threads(channel_id);
-
 CREATE TABLE IF NOT EXISTS pr_review_states (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     pr_url TEXT NOT NULL UNIQUE,
@@ -663,6 +646,13 @@ CREATE TABLE IF NOT EXISTS code_chunk_embeddings (
     embedding_model TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS code_index_metadata (
+    repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (repo_id, key)
+);
+
 CREATE TABLE IF NOT EXISTS indexing_progress (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     status TEXT NOT NULL DEFAULT 'idle',
@@ -742,3 +732,21 @@ CREATE TABLE IF NOT EXISTS eval_deltas (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_eval_deltas_attempt ON eval_deltas(attempt_id);
+
+-- Chat Sessions & Messages
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id TEXT PRIMARY KEY,
+    repo_id INTEGER REFERENCES repositories(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    sources_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, created_at);

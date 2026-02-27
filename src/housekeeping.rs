@@ -8,7 +8,7 @@
 
 use crate::watcher::Watcher;
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 
 /// A worker that periodically runs housekeeping tasks via a [`Watcher`].
 pub struct HousekeepingWorker {
@@ -52,6 +52,9 @@ impl HousekeepingWorker {
         const REFRESH_INTERVAL: u32 = 5;
         const LEARNING_INTERVAL: u32 = 10;
 
+        let reindex_interval = self.watcher.reindex_interval();
+        let mut last_reindex = Instant::now();
+
         while self.watcher.is_running() {
             timer.tick().await;
             if !self.watcher.is_running() {
@@ -64,7 +67,7 @@ impl HousekeepingWorker {
             cycle_count = cycle_count.wrapping_add(1);
 
             let cron_id = uuid::Uuid::new_v4().to_string();
-            let cron_start = std::time::Instant::now();
+            let cron_start = Instant::now();
             self.watcher
                 .send_cron_check_in("in_progress", &cron_id, None, self.interval_ms);
             // Periodically refresh repo index to detect new repositories
@@ -76,6 +79,14 @@ impl HousekeepingWorker {
                         self.watcher.discover_dependencies().await;
                     }
                     Err(e) => tracing::debug!(error = %e, "Error refreshing repos"),
+                }
+            }
+
+            // Periodically pull and re-index all repos
+            if let Some(reindex_dur) = reindex_interval {
+                if last_reindex.elapsed() >= reindex_dur {
+                    self.watcher.pull_and_reindex_all_repos().await;
+                    last_reindex = Instant::now();
                 }
             }
 

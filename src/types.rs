@@ -240,6 +240,12 @@ pub struct AgentResult {
     /// Q&A knowledge IDs used while preparing this run.
     #[serde(default)]
     pub used_qa_ids: Vec<i64>,
+    /// Confidence score (0-100) that the fix is correct.
+    #[serde(default)]
+    pub confidence: u8,
+    /// Reasoning behind the confidence score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_reasoning: Option<String>,
 }
 
 /// Structured blocking question emitted by Claude.
@@ -2060,6 +2066,8 @@ mod tests {
             error: None,
             blocking_question: None,
             used_qa_ids: Vec::new(),
+            confidence: 0,
+            confidence_reasoning: None,
         };
         assert!(result.success);
         assert!(result.pr_url.is_some());
@@ -2076,6 +2084,8 @@ mod tests {
             error: Some("Build failed".to_string()),
             blocking_question: None,
             used_qa_ids: Vec::new(),
+            confidence: 0,
+            confidence_reasoning: None,
         };
         assert!(!result.success);
         assert!(result.pr_url.is_none());
@@ -2411,6 +2421,8 @@ mod tests {
             error: Some("No output".to_string()),
             blocking_question: None,
             used_qa_ids: Vec::new(),
+            confidence: 0,
+            confidence_reasoning: None,
         };
 
         assert!(result.output.is_empty());
@@ -4410,6 +4422,8 @@ mod tests {
                 why: Some("Architecture decision".into()),
             }),
             used_qa_ids: vec![1, 2, 3],
+            confidence: 0,
+            confidence_reasoning: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: AgentResult = serde_json::from_str(&json).unwrap();
@@ -4430,6 +4444,8 @@ mod tests {
             error: None,
             blocking_question: None,
             used_qa_ids: Vec::new(),
+            confidence: 0,
+            confidence_reasoning: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("pr_url"));
@@ -5091,6 +5107,8 @@ mod tests {
             error: None,
             blocking_question: None,
             used_qa_ids: vec![1, 2, 3],
+            confidence: 0,
+            confidence_reasoning: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"success\":true"));
@@ -5109,6 +5127,8 @@ mod tests {
             error: Some("Process exited with code 1".to_string()),
             blocking_question: None,
             used_qa_ids: Vec::new(),
+            confidence: 0,
+            confidence_reasoning: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"success\":false"));
@@ -5131,6 +5151,8 @@ mod tests {
                 why: Some("Need to know which DB to fix".to_string()),
             }),
             used_qa_ids: Vec::new(),
+            confidence: 0,
+            confidence_reasoning: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deser: AgentResult = serde_json::from_str(&json).unwrap();
@@ -5150,6 +5172,8 @@ mod tests {
             error: None,
             blocking_question: None,
             used_qa_ids: vec![5, 10],
+            confidence: 85,
+            confidence_reasoning: Some("Tests pass and fix is straightforward".to_string()),
         };
         let json = serde_json::to_string(&original).unwrap();
         let deser: AgentResult = serde_json::from_str(&json).unwrap();
@@ -5165,5 +5189,188 @@ mod tests {
         let json = r#"{"success":true,"output":"ok"}"#;
         let result: AgentResult = serde_json::from_str(json).unwrap();
         assert!(result.used_qa_ids.is_empty());
+    }
+
+    #[test]
+    fn test_agent_result_confidence_defaults_when_missing() {
+        let json = r#"{"success":true,"output":"done"}"#;
+        let result: AgentResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.confidence, 0);
+        assert!(result.confidence_reasoning.is_none());
+    }
+
+    #[test]
+    fn test_agent_result_confidence_roundtrip_values() {
+        let original = AgentResult {
+            success: true,
+            output: "Fixed".to_string(),
+            pr_url: Some("https://github.com/a/b/pull/1".to_string()),
+            changelog: None,
+            error: None,
+            blocking_question: None,
+            used_qa_ids: vec![],
+            confidence: 92,
+            confidence_reasoning: Some("All tests pass, fix is straightforward".to_string()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let deser: AgentResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.confidence, 92);
+        assert_eq!(
+            deser.confidence_reasoning.as_deref(),
+            Some("All tests pass, fix is straightforward")
+        );
+    }
+
+    #[test]
+    fn test_agent_result_confidence_reasoning_skipped_when_none() {
+        let result = AgentResult {
+            success: true,
+            output: "ok".to_string(),
+            pr_url: None,
+            changelog: None,
+            error: None,
+            blocking_question: None,
+            used_qa_ids: vec![],
+            confidence: 75,
+            confidence_reasoning: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"confidence\":75"));
+        assert!(
+            !json.contains("confidence_reasoning"),
+            "confidence_reasoning should be skipped when None"
+        );
+    }
+
+    #[test]
+    fn test_agent_result_confidence_reasoning_present_when_some() {
+        let result = AgentResult {
+            success: true,
+            output: "ok".to_string(),
+            pr_url: None,
+            changelog: None,
+            error: None,
+            blocking_question: None,
+            used_qa_ids: vec![],
+            confidence: 60,
+            confidence_reasoning: Some("Moderate certainty".to_string()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"confidence\":60"));
+        assert!(json.contains("\"confidence_reasoning\":\"Moderate certainty\""));
+    }
+
+    #[test]
+    fn test_agent_result_confidence_boundary_max_u8() {
+        let result = AgentResult {
+            success: true,
+            output: "ok".to_string(),
+            pr_url: None,
+            changelog: None,
+            error: None,
+            blocking_question: None,
+            used_qa_ids: vec![],
+            confidence: 100,
+            confidence_reasoning: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: AgentResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.confidence, 100);
+    }
+
+    #[test]
+    fn test_agent_result_confidence_over_255_rejected() {
+        // u8 can hold 0-255, but JSON number 300 should fail deserialization
+        let json = r#"{"success":true,"output":"ok","confidence":300}"#;
+        let result = serde_json::from_str::<AgentResult>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_agent_result_confidence_negative_rejected() {
+        let json = r#"{"success":true,"output":"ok","confidence":-1}"#;
+        let result = serde_json::from_str::<AgentResult>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_agent_result_confidence_as_string_rejected() {
+        let json = r#"{"success":true,"output":"ok","confidence":"high"}"#;
+        let result = serde_json::from_str::<AgentResult>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_agent_result_confidence_with_all_fields() {
+        let result = AgentResult {
+            success: true,
+            output: "Fixed the auth bypass".to_string(),
+            pr_url: Some("https://github.com/org/repo/pull/42".to_string()),
+            changelog: Some("- Added input validation\n- Added unit test".to_string()),
+            error: None,
+            blocking_question: None,
+            used_qa_ids: vec![1, 5],
+            confidence: 95,
+            confidence_reasoning: Some(
+                "Exact reproduction test added, fix is minimal and targeted".to_string(),
+            ),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: AgentResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.confidence, 95);
+        assert_eq!(
+            deser.pr_url.as_deref(),
+            Some("https://github.com/org/repo/pull/42")
+        );
+        assert_eq!(deser.used_qa_ids, vec![1, 5]);
+        assert!(deser.confidence_reasoning.unwrap().contains("minimal"));
+    }
+
+    #[test]
+    fn test_agent_result_confidence_empty_reasoning_serialized() {
+        let result = AgentResult {
+            success: true,
+            output: "ok".to_string(),
+            pr_url: None,
+            changelog: None,
+            error: None,
+            blocking_question: None,
+            used_qa_ids: vec![],
+            confidence: 40,
+            confidence_reasoning: Some(String::new()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        // Empty string is still Some(""), so it should be serialized
+        assert!(json.contains("\"confidence_reasoning\":\"\""));
+        let deser: AgentResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.confidence_reasoning.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_agent_result_confidence_float_rejected() {
+        // serde_json rejects float values for u8 fields
+        let json = r#"{"success":true,"output":"ok","confidence":85.9}"#;
+        let result = serde_json::from_str::<AgentResult>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_agent_result_confidence_zero_with_reasoning() {
+        // Edge case: confidence=0 but reasoning still provided
+        let result = AgentResult {
+            success: false,
+            output: "could not fix".to_string(),
+            pr_url: None,
+            changelog: None,
+            error: Some("compilation failed".to_string()),
+            blocking_question: None,
+            used_qa_ids: vec![],
+            confidence: 0,
+            confidence_reasoning: Some("Code doesn't compile after changes".to_string()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: AgentResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.confidence, 0);
+        assert!(deser.confidence_reasoning.is_some());
     }
 }

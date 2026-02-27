@@ -27,9 +27,13 @@ tokio = { version = "1", features = ["full", "process", "signal"] }
 
 # HTTP server & client
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
-reqwest = { version = "0.13", features = ["json", "form"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+reqwest = { version = "0.13", features = ["json", "form", "stream"] }
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
+
+# TLS auto-provisioning (Let's Encrypt ACME)
+rustls-acme = { version = "0.15", features = ["axum", "aws-lc-rs"] }
 
 # Database
 rusqlite = { version = "0.38", features = ["bundled", "load_extension"], optional = true }
@@ -83,6 +87,7 @@ graphql_client = { version = "0.16", features = ["reqwest-rustls"] }
 
 # Async utilities
 futures = "0.3"
+futures-util = "0.3"
 tokio-stream = "0.1"
 async-trait = "0.1"
 
@@ -107,6 +112,10 @@ tree-sitter-c-sharp = "0.23"
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
 tree-sitter-lua = "0.4"
+
+# Local LLM inference (llama.cpp bindings)
+llama-cpp-2 = "0.1"
+encoding_rs = "0.8"
 
 # System info (memory detection for batch sizing)
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }

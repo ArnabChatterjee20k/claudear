@@ -62,12 +62,15 @@ pub fn try_load_vectorlite(conn: &Connection) -> Result<bool> {
         }
     }
 
-    // Also try from VECTORLITE_PATH env var
-    if let Ok(path) = std::env::var("VECTORLITE_PATH") {
+    // Also try from CLAUDEAR_VECTORLITE_PATH env var
+    if let Ok(path) = std::env::var("CLAUDEAR_VECTORLITE_PATH") {
         let path = Path::new(&path);
         if path.exists() {
             load_vectorlite_extension(conn, path)?;
-            tracing::info!("Loaded vectorlite from VECTORLITE_PATH: {:?}", path);
+            tracing::info!(
+                "Loaded vectorlite from CLAUDEAR_VECTORLITE_PATH: {:?}",
+                path
+            );
             return Ok(true);
         }
     }

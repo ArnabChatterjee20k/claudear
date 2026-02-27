@@ -5,7 +5,11 @@ use super::types::{
     InferenceStats, StoredDependency, StoredIndexedRepo, StoredPrReviewComment, StoredRepository,
     UserRow,
 };
-use super::{is_vectorlite_available, try_load_vectorlite, FixAttemptTracker};
+use super::{
+    is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
+    EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
+    SimilarityStore, UserStore, WebhookStore,
+};
 use crate::error::Result;
 use crate::feedback::{FixOutcome, Outcome};
 use crate::learning::cross_repo_correlator::CrossRepoCorrelation;
@@ -20,24 +24,8 @@ use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
-/// Compiled regex for parsing GitHub PR URLs into repo/PR number (compiled once, reused).
-static PR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-    regex_lite::Regex::new(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
-        .expect("PR URL regex should be valid")
-});
-
-/// Compiled regex for parsing GitLab MR URLs (compiled once, reused).
-/// Matches: https://gitlab.com/group/project/-/merge_requests/123
-/// Also matches self-hosted: https://gitlab.example.com/group/sub/project/-/merge_requests/123
-static MR_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-    regex_lite::Regex::new(r"https?://[^/]+/(.+?)/-/merge_requests/(\d+)")
-        .expect("MR URL regex should be valid")
-});
-
-/// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
-const MAX_PR_URL_LENGTH: usize = 2048;
 const DEFAULT_LOG_DIR: &str = "./logs";
 const AUDIT_LOG_SUBDIR: &str = "audit";
 const QA_VECTOR_TABLE: &str = "qa_question_embeddings";
@@ -52,6 +40,21 @@ const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
 const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
+
+/// Maximum allowed embedding dimension to prevent malformed data from generating
+/// unbounded DDL strings. Covers all common embedding models (up to 8192-dim).
+const MAX_EMBEDDING_DIMENSION: usize = 16384;
+
+/// Validate that an embedding dimension is within safe bounds for SQL DDL interpolation.
+fn validate_dimension(dimension: usize) -> Result<()> {
+    if dimension == 0 || dimension > MAX_EMBEDDING_DIMENSION {
+        return Err(crate::error::Error::storage(format!(
+            "Embedding dimension {} is out of valid range (1..={})",
+            dimension, MAX_EMBEDDING_DIMENSION
+        )));
+    }
+    Ok(())
+}
 
 impl UserRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -176,864 +179,18 @@ impl SqliteTracker {
         Ok(())
     }
 
-    // All schema DDL now lives in migrations/V1__initial_schema.sql.
-    // The legacy inline init is preserved below under #[cfg(any())] so it
-    // never compiles but can be referenced during review.
-    #[expect(dead_code)]
-    #[cfg(any())]
-    fn _init_legacy(&self) -> Result<()> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS fix_attempts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL,
-                issue_id TEXT NOT NULL,
-                short_id TEXT NOT NULL,
-                attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
-                pr_url TEXT,
-                scm_repo TEXT,
-                scm_pr_number INTEGER,
-                status TEXT NOT NULL DEFAULT 'pending',
-                error_message TEXT,
-                merged_at TEXT,
-                resolved_at TEXT,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                last_retry_at TEXT,
-                issue_labels TEXT,  -- JSON array of labels for bug detection
-                parent_attempt_id INTEGER REFERENCES fix_attempts(id),
-                cascade_repo TEXT,
-                reset_at TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_fix_attempts_status ON fix_attempts(status);
-            CREATE INDEX IF NOT EXISTS idx_fix_attempts_source_issue ON fix_attempts(source, issue_id);
-            CREATE INDEX IF NOT EXISTS idx_fix_attempts_pr_url ON fix_attempts(pr_url);
-            CREATE INDEX IF NOT EXISTS idx_fix_attempts_retryable ON fix_attempts(status, retry_count, attempted_at);
-            -- Hot path for attempts list endpoints: filter by status/source, sort by attempted_at.
-            CREATE INDEX IF NOT EXISTS idx_fix_attempts_status_attempted ON fix_attempts(status, attempted_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_fix_attempts_source_status_attempted ON fix_attempts(source, status, attempted_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_fix_attempts_parent ON fix_attempts(parent_attempt_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_fix_attempts_unique_original ON fix_attempts(source, issue_id) WHERE cascade_repo IS NULL;
-
-            -- Feedback outcomes table for learning from past fixes
-            CREATE TABLE IF NOT EXISTS feedback_outcomes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attempt_id INTEGER REFERENCES fix_attempts(id),
-                source TEXT NOT NULL,
-                issue_id TEXT NOT NULL,
-                issue_text TEXT NOT NULL,
-                prompt_used TEXT NOT NULL,
-                outcome TEXT NOT NULL,
-                error_type TEXT,
-                learnings TEXT,
-                keywords TEXT,
-                strategy_fingerprint_id INTEGER,
-                embedding BLOB,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_feedback_outcomes_source ON feedback_outcomes(source);
-            CREATE INDEX IF NOT EXISTS idx_feedback_outcomes_outcome ON feedback_outcomes(outcome);
-            CREATE INDEX IF NOT EXISTS idx_feedback_outcomes_attempt ON feedback_outcomes(attempt_id);
-            CREATE INDEX IF NOT EXISTS idx_feedback_source_issue ON feedback_outcomes(source, issue_id);
-
-            -- Discord threads table
-            CREATE TABLE IF NOT EXISTS discord_threads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT NOT NULL UNIQUE,
-                thread_name TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                pr_url TEXT NOT NULL,
-                issue_id TEXT NOT NULL,
-                source TEXT NOT NULL,
-                is_active INTEGER DEFAULT 1,
-                last_message_id TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_discord_threads_pr ON discord_threads(pr_url);
-            CREATE INDEX IF NOT EXISTS idx_discord_threads_active ON discord_threads(is_active);
-
-            -- PR review states table
-            CREATE TABLE IF NOT EXISTS pr_review_states (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pr_url TEXT NOT NULL UNIQUE,
-                repo TEXT NOT NULL,
-                pr_number INTEGER NOT NULL,
-                issue_id TEXT NOT NULL,
-                source TEXT NOT NULL,
-                last_review_id INTEGER,
-                last_review_time TEXT,
-                last_comment_id INTEGER,
-                last_comment_time TEXT,
-                is_active INTEGER DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_pr_review_states_active ON pr_review_states(is_active);
-
-            -- Repositories table (unified: includes index metadata)
-            CREATE TABLE IF NOT EXISTS repositories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                path TEXT NOT NULL DEFAULT '',
-                scm_url TEXT,
-                default_branch TEXT DEFAULT 'main',
-                file_count INTEGER DEFAULT 0,
-                last_indexed_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_repositories_name ON repositories(name);
-
-            -- Repository dependencies table
-            CREATE TABLE IF NOT EXISTS repository_dependencies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                upstream_id INTEGER REFERENCES repositories(id),
-                downstream_id INTEGER REFERENCES repositories(id),
-                dependency_type TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(upstream_id, downstream_id)
-            );
-
-            -- ============================================================
-            -- Analytics Tables
-            -- ============================================================
-
-            -- Activity log - persistent activity tracking (replaces in-memory)
-            CREATE TABLE IF NOT EXISTS activity_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-                activity_type TEXT NOT NULL,
-                source TEXT,
-                issue_id TEXT,
-                short_id TEXT,
-                message TEXT NOT NULL,
-                metadata TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_activity_issue ON activity_log(issue_id);
-            -- Composite index covers queries on source alone and source+issue_id
-            CREATE INDEX IF NOT EXISTS idx_activity_source_issue ON activity_log(source, issue_id, timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_activity_source_timestamp ON activity_log(source, timestamp DESC);
-
-            -- Claude executions - detailed execution metrics
-            CREATE TABLE IF NOT EXISTS claude_executions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attempt_id INTEGER REFERENCES fix_attempts(id),
-                started_at TEXT NOT NULL,
-                completed_at TEXT,
-                duration_secs REAL,
-                exit_code INTEGER,
-                timed_out INTEGER DEFAULT 0,
-                stdout_preview TEXT,
-                stderr_preview TEXT,
-                stdout_log_path TEXT,
-                stderr_log_path TEXT,
-                event_log_path TEXT,
-                prompt_used TEXT,
-                prompt_hash TEXT,
-                model_version TEXT,
-                working_directory TEXT,
-                git_branch TEXT,
-                git_commit_before TEXT,
-                git_commit_after TEXT,
-                files_changed INTEGER,
-                lines_added INTEGER,
-                lines_removed INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_executions_attempt ON claude_executions(attempt_id);
-            CREATE INDEX IF NOT EXISTS idx_executions_prompt_hash ON claude_executions(prompt_hash);
-
-            -- PR reviews - PR review feedback for learning
-            CREATE TABLE IF NOT EXISTS pr_reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attempt_id INTEGER REFERENCES fix_attempts(id),
-                pr_url TEXT NOT NULL,
-                reviewer TEXT,
-                review_state TEXT,
-                submitted_at TEXT,
-                body TEXT,
-                sentiment TEXT,
-                actionable_feedback TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_pr_reviews_attempt ON pr_reviews(attempt_id);
-
-            -- PR review comments - individual review comments for tracking
-            CREATE TABLE IF NOT EXISTS pr_review_comments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                scm_comment_id INTEGER NOT NULL UNIQUE,
-                pr_url TEXT NOT NULL,
-                review_id INTEGER REFERENCES pr_reviews(id),
-                path TEXT NOT NULL,
-                position INTEGER,
-                line INTEGER,
-                body TEXT NOT NULL,
-                author TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                html_url TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_pr_review_comments_pr ON pr_review_comments(pr_url);
-
-            -- Issues - issue content and optional vector embeddings for similarity
-            CREATE TABLE IF NOT EXISTS issues (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL,
-                issue_id TEXT NOT NULL,
-                short_id TEXT,
-                title TEXT,
-                description TEXT,
-                url TEXT,
-                priority TEXT DEFAULT 'none',
-                status TEXT DEFAULT 'open',
-                labels TEXT,
-                embedding BLOB,
-                embedding_model TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT,
-                UNIQUE(source, issue_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_issues_source ON issues(source);
-
-            -- Error patterns - recurring error analysis
-            CREATE TABLE IF NOT EXISTS error_patterns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pattern_hash TEXT UNIQUE,
-                error_type TEXT,
-                error_message TEXT,
-                first_seen TEXT,
-                last_seen TEXT,
-                occurrence_count INTEGER DEFAULT 1,
-                sources TEXT,
-                example_issue_ids TEXT,
-                resolution_hints TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_error_patterns_type ON error_patterns(error_type);
-            CREATE INDEX IF NOT EXISTS idx_error_patterns_count ON error_patterns(occurrence_count DESC);
-
-            -- Processing metrics - time-series operational metrics
-            CREATE TABLE IF NOT EXISTS processing_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-                metric_name TEXT NOT NULL,
-                metric_value REAL NOT NULL,
-                source TEXT,
-                tags TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_metrics_name_time ON processing_metrics(metric_name, timestamp DESC);
-
-            -- Prompt experiments - A/B testing prompts
-            CREATE TABLE IF NOT EXISTS prompt_experiments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                experiment_name TEXT NOT NULL,
-                variant TEXT NOT NULL,
-                prompt_template TEXT NOT NULL,
-                prompt_hash TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now')),
-                active INTEGER DEFAULT 1,
-                success_count INTEGER DEFAULT 0,
-                failure_count INTEGER DEFAULT 0,
-                avg_time_to_merge REAL,
-                avg_review_score REAL
-            );
-            CREATE INDEX IF NOT EXISTS idx_experiments_active ON prompt_experiments(active, experiment_name);
-
-            -- Similar issues - cached similarity matches
-            CREATE TABLE IF NOT EXISTS similar_issues (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_issue_id TEXT NOT NULL,
-                similar_issue_id TEXT NOT NULL,
-                similarity_score REAL NOT NULL,
-                computed_at TEXT DEFAULT (datetime('now')),
-                UNIQUE(source_issue_id, similar_issue_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_similar_source ON similar_issues(source_issue_id);
-            CREATE INDEX IF NOT EXISTS idx_similar_score ON similar_issues(similarity_score DESC);
-
-            -- Human Q&A knowledge for semantic reuse
-            CREATE TABLE IF NOT EXISTS qa_knowledge (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL,
-                repo TEXT,
-                issue_id TEXT NOT NULL,
-                short_id TEXT NOT NULL,
-                question_text TEXT NOT NULL,
-                question_norm TEXT NOT NULL,
-                question_embedding BLOB,
-                answer_text TEXT NOT NULL,
-                answer_norm TEXT NOT NULL,
-                answer_embedding BLOB,
-                channel TEXT NOT NULL,
-                responder TEXT,
-                correlation_id TEXT NOT NULL,
-                asked_at TEXT NOT NULL,
-                answered_at TEXT NOT NULL,
-                success_count INTEGER NOT NULL DEFAULT 0,
-                failure_count INTEGER NOT NULL DEFAULT 0,
-                last_used_at TEXT,
-                metadata TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_qa_scoped_time ON qa_knowledge(source, repo, answered_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_qa_question_norm ON qa_knowledge(question_norm);
-
-            CREATE TABLE IF NOT EXISTS qa_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attempt_id INTEGER NOT NULL REFERENCES fix_attempts(id),
-                qa_id INTEGER NOT NULL REFERENCES qa_knowledge(id),
-                usage_type TEXT NOT NULL,
-                similarity_score REAL NOT NULL DEFAULT 0.0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(attempt_id, qa_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_qa_usage_attempt ON qa_usage(attempt_id);
-
-            CREATE TABLE IF NOT EXISTS question_channel_cursor (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel TEXT NOT NULL,
-                cursor_key TEXT NOT NULL,
-                cursor_value TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(channel, cursor_key)
-            );
-
-            -- ============================================================
-            -- Repository File Index
-            -- ============================================================
-
-            -- File index for searching - files within repositories
-            CREATE TABLE IF NOT EXISTS repo_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-                file_path TEXT NOT NULL,
-                file_type TEXT,
-                last_modified TEXT,
-                UNIQUE(repo_id, file_path)
-            );
-            CREATE INDEX IF NOT EXISTS idx_repo_files_path ON repo_files(file_path);
-            CREATE INDEX IF NOT EXISTS idx_repo_files_type ON repo_files(file_type);
-            CREATE INDEX IF NOT EXISTS idx_repo_files_repo ON repo_files(repo_id);
-
-            -- ============================================================
-            -- Inference Tracking Tables
-            -- ============================================================
-
-            -- Track every inference attempt for learning and analytics
-            CREATE TABLE IF NOT EXISTS inference_attempts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                issue_id TEXT NOT NULL,
-                issue_source TEXT NOT NULL,
-
-                -- Input context
-                extracted_filenames TEXT,
-                extracted_functions TEXT,
-                extracted_keywords TEXT,
-                raw_context TEXT,
-
-                -- Inference result
-                inferred_repo_id INTEGER REFERENCES repositories(id),
-                confidence TEXT,
-                inference_reason TEXT,
-                match_details TEXT,
-
-                -- Outcome tracking (updated later)
-                was_correct INTEGER,
-                actual_repo_id INTEGER REFERENCES repositories(id),
-                feedback_source TEXT,
-
-                -- Timing
-                inference_duration_ms INTEGER,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                feedback_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_inference_issue ON inference_attempts(issue_id);
-            CREATE INDEX IF NOT EXISTS idx_inference_confidence ON inference_attempts(confidence);
-            CREATE INDEX IF NOT EXISTS idx_inference_correct ON inference_attempts(was_correct);
-            CREATE INDEX IF NOT EXISTS idx_inference_created ON inference_attempts(created_at DESC);
-
-            -- ============================================================
-            -- PR Lifecycle Tracking Table
-            -- ============================================================
-
-            -- Comprehensive PR tracking for lifecycle management
-            CREATE TABLE IF NOT EXISTS prs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pr_url TEXT NOT NULL UNIQUE,
-                scm_repo TEXT NOT NULL,
-                pr_number INTEGER NOT NULL,
-
-                -- Links
-                attempt_id INTEGER REFERENCES fix_attempts(id),
-                issue_id TEXT,
-                issue_source TEXT,
-
-                -- Metadata
-                title TEXT,
-                description TEXT,
-                author TEXT,
-                head_branch TEXT,
-                base_branch TEXT,
-
-                -- Status: open, merged, closed
-                status TEXT NOT NULL DEFAULT 'open',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT,
-                merged_at TEXT,
-                closed_at TEXT,
-
-                -- Review summary
-                approvals_count INTEGER DEFAULT 0,
-                changes_requested_count INTEGER DEFAULT 0,
-                comments_count INTEGER DEFAULT 0,
-                last_review_at TEXT,
-
-                -- Timing analytics
-                time_to_first_review_mins INTEGER,
-                time_to_merge_mins INTEGER,
-                review_cycles INTEGER DEFAULT 0,
-
-                -- Content metrics
-                files_changed INTEGER,
-                lines_added INTEGER,
-                lines_removed INTEGER,
-                fix_quality_score REAL
-            );
-            CREATE INDEX IF NOT EXISTS idx_prs_status ON prs(status);
-            CREATE INDEX IF NOT EXISTS idx_prs_repo ON prs(scm_repo);
-            CREATE INDEX IF NOT EXISTS idx_prs_attempt ON prs(attempt_id);
-            CREATE INDEX IF NOT EXISTS idx_prs_issue ON prs(issue_source, issue_id);
-
-            -- ============================================================
-            -- Regression Tracking Tables
-            -- ============================================================
-
-            -- Track watched issues for regression monitoring
-            CREATE TABLE IF NOT EXISTS regression_watches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                issue_type TEXT NOT NULL,           -- 'sentry_issue' or 'linear_bug'
-                issue_id TEXT NOT NULL,
-                fix_attempt_id INTEGER NOT NULL REFERENCES fix_attempts(id),
-                status TEXT NOT NULL DEFAULT 'awaiting_release',
-                -- Status: awaiting_release -> monitoring -> resolved | regressed
-                pr_merged_at TEXT,
-                monitoring_started_at TEXT,
-                resolved_at TEXT,
-                regressed_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(issue_type, issue_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_regression_watches_status ON regression_watches(status);
-            CREATE INDEX IF NOT EXISTS idx_regression_watches_fix_attempt ON regression_watches(fix_attempt_id);
-
-            -- Track release propagation
-            CREATE TABLE IF NOT EXISTS release_tracking (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                regression_watch_id INTEGER NOT NULL REFERENCES regression_watches(id),
-                release_version TEXT NOT NULL,
-                release_commit TEXT NOT NULL,
-                released_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_release_tracking_watch ON release_tracking(regression_watch_id);
-
-            -- Individual regression check results
-            CREATE TABLE IF NOT EXISTS regression_checks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                regression_watch_id INTEGER NOT NULL REFERENCES regression_watches(id),
-                issue_still_exists INTEGER NOT NULL DEFAULT 0,
-                checked_at TEXT,
-                check_details TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_regression_checks_watch ON regression_checks(regression_watch_id);
-
-            -- ============================================================
-            -- Authentication Tables
-            -- ============================================================
-
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                name TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'viewer',
-                avatar_url TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                expires_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
-            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-
-            -- Webhook delivery idempotency: prevents redelivered webhooks from
-            -- being processed twice after server restart.
-            CREATE TABLE IF NOT EXISTS webhook_deliveries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                delivery_id TEXT NOT NULL,
-                source TEXT NOT NULL,
-                received_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(delivery_id, source)
-            );
-            CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_cleanup
-                ON webhook_deliveries(received_at);
-            "#,
-        )?;
-
-        conn.execute_batch(
-            r#"
-            -- Diff analyses for merged PRs (System 2)
-            CREATE TABLE IF NOT EXISTS diff_analyses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attempt_id INTEGER REFERENCES fix_attempts(id),
-                pr_url TEXT NOT NULL,
-                scm_repo TEXT NOT NULL,
-                pr_number INTEGER NOT NULL,
-                files_changed TEXT NOT NULL DEFAULT '[]',
-                file_types TEXT NOT NULL DEFAULT '{}',
-                change_categories TEXT NOT NULL DEFAULT '[]',
-                diff_summary TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_diff_analyses_repo ON diff_analyses(scm_repo);
-            CREATE INDEX IF NOT EXISTS idx_diff_analyses_attempt ON diff_analyses(attempt_id);
-
-            -- Promoted instructions from repeated Q&A (System 3)
-            CREATE TABLE IF NOT EXISTS promoted_instructions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo TEXT NOT NULL,
-                source_type TEXT NOT NULL,
-                instruction_text TEXT NOT NULL,
-                occurrence_count INTEGER NOT NULL DEFAULT 1,
-                confidence REAL NOT NULL DEFAULT 0.5,
-                is_active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_promoted_instructions_repo ON promoted_instructions(repo, is_active);
-
-            -- Per-repo accumulated knowledge (System 4)
-            CREATE TABLE IF NOT EXISTS repo_knowledge (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo TEXT NOT NULL,
-                knowledge_key TEXT NOT NULL,
-                knowledge_value TEXT NOT NULL,
-                source_type TEXT NOT NULL,
-                confidence REAL NOT NULL DEFAULT 0.5,
-                occurrence_count INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(repo, knowledge_key, knowledge_value)
-            );
-            CREATE INDEX IF NOT EXISTS idx_repo_knowledge_repo ON repo_knowledge(repo);
-            CREATE INDEX IF NOT EXISTS idx_repo_knowledge_key ON repo_knowledge(repo, knowledge_key);
-
-            -- Classified review feedback patterns (System 5)
-            CREATE TABLE IF NOT EXISTS review_patterns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                scm_repo TEXT NOT NULL,
-                category TEXT NOT NULL,
-                pattern_text TEXT NOT NULL,
-                example_comments TEXT NOT NULL DEFAULT '[]',
-                occurrence_count INTEGER NOT NULL DEFAULT 1,
-                promoted_to_instruction INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_review_patterns_repo ON review_patterns(scm_repo);
-            CREATE INDEX IF NOT EXISTS idx_review_patterns_category ON review_patterns(scm_repo, category);
-
-            -- Strategy fingerprints (System 6)
-            CREATE TABLE IF NOT EXISTS strategy_fingerprints (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attempt_id INTEGER NOT NULL REFERENCES fix_attempts(id),
-                files_explored TEXT NOT NULL DEFAULT '[]',
-                tests_run INTEGER NOT NULL DEFAULT 0,
-                tools_used TEXT NOT NULL DEFAULT '{}',
-                fix_approach TEXT NOT NULL DEFAULT '',
-                strategy_summary TEXT NOT NULL DEFAULT '',
-                fix_quality_score REAL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_strategy_fingerprints_attempt ON strategy_fingerprints(attempt_id);
-
-            -- Issue clusters (System 8)
-            CREATE TABLE IF NOT EXISTS issue_clusters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cluster_key TEXT NOT NULL UNIQUE,
-                source TEXT NOT NULL,
-                issue_ids TEXT NOT NULL DEFAULT '[]',
-                window_start TEXT NOT NULL,
-                window_end TEXT NOT NULL,
-                resolved_by_issue_id TEXT,
-                resolved_by_attempt_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_issue_clusters_source ON issue_clusters(source, status);
-            CREATE INDEX IF NOT EXISTS idx_issue_clusters_key ON issue_clusters(cluster_key);
-
-            CREATE TABLE IF NOT EXISTS issue_cluster_members (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cluster_id INTEGER NOT NULL REFERENCES issue_clusters(id),
-                issue_id TEXT NOT NULL,
-                arrived_at TEXT NOT NULL,
-                UNIQUE(cluster_id, issue_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_issue_cluster_members_cluster ON issue_cluster_members(cluster_id);
-            "#,
-        )?;
-
-        // Prioritisation engine tables
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS content_clusters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cluster_key TEXT NOT NULL,
-                source TEXT NOT NULL,
-                representative_issue_id TEXT NOT NULL,
-                issue_ids TEXT NOT NULL DEFAULT '[]',
-                error_type TEXT,
-                culprit TEXT,
-                avg_similarity REAL NOT NULL DEFAULT 0.0,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(cluster_key, source)
-            );
-            CREATE INDEX IF NOT EXISTS idx_content_clusters_source ON content_clusters(source, status);
-            CREATE INDEX IF NOT EXISTS idx_content_clusters_key ON content_clusters(cluster_key);
-
-            CREATE TABLE IF NOT EXISTS severity_scores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL,
-                issue_id TEXT NOT NULL,
-                score REAL NOT NULL,
-                severity_component REAL NOT NULL DEFAULT 0.0,
-                frequency_component REAL NOT NULL DEFAULT 0.0,
-                regression_component REAL NOT NULL DEFAULT 0.0,
-                blast_radius_component REAL NOT NULL DEFAULT 0.0,
-                cluster_boost REAL NOT NULL DEFAULT 0.0,
-                blast_radius TEXT NOT NULL DEFAULT 'core',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(source, issue_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_severity_scores_source ON severity_scores(source);
-
-            CREATE TABLE IF NOT EXISTS suppression_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL,
-                issue_id TEXT NOT NULL,
-                rule_name TEXT NOT NULL,
-                reason TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(source, issue_id, rule_name)
-            );
-            CREATE INDEX IF NOT EXISTS idx_suppression_log_source ON suppression_log(source);
-
-            -- Code indexing: extracted symbols
-            CREATE TABLE IF NOT EXISTS code_symbols (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-                file_path TEXT NOT NULL,
-                symbol_name TEXT NOT NULL,
-                symbol_kind TEXT NOT NULL,
-                parent_symbol TEXT,
-                language TEXT NOT NULL,
-                start_line INTEGER NOT NULL,
-                end_line INTEGER NOT NULL,
-                signature TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_code_symbols_repo ON code_symbols(repo_id);
-            CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(symbol_name);
-            CREATE INDEX IF NOT EXISTS idx_code_symbols_kind ON code_symbols(symbol_kind);
-            CREATE INDEX IF NOT EXISTS idx_code_symbols_file ON code_symbols(repo_id, file_path);
-
-            -- Code indexing: semantic chunks for embedding
-            CREATE TABLE IF NOT EXISTS code_chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-                file_path TEXT NOT NULL,
-                chunk_type TEXT NOT NULL,
-                symbol_name TEXT,
-                language TEXT NOT NULL,
-                start_line INTEGER NOT NULL,
-                end_line INTEGER NOT NULL,
-                chunk_text TEXT NOT NULL,
-                context_text TEXT NOT NULL,
-                file_hash TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_code_chunks_repo ON code_chunks(repo_id);
-            CREATE INDEX IF NOT EXISTS idx_code_chunks_file ON code_chunks(repo_id, file_path);
-            CREATE INDEX IF NOT EXISTS idx_code_chunks_symbol ON code_chunks(symbol_name);
-            CREATE INDEX IF NOT EXISTS idx_code_chunks_hash ON code_chunks(repo_id, file_path, file_hash);
-
-            -- Code indexing: chunk embeddings
-            CREATE TABLE IF NOT EXISTS code_chunk_embeddings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chunk_id INTEGER NOT NULL UNIQUE REFERENCES code_chunks(id) ON DELETE CASCADE,
-                embedding BLOB NOT NULL,
-                embedding_model TEXT NOT NULL
-            );
-
-            -- Indexing progress tracking (single row, upserted)
-            CREATE TABLE IF NOT EXISTS indexing_progress (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                status TEXT NOT NULL DEFAULT 'idle',
-                total_repos INTEGER NOT NULL DEFAULT 0,
-                indexed_repos INTEGER NOT NULL DEFAULT 0,
-                current_repo TEXT,
-                current_repo_files INTEGER NOT NULL DEFAULT 0,
-                total_files_indexed INTEGER NOT NULL DEFAULT 0,
-                started_at TEXT,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            INSERT OR IGNORE INTO indexing_progress (id) VALUES (1);
-            "#,
-        )?;
-
-        // Reset any stuck "running" indexing progress rows from a previous crash
-        conn.execute(
-            "UPDATE indexing_progress SET status = 'idle' WHERE status = 'running'",
-            [],
-        )?;
-
-        // Cross-repo failure correlations, code complexity, and evaluation tables
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS cross_repo_correlations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo_a TEXT NOT NULL,
-                repo_b TEXT NOT NULL,
-                correlation_count INTEGER NOT NULL DEFAULT 1,
-                last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-                window_hours INTEGER NOT NULL DEFAULT 24,
-                UNIQUE(repo_a, repo_b)
-            );
-            CREATE INDEX IF NOT EXISTS idx_cross_repo_correlations_repos ON cross_repo_correlations(repo_a, repo_b);
-
-            CREATE TABLE IF NOT EXISTS code_complexity (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo_id INTEGER NOT NULL,
-                file_path TEXT NOT NULL,
-                avg_cyclomatic REAL,
-                max_cyclomatic REAL,
-                avg_func_length REAL,
-                max_func_length REAL,
-                avg_nesting REAL,
-                max_nesting REAL,
-                total_lines INTEGER,
-                function_count INTEGER,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(repo_id, file_path)
-            );
-            CREATE INDEX IF NOT EXISTS idx_code_complexity_repo ON code_complexity(repo_id);
-
-            CREATE TABLE IF NOT EXISTS eval_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attempt_id INTEGER,
-                phase TEXT NOT NULL,
-                category TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                exit_code INTEGER NOT NULL DEFAULT -1,
-                passed INTEGER NOT NULL DEFAULT 0,
-                failed INTEGER NOT NULL DEFAULT 0,
-                skipped INTEGER NOT NULL DEFAULT 0,
-                warnings INTEGER NOT NULL DEFAULT 0,
-                errors INTEGER NOT NULL DEFAULT 0,
-                diagnostics_json TEXT NOT NULL DEFAULT '[]',
-                raw_output TEXT NOT NULL DEFAULT '',
-                duration_secs REAL NOT NULL DEFAULT 0.0,
-                line_coverage_pct REAL,
-                branch_coverage_pct REAL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_eval_snapshots_attempt ON eval_snapshots(attempt_id, phase);
-
-            CREATE TABLE IF NOT EXISTS eval_deltas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attempt_id INTEGER,
-                repo TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                category TEXT NOT NULL,
-                new_passes INTEGER NOT NULL DEFAULT 0,
-                new_failures INTEGER NOT NULL DEFAULT 0,
-                regressions_json TEXT NOT NULL DEFAULT '[]',
-                fixed_json TEXT NOT NULL DEFAULT '[]',
-                coverage_delta_pct REAL,
-                overall_improved INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_eval_deltas_attempt ON eval_deltas(attempt_id);
-            "#,
-        )?;
-
-        // Idempotent migration: add cost/token columns to claude_executions.
-        // ALTER TABLE ADD COLUMN is a no-op if the column already exists (error ignored).
-        for col_def in [
-            "total_cost_usd REAL",
-            "num_turns INTEGER",
-            "session_id TEXT",
-            "duration_api_ms INTEGER",
-            "input_tokens INTEGER",
-            "output_tokens INTEGER",
-            "cache_read_input_tokens INTEGER",
-            "cache_creation_input_tokens INTEGER",
-        ] {
-            let _ = conn.execute(
-                &format!("ALTER TABLE claude_executions ADD COLUMN {}", col_def),
-                [],
-            );
-        }
-
-        // Idempotent migration: add provider + experiment columns to claude_executions.
-        for col_def in [
-            "provider TEXT DEFAULT 'claude'",
-            "experiment_name TEXT",
-            "experiment_variant TEXT",
-        ] {
-            let _ = conn.execute(
-                &format!("ALTER TABLE claude_executions ADD COLUMN {}", col_def),
-                [],
-            );
-        }
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_executions_provider ON claude_executions(provider)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_executions_experiment ON claude_executions(experiment_name)",
-            [],
-        );
-
-        // Update query planner statistics after schema creation
-        // This helps SQLite make better query planning decisions
-        conn.execute("ANALYZE", [])?;
-
-        Ok(())
-    }
-
-    fn parse_datetime(s: &str) -> DateTime<Utc> {
+    fn parse_datetime(s: &str) -> std::result::Result<DateTime<Utc>, rusqlite::Error> {
         DateTime::parse_from_rfc3339(s)
             .map(|dt| dt.with_timezone(&Utc))
             .or_else(|_| {
                 chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").map(|dt| dt.and_utc())
             })
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    component = "sqlite",
-                    input = %s,
-                    error = %e,
-                    "Failed to parse datetime, falling back to current time - this may indicate data corruption"
-                );
-                Utc::now()
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })
     }
 
@@ -1093,13 +250,18 @@ impl SqliteTracker {
             labels: row.get(meta_offset + 4)?,
             embedding,
             embedding_model: row.get(6)?,
-            created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-            updated_at: updated_at.map(|s| Self::parse_datetime(&s)),
+            created_at: Self::parse_datetime(&row.get::<_, String>(7)?)?,
+            updated_at: Self::parse_optional_datetime(updated_at)?,
         })
     }
 
-    fn parse_optional_datetime(s: Option<String>) -> Option<DateTime<Utc>> {
-        s.map(|s| Self::parse_datetime(&s))
+    fn parse_optional_datetime(
+        s: Option<String>,
+    ) -> std::result::Result<Option<DateTime<Utc>>, rusqlite::Error> {
+        match s {
+            Some(s) => Self::parse_datetime(&s).map(Some),
+            None => Ok(None),
+        }
     }
 
     fn resolve_log_root() -> PathBuf {
@@ -1173,29 +335,10 @@ impl SqliteTracker {
         }
     }
 
-    /// Parse a GitHub PR or GitLab MR URL to extract repo/project and number.
-    /// Supports:
-    /// - GitHub: https://github.com/owner/repo/pull/123
-    /// - GitLab: https://gitlab.com/group/project/-/merge_requests/123
-    /// - Self-hosted GitLab: https://gitlab.example.com/group/project/-/merge_requests/123
+    /// Delegate to the module-level `parse_pr_url` for backward compatibility
+    /// with tests that call `SqliteTracker::parse_pr_url`.
     pub fn parse_pr_url(url: &str) -> Option<(String, i64)> {
-        // Reject excessively long URLs to prevent ReDoS and memory issues
-        if url.len() > MAX_PR_URL_LENGTH {
-            return None;
-        }
-        // Try GitHub PR URL first
-        if let Some(caps) = PR_URL_REGEX.captures(url) {
-            let repo = caps.get(1)?.as_str().to_string();
-            let pr_number: i64 = caps.get(2)?.as_str().parse().ok()?;
-            return Some((repo, pr_number));
-        }
-        // Try GitLab MR URL
-        if let Some(caps) = MR_URL_REGEX.captures(url) {
-            let project = caps.get(1)?.as_str().to_string();
-            let mr_iid: i64 = caps.get(2)?.as_str().parse().ok()?;
-            return Some((project, mr_iid));
-        }
-        None
+        super::parse_pr_url(url)
     }
 
     fn embedding_to_blob(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
@@ -1238,6 +381,7 @@ impl SqliteTracker {
         if dimension == 0 {
             return Ok(false);
         }
+        validate_dimension(dimension)?;
 
         if !is_vectorlite_available(conn) {
             match try_load_vectorlite(conn) {
@@ -1316,6 +460,7 @@ impl SqliteTracker {
         if dimension == 0 {
             return Ok(false);
         }
+        validate_dimension(dimension)?;
 
         if !is_vectorlite_available(conn) {
             match try_load_vectorlite(conn) {
@@ -1398,6 +543,7 @@ impl SqliteTracker {
         if dimension == 0 {
             return Ok(false);
         }
+        validate_dimension(dimension)?;
 
         if !is_vectorlite_available(conn) {
             match try_load_vectorlite(conn) {
@@ -1786,7 +932,7 @@ impl SqliteTracker {
     }
 }
 
-impl FixAttemptTracker for SqliteTracker {
+impl AttemptTracker for SqliteTracker {
     fn has_attempted(&self, source: &str, issue_id: &str) -> Result<bool> {
         let conn = self.acquire_lock()?;
         // Exclude soft-reset entries (reset_at IS NOT NULL) so they are treated as
@@ -1797,46 +943,18 @@ impl FixAttemptTracker for SqliteTracker {
         Ok(stmt.exists(params![source, issue_id])?)
     }
 
-    fn get_attempted_issue_ids(&self, source: &str) -> HashSet<String> {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to acquire database lock in get_attempted_issue_ids");
-                return HashSet::new();
-            }
-        };
-        let mut stmt = match conn.prepare_cached(
+    fn get_attempted_issue_ids(&self, source: &str) -> Result<HashSet<String>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT issue_id FROM fix_attempts WHERE source = ? AND reset_at IS NULL",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to prepare statement in get_attempted_issue_ids");
-                return HashSet::new();
-            }
-        };
+        )?;
 
-        // Collect results immediately to avoid borrow lifetime issues
-        let query_result = stmt.query_map(params![source], |row| row.get::<_, String>(0));
+        let rows = stmt.query_map(params![source], |row| row.get::<_, String>(0))?;
         let mut result = HashSet::new();
-
-        match query_result {
-            Ok(rows) => {
-                for row in rows {
-                    match row {
-                        Ok(id) => {
-                            result.insert(id);
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to read issue_id row");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to query issue IDs");
-            }
+        for row in rows {
+            result.insert(row?);
         }
-        result
+        Ok(result)
     }
 
     fn record_attempt(&self, source: &str, issue_id: &str, short_id: &str) -> Result<()> {
@@ -1863,7 +981,7 @@ impl FixAttemptTracker for SqliteTracker {
         let labels_json = if labels.is_empty() {
             None
         } else {
-            Some(serde_json::to_string(labels).unwrap_or_default())
+            Some(serde_json::to_string(labels)?)
         };
 
         // Manual upsert: check for existing non-cascade row, then INSERT or UPDATE.
@@ -1944,7 +1062,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             UPDATE fix_attempts
             SET status = 'success', pr_url = ?, scm_repo = ?, scm_pr_number = ?
-            WHERE source = ? AND issue_id = ?
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
             "#,
             params![pr_url, scm_repo, scm_pr_number, source, issue_id],
         )?;
@@ -1969,7 +1087,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             UPDATE fix_attempts
             SET status = 'merged', merged_at = datetime('now')
-            WHERE source = ? AND issue_id = ?
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
             "#,
             params![source, issue_id],
         )?;
@@ -1993,7 +1111,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             UPDATE fix_attempts
             SET status = 'closed'
-            WHERE source = ? AND issue_id = ?
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
             "#,
             params![source, issue_id],
         )?;
@@ -2017,7 +1135,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             UPDATE fix_attempts
             SET resolved_at = datetime('now')
-            WHERE source = ? AND issue_id = ?
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
             "#,
             params![source, issue_id],
         )?;
@@ -2042,7 +1160,7 @@ impl FixAttemptTracker for SqliteTracker {
             r#"
             UPDATE fix_attempts
             SET status = 'failed', error_message = ?
-            WHERE source = ? AND issue_id = ?
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
             "#,
             params![error_message, source, issue_id],
         )?;
@@ -2341,7 +1459,9 @@ impl FixAttemptTracker for SqliteTracker {
 
         Ok(stats)
     }
+}
 
+impl ActivityStore for SqliteTracker {
     fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
         SqliteTracker::record_activity(self, entry)
     }
@@ -2368,89 +1488,6 @@ impl FixAttemptTracker for SqliteTracker {
 
     fn get_analytics_summary(&self) -> Result<AnalyticsSummary> {
         SqliteTracker::get_analytics_summary(self)
-    }
-
-    fn store_feedback_outcome(&self, outcome: &FixOutcome) -> Result<i64> {
-        SqliteTracker::store_feedback_outcome(self, outcome)
-    }
-
-    fn get_feedback_outcomes(&self, source: Option<&str>, limit: usize) -> Result<Vec<FixOutcome>> {
-        SqliteTracker::get_feedback_outcomes(self, source, limit)
-    }
-
-    fn get_feedback_outcome_by_attempt(&self, attempt_id: i64) -> Result<Option<FixOutcome>> {
-        SqliteTracker::get_feedback_outcome_by_attempt(self, attempt_id)
-    }
-
-    fn store_qa_knowledge(&self, entry: &QaKnowledgeEntry) -> Result<i64> {
-        SqliteTracker::store_qa_knowledge(self, entry)
-    }
-
-    fn find_similar_qa_scoped(
-        &self,
-        source: &str,
-        repo: Option<&str>,
-        question_norm: &str,
-        question_embedding: Option<&[f32]>,
-        threshold: f64,
-        limit: usize,
-    ) -> Result<Vec<QaMatch>> {
-        SqliteTracker::find_similar_qa_scoped(
-            self,
-            source,
-            repo,
-            question_norm,
-            question_embedding,
-            threshold,
-            limit,
-        )
-    }
-
-    fn find_similar_qa_global(
-        &self,
-        question_norm: &str,
-        question_embedding: Option<&[f32]>,
-        threshold: f64,
-        limit: usize,
-    ) -> Result<Vec<QaMatch>> {
-        SqliteTracker::find_similar_qa_global(
-            self,
-            question_norm,
-            question_embedding,
-            threshold,
-            limit,
-        )
-    }
-
-    fn record_qa_usage(
-        &self,
-        attempt_id: i64,
-        qa_id: i64,
-        usage_type: &str,
-        similarity_score: f64,
-    ) -> Result<i64> {
-        SqliteTracker::record_qa_usage(self, attempt_id, qa_id, usage_type, similarity_score)
-    }
-
-    fn update_qa_outcome_stats(&self, qa_id: i64, success: bool) -> Result<()> {
-        SqliteTracker::update_qa_outcome_stats(self, qa_id, success)
-    }
-
-    fn update_qa_outcome_stats_for_attempt(&self, attempt_id: i64, success: bool) -> Result<()> {
-        SqliteTracker::update_qa_outcome_stats_for_attempt(self, attempt_id, success)
-    }
-
-    fn get_channel_cursor(&self, channel: &str, cursor_key: &str) -> Result<Option<String>> {
-        SqliteTracker::get_channel_cursor(self, channel, cursor_key)
-    }
-
-    fn set_channel_cursor(
-        &self,
-        channel: &str,
-        cursor_key: &str,
-        cursor_value: &str,
-    ) -> Result<()> {
-        SqliteTracker::set_channel_cursor(self, channel, cursor_key, cursor_value)
     }
 
     fn get_recent_activities_filtered(
@@ -2532,266 +1569,12 @@ impl FixAttemptTracker for SqliteTracker {
         SqliteTracker::get_complexity_time_savings(self, since_iso, hourly_rate, period_label)
     }
 
-    fn get_regression_watches_by_status(
-        &self,
-        status: crate::types::RegressionWatchStatus,
-    ) -> Result<Vec<crate::types::RegressionWatch>> {
-        SqliteTracker::get_regression_watches_by_status(self, status)
-    }
-
-    fn get_all_regression_watches(&self) -> Result<Vec<crate::types::RegressionWatch>> {
-        SqliteTracker::get_all_regression_watches(self)
-    }
-
-    fn get_regression_checks(&self, watch_id: i64) -> Result<Vec<crate::types::RegressionCheck>> {
-        SqliteTracker::get_regression_checks(self, watch_id)
-    }
-
-    fn get_regression_watch(&self, id: i64) -> Result<Option<crate::types::RegressionWatch>> {
-        SqliteTracker::get_regression_watch(self, id)
-    }
-
-    fn record_regression_check(&self, check: &crate::types::RegressionCheck) -> Result<i64> {
-        SqliteTracker::record_regression_check(self, check)
-    }
-
-    fn get_active_experiments(&self) -> Result<Vec<PromptExperiment>> {
-        SqliteTracker::get_active_experiments(self)
-    }
-
-    fn list_indexed_repos(&self) -> Result<Vec<StoredIndexedRepo>> {
-        SqliteTracker::list_indexed_repos(self)
-    }
-
-    fn get_index_stats(&self) -> Result<IndexStats> {
-        SqliteTracker::get_index_stats(self)
-    }
-
-    fn get_indexing_progress(&self) -> Result<IndexingProgress> {
-        SqliteTracker::get_indexing_progress(self)
-    }
-
-    fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
-        SqliteTracker::subscribe_indexing_progress(self)
-    }
-
-    fn add_dependency(&self, upstream: &str, downstream: &str, dep_type: &str) -> Result<()> {
-        SqliteTracker::add_dependency(self, upstream, downstream, dep_type)
-    }
-
-    fn list_all_dependencies(&self) -> Result<Vec<StoredDependency>> {
-        SqliteTracker::list_all_dependencies(self)
-    }
-
-    fn get_inference_stats(&self) -> Result<InferenceStats> {
-        SqliteTracker::get_inference_stats(self)
-    }
-
-    fn get_inference_history(&self, limit: usize) -> Result<Vec<InferenceHistoryEntry>> {
-        SqliteTracker::get_inference_history(self, limit)
-    }
-
     fn list_prs(&self, status: Option<&str>, limit: usize) -> Result<Vec<crate::types::PrRecord>> {
         SqliteTracker::list_prs(self, status, limit)
     }
 
-    fn update_feedback_learnings(&self, outcome_id: i64, learnings: &str) -> Result<()> {
-        SqliteTracker::update_feedback_learnings(self, outcome_id, learnings)
-    }
-
-    fn store_diff_analysis(&self, analysis: &crate::types::DiffAnalysis) -> Result<i64> {
-        SqliteTracker::store_diff_analysis(self, analysis)
-    }
-
-    fn get_diff_analyses_for_repo(
-        &self,
-        repo: &str,
-        limit: usize,
-    ) -> Result<Vec<crate::types::DiffAnalysis>> {
-        SqliteTracker::get_diff_analyses_for_repo(self, repo, limit)
-    }
-
-    fn upsert_promoted_instruction(
-        &self,
-        instruction: &crate::types::PromotedInstruction,
-    ) -> Result<i64> {
-        SqliteTracker::upsert_promoted_instruction(self, instruction)
-    }
-
-    fn get_promoted_instructions(
-        &self,
-        repo: &str,
-    ) -> Result<Vec<crate::types::PromotedInstruction>> {
-        SqliteTracker::get_promoted_instructions(self, repo)
-    }
-
-    fn upsert_repo_knowledge(&self, entry: &crate::types::RepoKnowledge) -> Result<i64> {
-        SqliteTracker::upsert_repo_knowledge(self, entry)
-    }
-
-    fn get_repo_knowledge(&self, repo: &str) -> Result<Vec<crate::types::RepoKnowledge>> {
-        SqliteTracker::get_repo_knowledge(self, repo)
-    }
-
-    fn get_repo_knowledge_by_key(
-        &self,
-        repo: &str,
-        key: &str,
-    ) -> Result<Vec<crate::types::RepoKnowledge>> {
-        SqliteTracker::get_repo_knowledge_by_key(self, repo, key)
-    }
-
-    fn upsert_review_pattern(&self, pattern: &crate::types::ReviewPattern) -> Result<i64> {
-        SqliteTracker::upsert_review_pattern(self, pattern)
-    }
-
-    fn get_review_patterns(
-        &self,
-        repo: &str,
-        limit: usize,
-    ) -> Result<Vec<crate::types::ReviewPattern>> {
-        SqliteTracker::get_review_patterns(self, repo, limit)
-    }
-
-    fn get_review_patterns_by_category(
-        &self,
-        repo: &str,
-        category: crate::types::ReviewCategory,
-    ) -> Result<Vec<crate::types::ReviewPattern>> {
-        SqliteTracker::get_review_patterns_by_category(self, repo, category)
-    }
-
-    fn store_strategy_fingerprint(
-        &self,
-        fingerprint: &crate::types::StrategyFingerprint,
-    ) -> Result<i64> {
-        SqliteTracker::store_strategy_fingerprint(self, fingerprint)
-    }
-
-    fn get_successful_strategies(
-        &self,
-        repo: &str,
-        limit: usize,
-    ) -> Result<Vec<crate::types::StrategyFingerprint>> {
-        SqliteTracker::get_successful_strategies(self, repo, limit)
-    }
-
     fn update_pr_fix_quality_score(&self, pr_url: &str, score: f64) -> Result<()> {
         SqliteTracker::update_pr_fix_quality_score(self, pr_url, score)
-    }
-
-    fn store_issue_cluster(&self, cluster: &crate::types::IssueCluster) -> Result<i64> {
-        SqliteTracker::store_issue_cluster(self, cluster)
-    }
-
-    fn get_active_clusters(&self, source: &str) -> Result<Vec<crate::types::IssueCluster>> {
-        SqliteTracker::get_active_clusters(self, source)
-    }
-
-    fn update_cluster_resolution(
-        &self,
-        cluster_id: i64,
-        resolved_by_issue_id: &str,
-        resolved_by_attempt_id: i64,
-    ) -> Result<()> {
-        SqliteTracker::update_cluster_resolution(
-            self,
-            cluster_id,
-            resolved_by_issue_id,
-            resolved_by_attempt_id,
-        )
-    }
-
-    fn get_recent_issue_arrivals(
-        &self,
-        source: &str,
-        window_minutes: i64,
-    ) -> Result<Vec<(String, DateTime<Utc>)>> {
-        SqliteTracker::get_recent_issue_arrivals(self, source, window_minutes)
-    }
-
-    fn store_content_cluster(&self, cluster: &crate::types::ContentCluster) -> Result<i64> {
-        SqliteTracker::store_content_cluster(self, cluster)
-    }
-
-    fn get_active_content_clusters(
-        &self,
-        source: &str,
-    ) -> Result<Vec<crate::types::ContentCluster>> {
-        SqliteTracker::get_active_content_clusters(self, source)
-    }
-
-    fn resolve_content_cluster(&self, cluster_id: i64) -> Result<()> {
-        SqliteTracker::resolve_content_cluster(self, cluster_id)
-    }
-
-    fn store_severity_score(
-        &self,
-        source: &str,
-        issue_id: &str,
-        score: &crate::types::SeverityScore,
-        blast_radius: crate::types::BlastRadius,
-    ) -> Result<()> {
-        SqliteTracker::store_severity_score(self, source, issue_id, score, blast_radius)
-    }
-
-    fn record_suppression(
-        &self,
-        source: &str,
-        issue_id: &str,
-        rule_name: &str,
-        reason: &str,
-    ) -> Result<()> {
-        SqliteTracker::record_suppression(self, source, issue_id, rule_name, reason)
-    }
-
-    fn get_recent_attempts_since(&self, since: &DateTime<Utc>) -> Result<Vec<FixAttempt>> {
-        SqliteTracker::get_recent_attempts_since(self, since)
-    }
-
-    fn has_dependency(&self, repo_a: &str, repo_b: &str) -> Result<bool> {
-        SqliteTracker::has_dependency(self, repo_a, repo_b)
-    }
-
-    fn upsert_cross_repo_correlation(
-        &self,
-        repo_a: &str,
-        repo_b: &str,
-        window_hours: i64,
-    ) -> Result<CrossRepoCorrelation> {
-        SqliteTracker::upsert_cross_repo_correlation(self, repo_a, repo_b, window_hours)
-    }
-
-    fn get_cross_repo_correlations(
-        &self,
-        min_count: i64,
-        max_age_hours: i64,
-    ) -> Result<Vec<CrossRepoCorrelation>> {
-        SqliteTracker::get_cross_repo_correlations(self, min_count, max_age_hours)
-    }
-
-    /// Check if a webhook delivery ID has been seen, and record it if not.
-    /// Returns true if this is a new delivery, false if it's a duplicate.
-    fn check_and_record_delivery(&self, delivery_id: &str, source: &str) -> Result<bool> {
-        let conn = self.acquire_lock()?;
-        let rows_affected = conn.execute(
-            "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, source) VALUES (?, ?)",
-            params![delivery_id, source],
-        )?;
-        Ok(rows_affected > 0)
-    }
-
-    /// Remove webhook delivery records older than the specified number of hours.
-    fn cleanup_old_deliveries(&self, max_age_hours: u64) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-        let rows = conn.execute(
-            "DELETE FROM webhook_deliveries WHERE received_at < datetime('now', ?)",
-            params![format!("-{} hours", max_age_hours)],
-        )?;
-        if rows > 0 {
-            tracing::debug!(rows = rows, "Cleaned up old webhook deliveries");
-        }
-        Ok(rows)
     }
 
     /// Record multiple activities in a single transaction for better performance.
@@ -3021,6 +1804,1033 @@ impl FixAttemptTracker for SqliteTracker {
         }
 
         Ok(results)
+    }
+
+    /// Get metric row counts grouped by name since a timestamp.
+    fn get_metric_counts_since(
+        &self,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<String, i64>> {
+        if metric_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.acquire_lock()?;
+
+        let placeholders = (0..metric_names.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT metric_name, COUNT(*)
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND metric_name IN ({})
+            GROUP BY metric_name
+            "#,
+            placeholders
+        );
+
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(metric_names.len() + 1);
+        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
+        for metric_name in metric_names {
+            bind_params.push(Box::new((*metric_name).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut counts = HashMap::new();
+        for row in rows.flatten() {
+            counts.insert(row.0, row.1);
+        }
+        Ok(counts)
+    }
+
+    /// Get metric sums grouped by name since a timestamp.
+    fn get_metric_sums_since(
+        &self,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<String, f64>> {
+        if metric_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.acquire_lock()?;
+
+        let placeholders = (0..metric_names.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT metric_name, SUM(metric_value)
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND metric_name IN ({})
+            GROUP BY metric_name
+            "#,
+            placeholders
+        );
+
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(metric_names.len() + 1);
+        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
+        for metric_name in metric_names {
+            bind_params.push(Box::new((*metric_name).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+            ))
+        })?;
+
+        let mut sums = HashMap::new();
+        for row in rows.flatten() {
+            sums.insert(row.0, row.1);
+        }
+        Ok(sums)
+    }
+
+    fn get_metric_sums_by_source_since(
+        &self,
+        metric_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<(String, String), f64>> {
+        if metric_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.acquire_lock()?;
+
+        let placeholders = (0..metric_names.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT metric_name, source, SUM(metric_value)
+            FROM processing_metrics
+            WHERE timestamp >= ?1
+              AND metric_name IN ({})
+            GROUP BY metric_name, source
+            "#,
+            placeholders
+        );
+
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(metric_names.len() + 1);
+        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
+        for metric_name in metric_names {
+            bind_params.push(Box::new((*metric_name).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+            ))
+        })?;
+
+        let mut sums = HashMap::new();
+        for row in rows.flatten() {
+            if let Some(source) = row.1 {
+                sums.insert((row.0, source), row.2);
+            }
+        }
+        Ok(sums)
+    }
+
+    /// Prune old activity logs to prevent unbounded growth.
+    fn prune_old_activities(&self, days_to_keep: i64) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+
+        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
+        // This is safer than building strings in SQL even though days_to_keep is already i64
+        let modifier = format!("-{} days", days_to_keep.abs());
+
+        let deleted = conn.execute(
+            r#"
+            DELETE FROM activity_log
+            WHERE timestamp < datetime('now', ?)
+            "#,
+            params![modifier],
+        )?;
+
+        Ok(deleted)
+    }
+
+    /// Prune old metrics to prevent unbounded growth.
+    fn prune_old_metrics(&self, days_to_keep: i64) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+
+        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
+        let modifier = format!("-{} days", days_to_keep.abs());
+
+        let deleted = conn.execute(
+            r#"
+            DELETE FROM processing_metrics
+            WHERE timestamp < datetime('now', ?)
+            "#,
+            params![modifier],
+        )?;
+
+        Ok(deleted)
+    }
+
+    /// Get diagnostic counts for all major tables.
+    ///
+    /// This is useful for debugging and verifying that data is being written correctly.
+    fn get_diagnostic_counts(&self) -> Result<DiagnosticCounts> {
+        let conn = self.acquire_lock()?;
+
+        let fix_attempts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?;
+        let fix_attempts_by_status: HashMap<String, i64> = {
+            let mut map = HashMap::new();
+            let mut stmt =
+                conn.prepare("SELECT status, COUNT(*) FROM fix_attempts GROUP BY status")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows.flatten() {
+                map.insert(row.0, row.1);
+            }
+            map
+        };
+
+        let activity_log: i64 =
+            conn.query_row("SELECT COUNT(*) FROM activity_log", [], |row| row.get(0))?;
+
+        let claude_executions: i64 =
+            conn.query_row("SELECT COUNT(*) FROM claude_executions", [], |row| {
+                row.get(0)
+            })?;
+
+        let pr_reviews: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pr_reviews", [], |row| row.get(0))?;
+
+        let pr_review_states: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pr_review_states", [], |row| {
+                row.get(0)
+            })?;
+
+        let issues: i64 = conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?;
+
+        let similar_issues: i64 =
+            conn.query_row("SELECT COUNT(*) FROM similar_issues", [], |row| row.get(0))?;
+
+        let repositories: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+
+        let repo_files: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repo_files", [], |row| row.get(0))?;
+
+        let inference_attempts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM inference_attempts", [], |row| {
+                row.get(0)
+            })?;
+
+        let error_patterns: i64 =
+            conn.query_row("SELECT COUNT(*) FROM error_patterns", [], |row| row.get(0))?;
+
+        let processing_metrics: i64 =
+            conn.query_row("SELECT COUNT(*) FROM processing_metrics", [], |row| {
+                row.get(0)
+            })?;
+
+        let feedback_outcomes: i64 =
+            conn.query_row("SELECT COUNT(*) FROM feedback_outcomes", [], |row| {
+                row.get(0)
+            })?;
+
+        let prs: i64 = conn.query_row("SELECT COUNT(*) FROM prs", [], |row| row.get(0))?;
+
+        // Get recent fix attempts for debugging
+        let recent_fix_attempts: Vec<(String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT source, issue_id, short_id, status FROM fix_attempts ORDER BY attempted_at DESC LIMIT 5"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.flatten().collect()
+        };
+
+        Ok(DiagnosticCounts {
+            fix_attempts,
+            fix_attempts_by_status,
+            activity_log,
+            claude_executions,
+            pr_reviews,
+            pr_review_states,
+            issues,
+            similar_issues,
+            repositories,
+            repo_files,
+            inference_attempts,
+            error_patterns,
+            processing_metrics,
+            feedback_outcomes,
+            prs,
+            recent_fix_attempts,
+        })
+    }
+
+    /// Upsert a PR record.
+    ///
+    /// Creates a new record or updates an existing one based on pr_url.
+    fn upsert_pr(&self, pr: &crate::types::PrRecord) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO prs (
+                pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
+                title, description, author, head_branch, base_branch, status,
+                created_at, updated_at, merged_at, closed_at,
+                approvals_count, changes_requested_count, comments_count, last_review_at,
+                time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                files_changed, lines_added, lines_removed
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+            )
+            ON CONFLICT(pr_url) DO UPDATE SET
+                scm_repo = excluded.scm_repo,
+                pr_number = excluded.pr_number,
+                attempt_id = COALESCE(excluded.attempt_id, prs.attempt_id),
+                issue_id = COALESCE(excluded.issue_id, prs.issue_id),
+                issue_source = COALESCE(excluded.issue_source, prs.issue_source),
+                title = COALESCE(excluded.title, prs.title),
+                description = COALESCE(excluded.description, prs.description),
+                author = COALESCE(excluded.author, prs.author),
+                head_branch = COALESCE(excluded.head_branch, prs.head_branch),
+                base_branch = COALESCE(excluded.base_branch, prs.base_branch),
+                status = excluded.status,
+                updated_at = datetime('now'),
+                merged_at = COALESCE(excluded.merged_at, prs.merged_at),
+                closed_at = COALESCE(excluded.closed_at, prs.closed_at),
+                approvals_count = excluded.approvals_count,
+                changes_requested_count = excluded.changes_requested_count,
+                comments_count = excluded.comments_count,
+                last_review_at = COALESCE(excluded.last_review_at, prs.last_review_at),
+                time_to_first_review_mins = COALESCE(excluded.time_to_first_review_mins, prs.time_to_first_review_mins),
+                time_to_merge_mins = COALESCE(excluded.time_to_merge_mins, prs.time_to_merge_mins),
+                review_cycles = excluded.review_cycles,
+                files_changed = COALESCE(excluded.files_changed, prs.files_changed),
+                lines_added = COALESCE(excluded.lines_added, prs.lines_added),
+                lines_removed = COALESCE(excluded.lines_removed, prs.lines_removed)
+            "#,
+            params![
+                pr.pr_url,
+                pr.scm_repo,
+                pr.pr_number,
+                pr.attempt_id,
+                pr.issue_id,
+                pr.issue_source,
+                pr.title,
+                pr.description,
+                pr.author,
+                pr.head_branch,
+                pr.base_branch,
+                pr.status,
+                pr.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                pr.updated_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.merged_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.closed_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.approvals_count,
+                pr.changes_requested_count,
+                pr.comments_count,
+                pr.last_review_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+                pr.time_to_first_review_mins,
+                pr.time_to_merge_mins,
+                pr.review_cycles,
+                pr.files_changed,
+                pr.lines_added,
+                pr.lines_removed,
+            ],
+        )?;
+
+        // Get the id (either inserted or existing)
+        let id: i64 = conn.query_row(
+            "SELECT id FROM prs WHERE pr_url = ?",
+            params![pr.pr_url],
+            |row| row.get(0),
+        )?;
+
+        tracing::info!(
+            pr_url = %pr.pr_url,
+            status = %pr.status,
+            id = id,
+            "PR record upserted"
+        );
+
+        Ok(id)
+    }
+
+    /// Get a PR record by URL.
+    fn get_pr(&self, pr_url: &str) -> Result<Option<crate::types::PrRecord>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
+                   title, description, author, head_branch, base_branch, status,
+                   created_at, updated_at, merged_at, closed_at,
+                   approvals_count, changes_requested_count, comments_count, last_review_at,
+                   time_to_first_review_mins, time_to_merge_mins, review_cycles,
+                   files_changed, lines_added, lines_removed
+            FROM prs WHERE pr_url = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![pr_url], Self::row_to_pr_record).ok();
+        Ok(result)
+    }
+
+    /// Update PR status.
+    fn update_pr_status(&self, pr_url: &str, status: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let (merged_at, closed_at) = match status {
+            "merged" => (Some(now.clone()), None),
+            "closed" => (None, Some(now.clone())),
+            _ => (None, None),
+        };
+
+        conn.execute(
+            r#"
+            UPDATE prs SET
+                status = ?1,
+                updated_at = ?2,
+                merged_at = COALESCE(?3, merged_at),
+                closed_at = COALESCE(?4, closed_at)
+            WHERE pr_url = ?5
+            "#,
+            params![status, now, merged_at, closed_at, pr_url],
+        )?;
+
+        tracing::info!(
+            pr_url = %pr_url,
+            status = status,
+            "PR status updated"
+        );
+
+        Ok(())
+    }
+
+    /// Record a cascade fix attempt linked to a parent attempt.
+    fn record_cascade_attempt(
+        &self,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+        parent_attempt_id: i64,
+        cascade_repo: &str,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        // Check if there's already a pending cascade (no PR yet) for this combo.
+        // Completed cascades (with PR) are allowed to be re-triggered (e.g. merge + release).
+        let pending_id: Option<i64> = conn
+            .prepare_cached(
+                "SELECT id FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ? AND (pr_url IS NULL OR pr_url = '')",
+            )?
+            .query_row(params![source, issue_id, cascade_repo], |row| row.get(0))
+            .ok();
+
+        if let Some(id) = pending_id {
+            tracing::info!(
+                source = source,
+                issue_id = issue_id,
+                cascade_repo = cascade_repo,
+                attempt_id = id,
+                "Pending cascade attempt already exists, skipping"
+            );
+            return Ok(id);
+        }
+
+        conn.execute(
+            r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, parent_attempt_id, cascade_repo)
+               VALUES (?, ?, ?, 'pending', datetime('now'), ?, ?)"#,
+            params![source, issue_id, short_id, parent_attempt_id, cascade_repo],
+        )?;
+
+        let id = conn.last_insert_rowid();
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            cascade_repo = cascade_repo,
+            parent_attempt_id = parent_attempt_id,
+            attempt_id = id,
+            "Recorded cascade fix attempt"
+        );
+        Ok(id)
+    }
+
+    /// Update a cascade attempt's PR info.
+    fn update_attempt_pr(
+        &self,
+        attempt_id: i64,
+        pr_url: &str,
+        scm_repo: &str,
+        pr_number: i64,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE fix_attempts SET pr_url = ?, scm_repo = ?, scm_pr_number = ?, status = 'success' WHERE id = ?",
+            params![pr_url, scm_repo, pr_number, attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a cascade attempt as failed.
+    fn mark_cascade_failed(&self, attempt_id: i64, error: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE fix_attempts SET status = 'failed', error_message = ? WHERE id = ?",
+            params![error, attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// List fix attempts with optional status/source filters and pagination.
+    fn list_attempts(
+        &self,
+        status: Option<&str>,
+        source: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut attempts = Vec::new();
+
+        let query_all = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            ORDER BY attempted_at DESC
+            LIMIT ?1 OFFSET ?2
+        "#;
+        let query_status = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE status = ?1
+            ORDER BY attempted_at DESC
+            LIMIT ?2 OFFSET ?3
+        "#;
+        let query_source = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE source = ?1
+            ORDER BY attempted_at DESC
+            LIMIT ?2 OFFSET ?3
+        "#;
+        let query_status_source = r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE status = ?1 AND source = ?2
+            ORDER BY attempted_at DESC
+            LIMIT ?3 OFFSET ?4
+        "#;
+
+        match (status, source) {
+            (Some(status), Some(source)) => {
+                let mut stmt = conn.prepare_cached(query_status_source)?;
+                let rows = stmt.query_map(
+                    params![status, source, limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+            (Some(status), None) => {
+                let mut stmt = conn.prepare_cached(query_status)?;
+                let rows = stmt.query_map(
+                    params![status, limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+            (None, Some(source)) => {
+                let mut stmt = conn.prepare_cached(query_source)?;
+                let rows = stmt.query_map(
+                    params![source, limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare_cached(query_all)?;
+                let rows = stmt.query_map(
+                    params![limit as i64, offset as i64],
+                    Self::row_to_fix_attempt,
+                )?;
+                attempts.extend(rows.flatten());
+            }
+        }
+
+        Ok(attempts)
+    }
+
+    /// Count fix attempts with optional status/source filters.
+    fn count_attempts(&self, status: Option<&str>, source: Option<&str>) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let count: i64 = match (status, source) {
+            (Some(status), Some(source)) => conn.query_row(
+                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1 AND source = ?2",
+                params![status, source],
+                |row| row.get(0),
+            )?,
+            (Some(status), None) => conn.query_row(
+                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1",
+                params![status],
+                |row| row.get(0),
+            )?,
+            (None, Some(source)) => conn.query_row(
+                "SELECT COUNT(*) FROM fix_attempts WHERE source = ?1",
+                params![source],
+                |row| row.get(0),
+            )?,
+            (None, None) => {
+                conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?
+            }
+        };
+        Ok(count as usize)
+    }
+
+    /// List recent attempts ordered by attempted time descending.
+    fn list_recent_attempts(&self, limit: usize) -> Result<Vec<FixAttempt>> {
+        self.list_attempts(None, None, limit, 0)
+    }
+
+    /// List attempts since a timestamp, ordered by attempted time descending.
+    fn list_attempts_since(&self, since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE attempted_at >= ?1
+            ORDER BY attempted_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![since_str], Self::row_to_fix_attempt)?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Get the most recently merged fix attempt for a given SCM repo.
+    fn get_most_recent_merged_attempt_for_repo(
+        &self,
+        scm_repo: &str,
+    ) -> Result<Option<FixAttempt>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE scm_repo = ? AND status = 'merged'
+            ORDER BY merged_at DESC
+            LIMIT 1
+            "#,
+        )?;
+
+        let result = stmt
+            .query_row(params![scm_repo], Self::row_to_fix_attempt)
+            .ok();
+        Ok(result)
+    }
+
+    /// Get a specific execution for an attempt.
+    fn get_execution_for_attempt(
+        &self,
+        attempt_id: i64,
+        execution_id: i64,
+    ) -> Result<Option<AgentExecution>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
+                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
+                   prompt_used, prompt_hash, model_version, working_directory, git_branch,
+                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
+                   total_cost_usd, num_turns, session_id, duration_api_ms,
+                   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+                   provider, experiment_name, experiment_variant
+            FROM claude_executions
+            WHERE attempt_id = ?1 AND id = ?2
+            LIMIT 1
+            "#,
+        )?;
+
+        let execution = stmt
+            .query_row(params![attempt_id, execution_id], |row| {
+                Ok(AgentExecution {
+                    id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    started_at: Self::parse_datetime(&row.get::<_, String>(2)?)?,
+                    completed_at: Self::parse_optional_datetime(row.get(3)?)?,
+                    duration_secs: row.get(4)?,
+                    exit_code: row.get(5)?,
+                    timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
+                    stdout_preview: row.get(7)?,
+                    stderr_preview: row.get(8)?,
+                    stdout_log_path: row.get(9)?,
+                    stderr_log_path: row.get(10)?,
+                    event_log_path: row.get(11)?,
+                    prompt_used: row.get(12)?,
+                    prompt_hash: row.get(13)?,
+                    model_version: row.get(14)?,
+                    working_directory: row.get(15)?,
+                    git_branch: row.get(16)?,
+                    git_commit_before: row.get(17)?,
+                    git_commit_after: row.get(18)?,
+                    files_changed: row.get(19)?,
+                    lines_added: row.get(20)?,
+                    lines_removed: row.get(21)?,
+                    total_cost_usd: row.get(22)?,
+                    num_turns: row.get(23)?,
+                    session_id: row.get(24)?,
+                    duration_api_ms: row.get(25)?,
+                    input_tokens: row.get(26)?,
+                    output_tokens: row.get(27)?,
+                    cache_read_input_tokens: row.get(28)?,
+                    cache_creation_input_tokens: row.get(29)?,
+                    provider: row.get(30)?,
+                    experiment_name: row.get(31)?,
+                    experiment_variant: row.get(32)?,
+                })
+            })
+            .optional()?;
+
+        Ok(execution)
+    }
+
+    fn get_attempts_batch(&self, keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.acquire_lock()?;
+        let mut results = Vec::with_capacity(keys.len());
+        // Use a prepared statement to amortize compilation cost across the batch.
+        let mut stmt = conn.prepare_cached(
+            r#"
+            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
+                   scm_pr_number, status, error_message, merged_at, resolved_at,
+                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
+            FROM fix_attempts
+            WHERE source = ? AND issue_id = ?
+            "#,
+        )?;
+        for (source, issue_id) in keys {
+            let attempt = stmt
+                .query_row(params![source, issue_id], Self::row_to_fix_attempt)
+                .ok();
+            results.push(attempt);
+        }
+        Ok(results)
+    }
+
+    fn record_release_tracking(&self, tracking: &crate::types::ReleaseTracking) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO release_tracking (
+                regression_watch_id, release_version, release_commit, released_at, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                tracking.regression_watch_id,
+                tracking.release_version,
+                tracking.release_commit,
+                tracking
+                    .released_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                tracking.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn get_success_rate(&self) -> Result<f64> {
+        SqliteTracker::get_success_rate(self)
+    }
+
+    // --- Code Indexing ---
+}
+
+impl KnowledgeStore for SqliteTracker {
+    fn store_feedback_outcome(&self, outcome: &FixOutcome) -> Result<i64> {
+        SqliteTracker::store_feedback_outcome(self, outcome)
+    }
+
+    fn get_feedback_outcomes(&self, source: Option<&str>, limit: usize) -> Result<Vec<FixOutcome>> {
+        SqliteTracker::get_feedback_outcomes(self, source, limit)
+    }
+
+    fn get_feedback_outcome_by_attempt(&self, attempt_id: i64) -> Result<Option<FixOutcome>> {
+        SqliteTracker::get_feedback_outcome_by_attempt(self, attempt_id)
+    }
+
+    fn store_qa_knowledge(&self, entry: &QaKnowledgeEntry) -> Result<i64> {
+        SqliteTracker::store_qa_knowledge(self, entry)
+    }
+
+    fn find_similar_qa_scoped(
+        &self,
+        source: &str,
+        repo: Option<&str>,
+        question_norm: &str,
+        question_embedding: Option<&[f32]>,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        SqliteTracker::find_similar_qa_scoped(
+            self,
+            source,
+            repo,
+            question_norm,
+            question_embedding,
+            threshold,
+            limit,
+        )
+    }
+
+    fn find_similar_qa_global(
+        &self,
+        question_norm: &str,
+        question_embedding: Option<&[f32]>,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<QaMatch>> {
+        SqliteTracker::find_similar_qa_global(
+            self,
+            question_norm,
+            question_embedding,
+            threshold,
+            limit,
+        )
+    }
+
+    fn record_qa_usage(
+        &self,
+        attempt_id: i64,
+        qa_id: i64,
+        usage_type: &str,
+        similarity_score: f64,
+    ) -> Result<i64> {
+        SqliteTracker::record_qa_usage(self, attempt_id, qa_id, usage_type, similarity_score)
+    }
+
+    fn update_qa_outcome_stats(&self, qa_id: i64, success: bool) -> Result<()> {
+        SqliteTracker::update_qa_outcome_stats(self, qa_id, success)
+    }
+
+    fn update_qa_outcome_stats_for_attempt(&self, attempt_id: i64, success: bool) -> Result<()> {
+        SqliteTracker::update_qa_outcome_stats_for_attempt(self, attempt_id, success)
+    }
+
+    fn update_feedback_learnings(&self, outcome_id: i64, learnings: &str) -> Result<()> {
+        SqliteTracker::update_feedback_learnings(self, outcome_id, learnings)
+    }
+
+    fn store_diff_analysis(&self, analysis: &crate::types::DiffAnalysis) -> Result<i64> {
+        SqliteTracker::store_diff_analysis(self, analysis)
+    }
+
+    fn get_diff_analyses_for_repo(
+        &self,
+        repo: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::types::DiffAnalysis>> {
+        SqliteTracker::get_diff_analyses_for_repo(self, repo, limit)
+    }
+
+    fn upsert_promoted_instruction(
+        &self,
+        instruction: &crate::types::PromotedInstruction,
+    ) -> Result<i64> {
+        SqliteTracker::upsert_promoted_instruction(self, instruction)
+    }
+
+    fn get_promoted_instructions(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<crate::types::PromotedInstruction>> {
+        SqliteTracker::get_promoted_instructions(self, repo)
+    }
+
+    fn upsert_repo_knowledge(&self, entry: &crate::types::RepoKnowledge) -> Result<i64> {
+        SqliteTracker::upsert_repo_knowledge(self, entry)
+    }
+
+    fn get_repo_knowledge(&self, repo: &str) -> Result<Vec<crate::types::RepoKnowledge>> {
+        SqliteTracker::get_repo_knowledge(self, repo)
+    }
+
+    fn get_repo_knowledge_by_key(
+        &self,
+        repo: &str,
+        key: &str,
+    ) -> Result<Vec<crate::types::RepoKnowledge>> {
+        SqliteTracker::get_repo_knowledge_by_key(self, repo, key)
+    }
+
+    fn upsert_review_pattern(&self, pattern: &crate::types::ReviewPattern) -> Result<i64> {
+        SqliteTracker::upsert_review_pattern(self, pattern)
+    }
+
+    fn get_review_patterns(
+        &self,
+        repo: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::types::ReviewPattern>> {
+        SqliteTracker::get_review_patterns(self, repo, limit)
+    }
+
+    fn get_review_patterns_by_category(
+        &self,
+        repo: &str,
+        category: crate::types::ReviewCategory,
+    ) -> Result<Vec<crate::types::ReviewPattern>> {
+        SqliteTracker::get_review_patterns_by_category(self, repo, category)
+    }
+
+    fn store_strategy_fingerprint(
+        &self,
+        fingerprint: &crate::types::StrategyFingerprint,
+    ) -> Result<i64> {
+        SqliteTracker::store_strategy_fingerprint(self, fingerprint)
+    }
+
+    fn get_successful_strategies(
+        &self,
+        repo: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::types::StrategyFingerprint>> {
+        SqliteTracker::get_successful_strategies(self, repo, limit)
+    }
+
+    fn store_issue_cluster(&self, cluster: &crate::types::IssueCluster) -> Result<i64> {
+        SqliteTracker::store_issue_cluster(self, cluster)
+    }
+
+    fn get_active_clusters(&self, source: &str) -> Result<Vec<crate::types::IssueCluster>> {
+        SqliteTracker::get_active_clusters(self, source)
+    }
+
+    fn update_cluster_resolution(
+        &self,
+        cluster_id: i64,
+        resolved_by_issue_id: &str,
+        resolved_by_attempt_id: i64,
+    ) -> Result<()> {
+        SqliteTracker::update_cluster_resolution(
+            self,
+            cluster_id,
+            resolved_by_issue_id,
+            resolved_by_attempt_id,
+        )
+    }
+
+    fn get_recent_issue_arrivals(
+        &self,
+        source: &str,
+        window_minutes: i64,
+    ) -> Result<Vec<(String, DateTime<Utc>)>> {
+        SqliteTracker::get_recent_issue_arrivals(self, source, window_minutes)
+    }
+
+    fn store_content_cluster(&self, cluster: &crate::types::ContentCluster) -> Result<i64> {
+        SqliteTracker::store_content_cluster(self, cluster)
+    }
+
+    fn get_active_content_clusters(
+        &self,
+        source: &str,
+    ) -> Result<Vec<crate::types::ContentCluster>> {
+        SqliteTracker::get_active_content_clusters(self, source)
+    }
+
+    fn resolve_content_cluster(&self, cluster_id: i64) -> Result<()> {
+        SqliteTracker::resolve_content_cluster(self, cluster_id)
+    }
+
+    fn store_severity_score(
+        &self,
+        source: &str,
+        issue_id: &str,
+        score: &crate::types::SeverityScore,
+        blast_radius: crate::types::BlastRadius,
+    ) -> Result<()> {
+        SqliteTracker::store_severity_score(self, source, issue_id, score, blast_radius)
+    }
+
+    fn record_suppression(
+        &self,
+        source: &str,
+        issue_id: &str,
+        rule_name: &str,
+        reason: &str,
+    ) -> Result<()> {
+        SqliteTracker::record_suppression(self, source, issue_id, rule_name, reason)
+    }
+
+    fn upsert_cross_repo_correlation(
+        &self,
+        repo_a: &str,
+        repo_b: &str,
+        window_hours: i64,
+    ) -> Result<CrossRepoCorrelation> {
+        SqliteTracker::upsert_cross_repo_correlation(self, repo_a, repo_b, window_hours)
+    }
+
+    fn get_cross_repo_correlations(
+        &self,
+        min_count: i64,
+        max_age_hours: i64,
+    ) -> Result<Vec<CrossRepoCorrelation>> {
+        SqliteTracker::get_cross_repo_correlations(self, min_count, max_age_hours)
+    }
+}
+
+impl EmbeddingStore for SqliteTracker {
+    fn get_recent_attempts_since(&self, since: &DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+        SqliteTracker::get_recent_attempts_since(self, since)
     }
 
     /// Store an issue embedding.
@@ -3440,7 +3250,7 @@ impl FixAttemptTracker for SqliteTracker {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     embedding,
-                    created_at: Self::parse_datetime(&created_at_str),
+                    created_at: Self::parse_datetime(&created_at_str)?,
                 };
                 let similarity: f64 = row.get(12)?;
                 Ok((fo, similarity))
@@ -3462,345 +3272,6 @@ impl FixAttemptTracker for SqliteTracker {
         }
 
         Ok(Some(results))
-    }
-
-    /// Get metric row counts grouped by name since a timestamp.
-    fn get_metric_counts_since(
-        &self,
-        metric_names: &[&str],
-        since: DateTime<Utc>,
-    ) -> Result<HashMap<String, i64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, COUNT(*)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-
-        let mut counts = HashMap::new();
-        for row in rows.flatten() {
-            counts.insert(row.0, row.1);
-        }
-        Ok(counts)
-    }
-
-    /// Get metric sums grouped by name since a timestamp.
-    fn get_metric_sums_since(
-        &self,
-        metric_names: &[&str],
-        since: DateTime<Utc>,
-    ) -> Result<HashMap<String, f64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, SUM(metric_value)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-            ))
-        })?;
-
-        let mut sums = HashMap::new();
-        for row in rows.flatten() {
-            sums.insert(row.0, row.1);
-        }
-        Ok(sums)
-    }
-
-    fn get_metric_sums_by_source_since(
-        &self,
-        metric_names: &[&str],
-        since: DateTime<Utc>,
-    ) -> Result<HashMap<(String, String), f64>> {
-        if metric_names.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let conn = self.acquire_lock()?;
-
-        let placeholders = (0..metric_names.len())
-            .map(|i| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT metric_name, source, SUM(metric_value)
-            FROM processing_metrics
-            WHERE timestamp >= ?1
-              AND metric_name IN ({})
-            GROUP BY metric_name, source
-            "#,
-            placeholders
-        );
-
-        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(metric_names.len() + 1);
-        bind_params.push(Box::new(since.format("%Y-%m-%d %H:%M:%S").to_string()));
-        for metric_name in metric_names {
-            bind_params.push(Box::new((*metric_name).to_string()));
-        }
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind_params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-            ))
-        })?;
-
-        let mut sums = HashMap::new();
-        for row in rows.flatten() {
-            if let Some(source) = row.1 {
-                sums.insert((row.0, source), row.2);
-            }
-        }
-        Ok(sums)
-    }
-
-    /// Create or update a prompt experiment.
-    fn save_experiment(&self, experiment: &PromptExperiment) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO prompt_experiments (experiment_name, variant, prompt_template, prompt_hash, created_at, active, success_count, failure_count, avg_time_to_merge, avg_review_score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                experiment.experiment_name,
-                experiment.variant,
-                experiment.prompt_template,
-                experiment.prompt_hash,
-                experiment.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                experiment.active as i32,
-                experiment.success_count,
-                experiment.failure_count,
-                experiment.avg_time_to_merge,
-                experiment.avg_review_score,
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// Update prompt experiment configuration fields.
-    fn update_experiment(
-        &self,
-        experiment_id: i64,
-        experiment_name: &str,
-        variant: &str,
-        prompt_template: &str,
-        prompt_hash: &str,
-        active: bool,
-    ) -> Result<bool> {
-        let conn = self.acquire_lock()?;
-
-        let rows = conn.execute(
-            r#"
-            UPDATE prompt_experiments
-            SET experiment_name = ?, variant = ?, prompt_template = ?, prompt_hash = ?, active = ?
-            WHERE id = ?
-            "#,
-            params![
-                experiment_name,
-                variant,
-                prompt_template,
-                prompt_hash,
-                active as i32,
-                experiment_id,
-            ],
-        )?;
-
-        Ok(rows > 0)
-    }
-
-    /// Update experiment statistics.
-    fn update_experiment_stats(
-        &self,
-        experiment_id: i64,
-        success: bool,
-        time_to_merge: Option<f64>,
-    ) -> Result<()> {
-        let conn = self.acquire_lock()?;
-
-        if success {
-            conn.execute(
-                r#"
-                UPDATE prompt_experiments
-                SET success_count = success_count + 1
-                WHERE id = ?
-                "#,
-                params![experiment_id],
-            )?;
-        } else {
-            conn.execute(
-                r#"
-                UPDATE prompt_experiments
-                SET failure_count = failure_count + 1
-                WHERE id = ?
-                "#,
-                params![experiment_id],
-            )?;
-        }
-
-        if let Some(ttm) = time_to_merge {
-            // Update rolling average of time to merge
-            // Note: success_count was already incremented above, so we use
-            // (success_count - 1) for the old count and success_count for the new total
-            conn.execute(
-                r#"
-                UPDATE prompt_experiments
-                SET avg_time_to_merge = CASE
-                    WHEN avg_time_to_merge IS NULL THEN ?
-                    ELSE (avg_time_to_merge * (success_count - 1) + ?) / success_count
-                END
-                WHERE id = ?
-                "#,
-                params![ttm, ttm, experiment_id],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    /// Prune old activity logs to prevent unbounded growth.
-    fn prune_old_activities(&self, days_to_keep: i64) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-
-        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
-        // This is safer than building strings in SQL even though days_to_keep is already i64
-        let modifier = format!("-{} days", days_to_keep.abs());
-
-        let deleted = conn.execute(
-            r#"
-            DELETE FROM activity_log
-            WHERE timestamp < datetime('now', ?)
-            "#,
-            params![modifier],
-        )?;
-
-        Ok(deleted)
-    }
-
-    /// Prune old metrics to prevent unbounded growth.
-    fn prune_old_metrics(&self, days_to_keep: i64) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-
-        // Compute the full datetime modifier in Rust to avoid SQL string concatenation
-        let modifier = format!("-{} days", days_to_keep.abs());
-
-        let deleted = conn.execute(
-            r#"
-            DELETE FROM processing_metrics
-            WHERE timestamp < datetime('now', ?)
-            "#,
-            params![modifier],
-        )?;
-
-        Ok(deleted)
-    }
-
-    /// Sync repositories from a RepoIndex to the database.
-    ///
-    /// Updates paths for all repos in the index and optionally syncs files.
-    fn sync_from_index(&self, index: &crate::repo::RepoIndex, sync_files: bool) -> Result<usize> {
-        let repos = index.list();
-        let mut synced = 0;
-
-        for repo in repos {
-            let path_str = repo.path.to_string_lossy();
-
-            if sync_files {
-                // Use save_indexed_repo which also updates file_count and last_indexed_at
-                let repo_id = self.save_indexed_repo(
-                    &repo.name,
-                    &path_str,
-                    Some(&repo.scm_url),
-                    &repo.default_branch,
-                    repo.files.len(),
-                )?;
-
-                if !repo.files.is_empty() {
-                    let files_with_types: Vec<(String, Option<String>)> = repo
-                        .files
-                        .iter()
-                        .map(|f| {
-                            let file_type = std::path::Path::new(f)
-                                .extension()
-                                .map(|e| e.to_string_lossy().to_string());
-                            (f.clone(), file_type)
-                        })
-                        .collect();
-
-                    self.save_repo_files(repo_id, &files_with_types)?;
-                }
-            } else {
-                // Just update paths in repositories table
-                self.upsert_repository(&repo.name, Some(&path_str), None)?;
-            }
-            synced += 1;
-        }
-
-        Ok(synced)
-    }
-
-    fn sync_repo_files(&self, repo: &crate::repo::IndexedRepo) -> Result<()> {
-        self.sync_repo_files(repo)
     }
 
     /// Record an inference attempt.
@@ -3867,462 +3338,265 @@ impl FixAttemptTracker for SqliteTracker {
         Ok(())
     }
 
-    /// Get diagnostic counts for all major tables.
-    ///
-    /// This is useful for debugging and verifying that data is being written correctly.
-    fn get_diagnostic_counts(&self) -> Result<DiagnosticCounts> {
+    /// List issues with pagination, sorted by updated_at DESC, then created_at DESC.
+    fn list_issues(
+        &self,
+        source: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IssueEmbedding>> {
         let conn = self.acquire_lock()?;
 
-        let fix_attempts: i64 =
-            conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?;
-        let fix_attempts_by_status: HashMap<String, i64> = {
-            let mut map = HashMap::new();
-            let mut stmt =
-                conn.prepare("SELECT status, COUNT(*) FROM fix_attempts GROUP BY status")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            for row in rows.flatten() {
-                map.insert(row.0, row.1);
+        let query = match source {
+            Some(_) => {
+                r#"
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                       description, url, priority, status, labels, updated_at
+                FROM issues
+                WHERE source = ?
+                ORDER BY COALESCE(updated_at, created_at) DESC
+                LIMIT ? OFFSET ?
+                "#
             }
-            map
+            None => {
+                r#"
+                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
+                       description, url, priority, status, labels, updated_at
+                FROM issues
+                ORDER BY COALESCE(updated_at, created_at) DESC
+                LIMIT ? OFFSET ?
+                "#
+            }
         };
 
-        let activity_log: i64 =
-            conn.query_row("SELECT COUNT(*) FROM activity_log", [], |row| row.get(0))?;
+        let mut stmt = conn.prepare(query)?;
 
-        let claude_executions: i64 =
-            conn.query_row("SELECT COUNT(*) FROM claude_executions", [], |row| {
-                row.get(0)
-            })?;
+        let row_mapper = |row: &rusqlite::Row<'_>| Self::row_to_issue_embedding(row, 8);
 
-        let pr_reviews: i64 =
-            conn.query_row("SELECT COUNT(*) FROM pr_reviews", [], |row| row.get(0))?;
-
-        let pr_review_states: i64 =
-            conn.query_row("SELECT COUNT(*) FROM pr_review_states", [], |row| {
-                row.get(0)
-            })?;
-
-        let issues: i64 = conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?;
-
-        let similar_issues: i64 =
-            conn.query_row("SELECT COUNT(*) FROM similar_issues", [], |row| row.get(0))?;
-
-        let repositories: i64 =
-            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
-
-        let repo_files: i64 =
-            conn.query_row("SELECT COUNT(*) FROM repo_files", [], |row| row.get(0))?;
-
-        let inference_attempts: i64 =
-            conn.query_row("SELECT COUNT(*) FROM inference_attempts", [], |row| {
-                row.get(0)
-            })?;
-
-        let error_patterns: i64 =
-            conn.query_row("SELECT COUNT(*) FROM error_patterns", [], |row| row.get(0))?;
-
-        let processing_metrics: i64 =
-            conn.query_row("SELECT COUNT(*) FROM processing_metrics", [], |row| {
-                row.get(0)
-            })?;
-
-        let feedback_outcomes: i64 =
-            conn.query_row("SELECT COUNT(*) FROM feedback_outcomes", [], |row| {
-                row.get(0)
-            })?;
-
-        let prs: i64 = conn.query_row("SELECT COUNT(*) FROM prs", [], |row| row.get(0))?;
-
-        // Get recent fix attempts for debugging
-        let recent_fix_attempts: Vec<(String, String, String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT source, issue_id, short_id, status FROM fix_attempts ORDER BY attempted_at DESC LIMIT 5"
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            rows.flatten().collect()
+        let rows = match source {
+            Some(s) => stmt.query_map(params![s, limit as i64, offset as i64], row_mapper)?,
+            None => stmt.query_map(params![limit as i64, offset as i64], row_mapper)?,
         };
 
-        Ok(DiagnosticCounts {
-            fix_attempts,
-            fix_attempts_by_status,
-            activity_log,
-            claude_executions,
-            pr_reviews,
-            pr_review_states,
-            issues,
-            similar_issues,
-            repositories,
-            repo_files,
-            inference_attempts,
-            error_patterns,
-            processing_metrics,
-            feedback_outcomes,
-            prs,
-            recent_fix_attempts,
-        })
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::error::Error::Storage(format!("Failed to list issues: {}", e)))
     }
 
-    /// Upsert a PR record.
-    ///
-    /// Creates a new record or updates an existing one based on pr_url.
-    fn upsert_pr(&self, pr: &crate::types::PrRecord) -> Result<i64> {
+    /// Count issues, optionally filtered by source.
+    fn count_issues(&self, source: Option<&str>) -> Result<usize> {
         let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO prs (
-                pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
-                title, description, author, head_branch, base_branch, status,
-                created_at, updated_at, merged_at, closed_at,
-                approvals_count, changes_requested_count, comments_count, last_review_at,
-                time_to_first_review_mins, time_to_merge_mins, review_cycles,
-                files_changed, lines_added, lines_removed
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
-            )
-            ON CONFLICT(pr_url) DO UPDATE SET
-                scm_repo = excluded.scm_repo,
-                pr_number = excluded.pr_number,
-                attempt_id = COALESCE(excluded.attempt_id, prs.attempt_id),
-                issue_id = COALESCE(excluded.issue_id, prs.issue_id),
-                issue_source = COALESCE(excluded.issue_source, prs.issue_source),
-                title = COALESCE(excluded.title, prs.title),
-                description = COALESCE(excluded.description, prs.description),
-                author = COALESCE(excluded.author, prs.author),
-                head_branch = COALESCE(excluded.head_branch, prs.head_branch),
-                base_branch = COALESCE(excluded.base_branch, prs.base_branch),
-                status = excluded.status,
-                updated_at = datetime('now'),
-                merged_at = COALESCE(excluded.merged_at, prs.merged_at),
-                closed_at = COALESCE(excluded.closed_at, prs.closed_at),
-                approvals_count = excluded.approvals_count,
-                changes_requested_count = excluded.changes_requested_count,
-                comments_count = excluded.comments_count,
-                last_review_at = COALESCE(excluded.last_review_at, prs.last_review_at),
-                time_to_first_review_mins = COALESCE(excluded.time_to_first_review_mins, prs.time_to_first_review_mins),
-                time_to_merge_mins = COALESCE(excluded.time_to_merge_mins, prs.time_to_merge_mins),
-                review_cycles = excluded.review_cycles,
-                files_changed = COALESCE(excluded.files_changed, prs.files_changed),
-                lines_added = COALESCE(excluded.lines_added, prs.lines_added),
-                lines_removed = COALESCE(excluded.lines_removed, prs.lines_removed)
-            "#,
-            params![
-                pr.pr_url,
-                pr.scm_repo,
-                pr.pr_number,
-                pr.attempt_id,
-                pr.issue_id,
-                pr.issue_source,
-                pr.title,
-                pr.description,
-                pr.author,
-                pr.head_branch,
-                pr.base_branch,
-                pr.status,
-                pr.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                pr.updated_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                pr.merged_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                pr.closed_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                pr.approvals_count,
-                pr.changes_requested_count,
-                pr.comments_count,
-                pr.last_review_at.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                pr.time_to_first_review_mins,
-                pr.time_to_merge_mins,
-                pr.review_cycles,
-                pr.files_changed,
-                pr.lines_added,
-                pr.lines_removed,
-            ],
-        )?;
-
-        // Get the id (either inserted or existing)
-        let id: i64 = conn.query_row(
-            "SELECT id FROM prs WHERE pr_url = ?",
-            params![pr.pr_url],
-            |row| row.get(0),
-        )?;
-
-        tracing::info!(
-            pr_url = %pr.pr_url,
-            status = %pr.status,
-            id = id,
-            "PR record upserted"
-        );
-
-        Ok(id)
+        let count: i64 = match source {
+            Some(s) => conn.query_row(
+                "SELECT COUNT(*) FROM issues WHERE source = ?",
+                params![s],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?,
+        };
+        Ok(count as usize)
     }
 
-    /// Get a PR record by URL.
-    fn get_pr(&self, pr_url: &str) -> Result<Option<crate::types::PrRecord>> {
+    fn search_code_chunks(
+        &self,
+        query_embedding: &[f32],
+        repo_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::repo::code_index::CodeSearchResult>> {
+        SqliteTracker::search_code_chunks(self, query_embedding, repo_id, limit)
+    }
+}
+
+impl RepoStore for SqliteTracker {
+    fn list_indexed_repos(&self) -> Result<Vec<StoredIndexedRepo>> {
+        SqliteTracker::list_indexed_repos(self)
+    }
+
+    fn get_index_stats(&self) -> Result<IndexStats> {
+        SqliteTracker::get_index_stats(self)
+    }
+
+    fn get_indexing_progress(&self) -> Result<IndexingProgress> {
+        SqliteTracker::get_indexing_progress(self)
+    }
+
+    fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
+        SqliteTracker::subscribe_indexing_progress(self)
+    }
+
+    fn add_dependency(&self, upstream: &str, downstream: &str, dep_type: &str) -> Result<()> {
+        SqliteTracker::add_dependency(self, upstream, downstream, dep_type)
+    }
+
+    fn list_all_dependencies(&self) -> Result<Vec<StoredDependency>> {
+        SqliteTracker::list_all_dependencies(self)
+    }
+
+    fn get_inference_stats(&self) -> Result<InferenceStats> {
+        SqliteTracker::get_inference_stats(self)
+    }
+
+    fn get_inference_history(&self, limit: usize) -> Result<Vec<InferenceHistoryEntry>> {
+        SqliteTracker::get_inference_history(self, limit)
+    }
+
+    fn has_dependency(&self, repo_a: &str, repo_b: &str) -> Result<bool> {
+        SqliteTracker::has_dependency(self, repo_a, repo_b)
+    }
+
+    /// Sync repositories from a RepoIndex to the database.
+    ///
+    /// Updates paths for all repos in the index and optionally syncs files.
+    fn sync_from_index(&self, index: &crate::repo::RepoIndex, sync_files: bool) -> Result<usize> {
+        let repos = index.list();
+        let mut synced = 0;
+
+        for repo in repos {
+            let path_str = repo.path.to_string_lossy();
+
+            if sync_files {
+                // Use save_indexed_repo which also updates file_count and last_indexed_at
+                let repo_id = self.save_indexed_repo(
+                    &repo.name,
+                    &path_str,
+                    Some(&repo.scm_url),
+                    &repo.default_branch,
+                    repo.files.len(),
+                )?;
+
+                if !repo.files.is_empty() {
+                    let files_with_types: Vec<(String, Option<String>)> = repo
+                        .files
+                        .iter()
+                        .map(|f| {
+                            let file_type = std::path::Path::new(f)
+                                .extension()
+                                .map(|e| e.to_string_lossy().to_string());
+                            (f.clone(), file_type)
+                        })
+                        .collect();
+
+                    self.save_repo_files(repo_id, &files_with_types)?;
+                }
+            } else {
+                // Just update paths in repositories table
+                self.upsert_repository(&repo.name, Some(&path_str), None)?;
+            }
+            synced += 1;
+        }
+
+        Ok(synced)
+    }
+
+    fn sync_repo_files(&self, repo: &crate::repo::IndexedRepo) -> Result<()> {
+        self.sync_repo_files(repo)
+    }
+
+    fn get_indexed_repo(&self, name: &str) -> Result<Option<StoredIndexedRepo>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
-                   title, description, author, head_branch, base_branch, status,
-                   created_at, updated_at, merged_at, closed_at,
-                   approvals_count, changes_requested_count, comments_count, last_review_at,
-                   time_to_first_review_mins, time_to_merge_mins, review_cycles,
-                   files_changed, lines_added, lines_removed
-            FROM prs WHERE pr_url = ?
+            SELECT id, name, path, scm_url, default_branch, file_count, last_indexed_at, created_at
+            FROM repositories WHERE name = ?
             "#,
         )?;
 
-        let result = stmt.query_row(params![pr_url], Self::row_to_pr_record).ok();
-        Ok(result)
-    }
+        let result = stmt.query_row(params![name], |row| {
+            Ok(StoredIndexedRepo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                scm_url: row.get(3)?,
+                default_branch: row.get(4)?,
+                file_count: row.get(5)?,
+                last_indexed_at: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        });
 
-    /// Update PR status.
-    fn update_pr_status(&self, pr_url: &str, status: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let (merged_at, closed_at) = match status {
-            "merged" => (Some(now.clone()), None),
-            "closed" => (None, Some(now.clone())),
-            _ => (None, None),
-        };
-
-        conn.execute(
-            r#"
-            UPDATE prs SET
-                status = ?1,
-                updated_at = ?2,
-                merged_at = COALESCE(?3, merged_at),
-                closed_at = COALESCE(?4, closed_at)
-            WHERE pr_url = ?5
-            "#,
-            params![status, now, merged_at, closed_at, pr_url],
-        )?;
-
-        tracing::info!(
-            pr_url = %pr_url,
-            status = status,
-            "PR status updated"
-        );
-
-        Ok(())
-    }
-
-    /// Record a cascade fix attempt linked to a parent attempt.
-    fn record_cascade_attempt(
-        &self,
-        source: &str,
-        issue_id: &str,
-        short_id: &str,
-        parent_attempt_id: i64,
-        cascade_repo: &str,
-    ) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        // Check if there's already a pending cascade (no PR yet) for this combo.
-        // Completed cascades (with PR) are allowed to be re-triggered (e.g. merge + release).
-        let pending_id: Option<i64> = conn
-            .prepare_cached(
-                "SELECT id FROM fix_attempts WHERE source = ? AND issue_id = ? AND cascade_repo = ? AND (pr_url IS NULL OR pr_url = '')",
-            )?
-            .query_row(params![source, issue_id, cascade_repo], |row| row.get(0))
-            .ok();
-
-        if let Some(id) = pending_id {
-            tracing::info!(
-                source = source,
-                issue_id = issue_id,
-                cascade_repo = cascade_repo,
-                attempt_id = id,
-                "Pending cascade attempt already exists, skipping"
-            );
-            return Ok(id);
+        match result {
+            Ok(repo) => Ok(Some(repo)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
         }
-
-        conn.execute(
-            r#"INSERT INTO fix_attempts (source, issue_id, short_id, status, attempted_at, parent_attempt_id, cascade_repo)
-               VALUES (?, ?, ?, 'pending', datetime('now'), ?, ?)"#,
-            params![source, issue_id, short_id, parent_attempt_id, cascade_repo],
-        )?;
-
-        let id = conn.last_insert_rowid();
-        tracing::info!(
-            source = source,
-            issue_id = issue_id,
-            cascade_repo = cascade_repo,
-            parent_attempt_id = parent_attempt_id,
-            attempt_id = id,
-            "Recorded cascade fix attempt"
-        );
-        Ok(id)
     }
 
-    /// Update a cascade attempt's PR info.
-    fn update_attempt_pr(
+    // --- Analytics ---
+
+    fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
+        SqliteTracker::get_or_create_repo_id(self, name)
+    }
+
+    fn code_chunk_hash_matches(
         &self,
-        attempt_id: i64,
-        pr_url: &str,
-        scm_repo: &str,
-        pr_number: i64,
+        repo_id: i64,
+        file_path: &str,
+        file_hash: &str,
+    ) -> Result<bool> {
+        SqliteTracker::code_chunk_hash_matches(self, repo_id, file_path, file_hash)
+    }
+
+    fn delete_code_data_for_file(&self, repo_id: i64, file_path: &str) -> Result<()> {
+        SqliteTracker::delete_code_data_for_file(self, repo_id, file_path)
+    }
+
+    fn delete_code_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+        SqliteTracker::delete_code_chunks_by_ids(self, chunk_ids)
+    }
+
+    fn cleanup_stale_code_data(&self, repo_id: i64, current_paths: &[String]) -> Result<()> {
+        SqliteTracker::cleanup_stale_code_data(self, repo_id, current_paths)
+    }
+
+    fn save_code_symbols(&self, symbols: &[crate::repo::code_index::CodeSymbol]) -> Result<()> {
+        SqliteTracker::save_code_symbols(self, symbols)
+    }
+
+    fn save_code_chunks(&self, chunks: &[crate::repo::code_index::CodeChunk]) -> Result<Vec<i64>> {
+        SqliteTracker::save_code_chunks(self, chunks)
+    }
+
+    fn save_code_chunk_embeddings(&self, pairs: &[(i64, &[f32])], model_name: &str) -> Result<()> {
+        SqliteTracker::save_code_chunk_embeddings(self, pairs, model_name)
+    }
+
+    fn find_code_symbols(
+        &self,
+        name: &str,
+        kind: Option<crate::repo::code_index::SymbolKind>,
+        repo_id: Option<i64>,
+    ) -> Result<Vec<crate::repo::code_index::CodeSymbol>> {
+        SqliteTracker::find_code_symbols(self, name, kind, repo_id)
+    }
+
+    fn get_code_embedding_model(&self, repo_id: i64) -> Result<Option<String>> {
+        SqliteTracker::get_code_embedding_model(self, repo_id)
+    }
+
+    fn get_code_index_meta(&self, repo_id: i64, key: &str) -> Result<Option<String>> {
+        SqliteTracker::get_code_index_meta(self, repo_id, key)
+    }
+
+    fn set_code_index_meta(&self, repo_id: i64, key: &str, value: &str) -> Result<()> {
+        SqliteTracker::set_code_index_meta(self, repo_id, key, value)
+    }
+
+    fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
+        SqliteTracker::delete_all_code_data_for_repo(self, repo_id)
+    }
+}
+
+impl UserStore for SqliteTracker {
+    fn get_channel_cursor(&self, channel: &str, cursor_key: &str) -> Result<Option<String>> {
+        SqliteTracker::get_channel_cursor(self, channel, cursor_key)
+    }
+
+    fn set_channel_cursor(
+        &self,
+        channel: &str,
+        cursor_key: &str,
+        cursor_value: &str,
     ) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
-            "UPDATE fix_attempts SET pr_url = ?, scm_repo = ?, scm_pr_number = ?, status = 'success' WHERE id = ?",
-            params![pr_url, scm_repo, pr_number, attempt_id],
-        )?;
-        Ok(())
-    }
-
-    /// Mark a cascade attempt as failed.
-    fn mark_cascade_failed(&self, attempt_id: i64, error: &str) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        conn.execute(
-            "UPDATE fix_attempts SET status = 'failed', error_message = ? WHERE id = ?",
-            params![error, attempt_id],
-        )?;
-        Ok(())
-    }
-
-    /// Create a new regression watch.
-    fn create_regression_watch(&self, watch: &crate::types::RegressionWatch) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO regression_watches (
-                issue_type, issue_id, fix_attempt_id, status,
-                pr_merged_at, monitoring_started_at, resolved_at, regressed_at, created_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            "#,
-            params![
-                watch.issue_type.to_string(),
-                watch.issue_id,
-                watch.fix_attempt_id,
-                watch.status.to_string(),
-                watch
-                    .pr_merged_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                watch
-                    .monitoring_started_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                watch
-                    .resolved_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                watch
-                    .regressed_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                watch.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            ],
-        )?;
-
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// Update regression watch status.
-    fn update_regression_watch_status(
-        &self,
-        id: i64,
-        status: crate::types::RegressionWatchStatus,
-    ) -> Result<()> {
-        let conn = self.acquire_lock()?;
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-        // Update specific timestamp based on status
-        let (monitoring_started, resolved, regressed) = match status {
-            crate::types::RegressionWatchStatus::Monitoring => (Some(now.clone()), None, None),
-            crate::types::RegressionWatchStatus::Resolved => (None, Some(now.clone()), None),
-            crate::types::RegressionWatchStatus::Regressed => (None, None, Some(now.clone())),
-            _ => (None, None, None),
-        };
-
-        conn.execute(
-            r#"
-            UPDATE regression_watches SET
-                status = ?1,
-                monitoring_started_at = COALESCE(?2, monitoring_started_at),
-                resolved_at = COALESCE(?3, resolved_at),
-                regressed_at = COALESCE(?4, regressed_at)
-            WHERE id = ?5
-            "#,
-            params![
-                status.to_string(),
-                monitoring_started,
-                resolved,
-                regressed,
-                id
-            ],
-        )?;
-
-        Ok(())
-    }
-
-    fn store_eval_snapshot(
-        &self,
-        attempt_id: Option<i64>,
-        phase: &str,
-        snapshot: &crate::evaluation::EvalSnapshot,
-    ) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        let diagnostics_json =
-            serde_json::to_string(&snapshot.diagnostics).unwrap_or_else(|_| "[]".into());
-        conn.execute(
-            "INSERT INTO eval_snapshots (attempt_id, phase, category, tool_name, exit_code, passed, failed, skipped, warnings, errors, diagnostics_json, raw_output, duration_secs, line_coverage_pct, branch_coverage_pct)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                attempt_id,
-                phase,
-                snapshot.category.to_string(),
-                snapshot.tool_name,
-                snapshot.exit_code,
-                snapshot.passed,
-                snapshot.failed,
-                snapshot.skipped,
-                snapshot.warnings,
-                snapshot.errors,
-                diagnostics_json,
-                snapshot.raw_output,
-                snapshot.duration_secs,
-                snapshot.line_coverage_pct,
-                snapshot.branch_coverage_pct,
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    fn store_eval_delta(
-        &self,
-        attempt_id: Option<i64>,
-        repo: &str,
-        delta: &crate::evaluation::EvalDelta,
-    ) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-        let regressions_json =
-            serde_json::to_string(&delta.regressions).unwrap_or_else(|_| "[]".into());
-        let fixed_json = serde_json::to_string(&delta.fixed).unwrap_or_else(|_| "[]".into());
-        conn.execute(
-            "INSERT INTO eval_deltas (attempt_id, repo, tool_name, category, new_passes, new_failures, regressions_json, fixed_json, coverage_delta_pct, overall_improved)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                attempt_id,
-                repo,
-                delta.after.tool_name,
-                delta.after.category.to_string(),
-                delta.new_passes,
-                delta.new_failures,
-                regressions_json,
-                fixed_json,
-                delta.coverage_delta_pct,
-                delta.is_improvement() as i32,
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
+        SqliteTracker::set_channel_cursor(self, channel, cursor_key, cursor_value)
     }
 
     fn create_user(&self, email: &str, password_hash: &str, name: &str, role: &str) -> Result<i64> {
@@ -4468,313 +3742,278 @@ impl FixAttemptTracker for SqliteTracker {
         conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
         Ok(())
     }
+}
 
-    /// List fix attempts with optional status/source filters and pagination.
-    fn list_attempts(
+impl RegressionStore for SqliteTracker {
+    fn get_regression_watches_by_status(
         &self,
-        status: Option<&str>,
-        source: Option<&str>,
+        status: crate::types::RegressionWatchStatus,
+    ) -> Result<Vec<crate::types::RegressionWatch>> {
+        SqliteTracker::get_regression_watches_by_status(self, status)
+    }
+
+    fn get_all_regression_watches(&self) -> Result<Vec<crate::types::RegressionWatch>> {
+        SqliteTracker::get_all_regression_watches(self)
+    }
+
+    fn get_regression_checks(&self, watch_id: i64) -> Result<Vec<crate::types::RegressionCheck>> {
+        SqliteTracker::get_regression_checks(self, watch_id)
+    }
+
+    fn create_regression_watch(&self, watch: &crate::types::RegressionWatch) -> Result<i64> {
+        SqliteTracker::create_regression_watch(self, watch)
+    }
+
+    fn add_regression_check(&self, check: &crate::types::RegressionCheck) -> Result<i64> {
+        SqliteTracker::add_regression_check(self, check)
+    }
+
+    fn update_regression_watch_status(
+        &self,
+        id: i64,
+        status: crate::types::RegressionWatchStatus,
+    ) -> Result<()> {
+        SqliteTracker::update_regression_watch_status(self, id, status)
+    }
+
+    fn get_regression_watch(&self, id: i64) -> Result<Option<crate::types::RegressionWatch>> {
+        SqliteTracker::get_regression_watch(self, id)
+    }
+
+    fn record_regression_check(&self, check: &crate::types::RegressionCheck) -> Result<i64> {
+        SqliteTracker::record_regression_check(self, check)
+    }
+}
+
+impl ChatStore for SqliteTracker {
+    fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
+        SqliteTracker::create_chat_session(self, id, repo_id)
+    }
+
+    fn save_chat_message(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        sources_json: Option<&str>,
+    ) -> Result<i64> {
+        SqliteTracker::save_chat_message(self, session_id, role, content, sources_json)
+    }
+
+    fn get_chat_history(
+        &self,
+        session_id: &str,
         limit: usize,
-        offset: usize,
-    ) -> Result<Vec<FixAttempt>> {
-        let conn = self.acquire_lock()?;
-        let mut attempts = Vec::new();
-
-        let query_all = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            ORDER BY attempted_at DESC
-            LIMIT ?1 OFFSET ?2
-        "#;
-        let query_status = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE status = ?1
-            ORDER BY attempted_at DESC
-            LIMIT ?2 OFFSET ?3
-        "#;
-        let query_source = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE source = ?1
-            ORDER BY attempted_at DESC
-            LIMIT ?2 OFFSET ?3
-        "#;
-        let query_status_source = r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE status = ?1 AND source = ?2
-            ORDER BY attempted_at DESC
-            LIMIT ?3 OFFSET ?4
-        "#;
-
-        match (status, source) {
-            (Some(status), Some(source)) => {
-                let mut stmt = conn.prepare_cached(query_status_source)?;
-                let rows = stmt.query_map(
-                    params![status, source, limit as i64, offset as i64],
-                    Self::row_to_fix_attempt,
-                )?;
-                attempts.extend(rows.flatten());
-            }
-            (Some(status), None) => {
-                let mut stmt = conn.prepare_cached(query_status)?;
-                let rows = stmt.query_map(
-                    params![status, limit as i64, offset as i64],
-                    Self::row_to_fix_attempt,
-                )?;
-                attempts.extend(rows.flatten());
-            }
-            (None, Some(source)) => {
-                let mut stmt = conn.prepare_cached(query_source)?;
-                let rows = stmt.query_map(
-                    params![source, limit as i64, offset as i64],
-                    Self::row_to_fix_attempt,
-                )?;
-                attempts.extend(rows.flatten());
-            }
-            (None, None) => {
-                let mut stmt = conn.prepare_cached(query_all)?;
-                let rows = stmt.query_map(
-                    params![limit as i64, offset as i64],
-                    Self::row_to_fix_attempt,
-                )?;
-                attempts.extend(rows.flatten());
-            }
-        }
-
-        Ok(attempts)
+    ) -> Result<Vec<crate::chat::types::ChatMessage>> {
+        SqliteTracker::get_chat_history(self, session_id, limit)
     }
 
-    /// Count fix attempts with optional status/source filters.
-    fn count_attempts(&self, status: Option<&str>, source: Option<&str>) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-        let count: i64 = match (status, source) {
-            (Some(status), Some(source)) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1 AND source = ?2",
-                params![status, source],
-                |row| row.get(0),
-            )?,
-            (Some(status), None) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE status = ?1",
-                params![status],
-                |row| row.get(0),
-            )?,
-            (None, Some(source)) => conn.query_row(
-                "SELECT COUNT(*) FROM fix_attempts WHERE source = ?1",
-                params![source],
-                |row| row.get(0),
-            )?,
-            (None, None) => {
-                conn.query_row("SELECT COUNT(*) FROM fix_attempts", [], |row| row.get(0))?
-            }
-        };
-        Ok(count as usize)
+    fn list_chat_sessions(&self) -> Result<Vec<crate::chat::types::ChatSession>> {
+        SqliteTracker::list_chat_sessions(self)
     }
 
-    /// List recent attempts ordered by attempted time descending.
-    fn list_recent_attempts(&self, limit: usize) -> Result<Vec<FixAttempt>> {
-        self.list_attempts(None, None, limit, 0)
+    fn delete_chat_session(&self, session_id: &str) -> Result<()> {
+        SqliteTracker::delete_chat_session(self, session_id)
     }
 
-    /// List attempts since a timestamp, ordered by attempted time descending.
-    fn list_attempts_since(&self, since: DateTime<Utc>) -> Result<Vec<FixAttempt>> {
+    fn cleanup_expired_chat_sessions(&self, max_age_days: u32) -> Result<usize> {
+        SqliteTracker::cleanup_expired_chat_sessions(self, max_age_days)
+    }
+}
+
+impl ExperimentStore for SqliteTracker {
+    fn save_experiment(&self, experiment: &PromptExperiment) -> Result<i64> {
         let conn = self.acquire_lock()?;
-        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut stmt = conn.prepare(
+
+        conn.execute(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE attempted_at >= ?1
-            ORDER BY attempted_at DESC
+            INSERT INTO prompt_experiments (experiment_name, variant, prompt_template, prompt_hash, created_at, active, success_count, failure_count, avg_time_to_merge, avg_review_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
+            params![
+                experiment.experiment_name,
+                experiment.variant,
+                experiment.prompt_template,
+                experiment.prompt_hash,
+                experiment.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                experiment.active as i32,
+                experiment.success_count,
+                experiment.failure_count,
+                experiment.avg_time_to_merge,
+                experiment.avg_review_score,
+            ],
         )?;
-        let rows = stmt.query_map(params![since_str], Self::row_to_fix_attempt)?;
-        Ok(rows.flatten().collect())
+        Ok(conn.last_insert_rowid())
     }
 
-    /// Get the most recently merged fix attempt for a given SCM repo.
-    fn get_most_recent_merged_attempt_for_repo(
+    fn update_experiment(
         &self,
-        scm_repo: &str,
-    ) -> Result<Option<FixAttempt>> {
+        experiment_id: i64,
+        experiment_name: &str,
+        variant: &str,
+        prompt_template: &str,
+        prompt_hash: &str,
+        active: bool,
+    ) -> Result<bool> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
+
+        let rows = conn.execute(
             r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE scm_repo = ? AND status = 'merged'
-            ORDER BY merged_at DESC
-            LIMIT 1
+            UPDATE prompt_experiments
+            SET experiment_name = ?, variant = ?, prompt_template = ?, prompt_hash = ?, active = ?
+            WHERE id = ?
             "#,
+            params![
+                experiment_name,
+                variant,
+                prompt_template,
+                prompt_hash,
+                active as i32,
+                experiment_id,
+            ],
         )?;
 
-        let result = stmt
-            .query_row(params![scm_repo], Self::row_to_fix_attempt)
-            .ok();
-        Ok(result)
+        Ok(rows > 0)
     }
 
-    /// List issues with pagination, sorted by updated_at DESC, then created_at DESC.
-    fn list_issues(
+    fn update_experiment_stats(
         &self,
-        source: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<IssueEmbedding>> {
+        experiment_id: i64,
+        success: bool,
+        time_to_merge: Option<f64>,
+    ) -> Result<()> {
         let conn = self.acquire_lock()?;
 
-        let query = match source {
-            Some(_) => {
+        if success {
+            conn.execute(
                 r#"
-                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
-                       description, url, priority, status, labels, updated_at
-                FROM issues
-                WHERE source = ?
-                ORDER BY COALESCE(updated_at, created_at) DESC
-                LIMIT ? OFFSET ?
-                "#
-            }
-            None => {
+                UPDATE prompt_experiments
+                SET success_count = success_count + 1
+                WHERE id = ?
+                "#,
+                params![experiment_id],
+            )?;
+        } else {
+            conn.execute(
                 r#"
-                SELECT id, source, issue_id, short_id, title, embedding, embedding_model, created_at,
-                       description, url, priority, status, labels, updated_at
-                FROM issues
-                ORDER BY COALESCE(updated_at, created_at) DESC
-                LIMIT ? OFFSET ?
-                "#
-            }
-        };
+                UPDATE prompt_experiments
+                SET failure_count = failure_count + 1
+                WHERE id = ?
+                "#,
+                params![experiment_id],
+            )?;
+        }
 
-        let mut stmt = conn.prepare(query)?;
+        if let Some(ttm) = time_to_merge {
+            conn.execute(
+                r#"
+                UPDATE prompt_experiments
+                SET avg_time_to_merge = CASE
+                    WHEN avg_time_to_merge IS NULL THEN ?
+                    ELSE (avg_time_to_merge * (success_count - 1) + ?) / success_count
+                END
+                WHERE id = ?
+                "#,
+                params![ttm, ttm, experiment_id],
+            )?;
+        }
 
-        let row_mapper = |row: &rusqlite::Row<'_>| Self::row_to_issue_embedding(row, 8);
-
-        let rows = match source {
-            Some(s) => stmt.query_map(params![s, limit as i64, offset as i64], row_mapper)?,
-            None => stmt.query_map(params![limit as i64, offset as i64], row_mapper)?,
-        };
-
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| crate::error::Error::Storage(format!("Failed to list issues: {}", e)))
+        Ok(())
     }
 
-    /// Count issues, optionally filtered by source.
-    fn count_issues(&self, source: Option<&str>) -> Result<usize> {
-        let conn = self.acquire_lock()?;
-        let count: i64 = match source {
-            Some(s) => conn.query_row(
-                "SELECT COUNT(*) FROM issues WHERE source = ?",
-                params![s],
-                |row| row.get(0),
-            )?,
-            None => conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?,
-        };
-        Ok(count as usize)
+    fn get_active_experiments(&self) -> Result<Vec<PromptExperiment>> {
+        SqliteTracker::get_active_experiments(self)
     }
+}
 
-    /// Get a specific execution for an attempt.
-    fn get_execution_for_attempt(
+impl EvaluationStore for SqliteTracker {
+    fn store_eval_snapshot(
         &self,
-        attempt_id: i64,
-        execution_id: i64,
-    ) -> Result<Option<AgentExecution>> {
+        attempt_id: Option<i64>,
+        phase: &str,
+        snapshot: &crate::evaluation::EvalSnapshot,
+    ) -> Result<i64> {
         let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, attempt_id, started_at, completed_at, duration_secs, exit_code, timed_out,
-                   stdout_preview, stderr_preview, stdout_log_path, stderr_log_path, event_log_path,
-                   prompt_used, prompt_hash, model_version, working_directory, git_branch,
-                   git_commit_before, git_commit_after, files_changed, lines_added, lines_removed,
-                   total_cost_usd, num_turns, session_id, duration_api_ms,
-                   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
-                   provider, experiment_name, experiment_variant
-            FROM claude_executions
-            WHERE attempt_id = ?1 AND id = ?2
-            LIMIT 1
-            "#,
+        let diagnostics_json =
+            serde_json::to_string(&snapshot.diagnostics).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "INSERT INTO eval_snapshots (attempt_id, phase, category, tool_name, exit_code, passed, failed, skipped, warnings, errors, diagnostics_json, raw_output, duration_secs, line_coverage_pct, branch_coverage_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                attempt_id,
+                phase,
+                snapshot.category.to_string(),
+                snapshot.tool_name,
+                snapshot.exit_code,
+                snapshot.passed,
+                snapshot.failed,
+                snapshot.skipped,
+                snapshot.warnings,
+                snapshot.errors,
+                diagnostics_json,
+                snapshot.raw_output,
+                snapshot.duration_secs,
+                snapshot.line_coverage_pct,
+                snapshot.branch_coverage_pct,
+            ],
         )?;
-
-        let execution = stmt
-            .query_row(params![attempt_id, execution_id], |row| {
-                Ok(AgentExecution {
-                    id: row.get(0)?,
-                    attempt_id: row.get(1)?,
-                    started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
-                    completed_at: Self::parse_optional_datetime(row.get(3)?),
-                    duration_secs: row.get(4)?,
-                    exit_code: row.get(5)?,
-                    timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
-                    stdout_preview: row.get(7)?,
-                    stderr_preview: row.get(8)?,
-                    stdout_log_path: row.get(9)?,
-                    stderr_log_path: row.get(10)?,
-                    event_log_path: row.get(11)?,
-                    prompt_used: row.get(12)?,
-                    prompt_hash: row.get(13)?,
-                    model_version: row.get(14)?,
-                    working_directory: row.get(15)?,
-                    git_branch: row.get(16)?,
-                    git_commit_before: row.get(17)?,
-                    git_commit_after: row.get(18)?,
-                    files_changed: row.get(19)?,
-                    lines_added: row.get(20)?,
-                    lines_removed: row.get(21)?,
-                    total_cost_usd: row.get(22)?,
-                    num_turns: row.get(23)?,
-                    session_id: row.get(24)?,
-                    duration_api_ms: row.get(25)?,
-                    input_tokens: row.get(26)?,
-                    output_tokens: row.get(27)?,
-                    cache_read_input_tokens: row.get(28)?,
-                    cache_creation_input_tokens: row.get(29)?,
-                    provider: row.get(30)?,
-                    experiment_name: row.get(31)?,
-                    experiment_variant: row.get(32)?,
-                })
-            })
-            .optional()?;
-
-        Ok(execution)
+        Ok(conn.last_insert_rowid())
     }
 
-    fn get_attempts_batch(&self, keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
+    fn store_eval_delta(
+        &self,
+        attempt_id: Option<i64>,
+        repo: &str,
+        delta: &crate::evaluation::EvalDelta,
+    ) -> Result<i64> {
         let conn = self.acquire_lock()?;
-        let mut results = Vec::with_capacity(keys.len());
-        // Use a prepared statement to amortize compilation cost across the batch.
-        let mut stmt = conn.prepare_cached(
-            r#"
-            SELECT id, source, issue_id, short_id, attempted_at, pr_url, scm_repo,
-                   scm_pr_number, status, error_message, merged_at, resolved_at,
-                   retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
-            FROM fix_attempts
-            WHERE source = ? AND issue_id = ?
-            "#,
+        let regressions_json =
+            serde_json::to_string(&delta.regressions).unwrap_or_else(|_| "[]".into());
+        let fixed_json = serde_json::to_string(&delta.fixed).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "INSERT INTO eval_deltas (attempt_id, repo, tool_name, category, new_passes, new_failures, regressions_json, fixed_json, coverage_delta_pct, overall_improved)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                attempt_id,
+                repo,
+                delta.after.tool_name,
+                delta.after.category.to_string(),
+                delta.new_passes,
+                delta.new_failures,
+                regressions_json,
+                fixed_json,
+                delta.coverage_delta_pct,
+                delta.is_improvement() as i32,
+            ],
         )?;
-        for (source, issue_id) in keys {
-            let attempt = stmt
-                .query_row(params![source, issue_id], Self::row_to_fix_attempt)
-                .ok();
-            results.push(attempt);
-        }
-        Ok(results)
+        Ok(conn.last_insert_rowid())
+    }
+}
+
+impl WebhookStore for SqliteTracker {
+    fn check_and_record_delivery(&self, delivery_id: &str, source: &str) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let rows_affected = conn.execute(
+            "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, source) VALUES (?, ?)",
+            params![delivery_id, source],
+        )?;
+        Ok(rows_affected > 0)
     }
 
+    fn cleanup_old_deliveries(&self, max_age_hours: u64) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let rows = conn.execute(
+            "DELETE FROM webhook_deliveries WHERE received_at < datetime('now', ?)",
+            params![format!("-{} hours", max_age_hours)],
+        )?;
+        if rows > 0 {
+            tracing::debug!(rows = rows, "Cleaned up old webhook deliveries");
+        }
+        Ok(rows)
+    }
+}
+
+impl SimilarityStore for SqliteTracker {
     fn store_similar_issues_batch(&self, similar_issues: &[SimilarIssue]) -> Result<()> {
         if similar_issues.is_empty() {
             return Ok(());
@@ -4804,128 +4043,60 @@ impl FixAttemptTracker for SqliteTracker {
         Ok(())
     }
 
-    fn record_release_tracking(&self, tracking: &crate::types::ReleaseTracking) -> Result<i64> {
+    fn store_similar_issue(&self, similar: &SimilarIssue) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
         conn.execute(
             r#"
-            INSERT INTO release_tracking (
-                regression_watch_id, release_version, release_commit, released_at, created_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO similar_issues (source_issue_id, similar_issue_id, similarity_score, computed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(source_issue_id, similar_issue_id) DO UPDATE SET
+                similarity_score = excluded.similarity_score,
+                computed_at = excluded.computed_at
             "#,
             params![
-                tracking.regression_watch_id,
-                tracking.release_version,
-                tracking.release_commit,
-                tracking
-                    .released_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-                tracking.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                similar.source_issue_id,
+                similar.similar_issue_id,
+                similar.similarity_score,
+                similar.computed_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             ],
         )?;
-
         Ok(conn.last_insert_rowid())
     }
 
-    fn get_indexed_repo(&self, name: &str) -> Result<Option<StoredIndexedRepo>> {
+    fn find_similar_issues(
+        &self,
+        issue_id: &str,
+        min_score: f64,
+        limit: usize,
+    ) -> Result<Vec<SimilarIssue>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, name, path, scm_url, default_branch, file_count, last_indexed_at, created_at
-            FROM repositories WHERE name = ?
+            SELECT id, source_issue_id, similar_issue_id, similarity_score, computed_at
+            FROM similar_issues
+            WHERE source_issue_id = ? AND similarity_score >= ?
+            ORDER BY similarity_score DESC
+            LIMIT ?
             "#,
         )?;
 
-        let result = stmt.query_row(params![name], |row| {
-            Ok(StoredIndexedRepo {
+        let mut results = Vec::new();
+        let rows = stmt.query_map(params![issue_id, min_score, limit as i64], |row| {
+            Ok(SimilarIssue {
                 id: row.get(0)?,
-                name: row.get(1)?,
-                path: row.get(2)?,
-                scm_url: row.get(3)?,
-                default_branch: row.get(4)?,
-                file_count: row.get(5)?,
-                last_indexed_at: row.get(6)?,
-                created_at: row.get(7)?,
+                source_issue_id: row.get(1)?,
+                similar_issue_id: row.get(2)?,
+                similarity_score: row.get(3)?,
+                computed_at: Self::parse_datetime(&row.get::<_, String>(4)?)?,
             })
-        });
+        })?;
 
-        match result {
-            Ok(repo) => Ok(Some(repo)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+        for row in rows.flatten() {
+            results.push(row);
         }
-    }
 
-    // --- Analytics ---
-
-    fn get_success_rate(&self) -> Result<f64> {
-        SqliteTracker::get_success_rate(self)
-    }
-
-    // --- Code Indexing ---
-
-    fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
-        SqliteTracker::get_or_create_repo_id(self, name)
-    }
-
-    fn code_chunk_hash_matches(
-        &self,
-        repo_id: i64,
-        file_path: &str,
-        file_hash: &str,
-    ) -> Result<bool> {
-        SqliteTracker::code_chunk_hash_matches(self, repo_id, file_path, file_hash)
-    }
-
-    fn delete_code_data_for_file(&self, repo_id: i64, file_path: &str) -> Result<()> {
-        SqliteTracker::delete_code_data_for_file(self, repo_id, file_path)
-    }
-
-    fn delete_code_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
-        SqliteTracker::delete_code_chunks_by_ids(self, chunk_ids)
-    }
-
-    fn cleanup_stale_code_data(&self, repo_id: i64, current_paths: &[String]) -> Result<()> {
-        SqliteTracker::cleanup_stale_code_data(self, repo_id, current_paths)
-    }
-
-    fn save_code_symbols(&self, symbols: &[crate::repo::code_index::CodeSymbol]) -> Result<()> {
-        SqliteTracker::save_code_symbols(self, symbols)
-    }
-
-    fn save_code_chunks(&self, chunks: &[crate::repo::code_index::CodeChunk]) -> Result<Vec<i64>> {
-        SqliteTracker::save_code_chunks(self, chunks)
-    }
-
-    fn save_code_chunk_embeddings(&self, pairs: &[(i64, &[f32])], model_name: &str) -> Result<()> {
-        SqliteTracker::save_code_chunk_embeddings(self, pairs, model_name)
-    }
-
-    fn search_code_chunks(
-        &self,
-        query_embedding: &[f32],
-        repo_id: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<crate::repo::code_index::CodeSearchResult>> {
-        SqliteTracker::search_code_chunks(self, query_embedding, repo_id, limit)
-    }
-
-    fn find_code_symbols(
-        &self,
-        name: &str,
-        kind: Option<crate::repo::code_index::SymbolKind>,
-        repo_id: Option<i64>,
-    ) -> Result<Vec<crate::repo::code_index::CodeSymbol>> {
-        SqliteTracker::find_code_symbols(self, name, kind, repo_id)
-    }
-
-    fn get_code_embedding_model(&self, repo_id: i64) -> Result<Option<String>> {
-        SqliteTracker::get_code_embedding_model(self, repo_id)
-    }
-
-    fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
-        SqliteTracker::delete_all_code_data_for_repo(self, repo_id)
+        Ok(results)
     }
 }
 
@@ -5044,7 +4215,11 @@ impl SqliteTracker {
 
         ActivityLogEntry {
             id: row.get(0).unwrap_or(0),
-            timestamp: Self::parse_datetime(&row.get::<_, String>(1).unwrap_or_default()),
+            timestamp: row
+                .get::<_, String>(1)
+                .ok()
+                .and_then(|s| Self::parse_datetime(&s).ok())
+                .unwrap_or_else(Utc::now),
             activity_type: row.get(2).unwrap_or_default(),
             source: row.get(3).ok(),
             issue_id: row.get(4).ok(),
@@ -5070,7 +4245,7 @@ impl SqliteTracker {
             source: row.get(1)?,
             issue_id: row.get(2)?,
             short_id: row.get(3)?,
-            attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+            attempted_at: Self::parse_datetime(&row.get::<_, String>(4)?)?,
             pr_url: row.get(5)?,
             scm_repo: row.get(6)?,
             scm_pr_number: row.get(7)?,
@@ -5079,10 +4254,10 @@ impl SqliteTracker {
                 .parse()
                 .unwrap_or(FixAttemptStatus::Pending),
             error_message: row.get(9)?,
-            merged_at: Self::parse_optional_datetime(row.get(10)?),
-            resolved_at: Self::parse_optional_datetime(row.get(11)?),
+            merged_at: Self::parse_optional_datetime(row.get(10)?)?,
+            resolved_at: Self::parse_optional_datetime(row.get(11)?)?,
             retry_count: row.get::<_, Option<u32>>(12)?.unwrap_or(0),
-            last_retry_at: Self::parse_optional_datetime(row.get(13)?),
+            last_retry_at: Self::parse_optional_datetime(row.get(13)?)?,
             issue_labels,
             parent_attempt_id: row.get::<_, Option<i64>>(15).ok().flatten(),
             cascade_repo: row.get::<_, Option<String>>(16).ok().flatten(),
@@ -5216,8 +4391,8 @@ impl SqliteTracker {
             Ok(AgentExecution {
                 id: row.get(0)?,
                 attempt_id: row.get(1)?,
-                started_at: Self::parse_datetime(&row.get::<_, String>(2)?),
-                completed_at: Self::parse_optional_datetime(row.get(3)?),
+                started_at: Self::parse_datetime(&row.get::<_, String>(2)?)?,
+                completed_at: Self::parse_optional_datetime(row.get(3)?)?,
                 duration_secs: row.get(4)?,
                 exit_code: row.get(5)?,
                 timed_out: row.get::<_, i32>(6).unwrap_or(0) != 0,
@@ -5336,7 +4511,7 @@ impl SqliteTracker {
                 pr_url: row.get(2)?,
                 reviewer: row.get(3)?,
                 review_state: row.get(4)?,
-                submitted_at: Self::parse_optional_datetime(row.get(5)?),
+                submitted_at: Self::parse_optional_datetime(row.get(5)?)?,
                 body: row.get(6)?,
                 sentiment: row.get(7)?,
                 actionable_feedback: row.get(8)?,
@@ -5452,8 +4627,8 @@ impl SqliteTracker {
                 pattern_hash: row.get(1)?,
                 error_type: row.get(2)?,
                 error_message: row.get(3)?,
-                first_seen: Self::parse_datetime(&row.get::<_, String>(4)?),
-                last_seen: Self::parse_datetime(&row.get::<_, String>(5)?),
+                first_seen: Self::parse_datetime(&row.get::<_, String>(4)?)?,
+                last_seen: Self::parse_datetime(&row.get::<_, String>(5)?)?,
                 occurrence_count: row.get(6)?,
                 sources: sources_str.and_then(|s| serde_json::from_str(&s).ok()),
                 example_issue_ids: example_ids_str.and_then(|s| serde_json::from_str(&s).ok()),
@@ -5802,11 +4977,11 @@ impl SqliteTracker {
             channel: row.get(11)?,
             responder: row.get(12)?,
             correlation_id: row.get(13)?,
-            asked_at: Self::parse_datetime(&row.get::<_, String>(14)?),
-            answered_at: Self::parse_datetime(&row.get::<_, String>(15)?),
+            asked_at: Self::parse_datetime(&row.get::<_, String>(14)?)?,
+            answered_at: Self::parse_datetime(&row.get::<_, String>(15)?)?,
             success_count: row.get(16)?,
             failure_count: row.get(17)?,
-            last_used_at: Self::parse_optional_datetime(row.get::<_, Option<String>>(18)?),
+            last_used_at: Self::parse_optional_datetime(row.get::<_, Option<String>>(18)?)?,
             metadata: metadata.and_then(|s| serde_json::from_str(&s).ok()),
         })
     }
@@ -5860,7 +5035,7 @@ impl SqliteTracker {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default(),
             embedding,
-            created_at: Self::parse_datetime(&created_at_str),
+            created_at: Self::parse_datetime(&created_at_str)?,
         })
     }
 
@@ -6002,7 +5177,7 @@ impl SqliteTracker {
 
         Ok(ProcessingMetric {
             id: row.get(0)?,
-            timestamp: Self::parse_datetime(&row.get::<_, String>(1)?),
+            timestamp: Self::parse_datetime(&row.get::<_, String>(1)?)?,
             metric_name: row.get(2)?,
             metric_value: row.get(3)?,
             source: row.get(4)?,
@@ -6030,7 +5205,7 @@ impl SqliteTracker {
                 variant: row.get(2)?,
                 prompt_template: row.get(3)?,
                 prompt_hash: row.get(4)?,
-                created_at: Self::parse_datetime(&row.get::<_, String>(5)?),
+                created_at: Self::parse_datetime(&row.get::<_, String>(5)?)?,
                 active: row.get::<_, i32>(6)? != 0,
                 success_count: row.get(7)?,
                 failure_count: row.get(8)?,
@@ -6044,64 +5219,6 @@ impl SqliteTracker {
         }
 
         Ok(experiments)
-    }
-
-    /// Store a similar issue relationship.
-    pub fn store_similar_issue(&self, similar: &SimilarIssue) -> Result<i64> {
-        let conn = self.acquire_lock()?;
-
-        conn.execute(
-            r#"
-            INSERT INTO similar_issues (source_issue_id, similar_issue_id, similarity_score, computed_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(source_issue_id, similar_issue_id) DO UPDATE SET
-                similarity_score = excluded.similarity_score,
-                computed_at = excluded.computed_at
-            "#,
-            params![
-                similar.source_issue_id,
-                similar.similar_issue_id,
-                similar.similarity_score,
-                similar.computed_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// Find similar issues for a given issue.
-    pub fn find_similar_issues(
-        &self,
-        issue_id: &str,
-        min_score: f64,
-        limit: usize,
-    ) -> Result<Vec<SimilarIssue>> {
-        let conn = self.acquire_lock()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, source_issue_id, similar_issue_id, similarity_score, computed_at
-            FROM similar_issues
-            WHERE source_issue_id = ? AND similarity_score >= ?
-            ORDER BY similarity_score DESC
-            LIMIT ?
-            "#,
-        )?;
-
-        let mut results = Vec::new();
-        let rows = stmt.query_map(params![issue_id, min_score, limit as i64], |row| {
-            Ok(SimilarIssue {
-                id: row.get(0)?,
-                source_issue_id: row.get(1)?,
-                similar_issue_id: row.get(2)?,
-                similarity_score: row.get(3)?,
-                computed_at: Self::parse_datetime(&row.get::<_, String>(4)?),
-            })
-        })?;
-
-        for row in rows.flatten() {
-            results.push(row);
-        }
-
-        Ok(results)
     }
 
     /// Get the overall success rate.
@@ -7313,14 +6430,14 @@ impl SqliteTracker {
             head_branch: row.get(10)?,
             base_branch: row.get(11)?,
             status: row.get(12)?,
-            created_at: Self::parse_datetime(&row.get::<_, String>(13)?),
-            updated_at: Self::parse_optional_datetime(row.get(14)?),
-            merged_at: Self::parse_optional_datetime(row.get(15)?),
-            closed_at: Self::parse_optional_datetime(row.get(16)?),
+            created_at: Self::parse_datetime(&row.get::<_, String>(13)?)?,
+            updated_at: Self::parse_optional_datetime(row.get(14)?)?,
+            merged_at: Self::parse_optional_datetime(row.get(15)?)?,
+            closed_at: Self::parse_optional_datetime(row.get(16)?)?,
             approvals_count: row.get(17)?,
             changes_requested_count: row.get(18)?,
             comments_count: row.get(19)?,
-            last_review_at: Self::parse_optional_datetime(row.get(20)?),
+            last_review_at: Self::parse_optional_datetime(row.get(20)?)?,
             time_to_first_review_mins: row.get(21)?,
             time_to_merge_mins: row.get(22)?,
             review_cycles: row.get(23)?,
@@ -7455,6 +6572,84 @@ impl SqliteTracker {
         Ok(results)
     }
 
+    /// Create a new regression watch. Returns the watch ID.
+    pub fn create_regression_watch(&self, watch: &crate::types::RegressionWatch) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO regression_watches (
+                issue_type, issue_id, fix_attempt_id, status,
+                pr_merged_at, monitoring_started_at, resolved_at, regressed_at, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                watch.issue_type.to_string(),
+                watch.issue_id,
+                watch.fix_attempt_id,
+                watch.status.to_string(),
+                watch
+                    .pr_merged_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch
+                    .monitoring_started_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch
+                    .resolved_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch
+                    .regressed_at
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                watch.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Add a regression check. Returns the check ID.
+    pub fn add_regression_check(&self, check: &crate::types::RegressionCheck) -> Result<i64> {
+        self.record_regression_check(check)
+    }
+
+    /// Update regression watch status.
+    pub fn update_regression_watch_status(
+        &self,
+        id: i64,
+        status: crate::types::RegressionWatchStatus,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+        let (monitoring_started, resolved, regressed) = match status {
+            crate::types::RegressionWatchStatus::Monitoring => (Some(now.clone()), None, None),
+            crate::types::RegressionWatchStatus::Resolved => (None, Some(now.clone()), None),
+            crate::types::RegressionWatchStatus::Regressed => (None, None, Some(now.clone())),
+            _ => (None, None, None),
+        };
+
+        conn.execute(
+            r#"
+            UPDATE regression_watches SET
+                status = ?1,
+                monitoring_started_at = COALESCE(?2, monitoring_started_at),
+                resolved_at = COALESCE(?3, resolved_at),
+                regressed_at = COALESCE(?4, regressed_at)
+            WHERE id = ?5
+            "#,
+            params![
+                status.to_string(),
+                monitoring_started,
+                resolved,
+                regressed,
+                id
+            ],
+        )?;
+
+        Ok(())
+    }
+
     fn row_to_regression_watch(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<crate::types::RegressionWatch> {
@@ -7471,11 +6666,11 @@ impl SqliteTracker {
             status: status_str
                 .parse()
                 .unwrap_or(crate::types::RegressionWatchStatus::AwaitingRelease),
-            pr_merged_at: Self::parse_optional_datetime(row.get(5)?),
-            monitoring_started_at: Self::parse_optional_datetime(row.get(6)?),
-            resolved_at: Self::parse_optional_datetime(row.get(7)?),
-            regressed_at: Self::parse_optional_datetime(row.get(8)?),
-            created_at: Self::parse_datetime(&row.get::<_, String>(9)?),
+            pr_merged_at: Self::parse_optional_datetime(row.get(5)?)?,
+            monitoring_started_at: Self::parse_optional_datetime(row.get(6)?)?,
+            resolved_at: Self::parse_optional_datetime(row.get(7)?)?,
+            regressed_at: Self::parse_optional_datetime(row.get(8)?)?,
+            created_at: Self::parse_datetime(&row.get::<_, String>(9)?)?,
         })
     }
 
@@ -7486,9 +6681,9 @@ impl SqliteTracker {
             id: row.get(0)?,
             regression_watch_id: row.get(1)?,
             issue_still_exists: row.get::<_, i32>(2)? != 0,
-            checked_at: Self::parse_optional_datetime(row.get(3)?),
+            checked_at: Self::parse_optional_datetime(row.get(3)?)?,
             check_details: row.get(4)?,
-            created_at: Self::parse_datetime(&row.get::<_, String>(5)?),
+            created_at: Self::parse_datetime(&row.get::<_, String>(5)?)?,
         })
     }
 }
@@ -7554,7 +6749,7 @@ impl SqliteTracker {
                     change_categories: serde_json::from_str(&row.get::<_, String>(7)?)
                         .unwrap_or_default(),
                     diff_summary: row.get(8)?,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(9)?),
+                    created_at: Self::parse_datetime(&row.get::<_, String>(9)?)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -7633,8 +6828,8 @@ impl SqliteTracker {
                     occurrence_count: row.get(4)?,
                     confidence: row.get(5)?,
                     is_active: row.get::<_, i32>(6)? != 0,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?),
+                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?)?,
+                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -7698,8 +6893,8 @@ impl SqliteTracker {
                     source_type: row.get(4)?,
                     confidence: row.get(5)?,
                     occurrence_count: row.get(6)?,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?),
+                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?)?,
+                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -7728,8 +6923,8 @@ impl SqliteTracker {
                     source_type: row.get(4)?,
                     confidence: row.get(5)?,
                     occurrence_count: row.get(6)?,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?),
+                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?)?,
+                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -7800,8 +6995,8 @@ impl SqliteTracker {
                         .unwrap_or_default(),
                     occurrence_count: row.get(5)?,
                     promoted_to_instruction: row.get::<_, i32>(6)? != 0,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?),
+                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?)?,
+                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -7832,8 +7027,8 @@ impl SqliteTracker {
                         .unwrap_or_default(),
                     occurrence_count: row.get(5)?,
                     promoted_to_instruction: row.get::<_, i32>(6)? != 0,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?),
-                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?),
+                    created_at: Self::parse_datetime(&row.get::<_, String>(7)?)?,
+                    updated_at: Self::parse_datetime(&row.get::<_, String>(8)?)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -7894,7 +7089,7 @@ impl SqliteTracker {
                     fix_approach: row.get(5)?,
                     strategy_summary: row.get(6)?,
                     fix_quality_score: row.get(7)?,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(8)?),
+                    created_at: Self::parse_datetime(&row.get::<_, String>(8)?)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -7959,12 +7154,12 @@ impl SqliteTracker {
                     cluster_key: row.get(1)?,
                     source: row.get(2)?,
                     issue_ids: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                    window_start: Self::parse_datetime(&row.get::<_, String>(4)?),
-                    window_end: Self::parse_datetime(&row.get::<_, String>(5)?),
+                    window_start: Self::parse_datetime(&row.get::<_, String>(4)?)?,
+                    window_end: Self::parse_datetime(&row.get::<_, String>(5)?)?,
                     resolved_by_issue_id: row.get(6)?,
                     resolved_by_attempt_id: row.get(7)?,
                     status: row.get(8)?,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(9)?),
+                    created_at: Self::parse_datetime(&row.get::<_, String>(9)?)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -8003,7 +7198,7 @@ impl SqliteTracker {
         let rows = stmt
             .query_map(params![source, cutoff_modifier], |row| {
                 let issue_id: String = row.get(0)?;
-                let attempted_at = Self::parse_datetime(&row.get::<_, String>(1)?);
+                let attempted_at = Self::parse_datetime(&row.get::<_, String>(1)?)?;
                 Ok((issue_id, attempted_at))
             })?
             .filter_map(|r| r.ok())
@@ -8060,7 +7255,7 @@ impl SqliteTracker {
                     culprit: row.get(6)?,
                     avg_similarity: row.get(7)?,
                     status: row.get(8)?,
-                    created_at: Self::parse_datetime(&row.get::<_, String>(9)?),
+                    created_at: Self::parse_datetime(&row.get::<_, String>(9)?)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -8176,7 +7371,7 @@ impl SqliteTracker {
                     repo_a: row.get(1)?,
                     repo_b: row.get(2)?,
                     correlation_count: row.get(3)?,
-                    last_seen_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+                    last_seen_at: Self::parse_datetime(&row.get::<_, String>(4)?)?,
                     window_hours: row.get(5)?,
                 })
             },
@@ -8204,7 +7399,7 @@ impl SqliteTracker {
                     repo_a: row.get(1)?,
                     repo_b: row.get(2)?,
                     correlation_count: row.get(3)?,
-                    last_seen_at: Self::parse_datetime(&row.get::<_, String>(4)?),
+                    last_seen_at: Self::parse_datetime(&row.get::<_, String>(4)?)?,
                     window_hours: row.get(5)?,
                 })
             })?
@@ -8486,6 +7681,7 @@ impl SqliteTracker {
         if dimension == 0 {
             return Ok(false);
         }
+        validate_dimension(dimension)?;
 
         if !is_vectorlite_available(conn) {
             match try_load_vectorlite(conn) {
@@ -8721,6 +7917,30 @@ impl SqliteTracker {
         Ok(result)
     }
 
+    /// Get a value from the code_index_metadata table.
+    pub fn get_code_index_meta(&self, repo_id: i64, key: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT value FROM code_index_metadata WHERE repo_id = ?1 AND key = ?2",
+                params![repo_id, key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Set (upsert) a value in the code_index_metadata table.
+    pub fn set_code_index_meta(&self, repo_id: i64, key: &str, value: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO code_index_metadata (repo_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
+            params![repo_id, key, value],
+        )?;
+        Ok(())
+    }
+
     /// Delete all code data (symbols, chunks, embeddings) for a repo.
     pub fn delete_all_code_data_for_repo(&self, repo_id: i64) -> Result<()> {
         let mut conn = self.acquire_lock()?;
@@ -8736,6 +7956,130 @@ impl SqliteTracker {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    // --- Chat Session Store ---
+
+    /// Create a new chat session.
+    pub fn create_chat_session(&self, id: &str, repo_id: Option<i64>) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO chat_sessions (id, repo_id) VALUES (?1, ?2)",
+            params![id, repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// Save a chat message to a session.
+    pub fn save_chat_message(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        sources_json: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO chat_messages (session_id, role, content, sources_json) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, role, content, sources_json],
+        )?;
+        let id = conn.last_insert_rowid();
+        // Update session's updated_at
+        conn.execute(
+            "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?1",
+            params![session_id],
+        )?;
+        Ok(id)
+    }
+
+    /// Get chat message history for a session (most recent N messages).
+    pub fn get_chat_history(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::chat::types::ChatMessage>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, role, content, sources_json, created_at
+             FROM chat_messages
+             WHERE session_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+            let role_str: String = row.get(1)?;
+            let created_str: String = row.get(4)?;
+            Ok(crate::chat::types::ChatMessage {
+                id: Some(row.get(0)?),
+                role: crate::chat::types::ChatRole::parse(&role_str)
+                    .unwrap_or(crate::chat::types::ChatRole::User),
+                content: row.get(2)?,
+                sources_json: row.get(3)?,
+                created_at: chrono::NaiveDateTime::parse_from_str(
+                    &created_str,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                .map(|dt| dt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+        })?;
+
+        let mut messages: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+        messages.reverse(); // Return in chronological order
+        Ok(messages)
+    }
+
+    /// List all chat sessions.
+    pub fn list_chat_sessions(&self) -> Result<Vec<crate::chat::types::ChatSession>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, repo_id, created_at, updated_at
+             FROM chat_sessions
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let created_str: String = row.get(2)?;
+            let updated_str: String = row.get(3)?;
+            Ok(crate::chat::types::ChatSession {
+                id: row.get(0)?,
+                repo_id: row.get(1)?,
+                created_at: chrono::NaiveDateTime::parse_from_str(
+                    &created_str,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                .map(|dt| dt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now()),
+                updated_at: chrono::NaiveDateTime::parse_from_str(
+                    &updated_str,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                .map(|dt| dt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now()),
+                messages: Vec::new(),
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Delete a chat session and all its messages.
+    pub fn delete_chat_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        // Messages are CASCADE-deleted via FK.
+        conn.execute(
+            "DELETE FROM chat_sessions WHERE id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Cleanup expired chat sessions older than max_age_days. Returns count deleted.
+    pub fn cleanup_expired_chat_sessions(&self, max_age_days: u32) -> Result<usize> {
+        let conn = self.acquire_lock()?;
+        let count = conn.execute(
+            "DELETE FROM chat_sessions WHERE updated_at < datetime('now', ?1)",
+            params![format!("-{max_age_days} days")],
+        )?;
+        Ok(count)
     }
 }
 
@@ -8995,7 +8339,7 @@ mod tests {
         assert!(attempt.resolved_at.is_none());
 
         // get_attempted_issue_ids also excludes reset entries
-        let ids = tracker.get_attempted_issue_ids("linear");
+        let ids = tracker.get_attempted_issue_ids("linear").unwrap();
         assert!(!ids.contains("123"));
     }
 
@@ -9009,12 +8353,12 @@ mod tests {
             .record_attempt("sentry", "789", "SENTRY-789")
             .unwrap();
 
-        let linear_ids = tracker.get_attempted_issue_ids("linear");
+        let linear_ids = tracker.get_attempted_issue_ids("linear").unwrap();
         assert_eq!(linear_ids.len(), 2);
         assert!(linear_ids.contains("123"));
         assert!(linear_ids.contains("456"));
 
-        let sentry_ids = tracker.get_attempted_issue_ids("sentry");
+        let sentry_ids = tracker.get_attempted_issue_ids("sentry").unwrap();
         assert_eq!(sentry_ids.len(), 1);
         assert!(sentry_ids.contains("789"));
     }
@@ -9419,7 +8763,7 @@ mod tests {
 
     #[test]
     fn test_parse_datetime_rfc3339() {
-        let dt = SqliteTracker::parse_datetime("2024-01-15T10:30:00Z");
+        let dt = SqliteTracker::parse_datetime("2024-01-15T10:30:00Z").unwrap();
         assert_eq!(dt.year(), 2024);
         assert_eq!(dt.month(), 1);
         assert_eq!(dt.day(), 15);
@@ -9429,7 +8773,7 @@ mod tests {
 
     #[test]
     fn test_parse_datetime_sqlite_format() {
-        let dt = SqliteTracker::parse_datetime("2024-01-15 10:30:00");
+        let dt = SqliteTracker::parse_datetime("2024-01-15 10:30:00").unwrap();
         assert_eq!(dt.year(), 2024);
         assert_eq!(dt.month(), 1);
         assert_eq!(dt.day(), 15);
@@ -9437,19 +8781,19 @@ mod tests {
 
     #[test]
     fn test_parse_datetime_invalid() {
-        // Should return current time for invalid format
-        let dt = SqliteTracker::parse_datetime("not a date");
-        // Just verify it doesn't panic and returns a valid datetime
-        assert!(dt.year() >= 2024);
+        // Should return an error for invalid format
+        let result = SqliteTracker::parse_datetime("not a date");
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_optional_datetime() {
-        let none_result = SqliteTracker::parse_optional_datetime(None);
+        let none_result = SqliteTracker::parse_optional_datetime(None).unwrap();
         assert!(none_result.is_none());
 
         let some_result =
-            SqliteTracker::parse_optional_datetime(Some("2024-01-15T10:30:00Z".to_string()));
+            SqliteTracker::parse_optional_datetime(Some("2024-01-15T10:30:00Z".to_string()))
+                .unwrap();
         assert!(some_result.is_some());
     }
 
@@ -11967,7 +11311,7 @@ mod tests {
     fn test_parse_pr_url_too_long() {
         let long_url = format!(
             "https://github.com/{}/pull/1",
-            "a".repeat(MAX_PR_URL_LENGTH)
+            "a".repeat(crate::storage::MAX_PR_URL_LENGTH)
         );
         let result = SqliteTracker::parse_pr_url(&long_url);
         assert_eq!(result, None);
@@ -13214,7 +12558,9 @@ mod tests {
     #[test]
     fn test_get_attempted_issue_ids_empty_source() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let ids = tracker.get_attempted_issue_ids("nonexistent_source");
+        let ids = tracker
+            .get_attempted_issue_ids("nonexistent_source")
+            .unwrap();
         assert!(ids.is_empty());
     }
 
@@ -17301,5 +16647,821 @@ mod tests {
         assert_eq!(fetched.title.as_deref(), Some("Fix bug"));
         assert_eq!(fetched.issue_id.as_deref(), Some("ISS-1"));
         assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
+    }
+
+    // =========================================================
+    // Tests for previously uncovered code paths
+    // =========================================================
+
+    #[test]
+    fn test_validate_dimension_zero() {
+        let result = validate_dimension(0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_dimension_too_large() {
+        let result = validate_dimension(MAX_EMBEDDING_DIMENSION + 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_dimension_valid() {
+        assert!(validate_dimension(1).is_ok());
+        assert!(validate_dimension(128).is_ok());
+        assert!(validate_dimension(MAX_EMBEDDING_DIMENSION).is_ok());
+    }
+
+    #[test]
+    fn test_blob_to_embedding_none() {
+        assert!(SqliteTracker::blob_to_embedding(None).is_none());
+    }
+
+    #[test]
+    fn test_blob_to_embedding_empty() {
+        // Empty blob should return None because the Option<Vec<u8>> is Some but
+        // blob is empty, blob.len().is_multiple_of(4) is true (0%4==0), so it returns Some(empty vec)
+        let result = SqliteTracker::blob_to_embedding(Some(Vec::new()));
+        assert_eq!(result, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_blob_to_embedding_bad_alignment() {
+        // A blob of length 3 is not a multiple of 4
+        let result = SqliteTracker::blob_to_embedding(Some(vec![1, 2, 3]));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_blob_to_embedding_roundtrip() {
+        let original = vec![1.0f32, 2.5, -3.15, 0.0];
+        let blob = SqliteTracker::embedding_to_blob(Some(&original));
+        let restored = SqliteTracker::blob_to_embedding(blob);
+        assert_eq!(restored, Some(original));
+    }
+
+    #[test]
+    fn test_table_exists_true() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let conn = tracker.acquire_lock().unwrap();
+        // fix_attempts is created by migrations
+        assert!(SqliteTracker::table_exists(&conn, "fix_attempts").unwrap());
+    }
+
+    #[test]
+    fn test_table_exists_false() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let conn = tracker.acquire_lock().unwrap();
+        assert!(!SqliteTracker::table_exists(&conn, "nonexistent_table_xyz").unwrap());
+    }
+
+    #[test]
+    fn test_get_user_by_id() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let id = tracker
+            .create_user("user@example.com", "hash123", "Test User", "admin")
+            .unwrap();
+
+        let user = tracker.get_user_by_id(id).unwrap().unwrap();
+        assert_eq!(user.id, id);
+        assert_eq!(user.email, "user@example.com");
+        assert_eq!(user.name, "Test User");
+        assert_eq!(user.role, "admin");
+    }
+
+    #[test]
+    fn test_get_user_by_id_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user = tracker.get_user_by_id(99999).unwrap();
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn test_update_experiment_config() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let experiment = PromptExperiment::new("exp1", "control", "template1", "hash1");
+        let id = tracker.save_experiment(&experiment).unwrap();
+        assert!(id > 0);
+
+        // Update the experiment
+        let updated = tracker
+            .update_experiment(
+                id,
+                "exp1_renamed",
+                "variant_a",
+                "new template",
+                "new_hash",
+                false,
+            )
+            .unwrap();
+        assert!(updated);
+
+        // Verify via get_active_experiments (should be empty since we set active=false)
+        let active = tracker.get_active_experiments().unwrap();
+        assert!(active.iter().all(|e| e.id != id));
+    }
+
+    #[test]
+    fn test_update_experiment_nonexistent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let updated = tracker
+            .update_experiment(99999, "exp", "var", "tpl", "hash", true)
+            .unwrap();
+        assert!(!updated);
+    }
+
+    #[test]
+    fn test_get_most_recent_merged_attempt_for_repo() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Record and mark as merged with a known SCM repo
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker
+            .mark_success("linear", "1", "https://github.com/org/repo/pull/10")
+            .unwrap();
+        tracker.mark_merged("linear", "1").unwrap();
+
+        let result = tracker
+            .get_most_recent_merged_attempt_for_repo("org/repo")
+            .unwrap();
+        assert!(result.is_some());
+        let attempt = result.unwrap();
+        assert_eq!(attempt.issue_id, "1");
+        assert_eq!(attempt.scm_repo, Some("org/repo".to_string()));
+    }
+
+    #[test]
+    fn test_get_most_recent_merged_attempt_for_repo_not_found() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker
+            .get_most_recent_merged_attempt_for_repo("nonexistent/repo")
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_most_recent_merged_attempt_for_repo_only_returns_merged() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a success (but not merged) attempt
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker
+            .mark_success("linear", "2", "https://github.com/org/repo/pull/20")
+            .unwrap();
+
+        let result = tracker
+            .get_most_recent_merged_attempt_for_repo("org/repo")
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    // --- Chat Store Tests ---
+
+    #[test]
+    fn test_create_chat_session() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.create_chat_session("sess-1", None).unwrap();
+
+        let sessions = tracker.list_chat_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "sess-1");
+        assert!(sessions[0].repo_id.is_none());
+    }
+
+    #[test]
+    fn test_create_chat_session_with_repo_id() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("my-repo").unwrap();
+        tracker
+            .create_chat_session("sess-2", Some(repo_id))
+            .unwrap();
+
+        let sessions = tracker.list_chat_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].repo_id, Some(repo_id));
+    }
+
+    #[test]
+    fn test_save_and_get_chat_messages() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.create_chat_session("sess-1", None).unwrap();
+
+        let id1 = tracker
+            .save_chat_message("sess-1", "user", "Hello!", None)
+            .unwrap();
+        assert!(id1 > 0);
+
+        let id2 = tracker
+            .save_chat_message(
+                "sess-1",
+                "assistant",
+                "Hi there!",
+                Some(r#"{"docs":["a.rs"]}"#),
+            )
+            .unwrap();
+        assert!(id2 > id1);
+
+        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        assert_eq!(history.len(), 2);
+        // Should be in chronological order
+        assert_eq!(history[0].content, "Hello!");
+        assert_eq!(history[1].content, "Hi there!");
+        assert_eq!(
+            history[1].sources_json.as_deref(),
+            Some(r#"{"docs":["a.rs"]}"#)
+        );
+    }
+
+    #[test]
+    fn test_get_chat_history_respects_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.create_chat_session("sess-1", None).unwrap();
+
+        for i in 0..5 {
+            tracker
+                .save_chat_message("sess-1", "user", &format!("msg {}", i), None)
+                .unwrap();
+        }
+
+        let history = tracker.get_chat_history("sess-1", 3).unwrap();
+        assert_eq!(history.len(), 3);
+        // Should return the 3 most recent in chronological order
+        assert_eq!(history[0].content, "msg 2");
+        assert_eq!(history[1].content, "msg 3");
+        assert_eq!(history[2].content, "msg 4");
+    }
+
+    #[test]
+    fn test_get_chat_history_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.create_chat_session("sess-1", None).unwrap();
+        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_list_chat_sessions_multiple() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.create_chat_session("sess-a", None).unwrap();
+        tracker.create_chat_session("sess-b", None).unwrap();
+        tracker.create_chat_session("sess-c", None).unwrap();
+
+        let sessions = tracker.list_chat_sessions().unwrap();
+        assert_eq!(sessions.len(), 3);
+    }
+
+    #[test]
+    fn test_list_chat_sessions_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let sessions = tracker.list_chat_sessions().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_delete_chat_session() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.create_chat_session("sess-1", None).unwrap();
+        tracker
+            .save_chat_message("sess-1", "user", "hello", None)
+            .unwrap();
+
+        tracker.delete_chat_session("sess-1").unwrap();
+
+        let sessions = tracker.list_chat_sessions().unwrap();
+        assert!(sessions.is_empty());
+
+        // Messages should also be gone (CASCADE delete)
+        let history = tracker.get_chat_history("sess-1", 10).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_delete_chat_session_nonexistent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Should not error even if session doesn't exist
+        tracker.delete_chat_session("nonexistent").unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_expired_chat_sessions() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.create_chat_session("sess-old", None).unwrap();
+        tracker.create_chat_session("sess-new", None).unwrap();
+
+        // Manually age one session via direct SQL
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at = datetime('now', '-100 days') WHERE id = 'sess-old'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let deleted = tracker.cleanup_expired_chat_sessions(30).unwrap();
+        assert_eq!(deleted, 1);
+
+        let sessions = tracker.list_chat_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "sess-new");
+    }
+
+    #[test]
+    fn test_cleanup_expired_chat_sessions_none_expired() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.create_chat_session("sess-1", None).unwrap();
+
+        let deleted = tracker.cleanup_expired_chat_sessions(30).unwrap();
+        assert_eq!(deleted, 0);
+
+        let sessions = tracker.list_chat_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+    }
+
+    // --- Code Index Meta Tests ---
+
+    #[test]
+    fn test_get_set_code_index_meta() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        // Initially no meta
+        let val = tracker.get_code_index_meta(repo_id, "model").unwrap();
+        assert!(val.is_none());
+
+        // Set a value
+        tracker
+            .set_code_index_meta(repo_id, "model", "text-embedding-3-small")
+            .unwrap();
+        let val = tracker.get_code_index_meta(repo_id, "model").unwrap();
+        assert_eq!(val.as_deref(), Some("text-embedding-3-small"));
+
+        // Upsert (overwrite)
+        tracker
+            .set_code_index_meta(repo_id, "model", "text-embedding-3-large")
+            .unwrap();
+        let val = tracker.get_code_index_meta(repo_id, "model").unwrap();
+        assert_eq!(val.as_deref(), Some("text-embedding-3-large"));
+    }
+
+    #[test]
+    fn test_get_code_index_meta_different_keys() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        tracker
+            .set_code_index_meta(repo_id, "key_a", "val_a")
+            .unwrap();
+        tracker
+            .set_code_index_meta(repo_id, "key_b", "val_b")
+            .unwrap();
+
+        assert_eq!(
+            tracker
+                .get_code_index_meta(repo_id, "key_a")
+                .unwrap()
+                .as_deref(),
+            Some("val_a")
+        );
+        assert_eq!(
+            tracker
+                .get_code_index_meta(repo_id, "key_b")
+                .unwrap()
+                .as_deref(),
+            Some("val_b")
+        );
+    }
+
+    #[test]
+    fn test_get_code_embedding_model_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        let model = tracker.get_code_embedding_model(repo_id).unwrap();
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn test_get_code_embedding_model_with_data() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        // Save a chunk, then save an embedding for it
+        let chunks = vec![crate::repo::code_index::CodeChunk {
+            id: None,
+            repo_id,
+            file_path: "src/main.rs".to_string(),
+            chunk_type: "function".to_string(),
+            symbol_name: Some("main".to_string()),
+            language: crate::repo::code_index::Language::Rust,
+            start_line: 1,
+            end_line: 10,
+            chunk_text: "fn main() {}".to_string(),
+            context_text: "fn main() {}".to_string(),
+            file_hash: "abc123".to_string(),
+            content_hash: None,
+        }];
+        let ids = tracker.save_code_chunks(&chunks).unwrap();
+        assert_eq!(ids.len(), 1);
+
+        // Save embedding for the chunk
+        let embedding = vec![0.1f32, 0.2, 0.3, 0.4];
+        tracker
+            .save_code_chunk_embeddings(&[(ids[0], &embedding)], "test-model-v1")
+            .unwrap();
+
+        let model = tracker.get_code_embedding_model(repo_id).unwrap();
+        assert_eq!(model.as_deref(), Some("test-model-v1"));
+    }
+
+    // --- Delete All Code Data ---
+
+    #[test]
+    fn test_delete_all_code_data_for_repo() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+
+        // Save symbols
+        let symbols = vec![crate::repo::code_index::CodeSymbol {
+            id: None,
+            repo_id,
+            file_path: "src/lib.rs".to_string(),
+            symbol_name: "my_func".to_string(),
+            symbol_kind: crate::repo::code_index::SymbolKind::Function,
+            parent_symbol: None,
+            language: crate::repo::code_index::Language::Rust,
+            start_line: 1,
+            end_line: 5,
+            signature: None,
+        }];
+        tracker.save_code_symbols(&symbols).unwrap();
+
+        // Save chunks
+        let chunks = vec![crate::repo::code_index::CodeChunk {
+            id: None,
+            repo_id,
+            file_path: "src/lib.rs".to_string(),
+            chunk_type: "function".to_string(),
+            symbol_name: Some("my_func".to_string()),
+            language: crate::repo::code_index::Language::Rust,
+            start_line: 1,
+            end_line: 5,
+            chunk_text: "fn my_func() {}".to_string(),
+            context_text: "fn my_func() {}".to_string(),
+            file_hash: "hash1".to_string(),
+            content_hash: None,
+        }];
+        tracker.save_code_chunks(&chunks).unwrap();
+
+        // Delete all
+        tracker.delete_all_code_data_for_repo(repo_id).unwrap();
+
+        // Verify symbols and chunks are gone
+        let found_symbols = tracker
+            .find_code_symbols("my_func", None, Some(repo_id))
+            .unwrap();
+        assert!(found_symbols.is_empty());
+    }
+
+    #[test]
+    fn test_delete_all_code_data_for_repo_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let repo_id = tracker.get_or_create_repo_id("test-repo").unwrap();
+        // Should succeed even with no data
+        tracker.delete_all_code_data_for_repo(repo_id).unwrap();
+    }
+
+    // --- Indexing Progress ---
+
+    #[test]
+    fn test_get_indexing_progress_default() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let progress = tracker.get_indexing_progress().unwrap();
+        // After init, there should be a default idle row
+        assert_eq!(progress.status, "idle");
+        assert_eq!(progress.total_repos, 0);
+        assert_eq!(progress.indexed_repos, 0);
+    }
+
+    // --- Update user with no fields ---
+
+    #[test]
+    fn test_update_user_no_fields() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let id = tracker
+            .create_user("u@ex.com", "h", "Name", "admin")
+            .unwrap();
+
+        // Calling update with all None should return false (no fields to update)
+        let result = tracker
+            .update_user(id, None, None, None, None, None)
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_update_user_partial_fields() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let id = tracker
+            .create_user("u@ex.com", "oldhash", "OldName", "viewer")
+            .unwrap();
+
+        // Update only the name
+        let result = tracker
+            .update_user(id, None, None, Some("NewName"), None, None)
+            .unwrap();
+        assert!(result);
+
+        let user = tracker.get_user_by_id(id).unwrap().unwrap();
+        assert_eq!(user.name, "NewName");
+        assert_eq!(user.email, "u@ex.com"); // unchanged
+        assert_eq!(user.role, "viewer"); // unchanged
+    }
+
+    #[test]
+    fn test_update_user_avatar_url() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let id = tracker
+            .create_user("u@ex.com", "h", "Name", "admin")
+            .unwrap();
+
+        let result = tracker
+            .update_user(
+                id,
+                None,
+                None,
+                None,
+                None,
+                Some("https://example.com/avatar.png"),
+            )
+            .unwrap();
+        assert!(result);
+
+        let user = tracker.get_user_by_id(id).unwrap().unwrap();
+        assert_eq!(
+            user.avatar_url.as_deref(),
+            Some("https://example.com/avatar.png")
+        );
+    }
+
+    // --- get_activities_for_issue (isolation) ---
+
+    #[test]
+    fn test_get_activities_for_issue_filters_by_source_and_id() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let entry = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "fix_started".to_string(),
+            source: Some("linear".to_string()),
+            issue_id: Some("ISS-1".to_string()),
+            short_id: Some("L-1".to_string()),
+            message: "Started fix".to_string(),
+            metadata: None,
+        };
+        tracker.record_activity(&entry).unwrap();
+
+        // Different issue
+        let entry2 = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "fix_started".to_string(),
+            source: Some("linear".to_string()),
+            issue_id: Some("ISS-2".to_string()),
+            short_id: Some("L-2".to_string()),
+            message: "Other fix".to_string(),
+            metadata: None,
+        };
+        tracker.record_activity(&entry2).unwrap();
+
+        // Different source, same issue_id
+        let entry3 = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "fix_started".to_string(),
+            source: Some("sentry".to_string()),
+            issue_id: Some("ISS-1".to_string()),
+            short_id: Some("S-1".to_string()),
+            message: "Sentry fix".to_string(),
+            metadata: None,
+        };
+        tracker.record_activity(&entry3).unwrap();
+
+        let activities = tracker.get_activities_for_issue("linear", "ISS-1").unwrap();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].message, "Started fix");
+    }
+
+    #[test]
+    fn test_get_activities_for_issue_returns_empty_for_nonexistent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let activities = tracker
+            .get_activities_for_issue("linear", "nonexistent")
+            .unwrap();
+        assert!(activities.is_empty());
+    }
+
+    // --- find_similar_issues_vector (without vectorlite) ---
+
+    #[test]
+    fn test_find_similar_issues_vector_empty_embedding() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker
+            .find_similar_issues_vector(&[], "linear", None, 0.5, 10)
+            .unwrap();
+        // Empty embedding should return Some(empty vec)
+        assert!(result.is_some());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_find_similar_issues_vector_zero_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker
+            .find_similar_issues_vector(&[0.1, 0.2, 0.3], "linear", None, 0.5, 0)
+            .unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().is_empty());
+    }
+
+    // --- find_similar_outcomes_vector (without vectorlite) ---
+
+    #[test]
+    fn test_find_similar_outcomes_vector_empty_embedding() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker.find_similar_outcomes_vector(&[], 0.5, 10).unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_find_similar_outcomes_vector_zero_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker
+            .find_similar_outcomes_vector(&[0.1, 0.2], 0.5, 0)
+            .unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().is_empty());
+    }
+
+    // --- generate_session_token ---
+
+    #[test]
+    fn test_generate_session_token_length_and_uniqueness() {
+        let t1 = generate_session_token();
+        let t2 = generate_session_token();
+        // 32 bytes => 64 hex chars
+        assert_eq!(t1.len(), 64);
+        assert_eq!(t2.len(), 64);
+        // Tokens should be unique
+        assert_ne!(t1, t2);
+        // Should be valid hex
+        assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // --- record_release_tracking (edge case: no released_at) ---
+
+    #[test]
+    fn test_record_release_tracking_no_released_at() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a regression watch first
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
+        let watch = crate::types::RegressionWatch {
+            id: 0,
+            issue_type: crate::types::IssueType::SentryIssue,
+            issue_id: "1".to_string(),
+            fix_attempt_id: attempt.id,
+            status: crate::types::RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: Utc::now(),
+        };
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+
+        let tracking = crate::types::ReleaseTracking {
+            id: 0,
+            regression_watch_id: watch_id,
+            release_version: "v1.0.0".to_string(),
+            release_commit: "abc123".to_string(),
+            released_at: None, // No release date
+            created_at: Utc::now(),
+        };
+        let id = tracker.record_release_tracking(&tracking).unwrap();
+        assert!(id > 0);
+    }
+
+    // --- store_embeddings_batch with actual data ---
+
+    #[test]
+    fn test_store_embeddings_batch_with_embeddings() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let emb1 = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "1".to_string(),
+            short_id: Some("L-1".to_string()),
+            title: Some("Bug 1".to_string()),
+            description: None,
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            embedding: Some(vec![0.1, 0.2, 0.3]),
+            embedding_model: Some("test-model".to_string()),
+            created_at: Utc::now(),
+            updated_at: None,
+        };
+        let emb2 = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "2".to_string(),
+            short_id: Some("L-2".to_string()),
+            title: Some("Bug 2".to_string()),
+            description: Some("Desc".to_string()),
+            url: Some("https://example.com".to_string()),
+            priority: Some("high".to_string()),
+            status: Some("open".to_string()),
+            labels: Some("bug,critical".to_string()),
+            embedding: Some(vec![0.4, 0.5, 0.6]),
+            embedding_model: Some("test-model".to_string()),
+            created_at: Utc::now(),
+            updated_at: Some(Utc::now()),
+        };
+
+        tracker.store_embeddings_batch(&[emb1, emb2]).unwrap();
+
+        // Verify both were stored
+        let e1 = tracker.get_embedding("linear", "1").unwrap().unwrap();
+        assert_eq!(e1.title, Some("Bug 1".to_string()));
+        let e2 = tracker.get_embedding("linear", "2").unwrap().unwrap();
+        assert_eq!(e2.title, Some("Bug 2".to_string()));
+        assert_eq!(e2.description.as_deref(), Some("Desc"));
+    }
+
+    // --- list_issues (tested indirectly but let's test count_issues with source) ---
+
+    #[test]
+    fn test_count_issues_no_data() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let count = tracker.count_issues(None).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // --- get_success_rate with mixed outcomes ---
+
+    #[test]
+    fn test_get_success_rate_with_data() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create 3 attempts: 1 merged, 1 failed, 1 pending
+        // get_success_rate = (success + merged) / total = 1/3
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        tracker
+            .mark_success("linear", "1", "https://github.com/o/r/pull/1")
+            .unwrap();
+        tracker.mark_merged("linear", "1").unwrap();
+
+        tracker.record_attempt("linear", "2", "L-2").unwrap();
+        tracker.mark_failed("linear", "2", "error").unwrap();
+
+        tracker.record_attempt("linear", "3", "L-3").unwrap();
+
+        let rate = tracker.get_success_rate().unwrap();
+        // merged=1 out of total=3 => 1/3 ~ 0.333
+        assert!((rate - 1.0 / 3.0).abs() < 0.01);
+    }
+
+    // --- record_metrics_batch edge case ---
+
+    #[test]
+    fn test_record_metrics_batch_with_tags() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let metric = ProcessingMetric {
+            id: 0,
+            metric_name: "test_metric".to_string(),
+            metric_value: 42.5,
+            source: Some("linear".to_string()),
+            timestamp: Utc::now(),
+            tags: Some(serde_json::json!({"key": "val"})),
+        };
+
+        let count = tracker.record_metrics_batch(&[metric]).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    // --- subscribe_indexing_progress ---
+
+    #[test]
+    fn test_subscribe_indexing_progress_returns_receiver() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let rx = tracker.subscribe_indexing_progress();
+        // Should have the default value
+        let progress = rx.borrow().clone();
+        assert_eq!(progress.status, "idle");
     }
 }

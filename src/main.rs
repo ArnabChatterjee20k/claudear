@@ -27,7 +27,9 @@ use claudear::{
         DiscordSource, IssueSource, JiraSource, LinearSource, SentrySource, SlackSource,
         TelegramSource, WhatsAppSource,
     },
-    storage::{FixAttemptTracker, SqliteTracker},
+    storage::{
+        ActivityStore, EmbeddingStore, FixAttemptTracker, RepoStore, SqliteTracker, UserStore,
+    },
     telemetry::{InstrumentedNotifier, InstrumentedRunner, InstrumentedScm, InstrumentedSource},
     types::{ActivityLogEntry, FixAttemptStatus, Issue},
     users::UserRegistry,
@@ -210,6 +212,24 @@ enum Commands {
     /// User management commands
     #[command(subcommand)]
     Users(UsersCommands),
+
+    /// Interactive chat about indexed code
+    Chat {
+        /// Question to ask (omit for interactive REPL mode)
+        question: Option<String>,
+
+        /// Repository to scope the search to
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Model override (path to .gguf file)
+        #[arg(long)]
+        model: Option<std::path::PathBuf>,
+
+        /// Download the configured model if not present on disk
+        #[arg(long)]
+        download_model: bool,
+    },
 }
 
 /// Repository management subcommands
@@ -295,6 +315,13 @@ enum ReposCommands {
         /// Skip syncing file lists (faster but limits inference accuracy)
         #[arg(long, default_value = "false")]
         skip_files: bool,
+    },
+
+    /// Force re-index code embeddings for all (or specific) repositories
+    Reindex {
+        /// Only re-index a specific repository (e.g., "org/repo")
+        #[arg(long)]
+        repo: Option<String>,
     },
 }
 
@@ -1305,14 +1332,16 @@ fn start_regression_monitoring(
 fn main() -> anyhow::Result<()> {
     // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
     let _sentry_guard = sentry::init((
-        std::env::var("SENTRY_DSN").unwrap_or_default(),
+        std::env::var("CLAUDEAR_SENTRY_DSN").unwrap_or_default(),
         sentry::ClientOptions {
-            release: std::env::var("SENTRY_RELEASE")
+            release: std::env::var("CLAUDEAR_SENTRY_RELEASE")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(Into::into)
                 .or_else(|| sentry::release_name!()),
-            environment: std::env::var("SENTRY_ENVIRONMENT").ok().map(Into::into),
+            environment: std::env::var("CLAUDEAR_SENTRY_ENVIRONMENT")
+                .ok()
+                .map(Into::into),
             traces_sample_rate: 0.2,
             ..Default::default()
         },
@@ -1919,6 +1948,71 @@ async fn async_main() -> anyhow::Result<()> {
                 }
             }
 
+            ReposCommands::Reindex { repo } => {
+                use claudear::feedback::{EmbeddingClient, EmbeddingConfig};
+                use claudear::repo::code_index::CodeIndexer;
+                use claudear::repo::RepoIndex;
+
+                if !config.code_index.enabled {
+                    anyhow::bail!(
+                        "Code indexing is disabled in config (code_index.enabled = false)"
+                    );
+                }
+
+                let emb_client = Arc::new(EmbeddingClient::new(EmbeddingConfig::default())?);
+                let tracker: Arc<dyn claudear::storage::FixAttemptTracker> =
+                    Arc::new(SqliteTracker::new(&config.db_path)?);
+
+                let code_indexer = CodeIndexer::with_config(
+                    tracker.clone(),
+                    emb_client,
+                    config.code_index.max_file_size_kb,
+                    config.code_index.batch_size,
+                )
+                .with_force_reindex(true);
+
+                // Collect repos to reindex
+                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                let repos: Vec<_> = index
+                    .list()
+                    .into_iter()
+                    .filter(|r| r.path.exists())
+                    .filter(|r| repo.as_ref().is_none_or(|name| &r.name == name))
+                    .collect();
+
+                if repos.is_empty() {
+                    if let Some(name) = &repo {
+                        anyhow::bail!("Repository '{}' not found in index", name);
+                    }
+                    println!("No repositories found to reindex.");
+                    return Ok(());
+                }
+
+                println!(
+                    "\nForce re-indexing {} repositories (all existing embeddings will be regenerated)...",
+                    repos.len()
+                );
+
+                for r in &repos {
+                    print!("  {} ... ", r.name);
+                    match code_indexer.index_repo(&r.name, &r.path).await {
+                        Ok(stats) => {
+                            println!(
+                                "{} files, {} chunks, {} embeddings",
+                                stats.files_processed,
+                                stats.chunks_created,
+                                stats.embeddings_generated
+                            );
+                        }
+                        Err(e) => {
+                            println!("FAILED: {}", e);
+                        }
+                    }
+                }
+
+                println!("\nDone.");
+            }
+
             ReposCommands::Sync { skip_files } => {
                 use claudear::repo::RepoIndex;
 
@@ -2356,6 +2450,231 @@ async fn async_main() -> anyhow::Result<()> {
                     None => {
                         let id = db_tracker.create_user(email, &hash, name, "admin")?;
                         println!("Created admin user '{}' (id={})", email, id);
+                    }
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Handle Chat command early
+    if let Commands::Chat {
+        ref question,
+        ref repo,
+        ref model,
+        download_model,
+    } = cli.command
+    {
+        let db_tracker = Arc::new(SqliteTracker::new(&config.db_path)?);
+
+        // Apply model override if provided
+        let mut chat_config = config.chat.clone();
+        if let Some(model_path) = model {
+            chat_config.model_path = model_path.clone();
+        }
+
+        // Download model if requested and not present
+        if download_model {
+            let target = claudear::chat::service::expand_tilde(&chat_config.model_path);
+            if !target.exists() {
+                use std::sync::Arc as StdArc;
+                let progress = StdArc::new(claudear::chat::models::DownloadProgress::new());
+                let progress_clone = progress.clone();
+                let url = chat_config.model_url.clone();
+                let target_clone = target.clone();
+
+                println!("Downloading model to {}...", target.display());
+                let pb = indicatif::ProgressBar::new(0);
+                pb.set_style(
+                    indicatif::ProgressStyle::default_bar()
+                        .template(
+                            "{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+                        )
+                        .unwrap()
+                        .progress_chars("#>-"),
+                );
+
+                let download_handle = tokio::spawn(async move {
+                    claudear::chat::models::download::download_gguf(
+                        &url,
+                        &target_clone,
+                        progress_clone,
+                    )
+                    .await
+                });
+
+                // Poll progress
+                loop {
+                    let downloaded = progress
+                        .downloaded_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let total = progress
+                        .total_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if total > 0 {
+                        pb.set_length(total);
+                    }
+                    pb.set_position(downloaded);
+
+                    if progress
+                        .completed
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        pb.finish_with_message("Download complete");
+                        break;
+                    }
+                    if progress.failed.load(std::sync::atomic::Ordering::Relaxed) {
+                        pb.abandon_with_message("Download failed");
+                        let err = progress
+                            .error_message
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.clone())
+                            .unwrap_or_else(|| "Unknown error".to_string());
+                        eprintln!("Error: {err}");
+                        std::process::exit(1);
+                    }
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+
+                download_handle.await?.map_err(|e| anyhow::anyhow!(e))?;
+                println!();
+            } else {
+                println!("Model already exists at {}", target.display());
+            }
+        }
+
+        // Build embedding client for code search
+        let (_, embedding_client) =
+            claudear::watcher::Watcher::build_inferrer_with_embeddings(&config, None).await?;
+
+        let embedding_client = embedding_client.ok_or_else(|| {
+            anyhow::anyhow!("Embedding client required for chat. Ensure code_index is enabled.")
+        })?;
+
+        let code_search = claudear::repo::code_index::CodeSearchService::new(
+            db_tracker.clone(),
+            embedding_client,
+        );
+
+        let chat_service =
+            claudear::chat::ChatService::new(chat_config, code_search, db_tracker.clone());
+
+        // Resolve repo_id if repo name given
+        let repo_id = if let Some(repo_name) = repo {
+            db_tracker.get_indexed_repo(repo_name)?.map(|r| r.id)
+        } else {
+            None
+        };
+
+        if let Some(q) = question {
+            // One-shot mode
+            let session_id = uuid::Uuid::new_v4().to_string();
+            match chat_service.chat(&session_id, q, repo_id, None).await {
+                Ok((tokens, sources)) => {
+                    // Print streaming tokens
+                    for token in &tokens {
+                        print!("{}", token);
+                    }
+                    println!();
+
+                    // Print sources
+                    if !sources.is_empty() {
+                        println!();
+                        println!("Sources:");
+                        for src in &sources {
+                            let symbol = src
+                                .symbol_name
+                                .as_deref()
+                                .map(|s| format!(" ({s})"))
+                                .unwrap_or_default();
+                            println!(
+                                "  {}:{}-{}{} ({:.0}%)",
+                                src.file_path,
+                                src.start_line,
+                                src.end_line,
+                                symbol,
+                                src.similarity * 100.0
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            // Interactive REPL mode
+            println!("Claudear Code Chat (type /quit to exit, /clear to reset session)");
+            if let Some(ref r) = repo {
+                println!("Repository: {r}");
+            }
+            println!();
+
+            let mut session_id = uuid::Uuid::new_v4().to_string();
+            let stdin = std::io::stdin();
+            let mut show_sources = true;
+
+            loop {
+                use std::io::Write;
+                print!("> ");
+                std::io::stdout().flush()?;
+
+                let mut input = String::new();
+                if stdin.read_line(&mut input)? == 0 {
+                    break; // EOF
+                }
+
+                let input = input.trim();
+                if input.is_empty() {
+                    continue;
+                }
+
+                match input {
+                    "/quit" | "/exit" => break,
+                    "/clear" => {
+                        session_id = uuid::Uuid::new_v4().to_string();
+                        println!("Session cleared.");
+                        continue;
+                    }
+                    "/sources" => {
+                        show_sources = !show_sources;
+                        println!(
+                            "Source display: {}",
+                            if show_sources { "on" } else { "off" }
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                match chat_service.chat(&session_id, input, repo_id, None).await {
+                    Ok((tokens, sources)) => {
+                        println!();
+                        for token in &tokens {
+                            print!("{}", token);
+                        }
+                        println!();
+
+                        if show_sources && !sources.is_empty() {
+                            println!();
+                            for src in &sources {
+                                println!(
+                                    "  [{:.0}%] {}:{}-{}",
+                                    src.similarity * 100.0,
+                                    src.file_path,
+                                    src.start_line,
+                                    src.end_line,
+                                );
+                            }
+                        }
+                        println!();
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
                     }
                 }
             }
@@ -3439,7 +3758,8 @@ async fn async_main() -> anyhow::Result<()> {
                 | Commands::Repos(_)
                 | Commands::Inference(_)
                 | Commands::Diag(_)
-                | Commands::Users(_) => unreachable!(),
+                | Commands::Users(_)
+                | Commands::Chat { .. } => unreachable!(),
             }
         }
     }

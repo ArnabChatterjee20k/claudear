@@ -377,6 +377,12 @@ pub struct Config {
     /// Dashboard display configuration.
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// Local code chat configuration.
+    #[serde(default)]
+    pub chat: ChatConfig,
+    /// TLS auto-provisioning configuration (Let's Encrypt ACME).
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -399,6 +405,90 @@ impl Default for DashboardConfig {
         Self {
             max_plan_monthly_cost: 0.0,
             hourly_engineer_rate: 75.0,
+        }
+    }
+}
+
+/// Local code chat configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// Enable the chat feature.
+    pub enabled: bool,
+    /// Path to the GGUF model file.
+    pub model_path: PathBuf,
+    /// Context window length (tokens).
+    pub context_length: u32,
+    /// Number of layers to offload to GPU (0 = CPU only, 99 = all).
+    pub gpu_layers: u32,
+    /// Inference threads (0 = auto-detect).
+    pub threads: u32,
+    /// Default generation temperature.
+    pub temperature: f32,
+    /// Default top-p sampling.
+    pub top_p: f32,
+    /// Maximum tokens to generate per response.
+    pub max_tokens: u32,
+    /// Number of code chunks to retrieve per query.
+    pub max_context_chunks: usize,
+    /// Maximum conversation history messages to include in context.
+    pub max_history_messages: usize,
+    /// Session TTL in days (cleaned by housekeeping).
+    pub session_ttl_days: u32,
+    /// Default URL for downloading a GGUF model file.
+    pub model_url: String,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: PathBuf::from("~/.cache/claudear/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"),
+            context_length: 4096,
+            gpu_layers: 99,
+            threads: 0,
+            temperature: 0.7,
+            top_p: 0.9,
+            max_tokens: 2048,
+            max_context_chunks: 10,
+            max_history_messages: 20,
+            session_ttl_days: 7,
+            model_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf".to_string(),
+        }
+    }
+}
+
+/// TLS auto-provisioning configuration (Let's Encrypt ACME).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Enable automatic TLS certificate provisioning.
+    pub enabled: bool,
+    /// Domain names to provision certificates for (required when enabled).
+    #[serde(default, deserialize_with = "string_or_vec")]
+    pub domains: Vec<String>,
+    /// Contact email for Let's Encrypt notifications.
+    pub email: Option<String>,
+    /// Use Let's Encrypt production environment (default: false = staging).
+    pub production: bool,
+    /// Directory for caching ACME certificates (survives restarts).
+    pub cache_dir: PathBuf,
+    /// HTTPS port (default: 443).
+    pub https_port: u16,
+    /// HTTP port for HTTP→HTTPS redirect (default: 80, set to 0 to disable).
+    pub http_redirect_port: u16,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domains: Vec::new(),
+            email: None,
+            production: false,
+            cache_dir: PathBuf::from("./acme_cache"),
+            https_port: 443,
+            http_redirect_port: 80,
         }
     }
 }
@@ -433,6 +523,8 @@ impl Default for Config {
             evaluation: EvaluationConfig::default(),
             storage_dir: default_storage_dir(),
             dashboard: DashboardConfig::default(),
+            chat: ChatConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -625,6 +717,9 @@ pub struct CodeIndexConfig {
     pub max_file_size_kb: u64,
     /// Embedding batch size.
     pub batch_size: usize,
+    /// How often (in hours) to pull and re-index all repositories.
+    /// Set to 0 to disable periodic re-indexing.
+    pub reindex_interval_hours: f64,
 }
 
 impl Default for CodeIndexConfig {
@@ -633,6 +728,7 @@ impl Default for CodeIndexConfig {
             enabled: true,
             max_file_size_kb: 1024,
             batch_size: 32,
+            reindex_interval_hours: 6.0,
         }
     }
 }
@@ -1724,63 +1820,69 @@ impl Config {
     /// Environment variables take precedence over TOML values.
     fn apply_env_overrides(&mut self) {
         // Core settings
-        if let Ok(v) = env::var("WORKSPACE") {
+        if let Ok(v) = env::var("CLAUDEAR_WORKSPACE") {
             if !v.is_empty() {
                 self.workspace = v.into();
             }
         }
-        if let Ok(v) = env::var("KNOWN_ORGS") {
+        if let Ok(v) = env::var("CLAUDEAR_KNOWN_ORGS") {
             if !v.is_empty() {
                 self.known_orgs = v.split(',').map(|s| s.trim().to_string()).collect();
             }
         }
-        if let Ok(v) = env::var("AUTO_DISCOVER_PATHS") {
+        if let Ok(v) = env::var("CLAUDEAR_AUTO_DISCOVER_PATHS") {
             if !v.is_empty() {
                 self.auto_discover_paths = v.split(',').map(|s| s.trim().to_string()).collect();
             }
         }
-        if let Some(v) = env::var("POLL_INTERVAL_MS")
+        if let Some(v) = env::var("CLAUDEAR_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.poll_interval_ms = v;
         }
-        if let Some(v) = env::var("WEBHOOK_PORT").ok().and_then(|v| v.parse().ok()) {
+        if let Some(v) = env::var("CLAUDEAR_WEBHOOK_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             self.webhook_port = v;
         }
-        if let Ok(v) = env::var("DB_PATH") {
+        if let Ok(v) = env::var("CLAUDEAR_DB_PATH") {
             if !v.is_empty() {
                 self.db_path = v.into();
             }
         }
-        if let Some(v) = env::var("MAX_ISSUES_PER_CYCLE")
+        if let Some(v) = env::var("CLAUDEAR_MAX_ISSUES_PER_CYCLE")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.max_issues_per_cycle = v;
         }
-        if let Some(v) = env::var("MAX_CONCURRENT").ok().and_then(|v| v.parse().ok()) {
+        if let Some(v) = env::var("CLAUDEAR_MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             self.max_concurrent = v;
         }
-        if let Some(v) = env::var("PROCESSING_DELAY_MS")
+        if let Some(v) = env::var("CLAUDEAR_PROCESSING_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.processing_delay_ms = v;
         }
-        if let Some(v) = env::var("MAX_ACTIVITY_ENTRIES")
+        if let Some(v) = env::var("CLAUDEAR_MAX_ACTIVITY_ENTRIES")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.max_activity_entries = v;
         }
-        if let Some(v) = env::var("IPC_TIMEOUT_SECS")
+        if let Some(v) = env::var("CLAUDEAR_IPC_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.ipc_timeout_secs = v;
         }
-        if let Some(v) = env::var("CLAUDE_TIMEOUT_SECS")
+        if let Some(v) = env::var("CLAUDEAR_CLAUDE_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
@@ -1788,41 +1890,41 @@ impl Config {
         }
 
         // Agent provider (Claude) CLI -- env vars write into the default provider.
-        if let Ok(v) = env::var("CLAUDE_MODEL") {
+        if let Ok(v) = env::var("CLAUDEAR_CLAUDE_MODEL") {
             if !v.is_empty() {
                 self.agent.default_provider_config_mut().model = Some(v);
             }
         }
-        if let Ok(v) = env::var("CLAUDE_INSTRUCTIONS") {
+        if let Ok(v) = env::var("CLAUDEAR_CLAUDE_INSTRUCTIONS") {
             if !v.is_empty() {
                 self.agent.default_provider_config_mut().instructions = Some(v);
             }
         }
-        if let Ok(v) = env::var("CLAUDE_INSTRUCTIONS_FILE") {
+        if let Ok(v) = env::var("CLAUDEAR_CLAUDE_INSTRUCTIONS_FILE") {
             if !v.is_empty() {
                 self.agent.default_provider_config_mut().instructions_file = Some(v);
             }
         }
-        if let Ok(v) = env::var("CLAUDE_PERMISSIONS") {
+        if let Ok(v) = env::var("CLAUDEAR_CLAUDE_PERMISSIONS") {
             if !v.is_empty() {
                 self.agent.default_provider_config_mut().permissions =
                     v.split(',').map(|s| s.trim().to_string()).collect();
             }
         }
-        if let Ok(v) = env::var("CLAUDE_SKIP_PERMISSIONS") {
+        if let Ok(v) = env::var("CLAUDEAR_CLAUDE_SKIP_PERMISSIONS") {
             self.agent.default_provider_config_mut().skip_permissions =
                 v.to_lowercase() == "true" || v == "1";
         }
 
         // Discord notifier
-        if let Ok(v) = env::var("DISCORD_WEBHOOK_URL") {
+        if let Ok(v) = env::var("CLAUDEAR_DISCORD_WEBHOOK_URL") {
             self.notifiers.discord.webhook_url =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("DISCORD_USER_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_DISCORD_USER_ID") {
             self.notifiers.discord.user_id = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("DISCORD_BOT_TOKEN") {
+        if let Ok(v) = env::var("CLAUDEAR_DISCORD_BOT_TOKEN") {
             // Set on both notifier and source
             let val = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
             self.notifiers.discord.bot_token = val.clone();
@@ -1830,14 +1932,14 @@ impl Config {
                 src.bot_token = val;
             }
         }
-        if let Ok(v) = env::var("DISCORD_CHANNEL_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_DISCORD_CHANNEL_ID") {
             let val = Some(v).filter(|s| !s.is_empty());
             self.notifiers.discord.channel_id = val.clone();
             if let Some(ref mut src) = self.issues.discord {
                 src.channel_id = val;
             }
         }
-        if let Ok(v) = env::var("DISCORD_SOURCE_ENABLED") {
+        if let Ok(v) = env::var("CLAUDEAR_DISCORD_SOURCE_ENABLED") {
             if v == "true" || v == "1" {
                 let src = self
                     .issues
@@ -1848,20 +1950,20 @@ impl Config {
                 self.issues.discord = None;
             }
         }
-        if let Ok(v) = env::var("DISCORD_LISTEN_CHANNEL_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_DISCORD_LISTEN_CHANNEL_ID") {
             let val = Some(v).filter(|s| !s.is_empty());
             if let Some(ref mut src) = self.issues.discord {
                 src.listen_channel_id = val;
             }
         }
-        if let Ok(v) = env::var("DISCORD_GUILD_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_DISCORD_GUILD_ID") {
             let val = Some(v).filter(|s| !s.is_empty());
             self.notifiers.discord.guild_id = val.clone();
             if let Some(ref mut src) = self.issues.discord {
                 src.guild_id = val;
             }
         }
-        if let Some(v) = env::var("DISCORD_POLL_INTERVAL_MS")
+        if let Some(v) = env::var("CLAUDEAR_DISCORD_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
@@ -1871,32 +1973,32 @@ impl Config {
         }
 
         // Slack notifier
-        if let Ok(v) = env::var("SLACK_BOT_TOKEN") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_BOT_TOKEN") {
             let val = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
             self.notifiers.slack.bot_token = val.clone();
             if let Some(ref mut src) = self.issues.slack {
                 src.bot_token = val;
             }
         }
-        if let Ok(v) = env::var("SLACK_CHANNEL_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_CHANNEL_ID") {
             let val = Some(v).filter(|s| !s.is_empty());
             self.notifiers.slack.channel_id = val.clone();
             if let Some(ref mut src) = self.issues.slack {
                 src.channel_id = val;
             }
         }
-        if let Ok(v) = env::var("SLACK_WEBHOOK_URL") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_WEBHOOK_URL") {
             self.notifiers.slack.webhook_url =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("SLACK_USER_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_USER_ID") {
             let val = Some(v).filter(|s| !s.is_empty());
             self.notifiers.slack.user_id = val.clone();
             if let Some(ref mut src) = self.issues.slack {
                 src.user_id = val;
             }
         }
-        if let Ok(v) = env::var("SLACK_SOURCE_ENABLED") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_SOURCE_ENABLED") {
             if v == "true" || v == "1" {
                 let src = self
                     .issues
@@ -1907,35 +2009,35 @@ impl Config {
                 self.issues.slack = None;
             }
         }
-        if let Ok(v) = env::var("SLACK_LISTEN_CHANNEL_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_LISTEN_CHANNEL_ID") {
             let val = Some(v).filter(|s| !s.is_empty());
             if let Some(ref mut src) = self.issues.slack {
                 src.listen_channel_id = val;
             }
         }
-        if let Ok(v) = env::var("SLACK_WORKSPACE") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_WORKSPACE") {
             let val = Some(v).filter(|s| !s.is_empty());
             self.notifiers.slack.workspace = val.clone();
             if let Some(ref mut src) = self.issues.slack {
                 src.workspace = val;
             }
         }
-        if let Ok(v) = env::var("SLACK_SIGNING_SECRET") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_SIGNING_SECRET") {
             if let Some(ref mut src) = self.issues.slack {
                 src.signing_secret = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
             }
         }
-        if let Ok(v) = env::var("SLACK_APP_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_APP_ID") {
             if let Some(ref mut src) = self.issues.slack {
                 src.app_id = Some(v).filter(|s| !s.is_empty());
             }
         }
-        if let Ok(v) = env::var("SLACK_APP_CONFIG_TOKEN") {
+        if let Ok(v) = env::var("CLAUDEAR_SLACK_APP_CONFIG_TOKEN") {
             if let Some(ref mut src) = self.issues.slack {
                 src.app_config_token = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
             }
         }
-        if let Some(v) = env::var("SLACK_POLL_INTERVAL_MS")
+        if let Some(v) = env::var("CLAUDEAR_SLACK_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
@@ -1945,37 +2047,37 @@ impl Config {
         }
 
         // WhatsApp notifier/source
-        if let Ok(v) = env::var("WHATSAPP_PHONE_NUMBER_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_WHATSAPP_PHONE_NUMBER_ID") {
             self.notifiers.whatsapp.phone_number_id = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("WHATSAPP_ACCESS_TOKEN") {
+        if let Ok(v) = env::var("CLAUDEAR_WHATSAPP_ACCESS_TOKEN") {
             self.notifiers.whatsapp.access_token =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("WHATSAPP_BUSINESS_ACCOUNT_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_WHATSAPP_BUSINESS_ACCOUNT_ID") {
             self.notifiers.whatsapp.business_account_id = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("WHATSAPP_APP_SECRET") {
+        if let Ok(v) = env::var("CLAUDEAR_WHATSAPP_APP_SECRET") {
             self.notifiers.whatsapp.app_secret =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("WHATSAPP_WEBHOOK_VERIFY_TOKEN") {
+        if let Ok(v) = env::var("CLAUDEAR_WHATSAPP_WEBHOOK_VERIFY_TOKEN") {
             self.notifiers.whatsapp.webhook_verify_token =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("WHATSAPP_TO_NUMBERS") {
+        if let Ok(v) = env::var("CLAUDEAR_WHATSAPP_TO_NUMBERS") {
             if !v.is_empty() {
                 self.notifiers.whatsapp.to_numbers =
                     v.split(',').map(|s| s.trim().to_string()).collect();
             }
         }
-        if let Ok(v) = env::var("WHATSAPP_SOURCE_ENABLED") {
+        if let Ok(v) = env::var("CLAUDEAR_WHATSAPP_SOURCE_ENABLED") {
             self.notifiers.whatsapp.source_enabled = v.to_lowercase() == "true" || v == "1";
         }
-        if let Ok(v) = env::var("WHATSAPP_LISTEN_PHONE_NUMBER_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_WHATSAPP_LISTEN_PHONE_NUMBER_ID") {
             self.notifiers.whatsapp.listen_phone_number_id = Some(v).filter(|s| !s.is_empty());
         }
-        if let Some(v) = env::var("WHATSAPP_POLL_INTERVAL_MS")
+        if let Some(v) = env::var("CLAUDEAR_WHATSAPP_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
@@ -1983,26 +2085,26 @@ impl Config {
         }
 
         // Telegram notifier/source
-        if let Ok(v) = env::var("TELEGRAM_BOT_TOKEN") {
+        if let Ok(v) = env::var("CLAUDEAR_TELEGRAM_BOT_TOKEN") {
             self.notifiers.telegram.bot_token =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("TELEGRAM_CHAT_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_TELEGRAM_CHAT_ID") {
             self.notifiers.telegram.chat_id = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("TELEGRAM_TO_CHAT_IDS") {
+        if let Ok(v) = env::var("CLAUDEAR_TELEGRAM_TO_CHAT_IDS") {
             if !v.is_empty() {
                 self.notifiers.telegram.to_chat_ids =
                     v.split(',').map(|s| s.trim().to_string()).collect();
             }
         }
-        if let Ok(v) = env::var("TELEGRAM_SOURCE_ENABLED") {
+        if let Ok(v) = env::var("CLAUDEAR_TELEGRAM_SOURCE_ENABLED") {
             self.notifiers.telegram.source_enabled = v.to_lowercase() == "true" || v == "1";
         }
-        if let Ok(v) = env::var("TELEGRAM_LISTEN_CHAT_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_TELEGRAM_LISTEN_CHAT_ID") {
             self.notifiers.telegram.listen_chat_id = Some(v).filter(|s| !s.is_empty());
         }
-        if let Some(v) = env::var("TELEGRAM_POLL_INTERVAL_MS")
+        if let Some(v) = env::var("CLAUDEAR_TELEGRAM_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
@@ -2010,105 +2112,114 @@ impl Config {
         }
 
         // Email
-        if let Ok(v) = env::var("SMTP_HOST") {
+        if let Ok(v) = env::var("CLAUDEAR_SMTP_HOST") {
             self.notifiers.email.smtp_host = Some(v).filter(|s| !s.is_empty());
         }
-        if let Some(v) = env::var("SMTP_PORT").ok().and_then(|v| v.parse().ok()) {
+        if let Some(v) = env::var("CLAUDEAR_SMTP_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             self.notifiers.email.smtp_port = v;
         }
-        if let Ok(v) = env::var("SMTP_USERNAME") {
+        if let Ok(v) = env::var("CLAUDEAR_SMTP_USERNAME") {
             self.notifiers.email.smtp_username = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("SMTP_PASSWORD") {
+        if let Ok(v) = env::var("CLAUDEAR_SMTP_PASSWORD") {
             self.notifiers.email.smtp_password =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("EMAIL_FROM") {
+        if let Ok(v) = env::var("CLAUDEAR_EMAIL_FROM") {
             self.notifiers.email.from_address = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("EMAIL_TO") {
+        if let Ok(v) = env::var("CLAUDEAR_EMAIL_TO") {
             if !v.is_empty() {
                 self.notifiers.email.to_addresses =
                     v.split(',').map(|s| s.trim().to_string()).collect();
             }
         }
-        if let Ok(v) = env::var("SMTP_TLS") {
+        if let Ok(v) = env::var("CLAUDEAR_SMTP_TLS") {
             self.notifiers.email.use_tls = v.to_lowercase() == "true" || v == "1";
         }
-        if let Ok(v) = env::var("IMAP_HOST") {
+        if let Ok(v) = env::var("CLAUDEAR_IMAP_HOST") {
             self.notifiers.email.imap_host = Some(v).filter(|s| !s.is_empty());
         }
-        if let Some(v) = env::var("IMAP_PORT").ok().and_then(|v| v.parse().ok()) {
+        if let Some(v) = env::var("CLAUDEAR_IMAP_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             self.notifiers.email.imap_port = v;
         }
-        if let Ok(v) = env::var("IMAP_USERNAME") {
+        if let Ok(v) = env::var("CLAUDEAR_IMAP_USERNAME") {
             self.notifiers.email.imap_username = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("IMAP_PASSWORD") {
+        if let Ok(v) = env::var("CLAUDEAR_IMAP_PASSWORD") {
             self.notifiers.email.imap_password =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("IMAP_TLS") {
+        if let Ok(v) = env::var("CLAUDEAR_IMAP_TLS") {
             self.notifiers.email.imap_use_tls = v.to_lowercase() == "true" || v == "1";
         }
-        if let Ok(v) = env::var("IMAP_FOLDER") {
+        if let Ok(v) = env::var("CLAUDEAR_IMAP_FOLDER") {
             if !v.is_empty() {
                 self.notifiers.email.imap_folder = v;
             }
         }
 
         // Ask loop
-        if let Ok(v) = env::var("ASK_ENABLED") {
+        if let Ok(v) = env::var("CLAUDEAR_ASK_ENABLED") {
             self.ask.enabled = v.to_lowercase() == "true" || v == "1";
         }
-        if let Some(v) = env::var("ASK_WAIT_TIMEOUT_SECS")
+        if let Some(v) = env::var("CLAUDEAR_ASK_WAIT_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.ask.wait_timeout_secs = v;
         }
-        if let Some(v) = env::var("ASK_POLL_INTERVAL_SECS")
+        if let Some(v) = env::var("CLAUDEAR_ASK_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.ask.poll_interval_secs = v;
         }
-        if let Some(v) = env::var("ASK_MAX_ROUNDS").ok().and_then(|v| v.parse().ok()) {
+        if let Some(v) = env::var("CLAUDEAR_ASK_MAX_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             self.ask.max_rounds_per_attempt = v;
         }
-        if let Some(v) = env::var("ASK_SEMANTIC_THRESHOLD_SCOPED")
+        if let Some(v) = env::var("CLAUDEAR_ASK_SEMANTIC_THRESHOLD_SCOPED")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.ask.semantic_threshold_scoped = v;
         }
-        if let Some(v) = env::var("ASK_SEMANTIC_THRESHOLD_GLOBAL")
+        if let Some(v) = env::var("CLAUDEAR_ASK_SEMANTIC_THRESHOLD_GLOBAL")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.ask.semantic_threshold_global = v;
         }
-        if let Some(v) = env::var("ASK_MAX_REUSE_CANDIDATES")
+        if let Some(v) = env::var("CLAUDEAR_ASK_MAX_REUSE_CANDIDATES")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.ask.max_reuse_candidates = v;
         }
-        if let Ok(v) = env::var("ASK_BEST_EFFORT_ON_TIMEOUT") {
+        if let Ok(v) = env::var("CLAUDEAR_ASK_BEST_EFFORT_ON_TIMEOUT") {
             self.ask.best_effort_on_timeout = v.to_lowercase() == "true" || v == "1";
         }
 
         // SMS
-        if let Ok(v) = env::var("TWILIO_ACCOUNT_SID") {
+        if let Ok(v) = env::var("CLAUDEAR_TWILIO_ACCOUNT_SID") {
             self.notifiers.sms.account_sid = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("TWILIO_AUTH_TOKEN") {
+        if let Ok(v) = env::var("CLAUDEAR_TWILIO_AUTH_TOKEN") {
             self.notifiers.sms.auth_token = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("TWILIO_FROM_NUMBER") {
+        if let Ok(v) = env::var("CLAUDEAR_TWILIO_FROM_NUMBER") {
             self.notifiers.sms.from_number = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("TWILIO_TO_NUMBERS") {
+        if let Ok(v) = env::var("CLAUDEAR_TWILIO_TO_NUMBERS") {
             if !v.is_empty() {
                 self.notifiers.sms.to_numbers =
                     v.split(',').map(|s| s.trim().to_string()).collect();
@@ -2116,87 +2227,90 @@ impl Config {
         }
 
         // Push
-        if let Ok(v) = env::var("PUSHOVER_API_TOKEN") {
+        if let Ok(v) = env::var("CLAUDEAR_PUSHOVER_API_TOKEN") {
             self.notifiers.push.api_token = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("PUSHOVER_USER_KEY") {
+        if let Ok(v) = env::var("CLAUDEAR_PUSHOVER_USER_KEY") {
             self.notifiers.push.user_key = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("PUSHOVER_DEVICE") {
+        if let Ok(v) = env::var("CLAUDEAR_PUSHOVER_DEVICE") {
             self.notifiers.push.device = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("PUSHOVER_PRIORITY") {
+        if let Ok(v) = env::var("CLAUDEAR_PUSHOVER_PRIORITY") {
             self.notifiers.push.priority = v.parse().ok();
         }
 
         // GitHub
-        if let Ok(v) = env::var("GITHUB_TOKEN") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_TOKEN") {
             self.scm.github.token = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Some(v) = env::var("GITHUB_POLL_INTERVAL_MS")
+        if let Some(v) = env::var("CLAUDEAR_GITHUB_POLL_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.scm.github.poll_interval_ms = v;
         }
-        if let Ok(v) = env::var("GITHUB_AUTO_RESOLVE_ON_MERGE") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_AUTO_RESOLVE_ON_MERGE") {
             self.scm.github.auto_resolve_on_merge = v.to_lowercase() == "true" || v == "1";
         }
-        if let Ok(v) = env::var("GITHUB_WEBHOOK_SECRET") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_WEBHOOK_SECRET") {
             self.scm.github.webhook_secret =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("GITHUB_REVIEW_TRIGGER") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_REVIEW_TRIGGER") {
             self.scm.github.review_trigger = v;
         }
 
         // GitHub App
-        if let Some(v) = env::var("GITHUB_APP_ID").ok().and_then(|v| v.parse().ok()) {
+        if let Some(v) = env::var("CLAUDEAR_GITHUB_APP_ID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             self.scm.github.app.app_id = Some(v);
         }
-        if let Ok(v) = env::var("GITHUB_APP_PRIVATE_KEY_PATH") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_APP_PRIVATE_KEY_PATH") {
             self.scm.github.app.private_key_path =
                 Some(v).filter(|s| !s.is_empty()).map(PathBuf::from);
         }
-        if let Ok(v) = env::var("GITHUB_APP_PRIVATE_KEY") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_APP_PRIVATE_KEY") {
             self.scm.github.app.private_key =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("GITHUB_APP_WEBHOOK_SECRET") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_APP_WEBHOOK_SECRET") {
             self.scm.github.app.webhook_secret =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Some(v) = env::var("GITHUB_APP_INSTALLATION_ID")
+        if let Some(v) = env::var("CLAUDEAR_GITHUB_APP_INSTALLATION_ID")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.scm.github.app.installation_id = Some(v);
         }
-        if let Ok(v) = env::var("GITHUB_APP_CLIENT_ID") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_APP_CLIENT_ID") {
             self.scm.github.app.client_id = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("GITHUB_APP_CLIENT_SECRET") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_APP_CLIENT_SECRET") {
             self.scm.github.app.client_secret =
                 Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
         }
-        if let Ok(v) = env::var("GITHUB_APP_BASE_URL") {
+        if let Ok(v) = env::var("CLAUDEAR_GITHUB_APP_BASE_URL") {
             self.scm.github.app.base_url = Some(v).filter(|s| !s.is_empty());
         }
 
         // Retry
-        if let Some(v) = env::var("RETRY_MAX_RETRIES")
+        if let Some(v) = env::var("CLAUDEAR_RETRY_MAX_RETRIES")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.retry.max_retries = v;
         }
-        if let Some(v) = env::var("RETRY_BASE_DELAY_MS")
+        if let Some(v) = env::var("CLAUDEAR_RETRY_BASE_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.retry.base_delay_ms = v;
         }
-        if let Some(v) = env::var("RETRY_MAX_DELAY_MS")
+        if let Some(v) = env::var("CLAUDEAR_RETRY_MAX_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
@@ -2218,8 +2332,8 @@ impl Config {
 
     /// Apply Linear environment variable overrides.
     fn apply_linear_env_overrides(&mut self) {
-        // If LINEAR_API_KEY is set in env, ensure we have a LinearConfig
-        if let Ok(api_key) = env::var("LINEAR_API_KEY") {
+        // If CLAUDEAR_LINEAR_API_KEY is set in env, ensure we have a LinearConfig
+        if let Ok(api_key) = env::var("CLAUDEAR_LINEAR_API_KEY") {
             if !api_key.is_empty() {
                 let linear = self.issues.linear.get_or_insert_with(LinearConfig::default);
                 linear.api_key = SecretValue::new(api_key);
@@ -2228,44 +2342,44 @@ impl Config {
 
         // Apply other overrides if we have a LinearConfig
         if let Some(ref mut linear) = self.issues.linear {
-            if let Ok(v) = env::var("LINEAR_ENABLED") {
+            if let Ok(v) = env::var("CLAUDEAR_LINEAR_ENABLED") {
                 linear.enabled = v.to_lowercase() == "true" || v == "1";
             }
-            if let Ok(v) = env::var("LINEAR_TRIGGER_LABELS") {
+            if let Ok(v) = env::var("CLAUDEAR_LINEAR_TRIGGER_LABELS") {
                 if !v.is_empty() {
                     linear.trigger_labels = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Ok(v) = env::var("LINEAR_TRIGGER_ASSIGNEE") {
+            if let Ok(v) = env::var("CLAUDEAR_LINEAR_TRIGGER_ASSIGNEE") {
                 linear.trigger_assignee = Some(v).filter(|s| !s.is_empty());
             }
-            if let Ok(v) = env::var("LINEAR_TRIGGER_STATES") {
+            if let Ok(v) = env::var("CLAUDEAR_LINEAR_TRIGGER_STATES") {
                 if !v.is_empty() {
                     linear.trigger_states = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Ok(v) = env::var("LINEAR_TEAM_ID") {
+            if let Ok(v) = env::var("CLAUDEAR_LINEAR_TEAM_ID") {
                 linear.team_id = Some(v).filter(|s| !s.is_empty());
             }
-            if let Ok(v) = env::var("LINEAR_PROJECT_ID") {
+            if let Ok(v) = env::var("CLAUDEAR_LINEAR_PROJECT_ID") {
                 linear.project_id = Some(v).filter(|s| !s.is_empty());
             }
-            if let Ok(v) = env::var("LINEAR_WEBHOOK_SECRET") {
+            if let Ok(v) = env::var("CLAUDEAR_LINEAR_WEBHOOK_SECRET") {
                 linear.webhook_secret = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
             }
-            if let Some(v) = env::var("LINEAR_MAX_ISSUES_PER_CYCLE")
+            if let Some(v) = env::var("CLAUDEAR_LINEAR_MAX_ISSUES_PER_CYCLE")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 linear.max_issues_per_cycle = Some(v);
             }
-            if let Some(v) = env::var("LINEAR_MAX_CONCURRENT")
+            if let Some(v) = env::var("CLAUDEAR_LINEAR_MAX_CONCURRENT")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 linear.max_concurrent = Some(v);
             }
-            if let Some(v) = env::var("LINEAR_POLL_INTERVAL_MS")
+            if let Some(v) = env::var("CLAUDEAR_LINEAR_POLL_INTERVAL_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
@@ -2276,8 +2390,8 @@ impl Config {
 
     /// Apply Sentry environment variable overrides.
     fn apply_sentry_env_overrides(&mut self) {
-        // If SENTRY_AUTH_TOKEN is set in env, ensure we have a SentryConfig
-        if let Ok(auth_token) = env::var("SENTRY_AUTH_TOKEN") {
+        // If CLAUDEAR_SENTRY_AUTH_TOKEN is set in env, ensure we have a SentryConfig
+        if let Ok(auth_token) = env::var("CLAUDEAR_SENTRY_AUTH_TOKEN") {
             if !auth_token.is_empty() {
                 let sentry = self.issues.sentry.get_or_insert_with(SentryConfig::default);
                 sentry.auth_token = SecretValue::new(auth_token);
@@ -2286,59 +2400,59 @@ impl Config {
 
         // Apply other overrides if we have a SentryConfig
         if let Some(ref mut sentry) = self.issues.sentry {
-            if let Ok(v) = env::var("SENTRY_ENABLED") {
+            if let Ok(v) = env::var("CLAUDEAR_SENTRY_ENABLED") {
                 sentry.enabled = v.to_lowercase() == "true" || v == "1";
             }
-            if let Ok(v) = env::var("SENTRY_ORG_SLUG") {
+            if let Ok(v) = env::var("CLAUDEAR_SENTRY_ORG_SLUG") {
                 if !v.is_empty() {
                     sentry.org_slug = v;
                 }
             }
-            if let Ok(v) = env::var("SENTRY_PROJECT_SLUGS") {
+            if let Ok(v) = env::var("CLAUDEAR_SENTRY_PROJECT_SLUGS") {
                 if !v.is_empty() {
                     sentry.project_slugs = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Some(v) = env::var("SENTRY_TOP_ISSUES_COUNT")
+            if let Some(v) = env::var("CLAUDEAR_SENTRY_TOP_ISSUES_COUNT")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 sentry.top_issues_count = v;
             }
-            if let Some(v) = env::var("SENTRY_TOP_ISSUES_PERIOD")
+            if let Some(v) = env::var("CLAUDEAR_SENTRY_TOP_ISSUES_PERIOD")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 sentry.top_issues_period = v;
             }
-            if let Some(v) = env::var("SENTRY_MIN_EVENT_COUNT")
+            if let Some(v) = env::var("CLAUDEAR_SENTRY_MIN_EVENT_COUNT")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 sentry.min_event_count = v;
             }
-            if let Some(v) = env::var("SENTRY_ESCALATION_THRESHOLD")
+            if let Some(v) = env::var("CLAUDEAR_SENTRY_ESCALATION_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 sentry.escalation_threshold_percent = v;
             }
-            if let Ok(v) = env::var("SENTRY_CLIENT_SECRET") {
+            if let Ok(v) = env::var("CLAUDEAR_SENTRY_CLIENT_SECRET") {
                 sentry.client_secret = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
             }
-            if let Some(v) = env::var("SENTRY_MAX_ISSUES_PER_CYCLE")
+            if let Some(v) = env::var("CLAUDEAR_SENTRY_MAX_ISSUES_PER_CYCLE")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 sentry.max_issues_per_cycle = Some(v);
             }
-            if let Some(v) = env::var("SENTRY_MAX_CONCURRENT")
+            if let Some(v) = env::var("CLAUDEAR_SENTRY_MAX_CONCURRENT")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 sentry.max_concurrent = Some(v);
             }
-            if let Some(v) = env::var("SENTRY_POLL_INTERVAL_MS")
+            if let Some(v) = env::var("CLAUDEAR_SENTRY_POLL_INTERVAL_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
@@ -2349,8 +2463,8 @@ impl Config {
 
     /// Apply Jira environment variable overrides.
     fn apply_jira_env_overrides(&mut self) {
-        // If JIRA_API_TOKEN is set in env, ensure we have a JiraConfig
-        if let Ok(api_token) = env::var("JIRA_API_TOKEN") {
+        // If CLAUDEAR_JIRA_API_TOKEN is set in env, ensure we have a JiraConfig
+        if let Ok(api_token) = env::var("CLAUDEAR_JIRA_API_TOKEN") {
             if !api_token.is_empty() {
                 let jira = self.issues.jira.get_or_insert_with(JiraConfig::default);
                 jira.api_token = SecretValue::new(api_token);
@@ -2359,69 +2473,69 @@ impl Config {
 
         // Apply other overrides if we have a JiraConfig
         if let Some(ref mut jira) = self.issues.jira {
-            if let Ok(v) = env::var("JIRA_ENABLED") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_ENABLED") {
                 jira.enabled = v.to_lowercase() == "true" || v == "1";
             }
-            if let Ok(v) = env::var("JIRA_BASE_URL") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_BASE_URL") {
                 if !v.is_empty() {
                     jira.base_url = v;
                 }
             }
-            if let Ok(v) = env::var("JIRA_EMAIL") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_EMAIL") {
                 if !v.is_empty() {
                     jira.email = v;
                 }
             }
-            if let Ok(v) = env::var("JIRA_AUTH_MODE") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_AUTH_MODE") {
                 if !v.is_empty() {
                     jira.auth_mode = v;
                 }
             }
-            if let Ok(v) = env::var("JIRA_PROJECT_KEYS") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_PROJECT_KEYS") {
                 if !v.is_empty() {
                     jira.project_keys = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Ok(v) = env::var("JIRA_TRIGGER_LABELS") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_TRIGGER_LABELS") {
                 if !v.is_empty() {
                     jira.trigger_labels = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Ok(v) = env::var("JIRA_TRIGGER_STATUSES") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_TRIGGER_STATUSES") {
                 if !v.is_empty() {
                     jira.trigger_statuses = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Ok(v) = env::var("JIRA_TRIGGER_ASSIGNEE") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_TRIGGER_ASSIGNEE") {
                 jira.trigger_assignee = Some(v).filter(|s| !s.is_empty());
             }
-            if let Ok(v) = env::var("JIRA_ISSUE_TYPES") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_ISSUE_TYPES") {
                 if !v.is_empty() {
                     jira.issue_types = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Ok(v) = env::var("JIRA_CUSTOM_JQL") {
+            if let Ok(v) = env::var("CLAUDEAR_JIRA_CUSTOM_JQL") {
                 jira.custom_jql = Some(v).filter(|s| !s.is_empty());
             }
-            if let Some(v) = env::var("JIRA_MAX_RESULTS")
+            if let Some(v) = env::var("CLAUDEAR_JIRA_MAX_RESULTS")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 jira.max_results = v;
             }
-            if let Some(v) = env::var("JIRA_MAX_ISSUES_PER_CYCLE")
+            if let Some(v) = env::var("CLAUDEAR_JIRA_MAX_ISSUES_PER_CYCLE")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 jira.max_issues_per_cycle = Some(v);
             }
-            if let Some(v) = env::var("JIRA_MAX_CONCURRENT")
+            if let Some(v) = env::var("CLAUDEAR_JIRA_MAX_CONCURRENT")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 jira.max_concurrent = Some(v);
             }
-            if let Some(v) = env::var("JIRA_POLL_INTERVAL_MS")
+            if let Some(v) = env::var("CLAUDEAR_JIRA_POLL_INTERVAL_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
@@ -2432,8 +2546,8 @@ impl Config {
 
     /// Apply GitLab environment variable overrides.
     fn apply_gitlab_env_overrides(&mut self) {
-        // If GITLAB_TOKEN is set in env, ensure we have a GitLabConfig
-        if let Ok(token) = env::var("GITLAB_TOKEN") {
+        // If CLAUDEAR_GITLAB_TOKEN is set in env, ensure we have a GitLabConfig
+        if let Ok(token) = env::var("CLAUDEAR_GITLAB_TOKEN") {
             if !token.is_empty() {
                 let gitlab = self.scm.gitlab.get_or_insert_with(GitLabConfig::default);
                 gitlab.token = Some(SecretValue::new(token));
@@ -2443,59 +2557,92 @@ impl Config {
 
         // Apply other overrides if we have a GitLabConfig
         if let Some(ref mut gitlab) = self.scm.gitlab {
-            if let Ok(v) = env::var("GITLAB_ENABLED") {
+            if let Ok(v) = env::var("CLAUDEAR_GITLAB_ENABLED") {
                 gitlab.enabled = v.to_lowercase() == "true" || v == "1";
             }
-            if let Ok(v) = env::var("GITLAB_BASE_URL") {
+            if let Ok(v) = env::var("CLAUDEAR_GITLAB_BASE_URL") {
                 if !v.is_empty() {
                     gitlab.base_url = v;
                 }
             }
-            if let Ok(v) = env::var("GITLAB_GROUPS") {
+            if let Ok(v) = env::var("CLAUDEAR_GITLAB_GROUPS") {
                 if !v.is_empty() {
                     gitlab.groups = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Ok(v) = env::var("GITLAB_TRIGGER_LABELS") {
+            if let Ok(v) = env::var("CLAUDEAR_GITLAB_TRIGGER_LABELS") {
                 if !v.is_empty() {
                     gitlab.trigger_labels = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Ok(v) = env::var("GITLAB_TRIGGER_STATES") {
+            if let Ok(v) = env::var("CLAUDEAR_GITLAB_TRIGGER_STATES") {
                 if !v.is_empty() {
                     gitlab.trigger_states = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
-            if let Some(v) = env::var("GITLAB_POLL_INTERVAL_MS")
+            if let Some(v) = env::var("CLAUDEAR_GITLAB_POLL_INTERVAL_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 gitlab.poll_interval_ms = Some(v);
             }
-            if let Ok(v) = env::var("GITLAB_AUTO_RESOLVE_ON_MERGE") {
+            if let Ok(v) = env::var("CLAUDEAR_GITLAB_AUTO_RESOLVE_ON_MERGE") {
                 gitlab.auto_resolve_on_merge = v.to_lowercase() == "true" || v == "1";
             }
-            if let Ok(v) = env::var("GITLAB_WEBHOOK_SECRET") {
+            if let Ok(v) = env::var("CLAUDEAR_GITLAB_WEBHOOK_SECRET") {
                 gitlab.webhook_secret = Some(v).filter(|s| !s.is_empty()).map(SecretValue::new);
             }
-            if let Ok(v) = env::var("GITLAB_REVIEW_TRIGGER") {
+            if let Ok(v) = env::var("CLAUDEAR_GITLAB_REVIEW_TRIGGER") {
                 gitlab.review_trigger = v;
             }
-            if let Ok(v) = env::var("GITLAB_USE_SSH") {
+            if let Ok(v) = env::var("CLAUDEAR_GITLAB_USE_SSH") {
                 gitlab.use_ssh = v.to_lowercase() == "true" || v == "1";
             }
-            if let Some(v) = env::var("GITLAB_MAX_ISSUES_PER_CYCLE")
+            if let Some(v) = env::var("CLAUDEAR_GITLAB_MAX_ISSUES_PER_CYCLE")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 gitlab.max_issues_per_cycle = Some(v);
             }
-            if let Some(v) = env::var("GITLAB_MAX_CONCURRENT")
+            if let Some(v) = env::var("CLAUDEAR_GITLAB_MAX_CONCURRENT")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 gitlab.max_concurrent = Some(v);
             }
+        }
+
+        // TLS auto-provisioning
+        if let Ok(v) = env::var("CLAUDEAR_TLS_ENABLED") {
+            self.tls.enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = env::var("CLAUDEAR_TLS_DOMAINS") {
+            if !v.is_empty() {
+                self.tls.domains = v.split(',').map(|s| s.trim().to_string()).collect();
+            }
+        }
+        if let Ok(v) = env::var("CLAUDEAR_TLS_EMAIL") {
+            self.tls.email = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("CLAUDEAR_TLS_PRODUCTION") {
+            self.tls.production = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = env::var("CLAUDEAR_TLS_CACHE_DIR") {
+            if !v.is_empty() {
+                self.tls.cache_dir = v.into();
+            }
+        }
+        if let Some(v) = env::var("CLAUDEAR_TLS_HTTPS_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.tls.https_port = v;
+        }
+        if let Some(v) = env::var("CLAUDEAR_TLS_HTTP_REDIRECT_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.tls.http_redirect_port = v;
         }
     }
 
@@ -2574,6 +2721,14 @@ impl Config {
         // Validate prioritisation config only when engine is enabled
         if self.prioritisation.enabled {
             self.prioritisation.validate()?;
+        }
+
+        // Validate TLS config when enabled
+        if self.tls.enabled && self.tls.domains.is_empty() {
+            return Err(Error::config(
+                "tls.domains is required when TLS is enabled. \
+                 Specify at least one domain name for certificate provisioning.",
+            ));
         }
 
         Ok(())
@@ -2853,108 +3008,108 @@ mod tests {
 
     // All environment variables that Config reads
     const CONFIG_ENV_VARS: &[&str] = &[
-        "WORKSPACE",
-        "KNOWN_ORGS",
-        "AUTO_DISCOVER_PATHS",
-        "POLL_INTERVAL_MS",
-        "WEBHOOK_PORT",
-        "DB_PATH",
-        "MAX_ISSUES_PER_CYCLE",
-        "MAX_CONCURRENT",
-        "PROCESSING_DELAY_MS",
-        "LINEAR_API_KEY",
-        "LINEAR_ENABLED",
-        "LINEAR_TRIGGER_LABELS",
-        "LINEAR_TRIGGER_ASSIGNEE",
-        "LINEAR_TRIGGER_STATES",
-        "LINEAR_TEAM_ID",
-        "LINEAR_PROJECT_ID",
-        "LINEAR_WEBHOOK_SECRET",
-        "LINEAR_MAX_ISSUES_PER_CYCLE",
-        "LINEAR_MAX_CONCURRENT",
-        "LINEAR_POLL_INTERVAL_MS",
-        "SENTRY_AUTH_TOKEN",
-        "SENTRY_ORG_SLUG",
-        "SENTRY_ENABLED",
-        "SENTRY_PROJECT_SLUGS",
-        "SENTRY_TOP_ISSUES_COUNT",
-        "SENTRY_MIN_EVENT_COUNT",
-        "SENTRY_ESCALATION_THRESHOLD",
-        "SENTRY_CLIENT_SECRET",
-        "SENTRY_MAX_ISSUES_PER_CYCLE",
-        "SENTRY_MAX_CONCURRENT",
-        "SENTRY_POLL_INTERVAL_MS",
-        "JIRA_API_TOKEN",
-        "JIRA_ENABLED",
-        "JIRA_BASE_URL",
-        "JIRA_EMAIL",
-        "JIRA_AUTH_MODE",
-        "JIRA_PROJECT_KEYS",
-        "JIRA_TRIGGER_LABELS",
-        "JIRA_TRIGGER_STATUSES",
-        "JIRA_TRIGGER_ASSIGNEE",
-        "JIRA_ISSUE_TYPES",
-        "JIRA_CUSTOM_JQL",
-        "JIRA_MAX_RESULTS",
-        "JIRA_MAX_ISSUES_PER_CYCLE",
-        "JIRA_MAX_CONCURRENT",
-        "JIRA_POLL_INTERVAL_MS",
-        "DISCORD_WEBHOOK_URL",
-        "DISCORD_USER_ID",
-        "DISCORD_BOT_TOKEN",
-        "DISCORD_CHANNEL_ID",
-        "DISCORD_SOURCE_ENABLED",
-        "DISCORD_LISTEN_CHANNEL_ID",
-        "DISCORD_GUILD_ID",
-        "DISCORD_POLL_INTERVAL_MS",
-        "SMTP_HOST",
-        "SMTP_PORT",
-        "SMTP_USERNAME",
-        "SMTP_PASSWORD",
-        "EMAIL_FROM",
-        "EMAIL_TO",
-        "SMTP_TLS",
-        "IMAP_HOST",
-        "IMAP_PORT",
-        "IMAP_USERNAME",
-        "IMAP_PASSWORD",
-        "IMAP_TLS",
-        "IMAP_FOLDER",
-        "ASK_ENABLED",
-        "ASK_WAIT_TIMEOUT_SECS",
-        "ASK_POLL_INTERVAL_SECS",
-        "ASK_MAX_ROUNDS",
-        "ASK_SEMANTIC_THRESHOLD_SCOPED",
-        "ASK_SEMANTIC_THRESHOLD_GLOBAL",
-        "ASK_MAX_REUSE_CANDIDATES",
-        "ASK_BEST_EFFORT_ON_TIMEOUT",
-        "TWILIO_ACCOUNT_SID",
-        "TWILIO_AUTH_TOKEN",
-        "TWILIO_FROM_NUMBER",
-        "TWILIO_TO_NUMBERS",
-        "PUSHOVER_API_TOKEN",
-        "PUSHOVER_USER_KEY",
-        "PUSHOVER_DEVICE",
-        "PUSHOVER_PRIORITY",
-        "GITHUB_TOKEN",
-        "GITHUB_POLL_INTERVAL_MS",
-        "GITHUB_AUTO_RESOLVE_ON_MERGE",
-        "GITHUB_APP_ID",
-        "GITHUB_APP_PRIVATE_KEY_PATH",
-        "GITHUB_APP_PRIVATE_KEY",
-        "GITHUB_APP_WEBHOOK_SECRET",
-        "GITHUB_APP_INSTALLATION_ID",
-        "GITHUB_APP_CLIENT_ID",
-        "GITHUB_APP_CLIENT_SECRET",
-        "GITHUB_APP_BASE_URL",
-        "RETRY_MAX_RETRIES",
-        "RETRY_BASE_DELAY_MS",
-        "RETRY_MAX_DELAY_MS",
-        "CLAUDE_MODEL",
-        "CLAUDE_INSTRUCTIONS",
-        "CLAUDE_INSTRUCTIONS_FILE",
-        "CLAUDE_PERMISSIONS",
-        "CLAUDE_SKIP_PERMISSIONS",
+        "CLAUDEAR_WORKSPACE",
+        "CLAUDEAR_KNOWN_ORGS",
+        "CLAUDEAR_AUTO_DISCOVER_PATHS",
+        "CLAUDEAR_POLL_INTERVAL_MS",
+        "CLAUDEAR_WEBHOOK_PORT",
+        "CLAUDEAR_DB_PATH",
+        "CLAUDEAR_MAX_ISSUES_PER_CYCLE",
+        "CLAUDEAR_MAX_CONCURRENT",
+        "CLAUDEAR_PROCESSING_DELAY_MS",
+        "CLAUDEAR_LINEAR_API_KEY",
+        "CLAUDEAR_LINEAR_ENABLED",
+        "CLAUDEAR_LINEAR_TRIGGER_LABELS",
+        "CLAUDEAR_LINEAR_TRIGGER_ASSIGNEE",
+        "CLAUDEAR_LINEAR_TRIGGER_STATES",
+        "CLAUDEAR_LINEAR_TEAM_ID",
+        "CLAUDEAR_LINEAR_PROJECT_ID",
+        "CLAUDEAR_LINEAR_WEBHOOK_SECRET",
+        "CLAUDEAR_LINEAR_MAX_ISSUES_PER_CYCLE",
+        "CLAUDEAR_LINEAR_MAX_CONCURRENT",
+        "CLAUDEAR_LINEAR_POLL_INTERVAL_MS",
+        "CLAUDEAR_SENTRY_AUTH_TOKEN",
+        "CLAUDEAR_SENTRY_ORG_SLUG",
+        "CLAUDEAR_SENTRY_ENABLED",
+        "CLAUDEAR_SENTRY_PROJECT_SLUGS",
+        "CLAUDEAR_SENTRY_TOP_ISSUES_COUNT",
+        "CLAUDEAR_SENTRY_MIN_EVENT_COUNT",
+        "CLAUDEAR_SENTRY_ESCALATION_THRESHOLD",
+        "CLAUDEAR_SENTRY_CLIENT_SECRET",
+        "CLAUDEAR_SENTRY_MAX_ISSUES_PER_CYCLE",
+        "CLAUDEAR_SENTRY_MAX_CONCURRENT",
+        "CLAUDEAR_SENTRY_POLL_INTERVAL_MS",
+        "CLAUDEAR_JIRA_API_TOKEN",
+        "CLAUDEAR_JIRA_ENABLED",
+        "CLAUDEAR_JIRA_BASE_URL",
+        "CLAUDEAR_JIRA_EMAIL",
+        "CLAUDEAR_JIRA_AUTH_MODE",
+        "CLAUDEAR_JIRA_PROJECT_KEYS",
+        "CLAUDEAR_JIRA_TRIGGER_LABELS",
+        "CLAUDEAR_JIRA_TRIGGER_STATUSES",
+        "CLAUDEAR_JIRA_TRIGGER_ASSIGNEE",
+        "CLAUDEAR_JIRA_ISSUE_TYPES",
+        "CLAUDEAR_JIRA_CUSTOM_JQL",
+        "CLAUDEAR_JIRA_MAX_RESULTS",
+        "CLAUDEAR_JIRA_MAX_ISSUES_PER_CYCLE",
+        "CLAUDEAR_JIRA_MAX_CONCURRENT",
+        "CLAUDEAR_JIRA_POLL_INTERVAL_MS",
+        "CLAUDEAR_DISCORD_WEBHOOK_URL",
+        "CLAUDEAR_DISCORD_USER_ID",
+        "CLAUDEAR_DISCORD_BOT_TOKEN",
+        "CLAUDEAR_DISCORD_CHANNEL_ID",
+        "CLAUDEAR_DISCORD_SOURCE_ENABLED",
+        "CLAUDEAR_DISCORD_LISTEN_CHANNEL_ID",
+        "CLAUDEAR_DISCORD_GUILD_ID",
+        "CLAUDEAR_DISCORD_POLL_INTERVAL_MS",
+        "CLAUDEAR_SMTP_HOST",
+        "CLAUDEAR_SMTP_PORT",
+        "CLAUDEAR_SMTP_USERNAME",
+        "CLAUDEAR_SMTP_PASSWORD",
+        "CLAUDEAR_EMAIL_FROM",
+        "CLAUDEAR_EMAIL_TO",
+        "CLAUDEAR_SMTP_TLS",
+        "CLAUDEAR_IMAP_HOST",
+        "CLAUDEAR_IMAP_PORT",
+        "CLAUDEAR_IMAP_USERNAME",
+        "CLAUDEAR_IMAP_PASSWORD",
+        "CLAUDEAR_IMAP_TLS",
+        "CLAUDEAR_IMAP_FOLDER",
+        "CLAUDEAR_ASK_ENABLED",
+        "CLAUDEAR_ASK_WAIT_TIMEOUT_SECS",
+        "CLAUDEAR_ASK_POLL_INTERVAL_SECS",
+        "CLAUDEAR_ASK_MAX_ROUNDS",
+        "CLAUDEAR_ASK_SEMANTIC_THRESHOLD_SCOPED",
+        "CLAUDEAR_ASK_SEMANTIC_THRESHOLD_GLOBAL",
+        "CLAUDEAR_ASK_MAX_REUSE_CANDIDATES",
+        "CLAUDEAR_ASK_BEST_EFFORT_ON_TIMEOUT",
+        "CLAUDEAR_TWILIO_ACCOUNT_SID",
+        "CLAUDEAR_TWILIO_AUTH_TOKEN",
+        "CLAUDEAR_TWILIO_FROM_NUMBER",
+        "CLAUDEAR_TWILIO_TO_NUMBERS",
+        "CLAUDEAR_PUSHOVER_API_TOKEN",
+        "CLAUDEAR_PUSHOVER_USER_KEY",
+        "CLAUDEAR_PUSHOVER_DEVICE",
+        "CLAUDEAR_PUSHOVER_PRIORITY",
+        "CLAUDEAR_GITHUB_TOKEN",
+        "CLAUDEAR_GITHUB_POLL_INTERVAL_MS",
+        "CLAUDEAR_GITHUB_AUTO_RESOLVE_ON_MERGE",
+        "CLAUDEAR_GITHUB_APP_ID",
+        "CLAUDEAR_GITHUB_APP_PRIVATE_KEY_PATH",
+        "CLAUDEAR_GITHUB_APP_PRIVATE_KEY",
+        "CLAUDEAR_GITHUB_APP_WEBHOOK_SECRET",
+        "CLAUDEAR_GITHUB_APP_INSTALLATION_ID",
+        "CLAUDEAR_GITHUB_APP_CLIENT_ID",
+        "CLAUDEAR_GITHUB_APP_CLIENT_SECRET",
+        "CLAUDEAR_GITHUB_APP_BASE_URL",
+        "CLAUDEAR_RETRY_MAX_RETRIES",
+        "CLAUDEAR_RETRY_BASE_DELAY_MS",
+        "CLAUDEAR_RETRY_MAX_DELAY_MS",
+        "CLAUDEAR_CLAUDE_MODEL",
+        "CLAUDEAR_CLAUDE_INSTRUCTIONS",
+        "CLAUDEAR_CLAUDE_INSTRUCTIONS_FILE",
+        "CLAUDEAR_CLAUDE_PERMISSIONS",
+        "CLAUDEAR_CLAUDE_SKIP_PERMISSIONS",
     ];
 
     fn with_env<F, R>(vars: &[(&str, &str)], f: F) -> R
@@ -3249,7 +3404,7 @@ workspace = "/toml/path"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("WORKSPACE", "/env/path")], || {
+        with_env(&[("CLAUDEAR_WORKSPACE", "/env/path")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(config.workspace, PathBuf::from("/env/path"));
         });
@@ -3263,7 +3418,7 @@ known_orgs = ["toml-org"]
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("KNOWN_ORGS", "env-org1, env-org2")], || {
+        with_env(&[("CLAUDEAR_KNOWN_ORGS", "env-org1, env-org2")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(config.known_orgs, vec!["env-org1", "env-org2"]);
         });
@@ -3278,7 +3433,7 @@ auto_discover_paths = ["~/toml/path"]
         let file = create_temp_toml(toml_str);
 
         with_env(
-            &[("AUTO_DISCOVER_PATHS", "~/env/path1, ~/env/path2")],
+            &[("CLAUDEAR_AUTO_DISCOVER_PATHS", "~/env/path1, ~/env/path2")],
             || {
                 let config = Config::load(file.path()).unwrap();
                 assert_eq!(
@@ -3303,9 +3458,9 @@ api_key = "lin_key"
 
         with_env(
             &[
-                ("POLL_INTERVAL_MS", "200000"),
-                ("WEBHOOK_PORT", "4000"),
-                ("MAX_ISSUES_PER_CYCLE", "20"),
+                ("CLAUDEAR_POLL_INTERVAL_MS", "200000"),
+                ("CLAUDEAR_WEBHOOK_PORT", "4000"),
+                ("CLAUDEAR_MAX_ISSUES_PER_CYCLE", "20"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -3326,7 +3481,7 @@ api_key = "toml_key"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("LINEAR_API_KEY", "env_key")], || {
+        with_env(&[("CLAUDEAR_LINEAR_API_KEY", "env_key")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(
                 config.issues.linear.as_ref().unwrap().api_key,
@@ -3342,7 +3497,7 @@ workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("LINEAR_API_KEY", "env_key")], || {
+        with_env(&[("CLAUDEAR_LINEAR_API_KEY", "env_key")], || {
             let config = Config::load(file.path()).unwrap();
             assert!(config.issues.linear.is_some());
             assert_eq!(
@@ -3365,8 +3520,8 @@ org_slug = "toml-org"
 
         with_env(
             &[
-                ("SENTRY_AUTH_TOKEN", "env_token"),
-                ("SENTRY_ORG_SLUG", "env-org"),
+                ("CLAUDEAR_SENTRY_AUTH_TOKEN", "env_token"),
+                ("CLAUDEAR_SENTRY_ORG_SLUG", "env-org"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -3386,8 +3541,8 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("SENTRY_AUTH_TOKEN", "env_token"),
-                ("SENTRY_ORG_SLUG", "env-org"),
+                ("CLAUDEAR_SENTRY_AUTH_TOKEN", "env_token"),
+                ("CLAUDEAR_SENTRY_ORG_SLUG", "env-org"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -3413,13 +3568,16 @@ api_key = "key"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("DISCORD_WEBHOOK_URL", "https://env.webhook")], || {
-            let config = Config::load(file.path()).unwrap();
-            assert_eq!(
-                config.discord_merged().webhook_url,
-                Some(SecretValue::new("https://env.webhook"))
-            );
-        });
+        with_env(
+            &[("CLAUDEAR_DISCORD_WEBHOOK_URL", "https://env.webhook")],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(
+                    config.discord_merged().webhook_url,
+                    Some(SecretValue::new("https://env.webhook"))
+                );
+            },
+        );
     }
 
     #[test]
@@ -3439,9 +3597,9 @@ api_key = "key"
 
         with_env(
             &[
-                ("GITHUB_TOKEN", "env_token"),
-                ("GITHUB_POLL_INTERVAL_MS", "60000"),
-                ("GITHUB_AUTO_RESOLVE_ON_MERGE", "false"),
+                ("CLAUDEAR_GITHUB_TOKEN", "env_token"),
+                ("CLAUDEAR_GITHUB_POLL_INTERVAL_MS", "60000"),
+                ("CLAUDEAR_GITHUB_AUTO_RESOLVE_ON_MERGE", "false"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -3808,8 +3966,8 @@ poll_interval_ms = 120000
     fn test_poll_interval_ms_for_env_override() {
         with_env(
             &[
-                ("DISCORD_POLL_INTERVAL_MS", "15000"),
-                ("DISCORD_SOURCE_ENABLED", "1"),
+                ("CLAUDEAR_DISCORD_POLL_INTERVAL_MS", "15000"),
+                ("CLAUDEAR_DISCORD_SOURCE_ENABLED", "1"),
             ],
             || {
                 let config = Config::from_toml("workspace = \"/tmp\"").unwrap();
@@ -4286,13 +4444,13 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("GITHUB_APP_ID", "12345"),
-                ("GITHUB_APP_PRIVATE_KEY", "test-key"),
-                ("GITHUB_APP_WEBHOOK_SECRET", "webhook-secret"),
-                ("GITHUB_APP_INSTALLATION_ID", "67890"),
-                ("GITHUB_APP_CLIENT_ID", "client-id"),
-                ("GITHUB_APP_CLIENT_SECRET", "client-secret"),
-                ("GITHUB_APP_BASE_URL", "https://example.com"),
+                ("CLAUDEAR_GITHUB_APP_ID", "12345"),
+                ("CLAUDEAR_GITHUB_APP_PRIVATE_KEY", "test-key"),
+                ("CLAUDEAR_GITHUB_APP_WEBHOOK_SECRET", "webhook-secret"),
+                ("CLAUDEAR_GITHUB_APP_INSTALLATION_ID", "67890"),
+                ("CLAUDEAR_GITHUB_APP_CLIENT_ID", "client-id"),
+                ("CLAUDEAR_GITHUB_APP_CLIENT_SECRET", "client-secret"),
+                ("CLAUDEAR_GITHUB_APP_BASE_URL", "https://example.com"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -4438,7 +4596,7 @@ workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("CLAUDE_MODEL", "opus")], || {
+        with_env(&[("CLAUDEAR_CLAUDE_MODEL", "opus")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(
                 config.agent.default_provider_config().unwrap().model,
@@ -4454,7 +4612,7 @@ workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("CLAUDE_INSTRUCTIONS", "Be concise.")], || {
+        with_env(&[("CLAUDEAR_CLAUDE_INSTRUCTIONS", "Be concise.")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(
                 config.agent.default_provider_config().unwrap().instructions,
@@ -4473,7 +4631,7 @@ workspace = "/tmp/repos"
         fs::write(&config_path, "workspace = \"/tmp/repos\"\n").unwrap();
 
         with_env(
-            &[("CLAUDE_INSTRUCTIONS_FILE", "my-instructions.md")],
+            &[("CLAUDEAR_CLAUDE_INSTRUCTIONS_FILE", "my-instructions.md")],
             || {
                 let config = Config::load(&config_path).unwrap();
                 assert_eq!(
@@ -4500,13 +4658,16 @@ workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("CLAUDE_PERMISSIONS", "Bash(git *), Read, Edit")], || {
-            let config = Config::load(file.path()).unwrap();
-            assert_eq!(
-                config.agent.default_provider_config().unwrap().permissions,
-                vec!["Bash(git *)", "Read", "Edit"]
-            );
-        });
+        with_env(
+            &[("CLAUDEAR_CLAUDE_PERMISSIONS", "Bash(git *), Read, Edit")],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(
+                    config.agent.default_provider_config().unwrap().permissions,
+                    vec!["Bash(git *)", "Read", "Edit"]
+                );
+            },
+        );
     }
 
     #[test]
@@ -4516,7 +4677,7 @@ workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("CLAUDE_SKIP_PERMISSIONS", "false")], || {
+        with_env(&[("CLAUDEAR_CLAUDE_SKIP_PERMISSIONS", "false")], || {
             let config = Config::load(file.path()).unwrap();
             assert!(
                 !config
@@ -4538,7 +4699,7 @@ skip_permissions = false
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("CLAUDE_SKIP_PERMISSIONS", "1")], || {
+        with_env(&[("CLAUDEAR_CLAUDE_SKIP_PERMISSIONS", "1")], || {
             let config = Config::load(file.path()).unwrap();
             assert!(
                 config
@@ -4811,12 +4972,12 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("IMAP_HOST", "imap.example.com"),
-                ("IMAP_PORT", "143"),
-                ("IMAP_USERNAME", "user@example.com"),
-                ("IMAP_PASSWORD", "secret"),
-                ("IMAP_TLS", "false"),
-                ("IMAP_FOLDER", "Junk"),
+                ("CLAUDEAR_IMAP_HOST", "imap.example.com"),
+                ("CLAUDEAR_IMAP_PORT", "143"),
+                ("CLAUDEAR_IMAP_USERNAME", "user@example.com"),
+                ("CLAUDEAR_IMAP_PASSWORD", "secret"),
+                ("CLAUDEAR_IMAP_TLS", "false"),
+                ("CLAUDEAR_IMAP_FOLDER", "Junk"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -4848,14 +5009,14 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("ASK_ENABLED", "false"),
-                ("ASK_WAIT_TIMEOUT_SECS", "600"),
-                ("ASK_POLL_INTERVAL_SECS", "30"),
-                ("ASK_MAX_ROUNDS", "5"),
-                ("ASK_SEMANTIC_THRESHOLD_SCOPED", "0.90"),
-                ("ASK_SEMANTIC_THRESHOLD_GLOBAL", "0.95"),
-                ("ASK_MAX_REUSE_CANDIDATES", "10"),
-                ("ASK_BEST_EFFORT_ON_TIMEOUT", "false"),
+                ("CLAUDEAR_ASK_ENABLED", "false"),
+                ("CLAUDEAR_ASK_WAIT_TIMEOUT_SECS", "600"),
+                ("CLAUDEAR_ASK_POLL_INTERVAL_SECS", "30"),
+                ("CLAUDEAR_ASK_MAX_ROUNDS", "5"),
+                ("CLAUDEAR_ASK_SEMANTIC_THRESHOLD_SCOPED", "0.90"),
+                ("CLAUDEAR_ASK_SEMANTIC_THRESHOLD_GLOBAL", "0.95"),
+                ("CLAUDEAR_ASK_MAX_REUSE_CANDIDATES", "10"),
+                ("CLAUDEAR_ASK_BEST_EFFORT_ON_TIMEOUT", "false"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -4880,10 +5041,10 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("TWILIO_ACCOUNT_SID", "AC_test"),
-                ("TWILIO_AUTH_TOKEN", "auth_tok"),
-                ("TWILIO_FROM_NUMBER", "+15551234567"),
-                ("TWILIO_TO_NUMBERS", "+15559876543, +15551111111"),
+                ("CLAUDEAR_TWILIO_ACCOUNT_SID", "AC_test"),
+                ("CLAUDEAR_TWILIO_AUTH_TOKEN", "auth_tok"),
+                ("CLAUDEAR_TWILIO_FROM_NUMBER", "+15551234567"),
+                ("CLAUDEAR_TWILIO_TO_NUMBERS", "+15559876543, +15551111111"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -4916,10 +5077,10 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("PUSHOVER_API_TOKEN", "api_tok"),
-                ("PUSHOVER_USER_KEY", "user_key"),
-                ("PUSHOVER_DEVICE", "myphone"),
-                ("PUSHOVER_PRIORITY", "2"),
+                ("CLAUDEAR_PUSHOVER_API_TOKEN", "api_tok"),
+                ("CLAUDEAR_PUSHOVER_USER_KEY", "user_key"),
+                ("CLAUDEAR_PUSHOVER_DEVICE", "myphone"),
+                ("CLAUDEAR_PUSHOVER_PRIORITY", "2"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -4943,9 +5104,9 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("RETRY_MAX_RETRIES", "5"),
-                ("RETRY_BASE_DELAY_MS", "30000"),
-                ("RETRY_MAX_DELAY_MS", "7200000"),
+                ("CLAUDEAR_RETRY_MAX_RETRIES", "5"),
+                ("CLAUDEAR_RETRY_BASE_DELAY_MS", "30000"),
+                ("CLAUDEAR_RETRY_MAX_DELAY_MS", "7200000"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -4968,13 +5129,13 @@ api_key = "toml_key"
 
         with_env(
             &[
-                ("LINEAR_TRIGGER_LABELS", "urgent, critical"),
-                ("LINEAR_TRIGGER_STATES", "in_progress, review"),
-                ("LINEAR_TEAM_ID", "team_abc"),
-                ("LINEAR_PROJECT_ID", "proj_xyz"),
-                ("LINEAR_WEBHOOK_SECRET", "my_secret"),
-                ("LINEAR_MAX_ISSUES_PER_CYCLE", "3"),
-                ("LINEAR_MAX_CONCURRENT", "2"),
+                ("CLAUDEAR_LINEAR_TRIGGER_LABELS", "urgent, critical"),
+                ("CLAUDEAR_LINEAR_TRIGGER_STATES", "in_progress, review"),
+                ("CLAUDEAR_LINEAR_TEAM_ID", "team_abc"),
+                ("CLAUDEAR_LINEAR_PROJECT_ID", "proj_xyz"),
+                ("CLAUDEAR_LINEAR_WEBHOOK_SECRET", "my_secret"),
+                ("CLAUDEAR_LINEAR_MAX_ISSUES_PER_CYCLE", "3"),
+                ("CLAUDEAR_LINEAR_MAX_CONCURRENT", "2"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -5001,7 +5162,7 @@ enabled = true
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("LINEAR_ENABLED", "false")], || {
+        with_env(&[("CLAUDEAR_LINEAR_ENABLED", "false")], || {
             let config = Config::load(file.path()).unwrap();
             assert!(!config.issues.linear.as_ref().unwrap().enabled);
         });
@@ -5017,11 +5178,14 @@ api_key = "key"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("LINEAR_TRIGGER_ASSIGNEE", "Jane Smith")], || {
-            let config = Config::load(file.path()).unwrap();
-            let linear = config.issues.linear.unwrap();
-            assert_eq!(linear.trigger_assignee, Some("Jane Smith".to_string()));
-        });
+        with_env(
+            &[("CLAUDEAR_LINEAR_TRIGGER_ASSIGNEE", "Jane Smith")],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                let linear = config.issues.linear.unwrap();
+                assert_eq!(linear.trigger_assignee, Some("Jane Smith".to_string()));
+            },
+        );
     }
 
     #[test]
@@ -5035,7 +5199,7 @@ trigger_assignee = "Previous Value"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("LINEAR_TRIGGER_ASSIGNEE", "")], || {
+        with_env(&[("CLAUDEAR_LINEAR_TRIGGER_ASSIGNEE", "")], || {
             let config = Config::load(file.path()).unwrap();
             let linear = config.issues.linear.unwrap();
             // Empty env var should clear the value
@@ -5056,15 +5220,15 @@ org_slug = "toml-org"
 
         with_env(
             &[
-                ("SENTRY_ENABLED", "false"),
-                ("SENTRY_PROJECT_SLUGS", "web, api, worker"),
-                ("SENTRY_TOP_ISSUES_COUNT", "25"),
-                ("SENTRY_TOP_ISSUES_PERIOD", "7d"),
-                ("SENTRY_MIN_EVENT_COUNT", "50"),
-                ("SENTRY_ESCALATION_THRESHOLD", "75"),
-                ("SENTRY_CLIENT_SECRET", "sentry_secret"),
-                ("SENTRY_MAX_ISSUES_PER_CYCLE", "10"),
-                ("SENTRY_MAX_CONCURRENT", "4"),
+                ("CLAUDEAR_SENTRY_ENABLED", "false"),
+                ("CLAUDEAR_SENTRY_PROJECT_SLUGS", "web, api, worker"),
+                ("CLAUDEAR_SENTRY_TOP_ISSUES_COUNT", "25"),
+                ("CLAUDEAR_SENTRY_TOP_ISSUES_PERIOD", "7d"),
+                ("CLAUDEAR_SENTRY_MIN_EVENT_COUNT", "50"),
+                ("CLAUDEAR_SENTRY_ESCALATION_THRESHOLD", "75"),
+                ("CLAUDEAR_SENTRY_CLIENT_SECRET", "sentry_secret"),
+                ("CLAUDEAR_SENTRY_MAX_ISSUES_PER_CYCLE", "10"),
+                ("CLAUDEAR_SENTRY_MAX_CONCURRENT", "4"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -5094,12 +5258,12 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("MAX_CONCURRENT", "4"),
-                ("PROCESSING_DELAY_MS", "1000"),
-                ("DB_PATH", "/custom/db.sqlite"),
-                ("MAX_ACTIVITY_ENTRIES", "50000"),
-                ("IPC_TIMEOUT_SECS", "60"),
-                ("CLAUDE_TIMEOUT_SECS", "3600"),
+                ("CLAUDEAR_MAX_CONCURRENT", "4"),
+                ("CLAUDEAR_PROCESSING_DELAY_MS", "1000"),
+                ("CLAUDEAR_DB_PATH", "/custom/db.sqlite"),
+                ("CLAUDEAR_MAX_ACTIVITY_ENTRIES", "50000"),
+                ("CLAUDEAR_IPC_TIMEOUT_SECS", "60"),
+                ("CLAUDEAR_CLAUDE_TIMEOUT_SECS", "3600"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -5128,20 +5292,20 @@ api_key = "keep_key"
 
         with_env(
             &[
-                ("WORKSPACE", ""),
-                ("KNOWN_ORGS", ""),
-                ("DISCORD_WEBHOOK_URL", ""),
-                ("LINEAR_API_KEY", ""),
+                ("CLAUDEAR_WORKSPACE", ""),
+                ("CLAUDEAR_KNOWN_ORGS", ""),
+                ("CLAUDEAR_DISCORD_WEBHOOK_URL", ""),
+                ("CLAUDEAR_LINEAR_API_KEY", ""),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
-                // Empty WORKSPACE should not override
+                // Empty CLAUDEAR_WORKSPACE should not override
                 assert_eq!(config.workspace, PathBuf::from("/tmp/repos"));
-                // Empty KNOWN_ORGS should not override
+                // Empty CLAUDEAR_KNOWN_ORGS should not override
                 assert!(config.known_orgs.is_empty());
-                // Empty DISCORD_WEBHOOK_URL should set to None
+                // Empty CLAUDEAR_DISCORD_WEBHOOK_URL should set to None
                 assert!(config.notifiers.discord.webhook_url.is_none());
-                // Empty LINEAR_API_KEY should not create config
+                // Empty CLAUDEAR_LINEAR_API_KEY should not create config
                 assert_eq!(
                     config.issues.linear.as_ref().unwrap().api_key,
                     SecretValue::new("keep_key")
@@ -5159,8 +5323,8 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("GITHUB_WEBHOOK_SECRET", "gh_secret"),
-                ("GITHUB_REVIEW_TRIGGER", "@mybot"),
+                ("CLAUDEAR_GITHUB_WEBHOOK_SECRET", "gh_secret"),
+                ("CLAUDEAR_GITHUB_REVIEW_TRIGGER", "@mybot"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -5182,13 +5346,13 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("SMTP_HOST", "smtp.gmail.com"),
-                ("SMTP_PORT", "465"),
-                ("SMTP_USERNAME", "user@gmail.com"),
-                ("SMTP_PASSWORD", "app_password"),
-                ("EMAIL_FROM", "sender@gmail.com"),
-                ("EMAIL_TO", "admin@test.com, dev@test.com"),
-                ("SMTP_TLS", "true"),
+                ("CLAUDEAR_SMTP_HOST", "smtp.gmail.com"),
+                ("CLAUDEAR_SMTP_PORT", "465"),
+                ("CLAUDEAR_SMTP_USERNAME", "user@gmail.com"),
+                ("CLAUDEAR_SMTP_PASSWORD", "app_password"),
+                ("CLAUDEAR_EMAIL_FROM", "sender@gmail.com"),
+                ("CLAUDEAR_EMAIL_TO", "admin@test.com, dev@test.com"),
+                ("CLAUDEAR_SMTP_TLS", "true"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -5371,8 +5535,8 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("DISCORD_BOT_TOKEN", "bot_token_123"),
-                ("DISCORD_CHANNEL_ID", "channel_456"),
+                ("CLAUDEAR_DISCORD_BOT_TOKEN", "bot_token_123"),
+                ("CLAUDEAR_DISCORD_CHANNEL_ID", "channel_456"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -5396,7 +5560,7 @@ workspace = "/tmp/repos"
         let file = create_temp_toml(toml_str);
 
         with_env(
-            &[("GITHUB_APP_PRIVATE_KEY_PATH", "/path/to/key.pem")],
+            &[("CLAUDEAR_GITHUB_APP_PRIVATE_KEY_PATH", "/path/to/key.pem")],
             || {
                 let config = Config::load(file.path()).unwrap();
                 assert_eq!(
@@ -6199,14 +6363,14 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("SLACK_BOT_TOKEN", "xoxb-test-token"),
-                ("SLACK_CHANNEL_ID", "C12345"),
-                ("SLACK_WEBHOOK_URL", "https://hooks.slack.com/test"),
-                ("SLACK_USER_ID", "U12345"),
-                ("SLACK_SOURCE_ENABLED", "true"),
-                ("SLACK_LISTEN_CHANNEL_ID", "C67890"),
-                ("SLACK_WORKSPACE", "myworkspace"),
-                ("SLACK_POLL_INTERVAL_MS", "45000"),
+                ("CLAUDEAR_SLACK_BOT_TOKEN", "xoxb-test-token"),
+                ("CLAUDEAR_SLACK_CHANNEL_ID", "C12345"),
+                ("CLAUDEAR_SLACK_WEBHOOK_URL", "https://hooks.slack.com/test"),
+                ("CLAUDEAR_SLACK_USER_ID", "U12345"),
+                ("CLAUDEAR_SLACK_SOURCE_ENABLED", "true"),
+                ("CLAUDEAR_SLACK_LISTEN_CHANNEL_ID", "C67890"),
+                ("CLAUDEAR_SLACK_WORKSPACE", "myworkspace"),
+                ("CLAUDEAR_SLACK_POLL_INTERVAL_MS", "45000"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -6270,9 +6434,9 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("DISCORD_SOURCE_ENABLED", "1"),
-                ("DISCORD_LISTEN_CHANNEL_ID", "LC123"),
-                ("DISCORD_GUILD_ID", "G456"),
+                ("CLAUDEAR_DISCORD_SOURCE_ENABLED", "1"),
+                ("CLAUDEAR_DISCORD_LISTEN_CHANNEL_ID", "LC123"),
+                ("CLAUDEAR_DISCORD_GUILD_ID", "G456"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -6406,18 +6570,18 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("GITLAB_TOKEN", "glpat-env-token"),
-                ("GITLAB_BASE_URL", "https://gitlab.custom.com"),
-                ("GITLAB_GROUPS", "grp1, grp2"),
-                ("GITLAB_TRIGGER_LABELS", "fix, auto"),
-                ("GITLAB_TRIGGER_STATES", "opened, reopened"),
-                ("GITLAB_POLL_INTERVAL_MS", "120000"),
-                ("GITLAB_AUTO_RESOLVE_ON_MERGE", "true"),
-                ("GITLAB_WEBHOOK_SECRET", "gl_secret"),
-                ("GITLAB_REVIEW_TRIGGER", "@bot"),
-                ("GITLAB_USE_SSH", "true"),
-                ("GITLAB_MAX_ISSUES_PER_CYCLE", "8"),
-                ("GITLAB_MAX_CONCURRENT", "4"),
+                ("CLAUDEAR_GITLAB_TOKEN", "glpat-env-token"),
+                ("CLAUDEAR_GITLAB_BASE_URL", "https://gitlab.custom.com"),
+                ("CLAUDEAR_GITLAB_GROUPS", "grp1, grp2"),
+                ("CLAUDEAR_GITLAB_TRIGGER_LABELS", "fix, auto"),
+                ("CLAUDEAR_GITLAB_TRIGGER_STATES", "opened, reopened"),
+                ("CLAUDEAR_GITLAB_POLL_INTERVAL_MS", "120000"),
+                ("CLAUDEAR_GITLAB_AUTO_RESOLVE_ON_MERGE", "true"),
+                ("CLAUDEAR_GITLAB_WEBHOOK_SECRET", "gl_secret"),
+                ("CLAUDEAR_GITLAB_REVIEW_TRIGGER", "@bot"),
+                ("CLAUDEAR_GITLAB_USE_SSH", "true"),
+                ("CLAUDEAR_GITLAB_MAX_ISSUES_PER_CYCLE", "8"),
+                ("CLAUDEAR_GITLAB_MAX_CONCURRENT", "4"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -6450,7 +6614,7 @@ token = "tok"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("GITLAB_ENABLED", "false")], || {
+        with_env(&[("CLAUDEAR_GITLAB_ENABLED", "false")], || {
             let config = Config::load(file.path()).unwrap();
             assert!(!config.scm.gitlab.as_ref().unwrap().enabled);
         });
@@ -6619,21 +6783,21 @@ workspace = "/tmp/repos"
 
         with_env(
             &[
-                ("JIRA_API_TOKEN", "env_jira_token"),
-                ("JIRA_ENABLED", "true"),
-                ("JIRA_BASE_URL", "https://env.atlassian.net"),
-                ("JIRA_EMAIL", "env@example.com"),
-                ("JIRA_AUTH_MODE", "bearer"),
-                ("JIRA_PROJECT_KEYS", "PROJ1, PROJ2"),
-                ("JIRA_TRIGGER_LABELS", "fix, auto"),
-                ("JIRA_TRIGGER_STATUSES", "Open, In Progress"),
-                ("JIRA_TRIGGER_ASSIGNEE", "Jane Smith"),
-                ("JIRA_ISSUE_TYPES", "Bug, Story"),
-                ("JIRA_CUSTOM_JQL", "priority = Critical"),
-                ("JIRA_MAX_RESULTS", "25"),
-                ("JIRA_MAX_ISSUES_PER_CYCLE", "7"),
-                ("JIRA_MAX_CONCURRENT", "3"),
-                ("JIRA_POLL_INTERVAL_MS", "90000"),
+                ("CLAUDEAR_JIRA_API_TOKEN", "env_jira_token"),
+                ("CLAUDEAR_JIRA_ENABLED", "true"),
+                ("CLAUDEAR_JIRA_BASE_URL", "https://env.atlassian.net"),
+                ("CLAUDEAR_JIRA_EMAIL", "env@example.com"),
+                ("CLAUDEAR_JIRA_AUTH_MODE", "bearer"),
+                ("CLAUDEAR_JIRA_PROJECT_KEYS", "PROJ1, PROJ2"),
+                ("CLAUDEAR_JIRA_TRIGGER_LABELS", "fix, auto"),
+                ("CLAUDEAR_JIRA_TRIGGER_STATUSES", "Open, In Progress"),
+                ("CLAUDEAR_JIRA_TRIGGER_ASSIGNEE", "Jane Smith"),
+                ("CLAUDEAR_JIRA_ISSUE_TYPES", "Bug, Story"),
+                ("CLAUDEAR_JIRA_CUSTOM_JQL", "priority = Critical"),
+                ("CLAUDEAR_JIRA_MAX_RESULTS", "25"),
+                ("CLAUDEAR_JIRA_MAX_ISSUES_PER_CYCLE", "7"),
+                ("CLAUDEAR_JIRA_MAX_CONCURRENT", "3"),
+                ("CLAUDEAR_JIRA_POLL_INTERVAL_MS", "90000"),
             ],
             || {
                 let config = Config::load(file.path()).unwrap();
@@ -6664,7 +6828,7 @@ workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("JIRA_API_TOKEN", "env_jira_token")], || {
+        with_env(&[("CLAUDEAR_JIRA_API_TOKEN", "env_jira_token")], || {
             let config = Config::load(file.path()).unwrap();
             assert!(config.issues.jira.is_some());
             assert_eq!(
@@ -6681,7 +6845,7 @@ workspace = "/tmp/repos"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("GITLAB_TOKEN", "glpat-env")], || {
+        with_env(&[("CLAUDEAR_GITLAB_TOKEN", "glpat-env")], || {
             let config = Config::load(file.path()).unwrap();
             assert!(config.scm.gitlab.is_some());
             let gitlab = config.scm.gitlab.unwrap();
@@ -7050,7 +7214,7 @@ api_key = "key"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("LINEAR_POLL_INTERVAL_MS", "120000")], || {
+        with_env(&[("CLAUDEAR_LINEAR_POLL_INTERVAL_MS", "120000")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(
                 config.issues.linear.as_ref().unwrap().poll_interval_ms,
@@ -7070,7 +7234,7 @@ org_slug = "org"
 "#;
         let file = create_temp_toml(toml_str);
 
-        with_env(&[("SENTRY_POLL_INTERVAL_MS", "90000")], || {
+        with_env(&[("CLAUDEAR_SENTRY_POLL_INTERVAL_MS", "90000")], || {
             let config = Config::load(file.path()).unwrap();
             assert_eq!(
                 config.issues.sentry.as_ref().unwrap().poll_interval_ms,
@@ -7180,12 +7344,16 @@ instructions_file = "my-instructions.md"
             enabled: false,
             max_file_size_kb: 4096,
             batch_size: 128,
+            reindex_interval_hours: 0.0,
         };
         let toml_str = toml::to_string(&config).unwrap();
         let restored: CodeIndexConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.enabled, restored.enabled);
         assert_eq!(config.max_file_size_kb, restored.max_file_size_kb);
         assert_eq!(config.batch_size, restored.batch_size);
+        assert!(
+            (config.reindex_interval_hours - restored.reindex_interval_hours).abs() < f64::EPSILON,
+        );
     }
 
     #[test]
@@ -7547,7 +7715,7 @@ providers = []
 
     #[test]
     fn test_env_override_claude_model_over_toml() {
-        with_env(&[("CLAUDE_MODEL", "opus")], || {
+        with_env(&[("CLAUDEAR_CLAUDE_MODEL", "opus")], || {
             let toml_str = r#"
 workspace = "/tmp/repos"
 
@@ -7565,7 +7733,7 @@ model = "sonnet"
 
     #[test]
     fn test_env_override_claude_timeout() {
-        with_env(&[("CLAUDE_TIMEOUT_SECS", "7200")], || {
+        with_env(&[("CLAUDEAR_CLAUDE_TIMEOUT_SECS", "7200")], || {
             let toml_str = r#"
 workspace = "/tmp/repos"
 
@@ -7579,7 +7747,7 @@ timeout_secs = 3600
 
     #[test]
     fn test_env_override_skip_permissions() {
-        with_env(&[("CLAUDE_SKIP_PERMISSIONS", "true")], || {
+        with_env(&[("CLAUDEAR_CLAUDE_SKIP_PERMISSIONS", "true")], || {
             let toml_str = r#"
 workspace = "/tmp/repos"
 "#;

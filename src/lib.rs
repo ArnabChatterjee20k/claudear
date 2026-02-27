@@ -28,6 +28,7 @@
 pub mod api;
 pub mod api_events;
 pub(crate) mod ask_reply_inbox;
+pub mod chat;
 pub mod config;
 pub mod discord;
 pub mod env_writer;
@@ -44,6 +45,7 @@ pub mod ipc;
 pub mod learning;
 pub mod notifier;
 pub mod prioritisation;
+pub mod processing;
 pub mod qa;
 pub mod regression;
 pub mod release;
@@ -57,12 +59,16 @@ pub mod source;
 pub mod storage;
 pub mod telemetry;
 pub mod templates;
+pub mod tls;
 pub mod types;
 pub mod users;
 pub mod watcher;
 pub mod webhook;
 
-pub use config::{CascadeConfig, CodeIndexConfig, Config, EvaluationConfig, RetryConfig};
+pub use chat::{ChatService, ChatState};
+pub use config::{
+    CascadeConfig, ChatConfig, CodeIndexConfig, Config, EvaluationConfig, RetryConfig, TlsConfig,
+};
 pub use discord::{DiscordClient, ThreadManager, ThreadState};
 pub use error::{Error, Result};
 pub use evaluation::{
@@ -343,4 +349,136 @@ fn build_embedding_service(
             tracker.clone(),
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- build_sources with default config ---
+
+    #[test]
+    fn build_sources_default_config_returns_empty() {
+        let config = Config::default();
+        let sources = build_sources(&config);
+        assert!(
+            sources.is_empty(),
+            "Default config should produce no sources"
+        );
+    }
+
+    // --- build_notifier with default config ---
+
+    #[test]
+    fn build_notifier_default_config_has_console() {
+        let config = Config::default();
+        let user_registry = UserRegistry::new(std::collections::HashMap::new());
+        let _notifier = build_notifier(&config, user_registry);
+        // Should not panic -- console notifier is always added
+    }
+
+    // --- build_embedding_service ---
+
+    #[test]
+    fn build_embedding_service_none_when_no_client() {
+        let tracker: Arc<dyn storage::FixAttemptTracker> =
+            Arc::new(storage::SqliteTracker::in_memory().unwrap());
+        let result = build_embedding_service(&tracker, None);
+        assert!(result.is_none());
+    }
+
+    // --- build_review_watcher ---
+
+    #[test]
+    fn build_review_watcher_returns_none_when_github_disabled() {
+        let config = Config::default();
+        let tracker: Arc<dyn storage::FixAttemptTracker> =
+            Arc::new(storage::SqliteTracker::in_memory().unwrap());
+        let result = build_review_watcher(&config, tracker);
+        assert!(result.is_none());
+    }
+
+    // --- build_sources with linear enabled ---
+
+    #[test]
+    fn build_sources_with_linear_enabled() {
+        let mut config = Config::default();
+        config.issues.linear = Some(config::LinearConfig {
+            enabled: true,
+            api_key: secret::SecretValue::new("test-key"),
+            trigger_labels: vec!["claudear".to_string()],
+            trigger_states: vec!["Todo".to_string()],
+            team_id: None,
+            project_id: None,
+            webhook_secret: None,
+            ..Default::default()
+        });
+        let sources = build_sources(&config);
+        assert_eq!(sources.len(), 1);
+    }
+
+    #[test]
+    fn build_sources_with_linear_disabled() {
+        let mut config = Config::default();
+        config.issues.linear = Some(config::LinearConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let sources = build_sources(&config);
+        assert!(sources.is_empty());
+    }
+
+    // --- build_sources with jira enabled ---
+
+    #[test]
+    fn build_sources_with_jira_enabled() {
+        let mut config = Config::default();
+        config.issues.jira = Some(config::JiraConfig {
+            enabled: true,
+            base_url: "https://jira.example.com".to_string(),
+            email: "user@example.com".to_string(),
+            api_token: secret::SecretValue::new("token"),
+            project_keys: vec!["PROJ".to_string()],
+            ..Default::default()
+        });
+        let sources = build_sources(&config);
+        assert_eq!(sources.len(), 1);
+    }
+
+    // --- build_sources with sentry enabled ---
+
+    #[test]
+    fn build_sources_with_sentry_enabled() {
+        let mut config = Config::default();
+        config.issues.sentry = Some(config::SentryConfig {
+            enabled: true,
+            auth_token: secret::SecretValue::new("token"),
+            org_slug: "org".to_string(),
+            project_slugs: vec!["proj".to_string()],
+            ..Default::default()
+        });
+        let sources = build_sources(&config);
+        assert_eq!(sources.len(), 1);
+    }
+
+    #[test]
+    fn build_sources_multiple_enabled() {
+        let mut config = Config::default();
+        config.issues.linear = Some(config::LinearConfig {
+            enabled: true,
+            api_key: secret::SecretValue::new("key"),
+            trigger_labels: vec!["claudear".to_string()],
+            trigger_states: vec!["Todo".to_string()],
+            ..Default::default()
+        });
+        config.issues.sentry = Some(config::SentryConfig {
+            enabled: true,
+            auth_token: secret::SecretValue::new("token"),
+            org_slug: "org".to_string(),
+            project_slugs: vec!["proj".to_string()],
+            ..Default::default()
+        });
+        let sources = build_sources(&config);
+        assert_eq!(sources.len(), 2);
+    }
 }
