@@ -71,6 +71,28 @@ pub fn start_process(
     Ok(DaemonHandle::Process { child, log_path })
 }
 
+/// Extract the access token from a Claude Code credentials JSON string.
+///
+/// Tries serde_json first, then falls back to regex for malformed JSON
+/// (e.g. control characters from macOS keychain).
+fn extract_token_from_creds(creds_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(creds_json)
+        .ok()
+        .and_then(|v| {
+            v.get("claudeAiOauth")?
+                .get("accessToken")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            let re = regex_lite::Regex::new(r#""accessToken"\s*:\s*"([^"]+)""#).ok()?;
+            re.captures(creds_json)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().to_string())
+        })
+        .filter(|t| !t.is_empty())
+}
+
 /// Try to extract Claude Code OAuth token from the macOS keychain.
 fn get_keychain_oauth_token() -> Option<String> {
     let output = Command::new("security")
@@ -93,17 +115,7 @@ fn get_keychain_oauth_token() -> Option<String> {
         return None;
     }
 
-    // Parse JSON: {"claudeAiOauth":{"accessToken":"sk-ant-...",...}}
-    let parsed: serde_json::Value = serde_json::from_str(creds_json).ok()?;
-    let token = parsed
-        .get("claudeAiOauth")?
-        .get("accessToken")?
-        .as_str()?
-        .to_string();
-
-    if token.is_empty() {
-        return None;
-    }
+    let token = extract_token_from_creds(creds_json)?;
 
     tracing::info!("Extracted Claude Code OAuth token from macOS keychain");
     Some(token)
@@ -390,5 +402,99 @@ pub async fn wait_healthy(handle: &DaemonHandle, port: u16, timeout: Duration) -
             Ok(_) => return Ok(()), // Any HTTP response means the server is up
             Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_token_valid_json() {
+        let json =
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-test-token-123","refreshToken":"rt-456"}}"#;
+        let token = extract_token_from_creds(json);
+        assert_eq!(token.as_deref(), Some("sk-ant-test-token-123"));
+    }
+
+    #[test]
+    fn test_extract_token_valid_json_extra_fields() {
+        let json = r#"{"claudeAiOauth":{"accessToken":"sk-abc","refreshToken":"rt","expiresAt":"2026-01-01"},"otherKey":"value"}"#;
+        let token = extract_token_from_creds(json);
+        assert_eq!(token.as_deref(), Some("sk-abc"));
+    }
+
+    #[test]
+    fn test_extract_token_malformed_json_with_control_char() {
+        // Simulate the real-world case: JSON with a control character that breaks serde
+        let json = "{\"claudeAiOauth\":{\"accessToken\":\"sk-ant-real-token\",\"refreshToken\":\"rt\"},\"broken\":\"\x01\"}";
+        let token = extract_token_from_creds(json);
+        // serde_json may fail, but regex fallback should find the token
+        assert_eq!(token.as_deref(), Some("sk-ant-real-token"));
+    }
+
+    #[test]
+    fn test_extract_token_truncated_json() {
+        // JSON cut off mid-string — serde will fail, regex should still find accessToken
+        let json = r#"{"claudeAiOauth":{"accessToken":"sk-ant-partial","refresh"#;
+        let token = extract_token_from_creds(json);
+        assert_eq!(token.as_deref(), Some("sk-ant-partial"));
+    }
+
+    #[test]
+    fn test_extract_token_empty_access_token() {
+        let json = r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"rt"}}"#;
+        let token = extract_token_from_creds(json);
+        assert!(token.is_none(), "Empty token should return None");
+    }
+
+    #[test]
+    fn test_extract_token_missing_access_token_field() {
+        let json = r#"{"claudeAiOauth":{"refreshToken":"rt-only"}}"#;
+        let token = extract_token_from_creds(json);
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn test_extract_token_missing_claude_ai_oauth() {
+        let json = r#"{"someOtherKey":{"accessToken":"sk-wrong-path"}}"#;
+        let token = extract_token_from_creds(json);
+        // serde path fails (no claudeAiOauth), regex finds "accessToken" anyway
+        assert_eq!(token.as_deref(), Some("sk-wrong-path"));
+    }
+
+    #[test]
+    fn test_extract_token_completely_invalid() {
+        let token = extract_token_from_creds("not json at all");
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn test_extract_token_empty_string() {
+        let token = extract_token_from_creds("");
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn test_extract_token_nested_quotes_in_token() {
+        // Token shouldn't contain quotes — regex stops at first "
+        let json = r#"{"claudeAiOauth":{"accessToken":"sk-ant-abc123"}}"#;
+        let token = extract_token_from_creds(json);
+        assert_eq!(token.as_deref(), Some("sk-ant-abc123"));
+    }
+
+    #[test]
+    fn test_extract_token_whitespace_around_colon() {
+        // Regex allows \s* around the colon
+        let json = r#"{"claudeAiOauth":{"accessToken" : "sk-ant-spaced"}}"#;
+        let token = extract_token_from_creds(json);
+        assert_eq!(token.as_deref(), Some("sk-ant-spaced"));
+    }
+
+    #[test]
+    fn test_extract_token_regex_fallback_with_newlines() {
+        let json = "{\n  \"claudeAiOauth\": {\n    \"accessToken\": \"sk-ant-newline\"\n  },\n  \"broken\": \"\x00\"\n}";
+        let token = extract_token_from_creds(json);
+        assert_eq!(token.as_deref(), Some("sk-ant-newline"));
     }
 }

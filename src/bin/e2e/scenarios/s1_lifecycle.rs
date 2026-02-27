@@ -254,7 +254,7 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
     tracing::info!("S1-D: Waiting for PR creation");
     let pr_url = wait::wait_for_pr(&db, &issue_id, ctx.timeout()).await?;
 
-    let pr_number = ctx
+    let mut pr_number = ctx
         .scm
         .parse_pr_number(&pr_url)
         .context("parse PR number from URL")?;
@@ -318,6 +318,9 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         )
         .await?;
 
+        // Re-fetch current PR number — review processing may create a new PR
+        pr_number = refresh_pr_number(ctx, &db, &issue_id, pr_number, cleanup).await;
+
         tracing::info!("S1-E2: Posting review with inline comments (no @claudear tag)");
 
         let exec_count_before = db
@@ -355,6 +358,9 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             },
         )
         .await?;
+
+        // Re-fetch current PR number — review processing may create a new PR
+        pr_number = refresh_pr_number(ctx, &db, &issue_id, pr_number, cleanup).await;
 
         tracing::info!("S1-E3: Posting review with inline comments (with @claudear tag)");
 
@@ -394,6 +400,9 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         )
         .await?;
 
+        // Re-fetch current PR number — review processing may create a new PR
+        pr_number = refresh_pr_number(ctx, &db, &issue_id, pr_number, cleanup).await;
+
         tracing::info!("S1-F: Posting request_changes review");
 
         let exec_count_before = db
@@ -431,6 +440,9 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             }
         }
 
+        // Re-fetch current PR number — review processing may create a new PR
+        pr_number = refresh_pr_number(ctx, &db, &issue_id, pr_number, cleanup).await;
+
         tracing::info!("S1-G: Approving PR");
         match reviewer_scm
             .post_review(ctx.repo, pr_number, PostReviewAction::Approve, "LGTM")
@@ -442,6 +454,14 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
             }
         }
     }
+
+    // Ensure bug label is set right before merge so is_bug() returns true
+    // for regression watch creation (labels may not propagate from all sources).
+    tracing::info!("Ensuring 'bug' label on fix_attempts for regression watch");
+    db.exec(&format!(
+        "UPDATE fix_attempts SET issue_labels='[\"bug\",\"claudear-e2e\"]' WHERE issue_id='{}'",
+        issue_id.replace('\'', "''")
+    ))?;
 
     tracing::info!("S1-H: Merging PR");
     ctx.scm
@@ -504,6 +524,43 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
 
     tracing::info!("S1: All checkpoints passed!");
     Ok(())
+}
+
+/// Re-fetch the current PR number from fix_attempts. Review processing may
+/// cause Claude to create a new PR, so we need to track the latest one.
+async fn refresh_pr_number(
+    ctx: &ScenarioContext<'_>,
+    db: &E2eDb,
+    issue_id: &str,
+    current: i64,
+    cleanup: &mut CleanupTracker,
+) -> i64 {
+    let sql = format!(
+        "SELECT pr_url FROM fix_attempts WHERE issue_id = '{}' AND pr_url IS NOT NULL AND pr_url != '' ORDER BY id DESC LIMIT 1",
+        issue_id.replace('\'', "''")
+    );
+    let new_number = db
+        .query(&sql)
+        .ok()
+        .and_then(|url| {
+            let url = url.trim().to_string();
+            ctx.scm.parse_pr_number(&url)
+        })
+        .unwrap_or(current);
+
+    if new_number != current {
+        tracing::info!(
+            old_pr = current,
+            new_pr = new_number,
+            "PR changed during review processing, tracking new PR"
+        );
+        cleanup.track_pr(ctx.repo, new_number);
+        if let Ok(branch) = ctx.scm.get_pr_branch(ctx.repo, new_number).await {
+            cleanup.track_branch(ctx.repo, &branch);
+        }
+    }
+
+    new_number
 }
 
 fn build_reviewer_scm(
