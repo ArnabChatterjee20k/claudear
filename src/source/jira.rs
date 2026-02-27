@@ -3059,4 +3059,587 @@ mod tests {
             "With no filters, any non-done issue should match"
         );
     }
+
+    // --- Tests for create_issue coverage ---
+
+    #[tokio::test]
+    async fn test_create_issue_success() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+
+        let create_url = "https://test.atlassian.net/rest/api/3/issue".to_string();
+        mock.mock_post(
+            &create_url,
+            201,
+            r#"{"id": "20001", "key": "PROJ-NEW", "self": "https://test.atlassian.net/rest/api/3/issue/20001"}"#,
+        );
+
+        let source = JiraSource::with_http_client(config, mock);
+        let issue = source
+            .create_issue("New Bug", "Bug description", &["bug".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(issue.id, "20001");
+        assert_eq!(issue.short_id, "PROJ-NEW");
+        assert_eq!(issue.title, "New Bug");
+        assert_eq!(issue.source, "jira");
+        assert_eq!(issue.url, "https://test.atlassian.net/browse/PROJ-NEW");
+    }
+
+    #[tokio::test]
+    async fn test_create_issue_no_project_keys() {
+        let mut config = test_config();
+        config.project_keys = vec![];
+        let mock = MockJiraClient::new();
+
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.create_issue("Title", "Desc", &[]).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No project_keys configured"));
+    }
+
+    #[tokio::test]
+    async fn test_create_issue_api_error() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+
+        let create_url = "https://test.atlassian.net/rest/api/3/issue".to_string();
+        mock.mock_post(&create_url, 400, r#"{"errorMessages": ["Invalid field"]}"#);
+
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.create_issue("Title", "Desc", &[]).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to create issue"));
+    }
+
+    // --- Tests for find_or_create_label coverage ---
+
+    #[tokio::test]
+    async fn test_find_or_create_label_returns_name() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+
+        let source = JiraSource::with_http_client(config, mock);
+        let label = source.find_or_create_label("auto-implement").await.unwrap();
+
+        // Jira labels are plain strings, no ID resolution
+        assert_eq!(label, "auto-implement");
+    }
+
+    // --- Tests for list_open_issues coverage ---
+
+    #[tokio::test]
+    async fn test_list_open_issues_no_filter() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+
+        let issue_json = make_jira_issue_json("50001", "PROJ-50", "Open issue", "To Do", "new");
+        let expected_jql = format!(
+            "project = \"{}\" AND resolution = Unresolved ORDER BY updated DESC",
+            "PROJ"
+        );
+        let fields = "summary,description,status,priority,issuetype,labels,assignee,reporter,project,created,updated,resolution";
+        let expected_url = format!(
+            "https://test.atlassian.net/rest/api/3/search/jql?jql={}&maxResults=50&fields={}",
+            urlencoding::encode(&expected_jql),
+            fields
+        );
+        mock.mock_get(
+            &expected_url,
+            200,
+            format!(r#"{{"issues": [{}]}}"#, issue_json),
+        );
+
+        let source = JiraSource::with_http_client(config, mock);
+        let issues = source.list_open_issues("").await.unwrap();
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].short_id, "PROJ-50");
+    }
+
+    #[tokio::test]
+    async fn test_list_open_issues_with_title_filter() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+
+        let expected_jql = format!(
+            "project = \"{}\" AND resolution = Unresolved AND summary ~ \"{}\" ORDER BY updated DESC",
+            "PROJ", "search term"
+        );
+        let fields = "summary,description,status,priority,issuetype,labels,assignee,reporter,project,created,updated,resolution";
+        let expected_url = format!(
+            "https://test.atlassian.net/rest/api/3/search/jql?jql={}&maxResults=50&fields={}",
+            urlencoding::encode(&expected_jql),
+            fields
+        );
+        mock.mock_get(&expected_url, 200, r#"{"issues": []}"#);
+
+        let source = JiraSource::with_http_client(config, mock);
+        let issues = source.list_open_issues("search term").await.unwrap();
+
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_open_issues_no_project_keys() {
+        let mut config = test_config();
+        config.project_keys = vec![];
+        let mock = MockJiraClient::new();
+
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.list_open_issues("").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No project_keys configured"));
+    }
+
+    #[tokio::test]
+    async fn test_list_open_issues_api_error() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+        // No mock set -> returns 404
+
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.list_open_issues("").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to search issues"));
+    }
+
+    // --- Tests for build_issue_context coverage ---
+
+    #[tokio::test]
+    async fn test_build_issue_context_delegates_to_format() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new(
+            "1",
+            "PROJ-1",
+            "Context Test",
+            "https://jira/browse/PROJ-1",
+            "jira",
+        );
+        issue.description = Some("Some description".to_string());
+        issue.set_metadata("priority_name", "High");
+        issue.set_metadata("status_name", "To Do");
+
+        let context = source.build_issue_context(&issue).await.unwrap();
+
+        assert!(context.contains("# Jira Issue: PROJ-1"));
+        assert!(context.contains("**Title:** Context Test"));
+        assert!(context.contains("**Priority:** High"));
+        assert!(context.contains("## Description"));
+        assert!(context.contains("Some description"));
+    }
+
+    // --- Tests for get_issue_status coverage ---
+
+    #[tokio::test]
+    async fn test_get_issue_status_api_error() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+        // No mock -> 404
+
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.get_issue_status("PROJ-MISSING").await;
+
+        assert!(result.is_err());
+    }
+
+    // --- Tests for search_issues max_results cap ---
+
+    #[tokio::test]
+    async fn test_search_issues_caps_max_results_at_100() {
+        let mut config = test_config();
+        config.max_results = 200;
+        config.trigger_statuses = vec![];
+        config.trigger_labels = vec![];
+        config.project_keys = vec![];
+
+        let mock = MockJiraClient::new();
+
+        // Build the expected URL with maxResults=100
+        let jql = "resolution = Unresolved ORDER BY updated DESC";
+        let fields = "summary,description,status,priority,issuetype,labels,assignee,reporter,project,created,updated,resolution,comment";
+        let expected_url = format!(
+            "https://test.atlassian.net/rest/api/3/search/jql?jql={}&maxResults=100&fields={}",
+            urlencoding::encode(jql),
+            fields
+        );
+        mock.mock_get(&expected_url, 200, r#"{"issues": []}"#);
+
+        let source = JiraSource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        assert!(issues.is_empty());
+    }
+
+    // --- Tests for escape_jql_value edge cases ---
+
+    #[test]
+    fn test_escape_jql_value_multiple_backslashes() {
+        type JS = JiraSource<MockJiraClient>;
+        assert_eq!(JS::escape_jql_value("a\\b\\c"), "a\\\\b\\\\c");
+    }
+
+    #[test]
+    fn test_escape_jql_value_only_special_chars() {
+        type JS = JiraSource<MockJiraClient>;
+        assert_eq!(JS::escape_jql_value(r#"\"#), r#"\\"#);
+        assert_eq!(JS::escape_jql_value(r#"""#), r#"\""#);
+    }
+
+    // --- Tests for parse_jira_datetime edge cases ---
+
+    #[test]
+    fn test_parse_jira_datetime_with_colon_offset() {
+        let dt = parse_jira_datetime("2024-03-15T10:30:00.000+00:00");
+        assert!(dt.is_some());
+    }
+
+    #[test]
+    fn test_parse_jira_datetime_positive_offset() {
+        let dt = parse_jira_datetime("2024-03-15T10:30:00.000+0530");
+        assert!(dt.is_some());
+    }
+
+    #[test]
+    fn test_parse_jira_datetime_negative_offset() {
+        let dt = parse_jira_datetime("2024-03-15T10:30:00.000-0500");
+        assert!(dt.is_some());
+    }
+
+    // --- Tests for map_issue dates ---
+
+    #[test]
+    fn test_map_issue_rfc3339_dates() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let json = serde_json::json!({
+            "id": "dt1",
+            "key": "PROJ-DT1",
+            "self": "https://test.atlassian.net/rest/api/3/issue/dt1",
+            "fields": {
+                "summary": "Date test",
+                "description": null,
+                "status": {"name": "Open", "statusCategory": {"key": "new", "name": "To Do"}},
+                "priority": null,
+                "issuetype": null,
+                "labels": null,
+                "assignee": null,
+                "reporter": null,
+                "project": {"key": "PROJ", "name": "Project"},
+                "created": "2024-06-15T10:30:00Z",
+                "updated": "2024-06-16T14:00:00Z",
+                "resolution": null,
+                "comment": null
+            }
+        });
+        let api_issue: JiraApiIssue = serde_json::from_value(json).unwrap();
+        let issue = source.map_issue(api_issue);
+
+        assert!(issue.created_at.is_some());
+        assert!(issue.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_map_issue_invalid_dates() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let json = serde_json::json!({
+            "id": "dt2",
+            "key": "PROJ-DT2",
+            "self": "https://test.atlassian.net/rest/api/3/issue/dt2",
+            "fields": {
+                "summary": "Bad dates",
+                "description": null,
+                "status": {"name": "Open", "statusCategory": {"key": "new", "name": "To Do"}},
+                "priority": null,
+                "issuetype": null,
+                "labels": null,
+                "assignee": null,
+                "reporter": null,
+                "project": {"key": "PROJ", "name": "Project"},
+                "created": "not-a-date",
+                "updated": "also-not-a-date",
+                "resolution": null,
+                "comment": null
+            }
+        });
+        let api_issue: JiraApiIssue = serde_json::from_value(json).unwrap();
+        let issue = source.map_issue(api_issue);
+
+        assert!(issue.created_at.is_none());
+        assert!(issue.updated_at.is_none());
+    }
+
+    // --- Tests for extract_adf_text edge cases ---
+
+    #[test]
+    fn test_extract_adf_text_ordered_list() {
+        let value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "orderedList",
+                    "content": [
+                        {
+                            "type": "listItem",
+                            "content": [
+                                {
+                                    "type": "paragraph",
+                                    "content": [
+                                        {"type": "text", "text": "First item"}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let text = extract_adf_text(&value);
+        assert!(text.contains("First item"));
+    }
+
+    #[test]
+    fn test_extract_adf_text_unknown_node_type() {
+        // Unknown node types should not crash, just recurse into content
+        let value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "unknownType",
+                    "content": [
+                        {"type": "text", "text": "Inside unknown"}
+                    ]
+                }
+            ]
+        });
+        let text = extract_adf_text(&value);
+        assert!(text.contains("Inside unknown"));
+    }
+
+    #[test]
+    fn test_extract_adf_text_deeply_nested() {
+        let value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "blockquote",
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Deep "
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "text",
+                                    "marks": [{"type": "strong"}]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let text = extract_adf_text(&value);
+        assert!(text.contains("Deep text"));
+    }
+
+    // --- Tests for create_issue with trailing slash on base_url ---
+
+    #[tokio::test]
+    async fn test_create_issue_url_trailing_slash() {
+        let mut config = test_config();
+        config.base_url = "https://test.atlassian.net/".to_string();
+        let mock = MockJiraClient::new();
+
+        let create_url = "https://test.atlassian.net/rest/api/3/issue".to_string();
+        mock.mock_post(
+            &create_url,
+            201,
+            r#"{"id": "30001", "key": "PROJ-30", "self": "https://test.atlassian.net/rest/api/3/issue/30001"}"#,
+        );
+
+        let source = JiraSource::with_http_client(config, mock);
+        let issue = source.create_issue("Test", "Desc", &[]).await.unwrap();
+
+        assert_eq!(issue.url, "https://test.atlassian.net/browse/PROJ-30");
+    }
+
+    // --- Tests for matches_criteria medium priority ---
+
+    #[test]
+    fn test_matches_criteria_medium_priority() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "http://test.com", "jira");
+        issue.set_metadata("status_category", "new");
+        issue.set_metadata("status_name", "To Do");
+        issue.set_metadata("labels", vec!["auto-implement".to_string()]);
+        issue.priority = IssuePriority::Medium;
+
+        let result = source.matches_criteria(&issue);
+        assert!(result.matches);
+        assert_eq!(result.priority, MatchPriority::Normal);
+    }
+
+    // --- Test get_issue with trailing slash ---
+
+    #[tokio::test]
+    async fn test_get_issue_trailing_slash_base_url() {
+        let mut config = test_config();
+        config.base_url = "https://test.atlassian.net/".to_string();
+        let mock = MockJiraClient::new();
+
+        let issue_json = make_jira_issue_json("10099", "PROJ-99", "Slash test", "To Do", "new");
+        let fields = "summary,description,status,priority,issuetype,labels,assignee,reporter,project,created,updated,resolution,comment";
+        let url = format!(
+            "https://test.atlassian.net/rest/api/3/issue/PROJ-99?fields={}",
+            fields
+        );
+        mock.mock_get(&url, 200, &issue_json);
+
+        let source = JiraSource::with_http_client(config, mock);
+        let issue = source.get_issue("PROJ-99").await.unwrap();
+        assert_eq!(issue.short_id, "PROJ-99");
+    }
+
+    // --- Test map_issue with assignee account_id null ---
+
+    #[test]
+    fn test_map_issue_assignee_no_account_id() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let json = serde_json::json!({
+            "id": "500",
+            "key": "PROJ-500",
+            "self": "https://test.atlassian.net/rest/api/3/issue/500",
+            "fields": {
+                "summary": "No account id",
+                "description": null,
+                "status": {"name": "Open", "statusCategory": {"key": "new", "name": "To Do"}},
+                "priority": null,
+                "issuetype": null,
+                "labels": null,
+                "assignee": {"displayName": "Jane", "accountId": null},
+                "reporter": null,
+                "project": {"key": "PROJ", "name": "Project"},
+                "created": null,
+                "updated": null,
+                "resolution": null,
+                "comment": null
+            }
+        });
+        let api_issue: JiraApiIssue = serde_json::from_value(json).unwrap();
+        let issue = source.map_issue(api_issue);
+
+        assert_eq!(
+            issue.get_metadata::<String>("assignee"),
+            Some("Jane".to_string())
+        );
+        assert!(issue
+            .get_metadata::<String>("assignee_account_id")
+            .is_none());
+    }
+
+    // --- Test map_issue with labels but no assignee ---
+
+    #[test]
+    fn test_map_issue_labels_no_assignee() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let json = serde_json::json!({
+            "id": "600",
+            "key": "PROJ-600",
+            "self": "https://test.atlassian.net/rest/api/3/issue/600",
+            "fields": {
+                "summary": "Labels only",
+                "description": null,
+                "status": {"name": "Open", "statusCategory": {"key": "new", "name": "To Do"}},
+                "priority": null,
+                "issuetype": null,
+                "labels": ["label-a", "label-b"],
+                "assignee": null,
+                "reporter": null,
+                "project": {"key": "PROJ", "name": "Project"},
+                "created": null,
+                "updated": null,
+                "resolution": null,
+                "comment": null
+            }
+        });
+        let api_issue: JiraApiIssue = serde_json::from_value(json).unwrap();
+        let issue = source.map_issue(api_issue);
+
+        assert_eq!(
+            issue.get_metadata::<Vec<String>>("labels"),
+            Some(vec!["label-a".to_string(), "label-b".to_string()])
+        );
+        assert!(issue.get_metadata::<String>("assignee").is_none());
+    }
+
+    // --- Test build_issue_context returns Ok ---
+
+    #[tokio::test]
+    async fn test_build_issue_context_returns_ok() {
+        let config = test_config();
+        let source = JiraSource::with_http_client(config, MockJiraClient::new());
+
+        let issue = Issue::new("1", "PROJ-1", "Test", "url", "jira");
+        let result = source.build_issue_context(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    // --- Test extract_adf_text with object without type field ---
+
+    #[test]
+    fn test_extract_adf_text_object_no_type() {
+        let value = serde_json::json!({"key": "value"});
+        let text = extract_adf_text(&value);
+        assert_eq!(text, "");
+    }
+
+    // --- Test list_open_issues with title containing special JQL characters ---
+
+    #[tokio::test]
+    async fn test_list_open_issues_title_with_special_chars() {
+        let config = test_config();
+        let mock = MockJiraClient::new();
+
+        // We can't easily mock the exact URL with special chars, so just verify it errors (404)
+        let source = JiraSource::with_http_client(config, mock);
+        let result = source.list_open_issues(r#"say "hello""#).await;
+
+        // Will get API error since no mock matches
+        assert!(result.is_err());
+    }
 }

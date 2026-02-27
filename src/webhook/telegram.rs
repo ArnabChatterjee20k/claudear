@@ -131,7 +131,7 @@ impl WebhookHandler for TelegramWebhookHandler {
     fn verify_signature(&self, _payload: &[u8], headers: &HashMap<String, String>) -> bool {
         // Telegram webhook signatures are optional. If a secret token is present in env,
         // require the matching `X-Telegram-Bot-Api-Secret-Token` header.
-        let secret = std::env::var("TELEGRAM_WEBHOOK_SECRET").ok();
+        let secret = std::env::var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET").ok();
         let secret = secret.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let Some(secret) = secret else {
             return true;
@@ -203,5 +203,255 @@ impl WebhookHandler for TelegramWebhookHandler {
             context.push_str(&format!("Author ID: {}\n", author_id));
         }
         Ok(context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TelegramConfig;
+
+    fn make_handler(listen_chat_id: Option<&str>) -> TelegramWebhookHandler {
+        TelegramWebhookHandler::new(TelegramConfig {
+            listen_chat_id: listen_chat_id.map(|s| s.to_string()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_source_name() {
+        let handler = make_handler(None);
+        assert_eq!(handler.source_name(), "telegram");
+    }
+
+    #[test]
+    fn test_listen_chat_id_from_listen_field() {
+        let handler = make_handler(Some("-1001234567890"));
+        assert_eq!(handler.listen_chat_id(), Some(-1001234567890));
+    }
+
+    #[test]
+    fn test_listen_chat_id_falls_back_to_chat_id() {
+        let handler = TelegramWebhookHandler::new(TelegramConfig {
+            chat_id: Some("-1001234567890".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(handler.listen_chat_id(), Some(-1001234567890));
+    }
+
+    #[test]
+    fn test_listen_chat_id_none() {
+        let handler = make_handler(None);
+        assert_eq!(handler.listen_chat_id(), None);
+    }
+
+    #[test]
+    fn test_listen_chat_id_invalid_parse() {
+        let handler = make_handler(Some("not-a-number"));
+        assert_eq!(handler.listen_chat_id(), None);
+    }
+
+    #[test]
+    fn test_message_url_supergroup() {
+        let url = TelegramWebhookHandler::message_url(-1001234567890, 42);
+        assert_eq!(url, "https://t.me/c/1234567890/42");
+    }
+
+    #[test]
+    fn test_message_url_regular_chat() {
+        let url = TelegramWebhookHandler::message_url(12345, 42);
+        assert_eq!(url, "");
+    }
+
+    #[test]
+    fn test_extract_title_short() {
+        assert_eq!(
+            TelegramWebhookHandler::extract_title("Short title"),
+            "Short title"
+        );
+    }
+
+    #[test]
+    fn test_extract_title_multiline() {
+        assert_eq!(
+            TelegramWebhookHandler::extract_title("First\nSecond"),
+            "First"
+        );
+    }
+
+    #[test]
+    fn test_extract_title_long() {
+        let long = "a".repeat(200);
+        let title = TelegramWebhookHandler::extract_title(&long);
+        assert!(title.len() <= 103);
+        assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_verify_signature_no_env_secret() {
+        // When no CLAUDEAR_TELEGRAM_WEBHOOK_SECRET env, should accept any request
+        std::env::remove_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET");
+        let handler = make_handler(None);
+        assert!(handler.verify_signature(b"any", &HashMap::new()));
+    }
+
+    #[test]
+    fn test_verify_signature_with_env_secret_missing_header() {
+        std::env::set_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET", "mysecret");
+        let handler = make_handler(None);
+        assert!(!handler.verify_signature(b"any", &HashMap::new()));
+        std::env::remove_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET");
+    }
+
+    #[test]
+    fn test_verify_signature_with_env_secret_correct() {
+        std::env::set_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET", "mysecret");
+        let handler = make_handler(None);
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "mysecret".to_string(),
+        );
+        assert!(handler.verify_signature(b"any", &headers));
+        std::env::remove_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET");
+    }
+
+    #[test]
+    fn test_verify_signature_with_env_secret_wrong() {
+        std::env::set_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET", "mysecret");
+        let handler = make_handler(None);
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "wrong".to_string(),
+        );
+        assert!(!handler.verify_signature(b"any", &headers));
+        std::env::remove_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET");
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_no_message() {
+        let handler = make_handler(None);
+        let payload = serde_json::json!({"update_id": 123});
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_wrong_chat_id() {
+        let handler = make_handler(Some("-1001111111111"));
+        let payload = serde_json::json!({
+            "message": {
+                "message_id": 1,
+                "chat": {"id": -1002222222222_i64},
+                "from": {"id": 100, "is_bot": false},
+                "text": "hello"
+            }
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_from_bot() {
+        let handler = make_handler(None);
+        let payload = serde_json::json!({
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 123},
+                "from": {"id": 100, "is_bot": true},
+                "text": "hello"
+            }
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_empty_text() {
+        let handler = make_handler(None);
+        let payload = serde_json::json!({
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 123},
+                "from": {"id": 100, "is_bot": false},
+                "text": "  "
+            }
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_no_text() {
+        let handler = make_handler(None);
+        let payload = serde_json::json!({
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 123},
+                "from": {"id": 100, "is_bot": false}
+            }
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_valid_message() {
+        let handler = make_handler(None);
+        let payload = serde_json::json!({
+            "message": {
+                "message_id": 42,
+                "chat": {"id": -1001234567890_i64},
+                "from": {"id": 100, "is_bot": false, "username": "testuser"},
+                "text": "Bug: something broke",
+                "date": 1700000000
+            }
+        });
+        let issue = handler.parse_payload(&payload).await.unwrap().unwrap();
+        assert_eq!(issue.source, "telegram");
+        assert_eq!(issue.short_id, "TG-42");
+        assert_eq!(issue.title, "Bug: something broke");
+        assert_eq!(
+            issue.get_metadata::<i64>("chat_id").unwrap(),
+            -1001234567890
+        );
+        assert_eq!(issue.get_metadata::<i64>("message_id").unwrap(), 42);
+        assert_eq!(issue.get_metadata::<i64>("author_id").unwrap(), 100);
+        assert_eq!(
+            issue.get_metadata::<String>("author_username").unwrap(),
+            "testuser"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_valid_no_username() {
+        let handler = make_handler(None);
+        let payload = serde_json::json!({
+            "message": {
+                "message_id": 10,
+                "chat": {"id": 123},
+                "from": {"id": 200, "is_bot": false},
+                "text": "hello world"
+            }
+        });
+        let issue = handler.parse_payload(&payload).await.unwrap().unwrap();
+        assert!(issue.get_metadata::<String>("author_username").is_none());
+    }
+
+    #[test]
+    fn test_matches_criteria() {
+        let handler = make_handler(None);
+        let issue = Issue::new("1", "TG-1", "title", "url", "telegram");
+        assert!(handler.matches_criteria(&issue).matches);
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context() {
+        let handler = make_handler(None);
+        let mut issue = Issue::new("1", "TG-1", "Bug title", "url", "telegram");
+        issue.description = Some("Details here".to_string());
+        issue.set_metadata("author_username", "bob");
+        issue.set_metadata("author_id", 42i64);
+        let ctx = handler.build_issue_context(&issue).await.unwrap();
+        assert!(ctx.contains("Bug title"));
+        assert!(ctx.contains("Details here"));
+        assert!(ctx.contains("bob"));
+        assert!(ctx.contains("42"));
     }
 }

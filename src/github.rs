@@ -1013,6 +1013,117 @@ mod tests {
                 })
             }
         }
+
+        async fn post(
+            &self,
+            url: &str,
+            headers: Vec<(&str, String)>,
+            _body: &str,
+        ) -> Result<HttpResponse> {
+            let owned_headers: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            self.requests
+                .lock()
+                .unwrap()
+                .push((url.to_string(), owned_headers));
+
+            let responses = self.responses.lock().unwrap();
+            if let Some(response) = responses.get(url) {
+                Ok(HttpResponse {
+                    status: response.status,
+                    body: response.body.clone(),
+                })
+            } else {
+                Ok(HttpResponse {
+                    status: 404,
+                    body: "Not found".to_string(),
+                })
+            }
+        }
+
+        async fn put(
+            &self,
+            url: &str,
+            headers: Vec<(&str, String)>,
+            _body: &str,
+        ) -> Result<HttpResponse> {
+            let owned_headers: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            self.requests
+                .lock()
+                .unwrap()
+                .push((url.to_string(), owned_headers));
+
+            let responses = self.responses.lock().unwrap();
+            if let Some(response) = responses.get(url) {
+                Ok(HttpResponse {
+                    status: response.status,
+                    body: response.body.clone(),
+                })
+            } else {
+                Ok(HttpResponse {
+                    status: 404,
+                    body: "Not found".to_string(),
+                })
+            }
+        }
+
+        async fn patch(
+            &self,
+            url: &str,
+            headers: Vec<(&str, String)>,
+            _body: &str,
+        ) -> Result<HttpResponse> {
+            let owned_headers: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            self.requests
+                .lock()
+                .unwrap()
+                .push((url.to_string(), owned_headers));
+
+            let responses = self.responses.lock().unwrap();
+            if let Some(response) = responses.get(url) {
+                Ok(HttpResponse {
+                    status: response.status,
+                    body: response.body.clone(),
+                })
+            } else {
+                Ok(HttpResponse {
+                    status: 404,
+                    body: "Not found".to_string(),
+                })
+            }
+        }
+
+        async fn delete(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+            let owned_headers: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            self.requests
+                .lock()
+                .unwrap()
+                .push((url.to_string(), owned_headers));
+
+            let responses = self.responses.lock().unwrap();
+            if let Some(response) = responses.get(url) {
+                Ok(HttpResponse {
+                    status: response.status,
+                    body: response.body.clone(),
+                })
+            } else {
+                Ok(HttpResponse {
+                    status: 404,
+                    body: "Not found".to_string(),
+                })
+            }
+        }
     }
 
     #[test]
@@ -3658,5 +3769,1136 @@ mod tests {
         let repos = provider.list_repos("test-org").await.unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].full_name, "test-org/repo1");
+    }
+
+    fn test_config() -> GitHubConfig {
+        GitHubConfig {
+            token: Some("test_token".into()),
+            poll_interval_ms: 60000,
+            auto_resolve_on_merge: true,
+            webhook_secret: None,
+            review_trigger: "@claudear".to_string(),
+            use_ssh: false,
+            ..Default::default()
+        }
+    }
+
+    // --- merge_pr tests ---
+
+    #[tokio::test]
+    async fn test_merge_pr_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/merge",
+            200,
+            r#"{"sha": "abc123", "merged": true}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.merge_pr("owner/repo", 1).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/merge",
+            405,
+            "Pull Request is not mergeable",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.merge_pr("owner/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to merge"),
+            "error should mention merge failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.merge_pr("owner/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_conflict() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/5/merge",
+            409,
+            r#"{"message": "Head branch was modified"}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.merge_pr("owner/repo", 5).await;
+        assert!(result.is_err());
+    }
+
+    // --- close_pr tests ---
+
+    #[tokio::test]
+    async fn test_close_pr_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            200,
+            r#"{"number": 1, "state": "closed"}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.close_pr("owner/repo", 1).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_close_pr_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.close_pr("owner/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to close PR"),
+            "error should mention close failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_close_pr_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.close_pr("owner/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- delete_branch tests ---
+
+    #[tokio::test]
+    async fn test_delete_branch_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/git/refs/heads/feature-branch",
+            204,
+            "",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.delete_branch("owner/repo", "feature-branch").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_branch_not_found_is_ok() {
+        let mock = MockHttpClient::new();
+        // Branch already deleted -- 404 should be treated as success
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/git/refs/heads/gone",
+            404,
+            "Reference does not exist",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.delete_branch("owner/repo", "gone").await;
+        assert!(
+            result.is_ok(),
+            "404 on delete_branch should be treated as success"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_branch_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/git/refs/heads/protected",
+            422,
+            "Cannot delete a protected branch",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.delete_branch("owner/repo", "protected").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to delete branch"),
+            "error should mention delete failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_branch_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.delete_branch("owner/repo", "branch").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- post_review tests ---
+
+    #[tokio::test]
+    async fn test_post_review_comment_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"{"id": 1}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review("owner/repo", 1, PostReviewAction::Comment, "Looks good")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_post_review_approve_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"{"id": 2}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review("owner/repo", 1, PostReviewAction::Approve, "LGTM")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_post_review_request_changes_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"{"id": 3}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review(
+                "owner/repo",
+                1,
+                PostReviewAction::RequestChanges,
+                "Please fix",
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_post_review_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            422,
+            "Validation failed",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review("owner/repo", 1, PostReviewAction::Comment, "text")
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to post review"),
+            "error should mention review failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_review_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client
+            .post_review("owner/repo", 1, PostReviewAction::Comment, "hi")
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- post_review_with_comments tests ---
+
+    #[tokio::test]
+    async fn test_post_review_with_comments_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"{"id": 10}"#,
+        );
+
+        let comments = vec![
+            InlineReviewComment {
+                path: "src/main.rs".to_string(),
+                body: "Fix this line".to_string(),
+                position: Some(42),
+            },
+            InlineReviewComment {
+                path: "src/lib.rs".to_string(),
+                body: "Add a test".to_string(),
+                position: None,
+            },
+        ];
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review_with_comments(
+                "owner/repo",
+                1,
+                PostReviewAction::RequestChanges,
+                "Please address these",
+                &comments,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_post_review_with_comments_empty_comments() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            200,
+            r#"{"id": 11}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review_with_comments("owner/repo", 1, PostReviewAction::Comment, "Body text", &[])
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_post_review_with_comments_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/reviews",
+            422,
+            "Validation failed",
+        );
+
+        let comments = vec![InlineReviewComment {
+            path: "file.rs".to_string(),
+            body: "Fix".to_string(),
+            position: Some(1),
+        }];
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review_with_comments(
+                "owner/repo",
+                1,
+                PostReviewAction::Comment,
+                "body",
+                &comments,
+            )
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to post review with comments"),
+            "error should mention comments failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_review_with_comments_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client
+            .post_review_with_comments("owner/repo", 1, PostReviewAction::Comment, "body", &[])
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- list_open_prs tests ---
+
+    #[tokio::test]
+    async fn test_list_open_prs_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100",
+            200,
+            r#"[
+                {"number": 1, "title": "Feature A", "head": {"ref": "feature-a"}, "html_url": "https://github.com/owner/repo/pull/1"},
+                {"number": 2, "title": "Fix B", "head": {"ref": "fix-b"}, "html_url": "https://github.com/owner/repo/pull/2"}
+            ]"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let prs = client.list_open_prs("owner/repo").await.unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 1);
+        assert_eq!(prs[0].title, "Feature A");
+        assert_eq!(prs[0].branch, "feature-a");
+        assert!(prs[0].url.contains("pull/1"));
+        assert_eq!(prs[1].number, 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_open_prs_empty() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100",
+            200,
+            "[]",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let prs = client.list_open_prs("owner/repo").await.unwrap();
+        assert!(prs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_open_prs_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.list_open_prs("owner/repo").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to list open PRs"),
+            "error should mention list failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_open_prs_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.list_open_prs("owner/repo").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- get_latest_release tests ---
+
+    #[tokio::test]
+    async fn test_get_latest_release_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/releases/latest",
+            200,
+            r#"{
+                "tag_name": "v1.0.0",
+                "name": "Release 1.0.0",
+                "html_url": "https://github.com/owner/repo/releases/tag/v1.0.0",
+                "published_at": "2025-01-01T00:00:00Z"
+            }"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let release = client.get_latest_release("owner/repo").await.unwrap();
+        assert!(release.is_some());
+        let r = release.unwrap();
+        assert_eq!(r.tag, "v1.0.0");
+        assert_eq!(r.name.as_deref(), Some("Release 1.0.0"));
+        assert_eq!(r.url, "https://github.com/owner/repo/releases/tag/v1.0.0");
+        assert_eq!(r.published_at.as_deref(), Some("2025-01-01T00:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_release_no_releases() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/releases/latest",
+            404,
+            "Not Found",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let release = client.get_latest_release("owner/repo").await.unwrap();
+        assert!(release.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_release_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/releases/latest",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.get_latest_release("owner/repo").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to get latest release"),
+            "error should mention release failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_release_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.get_latest_release("owner/repo").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- create_release tests ---
+
+    #[tokio::test]
+    async fn test_create_release_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/releases",
+            201,
+            r#"{
+                "tag_name": "v2.0.0",
+                "name": "Version 2",
+                "html_url": "https://github.com/owner/repo/releases/tag/v2.0.0",
+                "published_at": "2025-06-01T00:00:00Z"
+            }"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let release = client
+            .create_release("owner/repo", "v2.0.0", "Version 2", "Release notes")
+            .await
+            .unwrap();
+        assert_eq!(release.tag, "v2.0.0");
+        assert_eq!(release.name.as_deref(), Some("Version 2"));
+        assert_eq!(
+            release.url,
+            "https://github.com/owner/repo/releases/tag/v2.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_release_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/releases",
+            422,
+            "Validation Failed",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client
+            .create_release("owner/repo", "v1.0.0", "Version 1", "notes")
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to create release"),
+            "error should mention create failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_release_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client
+            .create_release("owner/repo", "v1.0.0", "Version 1", "notes")
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- parse_pr_number tests ---
+
+    #[test]
+    fn test_parse_pr_number_pull_url() {
+        assert_eq!(
+            GitHubClient::<MockHttpClient>::parse_pr_number(
+                "https://github.com/owner/repo/pull/42"
+            ),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_number_pulls_url() {
+        assert_eq!(
+            GitHubClient::<MockHttpClient>::parse_pr_number(
+                "https://github.com/owner/repo/pulls/123"
+            ),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_number_no_match() {
+        assert_eq!(
+            GitHubClient::<MockHttpClient>::parse_pr_number(
+                "https://github.com/owner/repo/issues/5"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_number_empty_string() {
+        assert_eq!(GitHubClient::<MockHttpClient>::parse_pr_number(""), None);
+    }
+
+    #[test]
+    fn test_parse_pr_number_non_numeric() {
+        assert_eq!(
+            GitHubClient::<MockHttpClient>::parse_pr_number(
+                "https://github.com/owner/repo/pull/abc"
+            ),
+            None
+        );
+    }
+
+    // --- list_repo_issues tests ---
+
+    #[tokio::test]
+    async fn test_list_repo_issues_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues?per_page=100&page=1&state=open",
+            200,
+            r#"[
+                {
+                    "number": 1,
+                    "title": "Bug report",
+                    "body": "Something is broken",
+                    "state": "open",
+                    "html_url": "https://github.com/owner/repo/issues/1",
+                    "labels": [{"name": "bug"}],
+                    "user": {"id": 10, "login": "reporter"},
+                    "assignee": null
+                },
+                {
+                    "number": 2,
+                    "title": "PR title",
+                    "body": "This is a PR, not an issue",
+                    "state": "open",
+                    "html_url": "https://github.com/owner/repo/pull/2",
+                    "labels": [],
+                    "user": {"id": 20, "login": "dev"},
+                    "assignee": null,
+                    "pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/2"}
+                }
+            ]"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let issues = client
+            .list_repo_issues("owner/repo", Some("open"), &[])
+            .await
+            .unwrap();
+        // PR (number 2) should be filtered out
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 1);
+        assert_eq!(issues[0].title, "Bug report");
+        assert_eq!(issues[0].labels[0].name, "bug");
+    }
+
+    #[tokio::test]
+    async fn test_list_repo_issues_with_labels() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues?per_page=100&page=1&state=open&labels=bug,urgent",
+            200,
+            "[]",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let labels = vec!["bug".to_string(), "urgent".to_string()];
+        let issues = client
+            .list_repo_issues("owner/repo", Some("open"), &labels)
+            .await
+            .unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_repo_issues_no_state() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues?per_page=100&page=1",
+            200,
+            "[]",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let issues = client
+            .list_repo_issues("owner/repo", None, &[])
+            .await
+            .unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_repo_issues_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues?per_page=100&page=1",
+            403,
+            "Forbidden",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.list_repo_issues("owner/repo", None, &[]).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GitHub API error listing issues"),
+            "error should mention listing failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_repo_issues_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.list_repo_issues("owner/repo", None, &[]).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- get_issue tests ---
+
+    #[tokio::test]
+    async fn test_get_issue_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues/42",
+            200,
+            r#"{
+                "number": 42,
+                "title": "Single issue",
+                "body": "Details here",
+                "state": "open",
+                "html_url": "https://github.com/owner/repo/issues/42",
+                "labels": [{"name": "enhancement"}],
+                "user": {"id": 1, "login": "admin"},
+                "assignee": {"id": 2, "login": "dev"}
+            }"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let issue = client.get_issue("owner/repo", 42).await.unwrap();
+        assert_eq!(issue.number, 42);
+        assert_eq!(issue.title, "Single issue");
+        assert_eq!(issue.body.as_deref(), Some("Details here"));
+        assert_eq!(issue.state, "open");
+        assert_eq!(issue.labels[0].name, "enhancement");
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_not_found() {
+        let mock = MockHttpClient::new();
+        // No mock response -- returns 404 by default
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.get_issue("owner/repo", 999).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Issue not found"),
+            "error should mention issue not found: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues/42",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.get_issue("owner/repo", 42).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GitHub API error"),
+            "error should mention API error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_issue_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.get_issue("owner/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- close_issue tests ---
+
+    #[tokio::test]
+    async fn test_close_issue_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues/42",
+            200,
+            r#"{"number": 42, "state": "closed"}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.close_issue("owner/repo", 42).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_close_issue_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues/42",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.close_issue("owner/repo", 42).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to close issue"),
+            "error should mention close failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_close_issue_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.close_issue("owner/repo", 42).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- add_issue_comment tests ---
+
+    #[tokio::test]
+    async fn test_add_issue_comment_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues/42/comments",
+            201,
+            r#"{"id": 1, "body": "My comment"}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client
+            .add_issue_comment("owner/repo", 42, "My comment")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_add_issue_comment_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/issues/42/comments",
+            403,
+            "Forbidden",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.add_issue_comment("owner/repo", 42, "comment").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to add comment"),
+            "error should mention comment failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_issue_comment_no_token() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.add_issue_comment("owner/repo", 42, "comment").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_org_repos_not_found() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/orgs/nonexistent/repos?per_page=100&page=1",
+            404,
+            "Not Found",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let result = client.list_org_repos("nonexistent").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Organization not found"),
+            "error should mention org not found: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_org_repos_empty() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/orgs/myorg/repos?per_page=100&page=1",
+            200,
+            "[]",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let repos = client.list_org_repos("myorg").await.unwrap();
+        assert!(repos.is_empty());
+    }
+
+    // (test_list_org_repos_success, test_list_org_repos_api_error, test_list_org_repos_no_token already exist above)
+
+    #[tokio::test]
+    async fn test_list_org_repos_filters_archived_with_ssh() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/orgs/myorg/repos?per_page=100&page=1",
+            200,
+            r#"[
+                {
+                    "id": 1,
+                    "full_name": "myorg/active-repo",
+                    "name": "active-repo",
+                    "default_branch": "main",
+                    "clone_url": "https://github.com/myorg/active-repo.git",
+                    "ssh_url": "git@github.com:myorg/active-repo.git",
+                    "html_url": "https://github.com/myorg/active-repo",
+                    "private": true,
+                    "archived": false
+                },
+                {
+                    "id": 2,
+                    "full_name": "myorg/archived-repo",
+                    "name": "archived-repo",
+                    "default_branch": "main",
+                    "clone_url": "https://github.com/myorg/archived-repo.git",
+                    "ssh_url": "git@github.com:myorg/archived-repo.git",
+                    "html_url": "https://github.com/myorg/archived-repo",
+                    "private": false,
+                    "archived": true
+                }
+            ]"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let repos = client.list_org_repos("myorg").await.unwrap();
+        assert_eq!(repos.len(), 1, "archived repos should be filtered out");
+        assert_eq!(repos[0].full_name, "myorg/active-repo");
+        assert!(!repos[0].archived);
+    }
+
+    // Placeholder comment to avoid adjacent duplicate test resolution issues
+    #[tokio::test]
+    async fn test_list_org_repos_no_token_via_direct_method() {
+        let mock = MockHttpClient::new();
+        let client = GitHubClient::with_http_client(GitHubConfig::default(), mock);
+        let result = client.list_org_repos("myorg").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- ScmProvider trait delegation tests ---
+
+    #[tokio::test]
+    async fn test_scm_provider_merge_pr() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1/merge",
+            200,
+            "{}",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let provider: &dyn ScmProvider = &client;
+        let result = provider.merge_pr("owner/repo", 1).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_close_pr() {
+        let mock = MockHttpClient::new();
+        mock.mock_response("https://api.github.com/repos/owner/repo/pulls/1", 200, "{}");
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let provider: &dyn ScmProvider = &client;
+        let result = provider.close_pr("owner/repo", 1).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_delete_branch() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/git/refs/heads/branch",
+            204,
+            "",
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let provider: &dyn ScmProvider = &client;
+        let result = provider.delete_branch("owner/repo", "branch").await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_scm_provider_pr_url_pattern() {
+        let client = GitHubClient::new(test_config());
+        let provider: &dyn ScmProvider = &client;
+        assert_eq!(provider.pr_url_pattern(), "https://github.com/%");
+    }
+
+    #[test]
+    fn test_scm_provider_parse_pr_number() {
+        let client = GitHubClient::new(test_config());
+        let provider: &dyn ScmProvider = &client;
+        assert_eq!(
+            provider.parse_pr_number("https://github.com/owner/repo/pull/99"),
+            Some(99)
+        );
+        assert_eq!(
+            provider.parse_pr_number("https://github.com/owner/repo/issues/5"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_scm_provider_name_is_github() {
+        let client = GitHubClient::new(test_config());
+        let provider: &dyn ScmProvider = &client;
+        assert_eq!(provider.name(), "github");
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_get_pr_branch() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            200,
+            r#"{"state": "open", "merged": false, "head": {"ref": "my-branch"}, "base": {"ref": "main"}}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let provider: &dyn ScmProvider = &client;
+        let branch = provider.get_pr_branch("owner/repo", 1).await.unwrap();
+        assert_eq!(branch, "my-branch");
+    }
+
+    #[tokio::test]
+    async fn test_scm_provider_get_pr_branch_no_head() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            200,
+            r#"{"state": "open", "merged": false}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let provider: &dyn ScmProvider = &client;
+        let result = provider.get_pr_branch("owner/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No head branch"),
+            "error should mention missing branch: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_info_optional_fields_missing() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://api.github.com/repos/owner/repo/pulls/1",
+            200,
+            r#"{"state": "open", "merged": false}"#,
+        );
+
+        let client = GitHubClient::with_http_client(test_config(), mock);
+        let info = client.get_pr_info("owner/repo", 1).await.unwrap();
+        assert!(info.head_branch.is_none());
+        assert!(info.base_branch.is_none());
+        assert!(info.title.is_none());
+        assert!(info.author.is_none());
     }
 }

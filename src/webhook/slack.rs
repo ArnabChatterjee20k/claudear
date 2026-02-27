@@ -182,3 +182,320 @@ impl WebhookHandler for SlackWebhookHandler {
         Ok(context)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SlackSourceConfig;
+    use crate::secret::SecretValue;
+
+    fn make_handler(
+        signing_secret: Option<&str>,
+        channel_id: Option<&str>,
+        workspace: Option<&str>,
+    ) -> SlackWebhookHandler {
+        SlackWebhookHandler::new(SlackSourceConfig {
+            signing_secret: signing_secret.map(SecretValue::from),
+            listen_channel_id: channel_id.map(|s| s.to_string()),
+            workspace: workspace.map(|s| s.to_string()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_source_name() {
+        let handler = make_handler(None, None, None);
+        assert_eq!(handler.source_name(), "slack");
+    }
+
+    #[test]
+    fn test_listen_channel_id_from_listen_field() {
+        let handler = make_handler(None, Some("C123"), None);
+        assert_eq!(handler.listen_channel_id(), Some("C123"));
+    }
+
+    #[test]
+    fn test_listen_channel_id_falls_back_to_channel_id() {
+        let handler = SlackWebhookHandler::new(SlackSourceConfig {
+            channel_id: Some("C456".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(handler.listen_channel_id(), Some("C456"));
+    }
+
+    #[test]
+    fn test_listen_channel_id_none() {
+        let handler = make_handler(None, None, None);
+        assert_eq!(handler.listen_channel_id(), None);
+    }
+
+    #[test]
+    fn test_message_url_with_workspace() {
+        let handler = make_handler(None, None, Some("myworkspace"));
+        let url = handler.message_url("C123", "1234567890.123456");
+        assert_eq!(
+            url,
+            "https://myworkspace.slack.com/archives/C123/p1234567890123456"
+        );
+    }
+
+    #[test]
+    fn test_message_url_without_workspace() {
+        let handler = make_handler(None, None, None);
+        let url = handler.message_url("C123", "1234567890.123456");
+        assert_eq!(url, "https://slack.com/archives/C123/p1234567890123456");
+    }
+
+    #[test]
+    fn test_extract_title_short() {
+        assert_eq!(
+            SlackWebhookHandler::extract_title("Short title"),
+            "Short title"
+        );
+    }
+
+    #[test]
+    fn test_extract_title_multiline() {
+        assert_eq!(
+            SlackWebhookHandler::extract_title("First line\nSecond line"),
+            "First line"
+        );
+    }
+
+    #[test]
+    fn test_extract_title_long_truncates() {
+        let long = "a".repeat(200);
+        let title = SlackWebhookHandler::extract_title(&long);
+        assert!(title.len() <= 103);
+        assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_verify_signature_no_secret() {
+        let handler = make_handler(None, None, None);
+        assert!(!handler.verify_signature(b"payload", &HashMap::new()));
+    }
+
+    #[test]
+    fn test_verify_signature_missing_timestamp() {
+        let handler = make_handler(Some("secret"), None, None);
+        let mut headers = HashMap::new();
+        headers.insert("x-slack-signature".to_string(), "v0=abc".to_string());
+        assert!(!handler.verify_signature(b"payload", &headers));
+    }
+
+    #[test]
+    fn test_verify_signature_missing_signature() {
+        let handler = make_handler(Some("secret"), None, None);
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-slack-request-timestamp".to_string(),
+            Utc::now().timestamp().to_string(),
+        );
+        assert!(!handler.verify_signature(b"payload", &headers));
+    }
+
+    #[test]
+    fn test_verify_signature_invalid_timestamp() {
+        let handler = make_handler(Some("secret"), None, None);
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-slack-request-timestamp".to_string(),
+            "not-a-number".to_string(),
+        );
+        headers.insert("x-slack-signature".to_string(), "v0=abc".to_string());
+        assert!(!handler.verify_signature(b"payload", &headers));
+    }
+
+    #[test]
+    fn test_verify_signature_expired_timestamp() {
+        let handler = make_handler(Some("secret"), None, None);
+        let mut headers = HashMap::new();
+        let old_ts = (Utc::now().timestamp() - 600).to_string(); // 10 min ago
+        headers.insert("x-slack-request-timestamp".to_string(), old_ts);
+        headers.insert("x-slack-signature".to_string(), "v0=abc".to_string());
+        assert!(!handler.verify_signature(b"payload", &headers));
+    }
+
+    #[test]
+    fn test_verify_signature_valid() {
+        let secret = "test_secret";
+        let handler = make_handler(Some(secret), None, None);
+        let payload = b"test_payload";
+        let timestamp = Utc::now().timestamp().to_string();
+
+        // Compute expected signature
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        let base = format!("v0:{}:", timestamp);
+        mac.update(base.as_bytes());
+        mac.update(payload);
+        let expected = format!("v0={}", hex::encode(mac.finalize().into_bytes()));
+
+        let mut headers = HashMap::new();
+        headers.insert("x-slack-request-timestamp".to_string(), timestamp);
+        headers.insert("x-slack-signature".to_string(), expected);
+
+        assert!(handler.verify_signature(payload, &headers));
+    }
+
+    #[test]
+    fn test_verify_signature_wrong_signature() {
+        let handler = make_handler(Some("secret"), None, None);
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-slack-request-timestamp".to_string(),
+            Utc::now().timestamp().to_string(),
+        );
+        headers.insert("x-slack-signature".to_string(), "v0=wrong".to_string());
+        assert!(!handler.verify_signature(b"payload", &headers));
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_url_verification() {
+        let handler = make_handler(None, None, None);
+        let payload = serde_json::json!({"type": "url_verification", "challenge": "abc"});
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_unknown_type() {
+        let handler = make_handler(None, None, None);
+        let payload = serde_json::json!({"type": "unknown"});
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_no_event() {
+        let handler = make_handler(None, None, None);
+        let payload = serde_json::json!({"type": "event_callback"});
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_non_message_event() {
+        let handler = make_handler(None, None, None);
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": {"type": "reaction_added"}
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_bot_message() {
+        let handler = make_handler(None, None, None);
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": {"type": "message", "bot_id": "B123", "channel": "C123", "text": "hi", "ts": "123"}
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_subtype_message() {
+        let handler = make_handler(None, None, None);
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": {"type": "message", "subtype": "channel_join", "channel": "C123", "text": "hi", "ts": "123"}
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_wrong_channel() {
+        let handler = make_handler(None, Some("C999"), None);
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": {"type": "message", "channel": "C123", "text": "hello", "ts": "1234567890.000000"}
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_empty_text() {
+        let handler = make_handler(None, None, None);
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": {"type": "message", "channel": "C123", "text": "  ", "ts": "1234567890.000000"}
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_missing_ts() {
+        let handler = make_handler(None, None, None);
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": {"type": "message", "channel": "C123", "text": "hello"}
+        });
+        assert!(handler.parse_payload(&payload).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_valid_message() {
+        let handler = make_handler(None, None, None);
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "channel": "C123",
+                "text": "Bug: login broken",
+                "ts": "1234567890.000000",
+                "user": "U456"
+            }
+        });
+        let issue = handler.parse_payload(&payload).await.unwrap().unwrap();
+        assert_eq!(issue.source, "slack");
+        assert_eq!(issue.title, "Bug: login broken");
+        assert!(issue.short_id.starts_with("SLACK-"));
+        assert_eq!(issue.get_metadata::<String>("channel_id").unwrap(), "C123");
+        assert_eq!(issue.get_metadata::<String>("author_id").unwrap(), "U456");
+    }
+
+    #[tokio::test]
+    async fn test_parse_payload_valid_message_correct_channel() {
+        let handler = make_handler(None, Some("C123"), None);
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "channel": "C123",
+                "text": "Bug report",
+                "ts": "1234567890.000000"
+            }
+        });
+        let issue = handler.parse_payload(&payload).await.unwrap().unwrap();
+        assert_eq!(issue.source, "slack");
+    }
+
+    #[test]
+    fn test_matches_criteria() {
+        let handler = make_handler(None, None, None);
+        let issue = Issue::new("id", "SHORT-1", "title", "url", "slack");
+        let result = handler.matches_criteria(&issue);
+        assert!(result.matches);
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context() {
+        let handler = make_handler(None, None, None);
+        let mut issue = Issue::new("id", "SLACK-1", "Bug title", "url", "slack");
+        issue.description = Some("Detailed description".to_string());
+        issue.set_metadata("author_id", "U123");
+        issue.set_metadata("channel_id", "C456");
+        let ctx = handler.build_issue_context(&issue).await.unwrap();
+        assert!(ctx.contains("Bug title"));
+        assert!(ctx.contains("Detailed description"));
+        assert!(ctx.contains("U123"));
+        assert!(ctx.contains("C456"));
+    }
+
+    #[tokio::test]
+    async fn test_build_issue_context_no_metadata() {
+        let handler = make_handler(None, None, None);
+        let issue = Issue::new("id", "SLACK-1", "Bug title", "url", "slack");
+        let ctx = handler.build_issue_context(&issue).await.unwrap();
+        assert!(ctx.contains("Bug title"));
+        assert!(!ctx.contains("Author"));
+    }
+}

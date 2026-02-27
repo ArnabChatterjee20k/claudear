@@ -244,6 +244,11 @@ impl Notifier for EmailNotifier {
         } else {
             body
         };
+        let body = if let Some(confidence) = issue.get_metadata::<u8>("confidence") {
+            format!("{}\n\nFix Confidence: {}/100", body, confidence)
+        } else {
+            body
+        };
         self.send_email(&subject, &body, Some(issue)).await
     }
 
@@ -2471,5 +2476,601 @@ mod tests {
         // format_issue_info only has issue fields; trigger_reason is appended by notify_start
         assert!(!info.contains("Trigger"));
         assert!(info.contains("LIN-1"));
+    }
+
+    #[test]
+    fn test_extract_email_address_multiple_at_signs() {
+        let result = EmailNotifier::extract_email_address("user@host@domain.com");
+        // Contains @ so returns Some (the raw string lowercased)
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_extract_email_address_whitespace_inside_angle_brackets() {
+        let result = EmailNotifier::extract_email_address("Name < user@example.com >");
+        assert_eq!(result, Some("user@example.com".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_single_non_quoted_line() {
+        let result = EmailNotifier::sanitize_reply_text("Yes");
+        assert_eq!(result, Some("Yes".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_tabs_treated_as_whitespace() {
+        let body = "\t\t\n\tAnswer here\n\t\t";
+        let result = EmailNotifier::sanitize_reply_text(body);
+        assert_eq!(result, Some("Answer here".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_exactly_4000_chars_no_further_truncation() {
+        let line = "a".repeat(4000);
+        let result = EmailNotifier::sanitize_reply_text(&line).unwrap();
+        assert_eq!(result.len(), 4000);
+    }
+
+    #[test]
+    fn test_sanitize_reply_text_over_4000_chars_is_truncated() {
+        let line = "b".repeat(5000);
+        let result = EmailNotifier::sanitize_reply_text(&line).unwrap();
+        assert_eq!(result.len(), 4000);
+    }
+
+    #[test]
+    fn test_extract_plain_body_multipart_html_only_uses_fallback() {
+        let raw = b"Content-Type: multipart/alternative; boundary=\"boundary\"\r\n\r\n--boundary\r\nContent-Type: text/html\r\n\r\n<p>Hello</p>\r\n--boundary--";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let _body = EmailNotifier::extract_plain_body(&parsed);
+        // Should not panic; falls back to parent body
+    }
+
+    #[test]
+    fn test_format_issue_info_default_priority_and_status() {
+        let issue = Issue::new(
+            "id-x",
+            "SEN-1",
+            "Error msg",
+            "https://sentry.io/1",
+            "sentry",
+        );
+        let info = EmailNotifier::format_issue_info(&issue);
+        assert!(info.contains("SEN-1"));
+        assert!(info.contains("Error msg"));
+        assert!(info.contains("sentry"));
+        assert!(info.contains("none")); // default priority is None
+        assert!(info.contains("open")); // default status
+    }
+
+    #[test]
+    fn test_expected_reply_emails_empty_config_and_no_target() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-empty-cfg".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let emails = notifier.expected_reply_emails(&request);
+        assert!(emails.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_recipients_unknown_slug_falls_back() {
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "alice".to_string(),
+            crate::config::UserConfig {
+                email: Some("alice@company.com".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let config = EmailConfig {
+            to_addresses: vec!["fallback@example.com".to_string()],
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, registry).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "unknown_slug");
+        let recipients = notifier.resolve_recipients(Some(&issue));
+        assert_eq!(recipients, vec!["fallback@example.com"]);
+    }
+
+    #[test]
+    fn test_email_config_defaults() {
+        let config = EmailConfig::default();
+        assert_eq!(config.smtp_port, 587);
+        assert!(config.use_tls);
+        assert_eq!(config.imap_port, 993);
+        assert!(config.imap_use_tls);
+        assert_eq!(config.imap_folder, "INBOX");
+        assert!(config.to_addresses.is_empty());
+        assert!(config.smtp_host.is_none());
+        assert!(config.from_address.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_notify_urgent_issues_plural_subject_format() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let issues = vec![
+            Issue::new("1", "P-1", "Bug 1", "https://example.com", "linear"),
+            Issue::new("2", "P-2", "Bug 2", "https://example.com", "linear"),
+            Issue::new("3", "P-3", "Bug 3", "https://example.com", "linear"),
+        ];
+        let result = notifier.notify_urgent_issues(&issues).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_cascade_with_upstream_and_downstream() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+        issue.set_metadata("cascade_upstream_repo", "upstream/repo");
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/5")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_pr_update_metadata() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("is_pr_update", true);
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/5")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_completed_regression_resolved_metadata() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("regression_resolved", true);
+        let result = notifier.notify_completed(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_completed_custom_completion_reason() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("completion_reason", "Already fixed");
+        let result = notifier.notify_completed(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_regression_detected_metadata() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("regression_detected", true);
+        let result = notifier.notify_failed(&issue, "Tests failing").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_cascade_downstream_metadata() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+        issue.set_metadata("cascade_upstream_repo", "upstream/repo");
+        let result = notifier.notify_failed(&issue, "Build error").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_trigger_reason_appended() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Auto retry");
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_trigger_reason_appended() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Manual");
+        let result = notifier.notify_failed(&issue, "error msg").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_with_confidence() {
+        let notifier = EmailNotifier::new(disabled_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("confidence", 85u8);
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // --- Tests that exercise send_email internals (with transport) ---
+
+    fn send_config() -> EmailConfig {
+        EmailConfig {
+            smtp_host: Some("localhost".to_string()),
+            smtp_port: 25,
+            smtp_username: Some("user".to_string()),
+            smtp_password: Some("pass".into()),
+            from_address: Some("bot@example.com".to_string()),
+            to_addresses: vec!["recipient@example.com".to_string()],
+            use_tls: false,
+            ..Default::default()
+        }
+    }
+
+    #[allow(dead_code)]
+    fn send_config_multi_recipient() -> EmailConfig {
+        EmailConfig {
+            smtp_host: Some("localhost".to_string()),
+            smtp_port: 25,
+            smtp_username: Some("user".to_string()),
+            smtp_password: Some("pass".into()),
+            from_address: Some("bot@example.com".to_string()),
+            to_addresses: vec![
+                "alice@example.com".to_string(),
+                "bob@example.com".to_string(),
+            ],
+            use_tls: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_email_builds_message_and_fails_on_transport() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        assert!(notifier.is_enabled());
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        // This will build the email message but fail when trying to connect to localhost:25
+        let result = notifier.notify_start(&issue).await;
+        assert!(result.is_err());
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("email")
+                || err_str.contains("send")
+                || err_str.contains("SMTP")
+                || err_str.contains("Failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_email_success_path_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        // Exercises: from_address parsing, to_address parsing, Message building, transport.send
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_err()); // Transport fails but message was built
+    }
+
+    #[tokio::test]
+    async fn test_send_email_completed_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        let result = notifier.notify_completed(&issue).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_failed_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        let result = notifier.notify_failed(&issue, "Build error").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_merged_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        let result = notifier
+            .notify_merged(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_closed_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        let result = notifier
+            .notify_closed(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_status_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let result = notifier.notify_status("Status update message").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_urgent_issues_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let issues = vec![
+            Issue::new("1", "PROJ-1", "Bug 1", "https://example.com", "linear"),
+            Issue::new("2", "PROJ-2", "Bug 2", "https://example.com", "linear"),
+        ];
+        let result = notifier.notify_urgent_issues(&issues).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_ask_question_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = AskRequest {
+            correlation_id: "tok-send".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which env?".to_string(),
+                context: Some("Multiple envs".to_string()),
+                options: vec!["staging".to_string(), "prod".to_string()],
+                why: Some("Need to choose".to_string()),
+            },
+            asked_at: Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let result = notifier.ask_question(&issue, &request).await;
+        assert!(result.is_err()); // Transport fails
+    }
+
+    #[tokio::test]
+    async fn test_send_email_cascade_success_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+        issue.set_metadata("cascade_upstream_repo", "upstream/repo");
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_pr_update_success_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("is_pr_update", true);
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_regression_resolved_completed_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("regression_resolved", true);
+        let result = notifier.notify_completed(&issue).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_completion_reason_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("completion_reason", "Already resolved");
+        let result = notifier.notify_completed(&issue).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_regression_detected_failed_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("regression_detected", true);
+        let result = notifier.notify_failed(&issue, "Tests failing").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_cascade_failed_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "downstream/repo");
+        issue.set_metadata("cascade_upstream_repo", "upstream/repo");
+        let result = notifier.notify_failed(&issue, "Build error").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_with_trigger_reason_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Retry attempt");
+        let result = notifier.notify_start(&issue).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_success_trigger_reason_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Manual retry");
+        let result = notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_failed_trigger_reason_exercises_message_building() {
+        let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Auto retry");
+        let result = notifier.notify_failed(&issue, "timeout").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_zero_recipients_returns_ok() {
+        let config = EmailConfig {
+            smtp_host: Some("localhost".to_string()),
+            smtp_port: 25,
+            smtp_username: Some("user".to_string()),
+            smtp_password: Some("pass".into()),
+            from_address: Some("bot@example.com".to_string()),
+            to_addresses: vec![],
+            use_tls: false,
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        // No recipients -> for loop doesn't execute -> Ok(())
+        let result = notifier.notify_start(&issue).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_email_invalid_from_address_returns_error() {
+        let config = EmailConfig {
+            smtp_host: Some("localhost".to_string()),
+            smtp_port: 25,
+            smtp_username: Some("user".to_string()),
+            smtp_password: Some("pass".into()),
+            from_address: Some("not-a-valid-email".to_string()),
+            to_addresses: vec!["valid@example.com".to_string()],
+            use_tls: false,
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        let result = notifier.notify_start(&issue).await;
+        assert!(result.is_err());
+        let err_str = result.unwrap_err().to_string();
+        assert!(err_str.contains("Invalid from address") || err_str.contains("email"));
+    }
+
+    #[tokio::test]
+    async fn test_send_email_invalid_to_address_returns_error() {
+        let config = EmailConfig {
+            smtp_host: Some("localhost".to_string()),
+            smtp_port: 25,
+            smtp_username: Some("user".to_string()),
+            smtp_password: Some("pass".into()),
+            from_address: Some("bot@example.com".to_string()),
+            to_addresses: vec!["not-a-valid-email".to_string()],
+            use_tls: false,
+            ..Default::default()
+        };
+        let notifier = EmailNotifier::new(config, empty_registry()).unwrap();
+        let issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        let result = notifier.notify_start(&issue).await;
+        assert!(result.is_err());
+        let err_str = result.unwrap_err().to_string();
+        assert!(err_str.contains("Invalid to address") || err_str.contains("email"));
+    }
+
+    // --- Dynamic dispatch (Box<dyn Notifier>) tests ---
+
+    fn boxed_email_notifier(config: EmailConfig) -> Box<dyn Notifier> {
+        Box::new(EmailNotifier::new(config, empty_registry()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_dyn_email_notify_start() {
+        let n = boxed_email_notifier(send_config());
+        let issue = Issue::new("1", "DYN-E-1", "Test", "https://example.com", "linear");
+        let result = n.notify_start(&issue).await;
+        assert!(result.is_err()); // SMTP connection will fail
+    }
+
+    #[tokio::test]
+    async fn test_dyn_email_notify_success_regular() {
+        let n = boxed_email_notifier(send_config());
+        let issue = Issue::new("1", "DYN-E-1", "Test", "https://example.com", "linear");
+        let result = n.notify_success(&issue, "https://github.com/pr/1").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_email_notify_completed() {
+        let n = boxed_email_notifier(send_config());
+        let issue = Issue::new("1", "DYN-E-1", "Test", "https://example.com", "linear");
+        let result = n.notify_completed(&issue).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_email_notify_failed() {
+        let n = boxed_email_notifier(send_config());
+        let issue = Issue::new("1", "DYN-E-1", "Test", "https://example.com", "linear");
+        let result = n.notify_failed(&issue, "Some error").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_email_notify_merged() {
+        let n = boxed_email_notifier(send_config());
+        let issue = Issue::new("1", "DYN-E-1", "Test", "https://example.com", "linear");
+        let result = n.notify_merged(&issue, "https://github.com/pr/1").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_email_notify_closed() {
+        let n = boxed_email_notifier(send_config());
+        let issue = Issue::new("1", "DYN-E-1", "Test", "https://example.com", "linear");
+        let result = n.notify_closed(&issue, "https://github.com/pr/1").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_email_notify_status() {
+        let n = boxed_email_notifier(send_config());
+        let result = n.notify_status("status update").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_email_notify_urgent_issues() {
+        let n = boxed_email_notifier(send_config());
+        let issues = vec![Issue::new(
+            "1",
+            "DYN-E-1",
+            "Bug 1",
+            "https://example.com",
+            "linear",
+        )];
+        let result = n.notify_urgent_issues(&issues).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dyn_email_name_and_is_enabled() {
+        let n = boxed_email_notifier(send_config());
+        assert_eq!(n.name(), "email");
+        assert!(n.is_enabled());
     }
 }

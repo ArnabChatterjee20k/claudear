@@ -254,6 +254,9 @@ impl<H: WhatsAppHttpClient + 'static> Notifier for WhatsAppNotifier<H> {
         if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
             body.push_str(&format!("\nTrigger: {}", reason));
         }
+        if let Some(confidence) = issue.get_metadata::<u8>("confidence") {
+            body.push_str(&format!("\nFix Confidence: {}/100", confidence));
+        }
         self.send_message(&body, Some(issue)).await
     }
 
@@ -1821,5 +1824,654 @@ mod tests {
         let calls = notifier.http.get_last_calls();
         let text = calls[0].2["text"]["body"].as_str().unwrap();
         assert!(!text.contains("Trigger:"));
+    }
+
+    #[test]
+    fn test_extract_reply_text_normal() {
+        assert_eq!(
+            WhatsAppNotifier::<MockWhatsAppClient>::extract_reply_text("hello world"),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_reply_text_empty() {
+        assert_eq!(
+            WhatsAppNotifier::<MockWhatsAppClient>::extract_reply_text(""),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_reply_text_whitespace_only() {
+        assert_eq!(
+            WhatsAppNotifier::<MockWhatsAppClient>::extract_reply_text("   \n\t  "),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_reply_text_trims_whitespace() {
+        assert_eq!(
+            WhatsAppNotifier::<MockWhatsAppClient>::extract_reply_text("  answer  "),
+            Some("answer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_whatsapp_send_message_response_deserialize_success() {
+        let json = r#"{"messages":[{"id":"wamid.abc123"}]}"#;
+        let parsed: WhatsAppSendMessageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].id, "wamid.abc123");
+    }
+
+    #[test]
+    fn test_whatsapp_send_message_response_deserialize_empty_messages() {
+        let json = r#"{"messages":[]}"#;
+        let parsed: WhatsAppSendMessageResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.messages.is_empty());
+    }
+
+    #[test]
+    fn test_whatsapp_send_message_response_deserialize_missing_messages() {
+        let json = r#"{}"#;
+        let parsed: WhatsAppSendMessageResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.messages.is_empty());
+    }
+
+    #[test]
+    fn test_whatsapp_send_message_response_deserialize_multiple() {
+        let json = r#"{"messages":[{"id":"wamid.1"},{"id":"wamid.2"}]}"#;
+        let parsed: WhatsAppSendMessageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages[0].id, "wamid.1");
+        assert_eq!(parsed.messages[1].id, "wamid.2");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_with_ids_returns_message_id() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+
+        let ids = notifier
+            .send_message_with_ids("test body", Some(&issue))
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec!["wamid.xxx".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_with_ids_no_config_returns_empty() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(disabled_config(), mock);
+
+        let ids = notifier.send_message_with_ids("test", None).await.unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_message_with_ids_empty_message_id_skipped() {
+        let mock = MockWhatsAppClient::new(200, r#"{"messages":[{"id":"  "}]}"#);
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+
+        let ids = notifier.send_message_with_ids("test", None).await.unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_message_with_ids_unparseable_response_returns_empty() {
+        let mock = MockWhatsAppClient::new(200, "not json");
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+
+        let ids = notifier.send_message_with_ids("test", None).await.unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_with_trigger_reason() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Manual retry");
+        notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("PR Created"));
+        assert!(body.contains("Trigger: Manual retry"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_with_trigger_reason() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Scheduled run");
+        notifier.notify_failed(&issue, "timeout").await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("FAILED"));
+        assert!(body.contains("Trigger: Scheduled run"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_completed_with_completion_reason() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("completion_reason", "Already fixed upstream");
+        notifier.notify_completed(&issue).await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("Completed"));
+        assert!(body.contains("Already fixed upstream"));
+        assert!(!body.contains("no PR URL"));
+    }
+
+    #[test]
+    fn test_supports_replies_disabled_config() {
+        let notifier =
+            WhatsAppNotifier::with_http_client(disabled_config(), MockWhatsAppClient::success());
+        assert!(!notifier.supports_replies());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_poll_question_replies_source_not_enabled_returns_empty() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let notifier =
+            WhatsAppNotifier::with_http_client(enabled_config(), MockWhatsAppClient::success());
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-wa-no-src".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let replies = notifier
+            .poll_question_replies(&request, chrono::Utc::now() - chrono::Duration::seconds(10))
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_poll_question_replies_ignores_unrelated_messages() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let mut cfg = enabled_config();
+        cfg.source_enabled = true;
+        cfg.to_numbers = vec!["+15559876543".to_string(), "+15551112222".to_string()];
+        let notifier = WhatsAppNotifier::with_http_client(cfg, MockWhatsAppClient::success());
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-wa-unrelated".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+
+        // Record a message without matching context_message_id
+        crate::ask_reply_inbox::record_whatsapp_message(
+            crate::ask_reply_inbox::WhatsAppInboundMessage {
+                message_id: "wamid.unrelated".to_string(),
+                from: "+1555999".to_string(),
+                text: "Random text".to_string(),
+                replied_at: chrono::Utc::now(),
+                context_message_id: Some("wamid.different".to_string()),
+            },
+        );
+
+        let replies = notifier
+            .poll_question_replies(&request, chrono::Utc::now() - chrono::Duration::seconds(10))
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_poll_question_replies_single_sender_fallback() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let mut cfg = enabled_config();
+        cfg.source_enabled = true;
+        // Single sender = fallback mode
+        cfg.to_numbers = vec!["+15559876543".to_string()];
+        let notifier = WhatsAppNotifier::with_http_client(cfg, MockWhatsAppClient::success());
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-wa-fallback".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        notifier.ask_question(&issue, &request).await.unwrap();
+
+        // Record a message from the single configured sender, no context_message_id
+        let now = chrono::Utc::now();
+        crate::ask_reply_inbox::record_whatsapp_message(
+            crate::ask_reply_inbox::WhatsAppInboundMessage {
+                message_id: "wamid.fallback".to_string(),
+                from: "+15559876543".to_string(),
+                text: "My answer".to_string(),
+                replied_at: now,
+                context_message_id: None,
+            },
+        );
+
+        let replies = notifier
+            .poll_question_replies(&request, now - chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].answer, "My answer");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_poll_question_replies_empty_text_skipped() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let mut cfg = enabled_config();
+        cfg.source_enabled = true;
+        cfg.to_numbers = vec!["+15559876543".to_string()];
+        let notifier = WhatsAppNotifier::with_http_client(cfg, MockWhatsAppClient::success());
+        let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-wa-empty-reply".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "LIN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        notifier.ask_question(&issue, &request).await.unwrap();
+
+        let now = chrono::Utc::now();
+        crate::ask_reply_inbox::record_whatsapp_message(
+            crate::ask_reply_inbox::WhatsAppInboundMessage {
+                message_id: "wamid.empty".to_string(),
+                from: "+15559876543".to_string(),
+                text: "   ".to_string(),
+                replied_at: now,
+                context_message_id: Some("wamid.xxx".to_string()),
+            },
+        );
+
+        let replies = notifier
+            .poll_question_replies(&request, now - chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    // --- Dynamic dispatch (Box<dyn Notifier>) tests for tarpaulin coverage ---
+
+    fn boxed_notifier(mock: MockWhatsAppClient, config: WhatsAppConfig) -> Box<dyn Notifier> {
+        Box::new(WhatsAppNotifier::with_http_client(config, mock))
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_start() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        assert!(n.notify_start(&issue).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_start_with_trigger_reason() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let mut issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Retry");
+        assert!(n.notify_start(&issue).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_success_regular() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        assert!(n
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_success_cascade() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let mut issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "down/repo");
+        assert!(n
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_success_pr_update() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let mut issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        issue.set_metadata("is_pr_update", true);
+        assert!(n
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_success_with_trigger_reason() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let mut issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Auto");
+        assert!(n
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_completed_regular() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        assert!(n.notify_completed(&issue).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_completed_regression_resolved() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let mut issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        issue.set_metadata("regression_resolved", true);
+        assert!(n.notify_completed(&issue).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_completed_with_completion_reason() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let mut issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        issue.set_metadata("completion_reason", "Already fixed");
+        assert!(n.notify_completed(&issue).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_failed_regular() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        assert!(n.notify_failed(&issue, "error").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_failed_regression() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let mut issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        issue.set_metadata("regression_detected", true);
+        assert!(n.notify_failed(&issue, "regression error").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_failed_cascade() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let mut issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        issue.set_metadata("cascade_downstream_repo", "down/repo");
+        assert!(n.notify_failed(&issue, "cascade error").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_failed_with_trigger_reason() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let mut issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Scheduled");
+        assert!(n.notify_failed(&issue, "timeout").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_failed_long_error() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        let long_error = "x".repeat(200);
+        assert!(n.notify_failed(&issue, &long_error).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_merged() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        assert!(n
+            .notify_merged(&issue, "https://github.com/pr/1")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_closed() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        assert!(n
+            .notify_closed(&issue, "https://github.com/pr/1")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_status() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        assert!(n.notify_status("test status").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_urgent_issues_empty() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        assert!(n.notify_urgent_issues(&[]).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_notify_urgent_issues_multiple() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let issues = vec![
+            Issue::new("1", "DYN-1", "Bug 1", "https://example.com", "linear"),
+            Issue::new("2", "DYN-2", "Bug 2", "https://example.com", "linear"),
+            Issue::new("3", "DYN-3", "Bug 3", "https://example.com", "linear"),
+            Issue::new("4", "DYN-4", "Bug 4", "https://example.com", "linear"),
+        ];
+        assert!(n.notify_urgent_issues(&issues).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dyn_ask_question() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let issue = Issue::new("1", "DYN-1", "Dyn test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-dyn-ask".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "DYN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Which branch?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let delivery = n.ask_question(&issue, &request).await.unwrap().unwrap();
+        assert_eq!(delivery.channel, "whatsapp");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_dyn_poll_question_replies_source_disabled() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-dyn-poll".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "DYN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        let replies = n
+            .poll_question_replies(&request, chrono::Utc::now() - chrono::Duration::seconds(10))
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_dyn_poll_question_replies_with_source_enabled() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let mut cfg = enabled_config();
+        cfg.source_enabled = true;
+        let n: Box<dyn Notifier> = Box::new(WhatsAppNotifier::with_http_client(
+            cfg,
+            MockWhatsAppClient::success(),
+        ));
+        let issue = Issue::new("1", "DYN-1", "Test", "https://example.com", "linear");
+        let request = crate::types::AskRequest {
+            correlation_id: "tok-dyn-poll-en".to_string(),
+            source: "linear".to_string(),
+            repo: None,
+            issue_id: "1".to_string(),
+            short_id: "DYN-1".to_string(),
+            question: crate::types::BlockingQuestion {
+                question: "Q?".to_string(),
+                context: None,
+                options: vec![],
+                why: None,
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+        n.ask_question(&issue, &request).await.unwrap();
+
+        let now = chrono::Utc::now();
+        crate::ask_reply_inbox::record_whatsapp_message(
+            crate::ask_reply_inbox::WhatsAppInboundMessage {
+                message_id: "wamid.dyn-reply".to_string(),
+                from: "+15559876543".to_string(),
+                text: "Use main branch".to_string(),
+                replied_at: now,
+                context_message_id: Some("wamid.xxx".to_string()),
+            },
+        );
+
+        let replies = n
+            .poll_question_replies(&request, now - chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].answer, "Use main branch");
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_with_confidence() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("confidence", 85u8);
+        notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(body.contains("Fix Confidence: 85/100"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_without_confidence() {
+        let mock = MockWhatsAppClient::success();
+        let notifier = WhatsAppNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+        let calls = notifier.http.get_last_calls();
+        let body = calls[0].2["text"]["body"].as_str().unwrap();
+        assert!(!body.contains("Fix Confidence"));
+    }
+
+    #[test]
+    fn test_dyn_name_and_is_enabled() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        assert_eq!(n.name(), "whatsapp");
+        assert!(n.is_enabled());
+    }
+
+    #[test]
+    fn test_dyn_supports_replies_enabled() {
+        let mut cfg = enabled_config();
+        cfg.source_enabled = true;
+        let n: Box<dyn Notifier> = Box::new(WhatsAppNotifier::with_http_client(
+            cfg,
+            MockWhatsAppClient::success(),
+        ));
+        assert!(n.supports_replies());
+    }
+
+    #[test]
+    fn test_dyn_supports_replies_disabled() {
+        let n = boxed_notifier(MockWhatsAppClient::success(), enabled_config());
+        assert!(!n.supports_replies());
     }
 }

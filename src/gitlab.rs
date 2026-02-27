@@ -1079,6 +1079,91 @@ mod tests {
                 })
             }
         }
+
+        async fn post(
+            &self,
+            url: &str,
+            headers: Vec<(&str, String)>,
+            _body: &str,
+        ) -> Result<HttpResponse> {
+            {
+                let owned: Vec<(String, String)> = headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect();
+                self.captured_headers
+                    .lock()
+                    .unwrap()
+                    .insert(url.to_string(), owned);
+            }
+            let responses = self.responses.lock().unwrap();
+            if let Some(response) = responses.get(url) {
+                Ok(HttpResponse {
+                    status: response.status,
+                    body: response.body.clone(),
+                })
+            } else {
+                Ok(HttpResponse {
+                    status: 404,
+                    body: "Not found".to_string(),
+                })
+            }
+        }
+
+        async fn put(
+            &self,
+            url: &str,
+            headers: Vec<(&str, String)>,
+            _body: &str,
+        ) -> Result<HttpResponse> {
+            {
+                let owned: Vec<(String, String)> = headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect();
+                self.captured_headers
+                    .lock()
+                    .unwrap()
+                    .insert(url.to_string(), owned);
+            }
+            let responses = self.responses.lock().unwrap();
+            if let Some(response) = responses.get(url) {
+                Ok(HttpResponse {
+                    status: response.status,
+                    body: response.body.clone(),
+                })
+            } else {
+                Ok(HttpResponse {
+                    status: 404,
+                    body: "Not found".to_string(),
+                })
+            }
+        }
+
+        async fn delete(&self, url: &str, headers: Vec<(&str, String)>) -> Result<HttpResponse> {
+            {
+                let owned: Vec<(String, String)> = headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect();
+                self.captured_headers
+                    .lock()
+                    .unwrap()
+                    .insert(url.to_string(), owned);
+            }
+            let responses = self.responses.lock().unwrap();
+            if let Some(response) = responses.get(url) {
+                Ok(HttpResponse {
+                    status: response.status,
+                    body: response.body.clone(),
+                })
+            } else {
+                Ok(HttpResponse {
+                    status: 404,
+                    body: "Not found".to_string(),
+                })
+            }
+        }
     }
 
     fn test_config() -> GitLabConfig {
@@ -5383,5 +5468,797 @@ mod tests {
             err_msg.to_lowercase().contains("not found"),
             "error should mention not found: {err_msg}"
         );
+    }
+
+    // --- merge_pr tests ---
+
+    #[tokio::test]
+    async fn test_merge_pr_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/merge",
+            200,
+            r#"{"iid": 1, "state": "merged"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.merge_pr("group/repo", 1).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/merge",
+            405,
+            "Method Not Allowed",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.merge_pr("group/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to merge"),
+            "error should mention merge failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_no_token() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        let result = client.merge_pr("group/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_conflict() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/5/merge",
+            422,
+            r#"{"message": "Branch cannot be merged"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.merge_pr("group/repo", 5).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to merge"),
+            "error should mention merge failure: {err_msg}"
+        );
+    }
+
+    // --- close_pr tests ---
+
+    #[tokio::test]
+    async fn test_close_pr_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1",
+            200,
+            r#"{"iid": 1, "state": "closed"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.close_pr("group/repo", 1).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_close_pr_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.close_pr("group/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to close"),
+            "error should mention close failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_close_pr_no_token() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        let result = client.close_pr("group/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- delete_branch tests ---
+
+    #[tokio::test]
+    async fn test_delete_branch_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/repository/branches/feature%2Fmy-branch",
+            204,
+            "",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client
+            .delete_branch("group/repo", "feature/my-branch")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_branch_not_found_is_ok() {
+        let mock = MockHttpClient::new();
+        // Branch already deleted - 404 should be treated as success
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/repository/branches/gone",
+            404,
+            "Branch not found",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.delete_branch("group/repo", "gone").await;
+        assert!(
+            result.is_ok(),
+            "404 on delete_branch should be treated as success"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_branch_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/repository/branches/protected",
+            403,
+            "Branch is protected",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.delete_branch("group/repo", "protected").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to delete branch"),
+            "error should mention delete failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_branch_no_token() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        let result = client.delete_branch("group/repo", "branch").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- post_review tests ---
+
+    #[tokio::test]
+    async fn test_post_review_comment_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes",
+            201,
+            r#"{"id": 999, "body": "Looks good"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review("group/repo", 1, PostReviewAction::Comment, "Looks good")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_post_review_comment_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes",
+            403,
+            "Forbidden",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review("group/repo", 1, PostReviewAction::Comment, "text")
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to post comment"),
+            "error should mention comment failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_review_approve_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/approve",
+            201,
+            r#"{"id": 1}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review("group/repo", 1, PostReviewAction::Approve, "LGTM")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_post_review_approve_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/approve",
+            401,
+            "Unauthorized",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review("group/repo", 1, PostReviewAction::Approve, "LGTM")
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to approve"),
+            "error should mention approval failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_review_request_changes_success() {
+        let mock = MockHttpClient::new();
+        // Unapprove endpoint (may fail, errors ignored)
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/unapprove",
+            200,
+            "{}",
+        );
+        // Note endpoint for changes-requested comment
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes",
+            201,
+            r#"{"id": 1, "body": "Please fix"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review(
+                "group/repo",
+                1,
+                PostReviewAction::RequestChanges,
+                "Please fix",
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_post_review_request_changes_unapprove_fails_still_ok() {
+        let mock = MockHttpClient::new();
+        // Unapprove returns error (not previously approved) -- this should be ignored
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/unapprove",
+            403,
+            "Cannot unapprove",
+        );
+        // Note endpoint succeeds
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes",
+            201,
+            r#"{"id": 2}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review(
+                "group/repo",
+                1,
+                PostReviewAction::RequestChanges,
+                "Needs work",
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "unapprove failure should not cause overall failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_review_request_changes_note_fails() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/unapprove",
+            200,
+            "{}",
+        );
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/notes",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client
+            .post_review(
+                "group/repo",
+                1,
+                PostReviewAction::RequestChanges,
+                "Fix this",
+            )
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to post changes-requested note"),
+            "error should mention changes-requested failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_review_no_token() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        let result = client
+            .post_review("group/repo", 1, PostReviewAction::Comment, "hi")
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- list_open_prs tests ---
+
+    #[tokio::test]
+    async fn test_list_open_prs_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests?state=opened&per_page=100",
+            200,
+            r#"[
+                {"iid": 1, "title": "Feature A", "source_branch": "feature-a", "web_url": "https://gitlab.com/group/repo/-/merge_requests/1"},
+                {"iid": 2, "title": "Fix B", "source_branch": "fix-b", "web_url": "https://gitlab.com/group/repo/-/merge_requests/2"}
+            ]"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let prs = client.list_open_prs("group/repo").await.unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 1);
+        assert_eq!(prs[0].title, "Feature A");
+        assert_eq!(prs[0].branch, "feature-a");
+        assert!(prs[0].url.contains("merge_requests/1"));
+        assert_eq!(prs[1].number, 2);
+        assert_eq!(prs[1].title, "Fix B");
+    }
+
+    #[tokio::test]
+    async fn test_list_open_prs_empty() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests?state=opened&per_page=100",
+            200,
+            "[]",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let prs = client.list_open_prs("group/repo").await.unwrap();
+        assert!(prs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_open_prs_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests?state=opened&per_page=100",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.list_open_prs("group/repo").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to list open MRs"),
+            "error should mention list failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_open_prs_no_token() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        let result = client.list_open_prs("group/repo").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- get_pr_branch tests ---
+
+    #[tokio::test]
+    async fn test_get_pr_branch_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/3",
+            200,
+            r#"{"iid": 3, "state": "opened", "source_branch": "my-feature", "target_branch": "main"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let branch = client.get_pr_branch("group/repo", 3).await.unwrap();
+        assert_eq!(branch, "my-feature");
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_branch_no_source_branch() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/4",
+            200,
+            r#"{"iid": 4, "state": "opened"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.get_pr_branch("group/repo", 4).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No source branch"),
+            "error should mention missing branch: {err_msg}"
+        );
+    }
+
+    // --- pr_url_pattern tests ---
+
+    #[test]
+    fn test_pr_url_pattern() {
+        let client = GitLabClient::new(test_config());
+        assert_eq!(ScmProvider::pr_url_pattern(&client), "%-/merge_requests/%");
+    }
+
+    // --- parse_pr_number tests ---
+
+    #[test]
+    fn test_parse_pr_number_valid() {
+        let client = GitLabClient::new(test_config());
+        assert_eq!(
+            ScmProvider::parse_pr_number(
+                &client,
+                "https://gitlab.com/group/repo/-/merge_requests/42"
+            ),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_number_nested_path() {
+        let client = GitLabClient::new(test_config());
+        assert_eq!(
+            ScmProvider::parse_pr_number(
+                &client,
+                "https://gitlab.com/org/team/repo/-/merge_requests/123"
+            ),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_number_invalid_url() {
+        let client = GitLabClient::new(test_config());
+        assert_eq!(
+            ScmProvider::parse_pr_number(&client, "https://gitlab.com/group/repo/-/issues/5"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_number_no_number() {
+        let client = GitLabClient::new(test_config());
+        assert_eq!(
+            ScmProvider::parse_pr_number(
+                &client,
+                "https://gitlab.com/group/repo/-/merge_requests/"
+            ),
+            None
+        );
+    }
+
+    // --- get_latest_release tests ---
+
+    #[tokio::test]
+    async fn test_get_latest_release_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/releases?per_page=1&order_by=released_at&sort=desc",
+            200,
+            r#"[{
+                "tag_name": "v1.0.0",
+                "name": "Release 1.0.0",
+                "_links": {"self": "https://gitlab.com/group/repo/-/releases/v1.0.0"},
+                "released_at": "2025-01-01T00:00:00Z"
+            }]"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let release = client.get_latest_release("group/repo").await.unwrap();
+        assert!(release.is_some());
+        let r = release.unwrap();
+        assert_eq!(r.tag, "v1.0.0");
+        assert_eq!(r.name.as_deref(), Some("Release 1.0.0"));
+        assert_eq!(r.url, "https://gitlab.com/group/repo/-/releases/v1.0.0");
+        assert_eq!(r.published_at.as_deref(), Some("2025-01-01T00:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_release_no_releases() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/releases?per_page=1&order_by=released_at&sort=desc",
+            200,
+            "[]",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let release = client.get_latest_release("group/repo").await.unwrap();
+        assert!(release.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_release_404() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/releases?per_page=1&order_by=released_at&sort=desc",
+            404,
+            "Not Found",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let release = client.get_latest_release("group/repo").await.unwrap();
+        assert!(release.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_release_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/releases?per_page=1&order_by=released_at&sort=desc",
+            500,
+            "Internal Server Error",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.get_latest_release("group/repo").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to get releases"),
+            "error should mention releases failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_release_no_token() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        let result = client.get_latest_release("group/repo").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- create_release tests ---
+
+    #[tokio::test]
+    async fn test_create_release_success() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/releases",
+            201,
+            r#"{
+                "tag_name": "v2.0.0",
+                "name": "Version 2",
+                "_links": {"self": "https://gitlab.com/group/repo/-/releases/v2.0.0"},
+                "released_at": "2025-06-01T00:00:00Z"
+            }"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let release = client
+            .create_release("group/repo", "v2.0.0", "Version 2", "Release notes")
+            .await
+            .unwrap();
+        assert_eq!(release.tag, "v2.0.0");
+        assert_eq!(release.name.as_deref(), Some("Version 2"));
+        assert_eq!(
+            release.url,
+            "https://gitlab.com/group/repo/-/releases/v2.0.0"
+        );
+        assert_eq!(
+            release.published_at.as_deref(),
+            Some("2025-06-01T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_release_api_error() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/releases",
+            422,
+            r#"{"message": "Tag already exists"}"#,
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client
+            .create_release("group/repo", "v1.0.0", "Version 1", "notes")
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to create release"),
+            "error should mention create failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_release_no_token() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        let result = client
+            .create_release("group/repo", "v1.0.0", "Version 1", "notes")
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- ScmProvider name test ---
+
+    #[test]
+    fn test_scm_provider_name_is_gitlab() {
+        let config = test_config();
+        let client = GitLabClient::new(config);
+        let provider: &dyn ScmProvider = &client;
+        assert_eq!(provider.name(), "gitlab");
+    }
+
+    // --- get_mr_approvals no-token test ---
+
+    #[tokio::test]
+    async fn test_get_mr_approvals_no_token_direct() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        let result = client.get_mr_approvals("group/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- get_mr_notes no-token test ---
+
+    #[tokio::test]
+    async fn test_get_mr_notes_no_token() {
+        let client = GitLabClient::with_http_client(no_token_config(), MockHttpClient::new());
+        let result = client.get_mr_notes("group/repo", 1).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("token"),
+            "error should mention token: {err_msg}"
+        );
+    }
+
+    // --- merge_pr via ScmProvider trait ---
+
+    #[tokio::test]
+    async fn test_scm_provider_merge_pr() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1/merge",
+            200,
+            "{}",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let provider: &dyn ScmProvider = &client;
+        let result = provider.merge_pr("group/repo", 1).await;
+        assert!(result.is_ok());
+    }
+
+    // --- close_pr via ScmProvider trait ---
+
+    #[tokio::test]
+    async fn test_scm_provider_close_pr() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/1",
+            200,
+            "{}",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let provider: &dyn ScmProvider = &client;
+        let result = provider.close_pr("group/repo", 1).await;
+        assert!(result.is_ok());
+    }
+
+    // --- delete_branch via ScmProvider trait ---
+
+    #[tokio::test]
+    async fn test_scm_provider_delete_branch() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/group%2Frepo/repository/branches/my-branch",
+            204,
+            "",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let provider: &dyn ScmProvider = &client;
+        let result = provider.delete_branch("group/repo", "my-branch").await;
+        assert!(result.is_ok());
+    }
+
+    // --- nested project path in write ops ---
+
+    #[tokio::test]
+    async fn test_merge_pr_nested_project_path() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/org%2Fteam%2Frepo/merge_requests/7/merge",
+            200,
+            "{}",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.merge_pr("org/team/repo", 7).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_close_pr_nested_project_path() {
+        let mock = MockHttpClient::new();
+        mock.mock_response(
+            "https://gitlab.com/api/v4/projects/org%2Fteam%2Frepo/merge_requests/7",
+            200,
+            "{}",
+        );
+
+        let client = GitLabClient::with_http_client(test_config(), mock);
+        let result = client.close_pr("org/team/repo", 7).await;
+        assert!(result.is_ok());
     }
 }

@@ -403,6 +403,17 @@ pub(crate) fn build_success_message(
             inline: Some(false),
         });
     }
+    if let Some(confidence) = issue.get_metadata::<u8>("confidence") {
+        let mut conf_value = format!("{}/100", confidence);
+        if let Some(reasoning) = issue.get_metadata::<String>("confidence_reasoning") {
+            conf_value.push_str(&format!("\n{}", truncate_string(&reasoning, 900)));
+        }
+        fields.push(DiscordField {
+            name: "Fix Confidence".to_string(),
+            value: conf_value,
+            inline: Some(true),
+        });
+    }
 
     DiscordMessage {
         content: mention.map(|m| m.to_string()),
@@ -682,6 +693,18 @@ pub(crate) fn build_cascade_success_message(
         value: format!("[View PR]({})", pr_url_truncated),
         inline: Some(false),
     });
+
+    if let Some(confidence) = issue.get_metadata::<u8>("confidence") {
+        let mut conf_value = format!("{}/100", confidence);
+        if let Some(reasoning) = issue.get_metadata::<String>("confidence_reasoning") {
+            conf_value.push_str(&format!("\n{}", truncate_string(&reasoning, 900)));
+        }
+        fields.push(DiscordField {
+            name: "Fix Confidence".to_string(),
+            value: conf_value,
+            inline: Some(true),
+        });
+    }
 
     DiscordMessage {
         content: mention.map(|m| m.to_string()),
@@ -4641,5 +4664,84 @@ mod tests {
         let fields = embed.fields.as_ref().unwrap();
         let trigger = fields.iter().find(|f| f.name == "Trigger").unwrap();
         assert_eq!(trigger.value, "Manual trigger");
+    }
+
+    // === Coverage: build_success_message with changelog metadata ===
+
+    #[test]
+    fn test_build_success_message_changelog_field() {
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("changelog", "Fixed auth bug");
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Changes" && f.value.contains("Fixed auth bug")));
+    }
+
+    // === Coverage: build_completed_message with custom completion_reason ===
+
+    #[test]
+    fn test_build_completed_message_custom_reason() {
+        let mut issue = Issue::new("1", "PROJ-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("completion_reason", "Already fixed in previous release");
+        let msg = build_completed_message(&issue, None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f.name == "Reason" && f.value.contains("Already fixed")));
+    }
+
+    // === Coverage: confidence field in success messages ===
+
+    #[test]
+    fn test_build_success_message_with_confidence() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        issue.set_metadata("confidence", 85u8);
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        let conf = fields.iter().find(|f| f.name == "Fix Confidence").unwrap();
+        assert_eq!(conf.value, "85/100");
+        assert_eq!(conf.inline, Some(true));
+    }
+
+    #[test]
+    fn test_build_success_message_with_confidence_and_reasoning() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        issue.set_metadata("confidence", 72u8);
+        issue.set_metadata("confidence_reasoning", "Simple null check fix".to_string());
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        let conf = fields.iter().find(|f| f.name == "Fix Confidence").unwrap();
+        assert!(conf.value.contains("72/100"));
+        assert!(conf.value.contains("Simple null check fix"));
+    }
+
+    #[test]
+    fn test_build_success_message_without_confidence() {
+        let issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        assert!(!fields.iter().any(|f| f.name == "Fix Confidence"));
+    }
+
+    #[test]
+    fn test_build_cascade_success_message_with_confidence() {
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://linear.app/1", "linear");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream".to_string());
+        issue.set_metadata("cascade_upstream_repo", "org/upstream".to_string());
+        issue.set_metadata("confidence", 90u8);
+        issue.set_metadata("confidence_reasoning", "Straightforward port".to_string());
+        let msg = build_cascade_success_message(&issue, "https://github.com/pr/2", None);
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        let fields = embed.fields.as_ref().unwrap();
+        let conf = fields.iter().find(|f| f.name == "Fix Confidence").unwrap();
+        assert!(conf.value.contains("90/100"));
+        assert!(conf.value.contains("Straightforward port"));
     }
 }

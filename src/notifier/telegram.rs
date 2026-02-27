@@ -470,6 +470,9 @@ impl<H: TelegramHttpClient + 'static> Notifier for TelegramNotifier<H> {
         if let Some(reason) = issue.get_metadata::<String>("trigger_reason") {
             body.push_str(&format!("\nTrigger: {}", reason));
         }
+        if let Some(confidence) = issue.get_metadata::<u8>("confidence") {
+            body.push_str(&format!("\nFix Confidence: {}/100", confidence));
+        }
         self.send_message(&body, Some(issue)).await
     }
 
@@ -597,6 +600,7 @@ impl<H: TelegramHttpClient + 'static> Notifier for TelegramNotifier<H> {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2138,5 +2142,613 @@ mod tests {
         let calls = notifier.http.get_last_calls();
         let text = calls[0].1["text"].as_str().unwrap();
         assert!(text.contains("Trigger: Manual trigger"));
+    }
+
+    #[test]
+    fn test_extract_reply_text_normal() {
+        assert_eq!(
+            TelegramNotifier::<MockTelegramClient>::extract_reply_text("hello"),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_reply_text_empty() {
+        assert_eq!(
+            TelegramNotifier::<MockTelegramClient>::extract_reply_text(""),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_reply_text_whitespace_only() {
+        assert_eq!(
+            TelegramNotifier::<MockTelegramClient>::extract_reply_text("   \n\t  "),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_reply_text_trims_whitespace() {
+        assert_eq!(
+            TelegramNotifier::<MockTelegramClient>::extract_reply_text("  answer  "),
+            Some("answer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_poll_chat_ids_empty_config() {
+        let config = TelegramConfig {
+            bot_token: Some("tok".into()),
+            chat_id: None,
+            to_chat_ids: vec![],
+            source_enabled: false,
+            listen_chat_id: None,
+            poll_interval_ms: None,
+        };
+        let notifier = TelegramNotifier::with_http_client(config, MockTelegramClient::success());
+        let ids = notifier.poll_chat_ids();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_poll_chat_ids_collects_all_sources() {
+        let config = TelegramConfig {
+            bot_token: Some("tok".into()),
+            chat_id: Some("111".to_string()),
+            to_chat_ids: vec!["222".to_string(), "333".to_string()],
+            source_enabled: false,
+            listen_chat_id: Some("444".to_string()),
+            poll_interval_ms: None,
+        };
+        let notifier = TelegramNotifier::with_http_client(config, MockTelegramClient::success());
+        let ids = notifier.poll_chat_ids();
+        assert!(ids.contains(&111));
+        assert!(ids.contains(&222));
+        assert!(ids.contains(&333));
+        assert!(ids.contains(&444));
+        assert_eq!(ids.len(), 4);
+    }
+
+    #[test]
+    fn test_poll_chat_ids_skips_non_numeric() {
+        let config = TelegramConfig {
+            bot_token: Some("tok".into()),
+            chat_id: Some("not_a_number".to_string()),
+            to_chat_ids: vec!["222".to_string()],
+            source_enabled: false,
+            listen_chat_id: None,
+            poll_interval_ms: None,
+        };
+        let notifier = TelegramNotifier::with_http_client(config, MockTelegramClient::success());
+        let ids = notifier.poll_chat_ids();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&222));
+    }
+
+    #[test]
+    fn test_poll_chat_ids_deduplicates() {
+        let config = TelegramConfig {
+            bot_token: Some("tok".into()),
+            chat_id: Some("111".to_string()),
+            to_chat_ids: vec!["111".to_string()],
+            source_enabled: false,
+            listen_chat_id: Some("111".to_string()),
+            poll_interval_ms: None,
+        };
+        let notifier = TelegramNotifier::with_http_client(config, MockTelegramClient::success());
+        let ids = notifier.poll_chat_ids();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&111));
+    }
+
+    #[test]
+    fn test_telegram_send_message_api_response_deserialize_success() {
+        let json = r#"{"ok": true, "result": {"message_id": 42}}"#;
+        let parsed: TelegramSendMessageApiResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.result.unwrap().message_id, 42);
+    }
+
+    #[test]
+    fn test_telegram_send_message_api_response_deserialize_no_result() {
+        let json = r#"{"ok": false}"#;
+        let parsed: TelegramSendMessageApiResponse = serde_json::from_str(json).unwrap();
+        assert!(!parsed.ok);
+        assert!(parsed.result.is_none());
+    }
+
+    #[test]
+    fn test_telegram_get_updates_response_deserialize_success() {
+        let json = r#"{"ok": true, "result": [{"update_id": 100, "message": {"message_id": 1, "chat": {"id": 555}, "text": "hello", "date": 1700000000}}]}"#;
+        let parsed: TelegramGetUpdatesResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.result.len(), 1);
+        assert_eq!(parsed.result[0].update_id, 100);
+        let msg = parsed.result[0].message.as_ref().unwrap();
+        assert_eq!(msg.message_id, 1);
+        assert_eq!(msg.chat.id, 555);
+        assert_eq!(msg.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_telegram_get_updates_response_deserialize_empty() {
+        let json = r#"{"ok": true, "result": []}"#;
+        let parsed: TelegramGetUpdatesResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.ok);
+        assert!(parsed.result.is_empty());
+    }
+
+    #[test]
+    fn test_telegram_update_item_without_message() {
+        let json = r#"{"ok": true, "result": [{"update_id": 200}]}"#;
+        let parsed: TelegramGetUpdatesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.result.len(), 1);
+        assert!(parsed.result[0].message.is_none());
+    }
+
+    #[test]
+    fn test_telegram_inbound_message_with_reply() {
+        let json = r#"{
+            "message_id": 10,
+            "chat": {"id": 999},
+            "from": {"id": 123, "is_bot": false, "username": "testuser"},
+            "text": "my reply",
+            "date": 1700000000,
+            "reply_to_message": {"message_id": 5, "from": {"id": 456, "is_bot": true}, "text": "original question"}
+        }"#;
+        let parsed: TelegramInboundApiMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.message_id, 10);
+        assert_eq!(parsed.chat.id, 999);
+        assert_eq!(parsed.from.as_ref().unwrap().id, 123);
+        assert!(!parsed.from.as_ref().unwrap().is_bot);
+        assert_eq!(
+            parsed.from.as_ref().unwrap().username.as_deref(),
+            Some("testuser")
+        );
+        assert_eq!(parsed.text.as_deref(), Some("my reply"));
+        let reply = parsed.reply_to_message.as_ref().unwrap();
+        assert_eq!(reply.message_id, 5);
+        assert!(reply.from.as_ref().unwrap().is_bot);
+        assert_eq!(reply.text.as_deref(), Some("original question"));
+    }
+
+    #[test]
+    fn test_telegram_inbound_message_minimal() {
+        let json = r#"{"message_id": 1, "chat": {"id": 100}}"#;
+        let parsed: TelegramInboundApiMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.message_id, 1);
+        assert!(parsed.from.is_none());
+        assert!(parsed.text.is_none());
+        assert!(parsed.date.is_none());
+        assert!(parsed.reply_to_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_send_message_with_ids_ok_false_no_id_returned() {
+        let mock = MockTelegramClient::new(200, r#"{"ok": false}"#);
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+
+        let ids = notifier.send_message_with_ids("test", None).await.unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_message_with_ids_no_bot_token_returns_empty() {
+        let config = TelegramConfig {
+            bot_token: None,
+            chat_id: Some("111".to_string()),
+            to_chat_ids: vec![],
+            source_enabled: false,
+            listen_chat_id: None,
+            poll_interval_ms: None,
+        };
+        let notifier = TelegramNotifier::with_http_client(config, MockTelegramClient::success());
+
+        let ids = notifier.send_message_with_ids("test", None).await.unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_no_bot_token_noop() {
+        let config = TelegramConfig {
+            bot_token: None,
+            chat_id: Some("111".to_string()),
+            to_chat_ids: vec![],
+            source_enabled: false,
+            listen_chat_id: None,
+            poll_interval_ms: None,
+        };
+        let notifier = TelegramNotifier::with_http_client(config, MockTelegramClient::success());
+        let result = notifier.ingest_updates_into_reply_inbox().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_error_response() {
+        let mock = MockTelegramClient::success().with_get_response(400, "Bad request");
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.ingest_updates_into_reply_inbox().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_ok_false_returns_error() {
+        let mock =
+            MockTelegramClient::success().with_get_response(200, r#"{"ok": false, "result": []}"#);
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.ingest_updates_into_reply_inbox().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_invalid_json_returns_error() {
+        let mock = MockTelegramClient::success().with_get_response(200, "not json");
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.ingest_updates_into_reply_inbox().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_success_records_messages() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let updates_json = r#"{
+            "ok": true,
+            "result": [{
+                "update_id": 500,
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": 555},
+                    "from": {"id": 123, "is_bot": false, "username": "alice"},
+                    "text": "hello bot",
+                    "date": 1700000000
+                }
+            }]
+        }"#;
+        let mock = MockTelegramClient::success().with_get_response(200, updates_json);
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.ingest_updates_into_reply_inbox().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_tracks_last_update_id() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let updates_json = r#"{
+            "ok": true,
+            "result": [
+                {"update_id": 100, "message": {"message_id": 1, "chat": {"id": 555}, "from": {"id": 1, "is_bot": false}, "text": "a", "date": 1700000000}},
+                {"update_id": 200, "message": {"message_id": 2, "chat": {"id": 555}, "from": {"id": 1, "is_bot": false}, "text": "b", "date": 1700000001}}
+            ]
+        }"#;
+        let mock = MockTelegramClient::success().with_get_response(200, updates_json);
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        notifier.ingest_updates_into_reply_inbox().await.unwrap();
+
+        let last_id = notifier.reply_last_update_id.read().unwrap();
+        assert_eq!(*last_id, Some(200));
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_skips_bot_messages() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let updates_json = r#"{
+            "ok": true,
+            "result": [{
+                "update_id": 300,
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": 555},
+                    "from": {"id": 999, "is_bot": true},
+                    "text": "bot message",
+                    "date": 1700000000
+                }
+            }]
+        }"#;
+        let mock = MockTelegramClient::success().with_get_response(200, updates_json);
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.ingest_updates_into_reply_inbox().await;
+        assert!(result.is_ok());
+        // Bot messages should be skipped in record_inbound_message_for_replies
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_skips_empty_text() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let updates_json = r#"{
+            "ok": true,
+            "result": [{
+                "update_id": 400,
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": 555},
+                    "from": {"id": 123, "is_bot": false},
+                    "text": "   ",
+                    "date": 1700000000
+                }
+            }]
+        }"#;
+        let mock = MockTelegramClient::success().with_get_response(200, updates_json);
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.ingest_updates_into_reply_inbox().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_skips_no_text() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let updates_json = r#"{
+            "ok": true,
+            "result": [{
+                "update_id": 410,
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": 555},
+                    "from": {"id": 123, "is_bot": false},
+                    "date": 1700000000
+                }
+            }]
+        }"#;
+        let mock = MockTelegramClient::success().with_get_response(200, updates_json);
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.ingest_updates_into_reply_inbox().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_updates_skips_no_from() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let updates_json = r#"{
+            "ok": true,
+            "result": [{
+                "update_id": 420,
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": 555},
+                    "text": "anonymous",
+                    "date": 1700000000
+                }
+            }]
+        }"#;
+        let mock = MockTelegramClient::success().with_get_response(200, updates_json);
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let result = notifier.ingest_updates_into_reply_inbox().await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_record_inbound_message_with_date() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let msg = TelegramInboundApiMessage {
+            message_id: 42,
+            chat: TelegramInboundApiChat { id: 100 },
+            from: Some(TelegramInboundApiUser {
+                id: 5,
+                is_bot: false,
+                username: Some("user5".to_string()),
+            }),
+            text: Some("test message".to_string()),
+            date: Some(1700000000),
+            reply_to_message: None,
+        };
+        TelegramNotifier::<MockTelegramClient>::record_inbound_message_for_replies(&msg);
+        // Should not panic, message recorded
+    }
+
+    #[test]
+    fn test_record_inbound_message_without_date_uses_now() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let msg = TelegramInboundApiMessage {
+            message_id: 43,
+            chat: TelegramInboundApiChat { id: 100 },
+            from: Some(TelegramInboundApiUser {
+                id: 6,
+                is_bot: false,
+                username: None,
+            }),
+            text: Some("no date msg".to_string()),
+            date: None,
+            reply_to_message: None,
+        };
+        TelegramNotifier::<MockTelegramClient>::record_inbound_message_for_replies(&msg);
+    }
+
+    #[test]
+    fn test_record_inbound_message_with_reply_to() {
+        let _inbox_guard = crate::ask_reply_inbox::clear_for_tests();
+        let msg = TelegramInboundApiMessage {
+            message_id: 44,
+            chat: TelegramInboundApiChat { id: 100 },
+            from: Some(TelegramInboundApiUser {
+                id: 7,
+                is_bot: false,
+                username: Some("bob".to_string()),
+            }),
+            text: Some("my reply".to_string()),
+            date: Some(1700000000),
+            reply_to_message: Some(TelegramInboundApiReplyMessage {
+                message_id: 40,
+                from: Some(TelegramInboundApiUser {
+                    id: 999,
+                    is_bot: true,
+                    username: Some("mybot".to_string()),
+                }),
+                text: Some("original question text".to_string()),
+            }),
+        };
+        TelegramNotifier::<MockTelegramClient>::record_inbound_message_for_replies(&msg);
+    }
+
+    #[test]
+    fn test_supports_replies_enabled() {
+        let notifier =
+            TelegramNotifier::with_http_client(enabled_config(), MockTelegramClient::success());
+        assert!(notifier.supports_replies());
+    }
+
+    #[test]
+    fn test_supports_replies_disabled() {
+        let config = TelegramConfig {
+            bot_token: None,
+            chat_id: None,
+            to_chat_ids: vec![],
+            source_enabled: false,
+            listen_chat_id: None,
+            poll_interval_ms: None,
+        };
+        let notifier = TelegramNotifier::with_http_client(config, MockTelegramClient::success());
+        assert!(!notifier.supports_replies());
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_with_trigger_reason() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("trigger_reason", "Manual retry");
+        notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        assert!(text.contains("PR Created"));
+        assert!(text.contains("Trigger: Manual retry"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_completed_with_completion_reason() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("completion_reason", "Already resolved");
+        notifier.notify_completed(&issue).await.unwrap();
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        assert!(text.contains("Completed"));
+        assert!(text.contains("Already resolved"));
+        assert!(!text.contains("no PR URL"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_recipients_uses_user_registry() {
+        let mock = MockTelegramClient::success();
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "alice".to_string(),
+            crate::config::UserConfig {
+                telegram_chat_id: Some("99999".to_string()),
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let notifier =
+            TelegramNotifier::with_http_client_and_registry(enabled_config(), mock, registry);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "alice");
+        let recipients = notifier.resolve_recipients(Some(&issue));
+        assert_eq!(recipients, vec!["99999".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_recipients_fallback_when_no_telegram_chat_id() {
+        let mock = MockTelegramClient::success();
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            "alice".to_string(),
+            crate::config::UserConfig {
+                telegram_chat_id: None,
+                ..Default::default()
+            },
+        );
+        let registry = crate::users::UserRegistry::new(users);
+        let notifier =
+            TelegramNotifier::with_http_client_and_registry(enabled_config(), mock, registry);
+        let mut issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
+        issue.set_metadata("resolved_user", "alice");
+        let recipients = notifier.resolve_recipients(Some(&issue));
+        // Falls back to config chat_id
+        assert!(recipients.contains(&"987654321".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_recipients_no_issue() {
+        let config = TelegramConfig {
+            bot_token: Some("tok".into()),
+            chat_id: Some("aaa".to_string()),
+            to_chat_ids: vec!["bbb".to_string()],
+            source_enabled: false,
+            listen_chat_id: None,
+            poll_interval_ms: None,
+        };
+        let notifier = TelegramNotifier::with_http_client(config, MockTelegramClient::success());
+        let recipients = notifier.resolve_recipients(None);
+        assert_eq!(recipients, vec!["aaa".to_string(), "bbb".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_truncates_long_text() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+
+        let long_msg = "x".repeat(5000);
+        notifier.notify_status(&long_msg).await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        assert!(text.len() <= 4200);
+        assert!(text.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_with_confidence() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let mut issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        issue.set_metadata("confidence", 85u8);
+        notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        assert!(text.contains("Fix Confidence: 85/100"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_without_confidence() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+        let issue = Issue::new("1", "LIN-1", "Fix", "https://example.com", "linear");
+        notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        assert!(!text.contains("Fix Confidence"));
+    }
+
+    #[tokio::test]
+    async fn test_send_message_short_text_not_truncated() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+
+        notifier.notify_status("short msg").await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        let text = calls[0].1["text"].as_str().unwrap();
+        assert!(!text.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_send_message_includes_parse_mode() {
+        let mock = MockTelegramClient::success();
+        let notifier = TelegramNotifier::with_http_client(enabled_config(), mock);
+
+        notifier.notify_status("test").await.unwrap();
+
+        let calls = notifier.http.get_last_calls();
+        assert_eq!(calls[0].1["parse_mode"], "HTML");
     }
 }

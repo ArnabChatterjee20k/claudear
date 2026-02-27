@@ -4422,4 +4422,497 @@ mod tests {
         assert!(config.webhook_secret.is_none());
         assert!(config.trigger_assignee.is_none());
     }
+
+    // --- Tests for create_issue coverage ---
+
+    #[tokio::test]
+    async fn test_create_issue_success() {
+        let mock = SequentialMockLinearClient::new(vec![
+            // find_or_create_label: labels query returns existing label
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueLabels": {
+                            "nodes": [{"id": "label-1", "name": "bug"}]
+                        }
+                    }
+                }"#,
+            ),
+            // issueCreate mutation
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueCreate": {
+                            "success": true,
+                            "issue": {
+                                "id": "new-issue-id",
+                                "identifier": "PROJ-999",
+                                "url": "https://linear.app/team/issue/PROJ-999"
+                            }
+                        }
+                    }
+                }"#,
+            ),
+        ]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-abc".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let issue = source
+            .create_issue("New bug", "Bug description", &["bug".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(issue.id, "new-issue-id");
+        assert_eq!(issue.short_id, "PROJ-999");
+        assert_eq!(issue.title, "New bug");
+        assert_eq!(issue.source, "linear");
+    }
+
+    #[tokio::test]
+    async fn test_create_issue_no_team_id() {
+        let mock = SequentialMockLinearClient::new(vec![]);
+
+        let mut config = test_config();
+        config.team_id = None;
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.create_issue("Title", "Desc", &[]).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("team_id required"));
+    }
+
+    #[tokio::test]
+    async fn test_create_issue_success_false() {
+        let mock = SequentialMockLinearClient::new(vec![
+            // issueCreate returns success: false
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueCreate": {
+                            "success": false,
+                            "issue": null
+                        }
+                    }
+                }"#,
+            ),
+        ]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.create_issue("Title", "Desc", &[]).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("success=false"));
+    }
+
+    #[tokio::test]
+    async fn test_create_issue_null_payload() {
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "issueCreate": null
+                }
+            }"#,
+        )]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.create_issue("Title", "Desc", &[]).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No response from issueCreate"));
+    }
+
+    #[tokio::test]
+    async fn test_create_issue_no_issue_in_payload() {
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "issueCreate": {
+                        "success": true,
+                        "issue": null
+                    }
+                }
+            }"#,
+        )]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.create_issue("Title", "Desc", &[]).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("returned no issue"));
+    }
+
+    // --- Tests for find_or_create_label coverage ---
+
+    #[tokio::test]
+    async fn test_find_or_create_label_existing_label() {
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "issueLabels": {
+                        "nodes": [
+                            {"id": "lbl-1", "name": "Bug"},
+                            {"id": "lbl-2", "name": "Feature"}
+                        ]
+                    }
+                }
+            }"#,
+        )]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let label_id = source.find_or_create_label("bug").await.unwrap();
+
+        assert_eq!(label_id, "lbl-1");
+    }
+
+    #[tokio::test]
+    async fn test_find_or_create_label_creates_new() {
+        let mock = SequentialMockLinearClient::new(vec![
+            // labels query returns no matching label
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueLabels": {
+                            "nodes": [{"id": "lbl-other", "name": "Other"}]
+                        }
+                    }
+                }"#,
+            ),
+            // label create mutation
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueLabelCreate": {
+                            "success": true,
+                            "issueLabel": {
+                                "id": "lbl-new",
+                                "name": "new-label"
+                            }
+                        }
+                    }
+                }"#,
+            ),
+        ]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let label_id = source.find_or_create_label("new-label").await.unwrap();
+
+        assert_eq!(label_id, "lbl-new");
+    }
+
+    #[tokio::test]
+    async fn test_find_or_create_label_create_fails() {
+        let mock = SequentialMockLinearClient::new(vec![
+            // labels query returns empty
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueLabels": {
+                            "nodes": []
+                        }
+                    }
+                }"#,
+            ),
+            // label create returns success: false
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueLabelCreate": {
+                            "success": false,
+                            "issueLabel": null
+                        }
+                    }
+                }"#,
+            ),
+        ]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.find_or_create_label("fail-label").await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("success=false"));
+    }
+
+    #[tokio::test]
+    async fn test_find_or_create_label_create_null_payload() {
+        let mock = SequentialMockLinearClient::new(vec![
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueLabels": {
+                            "nodes": []
+                        }
+                    }
+                }"#,
+            ),
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueLabelCreate": null
+                    }
+                }"#,
+            ),
+        ]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.find_or_create_label("null-label").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No response from issueLabelCreate"));
+    }
+
+    #[tokio::test]
+    async fn test_find_or_create_label_create_no_label_in_payload() {
+        let mock = SequentialMockLinearClient::new(vec![
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueLabels": {
+                            "nodes": []
+                        }
+                    }
+                }"#,
+            ),
+            (
+                200,
+                r#"{
+                    "data": {
+                        "issueLabelCreate": {
+                            "success": true,
+                            "issueLabel": null
+                        }
+                    }
+                }"#,
+            ),
+        ]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.find_or_create_label("ghost-label").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("returned no label"));
+    }
+
+    // --- Tests for list_open_issues coverage ---
+
+    #[tokio::test]
+    async fn test_list_open_issues_no_filter() {
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            {
+                                "id": "open-1",
+                                "identifier": "PROJ-O1",
+                                "title": "Open issue 1",
+                                "description": null,
+                                "url": "https://linear.app/o1",
+                                "priority": 2,
+                                "createdAt": "2024-01-01T00:00:00Z",
+                                "updatedAt": "2024-01-02T00:00:00Z",
+                                "state": {"name": "Backlog", "type": "backlog"},
+                                "labels": {"nodes": []},
+                                "team": null,
+                                "project": null,
+                                "assignee": null
+                            }
+                        ]
+                    }
+                }
+            }"#,
+        )]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.list_open_issues("").await.unwrap();
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].short_id, "PROJ-O1");
+    }
+
+    #[tokio::test]
+    async fn test_list_open_issues_with_title_filter() {
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "issues": {
+                        "nodes": []
+                    }
+                }
+            }"#,
+        )]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.list_open_issues("search term").await.unwrap();
+
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_open_issues_with_team_filter() {
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "data": {
+                    "issues": {
+                        "nodes": []
+                    }
+                }
+            }"#,
+        )]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-filter".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.list_open_issues("").await.unwrap();
+
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_open_issues_api_error() {
+        let mock = SequentialMockLinearClient::new(vec![(500, "Server Error")]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.list_open_issues("").await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_issue_with_multiple_labels() {
+        let mock = SequentialMockLinearClient::new(vec![
+            // find label "bug" - exists
+            (
+                200,
+                r#"{"data":{"issueLabels":{"nodes":[{"id":"l1","name":"bug"}]}}}"#,
+            ),
+            // find label "priority" - does not exist, create
+            (200, r#"{"data":{"issueLabels":{"nodes":[]}}}"#),
+            (
+                200,
+                r#"{"data":{"issueLabelCreate":{"success":true,"issueLabel":{"id":"l2","name":"priority"}}}}"#,
+            ),
+            // issueCreate
+            (
+                200,
+                r#"{"data":{"issueCreate":{"success":true,"issue":{"id":"multi-lbl","identifier":"ML-1","url":"https://linear.app/ml"}}}}"#,
+            ),
+        ]);
+
+        let mut config = test_config();
+        config.team_id = Some("team-1".to_string());
+        let source = LinearSource::with_http_client(config, mock);
+        let issue = source
+            .create_issue(
+                "Multi label issue",
+                "Desc",
+                &["bug".to_string(), "priority".to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(issue.short_id, "ML-1");
+    }
+
+    #[tokio::test]
+    async fn test_find_or_create_label_no_team_id_uses_empty() {
+        let mock = SequentialMockLinearClient::new(vec![
+            // labels query empty
+            (200, r#"{"data":{"issueLabels":{"nodes":[]}}}"#),
+            // create label
+            (
+                200,
+                r#"{"data":{"issueLabelCreate":{"success":true,"issueLabel":{"id":"new-id","name":"test"}}}}"#,
+            ),
+        ]);
+
+        let mut config = test_config();
+        config.team_id = None; // No team_id, uses empty string
+        let source = LinearSource::with_http_client(config, mock);
+        let label_id = source.find_or_create_label("test").await.unwrap();
+
+        assert_eq!(label_id, "new-id");
+    }
+
+    #[tokio::test]
+    async fn test_list_open_issues_empty_team_id_skipped() {
+        let mock =
+            SequentialMockLinearClient::new(vec![(200, r#"{"data":{"issues":{"nodes":[]}}}"#)]);
+
+        let mut config = test_config();
+        config.team_id = Some("".to_string()); // Empty team_id
+        let source = LinearSource::with_http_client(config, mock);
+        let issues = source.list_open_issues("").await.unwrap();
+
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_graphql_multiple_errors_joined() {
+        let mock = SequentialMockLinearClient::new(vec![(
+            200,
+            r#"{
+                "errors": [
+                    {"message": "Error one"},
+                    {"message": "Error two"}
+                ]
+            }"#,
+        )]);
+
+        let config = test_config();
+        let source = LinearSource::with_http_client(config, mock);
+        let result = source.fetch_issues().await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Error one"));
+        assert!(err_msg.contains("Error two"));
+    }
 }

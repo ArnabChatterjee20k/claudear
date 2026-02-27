@@ -2145,7 +2145,11 @@ mod tests {
     mod pr_monitor_tests {
         use super::*;
         use crate::error::{Error, Result};
-        use crate::storage::FixAttemptTracker;
+        use crate::storage::{
+            ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore,
+            ExperimentStore, KnowledgeStore, RegressionStore, RepoStore, SimilarityStore,
+            UserStore, WebhookStore,
+        };
         use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, IssueType};
         use async_trait::async_trait;
         use chrono::Utc;
@@ -2254,13 +2258,13 @@ mod tests {
             }
         }
 
-        impl FixAttemptTracker for MockFixAttemptTracker {
+        impl AttemptTracker for MockFixAttemptTracker {
             fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
                 Ok(false)
             }
 
-            fn get_attempted_issue_ids(&self, _source: &str) -> HashSet<String> {
-                HashSet::new()
+            fn get_attempted_issue_ids(&self, _source: &str) -> Result<HashSet<String>> {
+                Ok(HashSet::new())
             }
 
             fn record_attempt(
@@ -2364,6 +2368,23 @@ mod tests {
                 Ok(())
             }
         }
+
+        impl ActivityStore for MockFixAttemptTracker {}
+
+        impl KnowledgeStore for MockFixAttemptTracker {}
+
+        impl EmbeddingStore for MockFixAttemptTracker {}
+
+        impl RepoStore for MockFixAttemptTracker {}
+
+        impl UserStore for MockFixAttemptTracker {}
+
+        impl ChatStore for MockFixAttemptTracker {}
+        impl RegressionStore for MockFixAttemptTracker {}
+        impl ExperimentStore for MockFixAttemptTracker {}
+        impl EvaluationStore for MockFixAttemptTracker {}
+        impl WebhookStore for MockFixAttemptTracker {}
+        impl SimilarityStore for MockFixAttemptTracker {}
 
         fn make_fix_attempt(
             source: &str,
@@ -3898,7 +3919,11 @@ mod tests {
             CodeReview, PrInfo, PrReviewState, PrStatus, RemoteRepo, ReviewComment, ReviewEvent,
             ReviewUser, ReviewWatcher, ScmProvider,
         };
-        use crate::storage::FixAttemptTracker;
+        use crate::storage::{
+            ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore,
+            ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore, RepoStore,
+            SimilarityStore, UserStore, WebhookStore,
+        };
         use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
         use async_trait::async_trait;
         use std::collections::HashSet;
@@ -3974,12 +3999,12 @@ mod tests {
 
         struct MockTracker;
 
-        impl FixAttemptTracker for MockTracker {
+        impl AttemptTracker for MockTracker {
             fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
                 Ok(false)
             }
-            fn get_attempted_issue_ids(&self, _source: &str) -> HashSet<String> {
-                HashSet::new()
+            fn get_attempted_issue_ids(&self, _source: &str) -> Result<HashSet<String>> {
+                Ok(HashSet::new())
             }
             fn record_attempt(
                 &self,
@@ -4058,6 +4083,23 @@ mod tests {
                 Ok(())
             }
         }
+
+        impl ActivityStore for MockTracker {}
+
+        impl KnowledgeStore for MockTracker {}
+
+        impl EmbeddingStore for MockTracker {}
+
+        impl RepoStore for MockTracker {}
+
+        impl UserStore for MockTracker {}
+
+        impl ChatStore for MockTracker {}
+        impl RegressionStore for MockTracker {}
+        impl ExperimentStore for MockTracker {}
+        impl EvaluationStore for MockTracker {}
+        impl WebhookStore for MockTracker {}
+        impl SimilarityStore for MockTracker {}
 
         fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
             CodeReview {
@@ -4565,7 +4607,11 @@ mod tests {
         use super::*;
         use crate::error::Result;
         use crate::scm::{PrInfo, PrMonitor, PrStatus, RemoteRepo};
-        use crate::storage::FixAttemptTracker;
+        use crate::storage::{
+            ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore,
+            ExperimentStore, KnowledgeStore, RegressionStore, RepoStore, SimilarityStore,
+            UserStore, WebhookStore,
+        };
         use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
         use async_trait::async_trait;
         use chrono::Utc;
@@ -4657,12 +4703,12 @@ mod tests {
             }
         }
 
-        impl FixAttemptTracker for MockFixAttemptTracker {
+        impl AttemptTracker for MockFixAttemptTracker {
             fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
                 Ok(false)
             }
-            fn get_attempted_issue_ids(&self, _source: &str) -> HashSet<String> {
-                HashSet::new()
+            fn get_attempted_issue_ids(&self, _source: &str) -> Result<HashSet<String>> {
+                Ok(HashSet::new())
             }
             fn record_attempt(
                 &self,
@@ -4749,6 +4795,23 @@ mod tests {
                 Ok(())
             }
         }
+
+        impl ActivityStore for MockFixAttemptTracker {}
+
+        impl KnowledgeStore for MockFixAttemptTracker {}
+
+        impl EmbeddingStore for MockFixAttemptTracker {}
+
+        impl RepoStore for MockFixAttemptTracker {}
+
+        impl UserStore for MockFixAttemptTracker {}
+
+        impl ChatStore for MockFixAttemptTracker {}
+        impl RegressionStore for MockFixAttemptTracker {}
+        impl ExperimentStore for MockFixAttemptTracker {}
+        impl EvaluationStore for MockFixAttemptTracker {}
+        impl WebhookStore for MockFixAttemptTracker {}
+        impl SimilarityStore for MockFixAttemptTracker {}
 
         fn make_fix_attempt(
             source: &str,
@@ -5160,7 +5223,11 @@ mod tests {
             CodeReview, PrInfo, PrReviewState, PrStatus, RemoteRepo, ReviewComment, ReviewUser,
             ReviewWatcher, ScmProvider,
         };
-        use crate::storage::{FixAttemptTracker, SqliteTracker};
+        use crate::storage::{
+            ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore,
+            ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore, RepoStore,
+            SimilarityStore, SqliteTracker, UserStore, WebhookStore,
+        };
         use crate::types::{
             ActivityLogEntry, FixAttempt, FixAttemptStats, FixAttemptStatus, PrReviewRecord,
         };
@@ -5250,12 +5317,12 @@ mod tests {
             }
         }
 
-        impl FixAttemptTracker for MockTrackerWithRecording {
+        impl AttemptTracker for MockTrackerWithRecording {
             fn has_attempted(&self, _source: &str, _issue_id: &str) -> Result<bool> {
                 Ok(false)
             }
-            fn get_attempted_issue_ids(&self, _source: &str) -> HashSet<String> {
-                HashSet::new()
+            fn get_attempted_issue_ids(&self, _source: &str) -> Result<HashSet<String>> {
+                Ok(HashSet::new())
             }
             fn record_attempt(
                 &self,
@@ -5333,6 +5400,9 @@ mod tests {
             fn prepare_for_retry(&self, _source: &str, _issue_id: &str) -> Result<()> {
                 Ok(())
             }
+        }
+
+        impl ActivityStore for MockTrackerWithRecording {
             fn record_pr_review(&self, review: &PrReviewRecord) -> Result<i64> {
                 self.review_calls
                     .lock()
@@ -5348,6 +5418,21 @@ mod tests {
                 Ok(1)
             }
         }
+
+        impl KnowledgeStore for MockTrackerWithRecording {}
+
+        impl EmbeddingStore for MockTrackerWithRecording {}
+
+        impl RepoStore for MockTrackerWithRecording {}
+
+        impl UserStore for MockTrackerWithRecording {}
+
+        impl ChatStore for MockTrackerWithRecording {}
+        impl RegressionStore for MockTrackerWithRecording {}
+        impl ExperimentStore for MockTrackerWithRecording {}
+        impl EvaluationStore for MockTrackerWithRecording {}
+        impl WebhookStore for MockTrackerWithRecording {}
+        impl SimilarityStore for MockTrackerWithRecording {}
 
         fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
             CodeReview {
@@ -5658,5 +5743,475 @@ mod tests {
             let events = watcher.check_for_reviews().await.unwrap();
             assert!(events.is_empty());
         }
+    }
+
+    // --- comment_is_after_cursor tests ---
+
+    #[test]
+    fn comment_is_after_cursor_no_cursor() {
+        let comment = make_review_comment("src/main.rs", "fix", Some(1));
+        // No last_comment_time => always returns true
+        assert!(ReviewWatcher::comment_is_after_cursor(&comment, None, None));
+    }
+
+    #[test]
+    fn comment_is_after_cursor_comment_newer() {
+        let mut comment = make_review_comment("src/main.rs", "fix", Some(1));
+        comment.updated_at = "2024-06-01T12:00:00Z".to_string();
+        comment.id = 50;
+        assert!(ReviewWatcher::comment_is_after_cursor(
+            &comment,
+            Some("2024-06-01T11:00:00Z"),
+            Some(40),
+        ));
+    }
+
+    #[test]
+    fn comment_is_after_cursor_comment_older() {
+        let mut comment = make_review_comment("src/main.rs", "fix", Some(1));
+        comment.updated_at = "2024-06-01T10:00:00Z".to_string();
+        comment.id = 50;
+        assert!(!ReviewWatcher::comment_is_after_cursor(
+            &comment,
+            Some("2024-06-01T11:00:00Z"),
+            Some(40),
+        ));
+    }
+
+    #[test]
+    fn comment_is_after_cursor_same_time_higher_id() {
+        let mut comment = make_review_comment("src/main.rs", "fix", Some(1));
+        comment.updated_at = "2024-06-01T12:00:00Z".to_string();
+        comment.id = 60;
+        assert!(ReviewWatcher::comment_is_after_cursor(
+            &comment,
+            Some("2024-06-01T12:00:00Z"),
+            Some(50),
+        ));
+    }
+
+    #[test]
+    fn comment_is_after_cursor_same_time_lower_id() {
+        let mut comment = make_review_comment("src/main.rs", "fix", Some(1));
+        comment.updated_at = "2024-06-01T12:00:00Z".to_string();
+        comment.id = 40;
+        assert!(!ReviewWatcher::comment_is_after_cursor(
+            &comment,
+            Some("2024-06-01T12:00:00Z"),
+            Some(50),
+        ));
+    }
+
+    #[test]
+    fn comment_is_after_cursor_same_time_equal_id() {
+        let mut comment = make_review_comment("src/main.rs", "fix", Some(1));
+        comment.updated_at = "2024-06-01T12:00:00Z".to_string();
+        comment.id = 50;
+        assert!(!ReviewWatcher::comment_is_after_cursor(
+            &comment,
+            Some("2024-06-01T12:00:00Z"),
+            Some(50),
+        ));
+    }
+
+    #[test]
+    fn comment_is_after_cursor_same_time_no_id() {
+        let mut comment = make_review_comment("src/main.rs", "fix", Some(1));
+        comment.updated_at = "2024-06-01T12:00:00Z".to_string();
+        comment.id = 50;
+        // No last_comment_id but same time => returns true
+        assert!(ReviewWatcher::comment_is_after_cursor(
+            &comment,
+            Some("2024-06-01T12:00:00Z"),
+            None,
+        ));
+    }
+
+    // --- ScmRelease serde ---
+
+    #[test]
+    fn scm_release_serialization_round_trip() {
+        let release = ScmRelease {
+            tag: "v1.2.3".to_string(),
+            name: Some("Release 1.2.3".to_string()),
+            url: "https://github.com/org/repo/releases/tag/v1.2.3".to_string(),
+            published_at: Some("2024-06-01T12:00:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&release).unwrap();
+        let deserialized: ScmRelease = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.tag, "v1.2.3");
+        assert_eq!(deserialized.name, Some("Release 1.2.3".to_string()));
+        assert_eq!(
+            deserialized.url,
+            "https://github.com/org/repo/releases/tag/v1.2.3"
+        );
+        assert_eq!(
+            deserialized.published_at,
+            Some("2024-06-01T12:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn scm_release_with_none_fields() {
+        let release = ScmRelease {
+            tag: "v0.1.0".to_string(),
+            name: None,
+            url: "https://example.com".to_string(),
+            published_at: None,
+        };
+        let json = serde_json::to_string(&release).unwrap();
+        let deserialized: ScmRelease = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.tag, "v0.1.0");
+        assert!(deserialized.name.is_none());
+        assert!(deserialized.published_at.is_none());
+    }
+
+    #[test]
+    fn scm_release_clone() {
+        let release = ScmRelease {
+            tag: "v2.0.0".to_string(),
+            name: Some("Major release".to_string()),
+            url: "https://example.com/release".to_string(),
+            published_at: Some("2024-12-01T00:00:00Z".to_string()),
+        };
+        let cloned = release.clone();
+        assert_eq!(cloned.tag, release.tag);
+        assert_eq!(cloned.name, release.name);
+    }
+
+    // --- RemoteRepo serde ---
+
+    #[test]
+    fn remote_repo_serialization_round_trip() {
+        let repo = RemoteRepo {
+            id: 42,
+            full_name: "org/my-repo".to_string(),
+            name: "my-repo".to_string(),
+            default_branch: "main".to_string(),
+            clone_url: "https://github.com/org/my-repo.git".to_string(),
+            ssh_url: "git@github.com:org/my-repo.git".to_string(),
+            html_url: "https://github.com/org/my-repo".to_string(),
+            private: true,
+            archived: false,
+        };
+        let json = serde_json::to_string(&repo).unwrap();
+        let deserialized: RemoteRepo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, 42);
+        assert_eq!(deserialized.full_name, "org/my-repo");
+        assert!(deserialized.private);
+        assert!(!deserialized.archived);
+    }
+
+    #[test]
+    fn remote_repo_ssh_url_default() {
+        // ssh_url has #[serde(default)] so it should default to empty string
+        let json = r#"{
+            "id": 1,
+            "full_name": "org/repo",
+            "name": "repo",
+            "default_branch": "main",
+            "clone_url": "https://github.com/org/repo.git",
+            "html_url": "https://github.com/org/repo",
+            "private": false,
+            "archived": false
+        }"#;
+        let repo: RemoteRepo = serde_json::from_str(json).unwrap();
+        assert_eq!(repo.ssh_url, "");
+    }
+
+    // --- ReviewComment serde ---
+
+    #[test]
+    fn review_comment_serialization_round_trip() {
+        let comment = ReviewComment {
+            id: 999,
+            path: "src/lib.rs".to_string(),
+            position: Some(5),
+            original_position: Some(5),
+            body: "Needs refactoring".to_string(),
+            user: ReviewUser {
+                id: 10,
+                login: "dev".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-02T00:00:00Z".to_string(),
+            html_url: "https://github.com/org/repo/pull/1#discussion_r999".to_string(),
+            pull_request_review_id: Some(500),
+            line: Some(42),
+            start_line: Some(40),
+            side: Some("RIGHT".to_string()),
+        };
+        let json = serde_json::to_string(&comment).unwrap();
+        let deserialized: ReviewComment = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, 999);
+        assert_eq!(deserialized.path, "src/lib.rs");
+        assert_eq!(deserialized.position, Some(5));
+        assert_eq!(deserialized.body, "Needs refactoring");
+        assert_eq!(deserialized.user.login, "dev");
+        assert_eq!(deserialized.pull_request_review_id, Some(500));
+        assert_eq!(deserialized.line, Some(42));
+        assert_eq!(deserialized.start_line, Some(40));
+        assert_eq!(deserialized.side, Some("RIGHT".to_string()));
+    }
+
+    #[test]
+    fn review_comment_with_optional_fields_none() {
+        let comment = ReviewComment {
+            id: 1,
+            path: "file.rs".to_string(),
+            position: None,
+            original_position: None,
+            body: "comment".to_string(),
+            user: ReviewUser {
+                id: 1,
+                login: "user".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            html_url: "https://example.com".to_string(),
+            pull_request_review_id: None,
+            line: None,
+            start_line: None,
+            side: None,
+        };
+        let json = serde_json::to_string(&comment).unwrap();
+        let deserialized: ReviewComment = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.position.is_none());
+        assert!(deserialized.pull_request_review_id.is_none());
+        assert!(deserialized.line.is_none());
+        assert!(deserialized.start_line.is_none());
+        assert!(deserialized.side.is_none());
+        assert!(deserialized.user.user_type.is_none());
+    }
+
+    // --- CodeReview serde ---
+
+    #[test]
+    fn code_review_serialization_round_trip() {
+        let review = CodeReview {
+            id: 777,
+            state: "APPROVED".to_string(),
+            body: Some("LGTM".to_string()),
+            user: ReviewUser {
+                id: 5,
+                login: "approver".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            submitted_at: Some("2024-03-15T10:30:00Z".to_string()),
+            html_url: Some("https://github.com/org/repo/pull/1#pullrequestreview-777".to_string()),
+        };
+        let json = serde_json::to_string(&review).unwrap();
+        let deserialized: CodeReview = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, 777);
+        assert_eq!(deserialized.state, "APPROVED");
+        assert_eq!(deserialized.body, Some("LGTM".to_string()));
+        assert_eq!(deserialized.user.login, "approver");
+        assert_eq!(
+            deserialized.submitted_at,
+            Some("2024-03-15T10:30:00Z".to_string())
+        );
+    }
+
+    // --- PrSummary serde ---
+
+    #[test]
+    fn pr_summary_serialization_round_trip() {
+        let summary = PrSummary {
+            number: 42,
+            title: "Fix auth bug".to_string(),
+            branch: "fix/auth-bug".to_string(),
+            url: "https://github.com/org/repo/pull/42".to_string(),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let deserialized: PrSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.number, 42);
+        assert_eq!(deserialized.title, "Fix auth bug");
+        assert_eq!(deserialized.branch, "fix/auth-bug");
+        assert_eq!(deserialized.url, "https://github.com/org/repo/pull/42");
+    }
+
+    // --- ReviewUser serde ---
+
+    #[test]
+    fn review_user_serialization_round_trip() {
+        let user = ReviewUser {
+            id: 123,
+            login: "testuser".to_string(),
+            user_type: Some("User".to_string()),
+        };
+        let json = serde_json::to_string(&user).unwrap();
+        // The "type" field should be serialized as "type" not "user_type"
+        assert!(json.contains("\"type\""));
+        let deserialized: ReviewUser = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, 123);
+        assert_eq!(deserialized.login, "testuser");
+        assert_eq!(deserialized.user_type, Some("User".to_string()));
+    }
+
+    #[test]
+    fn review_user_bot_type() {
+        let json = r#"{"id": 1, "login": "dependabot[bot]", "type": "Bot"}"#;
+        let user: ReviewUser = serde_json::from_str(json).unwrap();
+        assert_eq!(user.user_type, Some("Bot".to_string()));
+        assert_eq!(user.login, "dependabot[bot]");
+    }
+
+    // --- PostReviewAction ---
+
+    #[test]
+    fn post_review_action_equality() {
+        assert_eq!(PostReviewAction::Comment, PostReviewAction::Comment);
+        assert_eq!(
+            PostReviewAction::RequestChanges,
+            PostReviewAction::RequestChanges
+        );
+        assert_eq!(PostReviewAction::Approve, PostReviewAction::Approve);
+        assert_ne!(PostReviewAction::Comment, PostReviewAction::Approve);
+    }
+
+    #[test]
+    fn post_review_action_debug() {
+        assert_eq!(format!("{:?}", PostReviewAction::Comment), "Comment");
+        assert_eq!(
+            format!("{:?}", PostReviewAction::RequestChanges),
+            "RequestChanges"
+        );
+        assert_eq!(format!("{:?}", PostReviewAction::Approve), "Approve");
+    }
+
+    // --- PrStatusUpdate ---
+
+    #[test]
+    fn pr_status_update_fields() {
+        let update = PrStatusUpdate {
+            source: "linear".to_string(),
+            issue_id: "LIN-123".to_string(),
+            short_id: "LIN-123".to_string(),
+            pr_url: "https://github.com/org/repo/pull/1".to_string(),
+            new_status: PrStatus::Merged,
+            should_resolve: true,
+            regression_watch_id: Some(42),
+        };
+        assert_eq!(update.source, "linear");
+        assert_eq!(update.issue_id, "LIN-123");
+        assert_eq!(update.pr_url, "https://github.com/org/repo/pull/1");
+        assert_eq!(update.new_status, PrStatus::Merged);
+        assert!(update.should_resolve);
+        assert_eq!(update.regression_watch_id, Some(42));
+    }
+
+    #[test]
+    fn pr_status_update_no_regression_watch() {
+        let update = PrStatusUpdate {
+            source: "sentry".to_string(),
+            issue_id: "SENTRY-1".to_string(),
+            short_id: "SENTRY-1".to_string(),
+            pr_url: "https://github.com/org/repo/pull/2".to_string(),
+            new_status: PrStatus::Closed,
+            should_resolve: false,
+            regression_watch_id: None,
+        };
+        assert!(!update.should_resolve);
+        assert!(update.regression_watch_id.is_none());
+    }
+
+    // --- InlineReviewComment ---
+
+    #[test]
+    fn inline_review_comment_fields() {
+        let comment = InlineReviewComment {
+            path: "src/main.rs".to_string(),
+            body: "Consider using unwrap_or_default".to_string(),
+            position: Some(42),
+        };
+        assert_eq!(comment.path, "src/main.rs");
+        assert_eq!(comment.body, "Consider using unwrap_or_default");
+        assert_eq!(comment.position, Some(42));
+    }
+
+    #[test]
+    fn inline_review_comment_no_position() {
+        let comment = InlineReviewComment {
+            path: "README.md".to_string(),
+            body: "Typo".to_string(),
+            position: None,
+        };
+        assert!(comment.position.is_none());
+    }
+
+    // --- ReviewEvent requires_action for case-insensitive states (extended) ---
+
+    #[test]
+    fn review_event_requires_action_lowercase_changes_requested_2() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("changes_requested", None),
+            inline_comments: vec![],
+        };
+        assert!(event.requires_action());
+    }
+
+    #[test]
+    fn review_event_requires_action_mixed_case_commented_2() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("Commented", None),
+            inline_comments: vec![],
+        };
+        assert!(event.requires_action());
+    }
+
+    #[test]
+    fn review_event_requires_action_dismissed_2() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("DISMISSED", None),
+            inline_comments: vec![],
+        };
+        assert!(!event.requires_action());
+    }
+
+    #[test]
+    fn review_event_requires_action_pending_2() {
+        let event = ReviewEvent::ReviewSubmitted {
+            pr_url: "url".to_string(),
+            repo: "repo".to_string(),
+            pr_number: 1,
+            review: make_review("PENDING", None),
+            inline_comments: vec![],
+        };
+        assert!(!event.requires_action());
+    }
+
+    // --- PrReviewState serde with all-None cursors ---
+
+    #[test]
+    fn pr_review_state_serde_none_cursors() {
+        let state = PrReviewState::new("https://example.com/pr/1", "org/repo", 1, "ISS-1", "jira");
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: PrReviewState = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.pr_url, "https://example.com/pr/1");
+        assert!(deserialized.last_review_id.is_none());
+        assert!(deserialized.last_review_time.is_none());
+        assert!(deserialized.last_comment_id.is_none());
+        assert!(deserialized.last_comment_time.is_none());
+        assert!(deserialized.is_active);
+    }
+
+    #[test]
+    fn pr_review_state_deactivate() {
+        let mut state =
+            PrReviewState::new("https://example.com/pr/1", "org/repo", 1, "ISS-1", "linear");
+        assert!(state.is_active);
+        state.is_active = false;
+        assert!(!state.is_active);
     }
 }

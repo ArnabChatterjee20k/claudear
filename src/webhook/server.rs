@@ -4,23 +4,13 @@ use super::{GitHubWebhookHandler, WebhookHandler, WebhookHandlerRegistry};
 use crate::config::Config;
 use crate::error::Error;
 use crate::error::Result;
-use crate::feedback::{
-    format_similar_issues_context, FeedbackAnalyzer, FixOutcome, IssueEmbeddingService, Outcome,
-};
-use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
-use crate::notifier::{send_to_all_and_wait_first_reply, Notifier};
-use crate::qa::{
-    build_correlation_id, embed_text, find_reusable_qa, format_answer_context,
-    format_reuse_context, format_timeout_context, normalize_text,
-};
-use crate::repo::{worktree_path, GitOps};
-use crate::runner::{self, AgentRunner};
-use crate::scm::{PrReviewState, ReviewWatcher};
-use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker};
-use crate::types::{
-    validate_issue_id, ActivityLogEntry, AgentExecution, AskRequest, ErrorPattern, Issue,
-    IssueEmbedding, ProcessingMetric, QaKnowledgeEntry,
-};
+use crate::feedback::{FeedbackAnalyzer, IssueEmbeddingService};
+use crate::inference::{resolve_repo_for_issue, RepoInferrer};
+use crate::notifier::Notifier;
+use crate::runner::AgentRunner;
+use crate::scm::ReviewWatcher;
+use crate::storage::FixAttemptTracker;
+use crate::types::{validate_issue_id, ActivityLogEntry, Issue, IssueEmbedding, ProcessingMetric};
 use crate::users::UserRegistry;
 use axum::{
     body::Bytes,
@@ -59,6 +49,7 @@ struct AppState {
     embedding_client: Option<Arc<crate::feedback::EmbeddingClient>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
+    #[allow(dead_code)]
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     review_watcher: Option<Arc<ReviewWatcher>>,
     user_registry: UserRegistry,
@@ -253,23 +244,20 @@ impl WebhookServer {
             .layer(NewSentryLayer::new_from_top())
             .with_state(state.clone());
 
-        let addr = format!("{}:{}", bind_address, self.port);
-        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied && self.port < 1024 {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Cannot bind to port {} (privileged ports < 1024 require root). \
-                         Use a port >= 1024 or run with elevated privileges.",
-                        self.port
-                    ),
-                )
-            } else {
-                e
-            }
-        })?;
+        let tls_enabled = state.config.tls.enabled;
+        let scheme = if tls_enabled { "https" } else { "http" };
+        let display_port = if tls_enabled {
+            state.config.tls.https_port
+        } else {
+            self.port
+        };
 
-        tracing::info!("Webhook server listening on {}", addr);
+        tracing::info!(
+            "Webhook server starting ({}://{}:{})",
+            scheme,
+            bind_address,
+            display_port
+        );
         tracing::info!(
             workspace = ?state.config.workspace,
             known_orgs = state.config.known_orgs.len(),
@@ -288,16 +276,21 @@ impl WebhookServer {
         );
         tracing::info!("");
         tracing::info!("Endpoints:");
-        tracing::info!("  GET  http://localhost:{}/health", self.port);
+        tracing::info!("  GET  {}://localhost:{}/health", scheme, display_port);
         for handler in state.handlers.get_all() {
             tracing::info!(
-                "  POST http://localhost:{}/webhook/{}",
-                self.port,
+                "  POST {}://localhost:{}/webhook/{}",
+                scheme,
+                display_port,
                 handler.source_name()
             );
         }
 
-        axum::serve(listener, app).await?;
+        if tls_enabled {
+            crate::tls::serve_with_tls(&state.config.tls, &bind_address, app).await?;
+        } else {
+            crate::tls::serve_plain_http(&bind_address, self.port, app).await?;
+        }
 
         Ok(())
     }
@@ -343,7 +336,7 @@ async fn webhook_verify_handler(
         .map(|s| s.expose().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            std::env::var("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+            std::env::var("CLAUDEAR_WHATSAPP_WEBHOOK_VERIFY_TOKEN")
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -825,911 +818,87 @@ async fn handle_github_webhook(
 async fn process_issue(
     state: Arc<AppState>,
     handler: Arc<dyn WebhookHandler>,
-    mut issue: Issue,
+    issue: Issue,
     match_result: crate::types::MatchResult,
     processing_key: String,
 ) -> Result<()> {
-    let source_name = handler.source_name();
+    use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome, WebhookContext};
+
+    let source_name = handler.source_name().to_string();
 
     tracing::info!(short_id = %issue.short_id, title = %issue.title, "Processing webhook issue");
     tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
 
-    // Infer the target repository using the shared resolution function
     let resolution = resolve_repo_for_issue(state.inferrer.as_ref(), &issue, Some(&state.tracker));
 
-    let project_dir = match &resolution {
-        RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
-        RepoResolution::Skip { reason } => {
-            tracing::debug!(short_id = %issue.short_id, reason = %reason, "Skipping issue");
-            // Clean up processing flag before returning
-            let mut processing = state.processing.write().await;
-            processing.remove(&processing_key);
-            // Mark as failed so it won't be retried (skip is intentional)
-            state
-                .tracker
-                .mark_failed(source_name, &issue.id, &format!("Skipped: {}", reason))?;
-            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed)
-                .await;
-            return Ok(());
-        }
-    };
-
-    // Fetch the parent repo (no checkout/reset — just update object store)
-    // then create an isolated per-issue worktree for Claude to work in.
-    if let (Some(scm_url), Some(default_branch), Some(repo_name)) = (
-        resolution.scm_url(),
-        resolution.default_branch(),
-        resolution.repo_name(),
-    ) {
-        tracing::info!(
-            short_id = %issue.short_id,
-            repo = %repo_name,
-            "Fetching latest changes"
-        );
-
-        if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, scm_url).await {
-            tracing::error!(
-                short_id = %issue.short_id,
-                repo = %repo_name,
-                error = %e,
-                "Failed to fetch repository, skipping issue"
-            );
-            // Clean up processing flag before returning
-            let mut processing = state.processing.write().await;
-            processing.remove(&processing_key);
-            // Mark as failed
-            state.tracker.mark_failed(
-                source_name,
-                &issue.id,
-                &format!("Git fetch failed: {}", e),
-            )?;
-            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed)
-                .await;
-            return Ok(());
-        }
-
-        // Create per-issue worktree
-        let wt_path = worktree_path(&state.config.workspace, repo_name, &issue.short_id);
-        if let Err(e) = GitOps::create_worktree(
-            &project_dir,
-            &wt_path,
-            &format!("origin/{}", default_branch),
-        )
-        .await
-        {
-            tracing::error!(
-                short_id = %issue.short_id,
-                repo = %repo_name,
-                error = %e,
-                "Failed to create worktree, skipping issue"
-            );
-            let mut processing = state.processing.write().await;
-            processing.remove(&processing_key);
-            state.tracker.mark_failed(
-                source_name,
-                &issue.id,
-                &format!("Worktree creation failed: {}", e),
-            )?;
-            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed)
-                .await;
-            return Ok(());
-        }
-
-        // Re-index files and sync to database
-        if let Some(inferrer) = &state.inferrer {
-            if let Err(e) = inferrer.index_cloned_repo(repo_name) {
-                tracing::warn!(
-                    short_id = %issue.short_id,
-                    repo = %repo_name,
-                    error = %e,
-                    "Failed to re-index repository files"
-                );
-            }
-
-            // Sync updated files to database
-            if let (Some(repo), Some(tracker)) =
-                (inferrer.get_repo(repo_name), &state.sqlite_tracker)
-            {
-                if let Err(e) = tracker.sync_repo_files(&repo) {
-                    tracing::warn!(
-                        short_id = %issue.short_id,
-                        repo = %repo_name,
-                        error = %e,
-                        "Failed to sync repository files to database"
-                    );
-                }
-            }
-        }
-    }
-
-    // Use the per-issue worktree as the effective working directory for Claude.
-    // Fall back to project_dir only when no repo was resolved (no worktree attempted).
-    let effective_project_dir = if let Some(repo_name) = resolution.repo_name() {
-        let wt = worktree_path(&state.config.workspace, repo_name, &issue.short_id);
-        if !wt.exists() {
-            let err = format!("Worktree disappeared after creation: {:?}", wt);
-            tracing::error!(short_id = %issue.short_id, error = %err);
-            let mut processing = state.processing.write().await;
-            processing.remove(&processing_key);
-            state.tracker.mark_failed(source_name, &issue.id, &err)?;
-            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed)
-                .await;
-            return Ok(());
-        }
-        wt
-    } else {
-        project_dir.clone()
-    };
-
-    // Note: processing flag and attempt already recorded by handle_webhook before spawning
-    if let Some(assignee) = issue.get_metadata::<String>("assignee") {
-        if let Some(resolved) = state.user_registry.resolve(&issue.source, &assignee) {
-            issue.set_metadata("resolved_user", &resolved.slug);
-        }
-    }
     let attempt_id = state
         .tracker
-        .get_attempt(source_name, &issue.id)
+        .get_attempt(&source_name, &issue.id)
         .ok()
         .flatten()
         .map(|a| a.id);
 
-    let processing_started_at = Instant::now();
-    let result = async {
-        // Notify start
-        state.notifier.notify_start(&issue).await?;
+    let processor = IssueProcessor {
+        config: state.config.clone(),
+        tracker: state.tracker.clone(),
+        notifier: state.notifier.clone(),
+        agent: state.agent.clone(),
+        inferrer: state.inferrer.clone(),
+        embedding_client: state.embedding_client.clone(),
+        issue_embedding_service: state.issue_embedding_service.clone(),
+        code_search_service: state.code_search_service.clone(),
+        feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
+            crate::feedback::FeedbackAnalyzer::new().with_tracker(state.tracker.clone()),
+        )),
+        review_watcher: state.review_watcher.clone(),
+        user_registry: state.user_registry.clone(),
+        github_client: None,
+    };
 
-        // Build context and run Claude (with semantic Q&A reuse + ask loop).
-        let mut context = handler.build_issue_context(&issue).await?;
+    let input = ProcessingInput {
+        issue: issue.clone(),
+        source_name: source_name.clone(),
+        match_result,
+        resolution,
+        attempt_id,
+        review_feedback: None,
+        existing_pr_branch: None,
+    };
 
-        // Enrich context with similar past issues
-        if let Some(ref embedding_service) = state.issue_embedding_service {
-            match embedding_service.find_similar(&issue, source_name).await {
-                Ok(similar) if !similar.is_empty() => {
-                    let activity = ActivityLogEntry::new(
-                        "decision",
-                        format!("{} similar issues added to context for {}", similar.len(), issue.short_id),
-                    )
-                    .with_source(source_name.to_string())
-                    .with_issue(issue.id.clone(), issue.short_id.clone())
-                    .with_metadata(json!({
-                        "decision": "similar_issues_context_added",
-                        "details": { "similar_count": similar.len() }
-                    }));
-                    state.tracker.record_activity(&activity).ok();
+    let context_provider = WebhookContext(handler.as_ref());
+    let outcome = processor.run(input, &context_provider).await;
 
-                    let metric = ProcessingMetric::new("similar_issues_context_added", 1.0)
-                        .with_source(source_name.to_string());
-                    state.tracker.record_metric(&metric).ok();
+    // Log webhook-specific activity
+    let (activity_msg, activity_meta) = match &outcome {
+        ProcessingOutcome::Success { pr_url } => (
+            format!("Webhook processed: {} - PR created", issue.short_id),
+            json!({ "pr_url": pr_url, "success": true }),
+        ),
+        ProcessingOutcome::CompletedNoPr { reason } => (
+            format!(
+                "Webhook processed: {} - completed without PR: {}",
+                issue.short_id, reason
+            ),
+            json!({ "success": false, "reason": reason }),
+        ),
+        ProcessingOutcome::Failed { error } => (
+            format!("Webhook processed: {} - failed", issue.short_id),
+            json!({ "success": false, "error": error }),
+        ),
+    };
+    let activity = ActivityLogEntry::new("webhook_processed", activity_msg)
+        .with_source(source_name.clone())
+        .with_issue(issue.id.clone(), issue.short_id.clone())
+        .with_metadata(activity_meta);
+    state.tracker.record_activity(&activity).ok();
 
-                    context = format!("{}\n{}", context, format_similar_issues_context(&similar));
-                }
-                _ => {}
-            }
-        }
-
-        // Enrich context with relevant code from the repository
-        if state.config.code_index.enabled {
-            if let Some(ref code_search) = state.code_search_service {
-                let query = crate::repo::code_index::build_code_search_query(&issue);
-                let repo_id = resolution.repo_id();
-                match code_search.search(&query, repo_id, 5).await {
-                    Ok(results) if !results.is_empty() => {
-                        let activity = ActivityLogEntry::new(
-                            "decision",
-                            format!(
-                                "{} code snippets added to context for {}",
-                                results.len(),
-                                issue.short_id
-                            ),
-                        )
-                        .with_source(source_name.to_string())
-                        .with_issue(issue.id.clone(), issue.short_id.clone())
-                        .with_metadata(json!({
-                            "decision": "code_search_context_added",
-                            "details": { "snippet_count": results.len() }
-                        }));
-                        state.tracker.record_activity(&activity).ok();
-
-                        let metric = ProcessingMetric::new("code_search_context_added", 1.0)
-                            .with_source(source_name.to_string());
-                        state.tracker.record_metric(&metric).ok();
-
-                        context = format!(
-                            "{}\n{}",
-                            context,
-                            crate::repo::code_index::format_code_search_context(&results)
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let repo_scope = resolution.repo_name().map(|v| v.to_string());
-        let mut used_qa_ids: Vec<i64> = Vec::new();
-
-        if state.config.ask.enabled {
-            let preload_query = format!("{} {}", issue.title, context);
-            let preload_norm = normalize_text(&preload_query);
-            let preload_embedding =
-                embed_text(state.embedding_client.as_deref(), &preload_query).await;
-            match find_reusable_qa(
-                state.tracker.as_ref(),
-                &state.config.ask,
-                source_name,
-                repo_scope.as_deref(),
-                &preload_norm,
-                preload_embedding.as_deref(),
-            ) {
-                Ok(matches) if !matches.is_empty() => {
-                    context = format!("{}\n\n{}", context, format_reuse_context(&matches));
-                    if let Some(id) = attempt_id {
-                        for m in &matches {
-                            let _ = state.tracker.record_qa_usage(
-                                id,
-                                m.entry.id,
-                                "reused",
-                                m.final_score,
-                            );
-                        }
-                    }
-                    used_qa_ids.extend(matches.into_iter().map(|m| m.entry.id));
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "Failed to preload reusable Q&A context"),
-            }
-        }
-
-        let mut rounds: u8 = 0;
-        let claude_result = loop {
-            let prompt = state
-                .agent
-                .build_prompt_for_issue(&issue, &context, &effective_project_dir);
-
-            // Enhance prompt with feedback learnings from past outcomes (semantic when possible)
-            let prompt = {
-                let analyzer = state.feedback_analyzer.lock().await;
-                // Try to use pre-computed issue embedding for semantic search
-                let issue_emb = state
-                    .issue_embedding_service
-                    .as_ref()
-                    .and_then(|svc| svc.get_embedding(source_name, &issue.id).ok().flatten());
-                match issue_emb.and_then(|emb| emb.embedding) {
-                    Some(ref emb) => analyzer.enhance_prompt(&prompt, &issue, emb),
-                    None => prompt,
-                }
-            };
-
-            // Enhance prompt with continuous learning context
-            let prompt = enhance_prompt_with_learning(
-                &state,
-                &prompt,
-                &issue,
-                resolution.repo_name(),
-            );
-
-            let mut run_result = state
-                .agent
-                .execute_with_attempt(&prompt, Some(&issue), attempt_id, &effective_project_dir)
-                .await?;
-            run_result.used_qa_ids = used_qa_ids.clone();
-
-            let blocking_question = match (
-                state.config.ask.enabled,
-                run_result.blocking_question.clone(),
-            ) {
-                (true, Some(q)) => q,
-                _ => break run_result,
-            };
-
-            if rounds >= state.config.ask.max_rounds_per_attempt {
-                run_result.success = false;
-                run_result.error = Some(format!(
-                    "Maximum blocking-question rounds ({}) reached",
-                    state.config.ask.max_rounds_per_attempt
-                ));
-                break run_result;
-            }
-            rounds = rounds.saturating_add(1);
-
-            let question_norm = normalize_text(&blocking_question.question);
-            let question_embedding =
-                embed_text(state.embedding_client.as_deref(), &blocking_question.question).await;
-            let reusable = match find_reusable_qa(
-                state.tracker.as_ref(),
-                &state.config.ask,
-                source_name,
-                repo_scope.as_deref(),
-                &question_norm,
-                question_embedding.as_deref(),
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to query reusable Q&A");
-                    Vec::new()
-                }
-            };
-
-            if let Some(best) = reusable.first() {
-                if let Some(id) = attempt_id {
-                    let _ = state.tracker.record_qa_usage(
-                        id,
-                        best.entry.id,
-                        "reused",
-                        best.final_score,
-                    );
-                }
-                if !used_qa_ids.contains(&best.entry.id) {
-                    used_qa_ids.push(best.entry.id);
-                }
-                let activity = ActivityLogEntry::new(
-                    "question_reused",
-                    format!("Reused stored Q&A for {}", issue.short_id),
-                )
-                .with_source(source_name.to_string())
-                .with_issue(issue.id.clone(), issue.short_id.clone())
-                .with_metadata(json!({
-                    "qa_id": best.entry.id,
-                    "score": best.final_score,
-                }));
-                state.tracker.record_activity(&activity).ok();
-
-                context = format!(
-                    "{}\n\n{}",
-                    context,
-                    format_answer_context(
-                        &blocking_question,
-                        &best.entry.answer_text,
-                        &best.entry.channel,
-                        true
-                    )
-                );
-                continue;
-            }
-
-            let resolved_user = issue.get_metadata::<String>("resolved_user");
-            let target_discord_id = resolved_user
-                .as_deref()
-                .and_then(|slug| state.user_registry.get_by_slug(slug))
-                .and_then(|u| u.discord_id.clone());
-            let target_email = resolved_user
-                .as_deref()
-                .and_then(|slug| state.user_registry.get_by_slug(slug))
-                .and_then(|u| u.email.clone());
-            let ask_request = AskRequest {
-                correlation_id: build_correlation_id(&issue.short_id),
-                source: issue.source.clone(),
-                repo: repo_scope.clone(),
-                issue_id: issue.id.clone(),
-                short_id: issue.short_id.clone(),
-                question: blocking_question.clone(),
-                asked_at: chrono::Utc::now(),
-                target_discord_id,
-                target_email,
-                target_slack_id: resolved_user
-                    .as_deref()
-                    .and_then(|slug| state.user_registry.get_by_slug(slug))
-                    .and_then(|u| u.slack_id.clone()),
-            };
-
-            let asked_activity = ActivityLogEntry::new(
-                "question_asked",
-                format!("Asked human question for {}", issue.short_id),
-            )
-            .with_source(source_name.to_string())
-            .with_issue(issue.id.clone(), issue.short_id.clone())
-            .with_metadata(json!({
-                "correlation_id": ask_request.correlation_id,
-                "question": blocking_question.question,
-            }));
-            state.tracker.record_activity(&asked_activity).ok();
-
-            let reply = send_to_all_and_wait_first_reply(
-                Arc::clone(&state.notifier),
-                &issue,
-                &ask_request,
-                tokio::time::Duration::from_secs(state.config.ask.wait_timeout_secs),
-                tokio::time::Duration::from_secs(state.config.ask.poll_interval_secs),
-            )
-            .await?;
-
-            if let Some(reply) = reply {
-                let answered_activity = ActivityLogEntry::new(
-                    "question_answered",
-                    format!("Human answered question for {}", issue.short_id),
-                )
-                .with_source(source_name.to_string())
-                .with_issue(issue.id.clone(), issue.short_id.clone())
-                .with_metadata(json!({
-                    "channel": reply.channel,
-                    "responder": reply.responder,
-                    "correlation_id": reply.correlation_id,
-                }));
-                state.tracker.record_activity(&answered_activity).ok();
-
-                let qa_entry = QaKnowledgeEntry {
-                    id: 0,
-                    source: issue.source.clone(),
-                    repo: repo_scope.clone(),
-                    issue_id: issue.id.clone(),
-                    short_id: issue.short_id.clone(),
-                    question_text: blocking_question.question.clone(),
-                    question_norm,
-                    question_embedding: question_embedding.clone(),
-                    answer_text: reply.answer.clone(),
-                    answer_norm: normalize_text(&reply.answer),
-                    answer_embedding: embed_text(state.embedding_client.as_deref(), &reply.answer)
-                        .await,
-                    channel: reply.channel.clone(),
-                    responder: reply.responder.clone(),
-                    correlation_id: ask_request.correlation_id.clone(),
-                    asked_at: ask_request.asked_at,
-                    answered_at: reply.replied_at,
-                    success_count: 0,
-                    failure_count: 0,
-                    last_used_at: None,
-                    metadata: Some(json!({
-                        "context": blocking_question.context,
-                        "options": blocking_question.options,
-                        "why": blocking_question.why,
-                    })),
-                };
-                if let Ok(qa_id) = state.tracker.store_qa_knowledge(&qa_entry) {
-                    if let Some(id) = attempt_id {
-                        let _ = state.tracker.record_qa_usage(id, qa_id, "asked", 1.0);
-                    }
-                    if !used_qa_ids.contains(&qa_id) {
-                        used_qa_ids.push(qa_id);
-                    }
-                }
-
-                context = format!(
-                    "{}\n\n{}",
-                    context,
-                    format_answer_context(&blocking_question, &reply.answer, &reply.channel, false)
-                );
-                continue;
-            }
-
-            let timeout_activity = ActivityLogEntry::new(
-                "question_timeout_best_effort",
-                format!("No human reply received for {}", issue.short_id),
-            )
-            .with_source(source_name.to_string())
-            .with_issue(issue.id.clone(), issue.short_id.clone())
-            .with_metadata(json!({
-                "best_effort": state.config.ask.best_effort_on_timeout,
-                "question": blocking_question.question,
-            }));
-            state.tracker.record_activity(&timeout_activity).ok();
-
-            if state.config.ask.best_effort_on_timeout {
-                context = format!(
-                    "{}\n\n{}",
-                    context,
-                    format_timeout_context(&blocking_question)
-                );
-                continue;
-            }
-
-            run_result.success = false;
-            run_result.error = Some("Timed out waiting for human reply".to_string());
-            break run_result;
-        };
-
-        // Strategy fingerprinting (after Claude execution, regardless of outcome)
-        if state.config.learning.strategy_fingerprinting {
-            if let Some(ref sqlite) = state.sqlite_tracker {
-                if let Some(aid) = attempt_id {
-                    if let Ok(execs) = sqlite.get_executions_for_attempt(aid) {
-                        if let Some(exec) = execs.first() {
-                            if let Some(ref log_path) = exec.stdout_log_path {
-                                let path = std::path::Path::new(log_path);
-                                if path.exists() {
-                                    match crate::learning::StrategyParser::parse_from_log(path, aid) {
-                                        Ok(fp) => {
-                                            if let Err(e) = state.tracker.store_strategy_fingerprint(&fp) {
-                                                tracing::warn!(error = %e, "Failed to store strategy fingerprint");
-                                            }
-                                        }
-                                        Err(e) => tracing::debug!(error = %e, "Failed to parse strategy from log"),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if claude_result.success {
-            if let Some(pr_url) = claude_result.pr_url {
-                tracing::info!(short_id = %issue.short_id, pr_url = %pr_url, "Success! PR created");
-                state
-                    .tracker
-                    .mark_success(source_name, &issue.id, &pr_url)?;
-                if let Some(id) = attempt_id {
-                    let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, true);
-                }
-                if let Some(ref changelog) = claude_result.changelog {
-                    issue.set_metadata("changelog", changelog.clone());
-                }
-                state.notifier.notify_success(&issue, &pr_url).await?;
-
-                // Record pr_created metric
-                let metric = ProcessingMetric::new("pr_created", 1.0)
-                    .with_source(source_name.to_string());
-                state.tracker.record_metric(&metric).ok();
-
-                // Store embedding for future similarity lookups
-                if let Some(ref embedding_service) = state.issue_embedding_service {
-                    if embedding_service.embed_issue(&issue, source_name).await.is_ok() {
-                        let activity = ActivityLogEntry::new(
-                            "decision",
-                            format!("Stored embedding for {}", issue.short_id),
-                        )
-                        .with_source(source_name.to_string())
-                        .with_issue(issue.id.clone(), issue.short_id.clone())
-                        .with_metadata(json!({
-                            "decision": "issue_embedding_stored",
-                        }));
-                        state.tracker.record_activity(&activity).ok();
-
-                        let metric = ProcessingMetric::new("issue_embedding_stored", 1.0)
-                            .with_source(source_name.to_string());
-                        state.tracker.record_metric(&metric).ok();
-                    }
-                }
-
-                // Register PR for review watching (actual Merged outcome is
-                // recorded later when the review loop detects the merge)
-                if let Some(ref review_watcher) = state.review_watcher {
-                    if let Some((repo, pr_number)) = crate::storage::parse_pr_url(&pr_url) {
-                        let pr_state = PrReviewState::new(
-                            &pr_url,
-                            &repo,
-                            pr_number,
-                            &issue.id,
-                            source_name,
-                        );
-                        review_watcher.watch_pr(pr_state);
-                        tracing::info!(
-                            pr_url = %pr_url,
-                            repo = %repo,
-                            pr_number = pr_number,
-                            "PR registered for review watching (webhook)"
-                        );
-                    }
-                }
-
-                // Log webhook processed successfully with PR
-                let activity = ActivityLogEntry::new(
-                    "webhook_processed",
-                    format!("Webhook processed: {} - PR created", issue.short_id),
-                )
-                .with_source(source_name.to_string())
-                .with_issue(issue.id.clone(), issue.short_id.clone())
-                .with_metadata(json!({
-                    "pr_url": pr_url,
-                    "success": true
-                }));
-                state.tracker.record_activity(&activity).ok();
-            } else {
-                let reason = if claude_result.output.is_empty() {
-                    "No PR URL found in output".to_string()
-                } else if claude_result.output.chars().count() > 500 {
-                    let truncated: String = claude_result.output.chars().take(497).collect();
-                    format!("{}...", truncated)
-                } else {
-                    claude_result.output.clone()
-                };
-                tracing::info!(short_id = %issue.short_id, reason = %reason, "Completed without PR");
-                issue.set_metadata("completion_reason", reason.clone());
-                state
-                    .tracker
-                    .mark_failed(source_name, &issue.id, &format!("Claude completed without creating a PR: {}", reason))?;
-                if let Some(id) = attempt_id {
-                    let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
-                }
-                state.notifier.notify_completed(&issue).await?;
-                record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed).await;
-
-                // Log webhook processed without PR
-                let activity = ActivityLogEntry::new(
-                    "webhook_processed",
-                    format!("Webhook processed: {} - completed without PR: {}", issue.short_id, reason),
-                )
-                .with_source(source_name.to_string())
-                .with_issue(issue.id.clone(), issue.short_id.clone())
-                .with_metadata(json!({
-                    "success": false,
-                    "reason": &reason
-                }));
-                state.tracker.record_activity(&activity).ok();
-            }
-        } else {
-            let base_error = claude_result.error.as_deref().unwrap_or("Unknown error");
-            let error = if !claude_result.output.is_empty() {
-                let summary = if claude_result.output.chars().count() > 500 {
-                    let truncated: String = claude_result.output.chars().take(497).collect();
-                    format!("{}...", truncated)
-                } else {
-                    claude_result.output.clone()
-                };
-                format!("{}\n\nClaude's summary: {}", base_error, summary)
-            } else {
-                base_error.to_string()
-            };
-            tracing::error!(short_id = %issue.short_id, error = %error, "Failed");
-            state.tracker.mark_failed(source_name, &issue.id, &error)?;
-            if let Some(id) = attempt_id {
-                let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
-            }
-            notify_failed_with_escalation(&state, &issue, &error).await?;
-            record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed).await;
-
-            // Record error pattern for analytics
-            record_error_pattern(&state, source_name, &issue.id, &error);
-
-            // Log webhook processing failed
-            let activity = ActivityLogEntry::new(
-                "webhook_processed",
-                format!("Webhook processed: {} - failed", issue.short_id),
-            )
-            .with_source(source_name.to_string())
-            .with_issue(issue.id.clone(), issue.short_id.clone())
-            .with_metadata(json!({
-                "success": false,
-                "error": &error
-            }));
-            state.tracker.record_activity(&activity).ok();
-        }
-
-        Ok::<_, crate::error::Error>(())
-    }
-    .await;
-
-    if let Err(ref e) = result {
-        let error = e.to_string();
-        let _ = state.tracker.mark_failed(source_name, &issue.id, &error);
-        if let Some(id) = attempt_id {
-            let _ = state.tracker.update_qa_outcome_stats_for_attempt(id, false);
-        }
-        let _ = notify_failed_with_escalation(&state, &issue, &error).await;
-        record_feedback_outcome_from_attempt(&state, source_name, &issue, Outcome::Failed).await;
-
-        // Record error pattern for pipeline errors
-        record_error_pattern(&state, source_name, &issue.id, &error);
-    }
-
-    // Record processing duration metric
-    let final_status = state
-        .tracker
-        .get_attempt(source_name, &issue.id)
-        .ok()
-        .flatten()
-        .map(|a| a.status.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let processing_time_metric = ProcessingMetric::new(
-        "processing_time",
-        processing_started_at.elapsed().as_secs_f64(),
-    )
-    .with_source(source_name.to_string())
-    .with_tags(json!({ "status": final_status }));
-    state.tracker.record_metric(&processing_time_metric).ok();
-
-    // Cleanup worktree
-    if let Some(repo_name) = resolution.repo_name() {
-        let wt_path = worktree_path(&state.config.workspace, repo_name, &issue.short_id);
-        if wt_path.exists() {
-            if let Err(e) = GitOps::remove_worktree(&project_dir, &wt_path).await {
-                tracing::warn!(
-                    short_id = %issue.short_id,
-                    error = %e,
-                    "Failed to remove worktree"
-                );
-            }
-        }
-    }
-
-    // Remove from processing
+    // Clean up processing flag
     {
         let mut processing = state.processing.write().await;
         processing.remove(&processing_key);
     }
 
-    result
-}
-
-async fn record_feedback_outcome_from_attempt(
-    state: &AppState,
-    source_name: &str,
-    issue: &Issue,
-    outcome: Outcome,
-) {
-    let attempt = match state.tracker.get_attempt(source_name, &issue.id) {
-        Ok(Some(attempt)) => attempt,
-        _ => return,
-    };
-
-    let prompt = state
-        .sqlite_tracker
-        .as_ref()
-        .and_then(|t| t.get_executions_for_attempt(attempt.id).ok())
-        .and_then(|execs: Vec<AgentExecution>| execs.into_iter().next())
-        .and_then(|exec| exec.prompt_used)
-        .unwrap_or_default();
-
-    let mut fix_outcome = FixOutcome::from_attempt(&attempt, issue, &prompt, outcome);
-
-    // Compute embedding for the outcome's issue text (reuse existing issue embedding if available)
-    if let Some(ref embedding_client) = state.embedding_client {
-        let embedding = match state
-            .issue_embedding_service
-            .as_ref()
-            .and_then(|svc| svc.get_embedding(source_name, &issue.id).ok().flatten())
-            .and_then(|existing| existing.embedding)
-        {
-            Some(existing) => Some(existing),
-            None => embedding_client.embed(&fix_outcome.issue_text).await.ok(),
-        };
-        if let Some(emb) = embedding {
-            fix_outcome.set_embedding(emb);
-        }
-    }
-
-    if let Err(e) = state.tracker.store_feedback_outcome(&fix_outcome) {
-        tracing::warn!(error = %e, "Failed to store webhook feedback outcome");
-    }
-
-    // Update in-memory analyzer for prompt enhancement
-    let mut analyzer = state.feedback_analyzer.lock().await;
-    if let Err(e) = analyzer.record_outcome(&attempt, issue, &prompt, outcome) {
-        tracing::warn!(error = %e, "Failed to record webhook feedback in memory");
-    }
-}
-
-async fn notify_failed_with_escalation(state: &AppState, issue: &Issue, error: &str) -> Result<()> {
-    if runner::is_hard_error(error) {
-        let mut global_issue = issue.clone();
-        global_issue.metadata.remove("resolved_user");
-        global_issue
-            .metadata
-            .insert("hard_error".to_string(), serde_json::Value::Bool(true));
-
-        let activity = ActivityLogEntry::new(
-            "error",
-            format!("Hard Claude error escalated for {}", issue.short_id),
-        )
-        .with_source(issue.source.clone())
-        .with_issue(issue.id.clone(), issue.short_id.clone())
-        .with_metadata(json!({
-            "hard_error": true,
-            "rate_limited": runner::is_rate_limit_error(error),
-            "error": truncate_error_for_activity(error),
-        }));
-        state.tracker.record_activity(&activity).ok();
-
-        return state.notifier.notify_failed(&global_issue, error).await;
-    }
-
-    state.notifier.notify_failed(issue, error).await
-}
-
-fn truncate_error_for_activity(error: &str) -> String {
-    let max_len = 500;
-    if error.len() <= max_len {
-        error.to_string()
-    } else {
-        let safe_end = error
-            .char_indices()
-            .take_while(|(i, _)| *i <= max_len.saturating_sub(3))
-            .last()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        format!("{}...", &error[..safe_end])
-    }
-}
-
-/// Enhance a prompt with continuous learning context (repo knowledge, promoted
-/// instructions, strategy suggestions, cluster context).
-fn enhance_prompt_with_learning(
-    state: &AppState,
-    base_prompt: &str,
-    issue: &Issue,
-    repo: Option<&str>,
-) -> String {
-    let learning = &state.config.learning;
-    let Some(repo_name) = repo else {
-        return base_prompt.to_string();
-    };
-
-    let mut extra_context = String::new();
-
-    // System 4: Per-repo knowledge context
-    if learning.repo_knowledge {
-        if let Ok(knowledge) = state.tracker.get_repo_knowledge(repo_name) {
-            let ctx = crate::learning::RepoKnowledgeManager::format_knowledge_context(&knowledge);
-            if !ctx.is_empty() {
-                extra_context.push_str(&ctx);
-            }
-        }
-    }
-
-    // System 3: Promoted instructions
-    if learning.qa_promotion {
-        if let Ok(instructions) = state.tracker.get_promoted_instructions(repo_name) {
-            let ctx = crate::learning::QaPromoter::format_promoted_context(&instructions);
-            if !ctx.is_empty() {
-                extra_context.push_str(&ctx);
-            }
-        }
-    }
-
-    // System 6: Strategy suggestions
-    if learning.strategy_fingerprinting {
-        if let Ok(strategies) = state.tracker.get_successful_strategies(repo_name, 3) {
-            let ctx = crate::learning::StrategyParser::format_strategy_suggestions(&strategies);
-            if !ctx.is_empty() {
-                extra_context.push_str(&ctx);
-            }
-        }
-    }
-
-    // System 8: Cluster context
-    if learning.cluster_detection {
-        if let Ok(clusters) = state.tracker.get_active_clusters(&issue.source) {
-            for cluster in &clusters {
-                if cluster.issue_ids.contains(&issue.id) {
-                    extra_context.push_str(
-                        &crate::learning::ClusterDetector::format_cluster_context(cluster),
-                    );
-                    extra_context.push('\n');
-                    break;
-                }
-            }
-        }
-    }
-
-    // Cross-repo correlation context
-    if learning.cross_repo_correlation {
-        match crate::learning::CrossRepoCorrelator::get_active_insights(
-            state.tracker.as_ref(),
-            3,
-            learning.cross_repo_window_hours * 2,
-        ) {
-            Ok(insights) if !insights.is_empty() => {
-                let ctx = crate::learning::CrossRepoCorrelator::format_context(&insights);
-                if !ctx.is_empty() {
-                    extra_context.push_str(&ctx);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if extra_context.is_empty() {
-        return base_prompt.to_string();
-    }
-
-    format!("{}\n---\n\n{}", extra_context, base_prompt)
-}
-
-/// Record an error pattern to the analytics database.
-fn record_error_pattern(state: &AppState, source: &str, issue_id: &str, error_msg: &str) {
-    let error_type = classify_error(error_msg);
-    let pattern_hash = compute_error_hash(error_msg);
-
-    let mut pattern = ErrorPattern::new(pattern_hash);
-    pattern.error_type = Some(error_type.to_string());
-    pattern.error_message = Some(error_msg.to_string());
-    pattern.sources = Some(vec![source.to_string()]);
-    pattern.example_issue_ids = Some(vec![issue_id.to_string()]);
-
-    if let Err(e) = state.tracker.record_error_pattern(&pattern) {
-        tracing::warn!(error = %e, "Failed to record error pattern");
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1739,9 +908,14 @@ mod tests {
         AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, IssuesConfig, LearningConfig,
         NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig, ScmConfig,
     };
+    use crate::feedback::Outcome;
     use crate::notifier::Notifier;
+    use crate::processing::{
+        enhance_prompt_with_learning, notify_failed_with_escalation, record_error_pattern,
+        record_feedback_outcome, truncate_error_for_activity,
+    };
     use crate::reports::Report;
-    use crate::storage::SqliteTracker;
+    use crate::storage::{AttemptTracker, SqliteTracker, WebhookStore};
     use crate::types::{Issue, MatchPriority, MatchResult};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1871,6 +1045,8 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            chat: crate::config::ChatConfig::default(),
+            tls: crate::config::TlsConfig::default(),
         }
     }
 
@@ -2974,7 +2150,8 @@ mod tests {
         let state = make_app_state_for_learning(LearningConfig::default());
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "base prompt content";
-        let result = enhance_prompt_with_learning(&state, base, &issue, None);
+        let result =
+            enhance_prompt_with_learning(&state.config, &state.tracker, base, &issue, None);
         // No repo means no enhancement
         assert_eq!(result, base);
     }
@@ -2991,7 +2168,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "base prompt content";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("my-repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("my-repo"),
+        );
         // All learning disabled, but the functions still check the DB -- which returns
         // empty results from an in-memory tracker, so no context is added
         assert_eq!(result, base);
@@ -3009,7 +2192,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "base prompt content";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("my-repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("my-repo"),
+        );
         // No data in tracker, so still no enhancement
         assert_eq!(result, base);
     }
@@ -3040,7 +2229,12 @@ mod tests {
         };
 
         // Should not panic
-        record_error_pattern(&state, "linear", "issue-123", "Connection timeout occurred");
+        record_error_pattern(
+            &state.tracker,
+            "linear",
+            "issue-123",
+            "Connection timeout occurred",
+        );
     }
 
     #[test]
@@ -3069,7 +2263,7 @@ mod tests {
         };
 
         // Should not panic even with empty error
-        record_error_pattern(&state, "sentry", "issue-456", "");
+        record_error_pattern(&state.tracker, "sentry", "issue-456", "");
     }
 
     fn make_app_state(
@@ -4183,7 +3377,13 @@ mod tests {
         };
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
-        let result = notify_failed_with_escalation(&state, &issue, "Some normal error").await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "Some normal error",
+        )
+        .await;
         assert!(result.is_ok());
         assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
     }
@@ -4217,8 +3417,13 @@ mod tests {
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
         // "process timed out" is a hard error
-        let result =
-            notify_failed_with_escalation(&state, &issue, "process timed out after 300s").await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "process timed out after 300s",
+        )
+        .await;
         assert!(result.is_ok());
         assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
     }
@@ -4252,8 +3457,13 @@ mod tests {
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
         // "rate limited" is also a hard error
-        let result =
-            notify_failed_with_escalation(&state, &issue, "API rate limited by server").await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "API rate limited by server",
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -4823,20 +4033,30 @@ mod tests {
         };
 
         // Should not panic with various error types
-        record_error_pattern(&state, "linear", "issue-1", "Process timed out after 300s");
         record_error_pattern(
-            &state,
+            &state.tracker,
+            "linear",
+            "issue-1",
+            "Process timed out after 300s",
+        );
+        record_error_pattern(
+            &state.tracker,
             "sentry",
             "issue-2",
             "Build failed: cargo build error",
         );
         record_error_pattern(
-            &state,
+            &state.tracker,
             "linear",
             "issue-3",
             "Test assertion failed: expected 5 got 3",
         );
-        record_error_pattern(&state, "sentry", "issue-4", "Git merge conflict in main.rs");
+        record_error_pattern(
+            &state.tracker,
+            "sentry",
+            "issue-4",
+            "Git merge conflict in main.rs",
+        );
     }
 
     #[test]
@@ -4865,9 +4085,9 @@ mod tests {
         };
 
         // Recording multiple errors for the same issue should not panic
-        record_error_pattern(&state, "linear", "issue-1", "Error A");
-        record_error_pattern(&state, "linear", "issue-1", "Error B");
-        record_error_pattern(&state, "linear", "issue-1", "Error C");
+        record_error_pattern(&state.tracker, "linear", "issue-1", "Error A");
+        record_error_pattern(&state.tracker, "linear", "issue-1", "Error B");
+        record_error_pattern(&state.tracker, "linear", "issue-1", "Error C");
     }
 
     #[test]
@@ -4876,7 +4096,8 @@ mod tests {
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "base prompt";
         // Empty string for repo_name is still Some("")
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some(""));
+        let result =
+            enhance_prompt_with_learning(&state.config, &state.tracker, base, &issue, Some(""));
         // With empty repo name, DB lookups should return nothing
         assert_eq!(result, base);
     }
@@ -4893,7 +4114,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "base prompt";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("my-repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("my-repo"),
+        );
         // In-memory tracker has no data, so result should be unchanged
         assert_eq!(result, base);
     }
@@ -4910,7 +4137,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "base prompt";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("my-repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("my-repo"),
+        );
         assert_eq!(result, base);
     }
 
@@ -4926,7 +4159,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "base prompt";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("my-repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("my-repo"),
+        );
         assert_eq!(result, base);
     }
 
@@ -4942,7 +4181,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "base prompt";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("my-repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("my-repo"),
+        );
         assert_eq!(result, base);
     }
 
@@ -5072,7 +4317,8 @@ mod tests {
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
         // Empty error string is not a hard error
-        let result = notify_failed_with_escalation(&state, &issue, "").await;
+        let result =
+            notify_failed_with_escalation(&state.notifier, &state.tracker, &issue, "").await;
         assert!(result.is_ok());
         assert_eq!(notifier.call_count.load(Ordering::SeqCst), 1);
     }
@@ -5106,8 +4352,13 @@ mod tests {
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
         // "failed to spawn claude" is a hard error
-        let result =
-            notify_failed_with_escalation(&state, &issue, "failed to spawn claude process").await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "failed to spawn claude process",
+        )
+        .await;
         assert!(result.is_ok());
         assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
     }
@@ -5728,7 +4979,8 @@ mod tests {
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
         // "connection reset" is a hard error
         let result = notify_failed_with_escalation(
-            &state,
+            &state.notifier,
+            &state.tracker,
             &issue,
             "Connection reset by peer during API call",
         )
@@ -5765,9 +5017,13 @@ mod tests {
         };
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
-        let result =
-            notify_failed_with_escalation(&state, &issue, "Service unavailable: 503 from API")
-                .await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "Service unavailable: 503 from API",
+        )
+        .await;
         assert!(result.is_ok());
         assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
     }
@@ -5800,9 +5056,13 @@ mod tests {
         };
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
-        let result =
-            notify_failed_with_escalation(&state, &issue, "Network error: DNS resolution failed")
-                .await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "Network error: DNS resolution failed",
+        )
+        .await;
         assert!(result.is_ok());
         assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
     }
@@ -5835,9 +5095,13 @@ mod tests {
         };
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
-        let result =
-            notify_failed_with_escalation(&state, &issue, "Broken pipe while writing to process")
-                .await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "Broken pipe while writing to process",
+        )
+        .await;
         assert!(result.is_ok());
         assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
     }
@@ -5871,7 +5135,8 @@ mod tests {
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
         let result = notify_failed_with_escalation(
-            &state,
+            &state.notifier,
+            &state.tracker,
             &issue,
             "Internal server error from upstream API",
         )
@@ -5908,8 +5173,13 @@ mod tests {
         };
 
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
-        let result =
-            notify_failed_with_escalation(&state, &issue, "Quota exceeded for API key").await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "Quota exceeded for API key",
+        )
+        .await;
         assert!(result.is_ok());
         assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
     }
@@ -5946,8 +5216,13 @@ mod tests {
         assert!(issue.get_metadata::<String>("resolved_user").is_some());
 
         // Hard error should trigger escalation (global notification with resolved_user removed)
-        let result =
-            notify_failed_with_escalation(&state, &issue, "Process timed out after 300s").await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "Process timed out after 300s",
+        )
+        .await;
         assert!(result.is_ok());
         assert!(notifier.call_count.load(Ordering::SeqCst) >= 1);
     }
@@ -5983,8 +5258,13 @@ mod tests {
         issue.set_metadata("resolved_user", "some-user".to_string());
 
         // Normal error should NOT remove resolved_user (the original issue is passed as-is)
-        let result =
-            notify_failed_with_escalation(&state, &issue, "Compilation error in main.rs").await;
+        let result = notify_failed_with_escalation(
+            &state.notifier,
+            &state.tracker,
+            &issue,
+            "Compilation error in main.rs",
+        )
+        .await;
         assert!(result.is_ok());
         // The original issue should still have resolved_user
         assert!(issue.get_metadata::<String>("resolved_user").is_some());
@@ -6024,7 +5304,16 @@ mod tests {
             "test",
         );
         // Should return early without panicking when no attempt exists
-        record_feedback_outcome_from_attempt(&state, "test", &issue, Outcome::Failed).await;
+        record_feedback_outcome(
+            &state.tracker,
+            state.embedding_client.as_deref(),
+            state.issue_embedding_service.as_deref(),
+            &state.feedback_analyzer,
+            "test",
+            &issue,
+            Outcome::Failed,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -6064,7 +5353,16 @@ mod tests {
             "test",
         );
         // Should execute without panicking
-        record_feedback_outcome_from_attempt(&state, "test", &issue, Outcome::Failed).await;
+        record_feedback_outcome(
+            &state.tracker,
+            state.embedding_client.as_deref(),
+            state.issue_embedding_service.as_deref(),
+            &state.feedback_analyzer,
+            "test",
+            &issue,
+            Outcome::Failed,
+        )
+        .await;
     }
 
     #[test]
@@ -6079,7 +5377,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "Build the feature as described.";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("my-repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("my-repo"),
+        );
         // Fresh DB has no data, so prompt should be unchanged
         assert_eq!(result, base);
     }
@@ -6093,7 +5397,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "This is a complex multi-line\nprompt with specific instructions";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("test-repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("test-repo"),
+        );
         // Whether or not extra context is added, the base prompt must be present
         assert!(result.contains(base));
     }
@@ -6125,7 +5435,7 @@ mod tests {
 
         // Very long error message should not panic
         let long_error = "x".repeat(10000);
-        record_error_pattern(&state, "linear", "issue-long", &long_error);
+        record_error_pattern(&state.tracker, "linear", "issue-long", &long_error);
     }
 
     #[test]
@@ -6154,7 +5464,7 @@ mod tests {
         };
 
         record_error_pattern(
-            &state,
+            &state.tracker,
             "test",
             "issue-unicode",
             "Error with unicode: \u{1F4A9} \u{00E9}\u{00F1}",
@@ -6665,7 +5975,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test title", "https://test.com", "test");
         let base = "x".repeat(10000);
-        let result = enhance_prompt_with_learning(&state, &base, &issue, Some("my-repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            &base,
+            &issue,
+            Some("my-repo"),
+        );
         assert!(result.contains(&base));
     }
 
@@ -6917,7 +6233,7 @@ mod tests {
 
         // Should create error pattern without panicking
         record_error_pattern(
-            &state,
+            &state.tracker,
             "jira",
             "JIRA-42",
             "Compilation failed: undefined reference",
@@ -6925,7 +6241,7 @@ mod tests {
 
         // The pattern was recorded - verify by recording another for the same error hash
         record_error_pattern(
-            &state,
+            &state.tracker,
             "jira",
             "JIRA-43",
             "Compilation failed: undefined reference",
@@ -7113,9 +6429,14 @@ mod tests {
         };
 
         // Should not panic and should record without error
-        record_error_pattern(&state, "linear", "LIN-100", "Timeout during compilation");
-        record_error_pattern(&state, "sentry", "SENTRY-200", "");
-        record_error_pattern(&state, "jira", "JIRA-300", "a]b[c{d}e");
+        record_error_pattern(
+            &state.tracker,
+            "linear",
+            "LIN-100",
+            "Timeout during compilation",
+        );
+        record_error_pattern(&state.tracker, "sentry", "SENTRY-200", "");
+        record_error_pattern(&state.tracker, "jira", "JIRA-300", "a]b[c{d}e");
     }
 
     #[test]
@@ -7123,7 +6444,8 @@ mod tests {
         let state = make_app_state_for_learning(LearningConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug title", "https://test.com", "test");
         let base = "Fix the bug described in the issue.";
-        let result = enhance_prompt_with_learning(&state, base, &issue, None);
+        let result =
+            enhance_prompt_with_learning(&state.config, &state.tracker, base, &issue, None);
         assert_eq!(result, base);
     }
 
@@ -7139,7 +6461,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Bug title", "https://test.com", "test");
         let base = "Fix the bug described in the issue.";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("org/repo"),
+        );
         assert_eq!(result, base);
     }
 
@@ -7155,7 +6483,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Bug title", "https://test.com", "test");
         let base = "Fix the bug described in the issue.";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("org/repo"),
+        );
         // In-memory tracker has no data, so prompt should be unchanged
         assert_eq!(result, base);
     }
@@ -7237,7 +6571,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
         let base = "base prompt";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("org/repo"),
+        );
         // In-memory tracker has no cross-repo insights, so prompt should be unchanged
         assert_eq!(result, base);
     }
@@ -7255,7 +6595,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
         let base = "base prompt";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("org/repo"),
+        );
         assert_eq!(result, base);
     }
 
@@ -7272,7 +6618,13 @@ mod tests {
         let state = make_app_state_for_learning(learning);
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "test");
         let base = "base prompt";
-        let result = enhance_prompt_with_learning(&state, base, &issue, Some("org/repo"));
+        let result = enhance_prompt_with_learning(
+            &state.config,
+            &state.tracker,
+            base,
+            &issue,
+            Some("org/repo"),
+        );
         // In-memory tracker has no data for any system, so prompt should be unchanged
         assert_eq!(result, base);
     }
@@ -7281,5 +6633,400 @@ mod tests {
     fn test_app_state_code_search_service_none_in_test_config() {
         let state = make_app_state_for_learning(LearningConfig::default());
         assert!(state.code_search_service.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // webhook_verify_handler tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_webhook_verify_handler_non_whatsapp_source_returns_method_not_allowed() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(WebhookHandlerRegistry::new(), tracker, None);
+
+        let query = WebhookVerifyQuery::default();
+        let resp = webhook_verify_handler(State(state), Path("linear".to_string()), Query(query))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_verify_handler_whatsapp_no_token_configured() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        // Default config has no whatsapp webhook verify token
+        let state = make_app_state(WebhookHandlerRegistry::new(), tracker, None);
+
+        let query = WebhookVerifyQuery {
+            hub_mode: Some("subscribe".to_string()),
+            hub_verify_token: Some("sometoken".to_string()),
+            hub_challenge: Some("challenge123".to_string()),
+        };
+
+        let resp = webhook_verify_handler(State(state), Path("whatsapp".to_string()), Query(query))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn make_app_state_with_whatsapp_token(token: &str) -> Arc<AppState> {
+        let mut config = test_config();
+        config.notifiers.whatsapp.webhook_verify_token =
+            Some(crate::secret::SecretValue::new(token));
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        Arc::new(AppState {
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            config,
+            handlers: WebhookHandlerRegistry::new(),
+            notifier: Arc::new(MockNotifier::new()),
+            tracker,
+            sqlite_tracker: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
+            review_watcher: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            github_handler: None,
+            processing: RwLock::new(HashMap::new()),
+            suppression_regex_cache: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_webhook_verify_handler_whatsapp_wrong_mode() {
+        let state = make_app_state_with_whatsapp_token("test-secret-token");
+
+        let query = WebhookVerifyQuery {
+            hub_mode: Some("unsubscribe".to_string()), // wrong mode
+            hub_verify_token: Some("test-secret-token".to_string()),
+            hub_challenge: Some("challenge123".to_string()),
+        };
+
+        let resp = webhook_verify_handler(State(state), Path("whatsapp".to_string()), Query(query))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_verify_handler_whatsapp_wrong_token() {
+        let state = make_app_state_with_whatsapp_token("correct-token");
+
+        let query = WebhookVerifyQuery {
+            hub_mode: Some("subscribe".to_string()),
+            hub_verify_token: Some("wrong-token".to_string()),
+            hub_challenge: Some("challenge123".to_string()),
+        };
+
+        let resp = webhook_verify_handler(State(state), Path("whatsapp".to_string()), Query(query))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_verify_handler_whatsapp_success() {
+        let state = make_app_state_with_whatsapp_token("my-verify-token");
+
+        let query = WebhookVerifyQuery {
+            hub_mode: Some("subscribe".to_string()),
+            hub_verify_token: Some("my-verify-token".to_string()),
+            hub_challenge: Some("challenge-value-xyz".to_string()),
+        };
+
+        let resp = webhook_verify_handler(State(state), Path("whatsapp".to_string()), Query(query))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_verify_handler_whatsapp_no_challenge() {
+        let state = make_app_state_with_whatsapp_token("my-token");
+
+        let query = WebhookVerifyQuery {
+            hub_mode: Some("subscribe".to_string()),
+            hub_verify_token: Some("my-token".to_string()),
+            hub_challenge: None, // no challenge
+        };
+
+        let resp = webhook_verify_handler(State(state), Path("whatsapp".to_string()), Query(query))
+            .await
+            .into_response();
+
+        // Should succeed with empty challenge body
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -------------------------------------------------------------------
+    // Slack URL verification challenge
+    // -------------------------------------------------------------------
+
+    /// Mock handler for Slack source that passes signature validation
+    struct SlackMockHandler;
+
+    #[async_trait]
+    impl WebhookHandler for SlackMockHandler {
+        fn source_name(&self) -> &str {
+            "slack"
+        }
+        fn verify_signature(&self, _body: &[u8], _headers: &HashMap<String, String>) -> bool {
+            true
+        }
+        async fn parse_payload(
+            &self,
+            _payload: &serde_json::Value,
+        ) -> crate::error::Result<Option<Issue>> {
+            Ok(Some(Issue::new(
+                "1",
+                "SLACK-1",
+                "Test",
+                "https://test.com",
+                "slack",
+            )))
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("Test", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, _issue: &Issue) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_slack_url_verification_challenge() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(SlackMockHandler));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        let payload = serde_json::json!({
+            "type": "url_verification",
+            "challenge": "abc123_challenge_token"
+        });
+
+        let (status, Json(response)) = webhook_handler(
+            State(state),
+            Path("slack".to_string()),
+            HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["challenge"], "abc123_challenge_token");
+    }
+
+    #[tokio::test]
+    async fn test_slack_url_verification_no_challenge_value() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(SlackMockHandler));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        let payload = serde_json::json!({
+            "type": "url_verification"
+            // no challenge field
+        });
+
+        let (status, Json(response)) = webhook_handler(
+            State(state),
+            Path("slack".to_string()),
+            HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["challenge"], "");
+    }
+
+    #[tokio::test]
+    async fn test_slack_non_verification_event_proceeds() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(SlackMockHandler));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": { "type": "message" }
+        });
+
+        let (status, _) = webhook_handler(
+            State(state),
+            Path("slack".to_string()),
+            HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+
+        // Should proceed normally (accepted for processing)
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_slack_invalid_json_body() {
+        let mut handlers = WebhookHandlerRegistry::new();
+        handlers.register(Arc::new(SlackMockHandler));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(handlers, tracker, None);
+
+        let (status, Json(response)) = webhook_handler(
+            State(state),
+            Path("slack".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"not json at all"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(response["error"].as_str().unwrap().contains("Invalid JSON"));
+    }
+
+    // -------------------------------------------------------------------
+    // WebhookServer setter coverage
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_server_set_embedding_client_none() {
+        let config = test_config();
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
+        assert!(server.embedding_client.is_none());
+        server.set_embedding_client(None);
+        assert!(server.embedding_client.is_none());
+    }
+
+    #[test]
+    fn test_webhook_server_set_code_search_service_none_remains_none() {
+        let config = test_config();
+        let handlers = WebhookHandlerRegistry::new();
+        let notifier = Arc::new(MockNotifier::new());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut server = WebhookServer::new(
+            config,
+            handlers,
+            notifier,
+            tracker.clone(),
+            None,
+            None,
+            test_agent(tracker),
+        );
+        assert!(server.code_search_service.is_none());
+        server.set_code_search_service(None);
+        assert!(server.code_search_service.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // WebhookVerifyQuery deserialization
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_verify_query_default() {
+        let query = WebhookVerifyQuery::default();
+        assert!(query.hub_mode.is_none());
+        assert!(query.hub_verify_token.is_none());
+        assert!(query.hub_challenge.is_none());
+    }
+
+    #[test]
+    fn test_webhook_verify_query_deserialize() {
+        let json = r#"{"hub.mode":"subscribe","hub.verify_token":"tok","hub.challenge":"ch"}"#;
+        let query: WebhookVerifyQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.hub_mode.as_deref(), Some("subscribe"));
+        assert_eq!(query.hub_verify_token.as_deref(), Some("tok"));
+        assert_eq!(query.hub_challenge.as_deref(), Some("ch"));
+    }
+
+    #[test]
+    fn test_webhook_verify_query_partial_deserialize() {
+        let json = r#"{"hub.mode":"subscribe"}"#;
+        let query: WebhookVerifyQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.hub_mode.as_deref(), Some("subscribe"));
+        assert!(query.hub_verify_token.is_none());
+        assert!(query.hub_challenge.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // record_feedback_outcome tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_record_feedback_outcome_success() {
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        // Record an attempt first
+        tracker.record_attempt("test", "issue-1", "TST-1").unwrap();
+        tracker
+            .mark_success("test", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let issue = Issue::new("issue-1", "TST-1", "Test issue", "https://test.com", "test");
+        let feedback_analyzer = tokio::sync::Mutex::new(FeedbackAnalyzer::new());
+        record_feedback_outcome(
+            &tracker,
+            None,
+            None,
+            &feedback_analyzer,
+            "test",
+            &issue,
+            Outcome::Merged,
+        )
+        .await;
+
+        // Should succeed without panicking; outcome should be stored
+        let outcomes = tracker.get_feedback_outcomes(None, 10).unwrap();
+        assert!(!outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_record_feedback_outcome_failed() {
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        tracker.record_attempt("test", "issue-2", "TST-2").unwrap();
+        tracker
+            .mark_failed("test", "issue-2", "build error")
+            .unwrap();
+
+        let issue = Issue::new(
+            "issue-2",
+            "TST-2",
+            "Another issue",
+            "https://test.com",
+            "test",
+        );
+        let feedback_analyzer = tokio::sync::Mutex::new(FeedbackAnalyzer::new());
+        record_feedback_outcome(
+            &tracker,
+            None,
+            None,
+            &feedback_analyzer,
+            "test",
+            &issue,
+            Outcome::Failed,
+        )
+        .await;
+
+        let outcomes = tracker.get_feedback_outcomes(None, 10).unwrap();
+        assert!(!outcomes.is_empty());
     }
 }

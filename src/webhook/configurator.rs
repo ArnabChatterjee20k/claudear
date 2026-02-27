@@ -783,7 +783,7 @@ impl WebhookConfigurator {
         }
 
         let callback_url = format!("{}/webhook/telegram", base_url.trim_end_matches('/'));
-        let secret = std::env::var("TELEGRAM_WEBHOOK_SECRET")
+        let secret = std::env::var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -794,7 +794,7 @@ impl WebhookConfigurator {
                     Uuid::new_v4().simple()
                 )
             });
-        let generated_secret = std::env::var("TELEGRAM_WEBHOOK_SECRET")
+        let generated_secret = std::env::var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET")
             .ok()
             .map(|s| s.trim().is_empty())
             .unwrap_or(true)
@@ -976,7 +976,7 @@ impl WebhookConfigurator {
             .map(|s| s.expose().trim().to_string())
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                std::env::var("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+                std::env::var("CLAUDEAR_WHATSAPP_WEBHOOK_VERIFY_TOKEN")
                     .ok()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -1706,6 +1706,8 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            chat: crate::config::ChatConfig::default(),
+            tls: crate::config::TlsConfig::default(),
         }
     }
 
@@ -3061,5 +3063,1641 @@ mod tests {
             "Should get failure error, got: {}",
             err_msg
         );
+    }
+
+    // ---- jira_auth_header tests ----
+
+    #[test]
+    fn test_jira_auth_header_basic_mode() {
+        let config = crate::config::JiraConfig {
+            auth_mode: "basic".to_string(),
+            email: "user@example.com".to_string(),
+            api_token: "my-api-token".into(),
+            ..Default::default()
+        };
+        let header = WebhookConfigurator::jira_auth_header(&config);
+        assert!(
+            header.starts_with("Basic "),
+            "Should start with 'Basic ', got: {}",
+            header
+        );
+        // Decode and verify
+        use base64::Engine;
+        let encoded_part = header.strip_prefix("Basic ").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded_part)
+            .unwrap();
+        let decoded_str = String::from_utf8(decoded).unwrap();
+        assert_eq!(decoded_str, "user@example.com:my-api-token");
+    }
+
+    #[test]
+    fn test_jira_auth_header_bearer_mode() {
+        let config = crate::config::JiraConfig {
+            auth_mode: "bearer".to_string(),
+            api_token: "my-pat-token".into(),
+            ..Default::default()
+        };
+        let header = WebhookConfigurator::jira_auth_header(&config);
+        assert_eq!(header, "Bearer my-pat-token");
+    }
+
+    #[test]
+    fn test_jira_auth_header_bearer_case_insensitive() {
+        let config = crate::config::JiraConfig {
+            auth_mode: "Bearer".to_string(),
+            api_token: "token-123".into(),
+            ..Default::default()
+        };
+        let header = WebhookConfigurator::jira_auth_header(&config);
+        assert_eq!(header, "Bearer token-123");
+    }
+
+    #[test]
+    fn test_jira_auth_header_bearer_uppercase() {
+        let config = crate::config::JiraConfig {
+            auth_mode: "BEARER".to_string(),
+            api_token: "token-upper".into(),
+            ..Default::default()
+        };
+        let header = WebhookConfigurator::jira_auth_header(&config);
+        assert_eq!(header, "Bearer token-upper");
+    }
+
+    #[test]
+    fn test_jira_auth_header_default_is_basic() {
+        // Default auth_mode is "basic"
+        let config = crate::config::JiraConfig {
+            email: "dev@test.com".to_string(),
+            api_token: "api-tok".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.auth_mode, "basic");
+        let header = WebhookConfigurator::jira_auth_header(&config);
+        assert!(header.starts_with("Basic "));
+    }
+
+    #[test]
+    fn test_jira_auth_header_unknown_mode_falls_to_basic() {
+        // Any non-bearer mode should fall through to basic
+        let config = crate::config::JiraConfig {
+            auth_mode: "something-else".to_string(),
+            email: "me@co.com".to_string(),
+            api_token: "tok".into(),
+            ..Default::default()
+        };
+        let header = WebhookConfigurator::jira_auth_header(&config);
+        assert!(
+            header.starts_with("Basic "),
+            "Non-bearer should use Basic auth"
+        );
+    }
+
+    // ---- ensure_slack_events_subscription tests ----
+
+    #[test]
+    fn test_ensure_slack_events_subscription_empty_manifest() {
+        let mut manifest = serde_json::json!({});
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(changed, "Should report changes on empty manifest");
+
+        // Verify structure was created
+        let url = manifest["settings"]["event_subscriptions"]["request_url"]
+            .as_str()
+            .unwrap();
+        assert_eq!(url, "https://example.com/webhook/slack");
+
+        let events = manifest["settings"]["event_subscriptions"]["bot_events"]
+            .as_array()
+            .unwrap();
+        assert_eq!(events.len(), 4);
+        let event_strs: Vec<&str> = events.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(event_strs.contains(&"message.channels"));
+        assert!(event_strs.contains(&"message.groups"));
+        assert!(event_strs.contains(&"message.im"));
+        assert!(event_strs.contains(&"message.mpim"));
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_already_correct() {
+        let mut manifest = serde_json::json!({
+            "settings": {
+                "event_subscriptions": {
+                    "request_url": "https://example.com/webhook/slack",
+                    "bot_events": ["message.channels", "message.groups", "message.im", "message.mpim"]
+                }
+            }
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(!changed, "Should report no changes when already correct");
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_url_different() {
+        let mut manifest = serde_json::json!({
+            "settings": {
+                "event_subscriptions": {
+                    "request_url": "https://old.example.com/webhook/slack",
+                    "bot_events": ["message.channels", "message.groups", "message.im", "message.mpim"]
+                }
+            }
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://new.example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(changed, "Should report changes when URL differs");
+        assert_eq!(
+            manifest["settings"]["event_subscriptions"]["request_url"]
+                .as_str()
+                .unwrap(),
+            "https://new.example.com/webhook/slack"
+        );
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_missing_events() {
+        let mut manifest = serde_json::json!({
+            "settings": {
+                "event_subscriptions": {
+                    "request_url": "https://example.com/webhook/slack",
+                    "bot_events": ["message.channels"]
+                }
+            }
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(changed, "Should report changes when events are missing");
+        let events = manifest["settings"]["event_subscriptions"]["bot_events"]
+            .as_array()
+            .unwrap();
+        assert_eq!(events.len(), 4);
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_settings_not_object() {
+        let mut manifest = serde_json::json!({
+            "settings": "not-an-object"
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(changed);
+        // settings should have been reset to an object
+        assert!(manifest["settings"].is_object());
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_event_subs_not_object() {
+        let mut manifest = serde_json::json!({
+            "settings": {
+                "event_subscriptions": "bad"
+            }
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(manifest["settings"]["event_subscriptions"].is_object());
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_bot_events_not_array() {
+        let mut manifest = serde_json::json!({
+            "settings": {
+                "event_subscriptions": {
+                    "request_url": "https://example.com/webhook/slack",
+                    "bot_events": "not-array"
+                }
+            }
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(changed);
+        let events = manifest["settings"]["event_subscriptions"]["bot_events"]
+            .as_array()
+            .unwrap();
+        assert_eq!(events.len(), 4);
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_not_json_object() {
+        let mut manifest = serde_json::json!("not an object");
+        let result = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        );
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not a JSON object"));
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_no_url_key() {
+        let mut manifest = serde_json::json!({
+            "settings": {
+                "event_subscriptions": {
+                    "bot_events": ["message.channels", "message.groups", "message.im", "message.mpim"]
+                }
+            }
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(changed, "Should add request_url when missing");
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_preserves_extra_events() {
+        let mut manifest = serde_json::json!({
+            "settings": {
+                "event_subscriptions": {
+                    "request_url": "https://example.com/webhook/slack",
+                    "bot_events": ["message.channels", "message.groups", "message.im", "message.mpim", "app_mention"]
+                }
+            }
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(
+            !changed,
+            "Nothing to change when all required events present"
+        );
+        let events = manifest["settings"]["event_subscriptions"]["bot_events"]
+            .as_array()
+            .unwrap();
+        // Original 5 events should be preserved
+        assert_eq!(events.len(), 5);
+    }
+
+    #[test]
+    fn test_ensure_slack_events_subscription_empty_bot_events_array() {
+        let mut manifest = serde_json::json!({
+            "settings": {
+                "event_subscriptions": {
+                    "request_url": "https://example.com/webhook/slack",
+                    "bot_events": []
+                }
+            }
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(changed, "Should add all 4 events to empty array");
+        let events = manifest["settings"]["event_subscriptions"]["bot_events"]
+            .as_array()
+            .unwrap();
+        assert_eq!(events.len(), 4);
+    }
+
+    // ---- needs_configuration: Telegram ----
+
+    #[test]
+    fn test_needs_configuration_telegram_source_enabled_with_bot_token() {
+        let mut config = test_config();
+        config.notifiers.telegram.source_enabled = true;
+        config.notifiers.telegram.bot_token = Some(crate::secret::SecretValue::new("123:ABC"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_telegram_source_disabled() {
+        let mut config = test_config();
+        config.notifiers.telegram.source_enabled = false;
+        config.notifiers.telegram.bot_token = Some(crate::secret::SecretValue::new("123:ABC"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_telegram_no_bot_token() {
+        let mut config = test_config();
+        config.notifiers.telegram.source_enabled = true;
+        config.notifiers.telegram.bot_token = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_telegram_empty_bot_token() {
+        let mut config = test_config();
+        config.notifiers.telegram.source_enabled = true;
+        config.notifiers.telegram.bot_token = Some(crate::secret::SecretValue::new("  "));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    // ---- needs_configuration: Slack source ----
+
+    #[test]
+    fn test_needs_configuration_slack_source_all_present() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            app_id: Some("A123".to_string()),
+            app_config_token: Some(crate::secret::SecretValue::new("xoxe-config")),
+            signing_secret: Some(crate::secret::SecretValue::new("signing123")),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_slack_source_missing_app_id() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            app_id: None,
+            app_config_token: Some(crate::secret::SecretValue::new("xoxe-config")),
+            signing_secret: Some(crate::secret::SecretValue::new("signing123")),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_slack_source_missing_config_token() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            app_id: Some("A123".to_string()),
+            app_config_token: None,
+            signing_secret: Some(crate::secret::SecretValue::new("signing123")),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_slack_source_missing_signing_secret() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            app_id: Some("A123".to_string()),
+            app_config_token: Some(crate::secret::SecretValue::new("xoxe-config")),
+            signing_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_slack_source_empty_app_id() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            app_id: Some("  ".to_string()),
+            app_config_token: Some(crate::secret::SecretValue::new("xoxe-config")),
+            signing_secret: Some(crate::secret::SecretValue::new("signing123")),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    // ---- needs_configuration: WhatsApp ----
+
+    #[test]
+    fn test_needs_configuration_whatsapp_all_present() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("wa-token"));
+        config.notifiers.whatsapp.business_account_id = Some("12345".to_string());
+        config.notifiers.whatsapp.app_secret = Some(crate::secret::SecretValue::new("app-secret"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_whatsapp_source_disabled() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = false;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("wa-token"));
+        config.notifiers.whatsapp.business_account_id = Some("12345".to_string());
+        config.notifiers.whatsapp.app_secret = Some(crate::secret::SecretValue::new("app-secret"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_whatsapp_missing_access_token() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = None;
+        config.notifiers.whatsapp.business_account_id = Some("12345".to_string());
+        config.notifiers.whatsapp.app_secret = Some(crate::secret::SecretValue::new("app-secret"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_whatsapp_missing_business_account_id() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("wa-token"));
+        config.notifiers.whatsapp.business_account_id = None;
+        config.notifiers.whatsapp.app_secret = Some(crate::secret::SecretValue::new("app-secret"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_whatsapp_missing_app_secret() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("wa-token"));
+        config.notifiers.whatsapp.business_account_id = Some("12345".to_string());
+        config.notifiers.whatsapp.app_secret = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_whatsapp_empty_access_token() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("  "));
+        config.notifiers.whatsapp.business_account_id = Some("12345".to_string());
+        config.notifiers.whatsapp.app_secret = Some(crate::secret::SecretValue::new("app-secret"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    // ---- needs_configuration: Discord notifier missing one field ----
+
+    #[test]
+    fn test_needs_configuration_discord_notifier_only_bot_token() {
+        let mut config = test_config();
+        config.notifiers.discord.bot_token = Some(crate::secret::SecretValue::new("bot-tok"));
+        config.notifiers.discord.channel_id = None;
+        config.notifiers.discord.webhook_url = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        // Needs both bot_token AND channel_id
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_discord_notifier_only_channel_id() {
+        let mut config = test_config();
+        config.notifiers.discord.bot_token = None;
+        config.notifiers.discord.channel_id = Some("12345".to_string());
+        config.notifiers.discord.webhook_url = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_discord_notifier_empty_webhook_url() {
+        let mut config = test_config();
+        config.notifiers.discord.bot_token = Some(crate::secret::SecretValue::new("bot-tok"));
+        config.notifiers.discord.channel_id = Some("12345".to_string());
+        config.notifiers.discord.webhook_url = Some(crate::secret::SecretValue::new("  "));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        // Empty webhook_url counts as not present
+        assert!(configurator.needs_configuration());
+    }
+
+    // ---- needs_configuration: GitLab edge cases ----
+
+    #[test]
+    fn test_needs_configuration_gitlab_no_token() {
+        let mut config = test_config();
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: true,
+            token: None,
+            groups: vec!["grp".to_string()],
+            webhook_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_gitlab_empty_groups() {
+        let mut config = test_config();
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: true,
+            token: Some(crate::secret::SecretValue::new("glpat")),
+            groups: vec![],
+            webhook_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_gitlab_disabled() {
+        let mut config = test_config();
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: false,
+            token: Some(crate::secret::SecretValue::new("glpat")),
+            groups: vec!["grp".to_string()],
+            webhook_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    // ---- needs_configuration: GitHub edge cases ----
+
+    #[test]
+    fn test_needs_configuration_github_no_repos() {
+        let mut config = test_config();
+        config.scm.github.token = Some(crate::secret::SecretValue::new("ghp_test"));
+        config.scm.github.repos = vec![];
+        config.scm.github.webhook_secret = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_github_no_token_no_app() {
+        let mut config = test_config();
+        config.scm.github.token = None;
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.webhook_secret = None;
+        config.scm.github.app = crate::config::GitHubAppConfig::default();
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        // No token and no app configured => needs_configuration returns false for github
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_github_app_with_app_webhook_secret() {
+        let mut config = test_config();
+        config.scm.github.token = None;
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.app.app_id = Some(12345);
+        config.scm.github.app.private_key = Some(crate::secret::SecretValue::new(
+            "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        ));
+        config.scm.github.app.webhook_secret =
+            Some(crate::secret::SecretValue::new("app-wh-secret"));
+        config.scm.github.webhook_secret = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        // App webhook_secret is present -> no need for config
+        assert!(!configurator.needs_configuration());
+    }
+
+    // ---- needs_configuration: combined edge cases ----
+
+    #[test]
+    fn test_needs_configuration_multiple_sources_any_true_returns_true() {
+        let mut config = test_config();
+        // Only telegram needs config
+        config.notifiers.telegram.source_enabled = true;
+        config.notifiers.telegram.bot_token = Some(crate::secret::SecretValue::new("123:ABC"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    // ---- Deserialization tests for internal structs ----
+
+    #[test]
+    fn test_github_hook_list_item_deser() {
+        let json = r#"{"config": {"url": "https://example.com/hook"}}"#;
+        let item: GitHubHookListItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.config.url.as_deref(), Some("https://example.com/hook"));
+    }
+
+    #[test]
+    fn test_github_hook_list_item_deser_empty_config() {
+        let json = r#"{}"#;
+        let item: GitHubHookListItem = serde_json::from_str(json).unwrap();
+        assert!(item.config.url.is_none());
+    }
+
+    #[test]
+    fn test_github_hook_config_deser_no_url() {
+        let json = r#"{"content_type": "json"}"#;
+        let cfg: GitHubHookConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.url.is_none());
+    }
+
+    #[test]
+    fn test_github_hook_config_default() {
+        let cfg = GitHubHookConfig::default();
+        assert!(cfg.url.is_none());
+    }
+
+    #[test]
+    fn test_gitlab_hook_list_item_deser() {
+        let json = r#"{"url": "https://gitlab.example.com/hook", "id": 42}"#;
+        let item: GitLabHookListItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.url.as_deref(), Some("https://gitlab.example.com/hook"));
+    }
+
+    #[test]
+    fn test_gitlab_hook_list_item_deser_no_url() {
+        let json = r#"{"id": 42}"#;
+        let item: GitLabHookListItem = serde_json::from_str(json).unwrap();
+        assert!(item.url.is_none());
+    }
+
+    #[test]
+    fn test_telegram_api_response_deser_ok() {
+        let json = r#"{"ok": true}"#;
+        let resp: TelegramApiResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.description.is_none());
+    }
+
+    #[test]
+    fn test_telegram_api_response_deser_error() {
+        let json = r#"{"ok": false, "description": "Unauthorized"}"#;
+        let resp: TelegramApiResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.description.as_deref(), Some("Unauthorized"));
+    }
+
+    #[test]
+    fn test_slack_api_ok_response_deser_ok() {
+        let json = r#"{"ok": true}"#;
+        let resp: SlackApiOkResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_slack_api_ok_response_deser_error() {
+        let json = r#"{"ok": false, "error": "invalid_auth"}"#;
+        let resp: SlackApiOkResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("invalid_auth"));
+    }
+
+    #[test]
+    fn test_discord_webhook_create_response_deser() {
+        let json = r#"{"id": "1234567890", "token": "webhook-token-abc"}"#;
+        let resp: DiscordWebhookCreateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.id, "1234567890");
+        assert_eq!(resp.token.as_deref(), Some("webhook-token-abc"));
+    }
+
+    #[test]
+    fn test_discord_webhook_create_response_deser_no_token() {
+        let json = r#"{"id": "1234567890"}"#;
+        let resp: DiscordWebhookCreateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.id, "1234567890");
+        assert!(resp.token.is_none());
+    }
+
+    // ---- configure() async: Jira path variations ----
+
+    #[tokio::test]
+    async fn test_configure_jira_enabled_empty_base_url() {
+        let mut config = test_config();
+        config.issues.jira = Some(crate::config::JiraConfig {
+            enabled: true,
+            base_url: "  ".to_string(),
+            api_token: "jira-token".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-jira-empty-url.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Should have a note about empty base_url
+        assert!(
+            err_msg.contains("jira.base_url is empty") || err_msg.contains("No auto-configurable"),
+            "Expected jira base_url empty note, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_jira_enabled_empty_api_token() {
+        let mut config = test_config();
+        config.issues.jira = Some(crate::config::JiraConfig {
+            enabled: true,
+            base_url: "https://example.atlassian.net".to_string(),
+            api_token: "".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-jira-empty-token.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("jira.api_token is empty") || err_msg.contains("No auto-configurable"),
+            "Expected jira api_token empty note, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Telegram path variations ----
+
+    #[tokio::test]
+    async fn test_configure_telegram_source_enabled_no_bot_token() {
+        let mut config = test_config();
+        config.notifiers.telegram.source_enabled = true;
+        config.notifiers.telegram.bot_token = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-tg-no-token.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("telegram.bot_token is missing")
+                || err_msg.contains("No auto-configurable"),
+            "Expected telegram missing token note, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_telegram_source_enabled_empty_bot_token() {
+        let mut config = test_config();
+        config.notifiers.telegram.source_enabled = true;
+        config.notifiers.telegram.bot_token = Some(crate::secret::SecretValue::new("  "));
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-tg-empty-token.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("telegram.bot_token is missing")
+                || err_msg.contains("No auto-configurable"),
+            "Expected telegram missing token note, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Discord notifier path variations ----
+
+    #[tokio::test]
+    async fn test_configure_discord_notifier_only_bot_token_note() {
+        let mut config = test_config();
+        config.notifiers.discord.bot_token = Some(crate::secret::SecretValue::new("bot-tok"));
+        config.notifiers.discord.channel_id = None;
+        config.notifiers.discord.webhook_url = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-discord-bot-only.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("discord.channel_id") || err_msg.contains("No auto-configurable"),
+            "Expected discord channel_id missing note, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_discord_notifier_only_channel_id_note() {
+        let mut config = test_config();
+        config.notifiers.discord.bot_token = None;
+        config.notifiers.discord.channel_id = Some("12345".to_string());
+        config.notifiers.discord.webhook_url = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-discord-chan-only.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("discord.bot_token") || err_msg.contains("No auto-configurable"),
+            "Expected discord bot_token missing note, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_discord_notifier_both_missing_no_note() {
+        // When neither bot_token nor channel_id is present, no note is emitted for discord notifier
+        let mut config = test_config();
+        config.notifiers.discord.bot_token = None;
+        config.notifiers.discord.channel_id = None;
+        config.notifiers.discord.webhook_url = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-discord-both-missing.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Should NOT contain discord notes since neither field is present
+        assert!(
+            !err_msg.contains("discord.bot_token") && !err_msg.contains("discord.channel_id"),
+            "Should not mention discord fields when both missing, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Slack source path variations ----
+
+    #[tokio::test]
+    async fn test_configure_slack_source_missing_all_fields() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            bot_token: Some(crate::secret::SecretValue::new("xoxb-test")),
+            channel_id: Some("C123".to_string()),
+            app_id: None,
+            app_config_token: None,
+            signing_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-slack-missing-all.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("slack.app_id")
+                && err_msg.contains("slack.app_config_token")
+                && err_msg.contains("slack.signing_secret"),
+            "Should list all missing Slack fields, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_slack_source_missing_one_field() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            app_id: Some("A123".to_string()),
+            app_config_token: Some(crate::secret::SecretValue::new("xoxe-config")),
+            signing_secret: None, // Only this missing
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-slack-missing-one.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("slack.signing_secret"),
+            "Should mention missing signing_secret, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: WhatsApp path variations ----
+
+    #[tokio::test]
+    async fn test_configure_whatsapp_source_missing_fields() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = None;
+        config.notifiers.whatsapp.business_account_id = None;
+        config.notifiers.whatsapp.app_secret = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-wa-missing.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("whatsapp.access_token"),
+            "Should mention missing whatsapp fields, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_whatsapp_source_missing_only_business_account() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("wa-tok"));
+        config.notifiers.whatsapp.business_account_id = None;
+        config.notifiers.whatsapp.app_secret = Some(crate::secret::SecretValue::new("app-sec"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-wa-no-biz.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("whatsapp.business_account_id"),
+            "Should mention missing business_account_id, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: GitLab path variations ----
+
+    #[tokio::test]
+    async fn test_configure_gitlab_enabled_no_groups() {
+        let mut config = test_config();
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: true,
+            token: Some(crate::secret::SecretValue::new("glpat_test")),
+            groups: vec![],
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-gl-no-groups.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no groups are configured")
+                || err_msg.contains("No auto-configurable"),
+            "Expected gitlab no groups note, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_gitlab_enabled_no_token() {
+        let mut config = test_config();
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: true,
+            token: None,
+            groups: vec!["mygroup".to_string()],
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-gl-no-token.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no token is configured") || err_msg.contains("No auto-configurable"),
+            "Expected gitlab no token note, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: GitHub path variations ----
+
+    #[tokio::test]
+    async fn test_configure_github_repos_no_token_no_app() {
+        let mut config = test_config();
+        config.scm.github.token = None;
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.app = crate::config::GitHubAppConfig::default();
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-gh-no-token-no-app.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no GitHub token") || err_msg.contains("No auto-configurable"),
+            "Expected github no token note, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Slack notifier with webhook present does NOT emit note ----
+
+    #[tokio::test]
+    async fn test_configure_slack_notifier_has_webhook_no_note() {
+        let mut config = test_config();
+        config.notifiers.slack.webhook_url = Some(crate::secret::SecretValue::new(
+            "https://hooks.slack.com/xxx",
+        ));
+        config.notifiers.slack.bot_token = Some(crate::secret::SecretValue::new("xoxb-test"));
+        config.notifiers.slack.channel_id = Some("C123".to_string());
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-slack-notifier-webhook.env");
+
+        // Will fail because no auto-configurable sources
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Should NOT contain the Slack notifier note since webhook_url is present
+        assert!(
+            !err_msg.contains("Slack notifier incoming webhook URL"),
+            "Should not emit Slack notifier note when webhook_url present, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Slack notifier no webhook, no bot_channel ----
+
+    #[tokio::test]
+    async fn test_configure_slack_notifier_no_webhook_no_bot() {
+        let mut config = test_config();
+        config.notifiers.slack.webhook_url = None;
+        config.notifiers.slack.bot_token = None;
+        config.notifiers.slack.channel_id = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-slack-notifier-nothing.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // No note should be emitted when neither webhook nor bot+channel present
+        assert!(
+            !err_msg.contains("Slack notifier"),
+            "Should not emit Slack notifier note when nothing configured, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Discord source present adds polling note ----
+
+    #[tokio::test]
+    async fn test_configure_discord_source_with_other_source_adds_note() {
+        // Discord source present along with an auto-configurable source that fails
+        let mut config = test_config();
+        config.issues.discord = Some(crate::config::DiscordSourceConfig {
+            bot_token: Some(crate::secret::SecretValue::new("discord-bot")),
+            channel_id: Some("123".to_string()),
+            ..Default::default()
+        });
+        config.issues.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            api_key: "bad-key".into(),
+            webhook_secret: None,
+            ..Default::default()
+        });
+        let configurator =
+            WebhookConfigurator::new(config, "/tmp/test-discord-source-with-linear.env");
+
+        let result = configurator.configure("https://example.com").await;
+        // Will fail because linear API fails
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed to configure any webhooks"),
+            "Should fail with warning, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: WhatsApp source enabled, API will fail ----
+
+    #[tokio::test]
+    async fn test_configure_whatsapp_source_all_present_api_fails() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("wa-tok"));
+        config.notifiers.whatsapp.business_account_id = Some("12345".to_string());
+        config.notifiers.whatsapp.app_secret = Some(crate::secret::SecretValue::new("app-sec"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-wa-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("WhatsApp") || err_msg.contains("Failed to configure"),
+            "Expected WhatsApp failure, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Telegram source enabled, API will fail ----
+
+    #[tokio::test]
+    async fn test_configure_telegram_source_with_valid_token_api_fails() {
+        let mut config = test_config();
+        config.notifiers.telegram.source_enabled = true;
+        config.notifiers.telegram.bot_token = Some(crate::secret::SecretValue::new("123:ABCdef"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-tg-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Telegram") || err_msg.contains("Failed to configure"),
+            "Expected Telegram failure, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: GitLab with groups and token, API fails ----
+
+    #[tokio::test]
+    async fn test_configure_gitlab_with_groups_and_token_api_fails() {
+        let mut config = test_config();
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: true,
+            token: Some(crate::secret::SecretValue::new("glpat_test")),
+            groups: vec!["mygroup".to_string()],
+            webhook_secret: None,
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-gl-api-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GitLab") || err_msg.contains("Failed to configure"),
+            "Expected GitLab failure, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: GitHub PAT with repos, API fails ----
+
+    #[tokio::test]
+    async fn test_configure_github_with_token_and_repos_api_fails() {
+        let mut config = test_config();
+        config.scm.github.token = Some(crate::secret::SecretValue::new("ghp_test"));
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.webhook_secret = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-gh-api-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GitHub") || err_msg.contains("Failed to configure"),
+            "Expected GitHub failure, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Discord notifier bot+channel present, API fails ----
+
+    #[tokio::test]
+    async fn test_configure_discord_notifier_bot_channel_api_fails() {
+        let mut config = test_config();
+        config.notifiers.discord.bot_token = Some(crate::secret::SecretValue::new("bot-tok"));
+        config.notifiers.discord.channel_id = Some("12345".to_string());
+        config.notifiers.discord.webhook_url = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-discord-api-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Discord") || err_msg.contains("Failed to configure"),
+            "Expected Discord failure, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Multiple auto-configurable sources all fail ----
+
+    #[tokio::test]
+    async fn test_configure_multiple_sources_all_fail() {
+        let mut config = test_config();
+        config.issues.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            api_key: "bad-linear".into(),
+            webhook_secret: None,
+            ..Default::default()
+        });
+        config.issues.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            auth_token: "bad-sentry".into(),
+            org_slug: "fake".to_string(),
+            project_slugs: vec!["proj".to_string()],
+            client_secret: None,
+            ..Default::default()
+        });
+        config.scm.github.token = Some(crate::secret::SecretValue::new("ghp_bad"));
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.webhook_secret = None;
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-multi-fail.env");
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+    }
+
+    // ---- configure() async: Jira disabled ----
+
+    #[tokio::test]
+    async fn test_configure_jira_disabled_no_effect() {
+        let mut config = test_config();
+        config.issues.jira = Some(crate::config::JiraConfig {
+            enabled: false,
+            base_url: "https://example.atlassian.net".to_string(),
+            api_token: "jira-token".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-jira-disabled.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Jira disabled should not contribute any warnings about Jira
+        assert!(
+            !err_msg.contains("Jira webhook"),
+            "Disabled Jira should not show warnings, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Telegram source disabled ----
+
+    #[tokio::test]
+    async fn test_configure_telegram_source_disabled_no_effect() {
+        let mut config = test_config();
+        config.notifiers.telegram.source_enabled = false;
+        config.notifiers.telegram.bot_token = Some(crate::secret::SecretValue::new("123:ABC"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-tg-disabled.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Should not contain telegram notes
+        assert!(
+            !err_msg.contains("Telegram webhook"),
+            "Disabled Telegram should not show webhook warnings, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: WhatsApp source disabled ----
+
+    #[tokio::test]
+    async fn test_configure_whatsapp_source_disabled_no_effect() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = false;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("wa-tok"));
+        config.notifiers.whatsapp.business_account_id = Some("12345".to_string());
+        config.notifiers.whatsapp.app_secret = Some(crate::secret::SecretValue::new("app-sec"));
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-wa-disabled.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("WhatsApp webhook"),
+            "Disabled WhatsApp should not show webhook warnings, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: GitLab disabled ----
+
+    #[tokio::test]
+    async fn test_configure_gitlab_disabled_no_effect() {
+        let mut config = test_config();
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: false,
+            token: Some(crate::secret::SecretValue::new("glpat_test")),
+            groups: vec!["mygroup".to_string()],
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-gl-disabled.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("GitLab issue webhooks"),
+            "Disabled GitLab should not show webhook configured, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Discord notifier webhook already present ----
+
+    #[tokio::test]
+    async fn test_configure_discord_notifier_webhook_already_present_no_auto_setup() {
+        let mut config = test_config();
+        config.notifiers.discord.webhook_url = Some(crate::secret::SecretValue::new(
+            "https://discord.com/api/webhooks/1/token",
+        ));
+        config.notifiers.discord.bot_token = Some(crate::secret::SecretValue::new("bot-tok"));
+        config.notifiers.discord.channel_id = Some("12345".to_string());
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-discord-wh-present.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Should NOT attempt Discord notifier auto-setup when webhook_url is present
+        assert!(
+            !err_msg.contains("Discord notifier webhook"),
+            "Should not attempt auto-setup when webhook_url present, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- configure() async: Slack source with all tokens, API fails ----
+
+    #[tokio::test]
+    async fn test_configure_slack_source_all_tokens_api_fails() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            app_id: Some("A123".to_string()),
+            app_config_token: Some(crate::secret::SecretValue::new("xoxe-config")),
+            signing_secret: Some(crate::secret::SecretValue::new("signing123")),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-slack-source-api-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Slack") || err_msg.contains("Failed to configure"),
+            "Expected Slack failure, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- GitHub App path variations in configure() ----
+
+    #[tokio::test]
+    async fn test_configure_github_app_configured_api_fails() {
+        let mut config = test_config();
+        config.scm.github.token = None;
+        config.scm.github.repos = vec!["owner/repo".to_string()];
+        config.scm.github.app.app_id = Some(12345);
+        config.scm.github.app.private_key = Some(crate::secret::SecretValue::new(
+            "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        ));
+        config.scm.github.webhook_secret = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-gh-app-fail.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GitHub") || err_msg.contains("Failed to configure"),
+            "Expected GitHub App failure, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- GitHub no repos does not attempt setup ----
+
+    #[tokio::test]
+    async fn test_configure_github_no_repos_no_attempt() {
+        let mut config = test_config();
+        config.scm.github.token = Some(crate::secret::SecretValue::new("ghp_test"));
+        config.scm.github.repos = vec![];
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-gh-no-repos.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Should not mention GitHub setup failure since no repos
+        assert!(
+            !err_msg.contains("GitHub webhook setup failed"),
+            "No repos means no GitHub attempt, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- Webhook setup result: print with sentry zero projects and secret ----
+
+    #[test]
+    fn test_print_setup_result_sentry_zero_projects_with_secret() {
+        let result = WebhookSetupResult {
+            linear_configured: false,
+            linear_webhook_id: None,
+            linear_secret: None,
+            sentry_configured: true,
+            sentry_project_count: 0,
+            sentry_secret: Some("secret1234567890".to_string()),
+            warnings: vec![],
+        };
+        // Should not panic
+        print_setup_result(&result);
+    }
+
+    // ---- Combined path: multiple notes accumulation ----
+
+    #[tokio::test]
+    async fn test_configure_many_notes_accumulation() {
+        let mut config = test_config();
+        // Discord source -> polling note
+        config.issues.discord = Some(crate::config::DiscordSourceConfig {
+            bot_token: Some(crate::secret::SecretValue::new("discord-bot")),
+            channel_id: Some("123".to_string()),
+            ..Default::default()
+        });
+        // Telegram no token -> missing note
+        config.notifiers.telegram.source_enabled = true;
+        config.notifiers.telegram.bot_token = None;
+        // WhatsApp missing fields -> missing note
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = None;
+        // Slack notifier with bot+channel, no webhook -> chat.postMessage note
+        config.notifiers.slack.bot_token = Some(crate::secret::SecretValue::new("xoxb-test"));
+        config.notifiers.slack.channel_id = Some("C123".to_string());
+        config.notifiers.slack.webhook_url = None;
+
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-many-notes.env");
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Should contain multiple notes
+        assert!(
+            err_msg.contains("Discord source uses channel polling"),
+            "Expected discord polling note, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("telegram.bot_token is missing"),
+            "Expected telegram token note, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- Jira base_url with just whitespace ----
+
+    #[tokio::test]
+    async fn test_configure_jira_enabled_whitespace_base_url() {
+        let mut config = test_config();
+        config.issues.jira = Some(crate::config::JiraConfig {
+            enabled: true,
+            base_url: "   ".to_string(),
+            api_token: "jira-token".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-jira-ws-url.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("jira.base_url is empty") || err_msg.contains("No auto-configurable"),
+            "Expected jira base_url empty note for whitespace, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- Slack source with only app_id missing ----
+
+    #[tokio::test]
+    async fn test_configure_slack_source_only_app_id_missing() {
+        let mut config = test_config();
+        config.issues.slack = Some(crate::config::SlackSourceConfig {
+            app_id: None,
+            app_config_token: Some(crate::secret::SecretValue::new("xoxe-config")),
+            signing_secret: Some(crate::secret::SecretValue::new("signing")),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-slack-no-appid.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("slack.app_id"),
+            "Should mention missing app_id, got: {}",
+            err_msg
+        );
+        // Should NOT mention the fields that ARE present
+        assert!(
+            !err_msg.contains("slack.app_config_token")
+                && !err_msg.contains("slack.signing_secret"),
+            "Should not mention present fields, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- WhatsApp missing only app_secret ----
+
+    #[tokio::test]
+    async fn test_configure_whatsapp_source_missing_only_app_secret() {
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("wa-tok"));
+        config.notifiers.whatsapp.business_account_id = Some("12345".to_string());
+        config.notifiers.whatsapp.app_secret = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/test-wa-no-secret.env");
+
+        let result = configurator.configure("https://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("whatsapp.app_secret"),
+            "Should mention missing app_secret, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- ensure_slack_events_subscription: manifest with only settings key ----
+
+    #[test]
+    fn test_ensure_slack_events_subscription_settings_exists_no_event_subs() {
+        let mut manifest = serde_json::json!({
+            "settings": {
+                "other_key": "value"
+            }
+        });
+        let changed = WebhookConfigurator::ensure_slack_events_subscription(
+            &mut manifest,
+            "https://example.com/webhook/slack",
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(manifest["settings"]["event_subscriptions"].is_object());
+    }
+
+    // ---- GitHub repos with no webhooks secret => generates secret ----
+
+    #[test]
+    fn test_needs_configuration_github_token_repos_no_secret() {
+        let mut config = test_config();
+        config.scm.github.token = Some(crate::secret::SecretValue::new("ghp_test"));
+        config.scm.github.repos = vec!["a/b".to_string(), "c/d".to_string()];
+        config.scm.github.webhook_secret = None;
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    // ---- Jira needs configuration ----
+
+    #[test]
+    fn test_needs_configuration_jira_enabled_base_url_token() {
+        let mut config = test_config();
+        config.issues.jira = Some(crate::config::JiraConfig {
+            enabled: true,
+            base_url: "https://jira.example.com".to_string(),
+            api_token: "tok".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_jira_disabled() {
+        let mut config = test_config();
+        config.issues.jira = Some(crate::config::JiraConfig {
+            enabled: false,
+            base_url: "https://jira.example.com".to_string(),
+            api_token: "tok".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_jira_empty_base_url() {
+        let mut config = test_config();
+        config.issues.jira = Some(crate::config::JiraConfig {
+            enabled: true,
+            base_url: "".to_string(),
+            api_token: "tok".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        // Empty base_url means !c.base_url.trim().is_empty() is false
+        assert!(!configurator.needs_configuration());
+    }
+
+    #[test]
+    fn test_needs_configuration_jira_empty_api_token() {
+        let mut config = test_config();
+        config.issues.jira = Some(crate::config::JiraConfig {
+            enabled: true,
+            base_url: "https://jira.example.com".to_string(),
+            api_token: "".into(),
+            ..Default::default()
+        });
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        // Empty api_token => is_empty() returns true => needs_config false
+        assert!(!configurator.needs_configuration());
+    }
+
+    // ---- Comprehensive needs_configuration: all sources enabled ----
+
+    #[test]
+    fn test_needs_configuration_all_sources_enabled_various_secrets() {
+        let mut config = test_config();
+        // Linear: needs config (no secret)
+        config.issues.linear = Some(crate::config::LinearConfig {
+            enabled: true,
+            webhook_secret: None,
+            ..Default::default()
+        });
+        // Sentry: configured (has secret)
+        config.issues.sentry = Some(crate::config::SentryConfig {
+            enabled: true,
+            client_secret: Some(crate::secret::SecretValue::new("sen-sec")),
+            ..Default::default()
+        });
+        // GitHub: configured (has secret)
+        config.scm.github.token = Some(crate::secret::SecretValue::new("ghp"));
+        config.scm.github.repos = vec!["o/r".to_string()];
+        config.scm.github.webhook_secret = Some(crate::secret::SecretValue::new("gh-sec"));
+        // GitLab: needs config (no secret)
+        config.scm.gitlab = Some(crate::config::GitLabConfig {
+            enabled: true,
+            token: Some(crate::secret::SecretValue::new("glpat")),
+            groups: vec!["grp".to_string()],
+            webhook_secret: None,
+            ..Default::default()
+        });
+        // Overall: should need config because Linear and GitLab need it
+        let configurator = WebhookConfigurator::new(config, "/tmp/.env");
+        assert!(configurator.needs_configuration());
     }
 }

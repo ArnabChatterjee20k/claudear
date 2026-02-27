@@ -504,6 +504,15 @@ pub(crate) fn build_success_message(
             elements: vec![SlackText::mrkdwn(format!("*Trigger:* {}", reason))],
         });
     }
+    if let Some(confidence) = issue.get_metadata::<u8>("confidence") {
+        let mut text = format!("*Fix Confidence:* {}/100", confidence);
+        if let Some(reasoning) = issue.get_metadata::<String>("confidence_reasoning") {
+            text.push_str(&format!(" — {}", truncate_string(&reasoning, 800)));
+        }
+        blocks.push(SlackBlock::Context {
+            elements: vec![SlackText::mrkdwn(text)],
+        });
+    }
     if let Some(ref m) = mention {
         blocks.push(SlackBlock::Context {
             elements: vec![SlackText::mrkdwn(m.clone())],
@@ -4288,5 +4297,398 @@ mod tests {
             }
         });
         assert!(trigger_block.is_some());
+    }
+
+    // === Coverage tests for build_closed_message ===
+
+    #[test]
+    fn test_build_closed_message_without_mention_v2() {
+        let issue = test_issue();
+        let msg = build_closed_message(&issue, "https://github.com/org/repo/pull/10", None);
+
+        assert!(msg.text.contains("PR Closed"));
+        assert!(msg.text.contains("PROJ-123"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("closed without merging"));
+        assert!(block_json.contains("View PR"));
+    }
+
+    #[test]
+    fn test_build_closed_message_with_mention_v2() {
+        let issue = test_issue();
+        let msg = build_closed_message(
+            &issue,
+            "https://github.com/org/repo/pull/10",
+            Some("<@U_CLOSED>".to_string()),
+        );
+
+        let blocks = msg.blocks.unwrap();
+        // Mention block is inserted at position 0
+        match &blocks[0] {
+            SlackBlock::Section { text, .. } => {
+                assert!(text.text.contains("<@U_CLOSED>"));
+            }
+            _ => panic!("Expected Section block with mention at position 0"),
+        }
+    }
+
+    // === Coverage tests for build_cascade_success_message ===
+
+    #[test]
+    fn test_build_cascade_success_message_basic() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+        let msg = build_cascade_success_message(&issue, "https://github.com/pr/99", None);
+
+        assert!(msg.text.contains("Cascade PR"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("org/upstream"));
+        assert!(block_json.contains("org/downstream"));
+        assert!(block_json.contains("View PR"));
+    }
+
+    #[test]
+    fn test_build_cascade_success_message_with_mention_v2() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/up");
+        issue.set_metadata("cascade_downstream_repo", "org/down");
+        let msg = build_cascade_success_message(
+            &issue,
+            "https://github.com/pr/99",
+            Some("<@U_CASCADE>".to_string()),
+        );
+
+        let blocks = msg.blocks.unwrap();
+        match &blocks[0] {
+            SlackBlock::Section { text, .. } => {
+                assert!(text.text.contains("<@U_CASCADE>"));
+            }
+            _ => panic!("Expected mention Section at position 0"),
+        }
+    }
+
+    // === Coverage tests for build_cascade_failed_message ===
+
+    #[test]
+    fn test_build_cascade_failed_message_basic() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+        let msg = build_cascade_failed_message(&issue, "merge conflict", None);
+
+        assert!(msg.text.contains("Cascade Failed"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("org/upstream"));
+        assert!(block_json.contains("org/downstream"));
+        assert!(block_json.contains("merge conflict"));
+    }
+
+    #[test]
+    fn test_build_cascade_failed_message_truncates_long_error_v2() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/up");
+        issue.set_metadata("cascade_downstream_repo", "org/down");
+        let long_error = "e".repeat(1000);
+        let msg = build_cascade_failed_message(&issue, &long_error, None);
+
+        let blocks = msg.blocks.unwrap();
+        let error_block = blocks
+            .iter()
+            .find(|b| match b {
+                SlackBlock::Section { text, .. } => text.text.contains("Error"),
+                _ => false,
+            })
+            .expect("Error section block should exist");
+        match error_block {
+            SlackBlock::Section { text, .. } => {
+                assert!(text.text.len() <= 600);
+                assert!(text.text.contains("..."));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_build_cascade_failed_message_with_mention_v2() {
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_upstream_repo", "org/up");
+        issue.set_metadata("cascade_downstream_repo", "org/down");
+        let msg = build_cascade_failed_message(&issue, "error", Some("<@U_CF>".to_string()));
+        let blocks = msg.blocks.unwrap();
+        match &blocks[0] {
+            SlackBlock::Section { text, .. } => {
+                assert!(text.text.contains("<@U_CF>"));
+            }
+            _ => panic!("Expected mention at position 0"),
+        }
+    }
+
+    // === Coverage tests for build_regression_detected_message ===
+
+    #[test]
+    fn test_build_regression_detected_message_basic() {
+        let issue = test_issue();
+        let msg = build_regression_detected_message(&issue, "CI test #42 failed again", None);
+
+        assert!(msg.text.contains("Regression Detected"));
+        assert!(msg.text.contains("PROJ-123"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("previously fixed issue has regressed"));
+        assert!(block_json.contains("CI test #42 failed again"));
+        assert!(block_json.contains("Retry has been scheduled"));
+    }
+
+    #[test]
+    fn test_build_regression_detected_message_with_mention_v2() {
+        let issue = test_issue();
+        let msg = build_regression_detected_message(
+            &issue,
+            "regression error",
+            Some("<@U_REG>".to_string()),
+        );
+        let blocks = msg.blocks.unwrap();
+        match &blocks[0] {
+            SlackBlock::Section { text, .. } => {
+                assert!(text.text.contains("<@U_REG>"));
+            }
+            _ => panic!("Expected mention at position 0"),
+        }
+    }
+
+    #[test]
+    fn test_build_regression_detected_message_truncates_long_error_v2() {
+        let issue = test_issue();
+        let long_error = "r".repeat(1000);
+        let msg = build_regression_detected_message(&issue, &long_error, None);
+        let blocks = msg.blocks.unwrap();
+        let detail_block = blocks
+            .iter()
+            .find(|b| match b {
+                SlackBlock::Section { text, .. } => text.text.contains("Details"),
+                _ => false,
+            })
+            .unwrap();
+        match detail_block {
+            SlackBlock::Section { text, .. } => {
+                assert!(text.text.len() <= 600);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // === Coverage tests for build_regression_resolved_message ===
+
+    #[test]
+    fn test_build_regression_resolved_message_basic() {
+        let issue = test_issue();
+        let msg = build_regression_resolved_message(&issue, None);
+
+        assert!(msg.text.contains("Regression Resolved"));
+        assert!(msg.text.contains("PROJ-123"));
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("No regression detected after monitoring period"));
+        assert!(block_json.contains("Issue resolved after final check"));
+    }
+
+    #[test]
+    fn test_build_regression_resolved_message_with_mention_v2() {
+        let issue = test_issue();
+        let msg = build_regression_resolved_message(&issue, Some("<@U_RESOLVED>".to_string()));
+        let blocks = msg.blocks.unwrap();
+        match &blocks[0] {
+            SlackBlock::Section { text, .. } => {
+                assert!(text.text.contains("<@U_RESOLVED>"));
+            }
+            _ => panic!("Expected mention at position 0"),
+        }
+    }
+
+    // === Coverage tests for Notifier trait methods via mock HTTP ===
+
+    #[tokio::test]
+    async fn test_notify_merged_sends_correct_content() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        notifier
+            .notify_merged(&test_issue(), "https://github.com/org/repo/pull/42")
+            .await
+            .unwrap();
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("PR Merged"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_closed_sends_correct_content() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        notifier
+            .notify_closed(&test_issue(), "https://github.com/org/repo/pull/42")
+            .await
+            .unwrap();
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("PR Closed"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_report_sends_correct_content() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let report = crate::reports::Report {
+            period: "Weekly".to_string(),
+            from: chrono::Utc::now() - chrono::Duration::days(7),
+            to: chrono::Utc::now(),
+            issues_attempted: 20,
+            issues_succeeded: 15,
+            issues_failed: 3,
+            issues_cannot_fix: 2,
+            success_rate: 75.0,
+            failure_rate: 15.0,
+            prs_created: 15,
+            prs_merged: 12,
+            prs_closed: 1,
+            by_source: std::collections::HashMap::new(),
+            pending_count: 5,
+            retryable_count: 2,
+        };
+        notifier.notify_report(&report).await.unwrap();
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let blocks = body["blocks"].as_array().unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("Weekly"));
+        assert!(block_json.contains("75.0"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_success_cascade_path() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        notifier
+            .notify_success(&issue, "https://github.com/pr/1")
+            .await
+            .unwrap();
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("Cascade PR"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_completed_regression_resolved_path() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let mut issue = test_issue();
+        issue.set_metadata("regression_resolved", true);
+        notifier.notify_completed(&issue).await.unwrap();
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("Regression Resolved"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_regression_detected_path() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let mut issue = test_issue();
+        issue.set_metadata("regression_detected", true);
+        notifier
+            .notify_failed(&issue, "regression error")
+            .await
+            .unwrap();
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("Regression Detected"));
+    }
+
+    #[tokio::test]
+    async fn test_notify_failed_cascade_failed_path() {
+        let mock = MockSlackHttpClient::success();
+        let notifier = SlackNotifier::with_http_client(webhook_config(), mock);
+        let mut issue = test_issue();
+        issue.set_metadata("cascade_downstream_repo", "org/downstream");
+        issue.set_metadata("cascade_upstream_repo", "org/upstream");
+        notifier
+            .notify_failed(&issue, "cascade error")
+            .await
+            .unwrap();
+        let (_, body, _) = notifier.http.get_last_post_call().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("Cascade Failed"));
+    }
+
+    // === Coverage: build_success_message with is_pr_update and changelog ===
+
+    #[test]
+    fn test_build_success_message_pr_update_v2() {
+        let mut issue = test_issue();
+        issue.set_metadata("is_pr_update", true);
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        assert!(msg.text.contains("PR Updated"));
+    }
+
+    #[test]
+    fn test_build_success_message_with_changelog() {
+        let mut issue = test_issue();
+        issue.set_metadata("changelog", "Fixed authentication bug");
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("Changes"));
+        assert!(block_json.contains("Fixed authentication bug"));
+    }
+
+    // === Coverage: build_completed_message with custom completion_reason ===
+
+    #[test]
+    fn test_build_completed_message_with_custom_reason() {
+        let mut issue = test_issue();
+        issue.set_metadata("completion_reason", "Already fixed in previous release");
+        let msg = build_completed_message(&issue, None);
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("Already fixed in previous release"));
+    }
+
+    // === Coverage: confidence in success messages ===
+
+    #[test]
+    fn test_build_success_message_with_confidence() {
+        let mut issue = test_issue();
+        issue.set_metadata("confidence", 85u8);
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("Fix Confidence"));
+        assert!(block_json.contains("85/100"));
+    }
+
+    #[test]
+    fn test_build_success_message_with_confidence_and_reasoning() {
+        let mut issue = test_issue();
+        issue.set_metadata("confidence", 72u8);
+        issue.set_metadata("confidence_reasoning", "Simple null check fix".to_string());
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(block_json.contains("72/100"));
+        assert!(block_json.contains("Simple null check fix"));
+    }
+
+    #[test]
+    fn test_build_success_message_without_confidence() {
+        let issue = test_issue();
+        let msg = build_success_message(&issue, "https://github.com/pr/1", None);
+        let blocks = msg.blocks.unwrap();
+        let block_json = serde_json::to_string(&blocks).unwrap();
+        assert!(!block_json.contains("Fix Confidence"));
     }
 }

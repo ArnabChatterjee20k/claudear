@@ -1822,4 +1822,205 @@ mod tests {
         let debug = format!("{:?}", result);
         assert!(debug.contains("WebhookCreateResult"));
     }
+
+    // --- WebhookData deserialization ---
+
+    #[test]
+    fn test_webhook_data_deserialization() {
+        let json = r#"{
+            "id": "wh_data_1",
+            "url": "https://data.test/hook",
+            "enabled": false,
+            "secret": "data_secret"
+        }"#;
+        let data: WebhookData = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(data.id, "wh_data_1");
+        assert_eq!(data.url, "https://data.test/hook");
+        assert!(!data.enabled);
+        assert_eq!(data.secret, "data_secret");
+    }
+
+    #[test]
+    fn test_webhook_data_debug() {
+        let json = r#"{
+            "id": "wh_dbg",
+            "url": "https://debug.test",
+            "enabled": true,
+            "secret": "sec"
+        }"#;
+        let data: WebhookData = serde_json::from_str(json).unwrap();
+        let debug = format!("{:?}", data);
+        assert!(debug.contains("WebhookData"));
+        assert!(debug.contains("wh_dbg"));
+    }
+
+    // --- WebhooksConnection deserialization ---
+
+    #[test]
+    fn test_webhooks_connection_empty() {
+        let json = r#"{"nodes": []}"#;
+        let conn: WebhooksConnection = serde_json::from_str(json).unwrap();
+        assert!(conn.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_webhooks_connection_with_nodes() {
+        let json = r#"{"nodes": [
+            {"id": "n1", "url": "https://a.com", "enabled": true},
+            {"id": "n2", "url": "https://b.com", "enabled": false}
+        ]}"#;
+        let conn: WebhooksConnection = serde_json::from_str(json).unwrap();
+        assert_eq!(conn.nodes.len(), 2);
+        assert_eq!(conn.nodes[0].id, "n1");
+        assert!(!conn.nodes[1].enabled);
+    }
+
+    // --- Full GraphQL response round-trips for WebhooksResponse ---
+
+    #[test]
+    fn test_graphql_webhooks_response_full() {
+        let json = r#"{
+            "data": {
+                "webhooks": {
+                    "nodes": [
+                        {"id": "wh_a", "url": "https://a.test", "enabled": true},
+                        {"id": "wh_b", "url": "https://b.test", "enabled": false}
+                    ]
+                }
+            }
+        }"#;
+        let resp: GraphQLResponse<WebhooksResponse> = serde_json::from_str(json).unwrap();
+        let data = resp.data.unwrap();
+        assert_eq!(data.webhooks.nodes.len(), 2);
+        assert_eq!(data.webhooks.nodes[0].id, "wh_a");
+        assert!(data.webhooks.nodes[0].enabled);
+        assert_eq!(data.webhooks.nodes[1].url, "https://b.test");
+    }
+
+    // --- GraphQLError deserialization ---
+
+    #[test]
+    fn test_graphql_error_deserialization() {
+        let json = r#"{"message": "Something went wrong"}"#;
+        let err: GraphQLError = serde_json::from_str(json).unwrap();
+        assert_eq!(err.message, "Something went wrong");
+    }
+
+    #[test]
+    fn test_graphql_error_debug() {
+        let json = r#"{"message": "debug test"}"#;
+        let err: GraphQLError = serde_json::from_str(json).unwrap();
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("GraphQLError"));
+        assert!(debug.contains("debug test"));
+    }
+
+    #[test]
+    fn test_graphql_error_empty_message() {
+        let json = r#"{"message": ""}"#;
+        let err: GraphQLError = serde_json::from_str(json).unwrap();
+        assert_eq!(err.message, "");
+    }
+
+    // --- WebhookCreateResponse deserialization (extended) ---
+
+    #[test]
+    fn test_webhook_create_response_success_no_webhook_2() {
+        let json = r#"{
+            "webhookCreate": {
+                "success": true,
+                "webhook": null
+            }
+        }"#;
+        let resp: WebhookCreateResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.webhook_create.success);
+        assert!(resp.webhook_create.webhook.is_none());
+    }
+
+    #[test]
+    fn test_webhook_create_response_with_all_fields() {
+        let json = r#"{
+            "webhookCreate": {
+                "success": true,
+                "webhook": {
+                    "id": "wh_full",
+                    "url": "https://full.test/hook",
+                    "enabled": true,
+                    "secret": "full_secret"
+                }
+            }
+        }"#;
+        let resp: WebhookCreateResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.webhook_create.success);
+        let wh = resp.webhook_create.webhook.unwrap();
+        assert_eq!(wh.id, "wh_full");
+        assert_eq!(wh.url, "https://full.test/hook");
+        assert!(wh.enabled);
+        assert_eq!(wh.secret, "full_secret");
+    }
+
+    // --- WebhookNode edge cases ---
+
+    #[test]
+    fn test_webhook_node_with_empty_fields() {
+        let json = r#"{"id": "", "url": "", "enabled": false}"#;
+        let node: WebhookNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.id, "");
+        assert_eq!(node.url, "");
+        assert!(!node.enabled);
+    }
+
+    #[test]
+    fn test_webhook_node_debug() {
+        let json = r#"{"id": "dbg_node", "url": "https://dbg.test", "enabled": true}"#;
+        let node: WebhookNode = serde_json::from_str(json).unwrap();
+        let debug = format!("{:?}", node);
+        assert!(debug.contains("WebhookNode"));
+        assert!(debug.contains("dbg_node"));
+    }
+
+    // --- GraphQLResponse with WebhooksResponse error path ---
+
+    #[test]
+    fn test_graphql_webhooks_response_with_errors_only() {
+        let json = r#"{
+            "data": null,
+            "errors": [{"message": "Unauthorized access"}]
+        }"#;
+        let resp: GraphQLResponse<WebhooksResponse> = serde_json::from_str(json).unwrap();
+        assert!(resp.data.is_none());
+        let errors = resp.errors.unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "Unauthorized access");
+    }
+
+    // --- WebhookCreateResult with success true but no webhook data ---
+
+    #[test]
+    fn test_webhook_create_result_success_true_no_webhook() {
+        let json = r#"{"success": true, "webhook": null}"#;
+        let result: WebhookCreateResult = serde_json::from_str(json).unwrap();
+        assert!(result.success);
+        assert!(result.webhook.is_none());
+    }
+
+    // --- Multiple GraphQL errors ---
+
+    #[test]
+    fn test_graphql_response_multiple_errors_for_webhooks() {
+        let json = r#"{
+            "data": null,
+            "errors": [
+                {"message": "err_a"},
+                {"message": "err_b"},
+                {"message": "err_c"}
+            ]
+        }"#;
+        let resp: GraphQLResponse<WebhooksResponse> = serde_json::from_str(json).unwrap();
+        let errors = resp.errors.unwrap();
+        assert_eq!(errors.len(), 3);
+        assert_eq!(errors[0].message, "err_a");
+        assert_eq!(errors[1].message, "err_b");
+        assert_eq!(errors[2].message, "err_c");
+    }
 }
