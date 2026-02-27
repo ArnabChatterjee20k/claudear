@@ -376,7 +376,9 @@ mod tests {
 
     #[test]
     fn test_language_from_extension_returns_none_for_unknown() {
-        let unknown_exts = ["xml", "txt", "md", "toml", "ini", "cfg", "csv", "html", "css"];
+        let unknown_exts = [
+            "xml", "txt", "md", "toml", "ini", "cfg", "csv", "html", "css",
+        ];
         for ext in unknown_exts {
             assert_eq!(
                 Language::from_extension(ext),

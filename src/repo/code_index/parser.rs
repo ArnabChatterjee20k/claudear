@@ -769,8 +769,7 @@ database:
       port: 5434
 "#;
         let tree = parse_file(src, Language::Yaml).unwrap();
-        let symbols =
-            extract_symbols(&tree, src.as_bytes(), Language::Yaml, 1, "database.yaml");
+        let symbols = extract_symbols(&tree, src.as_bytes(), Language::Yaml, 1, "database.yaml");
         assert!(symbols.is_empty());
     }
 
@@ -862,7 +861,10 @@ end
         let tree = parse_file(src, Language::Lua).unwrap();
         let symbols = extract_symbols(&tree, src.as_bytes(), Language::Lua, 1, "test.lua");
         assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].start_line, 1, "Lua line numbers should be 1-indexed");
+        assert_eq!(
+            symbols[0].start_line, 1,
+            "Lua line numbers should be 1-indexed"
+        );
     }
 
     #[test]
@@ -908,12 +910,17 @@ end
 "#;
         let tree = parse_file(src, Language::Json).unwrap();
         let symbols = extract_symbols(&tree, src.as_bytes(), Language::Json, 1, "types.json");
-        assert!(symbols.is_empty(), "No JSON node types should produce symbols");
+        assert!(
+            symbols.is_empty(),
+            "No JSON node types should produce symbols"
+        );
     }
 
     #[test]
     fn test_parse_json_large_array() {
-        let items: Vec<String> = (0..50).map(|i| format!(r#"{{"id": {}, "name": "item{}"}}"#, i, i)).collect();
+        let items: Vec<String> = (0..50)
+            .map(|i| format!(r#"{{"id": {}, "name": "item{}"}}"#, i, i))
+            .collect();
         let src = format!("[\n{}\n]", items.join(",\n"));
         let tree = parse_file(&src, Language::Json).unwrap();
         let symbols = extract_symbols(&tree, src.as_bytes(), Language::Json, 1, "large.json");

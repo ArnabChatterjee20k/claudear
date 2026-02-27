@@ -555,4 +555,140 @@ mod tests {
         let response = IpcResponse::Ok(IpcData::Activity(entries));
         print_response(&response);
     }
+
+    // === Coverage tests for print_response with by_source entries ===
+
+    #[test]
+    fn test_print_response_stats_with_by_source() {
+        use crate::types::SourceStats;
+        let mut by_source = std::collections::HashMap::new();
+        by_source.insert(
+            "linear".to_string(),
+            SourceStats {
+                total: 5,
+                success: 3,
+                failed: 1,
+                merged: 2,
+                closed: 0,
+                cannot_fix: 0,
+            },
+        );
+        by_source.insert(
+            "sentry".to_string(),
+            SourceStats {
+                total: 3,
+                success: 1,
+                failed: 2,
+                merged: 0,
+                closed: 0,
+                cannot_fix: 0,
+            },
+        );
+        let stats = FixAttemptStats {
+            total: 8,
+            pending: 1,
+            success: 4,
+            failed: 3,
+            merged: 2,
+            closed: 0,
+            cannot_fix: 0,
+            by_source,
+        };
+        let response = IpcResponse::Ok(IpcData::Stats(stats));
+        // Should not panic
+        print_response(&response);
+    }
+
+    // === Coverage: state with no poll_interval and no processing ===
+
+    #[test]
+    fn test_print_response_state_no_poll_no_processing() {
+        let state = WatcherState {
+            running: false,
+            paused: true,
+            mode: "webhook".to_string(),
+            uptime_secs: 0,
+            issues_processed: 0,
+            prs_created: 0,
+            processing: vec![],
+            sources: vec![],
+            poll_interval_ms: None,
+        };
+        let response = IpcResponse::Ok(IpcData::State(state));
+        print_response(&response);
+    }
+
+    // === Coverage: convenience methods that delegate to send ===
+
+    #[tokio::test]
+    async fn test_pause_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.pause().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_resume_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.resume().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reset_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.reset("linear", "LIN-1").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stats_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.stats().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_prs_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.list_prs().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_retries_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.list_retries().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_process_retries_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.process_retries().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_activity_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.activity(10).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_nonexistent_socket_returns_error() {
+        let client =
+            IpcClient::with_socket_path(PathBuf::from("/tmp/claudear-no-such-socket.sock"));
+        let result = client.shutdown().await;
+        assert!(result.is_err());
+    }
 }

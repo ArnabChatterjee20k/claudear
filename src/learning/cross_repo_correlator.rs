@@ -162,7 +162,7 @@ impl CrossRepoCorrelator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::SqliteTracker;
+    use crate::storage::{AttemptTracker, SqliteTracker};
 
     #[test]
     fn test_format_context_empty() {

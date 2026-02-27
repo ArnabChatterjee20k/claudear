@@ -766,4 +766,1015 @@ mod tests {
         let config = IssueEmbeddingConfig::default();
         assert!(config.enabled, "default enabled should be true");
     }
+
+    #[test]
+    fn test_config_custom_values() {
+        let config = IssueEmbeddingConfig {
+            enabled: false,
+            min_similarity: 0.5,
+            max_similar_issues: 10,
+            skip_similarity_threshold: 0.95,
+        };
+        assert!(!config.enabled);
+        assert!((config.min_similarity - 0.5).abs() < f64::EPSILON);
+        assert_eq!(config.max_similar_issues, 10);
+        assert!((config.skip_similarity_threshold - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let config = IssueEmbeddingConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config.enabled, cloned.enabled);
+        assert!((config.min_similarity - cloned.min_similarity).abs() < f64::EPSILON);
+        assert_eq!(config.max_similar_issues, cloned.max_similar_issues);
+    }
+
+    #[test]
+    fn test_config_debug() {
+        let config = IssueEmbeddingConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("IssueEmbeddingConfig"));
+        assert!(dbg.contains("enabled"));
+        assert!(dbg.contains("min_similarity"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_labels_with_non_string_elements() {
+        let mut issue = make_issue("Mixed labels");
+        issue.metadata.insert(
+            "labels".to_string(),
+            serde_json::json!(["bug", 42, null, "critical"]),
+        );
+        let text = build_embedding_text(&issue);
+        // Only string elements should appear
+        assert!(text.contains("Labels: bug, critical"));
+        assert!(!text.contains("42"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_stack_trace_under_2000_not_truncated() {
+        let mut issue = make_issue("Short stack");
+        let short_stack = "a".repeat(500);
+        issue
+            .metadata
+            .insert("stack_trace".to_string(), serde_json::json!(short_stack));
+        let text = build_embedding_text(&issue);
+        assert!(!text.ends_with("..."));
+        assert!(text.contains(&"a".repeat(500)));
+    }
+
+    #[test]
+    fn test_build_embedding_text_stack_trace_2001_truncated() {
+        let mut issue = make_issue("Just over stack");
+        let stack = "z".repeat(2001);
+        issue
+            .metadata
+            .insert("stack_trace".to_string(), serde_json::json!(stack));
+        let text = build_embedding_text(&issue);
+        assert!(text.ends_with("..."));
+        assert!(text.contains(&"z".repeat(2000)));
+    }
+
+    #[test]
+    fn test_build_embedding_text_non_string_error_message_skipped() {
+        let mut issue = make_issue("Numeric error");
+        issue
+            .metadata
+            .insert("error_message".to_string(), serde_json::json!(123));
+        let text = build_embedding_text(&issue);
+        assert_eq!(text, "Numeric error");
+    }
+
+    #[test]
+    fn test_build_embedding_text_both_stack_and_error() {
+        let mut issue = make_issue("Full error");
+        issue
+            .metadata
+            .insert("stack_trace".to_string(), serde_json::json!("at line 42"));
+        issue
+            .metadata
+            .insert("error_message".to_string(), serde_json::json!("NullRef"));
+        let text = build_embedding_text(&issue);
+        assert!(text.contains("at line 42"));
+        assert!(text.contains("NullRef"));
+        // Error message should come after stack trace
+        let stack_pos = text.find("at line 42").unwrap();
+        let error_pos = text.find("NullRef").unwrap();
+        assert!(error_pos > stack_pos);
+    }
+
+    #[test]
+    fn test_build_embedding_text_unicode_title() {
+        let issue = make_issue("Fix bug in \u{65E5}\u{672C}\u{8A9E} module");
+        let text = build_embedding_text(&issue);
+        assert!(text.contains("\u{65E5}\u{672C}\u{8A9E}"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_unicode_stack_trace_truncation() {
+        let mut issue = make_issue("Unicode stack");
+        // Multi-byte characters that cross the 2000-byte boundary
+        let stack: String = "\u{1F600}".repeat(600); // Each is 4 bytes, 600 * 4 = 2400 bytes
+        issue
+            .metadata
+            .insert("stack_trace".to_string(), serde_json::json!(stack));
+        let text = build_embedding_text(&issue);
+        assert!(text.ends_with("..."));
+        // Should not panic from splitting multi-byte characters
+    }
+
+    #[test]
+    fn test_format_similar_issues_context_header() {
+        let similar = vec![SimilarIssueWithDetails {
+            embedding: IssueEmbedding::new("linear", "x", vec![0.1]),
+            similarity: 0.5,
+            outcome: None,
+            pr_url: None,
+        }];
+        let context = format_similar_issues_context(&similar);
+        assert!(context.contains("## Similar Past Issues"));
+        assert!(context.contains("Use this context to inform your approach"));
+    }
+
+    #[test]
+    fn test_format_similar_issues_context_five_items() {
+        let similar: Vec<SimilarIssueWithDetails> = (1..=5)
+            .map(|i| SimilarIssueWithDetails {
+                embedding: IssueEmbedding::new("linear", format!("id-{}", i), vec![0.1]),
+                similarity: 0.9 - (i as f64 * 0.05),
+                outcome: Some("success".to_string()),
+                pr_url: Some(format!("https://github.com/pull/{}", i)),
+            })
+            .collect();
+        let context = format_similar_issues_context(&similar);
+        for i in 1..=5 {
+            assert!(context.contains(&format!("### {}.", i)));
+            assert!(context.contains(&format!("id-{}", i)));
+        }
+    }
+
+    #[test]
+    fn test_similar_issue_with_details_clone() {
+        let detail = SimilarIssueWithDetails {
+            embedding: IssueEmbedding::new("linear", "456", vec![0.1, 0.2]),
+            similarity: 0.85,
+            outcome: Some("merged".to_string()),
+            pr_url: Some("https://github.com/pull/42".to_string()),
+        };
+        let cloned = detail.clone();
+        assert!((cloned.similarity - 0.85).abs() < f64::EPSILON);
+        assert_eq!(cloned.outcome, Some("merged".to_string()));
+        assert_eq!(
+            cloned.pr_url,
+            Some("https://github.com/pull/42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_similar_issue_with_details_debug() {
+        let detail = SimilarIssueWithDetails {
+            embedding: IssueEmbedding::new("linear", "789", vec![]),
+            similarity: 0.0,
+            outcome: None,
+            pr_url: None,
+        };
+        let dbg = format!("{:?}", detail);
+        assert!(dbg.contains("SimilarIssueWithDetails"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_empty_metadata() {
+        let issue = make_issue("No metadata issue");
+        let text = build_embedding_text(&issue);
+        assert_eq!(text, "No metadata issue");
+    }
+
+    #[test]
+    fn test_build_embedding_text_capacity_estimation() {
+        // Test that the capacity estimation does not cause issues
+        let mut issue = make_issue("A");
+        issue.description = Some("B".repeat(10000));
+        let text = build_embedding_text(&issue);
+        assert!(text.contains("A"));
+        assert!(text.contains(&"B".repeat(10000)));
+    }
+
+    #[test]
+    fn test_format_context_fractional_similarity() {
+        let similar = vec![SimilarIssueWithDetails {
+            embedding: IssueEmbedding::new("linear", "frac", vec![0.1]),
+            similarity: 0.777,
+            outcome: None,
+            pr_url: None,
+        }];
+        let context = format_similar_issues_context(&similar);
+        // 0.777 * 100 = 77.7, formatted as 78% (rounded)
+        assert!(context.contains("78%"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_labels_single_element() {
+        let mut issue = make_issue("Single label");
+        issue
+            .metadata
+            .insert("labels".to_string(), serde_json::json!(["enhancement"]));
+        let text = build_embedding_text(&issue);
+        assert!(text.contains("Labels: enhancement"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_null_labels_skipped() {
+        let mut issue = make_issue("Null labels");
+        issue
+            .metadata
+            .insert("labels".to_string(), serde_json::Value::Null);
+        let text = build_embedding_text(&issue);
+        assert!(!text.contains("Labels:"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_null_stack_trace_skipped() {
+        let mut issue = make_issue("Null stack");
+        issue
+            .metadata
+            .insert("stack_trace".to_string(), serde_json::Value::Null);
+        let text = build_embedding_text(&issue);
+        assert_eq!(text, "Null stack");
+    }
+
+    #[test]
+    fn test_build_embedding_text_null_error_message_skipped() {
+        let mut issue = make_issue("Null error");
+        issue
+            .metadata
+            .insert("error_message".to_string(), serde_json::Value::Null);
+        let text = build_embedding_text(&issue);
+        assert_eq!(text, "Null error");
+    }
+
+    // ===================================================================
+    // Mock tracker and IssueEmbeddingService tests
+    // ===================================================================
+
+    use crate::storage::{
+        ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore, ExperimentStore,
+        KnowledgeStore, RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
+    };
+    use crate::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// A mock tracker that implements all sub-traits required by FixAttemptTracker.
+    /// Stores embeddings in memory and returns configurable results for get_embedding
+    /// and find_similar_issues_vector.
+    struct MockTracker {
+        stored_embeddings: Mutex<Vec<IssueEmbedding>>,
+        /// If set, `get_embedding` returns this for any query.
+        get_embedding_result: Mutex<Option<IssueEmbedding>>,
+        /// If set, `find_similar_issues_vector` returns Some(this).
+        /// If None, returns None (simulating vectorlite unavailable).
+        similar_results: Mutex<Option<Vec<(IssueEmbedding, f64)>>>,
+        /// Attempts returned by `get_attempts_batch`.
+        batch_attempts: Mutex<Vec<Option<FixAttempt>>>,
+    }
+
+    impl MockTracker {
+        fn new() -> Self {
+            Self {
+                stored_embeddings: Mutex::new(Vec::new()),
+                get_embedding_result: Mutex::new(None),
+                similar_results: Mutex::new(None),
+                batch_attempts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_get_embedding(self, emb: IssueEmbedding) -> Self {
+            *self.get_embedding_result.lock().unwrap() = Some(emb);
+            self
+        }
+
+        fn with_similar_results(self, results: Vec<(IssueEmbedding, f64)>) -> Self {
+            *self.similar_results.lock().unwrap() = Some(results);
+            self
+        }
+
+        fn with_batch_attempts(self, attempts: Vec<Option<FixAttempt>>) -> Self {
+            *self.batch_attempts.lock().unwrap() = attempts;
+            self
+        }
+    }
+
+    impl AttemptTracker for MockTracker {
+        fn has_attempted(&self, _: &str, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn get_attempted_issue_ids(&self, _: &str) -> Result<HashSet<String>> {
+            Ok(HashSet::new())
+        }
+        fn record_attempt(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn record_attempt_with_labels(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[String],
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn mark_success(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn mark_failed(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn mark_merged(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn mark_closed(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn mark_resolved(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn get_attempt(&self, _: &str, _: &str) -> Result<Option<FixAttempt>> {
+            Ok(None)
+        }
+        fn get_attempts_by_status(&self, _: FixAttemptStatus) -> Result<Vec<FixAttempt>> {
+            Ok(vec![])
+        }
+        fn get_pending_prs(&self) -> Result<Vec<FixAttempt>> {
+            Ok(vec![])
+        }
+        fn get_attempt_by_pr_url(&self, _: &str) -> Result<Option<FixAttempt>> {
+            Ok(None)
+        }
+        fn reset_attempt(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn get_stats(&self) -> Result<FixAttemptStats> {
+            Ok(FixAttemptStats {
+                total: 0,
+                pending: 0,
+                success: 0,
+                failed: 0,
+                merged: 0,
+                closed: 0,
+                cannot_fix: 0,
+                by_source: Default::default(),
+            })
+        }
+        fn increment_retry(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn mark_cannot_fix(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn get_retryable_issues(&self, _: u32) -> Result<Vec<FixAttempt>> {
+            Ok(vec![])
+        }
+        fn prepare_for_retry(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl EmbeddingStore for MockTracker {
+        fn store_embedding(&self, embedding: &IssueEmbedding) -> Result<i64> {
+            self.stored_embeddings
+                .lock()
+                .unwrap()
+                .push(embedding.clone());
+            Ok(self.stored_embeddings.lock().unwrap().len() as i64)
+        }
+
+        fn store_embeddings_batch(&self, embeddings: &[IssueEmbedding]) -> Result<()> {
+            self.stored_embeddings
+                .lock()
+                .unwrap()
+                .extend(embeddings.iter().cloned());
+            Ok(())
+        }
+
+        fn get_embedding(&self, _source: &str, _issue_id: &str) -> Result<Option<IssueEmbedding>> {
+            Ok(self.get_embedding_result.lock().unwrap().clone())
+        }
+
+        fn find_similar_issues_vector(
+            &self,
+            _query_embedding: &[f32],
+            _source: &str,
+            _exclude_issue_id: Option<&str>,
+            _min_similarity: f64,
+            _limit: usize,
+        ) -> Result<Option<Vec<(IssueEmbedding, f64)>>> {
+            Ok(self.similar_results.lock().unwrap().clone())
+        }
+    }
+
+    impl ActivityStore for MockTracker {
+        fn get_attempts_batch(&self, _keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
+            Ok(self.batch_attempts.lock().unwrap().clone())
+        }
+    }
+
+    impl KnowledgeStore for MockTracker {}
+    impl RepoStore for MockTracker {}
+    impl UserStore for MockTracker {}
+    impl RegressionStore for MockTracker {}
+    impl ChatStore for MockTracker {}
+    impl ExperimentStore for MockTracker {}
+    impl EvaluationStore for MockTracker {}
+    impl WebhookStore for MockTracker {}
+    impl SimilarityStore for MockTracker {}
+
+    // --- Helper to create a mock EmbeddingClient for tests ---
+    // We use the real EmbeddingClient with the fast (AllMiniLML6V2) model.
+    // This is cached after first download and runs locally.
+    fn make_embedding_client() -> Arc<EmbeddingClient> {
+        use crate::feedback::EmbeddingConfig;
+        use fastembed::EmbeddingModel;
+        Arc::new(
+            EmbeddingClient::new(EmbeddingConfig {
+                model: EmbeddingModel::AllMiniLML6V2,
+                show_download_progress: false,
+                cache_dir: None,
+                pool_size: 1,
+            })
+            .expect("Failed to create test embedding client"),
+        )
+    }
+
+    fn make_service(tracker: Arc<dyn crate::storage::FixAttemptTracker>) -> IssueEmbeddingService {
+        let client = make_embedding_client();
+        IssueEmbeddingService::new(client, tracker, IssueEmbeddingConfig::default())
+    }
+
+    fn make_service_disabled(
+        tracker: Arc<dyn crate::storage::FixAttemptTracker>,
+    ) -> IssueEmbeddingService {
+        let client = make_embedding_client();
+        IssueEmbeddingService::new(
+            client,
+            tracker,
+            IssueEmbeddingConfig {
+                enabled: false,
+                ..IssueEmbeddingConfig::default()
+            },
+        )
+    }
+
+    fn make_service_with_config(
+        tracker: Arc<dyn crate::storage::FixAttemptTracker>,
+        config: IssueEmbeddingConfig,
+    ) -> IssueEmbeddingService {
+        let client = make_embedding_client();
+        IssueEmbeddingService::new(client, tracker, config)
+    }
+
+    #[test]
+    fn test_service_is_enabled_default() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker);
+        assert!(service.is_enabled());
+    }
+
+    #[test]
+    fn test_service_is_enabled_false() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service_disabled(tracker);
+        assert!(!service.is_enabled());
+    }
+
+    #[test]
+    fn test_service_with_defaults_constructor() {
+        let tracker = Arc::new(MockTracker::new());
+        let client = make_embedding_client();
+        let service = IssueEmbeddingService::with_defaults(client, tracker);
+        // with_defaults uses IssueEmbeddingConfig::default(), which has enabled=true
+        assert!(service.is_enabled());
+    }
+
+    #[test]
+    fn test_service_get_embedding_returns_none() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker);
+        let result = service.get_embedding("linear", "nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_service_get_embedding_returns_some() {
+        let emb = IssueEmbedding::new("linear", "123", vec![0.1, 0.2]);
+        let tracker = Arc::new(MockTracker::new().with_get_embedding(emb.clone()));
+        let service = make_service(tracker);
+        let result = service.get_embedding("linear", "123").unwrap();
+        assert!(result.is_some());
+        let returned = result.unwrap();
+        assert_eq!(returned.issue_id, "123");
+    }
+
+    #[test]
+    fn test_service_has_embedding_true() {
+        let emb = IssueEmbedding::new("linear", "123", vec![0.1]);
+        let tracker = Arc::new(MockTracker::new().with_get_embedding(emb));
+        let service = make_service(tracker);
+        assert!(service.has_embedding("linear", "123"));
+    }
+
+    #[test]
+    fn test_service_has_embedding_false() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker);
+        assert!(!service.has_embedding("linear", "nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn test_service_embed_batch_empty() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker);
+        let result = service.embed_batch(&[], "linear").await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_service_find_similar_disabled() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service_disabled(tracker);
+        let issue = make_issue("Test issue");
+        let result = service.find_similar(&issue, "linear").await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_disabled() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service_disabled(tracker);
+        let issue = make_issue("Test issue");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_service_find_similar_vectorlite_unavailable() {
+        // MockTracker default returns None for find_similar_issues_vector
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker);
+        let issue = make_issue("Test issue for similarity");
+        let result = service.find_similar(&issue, "linear").await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_service_find_similar_with_results_no_attempts() {
+        let emb1 = IssueEmbedding::new("linear", "old-1", vec![0.1, 0.2]);
+        let emb2 = IssueEmbedding::new("linear", "old-2", vec![0.3, 0.4]);
+        let similar = vec![(emb1, 0.85), (emb2, 0.75)];
+        // batch_attempts returns empty (no matching attempts)
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(similar)
+                .with_batch_attempts(vec![None, None]),
+        );
+        let service = make_service(tracker);
+        let issue = make_issue("New similar issue");
+        let result = service.find_similar(&issue, "linear").await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert!((result[0].similarity - 0.85).abs() < f64::EPSILON);
+        assert!(result[0].outcome.is_none());
+        assert!(result[0].pr_url.is_none());
+        assert!((result[1].similarity - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_service_find_similar_with_attempts() {
+        let emb = IssueEmbedding::new("linear", "old-1", vec![0.1]);
+        let similar = vec![(emb, 0.90)];
+        let attempt = FixAttempt {
+            id: 1,
+            issue_id: "old-1".to_string(),
+            short_id: "PROJ-1".to_string(),
+            source: "linear".to_string(),
+            attempted_at: Utc::now(),
+            pr_url: Some("https://github.com/org/repo/pull/10".to_string()),
+            scm_repo: None,
+            scm_pr_number: None,
+            status: FixAttemptStatus::Merged,
+            error_message: None,
+            merged_at: None,
+            resolved_at: None,
+            retry_count: 0,
+            last_retry_at: None,
+            issue_labels: vec![],
+            parent_attempt_id: None,
+            cascade_repo: None,
+        };
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(similar)
+                .with_batch_attempts(vec![Some(attempt)]),
+        );
+        let service = make_service(tracker);
+        let issue = make_issue("Issue with fix history");
+        let result = service.find_similar(&issue, "linear").await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].outcome.as_deref(), Some("merged"));
+        assert_eq!(
+            result[0].pr_url.as_deref(),
+            Some("https://github.com/org/repo/pull/10")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_embed_issue_stores_embedding() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker.clone());
+        let mut issue = make_issue("Embed this issue");
+        issue.description = Some("Description for embedding".to_string());
+        issue
+            .metadata
+            .insert("labels".to_string(), serde_json::json!(["bug", "critical"]));
+
+        let result = service.embed_issue(&issue, "linear").await.unwrap();
+        assert_eq!(result.issue_id, "123");
+        assert_eq!(result.short_id, Some("PROJ-123".to_string()));
+        assert_eq!(result.title, Some("Embed this issue".to_string()));
+        assert_eq!(
+            result.description,
+            Some("Description for embedding".to_string())
+        );
+        assert!(result.embedding.is_some());
+        assert!(result.embedding_model.is_some());
+        // The embedding should have been stored in the tracker
+        let stored = tracker.stored_embeddings.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].issue_id, "123");
+    }
+
+    #[tokio::test]
+    async fn test_service_embed_issue_without_labels() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker.clone());
+        let issue = make_issue("No labels issue");
+
+        let result = service.embed_issue(&issue, "sentry").await.unwrap();
+        assert!(result.labels.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_service_embed_issue_with_labels() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker.clone());
+        let mut issue = make_issue("Labeled issue embed");
+        issue
+            .metadata
+            .insert("labels".to_string(), serde_json::json!(["bug", "p1"]));
+
+        let result = service.embed_issue(&issue, "linear").await.unwrap();
+        assert!(result.labels.is_some());
+        let labels_str = result.labels.unwrap();
+        assert!(labels_str.contains("bug"));
+        assert!(labels_str.contains("p1"));
+    }
+
+    #[tokio::test]
+    async fn test_service_embed_batch_multiple_issues() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker.clone());
+
+        let mut issue1 = make_issue("First batch issue");
+        issue1.id = "batch-1".to_string();
+        let mut issue2 = make_issue("Second batch issue");
+        issue2.id = "batch-2".to_string();
+
+        let issues = vec![issue1, issue2];
+        let result = service.embed_batch(&issues, "linear").await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].issue_id, "batch-1");
+        assert_eq!(result[1].issue_id, "batch-2");
+        // Both should have been stored
+        let stored = tracker.stored_embeddings.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_no_similar() {
+        // find_similar returns empty when vectorlite unavailable (None)
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker);
+        let issue = make_issue("Unique issue");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_below_threshold() {
+        // Similar issue found but below skip_similarity_threshold (0.90 default)
+        let emb = IssueEmbedding::new("linear", "existing", vec![0.1]);
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(vec![(emb, 0.80)]) // below 0.90
+                .with_batch_attempts(vec![Some(FixAttempt {
+                    id: 1,
+                    issue_id: "existing".to_string(),
+                    short_id: "PROJ-1".to_string(),
+                    source: "linear".to_string(),
+                    attempted_at: Utc::now(),
+                    pr_url: None,
+                    scm_repo: None,
+                    scm_pr_number: None,
+                    status: FixAttemptStatus::Pending,
+                    error_message: None,
+                    merged_at: None,
+                    resolved_at: None,
+                    retry_count: 0,
+                    last_retry_at: None,
+                    issue_labels: vec![],
+                    parent_attempt_id: None,
+                    cascade_repo: None,
+                })]),
+        );
+        let service = make_service(tracker);
+        let issue = make_issue("Similar but not duplicate");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_above_threshold_active() {
+        // Similar issue above threshold with active outcome (pending)
+        let emb = IssueEmbedding::new("linear", "dup-issue", vec![0.1]);
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(vec![(emb, 0.95)]) // above 0.90
+                .with_batch_attempts(vec![Some(FixAttempt {
+                    id: 2,
+                    issue_id: "dup-issue".to_string(),
+                    short_id: "PROJ-2".to_string(),
+                    source: "linear".to_string(),
+                    attempted_at: Utc::now(),
+                    pr_url: None,
+                    scm_repo: None,
+                    scm_pr_number: None,
+                    status: FixAttemptStatus::Pending,
+                    error_message: None,
+                    merged_at: None,
+                    resolved_at: None,
+                    retry_count: 0,
+                    last_retry_at: None,
+                    issue_labels: vec![],
+                    parent_attempt_id: None,
+                    cascade_repo: None,
+                })]),
+        );
+        let service = make_service(tracker);
+        let issue = make_issue("Duplicate of active issue");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        assert!(result.is_some());
+        let dup = result.unwrap();
+        assert_eq!(dup.embedding.issue_id, "dup-issue");
+        assert!(dup.similarity >= 0.90);
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_above_threshold_success() {
+        // Similar issue above threshold with "success" outcome
+        let emb = IssueEmbedding::new("linear", "success-issue", vec![0.1]);
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(vec![(emb, 0.95)])
+                .with_batch_attempts(vec![Some(FixAttempt {
+                    id: 3,
+                    issue_id: "success-issue".to_string(),
+                    short_id: "PROJ-3".to_string(),
+                    source: "linear".to_string(),
+                    attempted_at: Utc::now(),
+                    pr_url: Some("https://github.com/pull/5".to_string()),
+                    scm_repo: None,
+                    scm_pr_number: None,
+                    status: FixAttemptStatus::Success,
+                    error_message: None,
+                    merged_at: None,
+                    resolved_at: None,
+                    retry_count: 0,
+                    last_retry_at: None,
+                    issue_labels: vec![],
+                    parent_attempt_id: None,
+                    cascade_repo: None,
+                })]),
+        );
+        let service = make_service(tracker);
+        let issue = make_issue("Duplicate of success issue");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_above_threshold_merged() {
+        // Similar issue above threshold with "merged" outcome
+        let emb = IssueEmbedding::new("linear", "merged-issue", vec![0.1]);
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(vec![(emb, 0.92)])
+                .with_batch_attempts(vec![Some(FixAttempt {
+                    id: 4,
+                    issue_id: "merged-issue".to_string(),
+                    short_id: "PROJ-4".to_string(),
+                    source: "linear".to_string(),
+                    attempted_at: Utc::now(),
+                    pr_url: Some("https://github.com/pull/8".to_string()),
+                    scm_repo: None,
+                    scm_pr_number: None,
+                    status: FixAttemptStatus::Merged,
+                    error_message: None,
+                    merged_at: Some(Utc::now()),
+                    resolved_at: None,
+                    retry_count: 0,
+                    last_retry_at: None,
+                    issue_labels: vec![],
+                    parent_attempt_id: None,
+                    cascade_repo: None,
+                })]),
+        );
+        let service = make_service(tracker);
+        let issue = make_issue("Duplicate of merged issue");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_above_threshold_failed_not_dup() {
+        // Similar issue above threshold but outcome is "failed" -- should NOT be a duplicate
+        let emb = IssueEmbedding::new("linear", "failed-issue", vec![0.1]);
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(vec![(emb, 0.95)])
+                .with_batch_attempts(vec![Some(FixAttempt {
+                    id: 5,
+                    issue_id: "failed-issue".to_string(),
+                    short_id: "PROJ-5".to_string(),
+                    source: "linear".to_string(),
+                    attempted_at: Utc::now(),
+                    pr_url: None,
+                    scm_repo: None,
+                    scm_pr_number: None,
+                    status: FixAttemptStatus::Failed,
+                    error_message: Some("build error".to_string()),
+                    merged_at: None,
+                    resolved_at: None,
+                    retry_count: 0,
+                    last_retry_at: None,
+                    issue_labels: vec![],
+                    parent_attempt_id: None,
+                    cascade_repo: None,
+                })]),
+        );
+        let service = make_service(tracker);
+        let issue = make_issue("Similar to failed issue");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        // Failed outcome should NOT be considered a duplicate
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_above_threshold_no_outcome() {
+        // Similar issue above threshold but no attempt record (outcome is None)
+        let emb = IssueEmbedding::new("linear", "no-attempt", vec![0.1]);
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(vec![(emb, 0.95)])
+                .with_batch_attempts(vec![None]),
+        );
+        let service = make_service(tracker);
+        let issue = make_issue("Similar to untracked issue");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        // No outcome means not actively handled, should NOT be a duplicate
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_above_threshold_closed_not_dup() {
+        // Similar issue above threshold but outcome is "closed" -- should NOT be a duplicate
+        let emb = IssueEmbedding::new("linear", "closed-issue", vec![0.1]);
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(vec![(emb, 0.95)])
+                .with_batch_attempts(vec![Some(FixAttempt {
+                    id: 6,
+                    issue_id: "closed-issue".to_string(),
+                    short_id: "PROJ-6".to_string(),
+                    source: "linear".to_string(),
+                    attempted_at: Utc::now(),
+                    pr_url: None,
+                    scm_repo: None,
+                    scm_pr_number: None,
+                    status: FixAttemptStatus::Closed,
+                    error_message: None,
+                    merged_at: None,
+                    resolved_at: None,
+                    retry_count: 0,
+                    last_retry_at: None,
+                    issue_labels: vec![],
+                    parent_attempt_id: None,
+                    cascade_repo: None,
+                })]),
+        );
+        let service = make_service(tracker);
+        let issue = make_issue("Similar to closed issue");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_service_check_duplicate_custom_threshold() {
+        // Use a lower skip_similarity_threshold (0.80) and check that 0.85 triggers duplicate
+        let emb = IssueEmbedding::new("linear", "custom-thresh", vec![0.1]);
+        let tracker = Arc::new(
+            MockTracker::new()
+                .with_similar_results(vec![(emb, 0.85)])
+                .with_batch_attempts(vec![Some(FixAttempt {
+                    id: 7,
+                    issue_id: "custom-thresh".to_string(),
+                    short_id: "PROJ-7".to_string(),
+                    source: "linear".to_string(),
+                    attempted_at: Utc::now(),
+                    pr_url: None,
+                    scm_repo: None,
+                    scm_pr_number: None,
+                    status: FixAttemptStatus::Pending,
+                    error_message: None,
+                    merged_at: None,
+                    resolved_at: None,
+                    retry_count: 0,
+                    last_retry_at: None,
+                    issue_labels: vec![],
+                    parent_attempt_id: None,
+                    cascade_repo: None,
+                })]),
+        );
+        let service = make_service_with_config(
+            tracker,
+            IssueEmbeddingConfig {
+                enabled: true,
+                min_similarity: 0.5,
+                max_similar_issues: 5,
+                skip_similarity_threshold: 0.80,
+            },
+        );
+        let issue = make_issue("Custom threshold test");
+        let result = service.check_duplicate(&issue, "linear").await.unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_service_embed_batch_with_labels() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker.clone());
+
+        let mut issue = make_issue("Batch with labels");
+        issue.id = "batch-label-1".to_string();
+        issue.metadata.insert(
+            "labels".to_string(),
+            serde_json::json!(["enhancement", "backend"]),
+        );
+
+        let result = service.embed_batch(&[issue], "linear").await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].labels.is_some());
+        let labels_str = result[0].labels.as_ref().unwrap();
+        assert!(labels_str.contains("enhancement"));
+    }
+
+    #[tokio::test]
+    async fn test_service_embed_batch_without_labels() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker.clone());
+
+        let mut issue = make_issue("Batch no labels");
+        issue.id = "batch-nolabel-1".to_string();
+
+        let result = service.embed_batch(&[issue], "linear").await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].labels.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_service_embed_issue_populates_all_fields() {
+        let tracker = Arc::new(MockTracker::new());
+        let service = make_service(tracker.clone());
+        let mut issue = make_issue("Full field test");
+        issue.description = Some("Full description".to_string());
+        issue.url = "https://linear.app/issue/123".to_string();
+        issue.priority = IssuePriority::Critical;
+        issue.status = IssueStatus::InProgress;
+        issue.updated_at = Some(Utc::now());
+
+        let result = service.embed_issue(&issue, "linear").await.unwrap();
+        assert_eq!(result.url, Some("https://linear.app/issue/123".to_string()));
+        assert_eq!(result.priority, Some("critical".to_string()));
+        assert_eq!(result.status, Some("in_progress".to_string()));
+        assert!(result.updated_at.is_some());
+        assert!(result.created_at <= Utc::now());
+    }
 }

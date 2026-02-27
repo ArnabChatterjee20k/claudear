@@ -645,7 +645,7 @@ mod tests {
     use super::*;
     use crate::http::HttpClient;
     use crate::http::HttpResponse;
-    use crate::storage::{FixAttemptTracker, SqliteTracker};
+    use crate::storage::{AttemptTracker, SqliteTracker};
     use crate::types::IssueType;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5327,6 +5327,376 @@ mod tests {
                 "org/target",
                 DependencyType::Composer,
             )
+            .await
+            .unwrap();
+        assert!(result);
+
+        let updated = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+        assert_eq!(updated.status, RegressionWatchStatus::Monitoring);
+    }
+
+    // Covers: verify_release_after with source release that has published_at -> ok_or_else success path
+    #[tokio::test]
+    async fn test_verify_release_after_source_release_published_at_present() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Source release with published_at present
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"[{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-12T10:00:00Z",
+                    "published_at": "2024-01-12T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+        )]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-pa", 1);
+
+        // Target release published BEFORE source release -> should return false
+        let target_release = crate::release::github::GitHubRelease {
+            id: 10,
+            tag_name: "v0.5.0".to_string(),
+            name: Some("v0.5.0".to_string()),
+            draft: false,
+            prerelease: false,
+            created_at: "2024-01-01T10:00:00Z".to_string(),
+            published_at: Some("2024-01-01T10:30:00Z".to_string()),
+            target_commitish: "main".to_string(),
+            body: None,
+            html_url: "url".to_string(),
+        };
+
+        let result = release_tracker
+            .verify_release_after(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                &target_release,
+            )
+            .await
+            .unwrap();
+        // Target (Jan 1) < Source release (Jan 12) -> false
+        assert!(!result);
+    }
+
+    // Covers: Composer with multiple package names, first doesn't match, second matches
+    #[tokio::test]
+    async fn test_check_graph_release_composer_multiple_packages_second_matches() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-mp", "SENTRY-MP")
+            .unwrap();
+        let attempt = tracker.get_attempt("sentry", "issue-mp").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-mp", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        // composer.lock has "real-pkg" at correct version but not "wrong-pkg"
+        let lock_content =
+            r#"{"packages":[{"name":"real-pkg","version":"v1.0.0"}],"packages-dev":[]}"#;
+
+        let mock = MockHttpClient::new(vec![
+            // get_latest_release for target
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v5.0.0", "name": "v5.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            // First package name "wrong-pkg": get_first_release_after for source
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            // First package name: get_file_at_ref for composer.lock
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        lock_content
+                    )
+                ),
+            ),
+            // Second package name "real-pkg": get_first_release_after for source
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            // Second package name: get_file_at_ref for composer.lock
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        lock_content
+                    )
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let config = ReleaseTrackerConfig {
+            package_names: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "org/source".to_string(),
+                    vec!["wrong-pkg".to_string(), "real-pkg".to_string()],
+                );
+                m
+            },
+            ..Default::default()
+        };
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker.clone(), config);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("sha".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Composer,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers: Npm with multiple package names, first doesn't match, second matches
+    #[tokio::test]
+    async fn test_check_graph_release_npm_multiple_packages_second_matches() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-nmp", "SENTRY-NMP")
+            .unwrap();
+        let attempt = tracker.get_attempt("sentry", "issue-nmp").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-nmp", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let lock_content = r#"{"packages":{"node_modules/@scope/real-pkg":{"version":"2.0.0"}}}"#;
+
+        let mock = MockHttpClient::new(vec![
+            // get_latest_release for target
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v3.0.0", "name": "v3.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-02-01T10:00:00Z",
+                    "published_at": "2024-02-01T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            // First package "wrong-pkg": get_first_release_after
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v2.0.0", "name": "v2.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            // First package: get_file_at_ref
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        lock_content
+                    )
+                ),
+            ),
+            // Second package "@scope/real-pkg": get_first_release_after
+            (
+                200,
+                r#"[{
+                    "id": 2, "tag_name": "v2.0.0", "name": "v2.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+            ),
+            // Second package: get_file_at_ref
+            (
+                200,
+                &format!(
+                    r#"{{"content": "{}", "encoding": "base64"}}"#,
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        lock_content
+                    )
+                ),
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let config = ReleaseTrackerConfig {
+            package_names: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "org/source".to_string(),
+                    vec!["wrong-pkg".to_string(), "@scope/real-pkg".to_string()],
+                );
+                m
+            },
+            ..Default::default()
+        };
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker.clone(), config);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("sha".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_graph_release(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                &pr_details,
+                "org/target",
+                DependencyType::Npm,
+            )
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    // Covers: verify_release_after where source release published_at is missing (error path line 569)
+    #[tokio::test]
+    async fn test_verify_release_after_source_release_no_published_at() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Source release exists but has no published_at
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"[{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-12T10:00:00Z",
+                    "published_at": null, "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }]"#,
+        )]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let release_tracker =
+            ReleaseTracker::with_http_client(client, tracker, ReleaseTrackerConfig::default());
+
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-npa", 1);
+
+        let target_release = crate::release::github::GitHubRelease {
+            id: 10,
+            tag_name: "v2.0.0".to_string(),
+            name: Some("v2.0.0".to_string()),
+            draft: false,
+            prerelease: false,
+            created_at: "2024-02-01T10:00:00Z".to_string(),
+            published_at: Some("2024-02-01T10:30:00Z".to_string()),
+            target_commitish: "main".to_string(),
+            body: None,
+            html_url: "url".to_string(),
+        };
+
+        // Source release has null published_at -> get_first_release_after will filter it out
+        // This means no release found -> falls back to merge time path
+        let result = release_tracker
+            .verify_release_after(
+                &watch,
+                "org/source",
+                "2024-01-10T10:00:00Z",
+                "org/target",
+                &target_release,
+            )
+            .await
+            .unwrap();
+        // target (Feb 1) > merge_time (Jan 10) -> true
+        assert!(result);
+    }
+
+    // Covers: check_direct_release_any_target with multiple targets, first not found, second found
+    #[tokio::test]
+    async fn test_check_direct_release_any_target_multiple_targets_second_succeeds() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        tracker
+            .record_attempt("sentry", "issue-mt2", "SENTRY-MT2")
+            .unwrap();
+        let attempt = tracker.get_attempt("sentry", "issue-mt2").unwrap().unwrap();
+        let watch = RegressionWatch::new(IssueType::SentryIssue, "issue-mt2", attempt.id);
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        let watch = tracker.get_regression_watch(watch_id).unwrap().unwrap();
+
+        let mock = MockHttpClient::new(vec![
+            // get_latest_release for first target: not found
+            (404, r#"{"message": "Not Found"}"#),
+            // get_latest_release for second target: found
+            (
+                200,
+                r#"{
+                    "id": 1, "tag_name": "v1.0.0", "name": "v1.0.0", "draft": false,
+                    "prerelease": false, "created_at": "2024-01-15T10:00:00Z",
+                    "published_at": "2024-01-15T10:30:00Z", "target_commitish": "main",
+                    "body": "", "html_url": "url"
+                }"#,
+            ),
+            // is_commit_in_release for second target
+            (
+                200,
+                r#"{"status": "behind", "ahead_by": 0, "behind_by": 3}"#,
+            ),
+        ]);
+
+        let client = ReleaseClient::with_http_client("test-token", mock);
+        let config = ReleaseTrackerConfig {
+            target_repos: vec!["org/target-1".to_string(), "org/target-2".to_string()],
+            ..Default::default()
+        };
+        let release_tracker = ReleaseTracker::with_http_client(client, tracker.clone(), config);
+
+        let pr_details = crate::release::PrDetails {
+            number: 1,
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2024-01-10T10:00:00Z".to_string()),
+        };
+
+        let result = release_tracker
+            .check_direct_release_any_target(&watch, "org/source", &pr_details)
             .await
             .unwrap();
         assert!(result);

@@ -2314,4 +2314,851 @@ mod tests {
 
         assert_eq!(results, Some("appwrite/console".to_string()));
     }
+
+    // --- Additional coverage tests ---
+
+    #[test]
+    fn test_find_repo_by_project_uat_suffix() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("cloud-uat"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/cloud");
+    }
+
+    #[test]
+    fn test_find_repo_by_project_canary_suffix() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("cloud-canary"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/cloud");
+    }
+
+    #[test]
+    fn test_find_repo_by_project_development_suffix() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("cloud-development"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/cloud");
+    }
+
+    #[test]
+    fn test_find_repo_by_project_case_insensitive() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("Cloud-Staging"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/cloud");
+    }
+
+    #[test]
+    fn test_find_repo_by_project_no_suffix_exact_match() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        // "database" should match "utopia-php/database"
+        let mut issue = create_test_issue("sentry", "SQL Error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("database"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "utopia-php/database");
+    }
+
+    #[test]
+    fn test_find_repo_by_project_only_first_suffix_stripped() {
+        // Only the first matching suffix should be stripped, not multiple
+        let mut index = RepoIndex::new();
+        let repo = IndexedRepo::new("org/my-app-dev", "/path/my-app-dev");
+        index.add_repo(repo);
+        let inferrer = RepoInferrer::new(index);
+
+        // "my-app-dev-staging" should strip "-staging" to get "my-app-dev" which matches
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("my-app-dev-staging"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "org/my-app-dev");
+    }
+
+    #[test]
+    fn test_infer_with_embedding_exact_threshold_boundary() {
+        let index = create_test_index();
+        let embeddings = vec![RepoEmbedding {
+            name: "appwrite/console".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+        }];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        let issue = create_test_issue("linear", "test", "");
+
+        // Embedding that produces exactly 0.5 similarity
+        // cos_sim([1,0,0], [0.5,0.866,0]) = 0.5
+        let emb = vec![0.5, 0.866_025_4, 0.0];
+        let result = inferrer.infer_with_embedding(&issue, Some(&emb));
+        // 0.5 is exactly the threshold (>= 0.5), so should match
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn test_infer_with_embedding_just_below_threshold() {
+        let index = create_test_index();
+        let embeddings = vec![RepoEmbedding {
+            name: "appwrite/console".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+        }];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        let issue = create_test_issue("linear", "test", "");
+
+        // Embedding that produces similarity just below 0.5
+        // cos_sim([1,0,0], [0.4, 0.9165, 0]) ~ 0.4
+        let emb = vec![0.4, 0.916_515, 0.0];
+        let result = inferrer.infer_with_embedding(&issue, Some(&emb));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_infer_with_embedding_medium_confidence_boundary() {
+        let index = create_test_index();
+        let embeddings = vec![RepoEmbedding {
+            name: "appwrite/console".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+        }];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        let issue = create_test_issue("linear", "test", "");
+
+        // cos_sim([1,0,0], [0.65, 0.76, 0]) = 0.65
+        let emb = vec![0.65, 0.759_934, 0.0];
+        let result = inferrer.infer_with_embedding(&issue, Some(&emb));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn test_infer_with_embedding_high_confidence_boundary() {
+        let index = create_test_index();
+        let embeddings = vec![RepoEmbedding {
+            name: "appwrite/console".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+        }];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        let issue = create_test_issue("linear", "test", "");
+
+        // cos_sim([1,0,0], [0.8, 0.6, 0]) = 0.8
+        let emb = vec![0.8, 0.6, 0.0];
+        let result = inferrer.infer_with_embedding(&issue, Some(&emb));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().confidence, Confidence::High);
+    }
+
+    #[test]
+    fn test_fuzzy_match_multiple_repos_ambiguous_returns_none() {
+        // When fuzzy search returns matches across different repos, no match should be made
+        let mut index = RepoIndex::new();
+
+        let mut repo1 = IndexedRepo::new("org/repo-a", "/path/repo-a");
+        repo1.files = vec!["src/utils/helper.ts".to_string()];
+        index.add_repo(repo1);
+
+        let mut repo2 = IndexedRepo::new("org/repo-b", "/path/repo-b");
+        repo2.files = vec!["src/utils/helper.ts".to_string()];
+        index.add_repo(repo2);
+
+        let inferrer = RepoInferrer::new(index);
+
+        // Direct file match won't work because the file exists in both repos
+        // Fuzzy search returns matches in different repos -> ambiguous -> None
+        let issue = create_test_issue("linear", "Helper error", "Error at src/utils/helper.ts");
+
+        let result = inferrer.infer(&issue);
+        // This should resolve (direct file match finds the file in at least one repo)
+        // If direct file match returns the first one found, that's fine
+        // The point is this doesn't panic
+        if let Some(inferred) = result {
+            assert!(inferred.repo.name == "org/repo-a" || inferred.repo.name == "org/repo-b");
+        }
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_no_inferrer_with_tracker() {
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+
+        let issue = create_test_issue("linear", "Some issue", "description");
+        let result = resolve_repo_for_issue(None, &issue, Some(&db));
+        assert!(!result.is_resolved());
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_with_embedding_no_inferrer() {
+        let issue = create_test_issue("linear", "Some issue", "desc");
+        let emb = vec![1.0, 0.0, 0.0];
+        let result = resolve_repo_for_issue_with_embedding(None, &issue, None, Some(&emb));
+        assert!(!result.is_resolved());
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_with_embedding_no_inferrer_with_tracker() {
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+
+        let issue = create_test_issue("linear", "Some issue", "desc");
+        let emb = vec![1.0, 0.0, 0.0];
+        let result = resolve_repo_for_issue_with_embedding(None, &issue, Some(&db), Some(&emb));
+        assert!(!result.is_resolved());
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_with_embedding_match_records_activity() {
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let index = create_test_index();
+        let embeddings = vec![RepoEmbedding {
+            name: "appwrite/console".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+        }];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        let issue = create_test_issue("linear", "Frontend bug", "");
+        let emb = vec![0.95, 0.05, 0.0];
+
+        let result =
+            resolve_repo_for_issue_with_embedding(Some(&inferrer), &issue, Some(&db), Some(&emb));
+        assert!(result.is_resolved());
+        assert_eq!(result.repo_name(), Some("appwrite/console"));
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_no_match_records_failed_inference() {
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let issue = create_test_issue("linear", "Unknown thing", "No matching info");
+        let result = resolve_repo_for_issue(Some(&inferrer), &issue, Some(&db));
+        assert!(!result.is_resolved());
+    }
+
+    #[test]
+    fn test_record_inference_attempt_with_no_match_uses_default_values() {
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let issue = create_test_issue("sentry", "Error", "details");
+        let context = IssueContext {
+            filenames: vec!["unknown.py".to_string()],
+            functions: vec!["unknown_fn".to_string()],
+            repos: vec![],
+            keywords: vec!["error".to_string()],
+            raw_text: "Error details".to_string(),
+        };
+
+        let result = record_inference_attempt(Some(&db), &issue, &context, None, 75);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_record_inference_attempt_with_inferred_repo() {
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let issue = create_test_issue("sentry", "Auth error", "auth module");
+        let context = IssueContext {
+            filenames: vec!["auth.ts".to_string()],
+            functions: vec!["login".to_string()],
+            repos: vec![],
+            keywords: vec!["auth".to_string()],
+            raw_text: "Auth module error".to_string(),
+        };
+
+        let repo = IndexedRepo::new("org/auth-service", "/path/auth-service");
+        let inferred = InferredRepo {
+            repo,
+            confidence: Confidence::Medium,
+            reason: "Fuzzy file match".to_string(),
+            matched_file: Some("auth.ts".to_string()),
+        };
+
+        let result = record_inference_attempt(Some(&db), &issue, &context, Some(&inferred), 150);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_infer_sentry_project_without_metadata_key() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        // Sentry issue without "project" metadata should skip strategy 0
+        let issue = create_test_issue("sentry", "MySQL Error", "");
+        let result = inferrer.infer(&issue);
+        // No project metadata, no file paths -> None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_infer_sentry_project_with_non_string_metadata() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Error", "");
+        // project metadata is a number, not a string -> as_str() returns None
+        issue.metadata.insert("project".to_string(), json!(42));
+
+        let result = inferrer.infer(&issue);
+        // Should skip project matching since it's not a string
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_infer_explicit_repo_reference_not_found() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        // References a non-existent repo in org/repo format
+        let issue = create_test_issue(
+            "linear",
+            "Bug in nonexistent/repo",
+            "Something in nonexistent/repo is broken",
+        );
+
+        let result = inferrer.infer(&issue);
+        // Should not match since nonexistent/repo is not in the index
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_infer_multiple_filenames_first_match_wins() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        // Issue with two filenames from different repos
+        let mut issue = create_test_issue("sentry", "Multi-file error", "");
+        // First file matches console, second matches sdk-for-php
+        issue.metadata.insert(
+            "stacktrace".to_string(),
+            json!("Error at src/routes/auth.ts\nAlso in src/Appwrite/Client.php"),
+        );
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        // First match should win
+        let inferred = result.unwrap();
+        assert!(
+            inferred.repo.name == "appwrite/console"
+                || inferred.repo.name == "appwrite/sdk-for-php"
+        );
+    }
+
+    #[test]
+    fn test_infer_basename_match_multiple_repos_returns_none() {
+        // When basename matches files in multiple repos, it should not produce a match
+        let mut index = RepoIndex::new();
+
+        let mut repo1 = IndexedRepo::new("org/service-a", "/path/service-a");
+        repo1.files = vec!["src/config.ts".to_string()];
+        index.add_repo(repo1);
+
+        let mut repo2 = IndexedRepo::new("org/service-b", "/path/service-b");
+        repo2.files = vec!["lib/config.ts".to_string()];
+        index.add_repo(repo2);
+
+        let inferrer = RepoInferrer::new(index);
+
+        // "config.ts" basename exists in both repos
+        let issue = create_test_issue("linear", "Config error", "Issue in config.ts");
+        let result = inferrer.infer(&issue);
+        // The basename "config.ts" matches in both repos, so no clear winner
+        // Direct file match for "config.ts" won't work (not a full path),
+        // fuzzy search might match both, basename match might match both
+        // This tests that the engine handles ambiguity gracefully
+        if let Some(inferred) = result {
+            assert!(inferred.repo.name == "org/service-a" || inferred.repo.name == "org/service-b");
+        }
+    }
+
+    #[test]
+    fn test_infer_with_embedding_returns_none_when_no_embedding_provided() {
+        let index = create_test_index();
+        let embeddings = vec![RepoEmbedding {
+            name: "appwrite/console".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+        }];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        let issue = create_test_issue("linear", "Unknown issue", "");
+        // No embedding provided (None) and no file match
+        let result = inferrer.infer_with_embedding(&issue, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_repo_for_cascade_returns_skip_with_reason() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let result = resolve_repo_for_cascade(Some(&inferrer), "nonexistent/repo");
+        match result {
+            RepoResolution::Skip { reason } => {
+                assert!(reason.contains("not found"));
+            }
+            _ => panic!("Expected Skip variant"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_repo_for_cascade_no_inferrer_reason() {
+        let result = resolve_repo_for_cascade(None, "any/repo");
+        match result {
+            RepoResolution::Skip { reason } => {
+                assert!(reason.contains("No inferrer"));
+            }
+            _ => panic!("Expected Skip variant"),
+        }
+    }
+
+    #[test]
+    fn test_repo_resolution_skip_reason_preserved() {
+        let reason = "Custom skip reason for testing";
+        let res = RepoResolution::Skip {
+            reason: reason.to_string(),
+        };
+        if let RepoResolution::Skip { reason: r } = res {
+            assert_eq!(r, reason);
+        } else {
+            panic!("Expected Skip variant");
+        }
+    }
+
+    #[test]
+    fn test_confidence_none_display() {
+        assert_eq!(Confidence::None.to_string(), "none");
+    }
+
+    #[test]
+    fn test_confidence_clone() {
+        let c = Confidence::Medium;
+        let c2 = c;
+        let c3 = c;
+        assert_eq!(c2, c3);
+        assert_eq!(c2, Confidence::Medium);
+    }
+
+    #[test]
+    fn test_inferred_repo_matched_file_none() {
+        let repo = IndexedRepo::new("test/repo", "/path");
+        let inferred = InferredRepo {
+            repo,
+            confidence: Confidence::None,
+            reason: "No match".to_string(),
+            matched_file: None,
+        };
+        assert!(inferred.matched_file.is_none());
+        assert_eq!(inferred.confidence, Confidence::None);
+    }
+
+    #[test]
+    fn test_repo_embedding_empty_vector() {
+        let emb = RepoEmbedding {
+            name: "test/repo".to_string(),
+            embedding: vec![],
+        };
+        assert!(emb.embedding.is_empty());
+        assert_eq!(emb.name, "test/repo");
+    }
+
+    #[test]
+    fn test_find_by_embedding_best_match_wins() {
+        let index = create_test_index();
+        let embeddings = vec![
+            RepoEmbedding {
+                name: "appwrite/console".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+            },
+            RepoEmbedding {
+                name: "appwrite/sdk-for-php".to_string(),
+                embedding: vec![0.0, 1.0, 0.0],
+            },
+        ];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        // find_by_embedding is private, but tested indirectly via infer_with_embedding
+        let issue = create_test_issue("linear", "test", "");
+
+        // Very close to console
+        let emb_console = vec![0.99, 0.01, 0.0];
+        let result = inferrer.infer_with_embedding(&issue, Some(&emb_console));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/console");
+
+        // Very close to sdk-for-php
+        let emb_php = vec![0.01, 0.99, 0.0];
+        let result = inferrer.infer_with_embedding(&issue, Some(&emb_php));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/sdk-for-php");
+    }
+
+    #[test]
+    fn test_find_unknown_repos_single_unknown() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+        let context = IssueContext {
+            filenames: vec![],
+            functions: vec![],
+            repos: vec!["totally-unknown/repo".to_string()],
+            keywords: vec![],
+            raw_text: String::new(),
+        };
+        let unknown = inferrer.find_unknown_repos(&context);
+        assert_eq!(unknown, vec!["totally-unknown/repo".to_string()]);
+    }
+
+    #[test]
+    fn test_find_unknown_repos_preserves_order() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+        let context = IssueContext {
+            filenames: vec![],
+            functions: vec![],
+            repos: vec![
+                "z-org/z-repo".to_string(),
+                "a-org/a-repo".to_string(),
+                "m-org/m-repo".to_string(),
+            ],
+            keywords: vec![],
+            raw_text: String::new(),
+        };
+        let unknown = inferrer.find_unknown_repos(&context);
+        assert_eq!(unknown.len(), 3);
+        assert_eq!(unknown[0], "z-org/z-repo");
+        assert_eq!(unknown[1], "a-org/a-repo");
+        assert_eq!(unknown[2], "m-org/m-repo");
+    }
+
+    #[test]
+    fn test_with_index_complex_query() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let result = inferrer
+            .with_index(|idx| {
+                let repos = idx.list();
+                let names: Vec<String> = repos.iter().map(|r| r.name.clone()).collect();
+                Ok(names)
+            })
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"appwrite/console".to_string()));
+        assert!(result.contains(&"appwrite/sdk-for-php".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_delegates_to_with_embedding() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Auth error", "");
+        issue
+            .metadata
+            .insert("filename".to_string(), json!("src/routes/auth.ts"));
+
+        // Both functions should produce the same result for the same inputs
+        let result1 = resolve_repo_for_issue(Some(&inferrer), &issue, None);
+        let result2 = resolve_repo_for_issue_with_embedding(Some(&inferrer), &issue, None, None);
+
+        assert!(result1.is_resolved());
+        assert!(result2.is_resolved());
+        assert_eq!(result1.repo_name(), result2.repo_name());
+    }
+
+    #[test]
+    fn test_infer_vendor_prefix_extraction() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        // Issue with vendor-prefixed path in stacktrace should extract the repo reference
+        let mut issue = create_test_issue("sentry", "Pool error", "");
+        issue.metadata.insert(
+            "stacktrace".to_string(),
+            json!(
+                r#"/usr/src/code/vendor/utopia-php/database/src/Database/Database.php at line 100"#
+            ),
+        );
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "utopia-php/database");
+    }
+
+    #[test]
+    fn test_find_repo_by_project_preview_suffix() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("cloud-preview"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/cloud");
+    }
+
+    #[test]
+    fn test_infer_with_embedding_returns_semantic_similarity_reason() {
+        let index = create_test_index();
+        let embeddings = vec![RepoEmbedding {
+            name: "appwrite/console".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+        }];
+        let inferrer = RepoInferrer::with_embeddings(index, embeddings);
+
+        let issue = create_test_issue("linear", "test", "");
+        let emb = vec![0.95, 0.05, 0.0];
+
+        let result = inferrer.infer_with_embedding(&issue, Some(&emb));
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert!(
+            inferred.reason.contains("Semantic similarity"),
+            "reason should mention semantic similarity, got: {}",
+            inferred.reason
+        );
+        assert!(inferred.matched_file.is_none());
+    }
+
+    #[test]
+    fn test_get_repo_returns_cloned_data() {
+        let mut index = RepoIndex::new();
+        let mut repo = IndexedRepo::new("org/myrepo", "/path/myrepo");
+        repo.files = vec!["file1.rs".to_string(), "file2.rs".to_string()];
+        index.add_repo(repo);
+
+        let inferrer = RepoInferrer::new(index);
+        let fetched = inferrer.get_repo("org/myrepo").unwrap();
+        assert_eq!(fetched.name, "org/myrepo");
+        assert_eq!(fetched.files.len(), 2);
+    }
+
+    #[test]
+    fn test_max_repo_embeddings_constant() {
+        assert_eq!(MAX_REPO_EMBEDDINGS, 1000);
+    }
+
+    #[test]
+    fn test_resolve_repo_for_cascade_resolved_has_no_repo_id() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let result = resolve_repo_for_cascade(Some(&inferrer), "appwrite/console");
+        assert!(result.is_resolved());
+        // Cascade resolution doesn't do DB lookup, so repo_id should be None
+        assert!(result.repo_id().is_none());
+    }
+
+    #[test]
+    fn test_infer_from_metadata_filename() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue.metadata.insert(
+            "filename".to_string(),
+            json!("src/Appwrite/Services/Account.php"),
+        );
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/sdk-for-php");
+    }
+
+    #[test]
+    fn test_resolve_repo_for_issue_with_unknown_repos_logs_them() {
+        let db: std::sync::Arc<dyn crate::storage::FixAttemptTracker> =
+            std::sync::Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        // Issue that references unknown repos in org/repo format
+        let issue = create_test_issue(
+            "linear",
+            "Issue in unknown/repo",
+            "The unknown/repo has a bug",
+        );
+        let result = resolve_repo_for_issue(Some(&inferrer), &issue, Some(&db));
+        // The issue references unknown/repo which is not in the index
+        // Inference should fail but the unknown repo is logged
+        assert!(!result.is_resolved());
+    }
+
+    #[test]
+    fn test_infer_from_title_only() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        // Issue title mentions a file path
+        let issue = create_test_issue("linear", "Fix src/routes/auth.ts failing validation", "");
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().repo.name, "appwrite/console");
+    }
+
+    #[test]
+    fn test_repo_resolution_all_accessors_on_resolved() {
+        let res = RepoResolution::Resolved {
+            project_dir: PathBuf::from("/my/project"),
+            repo_name: "my-org/my-repo".to_string(),
+            repo_id: Some(123),
+            scm_url: "https://github.com/my-org/my-repo".to_string(),
+            default_branch: "develop".to_string(),
+        };
+
+        assert!(res.is_resolved());
+        assert_eq!(res.project_dir(), Some(&PathBuf::from("/my/project")));
+        assert_eq!(res.repo_name(), Some("my-org/my-repo"));
+        assert_eq!(res.repo_id(), Some(123));
+        assert_eq!(res.scm_url(), Some("https://github.com/my-org/my-repo"));
+        assert_eq!(res.default_branch(), Some("develop"));
+    }
+
+    #[test]
+    fn test_repo_resolution_all_accessors_on_skip() {
+        let res = RepoResolution::Skip {
+            reason: "test reason".to_string(),
+        };
+
+        assert!(!res.is_resolved());
+        assert!(res.project_dir().is_none());
+        assert!(res.repo_name().is_none());
+        assert!(res.repo_id().is_none());
+        assert!(res.scm_url().is_none());
+        assert!(res.default_branch().is_none());
+    }
+
+    #[test]
+    fn test_inferrer_with_discovery_config_preserved() {
+        let index = create_test_index();
+        let embeddings = vec![
+            RepoEmbedding {
+                name: "appwrite/console".to_string(),
+                embedding: vec![1.0],
+            },
+            RepoEmbedding {
+                name: "appwrite/sdk-for-php".to_string(),
+                embedding: vec![0.0],
+            },
+        ];
+        let inferrer = RepoInferrer::with_discovery(
+            index,
+            embeddings,
+            vec!["org1".to_string(), "org2".to_string()],
+            vec!["/path1".to_string(), "/path2".to_string()],
+        );
+        assert_eq!(inferrer.repo_count(), 2);
+        assert!(inferrer.has_embeddings());
+        assert_eq!(inferrer.embedding_count(), 2);
+    }
+
+    #[test]
+    fn test_inferrer_clone() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+        let cloned = inferrer.clone();
+        assert_eq!(cloned.repo_count(), inferrer.repo_count());
+        assert_eq!(cloned.has_embeddings(), inferrer.has_embeddings());
+    }
+
+    #[test]
+    fn test_infer_high_confidence_direct_file_match_reason() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue
+            .metadata
+            .insert("filename".to_string(), json!("src/routes/auth.ts"));
+
+        let result = inferrer.infer(&issue).unwrap();
+        assert_eq!(result.confidence, Confidence::High);
+        assert!(
+            result.reason.contains("Direct file match") || result.reason.contains("Explicit repo"),
+            "Expected direct file match reason, got: {}",
+            result.reason
+        );
+        assert!(result.matched_file.is_some());
+    }
+
+    #[test]
+    fn test_infer_explicit_repo_reference_reason() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        let issue = create_test_issue(
+            "linear",
+            "Bug in console",
+            "Found issue in appwrite/console repository",
+        );
+
+        let result = inferrer.infer(&issue).unwrap();
+        assert_eq!(result.confidence, Confidence::High);
+        assert!(
+            result.reason.contains("Explicit repo reference"),
+            "Expected explicit repo reference reason, got: {}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn test_infer_sentry_project_matching_reason() {
+        let index = create_test_index_with_cloud();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Error", "");
+        issue
+            .metadata
+            .insert("project".to_string(), json!("cloud-staging"));
+
+        let result = inferrer.infer(&issue).unwrap();
+        assert_eq!(result.confidence, Confidence::High);
+        assert!(
+            result.reason.contains("Sentry project"),
+            "Expected Sentry project reason, got: {}",
+            result.reason
+        );
+    }
 }

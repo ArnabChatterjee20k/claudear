@@ -1293,4 +1293,967 @@ mod tests {
         assert!(tools.iter().any(|t| t.name == "cargo test"));
         assert!(tools.iter().any(|t| t.name == "gradle test"));
     }
+
+    #[test]
+    fn test_shell_words_multiple_spaces_between_words() {
+        assert_eq!(shell_words("a      b      c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_shell_words_newlines_treated_as_whitespace() {
+        assert_eq!(
+            shell_words("cargo\ntest\n--json"),
+            vec!["cargo", "test", "--json"]
+        );
+    }
+
+    #[test]
+    fn test_custom_test_and_coverage_overrides_together() {
+        let dir = TempDir::new().unwrap();
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("make test".into()),
+            custom_coverage_cmd: Some("make cov".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        assert_eq!(tools.len(), 2);
+        let test_tool = tools
+            .iter()
+            .find(|t| t.category == EvalCategory::Test)
+            .unwrap();
+        assert_eq!(test_tool.command, vec!["make", "test"]);
+        let cov_tool = tools
+            .iter()
+            .find(|t| t.category == EvalCategory::Coverage)
+            .unwrap();
+        assert_eq!(cov_tool.command, vec!["make", "cov"]);
+    }
+
+    #[test]
+    fn test_detect_python_setup_py() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("setup.py"),
+            "from setuptools import setup\nsetup()",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // Detection depends on which_exists for pytest/mypy/ruff, but should not panic
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_multiple_project_files_all_detected() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name": "test"}"#).unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"test\"",
+        )
+        .unwrap();
+        fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // At minimum Rust tools should be detected
+        assert!(tools.iter().any(|t| t.name == "cargo test"));
+    }
+
+    #[test]
+    fn test_custom_overrides_block_all_autodetect_across_all_languages() {
+        let dir = TempDir::new().unwrap();
+        // Create files for multiple languages
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name": "test"}"#).unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/phpunit"), "#!/bin/sh").unwrap();
+        fs::write(dir.path().join("vendor/bin/phpstan"), "#!/bin/sh").unwrap();
+        fs::write(dir.path().join("vendor/bin/php-cs-fixer"), "#!/bin/sh").unwrap();
+
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("make test".into()),
+            custom_lint_cmd: Some("make lint".into()),
+            custom_analysis_cmd: Some("make analyze".into()),
+            custom_coverage_cmd: Some("make coverage".into()),
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        // Only 4 custom tools, no auto-detected ones
+        assert_eq!(tools.len(), 4);
+        assert!(tools.iter().all(|t| t.name == "custom"));
+    }
+
+    #[test]
+    fn test_detect_dart_pubspec_no_dart_binary() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: test\nversion: 1.0.0",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // Tools depend on which_exists("dart"), should not panic regardless
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_php_only_phpstan_no_phpunit() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/phpstan"), "#!/bin/sh").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(tools.iter().any(|t| t.name == "phpstan"));
+        assert!(!tools.iter().any(|t| t.name == "phpunit"));
+        assert!(!tools.iter().any(|t| t.name == "phpunit coverage"));
+    }
+
+    #[test]
+    fn test_detected_tool_command_not_empty() {
+        let tool = DetectedTool {
+            category: EvalCategory::Test,
+            name: "cargo test".into(),
+            command: vec!["cargo".into(), "test".into()],
+        };
+        assert!(!tool.command.is_empty());
+        assert_eq!(tool.command[0], "cargo");
+    }
+
+    #[test]
+    fn test_detect_cmake_vs_makefile_priority() {
+        // With both CMakeLists.txt and Makefile, has_cmake is true
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        fs::write(dir.path().join("Makefile"), "all:\n\tgcc main.c").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // CMake+ctest takes priority if ctest is available
+        // At minimum detection should not panic
+        for tool in &tools {
+            assert!(
+                tool.category == EvalCategory::Test
+                    || tool.category == EvalCategory::Lint
+                    || tool.category == EvalCategory::StaticAnalysis
+                    || tool.category == EvalCategory::Coverage
+            );
+        }
+    }
+
+    #[test]
+    fn test_which_exists_empty_string() {
+        // Empty string should not exist
+        assert!(!which_exists(""));
+    }
+
+    #[test]
+    fn test_detect_kotlin_custom_test_blocks_gradle_test() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins { }").unwrap();
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("my-test".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        let test_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Test)
+            .collect();
+        assert_eq!(test_tools.len(), 1);
+        assert_eq!(test_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_detect_rust_all_tools_when_binaries_present() {
+        // cargo is always available in this environment
+        if !which_exists("cargo") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        // cargo clippy (static analysis)
+        let clippy = tools.iter().find(|t| t.name == "cargo clippy");
+        assert!(clippy.is_some(), "Should detect cargo clippy");
+        let clippy = clippy.unwrap();
+        assert_eq!(clippy.category, EvalCategory::StaticAnalysis);
+        assert!(clippy.command.contains(&"clippy".to_string()));
+        assert!(clippy
+            .command
+            .contains(&"--message-format=json".to_string()));
+        assert!(clippy.command.contains(&"-D".to_string()));
+        assert!(clippy.command.contains(&"warnings".to_string()));
+
+        // cargo fmt (lint)
+        let fmt = tools.iter().find(|t| t.name == "cargo fmt");
+        assert!(fmt.is_some(), "Should detect cargo fmt");
+        let fmt = fmt.unwrap();
+        assert_eq!(fmt.category, EvalCategory::Lint);
+        assert!(fmt.command.contains(&"fmt".to_string()));
+        assert!(fmt.command.contains(&"--check".to_string()));
+    }
+
+    #[test]
+    fn test_detect_rust_coverage_with_llvm_cov() {
+        if !which_exists("cargo") || !which_exists("cargo-llvm-cov") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        let cov = tools.iter().find(|t| t.name == "cargo llvm-cov");
+        assert!(cov.is_some(), "Should detect cargo llvm-cov");
+        let cov = cov.unwrap();
+        assert_eq!(cov.category, EvalCategory::Coverage);
+        assert_eq!(cov.command, vec!["cargo", "llvm-cov", "--json"]);
+    }
+
+    #[test]
+    fn test_detect_swift_test_and_coverage() {
+        if !which_exists("swift") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("Package.swift"),
+            "// swift-tools-version:5.5",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        // swift test
+        let swift_test = tools.iter().find(|t| t.name == "swift test");
+        assert!(swift_test.is_some(), "Should detect swift test");
+        let swift_test = swift_test.unwrap();
+        assert_eq!(swift_test.category, EvalCategory::Test);
+        assert_eq!(swift_test.command, vec!["swift", "test"]);
+
+        // swift coverage
+        let swift_cov = tools.iter().find(|t| t.name == "swift coverage");
+        assert!(swift_cov.is_some(), "Should detect swift coverage");
+        let swift_cov = swift_cov.unwrap();
+        assert_eq!(swift_cov.category, EvalCategory::Coverage);
+        assert_eq!(
+            swift_cov.command,
+            vec!["swift", "test", "--enable-code-coverage"]
+        );
+    }
+
+    #[test]
+    fn test_detect_swift_custom_overrides_block_autodetect() {
+        if !which_exists("swift") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("Package.swift"),
+            "// swift-tools-version:5.5",
+        )
+        .unwrap();
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("my-swift-test".into()),
+            custom_coverage_cmd: Some("my-swift-cov".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        let test_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Test)
+            .collect();
+        assert_eq!(test_tools.len(), 1);
+        assert_eq!(test_tools[0].name, "custom");
+        let cov_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Coverage)
+            .collect();
+        assert_eq!(cov_tools.len(), 1);
+        assert_eq!(cov_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_detect_c_cmake_with_ctest_and_tools() {
+        if !which_exists("ctest") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        // ctest (test)
+        let ctest = tools.iter().find(|t| t.name == "ctest");
+        assert!(ctest.is_some(), "Should detect ctest");
+        let ctest = ctest.unwrap();
+        assert_eq!(ctest.category, EvalCategory::Test);
+        assert_eq!(ctest.command, vec!["ctest"]);
+    }
+
+    #[test]
+    fn test_detect_c_cmake_clang_format_lint() {
+        if !which_exists("clang-format") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        let cf = tools.iter().find(|t| t.name == "clang-format");
+        assert!(cf.is_some(), "Should detect clang-format");
+        let cf = cf.unwrap();
+        assert_eq!(cf.category, EvalCategory::Lint);
+        assert_eq!(cf.command, vec!["clang-format", "--dry-run", "-Werror"]);
+    }
+
+    #[test]
+    fn test_detect_c_cmake_gcov_coverage() {
+        if !which_exists("gcov") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        let gcov = tools.iter().find(|t| t.name == "gcov");
+        assert!(gcov.is_some(), "Should detect gcov");
+        let gcov = gcov.unwrap();
+        assert_eq!(gcov.category, EvalCategory::Coverage);
+        assert_eq!(gcov.command, vec!["gcov"]);
+    }
+
+    #[test]
+    fn test_detect_makefile_only_uses_make_test() {
+        if !which_exists("make") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // Only Makefile, no CMakeLists.txt => has_cmake=false => fallback to make test
+        fs::write(dir.path().join("Makefile"), "all:\n\tgcc main.c").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        // Should use make test (not ctest) since there's no CMakeLists.txt
+        let make_test = tools.iter().find(|t| t.name == "make test");
+        assert!(
+            make_test.is_some(),
+            "Should detect make test for Makefile-only project"
+        );
+        let make_test = make_test.unwrap();
+        assert_eq!(make_test.category, EvalCategory::Test);
+        assert_eq!(make_test.command, vec!["make", "test"]);
+    }
+
+    #[test]
+    fn test_detect_js_all_tools_with_npx() {
+        if !which_exists("npx") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "test", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        // jest (test)
+        let jest = tools.iter().find(|t| t.name == "jest");
+        assert!(jest.is_some(), "Should detect jest");
+        let jest = jest.unwrap();
+        assert_eq!(jest.category, EvalCategory::Test);
+        assert_eq!(jest.command, vec!["npx", "jest", "--json"]);
+
+        // eslint (static analysis)
+        let eslint = tools.iter().find(|t| t.name == "eslint");
+        assert!(eslint.is_some(), "Should detect eslint");
+        let eslint = eslint.unwrap();
+        assert_eq!(eslint.category, EvalCategory::StaticAnalysis);
+        assert_eq!(
+            eslint.command,
+            vec!["npx", "eslint", "--format", "json", "."]
+        );
+
+        // prettier (lint)
+        let prettier = tools.iter().find(|t| t.name == "prettier");
+        assert!(prettier.is_some(), "Should detect prettier");
+        let prettier = prettier.unwrap();
+        assert_eq!(prettier.category, EvalCategory::Lint);
+        assert_eq!(prettier.command, vec!["npx", "prettier", "--check", "."]);
+
+        // jest coverage
+        let jest_cov = tools.iter().find(|t| t.name == "jest coverage");
+        assert!(jest_cov.is_some(), "Should detect jest coverage");
+        let jest_cov = jest_cov.unwrap();
+        assert_eq!(jest_cov.category, EvalCategory::Coverage);
+        assert_eq!(
+            jest_cov.command,
+            vec![
+                "npx",
+                "jest",
+                "--coverage",
+                "--coverageReporters=json-summary"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_detect_js_custom_overrides_block_all_autodetect() {
+        if !which_exists("npx") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name": "test"}"#).unwrap();
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("vitest".into()),
+            custom_lint_cmd: Some("biome lint".into()),
+            custom_analysis_cmd: Some("tsc --noEmit".into()),
+            custom_coverage_cmd: Some("vitest coverage".into()),
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        assert_eq!(tools.len(), 4);
+        assert!(tools.iter().all(|t| t.name == "custom"));
+    }
+
+    #[test]
+    fn test_detect_dart_all_tools() {
+        if !which_exists("dart") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: test\nversion: 1.0.0",
+        )
+        .unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        // dart test
+        let dt = tools.iter().find(|t| t.name == "dart test");
+        assert!(dt.is_some(), "Should detect dart test");
+        let dt = dt.unwrap();
+        assert_eq!(dt.category, EvalCategory::Test);
+        assert_eq!(dt.command, vec!["dart", "test"]);
+
+        // dart analyze
+        let da = tools.iter().find(|t| t.name == "dart analyze");
+        assert!(da.is_some(), "Should detect dart analyze");
+        let da = da.unwrap();
+        assert_eq!(da.category, EvalCategory::StaticAnalysis);
+        assert_eq!(da.command, vec!["dart", "analyze"]);
+
+        // dart format
+        let df = tools.iter().find(|t| t.name == "dart format");
+        assert!(df.is_some(), "Should detect dart format");
+        let df = df.unwrap();
+        assert_eq!(df.category, EvalCategory::Lint);
+        assert_eq!(
+            df.command,
+            vec![
+                "dart",
+                "format",
+                "--output=none",
+                "--set-exit-if-changed",
+                "."
+            ]
+        );
+
+        // dart test coverage
+        let dc = tools.iter().find(|t| t.name == "dart test coverage");
+        assert!(dc.is_some(), "Should detect dart test coverage");
+        let dc = dc.unwrap();
+        assert_eq!(dc.category, EvalCategory::Coverage);
+        assert_eq!(dc.command, vec!["dart", "test", "--coverage=coverage"]);
+    }
+
+    #[test]
+    fn test_detect_dart_custom_overrides_block_all() {
+        if !which_exists("dart") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: test\nversion: 1.0.0",
+        )
+        .unwrap();
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("my-dart-test".into()),
+            custom_lint_cmd: Some("my-dart-lint".into()),
+            custom_analysis_cmd: Some("my-dart-analysis".into()),
+            custom_coverage_cmd: Some("my-dart-cov".into()),
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        assert_eq!(tools.len(), 4);
+        assert!(tools.iter().all(|t| t.name == "custom"));
+        // None of the dart auto-detected tools should be present
+        assert!(!tools.iter().any(|t| t.name.contains("dart")));
+    }
+
+    #[test]
+    fn test_detect_csharp_all_dotnet_tools() {
+        if !which_exists("dotnet") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("MyProject.csproj"), "<Project></Project>").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        // dotnet test
+        let dt = tools.iter().find(|t| t.name == "dotnet test");
+        assert!(dt.is_some(), "Should detect dotnet test");
+        let dt = dt.unwrap();
+        assert_eq!(dt.category, EvalCategory::Test);
+        assert!(dt.command.contains(&"--logger".to_string()));
+        assert!(dt.command.contains(&"trx".to_string()));
+
+        // dotnet build (static analysis)
+        let db = tools.iter().find(|t| t.name == "dotnet build");
+        assert!(db.is_some(), "Should detect dotnet build");
+        let db = db.unwrap();
+        assert_eq!(db.category, EvalCategory::StaticAnalysis);
+        assert!(db.command.contains(&"/warnaserror".to_string()));
+
+        // dotnet format (lint)
+        let df = tools.iter().find(|t| t.name == "dotnet format");
+        assert!(df.is_some(), "Should detect dotnet format");
+        let df = df.unwrap();
+        assert_eq!(df.category, EvalCategory::Lint);
+        assert!(df.command.contains(&"--verify-no-changes".to_string()));
+
+        // dotnet coverage
+        let dc = tools.iter().find(|t| t.name == "dotnet coverage");
+        assert!(dc.is_some(), "Should detect dotnet coverage");
+        let dc = dc.unwrap();
+        assert_eq!(dc.category, EvalCategory::Coverage);
+        assert!(dc
+            .command
+            .contains(&"--collect:XPlat Code Coverage".to_string()));
+    }
+
+    #[test]
+    fn test_detect_csharp_sln_all_dotnet_tools() {
+        if !which_exists("dotnet") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("MySolution.sln"), "").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        assert!(tools.iter().any(|t| t.name == "dotnet test"));
+        assert!(tools.iter().any(|t| t.name == "dotnet build"));
+        assert!(tools.iter().any(|t| t.name == "dotnet format"));
+        assert!(tools.iter().any(|t| t.name == "dotnet coverage"));
+    }
+
+    #[test]
+    fn test_detect_csharp_custom_overrides_block_dotnet() {
+        if !which_exists("dotnet") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("MyProject.csproj"), "<Project></Project>").unwrap();
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("my-test".into()),
+            custom_lint_cmd: Some("my-lint".into()),
+            custom_analysis_cmd: Some("my-analysis".into()),
+            custom_coverage_cmd: Some("my-cov".into()),
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        assert_eq!(tools.len(), 4);
+        assert!(tools.iter().all(|t| t.name == "custom"));
+    }
+
+    #[test]
+    fn test_detect_ruby_with_rake_no_rspec() {
+        if !which_exists("rake") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Gemfile"), "source 'https://rubygems.org'").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        // rspec not available, so should fall back to rake test
+        if !which_exists("rspec") {
+            let rake_test = tools.iter().find(|t| t.name == "rake test");
+            assert!(
+                rake_test.is_some(),
+                "Should detect rake test when rspec unavailable"
+            );
+            let rake_test = rake_test.unwrap();
+            assert_eq!(rake_test.category, EvalCategory::Test);
+            assert_eq!(rake_test.command, vec!["rake", "test"]);
+        }
+    }
+
+    #[test]
+    fn test_detect_c_cmake_and_makefile_prefers_ctest() {
+        // With both CMakeLists.txt and Makefile + ctest available, ctest takes priority
+        if !which_exists("ctest") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        fs::write(dir.path().join("Makefile"), "all:\n\tgcc main.c").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        let test_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Test)
+            .collect();
+        assert_eq!(test_tools.len(), 1, "Should have exactly one test tool");
+        assert_eq!(test_tools[0].name, "ctest");
+    }
+
+    #[test]
+    fn test_detect_c_cmake_custom_test_blocks_ctest() {
+        if !which_exists("ctest") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("my-ctest".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        let test_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Test)
+            .collect();
+        assert_eq!(test_tools.len(), 1);
+        assert_eq!(test_tools[0].name, "custom");
+        assert!(!tools.iter().any(|t| t.name == "ctest"));
+    }
+
+    #[test]
+    fn test_detect_c_cmake_custom_lint_blocks_clang_format() {
+        if !which_exists("clang-format") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        let overrides = ToolOverrides {
+            custom_lint_cmd: Some("my-lint".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        let lint_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Lint)
+            .collect();
+        assert_eq!(lint_tools.len(), 1);
+        assert_eq!(lint_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_detect_c_cmake_custom_coverage_blocks_gcov() {
+        if !which_exists("gcov") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        let overrides = ToolOverrides {
+            custom_coverage_cmd: Some("my-cov".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        let cov_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Coverage)
+            .collect();
+        assert_eq!(cov_tools.len(), 1);
+        assert_eq!(cov_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_detect_all_languages_with_all_overrides() {
+        let dir = TempDir::new().unwrap();
+        // Create files for every supported language
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name": "test"}"#).unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/phpunit"), "#!/bin/sh").unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins { }").unwrap();
+        fs::write(
+            dir.path().join("Package.swift"),
+            "// swift-tools-version:5.5",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"test\"",
+        )
+        .unwrap();
+        fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
+        fs::write(dir.path().join("pom.xml"), "<project></project>").unwrap();
+        fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)",
+        )
+        .unwrap();
+        fs::write(dir.path().join("Gemfile"), "source 'https://rubygems.org'").unwrap();
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: test\nversion: 1.0.0",
+        )
+        .unwrap();
+        fs::write(dir.path().join("MyProject.csproj"), "<Project></Project>").unwrap();
+
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("universal-test".into()),
+            custom_lint_cmd: Some("universal-lint".into()),
+            custom_analysis_cmd: Some("universal-analyze".into()),
+            custom_coverage_cmd: Some("universal-cov".into()),
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        // Only 4 custom tools despite having every language file
+        assert_eq!(tools.len(), 4);
+        assert!(tools.iter().all(|t| t.name == "custom"));
+    }
+
+    #[test]
+    fn test_detect_kotlin_gradle_kts_detekt_ktlint_jacoco() {
+        // When gradle binary is available, should detect detekt/ktlint/jacoco
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins { }").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // gradle test is always detected (no which_exists check for gradle test)
+        assert!(tools.iter().any(|t| t.name == "gradle test"));
+        // detekt/ktlint/jacoco depend on which_exists("gradle")
+        if which_exists("gradle") {
+            assert!(tools.iter().any(|t| t.name == "detekt"));
+            assert!(tools.iter().any(|t| t.name == "ktlint"));
+            assert!(tools.iter().any(|t| t.name == "jacoco"));
+        }
+    }
+
+    #[test]
+    fn test_detect_kotlin_gradlew_detekt_command() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins { }").unwrap();
+        fs::write(dir.path().join("gradlew"), "#!/bin/sh").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+        // With gradlew, the command prefix should be ./gradlew
+        let test_tool = tools.iter().find(|t| t.name == "gradle test").unwrap();
+        assert_eq!(test_tool.command[0], "./gradlew");
+        // If which_exists("./gradlew") is true, check analysis/lint/coverage tools
+        if which_exists("./gradlew") {
+            if let Some(detekt) = tools.iter().find(|t| t.name == "detekt") {
+                assert_eq!(detekt.command[0], "./gradlew");
+                assert_eq!(detekt.command[1], "detekt");
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_php_custom_analysis_blocks_phpstan() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/phpstan"), "#!/bin/sh").unwrap();
+        let overrides = ToolOverrides {
+            custom_analysis_cmd: Some("my-analysis".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        assert!(!tools.iter().any(|t| t.name == "phpstan"));
+        let analysis_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::StaticAnalysis)
+            .collect();
+        assert_eq!(analysis_tools.len(), 1);
+        assert_eq!(analysis_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_detect_php_custom_lint_blocks_cs_fixer() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name": "test/pkg"}"#).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/bin")).unwrap();
+        fs::write(dir.path().join("vendor/bin/php-cs-fixer"), "#!/bin/sh").unwrap();
+        let overrides = ToolOverrides {
+            custom_lint_cmd: Some("my-lint".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        assert!(!tools.iter().any(|t| t.name == "php-cs-fixer"));
+        let lint_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Lint)
+            .collect();
+        assert_eq!(lint_tools.len(), 1);
+        assert_eq!(lint_tools[0].name, "custom");
+    }
+
+    #[test]
+    fn test_detect_mixed_project_partial_overrides() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name": "test"}"#).unwrap();
+        // Only override test and lint, let analysis and coverage auto-detect
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("my-test".into()),
+            custom_lint_cmd: Some("my-lint".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        // Test and lint should be custom
+        let test_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Test)
+            .collect();
+        assert_eq!(test_tools.len(), 1);
+        assert_eq!(test_tools[0].name, "custom");
+        let lint_tools: Vec<_> = tools
+            .iter()
+            .filter(|t| t.category == EvalCategory::Lint)
+            .collect();
+        assert_eq!(lint_tools.len(), 1);
+        assert_eq!(lint_tools[0].name, "custom");
+        // Analysis and coverage should be auto-detected (at least for Rust)
+        if which_exists("cargo") {
+            assert!(tools.iter().any(|t| t.name == "cargo clippy"));
+        }
+    }
+
+    #[test]
+    fn test_custom_override_command_parsing_complex() {
+        let dir = TempDir::new().unwrap();
+        let overrides = ToolOverrides {
+            custom_test_cmd: Some("docker compose exec app php artisan test --parallel".into()),
+            ..Default::default()
+        };
+        let tools = detect_tools(dir.path(), &overrides);
+        let test_tool = tools
+            .iter()
+            .find(|t| t.category == EvalCategory::Test)
+            .unwrap();
+        assert_eq!(
+            test_tool.command,
+            vec![
+                "docker",
+                "compose",
+                "exec",
+                "app",
+                "php",
+                "artisan",
+                "test",
+                "--parallel"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_detect_go_all_tools_when_available() {
+        if !which_exists("go") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        let go_test = tools.iter().find(|t| t.name == "go test");
+        assert!(go_test.is_some(), "Should detect go test");
+        let go_test = go_test.unwrap();
+        assert_eq!(go_test.category, EvalCategory::Test);
+        assert_eq!(go_test.command, vec!["go", "test", "-json", "./..."]);
+
+        let go_vet = tools.iter().find(|t| t.name == "go vet");
+        assert!(go_vet.is_some(), "Should detect go vet");
+        let go_vet = go_vet.unwrap();
+        assert_eq!(go_vet.category, EvalCategory::StaticAnalysis);
+        assert_eq!(go_vet.command, vec!["go", "vet", "./..."]);
+
+        let go_cov = tools.iter().find(|t| t.name == "go test coverage");
+        assert!(go_cov.is_some(), "Should detect go test coverage");
+        let go_cov = go_cov.unwrap();
+        assert_eq!(go_cov.category, EvalCategory::Coverage);
+        assert_eq!(go_cov.command, vec!["go", "test", "-cover", "./..."]);
+    }
+
+    #[test]
+    fn test_detect_go_gofmt_lint() {
+        if !which_exists("gofmt") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        let gofmt = tools.iter().find(|t| t.name == "gofmt");
+        assert!(gofmt.is_some(), "Should detect gofmt");
+        let gofmt = gofmt.unwrap();
+        assert_eq!(gofmt.category, EvalCategory::Lint);
+        assert_eq!(gofmt.command, vec!["gofmt", "-l", "."]);
+    }
+
+    #[test]
+    fn test_detect_java_maven_all_tools() {
+        if !which_exists("mvn") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("pom.xml"), "<project></project>").unwrap();
+        let tools = detect_tools(dir.path(), &ToolOverrides::default());
+
+        let mvn_test = tools.iter().find(|t| t.name == "mvn test");
+        assert!(mvn_test.is_some(), "Should detect mvn test");
+        assert_eq!(mvn_test.unwrap().command, vec!["mvn", "test", "-B"]);
+
+        let mvn_verify = tools.iter().find(|t| t.name == "mvn verify");
+        assert!(mvn_verify.is_some(), "Should detect mvn verify");
+        assert_eq!(
+            mvn_verify.unwrap().command,
+            vec!["mvn", "verify", "-B", "-DskipTests"]
+        );
+
+        let mvn_jacoco = tools.iter().find(|t| t.name == "mvn jacoco");
+        assert!(mvn_jacoco.is_some(), "Should detect mvn jacoco");
+        assert_eq!(
+            mvn_jacoco.unwrap().command,
+            vec!["mvn", "test", "jacoco:report", "-B"]
+        );
+    }
 }

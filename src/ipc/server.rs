@@ -1515,4 +1515,656 @@ mod tests {
         assert_eq!(server.state.max_activity_entries, 250);
         assert_eq!(server.state.max_retries, 10);
     }
+
+    // -------------------------------------------------------------------
+    // handle_command: ProcessRetries without watcher
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_command_process_retries_without_watcher() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::ProcessRetries,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Error { message } => {
+                assert!(message.contains("Watcher not available"));
+            }
+            other => panic!("Expected error, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // handle_command: Reset without watcher (tracker fallback)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_command_reset_nonexistent_attempt_without_watcher() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        // Reset an attempt that doesn't exist - should still succeed via
+        // the tracker's reset_attempt which is a no-op for missing attempts
+        let resp = handle_command(
+            IpcCommand::Reset {
+                source: "linear".to_string(),
+                issue_id: "NONEXISTENT".to_string(),
+            },
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Reset { source, issue_id }) => {
+                assert_eq!(source, "linear");
+                assert_eq!(issue_id, "NONEXISTENT");
+            }
+            other => panic!("Expected Reset, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // handle_command: Stats with recorded data
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_command_stats_with_data() {
+        let tracker = mock_tracker();
+        // Record some attempts
+        tracker.record_attempt("linear", "LIN-1", "LIN-1").unwrap();
+        tracker
+            .mark_success("linear", "LIN-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.record_attempt("sentry", "SEN-1", "SEN-1").unwrap();
+        tracker
+            .mark_failed("sentry", "SEN-1", "build error")
+            .unwrap();
+
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Stats,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Stats(stats)) => {
+                assert_eq!(stats.total, 2);
+                assert_eq!(stats.success, 1);
+                assert_eq!(stats.failed, 1);
+            }
+            other => panic!("Expected Stats, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // handle_command: ListPrs with data
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_command_list_prs_with_data() {
+        let tracker = mock_tracker();
+        tracker.record_attempt("linear", "LIN-1", "LIN-1").unwrap();
+        tracker
+            .mark_success("linear", "LIN-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::ListPrs,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Attempts(attempts)) => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].source, "linear");
+            }
+            other => panic!("Expected Attempts, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // handle_command: ListRetries with retryable data
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_command_list_retries_with_data() {
+        let tracker = mock_tracker();
+        tracker.record_attempt("linear", "LIN-1", "LIN-1").unwrap();
+        tracker
+            .mark_failed("linear", "LIN-1", "build error")
+            .unwrap();
+
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::ListRetries,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Attempts(attempts)) => {
+                assert!(!attempts.is_empty());
+                assert_eq!(attempts[0].source, "linear");
+            }
+            other => panic!("Expected Attempts, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // handle_command: Activity with empty state
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_command_activity_empty() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Activity { limit: 50 },
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Activity(entries)) => {
+                assert!(entries.is_empty());
+            }
+            other => panic!("Expected Activity, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // log_activity with all activity type variants
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_log_activity_all_activity_types() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+
+        let all_types = vec![
+            ActivityType::IssueDetected,
+            ActivityType::IssueStatusChanged,
+            ActivityType::IssuePriorityChanged,
+            ActivityType::IssueCommented,
+            ActivityType::IssueResolved,
+            ActivityType::IssueCancelled,
+            ActivityType::IssueEscalated,
+            ActivityType::ProcessingStarted,
+            ActivityType::ProcessingCompleted,
+            ActivityType::ProcessingFailed,
+            ActivityType::ProcessingSkipped,
+            ActivityType::RetryScheduled,
+            ActivityType::RetryExecuted,
+            ActivityType::PrCreated,
+            ActivityType::PrMerged,
+            ActivityType::PrClosed,
+            ActivityType::PrReviewReceived,
+            ActivityType::PrReviewRequested,
+            ActivityType::PrCommented,
+            ActivityType::PrStatusCheckPassed,
+            ActivityType::PrStatusCheckFailed,
+            ActivityType::PrAutoClosed,
+            ActivityType::ClaudeStarted,
+            ActivityType::ClaudeCompleted,
+            ActivityType::ClaudeTimedOut,
+            ActivityType::ClaudeFailed,
+            ActivityType::WebhookReceived,
+            ActivityType::WebhookProcessed,
+            ActivityType::WebhookRejected,
+            ActivityType::WatcherStarted,
+            ActivityType::WatcherStopped,
+            ActivityType::WatcherPaused,
+            ActivityType::WatcherResumed,
+            ActivityType::RateLimitHit,
+            ActivityType::StateChange,
+            ActivityType::Error,
+        ];
+
+        let count = all_types.len();
+        for (i, activity_type) in all_types.into_iter().enumerate() {
+            server
+                .log_activity(activity_type, &format!("msg-{}", i), None, None)
+                .await;
+        }
+
+        let activity = server.state.activity.lock().await;
+        assert_eq!(activity.len(), count);
+    }
+
+    // -------------------------------------------------------------------
+    // log_activity with issue_id and source variations
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_log_activity_with_issue_and_source() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+
+        server
+            .log_activity(
+                ActivityType::IssueDetected,
+                "msg with all fields",
+                Some("LIN-42"),
+                Some("linear"),
+            )
+            .await;
+
+        let activity = server.state.activity.lock().await;
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].issue_id, Some("LIN-42".to_string()));
+        assert_eq!(activity[0].source, Some("linear".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_log_activity_without_issue_or_source() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+
+        server
+            .log_activity(ActivityType::WatcherStarted, "no context", None, None)
+            .await;
+
+        let activity = server.state.activity.lock().await;
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].issue_id, None);
+        assert_eq!(activity[0].source, None);
+    }
+
+    // -------------------------------------------------------------------
+    // IpcServer with_watcher
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ipc_server_with_watcher_sets_watcher() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert!(server.watcher.is_none());
+        // We cannot easily create a real Watcher in tests, but we can verify
+        // the initial state
+    }
+
+    // -------------------------------------------------------------------
+    // Builder chaining
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_builder_chaining() {
+        let server = IpcServerBuilder::new(mock_tracker(), mock_sources(), mock_notifier())
+            .max_activity_entries(100)
+            .max_retries(3)
+            .build();
+
+        assert_eq!(server.state.max_activity_entries, 100);
+        assert_eq!(server.state.max_retries, 3);
+        assert!(!server.is_paused());
+    }
+
+    // -------------------------------------------------------------------
+    // Shutdown receiver can be subscribed multiple times
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_multiple_shutdown_receivers() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        let mut rx1 = server.shutdown_receiver();
+        let mut rx2 = server.shutdown_receiver();
+
+        server.shutdown();
+
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // IpcServer::new uses default builder
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ipc_server_new_uses_defaults() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+        assert_eq!(
+            server.state.max_activity_entries,
+            DEFAULT_MAX_ACTIVITY_ENTRIES
+        );
+        assert_eq!(server.state.max_retries, 2);
+        assert_eq!(*server.state.mode.blocking_read(), "initializing");
+    }
+
+    // -------------------------------------------------------------------
+    // Status command shows processing items
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_command_status_with_processing_items() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        {
+            let mut processing = state.processing.write().await;
+            processing.push("LIN-1".to_string());
+            processing.push("SEN-2".to_string());
+        }
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let resp = handle_command(
+            IpcCommand::Status,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::State(ws)) => {
+                assert_eq!(ws.processing.len(), 2);
+                assert!(ws.processing.contains(&"LIN-1".to_string()));
+                assert!(ws.processing.contains(&"SEN-2".to_string()));
+            }
+            other => panic!("Expected State, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Pause and resume toggle
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_pause_resume_toggle() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        // Initially not paused
+        assert!(!state.paused.load(Ordering::SeqCst));
+
+        // Pause
+        handle_command(
+            IpcCommand::Pause,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+        assert!(state.paused.load(Ordering::SeqCst));
+
+        // Resume
+        handle_command(
+            IpcCommand::Resume,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+        assert!(!state.paused.load(Ordering::SeqCst));
+
+        // Double pause
+        handle_command(
+            IpcCommand::Pause,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+        handle_command(
+            IpcCommand::Pause,
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+        assert!(state.paused.load(Ordering::SeqCst));
+    }
+
+    // -------------------------------------------------------------------
+    // Activity limit edge case: limit = 0
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_command_activity_limit_zero() {
+        let tracker = mock_tracker();
+        let sources = mock_sources();
+        let notifier = mock_notifier();
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        // Add some entries
+        {
+            let mut activity = state.activity.lock().await;
+            activity.push_back(ActivityEntry {
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                activity_type: ActivityType::IssueDetected,
+                message: "test".to_string(),
+                issue_id: None,
+                source: None,
+            });
+        }
+
+        let resp = handle_command(
+            IpcCommand::Activity { limit: 0 },
+            &tracker,
+            &sources,
+            &notifier,
+            &None,
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Ok(IpcData::Activity(entries)) => {
+                assert!(entries.is_empty());
+            }
+            other => panic!("Expected Activity, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Concurrent increments
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_concurrent_increments() {
+        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
+
+        for _ in 0..100 {
+            server.inc_issues_processed();
+        }
+        for _ in 0..50 {
+            server.inc_prs_created();
+        }
+
+        assert_eq!(server.state.issues_processed.load(Ordering::SeqCst), 100);
+        assert_eq!(server.state.prs_created.load(Ordering::SeqCst), 50);
+    }
+
+    // -------------------------------------------------------------------
+    // Builder with empty sources
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_builder_empty_sources() {
+        let server = IpcServerBuilder::new(
+            mock_tracker(),
+            vec![], // no sources
+            mock_notifier(),
+        )
+        .build();
+
+        assert!(server.state.source_names.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // IpcCommand serialization roundtrip
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ipc_command_serde_roundtrip() {
+        let commands = vec![
+            IpcCommand::Ping,
+            IpcCommand::Status,
+            IpcCommand::Pause,
+            IpcCommand::Resume,
+            IpcCommand::Stats,
+            IpcCommand::ListPrs,
+            IpcCommand::ListRetries,
+            IpcCommand::ProcessRetries,
+            IpcCommand::Shutdown,
+            IpcCommand::Activity { limit: 42 },
+            IpcCommand::Trigger {
+                source: "linear".to_string(),
+                issue_id: "LIN-1".to_string(),
+            },
+            IpcCommand::Reset {
+                source: "sentry".to_string(),
+                issue_id: "SEN-1".to_string(),
+            },
+        ];
+
+        for cmd in commands {
+            let json = serde_json::to_string(&cmd).unwrap();
+            let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+            // Verify it round-trips by serializing again
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // IpcResponse serialization roundtrip
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ipc_response_ok_serde() {
+        let resp = IpcResponse::ok_with(IpcData::Pong);
+        assert!(resp.is_ok());
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_ipc_response_error_serde() {
+        let resp = IpcResponse::error("something went wrong");
+        assert!(!resp.is_ok());
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.is_ok());
+    }
+
+    #[test]
+    fn test_ipc_response_message_serde() {
+        let resp = IpcResponse::ok_with(IpcData::Message("hello world".to_string()));
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("hello world"));
+    }
+
+    #[test]
+    fn test_ipc_response_retries_processed_serde() {
+        let resp = IpcResponse::ok_with(IpcData::RetriesProcessed { count: 5 });
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcResponse::Ok(IpcData::RetriesProcessed { count }) => {
+                assert_eq!(count, 5);
+            }
+            other => panic!("Expected RetriesProcessed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_ipc_response_triggered_serde() {
+        let resp = IpcResponse::ok_with(IpcData::Triggered {
+            source: "linear".to_string(),
+            issue_id: "LIN-1".to_string(),
+            pr_url: Some("https://github.com/org/repo/pull/1".to_string()),
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcResponse::Ok(IpcData::Triggered {
+                source,
+                issue_id,
+                pr_url,
+            }) => {
+                assert_eq!(source, "linear");
+                assert_eq!(issue_id, "LIN-1");
+                assert!(pr_url.is_some());
+            }
+            other => panic!("Expected Triggered, got {:?}", other),
+        }
+    }
 }

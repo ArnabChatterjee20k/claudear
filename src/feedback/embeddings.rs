@@ -40,7 +40,7 @@ impl Default for EmbeddingConfig {
 impl EmbeddingConfig {
     /// Create from environment variables.
     pub fn from_env() -> Self {
-        let model = std::env::var("EMBEDDING_MODEL")
+        let model = std::env::var("CLAUDEAR_EMBEDDING_MODEL")
             .ok()
             .and_then(|m| match m.to_lowercase().as_str() {
                 "nomic-embed-text" | "nomic" => Some(EmbeddingModel::NomicEmbedTextV15),
@@ -50,9 +50,9 @@ impl EmbeddingConfig {
             })
             .unwrap_or(EmbeddingModel::NomicEmbedTextV15);
 
-        let cache_dir = std::env::var("EMBEDDING_CACHE_DIR").ok();
+        let cache_dir = std::env::var("CLAUDEAR_EMBEDDING_CACHE_DIR").ok();
 
-        let pool_size = std::env::var("EMBEDDING_POOL_SIZE")
+        let pool_size = std::env::var("CLAUDEAR_EMBEDDING_POOL_SIZE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
@@ -213,7 +213,7 @@ impl EmbeddingClient {
     /// Uses 50% of available RAM as a budget.  Falls back to 32 if sysinfo
     /// reports 0.  Respects `EMBEDDING_SUB_BATCH` env var for manual override.
     fn compute_sub_batch(dimension: usize) -> usize {
-        if let Some(val) = std::env::var("EMBEDDING_SUB_BATCH")
+        if let Some(val) = std::env::var("CLAUDEAR_EMBEDDING_SUB_BATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
@@ -713,5 +713,40 @@ mod tests {
         assert_eq!(cloned.id, 1);
         assert!((cloned.similarity - 0.9).abs() < 0.001);
         assert_eq!(cloned.text, Some("test".to_string()));
+    }
+
+    // === Coverage tests for EmbeddingConfig::from_env ===
+
+    #[test]
+    fn test_embedding_config_from_env_returns_valid_config() {
+        // from_env always returns a valid config regardless of env state
+        let config = EmbeddingConfig::from_env();
+        assert!(config.pool_size >= 1);
+    }
+
+    // === Coverage tests for compute_sub_batch ===
+
+    #[test]
+    fn test_compute_sub_batch_without_env_high_dim() {
+        std::env::remove_var("EMBEDDING_SUB_BATCH");
+        let result = EmbeddingClient::compute_sub_batch(768);
+        // Should be between 4 and 16 (memory-based clamp range)
+        assert!((4..=16).contains(&result));
+    }
+
+    #[test]
+    fn test_compute_sub_batch_without_env_low_dim() {
+        std::env::remove_var("EMBEDDING_SUB_BATCH");
+        let result = EmbeddingClient::compute_sub_batch(384);
+        // Low dimension uses 40 MB/text, so budget allows more per batch
+        assert!((4..=16).contains(&result));
+    }
+
+    // === Coverage: default_pool_size ===
+
+    #[test]
+    fn test_default_pool_size_at_least_one() {
+        let size = default_pool_size();
+        assert!(size >= 1);
     }
 }

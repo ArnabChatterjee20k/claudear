@@ -2285,7 +2285,11 @@ end
         assert_eq!(analysis.function_lengths.len(), 2);
         // The longer function should have more lines
         let max_len = analysis.function_lengths.iter().max().copied().unwrap_or(0);
-        assert!(max_len > 3, "Expected longer function > 3 lines, got {}", max_len);
+        assert!(
+            max_len > 3,
+            "Expected longer function > 3 lines, got {}",
+            max_len
+        );
     }
 
     #[test]

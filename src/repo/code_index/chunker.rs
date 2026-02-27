@@ -9,13 +9,13 @@ use crate::error::Result;
 
 /// Maximum chunk size in characters (~1500 tokens).
 const MAX_CHUNK_CHARS: usize = 6000;
-/// Minimum chunk size — trivial chunks are merged into enclosing context.
-const MIN_CHUNK_LINES: usize = 3;
-const MIN_CHUNK_CHARS: usize = 50;
-/// Large class threshold: classes above this line count get split.
+/// Minimum chunk size — only truly empty/whitespace-only chunks are rejected.
+/// Small functions (getters, setters, one-liners) are preserved for full coverage.
+const MIN_CHUNK_CHARS: usize = 15;
+/// Large class threshold: classes above this line count get split into method chunks.
 const LARGE_CLASS_LINES: usize = 100;
-/// Top-level chunk cap.
-const TOP_LEVEL_MAX_LINES: usize = 200;
+/// Maximum characters of import context to include per chunk.
+const MAX_IMPORT_CONTEXT_CHARS: usize = 500;
 /// Number of lines to carry forward when splitting oversized chunks.
 const OVERLAP_LINES: usize = 3;
 
@@ -27,12 +27,20 @@ pub fn chunk_file(
     file_path: &str,
     file_hash: &str,
 ) -> Result<(Vec<CodeSymbol>, Vec<CodeChunk>)> {
+    // Skip generated/minified files that would pollute the index.
+    if is_likely_generated(source, file_path) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
     let tree = parse_file(source, language)?;
     let symbols = extract_symbols(&tree, source.as_bytes(), language, repo_id, file_path);
 
     let lines: Vec<&str> = source.lines().collect();
     let mut chunks = Vec::new();
     let mut covered_lines = vec![false; lines.len()];
+
+    // Extract file-level imports for inclusion in chunk context.
+    let imports = extract_imports(source, language);
 
     // Phase 1: Create chunks from top-level container symbols (classes, impls, traits).
     for sym in symbols.iter().filter(|s| is_top_level_container(s)) {
@@ -41,32 +49,49 @@ pub fn chunk_file(
         let line_count = end.saturating_sub(start);
 
         if line_count > LARGE_CLASS_LINES {
-            // Large container: skeleton + per-method chunks
+            // Large container: skeleton overview + per-method chunks.
             chunks.push(build_skeleton_chunk(
-                &lines, sym, &symbols, language, repo_id, file_path, file_hash,
+                &lines,
+                sym,
+                &symbols,
+                language,
+                repo_id,
+                file_path,
+                file_hash,
+                imports.as_deref(),
             ));
 
-            // Create individual method chunks
+            // Create individual method/function chunks for every child symbol.
             for method in symbols.iter().filter(|s| {
                 s.parent_symbol.as_deref() == Some(&sym.symbol_name)
                     && matches!(s.symbol_kind, SymbolKind::Method | SymbolKind::Function)
             }) {
                 let m_start = method.start_line.saturating_sub(1);
                 let m_end = method.end_line.min(lines.len());
-                if let Some(chunk) =
-                    build_symbol_chunk(&lines, method, language, repo_id, file_path, file_hash)
-                {
-                    chunks.push(chunk);
-                }
+                let chunk = build_symbol_chunk(
+                    &lines,
+                    method,
+                    language,
+                    repo_id,
+                    file_path,
+                    file_hash,
+                    imports.as_deref(),
+                );
+                chunks.push(chunk);
                 mark_covered(&mut covered_lines, m_start, m_end);
             }
         } else {
-            // Small container: single chunk
-            if let Some(chunk) =
-                build_symbol_chunk(&lines, sym, language, repo_id, file_path, file_hash)
-            {
-                chunks.push(chunk);
-            }
+            // Small container: single chunk with all its contents.
+            let chunk = build_symbol_chunk(
+                &lines,
+                sym,
+                language,
+                repo_id,
+                file_path,
+                file_hash,
+                imports.as_deref(),
+            );
+            chunks.push(chunk);
         }
         mark_covered(&mut covered_lines, start, end);
     }
@@ -79,86 +104,182 @@ pub fn chunk_file(
         let start = sym.start_line.saturating_sub(1);
         let end = sym.end_line.min(lines.len());
         if !covered_lines.get(start).copied().unwrap_or(true) {
-            if let Some(chunk) =
-                build_symbol_chunk(&lines, sym, language, repo_id, file_path, file_hash)
-            {
-                chunks.push(chunk);
-            }
+            let chunk = build_symbol_chunk(
+                &lines,
+                sym,
+                language,
+                repo_id,
+                file_path,
+                file_hash,
+                imports.as_deref(),
+            );
+            chunks.push(chunk);
             mark_covered(&mut covered_lines, start, end);
         }
     }
 
-    // Phase 3: Collect uncovered top-level code into a top_level chunk.
-    // Only include lines that are actually uncovered (skip covered gaps).
-    let mut top_level_lines: Vec<usize> = Vec::new();
-    for (i, &covered) in covered_lines.iter().enumerate() {
-        if !covered && !lines.get(i).unwrap_or(&"").trim().is_empty() {
-            top_level_lines.push(i);
+    // Phase 3: Standalone constants/enums that aren't inside containers.
+    for sym in symbols.iter().filter(|s| {
+        s.parent_symbol.is_none()
+            && matches!(
+                s.symbol_kind,
+                SymbolKind::Constant | SymbolKind::Enum | SymbolKind::Struct
+            )
+            && !is_top_level_container(s)
+    }) {
+        let start = sym.start_line.saturating_sub(1);
+        let end = sym.end_line.min(lines.len());
+        if !covered_lines.get(start).copied().unwrap_or(true) {
+            let chunk = build_symbol_chunk(
+                &lines,
+                sym,
+                language,
+                repo_id,
+                file_path,
+                file_hash,
+                imports.as_deref(),
+            );
+            chunks.push(chunk);
+            mark_covered(&mut covered_lines, start, end);
         }
     }
 
-    if !top_level_lines.is_empty() {
-        // Collect only the uncovered lines rather than a contiguous range
-        // that could re-include already-chunked lines.
-        let collect_uncovered = |idxs: &[usize]| -> String {
-            idxs.iter()
-                .map(|&i| lines.get(i).copied().unwrap_or(""))
-                .collect::<Vec<&str>>()
-                .join("\n")
-        };
+    // Phase 4: Collect uncovered top-level code into contiguous block chunks.
+    // Instead of arbitrary batching, group by contiguous non-empty lines
+    // separated by blank lines.
+    build_top_level_chunks(
+        &lines,
+        &covered_lines,
+        language,
+        repo_id,
+        file_path,
+        file_hash,
+        imports.as_deref(),
+        &mut chunks,
+    );
 
-        if top_level_lines.len() <= TOP_LEVEL_MAX_LINES {
-            let text = collect_uncovered(&top_level_lines);
-            let start = top_level_lines[0];
-            let end = *top_level_lines.last().unwrap() + 1;
-            if text.len() >= MIN_CHUNK_CHARS && top_level_lines.len() >= MIN_CHUNK_LINES {
-                let prefix = build_context_prefix(file_path, language, "top_level", None, None);
-                chunks.push(CodeChunk {
-                    id: None,
-                    repo_id,
-                    file_path: file_path.to_string(),
-                    chunk_type: "top_level".to_string(),
-                    symbol_name: None,
-                    language,
-                    start_line: start + 1,
-                    end_line: end,
-                    chunk_text: text,
-                    context_text: prefix,
-                    file_hash: file_hash.to_string(),
-                    content_hash: None,
-                });
-            }
-        } else {
-            // Split top-level into multiple capped chunks
-            for batch in top_level_lines.chunks(TOP_LEVEL_MAX_LINES) {
-                let text = collect_uncovered(batch);
-                let start = batch[0];
-                let end = *batch.last().unwrap() + 1;
-                if text.len() >= MIN_CHUNK_CHARS && batch.len() >= MIN_CHUNK_LINES {
-                    let prefix = build_context_prefix(file_path, language, "top_level", None, None);
-                    chunks.push(CodeChunk {
-                        id: None,
-                        repo_id,
-                        file_path: file_path.to_string(),
-                        chunk_type: "top_level".to_string(),
-                        symbol_name: None,
-                        language,
-                        start_line: start + 1,
-                        end_line: end,
-                        chunk_text: text,
-                        context_text: prefix,
-                        file_hash: file_hash.to_string(),
-                        content_hash: None,
-                    });
-                }
-            }
-        }
-    }
-
-    // Phase 4: Split any oversized chunks.
+    // Phase 5: Split any oversized chunks.
     let final_chunks = split_oversized(chunks);
 
     Ok((symbols, final_chunks))
+}
+
+/// Check if a file is likely generated or minified (would pollute the index).
+fn is_likely_generated(source: &str, file_path: &str) -> bool {
+    // Known generated file patterns.
+    let path_lower = file_path.to_lowercase();
+    if path_lower.contains(".generated.")
+        || path_lower.contains(".auto.")
+        || path_lower.contains("/generated/")
+        || path_lower.contains("_generated.")
+        || path_lower.ends_with(".pb.go")
+        || path_lower.ends_with(".pb.rs")
+        || path_lower.ends_with(".pb.cc")
+        || path_lower.ends_with(".grpc.go")
+        || path_lower.ends_with(".g.dart")
+        || path_lower.ends_with(".freezed.dart")
+        || path_lower.ends_with(".min.js")
+        || path_lower.ends_with(".min.css")
+        || path_lower.ends_with(".bundle.js")
+        || path_lower.contains("/dist/")
+        || path_lower.ends_with(".d.ts")
+    {
+        return true;
+    }
+
+    // Heuristic: minified code has very long average line length.
+    if !source.is_empty() {
+        let line_count = source.lines().count().max(1);
+        let avg_line_len = source.len() / line_count;
+        // Minified JS/CSS typically has avg line length > 300.
+        if avg_line_len > 300 && line_count < 20 {
+            return true;
+        }
+    }
+
+    // Heuristic: file starts with a generation marker.
+    let first_lines: String = source.lines().take(5).collect::<Vec<_>>().join(" ");
+    let first_lower = first_lines.to_lowercase();
+    if first_lower.contains("generated by")
+        || first_lower.contains("auto-generated")
+        || first_lower.contains("do not edit")
+        || first_lower.contains("code generated by")
+        || first_lower.contains("automatically generated")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Extract file-level import/use statements for enriching chunk context.
+///
+/// Returns a compact summary of imports (capped at [`MAX_IMPORT_CONTEXT_CHARS`]).
+fn extract_imports(source: &str, language: Language) -> Option<String> {
+    let mut import_lines = Vec::new();
+    let mut in_go_import_block = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        // Track Go's `import (...)` block.
+        if language == Language::Go {
+            if trimmed == "import (" {
+                in_go_import_block = true;
+                continue;
+            }
+            if in_go_import_block {
+                if trimmed == ")" {
+                    in_go_import_block = false;
+                } else if !trimmed.is_empty() {
+                    import_lines.push(trimmed.to_string());
+                }
+                continue;
+            }
+        }
+
+        let is_import = match language {
+            Language::Rust => trimmed.starts_with("use ") || trimmed.starts_with("pub use "),
+            Language::Python => trimmed.starts_with("import ") || trimmed.starts_with("from "),
+            Language::JavaScript | Language::TypeScript | Language::Tsx => {
+                trimmed.starts_with("import ") || trimmed.contains("require(")
+            }
+            Language::Go => trimmed.starts_with("import "),
+            Language::Java | Language::Kotlin => {
+                trimmed.starts_with("import ") || trimmed.starts_with("package ")
+            }
+            Language::C | Language::Cpp => trimmed.starts_with("#include"),
+            Language::CSharp => trimmed.starts_with("using "),
+            Language::Ruby => {
+                trimmed.starts_with("require ") || trimmed.starts_with("require_relative ")
+            }
+            Language::Php => trimmed.starts_with("use ") || trimmed.starts_with("namespace "),
+            Language::Swift => trimmed.starts_with("import "),
+            Language::Dart => trimmed.starts_with("import ") || trimmed.starts_with("part "),
+            _ => false,
+        };
+
+        if is_import {
+            import_lines.push(trimmed.to_string());
+        }
+    }
+
+    if import_lines.is_empty() {
+        return None;
+    }
+
+    // Cap total import context size.
+    let mut result = String::new();
+    for line in &import_lines {
+        if result.len() + line.len() + 1 > MAX_IMPORT_CONTEXT_CHARS {
+            result.push_str("// ...\n");
+            break;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    Some(result)
 }
 
 fn is_top_level_container(sym: &CodeSymbol) -> bool {
@@ -253,6 +374,10 @@ fn gather_leading_context(lines: &[&str], start_0idx: usize) -> usize {
     ctx_start
 }
 
+/// Build a chunk for a symbol (function, class, method, etc.).
+///
+/// Unlike the previous version, this never returns None — even small functions
+/// (getters, one-liners) are preserved for full search coverage.
 fn build_symbol_chunk(
     lines: &[&str],
     sym: &CodeSymbol,
@@ -260,19 +385,17 @@ fn build_symbol_chunk(
     repo_id: i64,
     file_path: &str,
     file_hash: &str,
-) -> Option<CodeChunk> {
+    imports: Option<&str>,
+) -> CodeChunk {
     let raw_start = sym.start_line.saturating_sub(1);
     let start = gather_leading_context(lines, raw_start);
     let end = sym.end_line.min(lines.len());
 
-    if end <= start {
-        return None;
-    }
-
-    let text = collect_lines(lines, start, end);
-    if text.len() < MIN_CHUNK_CHARS || (end - start) < MIN_CHUNK_LINES {
-        return None;
-    }
+    let text = if end > start {
+        collect_lines(lines, start, end)
+    } else {
+        String::new()
+    };
 
     let chunk_type = match sym.symbol_kind {
         SymbolKind::Function => "function",
@@ -293,9 +416,11 @@ fn build_symbol_chunk(
         chunk_type,
         Some(&sym.symbol_name),
         sym.parent_symbol.as_deref(),
+        sym.signature.as_deref(),
+        imports,
     );
 
-    Some(CodeChunk {
+    CodeChunk {
         id: None,
         repo_id,
         file_path: file_path.to_string(),
@@ -308,10 +433,11 @@ fn build_symbol_chunk(
         context_text: prefix,
         file_hash: file_hash.to_string(),
         content_hash: None,
-    })
+    }
 }
 
 /// Build a skeleton chunk for a large class (declaration + method signatures only).
+#[allow(clippy::too_many_arguments)]
 fn build_skeleton_chunk(
     lines: &[&str],
     sym: &CodeSymbol,
@@ -320,6 +446,7 @@ fn build_skeleton_chunk(
     repo_id: i64,
     file_path: &str,
     file_hash: &str,
+    imports: Option<&str>,
 ) -> CodeChunk {
     let raw_start = sym.start_line.saturating_sub(1);
     let start = gather_leading_context(lines, raw_start);
@@ -347,7 +474,15 @@ fn build_skeleton_chunk(
         }
     }
 
-    let prefix = build_context_prefix(file_path, language, "class", Some(&sym.symbol_name), None);
+    let prefix = build_context_prefix(
+        file_path,
+        language,
+        "class",
+        Some(&sym.symbol_name),
+        None,
+        sym.signature.as_deref(),
+        imports,
+    );
 
     CodeChunk {
         id: None,
@@ -365,16 +500,102 @@ fn build_skeleton_chunk(
     }
 }
 
-/// Build the metadata prefix for storage in the DB.
+/// Group contiguous uncovered lines into semantic top-level blocks.
 ///
-/// This is a lightweight version of `build_context_text` that excludes the code body.
-/// The full context (prefix + code) is reconstructed at embedding time and search time.
+/// Splits on blank lines to create natural groupings rather than
+/// arbitrary fixed-size batches.
+#[allow(clippy::too_many_arguments)]
+fn build_top_level_chunks(
+    lines: &[&str],
+    covered_lines: &[bool],
+    language: Language,
+    repo_id: i64,
+    file_path: &str,
+    file_hash: &str,
+    imports: Option<&str>,
+    chunks: &mut Vec<CodeChunk>,
+) {
+    // Collect contiguous blocks of uncovered non-empty lines.
+    let mut blocks: Vec<(usize, usize)> = Vec::new(); // (start, end) 0-indexed
+    let mut block_start: Option<usize> = None;
+    let mut consecutive_blanks = 0;
+
+    for (i, &covered) in covered_lines.iter().enumerate() {
+        let is_blank = lines.get(i).unwrap_or(&"").trim().is_empty();
+
+        if !covered && !is_blank {
+            if block_start.is_none() {
+                block_start = Some(i);
+            }
+            consecutive_blanks = 0;
+        } else if block_start.is_some() {
+            if is_blank && !covered {
+                consecutive_blanks += 1;
+                // Two+ consecutive blank lines = block boundary.
+                if consecutive_blanks >= 2 {
+                    if let Some(bs) = block_start.take() {
+                        let end = i.saturating_sub(consecutive_blanks - 1);
+                        if end > bs {
+                            blocks.push((bs, end));
+                        }
+                    }
+                    consecutive_blanks = 0;
+                }
+            } else {
+                // Covered line or non-blank covered: end the block.
+                if let Some(bs) = block_start.take() {
+                    blocks.push((bs, i));
+                }
+                consecutive_blanks = 0;
+            }
+        }
+    }
+    // Flush final block.
+    if let Some(bs) = block_start {
+        blocks.push((bs, lines.len()));
+    }
+
+    let prefix = build_context_prefix(file_path, language, "top_level", None, None, None, imports);
+
+    for (block_start_idx, block_end_idx) in blocks {
+        // Collect only uncovered lines within the block.
+        let text: String = (block_start_idx..block_end_idx)
+            .filter(|&i| !covered_lines.get(i).copied().unwrap_or(true))
+            .map(|i| lines.get(i).copied().unwrap_or(""))
+            .collect::<Vec<&str>>()
+            .join("\n");
+
+        if text.len() >= MIN_CHUNK_CHARS {
+            chunks.push(CodeChunk {
+                id: None,
+                repo_id,
+                file_path: file_path.to_string(),
+                chunk_type: "top_level".to_string(),
+                symbol_name: None,
+                language,
+                start_line: block_start_idx + 1,
+                end_line: block_end_idx,
+                chunk_text: text,
+                context_text: prefix.clone(),
+                file_hash: file_hash.to_string(),
+                content_hash: None,
+            });
+        }
+    }
+}
+
+/// Build the metadata prefix stored in the DB.
+///
+/// Includes: file path, language, symbol info, parent, signature, and imports.
+/// This prefix is prepended to the code body at embedding time for rich context.
 pub fn build_context_prefix(
     file_path: &str,
     language: Language,
     chunk_type: &str,
     symbol_name: Option<&str>,
     parent: Option<&str>,
+    signature: Option<&str>,
+    imports: Option<&str>,
 ) -> String {
     let mut ctx = format!("File: {}\nLanguage: {}\n", file_path, language);
 
@@ -386,48 +607,40 @@ pub fn build_context_prefix(
 
     if let Some(p) = parent {
         ctx.push_str(&format!("Parent: {}\n", p));
+    }
+
+    if let Some(sig) = signature {
+        ctx.push_str(&format!("Signature: {}\n", sig));
+    }
+
+    if let Some(imp) = imports {
+        if !imp.is_empty() {
+            ctx.push_str("Imports:\n");
+            ctx.push_str(imp);
+        }
     }
 
     ctx
 }
 
-/// Build enriched context text for embedding.
-pub fn build_context_text(
-    file_path: &str,
-    language: Language,
-    chunk_type: &str,
-    symbol_name: Option<&str>,
-    parent: Option<&str>,
-    code: &str,
-) -> String {
-    let mut ctx = format!("File: {}\nLanguage: {}\n", file_path, language);
-
-    if let Some(name) = symbol_name {
-        ctx.push_str(&format!("Symbol: {} ({})\n", name, chunk_type));
-    } else {
-        ctx.push_str(&format!("Type: {}\n", chunk_type));
-    }
-
-    if let Some(p) = parent {
-        ctx.push_str(&format!("Parent: {}\n", p));
-    }
-
-    ctx.push('\n');
-    // Truncate code if absurdly long for the context field
-    if code.len() > MAX_CHUNK_CHARS {
-        // Find the nearest char boundary at or before MAX_CHUNK_CHARS to avoid
-        // panicking on multi-byte UTF-8 sequences.
+/// Build full embedding text from a chunk's stored context_text and code body.
+///
+/// This is the preferred path for embedding — uses the rich context prefix
+/// (with imports, signature) stored on the chunk rather than reconstructing.
+pub fn build_embedding_text(context_text: &str, chunk_text: &str) -> String {
+    let mut text = context_text.to_string();
+    text.push('\n');
+    if chunk_text.len() > MAX_CHUNK_CHARS {
         let mut end = MAX_CHUNK_CHARS;
-        while end > 0 && !code.is_char_boundary(end) {
+        while end > 0 && !chunk_text.is_char_boundary(end) {
             end -= 1;
         }
-        ctx.push_str(&code[..end]);
-        ctx.push_str("\n// ... truncated ...");
+        text.push_str(&chunk_text[..end]);
+        text.push_str("\n// ... truncated ...");
     } else {
-        ctx.push_str(code);
+        text.push_str(chunk_text);
     }
-
-    ctx
+    text
 }
 
 /// Split chunks that exceed MAX_CHUNK_CHARS.
@@ -443,14 +656,6 @@ fn split_oversized(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
             result.push(chunk);
             continue;
         }
-
-        let prefix = build_context_prefix(
-            &chunk.file_path,
-            chunk.language,
-            &chunk.chunk_type,
-            chunk.symbol_name.as_deref(),
-            None,
-        );
 
         // Split at line boundaries near the limit.
         let lines: Vec<&str> = chunk.chunk_text.lines().collect();
@@ -474,7 +679,7 @@ fn split_oversized(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
                         start_line: base_start_line + part_start,
                         end_line: base_start_line + part_end - 1,
                         chunk_text: text,
-                        context_text: prefix.clone(),
+                        context_text: chunk.context_text.clone(),
                         file_hash: chunk.file_hash.clone(),
                         content_hash: None,
                     });
@@ -495,6 +700,27 @@ fn split_oversized(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: build embedding text from individual components.
+    fn build_context_text(
+        file_path: &str,
+        language: Language,
+        chunk_type: &str,
+        symbol_name: Option<&str>,
+        parent: Option<&str>,
+        code: &str,
+    ) -> String {
+        let prefix = build_context_prefix(
+            file_path,
+            language,
+            chunk_type,
+            symbol_name,
+            parent,
+            None,
+            None,
+        );
+        build_embedding_text(&prefix, code)
+    }
 
     #[test]
     fn test_chunk_rust_file() {
@@ -594,14 +820,105 @@ def main():
     }
 
     #[test]
-    fn test_min_chunk_filtering() {
-        // A file with only a tiny constant — should be filtered out or kept as top_level
-        let src = "const X: i32 = 1;\n";
-        let (_, chunks) = chunk_file(src, Language::Rust, 1, "tiny.rs", "h").unwrap();
-        // Tiny chunks (< MIN_CHUNK_LINES or MIN_CHUNK_CHARS) are filtered
-        for chunk in &chunks {
-            assert!(chunk.chunk_text.len() >= MIN_CHUNK_CHARS);
-        }
+    fn test_small_functions_preserved() {
+        // Small functions should NOT be silently dropped.
+        let src = r#"
+fn get_name() -> &str {
+    "alice"
+}
+
+fn get_age() -> u32 {
+    30
+}
+"#;
+        let (_, chunks) = chunk_file(src, Language::Rust, 1, "getters.rs", "h").unwrap();
+        let fn_names: Vec<&str> = chunks
+            .iter()
+            .filter_map(|c| c.symbol_name.as_deref())
+            .collect();
+        assert!(
+            fn_names.contains(&"get_name"),
+            "Small function get_name should be preserved, got: {:?}",
+            fn_names
+        );
+        assert!(
+            fn_names.contains(&"get_age"),
+            "Small function get_age should be preserved, got: {:?}",
+            fn_names
+        );
+    }
+
+    #[test]
+    fn test_imports_included_in_context() {
+        let src = r#"
+use std::collections::HashMap;
+use std::io::Read;
+
+fn process(data: &HashMap<String, Vec<u8>>) -> String {
+    let mut result = String::new();
+    for (key, value) in data {
+        result.push_str(key);
+    }
+    result
+}
+"#;
+        let (_, chunks) = chunk_file(src, Language::Rust, 1, "process.rs", "h").unwrap();
+        let fn_chunk = chunks
+            .iter()
+            .find(|c| c.symbol_name.as_deref() == Some("process"))
+            .expect("Should have a process function chunk");
+
+        assert!(
+            fn_chunk.context_text.contains("Imports:"),
+            "Context should include imports section"
+        );
+        assert!(
+            fn_chunk.context_text.contains("HashMap"),
+            "Context should include HashMap import"
+        );
+    }
+
+    #[test]
+    fn test_generated_file_skipped() {
+        let src = "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage pb\n";
+        let (symbols, chunks) = chunk_file(src, Language::Go, 1, "api.pb.go", "h").unwrap();
+        assert!(
+            symbols.is_empty(),
+            "Generated file should produce no symbols"
+        );
+        assert!(chunks.is_empty(), "Generated file should produce no chunks");
+    }
+
+    #[test]
+    fn test_minified_file_skipped() {
+        // Single very long line simulating minified JS.
+        let src = "x".repeat(10000);
+        let (symbols, chunks) =
+            chunk_file(&src, Language::JavaScript, 1, "app.min.js", "h").unwrap();
+        assert!(
+            symbols.is_empty(),
+            "Minified file should produce no symbols"
+        );
+        assert!(chunks.is_empty(), "Minified file should produce no chunks");
+    }
+
+    #[test]
+    fn test_signature_in_context() {
+        let src = r#"
+pub fn calculate_total(items: &[Item], tax_rate: f64) -> f64 {
+    items.iter().map(|i| i.price).sum::<f64>() * (1.0 + tax_rate)
+}
+"#;
+        let (_, chunks) = chunk_file(src, Language::Rust, 1, "pricing.rs", "h").unwrap();
+        let fn_chunk = chunks
+            .iter()
+            .find(|c| c.symbol_name.as_deref() == Some("calculate_total"))
+            .expect("Should have calculate_total chunk");
+
+        assert!(
+            fn_chunk.context_text.contains("Signature:"),
+            "Context should include signature"
+        );
     }
 
     #[test]
@@ -972,1459 +1289,237 @@ impl Counter {
     }
 
     #[test]
-    fn test_chunk_file_very_small_source_below_min() {
-        // Single short line -- below both MIN_CHUNK_CHARS (50) and MIN_CHUNK_LINES (3)
-        let src = "let x = 1;";
-        let (_, chunks) = chunk_file(src, Language::Rust, 1, "tiny.rs", "t").unwrap();
-        // Everything should be filtered out due to min thresholds
-        for c in &chunks {
-            assert!(
-                c.chunk_text.len() >= MIN_CHUNK_CHARS,
-                "No chunk should be below MIN_CHUNK_CHARS"
-            );
-        }
+    fn test_extract_imports_rust() {
+        let src = "use std::collections::HashMap;\nuse std::io::Read;\n\nfn main() {}";
+        let imports = extract_imports(src, Language::Rust);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("use std::collections::HashMap;"));
+        assert!(imports.contains("use std::io::Read;"));
     }
 
     #[test]
-    fn test_chunk_file_two_line_function_filtered() {
-        // A function that is only 2 lines -- below MIN_CHUNK_LINES=3
-        // and likely below MIN_CHUNK_CHARS=50
-        let src = "fn f() {\n}\n";
-        let (_, chunks) = chunk_file(src, Language::Rust, 1, "short.rs", "s").unwrap();
-        // The function is too small to be chunked
-        let fn_chunk = chunks
-            .iter()
-            .find(|c| c.symbol_name.as_deref() == Some("f"));
-        assert!(
-            fn_chunk.is_none(),
-            "A 2-line trivial function should be filtered out by MIN thresholds"
+    fn test_extract_imports_python() {
+        let src = "import os\nfrom pathlib import Path\n\ndef main(): pass";
+        let imports = extract_imports(src, Language::Python);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("import os"));
+        assert!(imports.contains("from pathlib import Path"));
+    }
+
+    #[test]
+    fn test_extract_imports_go_block() {
+        let src = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {}";
+        let imports = extract_imports(src, Language::Go);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("\"fmt\""));
+        assert!(imports.contains("\"os\""));
+    }
+
+    #[test]
+    fn test_extract_imports_none_when_empty() {
+        let src = "fn main() {}";
+        let imports = extract_imports(src, Language::Rust);
+        assert!(imports.is_none());
+    }
+
+    #[test]
+    fn test_is_likely_generated_protobuf() {
+        assert!(is_likely_generated("", "api.pb.go"));
+        assert!(is_likely_generated("", "types.pb.rs"));
+        assert!(is_likely_generated("", "service.grpc.go"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_minified() {
+        assert!(is_likely_generated("", "bundle.min.js"));
+        assert!(is_likely_generated("", "styles.min.css"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_header_marker() {
+        let src = "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage pb\n";
+        assert!(is_likely_generated(src, "api.go"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_normal_file() {
+        let src = "fn main() {\n    println!(\"hello\");\n}\n";
+        assert!(!is_likely_generated(src, "main.rs"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_dts() {
+        assert!(is_likely_generated("", "types.d.ts"));
+    }
+
+    #[test]
+    fn test_build_embedding_text() {
+        let prefix = "File: test.rs\nLanguage: Rust\nSymbol: foo (function)\n";
+        let code = "fn foo() { 42 }";
+        let result = build_embedding_text(prefix, code);
+        assert!(result.contains("File: test.rs"));
+        assert!(result.contains("fn foo() { 42 }"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_truncation() {
+        let prefix = "File: big.rs\n";
+        let code = "x".repeat(MAX_CHUNK_CHARS + 500);
+        let result = build_embedding_text(prefix, &code);
+        assert!(result.contains("// ... truncated ..."));
+        assert!(result.len() < code.len());
+    }
+
+    #[test]
+    fn test_build_context_prefix_with_imports_and_signature() {
+        let imports = "use std::io;\nuse std::collections::HashMap;\n";
+        let ctx = build_context_prefix(
+            "src/lib.rs",
+            Language::Rust,
+            "function",
+            Some("process"),
+            Some("Handler"),
+            Some("pub fn process(&self, data: &[u8]) -> Result<()>"),
+            Some(imports),
         );
+        assert!(ctx.contains("File: src/lib.rs"));
+        assert!(ctx.contains("Symbol: process (function)"));
+        assert!(ctx.contains("Parent: Handler"));
+        assert!(ctx.contains("Signature: pub fn process"));
+        assert!(ctx.contains("Imports:"));
+        assert!(ctx.contains("use std::io;"));
     }
 
     #[test]
-    fn test_chunk_file_multiple_standalone_functions() {
+    fn test_contiguous_top_level_grouping() {
+        // Top-level code that isn't captured as symbols should be grouped
+        // by contiguous blocks, not arbitrary fixed-size batches.
         let src = r#"
-/// First function performs alpha processing.
-pub fn alpha(x: i32) -> i32 {
-    let result = x * 2;
-    result + 1
-}
+// Module documentation
+// This module handles configuration parsing
+// and validation for the application.
 
-/// Second function performs beta processing.
-pub fn beta(y: i32) -> i32 {
-    let result = y * 3;
-    result - 1
-}
-
-/// Third function performs gamma processing.
-pub fn gamma(z: i32) -> i32 {
-    let result = z * 4;
-    result + 2
-}
+// Version info
+const VERSION: &str = "1.0";
 "#;
-        let (_symbols, chunks) = chunk_file(src, Language::Rust, 1, "multi.rs", "mh").unwrap();
-
-        let fn_names: Vec<_> = chunks
+        let (_, chunks) = chunk_file(src, Language::Rust, 1, "config.rs", "h").unwrap();
+        // The comments are uncovered top-level code — should be in at most one chunk.
+        let top_chunks: Vec<_> = chunks
             .iter()
-            .filter_map(|c| c.symbol_name.as_deref())
+            .filter(|c| c.chunk_type == "top_level" && c.symbol_name.is_none())
             .collect();
-
-        // All three standalone functions should be chunked
         assert!(
-            fn_names.contains(&"alpha"),
-            "alpha should be chunked, got: {:?}",
-            fn_names
+            top_chunks.len() <= 1,
+            "Contiguous top-level comments should be in one chunk, got {}",
+            top_chunks.len()
         );
-        assert!(
-            fn_names.contains(&"beta"),
-            "beta should be chunked, got: {:?}",
-            fn_names
-        );
-        assert!(
-            fn_names.contains(&"gamma"),
-            "gamma should be chunked, got: {:?}",
-            fn_names
-        );
-
-        // Check that they are all typed as "function"
-        for c in chunks
-            .iter()
-            .filter(|c| matches!(c.symbol_name.as_deref(), Some("alpha" | "beta" | "gamma")))
-        {
-            assert_eq!(c.chunk_type, "function");
-        }
-    }
-
-    #[test]
-    fn test_chunk_file_enum() {
-        let src = r#"
-/// Represents directions.
-pub enum Direction {
-    North,
-    South,
-    East,
-    West,
-}
-"#;
-        let (_, chunks) = chunk_file(src, Language::Rust, 1, "dir.rs", "dh").unwrap();
-
-        let enum_chunk = chunks
-            .iter()
-            .find(|c| c.symbol_name.as_deref() == Some("Direction"));
-        assert!(
-            enum_chunk.is_some(),
-            "Should produce a chunk for the Direction enum"
-        );
-        let ec = enum_chunk.unwrap();
-        assert_eq!(ec.chunk_type, "class"); // Enum maps to "class" chunk_type
-        assert!(ec.chunk_text.contains("pub enum Direction"));
-    }
-
-    #[test]
-    fn test_chunk_file_trait() {
-        let src = r#"
-/// A drawable trait.
-pub trait Drawable {
-    fn draw(&self);
-    fn bounds(&self) -> (i32, i32, i32, i32);
-}
-"#;
-        let (_, chunks) = chunk_file(src, Language::Rust, 1, "draw.rs", "drh").unwrap();
-
-        let trait_chunk = chunks
-            .iter()
-            .find(|c| c.symbol_name.as_deref() == Some("Drawable"));
-        assert!(
-            trait_chunk.is_some(),
-            "Should produce a chunk for the Drawable trait"
-        );
-        let tc = trait_chunk.unwrap();
-        assert_eq!(tc.chunk_type, "class"); // Trait maps to "class" chunk_type
-        assert!(tc.chunk_text.contains("pub trait Drawable"));
-    }
-
-    #[test]
-    fn test_chunk_file_top_level_code() {
-        // Enough uncovered lines to pass MIN thresholds
-        let src = r#"use std::collections::HashMap;
-use std::io::Read;
-use std::io::Write;
-use std::io::BufReader;
-use std::fs::File;
-use std::path::PathBuf;
-use std::env;
-use std::process;
-"#;
-        let (_, chunks) = chunk_file(src, Language::Rust, 1, "imports.rs", "ih").unwrap();
-
-        // These use statements are top-level uncovered code
-        let top_level_chunks: Vec<_> = chunks
-            .iter()
-            .filter(|c| c.chunk_type == "top_level")
-            .collect();
-
-        // If there are enough uncovered lines, they should form a top_level chunk
-        if !top_level_chunks.is_empty() {
-            let tl = &top_level_chunks[0];
-            assert!(tl.symbol_name.is_none());
-            assert!(tl.context_text.contains("Type: top_level"));
-        }
-    }
-
-    #[test]
-    fn test_is_top_level_container_all_kinds_exhaustive() {
-        // Container kinds without parent -> true
-        let containers = [
-            SymbolKind::Class,
-            SymbolKind::Struct,
-            SymbolKind::Trait,
-            SymbolKind::Impl,
-            SymbolKind::Interface,
-            SymbolKind::Enum,
-            SymbolKind::Module,
-        ];
-        for kind in &containers {
-            assert!(
-                is_top_level_container(&make_symbol(*kind, None)),
-                "{:?} without parent should be a top-level container",
-                kind
-            );
-        }
-
-        // Non-container kinds without parent -> false
-        let non_containers = [
-            SymbolKind::Function,
-            SymbolKind::Method,
-            SymbolKind::Constant,
-        ];
-        for kind in &non_containers {
-            assert!(
-                !is_top_level_container(&make_symbol(*kind, None)),
-                "{:?} should NOT be a top-level container",
-                kind
-            );
-        }
-
-        // All kinds with parent -> false
-        for kind in containers.iter().chain(non_containers.iter()) {
-            assert!(
-                !is_top_level_container(&make_symbol(*kind, Some("Parent"))),
-                "{:?} with parent should NOT be a top-level container",
-                kind
-            );
-        }
-    }
-
-    #[test]
-    fn test_mark_covered_empty_array() {
-        let mut covered: Vec<bool> = vec![];
-        mark_covered(&mut covered, 0, 0);
-        assert!(covered.is_empty());
-    }
-
-    #[test]
-    fn test_mark_covered_full_range() {
-        let mut covered = vec![false; 5];
-        mark_covered(&mut covered, 0, 5);
-        assert!(covered.iter().all(|&c| c));
-    }
-
-    #[test]
-    fn test_mark_covered_start_equals_end() {
-        let mut covered = vec![false; 5];
-        mark_covered(&mut covered, 3, 3);
-        // No lines should be covered since start == end means empty range
-        assert!(covered.iter().all(|&c| !c));
-    }
-
-    #[test]
-    fn test_mark_covered_end_exceeds_length() {
-        let mut covered = vec![false; 3];
-        // end > length should be safe due to .take(end).skip(start)
-        mark_covered(&mut covered, 1, 100);
-        assert!(!covered[0]);
-        assert!(covered[1]);
-        assert!(covered[2]);
-    }
-
-    #[test]
-    fn test_mark_covered_single_line() {
-        let mut covered = vec![false; 5];
-        mark_covered(&mut covered, 2, 3);
-        assert!(!covered[0]);
-        assert!(!covered[1]);
-        assert!(covered[2]);
-        assert!(!covered[3]);
-        assert!(!covered[4]);
-    }
-
-    #[test]
-    fn test_collect_lines_empty_array() {
-        let lines: Vec<&str> = vec![];
-        assert_eq!(collect_lines(&lines, 0, 0), "");
-    }
-
-    #[test]
-    fn test_collect_lines_single_line() {
-        let lines = vec!["only line"];
-        assert_eq!(collect_lines(&lines, 0, 1), "only line");
-    }
-
-    #[test]
-    fn test_collect_lines_end_greater_than_len() {
-        let lines = vec!["a", "b", "c"];
-        // end=100 should be clamped to lines.len()=3
-        assert_eq!(collect_lines(&lines, 0, 100), "a\nb\nc");
-    }
-
-    #[test]
-    fn test_collect_lines_start_equals_end() {
-        let lines = vec!["a", "b", "c"];
-        assert_eq!(collect_lines(&lines, 1, 1), "");
-    }
-
-    #[test]
-    fn test_gather_leading_context_python_comments() {
-        let lines = vec![
-            "# This is a Python comment",
-            "# Another Python comment",
-            "def foo():",
-        ];
-        let start = gather_leading_context(&lines, 2);
-        assert_eq!(start, 0, "Should walk back past # comments");
-    }
-
-    #[test]
-    fn test_gather_leading_context_block_comment_continuation() {
-        let lines = vec![
-            "/**",
-            " * Line one of the doc.",
-            " * Line two of the doc.",
-            " */",
-            "fn documented() {}",
-        ];
-        let start = gather_leading_context(&lines, 4);
-        assert_eq!(start, 0, "Should walk back through full block comment");
-    }
-
-    #[test]
-    fn test_gather_leading_context_rust_inner_attribute() {
-        let lines = vec!["#![allow(unused)]", "fn foo() {}"];
-        let start = gather_leading_context(&lines, 1);
-        assert_eq!(start, 0, "Should walk back past #![...] inner attributes");
-    }
-
-    #[test]
-    fn test_gather_leading_context_no_context() {
-        let lines = vec!["let x = 1;", "fn foo() {}"];
-        let start = gather_leading_context(&lines, 1);
-        // "let x = 1;" is not a comment/attr/annotation, so context stays at 1
-        assert_eq!(
-            start, 1,
-            "Non-comment/attribute lines should not be included"
-        );
-    }
-
-    #[test]
-    fn test_gather_leading_context_mixed_comments_and_attributes() {
-        let lines = vec![
-            "/// Documentation comment",
-            "#[derive(Debug)]",
-            "#[allow(dead_code)]",
-            "struct Foo {}",
-        ];
-        let start = gather_leading_context(&lines, 3);
-        assert_eq!(
-            start, 0,
-            "Should walk back through interleaved comments and attributes"
-        );
-    }
-
-    #[test]
-    fn test_gather_leading_context_triple_quote_docstring() {
-        let lines = vec!["\"\"\"", "This is a docstring.", "\"\"\"", "def foo():"];
-        let start = gather_leading_context(&lines, 3);
-        // With multi-line docstring support, we walk back through the closing
-        // triple-quote, across the body, and through the opening triple-quote.
-        assert_eq!(
-            start, 0,
-            "Should walk back through entire multi-line triple-quote docstring"
-        );
-    }
-
-    #[test]
-    fn test_gather_leading_context_python_single_triple_quote() {
-        let lines = vec!["'''", "Docstring body.", "'''", "def bar():"];
-        let start = gather_leading_context(&lines, 3);
-        // With multi-line docstring support, we walk back through the full docstring.
-        assert_eq!(
-            start, 0,
-            "Should walk back through entire multi-line single-quote docstring"
-        );
-    }
-
-    fn make_symbol_with_lines(
-        kind: SymbolKind,
-        name: &str,
-        start: usize,
-        end: usize,
-        parent: Option<&str>,
-        signature: Option<&str>,
-    ) -> CodeSymbol {
-        CodeSymbol {
-            id: None,
-            repo_id: 1,
-            file_path: "test.rs".to_string(),
-            symbol_name: name.to_string(),
-            symbol_kind: kind,
-            parent_symbol: parent.map(|s| s.to_string()),
-            language: Language::Rust,
-            start_line: start,
-            end_line: end,
-            signature: signature.map(|s| s.to_string()),
-        }
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_function() {
-        let lines: Vec<&str> = vec![
-            "/// Docs for foo.",
-            "pub fn foo(x: i32) -> i32 {",
-            "    let y = x * 2;",
-            "    y + 1",
-            "}",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Function, "foo", 2, 5, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_some());
-        let c = chunk.unwrap();
-        assert_eq!(c.chunk_type, "function");
-        assert!(c.chunk_text.contains("/// Docs for foo."));
-        assert!(c.chunk_text.contains("pub fn foo"));
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_method() {
-        let lines: Vec<&str> = vec![
-            "impl Foo {",
-            "    /// Method docs.",
-            "    pub fn bar(&self) -> String {",
-            "        self.name.clone()",
-            "    }",
-            "}",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Method, "bar", 3, 5, Some("Foo"), None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_some());
-        let c = chunk.unwrap();
-        assert_eq!(c.chunk_type, "function"); // Method maps to "function"
-        assert!(c.context_text.contains("Parent: Foo"));
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_class() {
-        let lines: Vec<&str> = vec![
-            "/// A class.",
-            "class MyClass {",
-            "    field1: i32,",
-            "    field2: String,",
-            "}",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Class, "MyClass", 2, 5, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_some());
-        assert_eq!(chunk.unwrap().chunk_type, "class");
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_struct() {
-        let lines: Vec<&str> = vec![
-            "/// A struct.",
-            "pub struct Point {",
-            "    pub x: f64,",
-            "    pub y: f64,",
-            "}",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Struct, "Point", 2, 5, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_some());
-        assert_eq!(chunk.unwrap().chunk_type, "class"); // Struct maps to "class"
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_impl() {
-        let lines: Vec<&str> = vec![
-            "/// Impl block.",
-            "impl Point {",
-            "    fn new() -> Self {",
-            "        Self { x: 0.0, y: 0.0 }",
-            "    }",
-            "}",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Impl, "Point", 2, 6, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_some());
-        assert_eq!(chunk.unwrap().chunk_type, "impl_block");
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_trait() {
-        let lines: Vec<&str> = vec![
-            "/// A trait.",
-            "pub trait Renderable {",
-            "    fn render(&self);",
-            "    fn update(&mut self);",
-            "}",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Trait, "Renderable", 2, 5, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_some());
-        assert_eq!(chunk.unwrap().chunk_type, "class"); // Trait maps to "class"
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_interface() {
-        let lines: Vec<&str> = vec![
-            "/// An interface.",
-            "interface Printable {",
-            "    fn print(&self);",
-            "    fn format(&self) -> String;",
-            "}",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Interface, "Printable", 2, 5, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_some());
-        assert_eq!(chunk.unwrap().chunk_type, "class"); // Interface maps to "class"
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_enum() {
-        let lines: Vec<&str> = vec![
-            "/// An enum.",
-            "pub enum Color {",
-            "    Red,",
-            "    Green,",
-            "    Blue,",
-            "}",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Enum, "Color", 2, 6, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_some());
-        assert_eq!(chunk.unwrap().chunk_type, "class"); // Enum maps to "class"
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_module() {
-        let lines: Vec<&str> = vec![
-            "/// Module docs.",
-            "mod inner {",
-            "    pub fn helper() {}",
-            "    pub fn util() {}",
-            "}",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Module, "inner", 2, 5, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_some());
-        assert_eq!(chunk.unwrap().chunk_type, "module_header");
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_constant() {
-        let lines: Vec<&str> = vec![
-            "/// A constant.",
-            "/// With multiline docs.",
-            "pub const MAX_SIZE: usize = 1024;",
-            "pub const MIN_SIZE: usize = 1;",
-            "pub const DEFAULT: usize = 512;",
-        ];
-        let sym = make_symbol_with_lines(SymbolKind::Constant, "MAX_SIZE", 3, 5, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        // Constant maps to "top_level"
-        if let Some(c) = chunk {
-            assert_eq!(c.chunk_type, "top_level");
-        }
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_returns_none_for_tiny() {
-        // Symbol that is too small (< MIN_CHUNK_CHARS and < MIN_CHUNK_LINES)
-        let lines: Vec<&str> = vec!["fn t() {}"];
-        let sym = make_symbol_with_lines(SymbolKind::Function, "t", 1, 1, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(
-            chunk.is_none(),
-            "A tiny single-line function should be filtered out"
-        );
-    }
-
-    #[test]
-    fn test_build_symbol_chunk_returns_none_when_end_lte_start() {
-        let lines: Vec<&str> = vec!["fn foo() {}"];
-        // end_line < start_line
-        let sym = make_symbol_with_lines(SymbolKind::Function, "foo", 5, 1, None, None);
-        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "h");
-        assert!(chunk.is_none(), "Should return None when end <= start");
     }
 
     #[test]
     fn test_build_context_text_all_chunk_types() {
-        let types_and_names = vec![
-            ("function", Some("my_func"), None),
+        let types = [
+            ("function", Some("process_data"), Some("DataProcessor")),
             ("class", Some("MyClass"), None),
             ("impl_block", Some("MyStruct"), None),
-            ("module_header", Some("my_mod"), None),
             ("top_level", None, None),
-            ("function", Some("method"), Some("ParentClass")),
+            ("module_header", Some("mymod"), None),
         ];
 
-        for (chunk_type, sym_name, parent) in &types_and_names {
+        for (chunk_type, symbol, parent) in &types {
             let ctx = build_context_text(
-                "test.rs",
+                "file.rs",
                 Language::Rust,
                 chunk_type,
-                *sym_name,
+                *symbol,
                 *parent,
-                "code here",
+                "code",
             );
-            assert!(ctx.contains("File: test.rs"));
-            assert!(ctx.contains("Language: Rust"));
-            if let Some(name) = sym_name {
+            assert!(
+                ctx.contains("File: file.rs"),
+                "Missing file info for {}",
+                chunk_type
+            );
+            assert!(
+                ctx.contains("Language: Rust"),
+                "Missing language for {}",
+                chunk_type
+            );
+            if let Some(sym) = symbol {
                 assert!(
-                    ctx.contains(&format!("Symbol: {} ({})", name, chunk_type)),
-                    "ctx should contain Symbol line for {}",
-                    name,
+                    ctx.contains(&format!("Symbol: {} ({})", sym, chunk_type)),
+                    "Missing symbol for {}",
+                    chunk_type
                 );
-            } else {
-                assert!(ctx.contains(&format!("Type: {}", chunk_type)));
             }
             if let Some(p) = parent {
-                assert!(ctx.contains(&format!("Parent: {}", p)));
+                assert!(
+                    ctx.contains(&format!("Parent: {}", p)),
+                    "Missing parent for {}",
+                    chunk_type
+                );
             }
-            assert!(ctx.contains("code here"));
         }
     }
 
     #[test]
     fn test_build_context_text_different_languages() {
-        let languages = vec![
-            (Language::Python, "Python"),
-            (Language::TypeScript, "TypeScript"),
-            (Language::Go, "Go"),
-            (Language::Java, "Java"),
+        let languages = [
+            Language::Rust,
+            Language::Python,
+            Language::TypeScript,
+            Language::Java,
+            Language::Go,
         ];
-        for (lang, expected_str) in &languages {
+        for lang in &languages {
             let ctx = build_context_text("file.ext", *lang, "function", Some("f"), None, "code");
             assert!(
-                ctx.contains(&format!("Language: {}", expected_str)),
-                "Context should contain the correct language string for {:?}",
-                lang,
+                ctx.contains(&format!("Language: {}", lang)),
+                "Missing language for {}",
+                lang
             );
         }
     }
 
     #[test]
     fn test_build_context_text_truncation_at_char_boundary() {
-        // Create code with multi-byte characters near the boundary
-        // Each character below is 3 bytes in UTF-8
-        let mut code = String::new();
-        for _ in 0..(MAX_CHUNK_CHARS / 3 + 100) {
-            code.push('\u{2603}'); // Snowman character (3 bytes each)
-        }
-        assert!(code.len() > MAX_CHUNK_CHARS);
+        // Create a string with multi-byte characters that might split at a bad boundary
+        let code = "a".repeat(MAX_CHUNK_CHARS - 10) + &"\u{00e9}".repeat(20); // é is 2 bytes in UTF-8
+
         let ctx = build_context_text("test.rs", Language::Rust, "top_level", None, None, &code);
+        // Should not panic and should be valid UTF-8
         assert!(ctx.contains("// ... truncated ..."));
-        // Verify the truncation happened at a valid char boundary (no panic)
-        assert!(ctx.is_char_boundary(ctx.len()));
-    }
-
-    #[test]
-    fn test_split_oversized_empty_input() {
-        let result = split_oversized(vec![]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_split_oversized_multiple_chunks_mixed() {
-        let small_chunk = CodeChunk {
-            id: None,
-            repo_id: 1,
-            file_path: "test.rs".to_string(),
-            chunk_type: "function".to_string(),
-            symbol_name: Some("small".to_string()),
-            language: Language::Rust,
-            start_line: 1,
-            end_line: 3,
-            chunk_text: "fn small() {\n    println!(\"small\");\n}".to_string(),
-            context_text: "ctx".to_string(),
-            file_hash: "h".to_string(),
-            content_hash: None,
-        };
-
-        let long_line = "y".repeat(200);
-        let big_lines: Vec<String> = (0..50)
-            .map(|i| format!("// line {}: {}", i, long_line))
-            .collect();
-        let big_text = big_lines.join("\n");
-        let big_chunk = CodeChunk {
-            id: None,
-            repo_id: 1,
-            file_path: "test.rs".to_string(),
-            chunk_type: "top_level".to_string(),
-            symbol_name: None,
-            language: Language::Rust,
-            start_line: 10,
-            end_line: 60,
-            chunk_text: big_text,
-            context_text: "ctx".to_string(),
-            file_hash: "h".to_string(),
-            content_hash: None,
-        };
-
-        let result = split_oversized(vec![small_chunk.clone(), big_chunk]);
-        // The small chunk should pass through unchanged
-        assert_eq!(result[0].chunk_text, small_chunk.chunk_text);
-        // The big chunk should be split into multiple
-        assert!(
-            result.len() > 2,
-            "Should have 1 small + multiple splits from big, got {}",
-            result.len()
-        );
-    }
-
-    #[test]
-    fn test_split_oversized_preserves_metadata() {
-        let long_line = "z".repeat(300);
-        let big_lines: Vec<String> = (0..40)
-            .map(|i| format!("// line {}: {}", i, long_line))
-            .collect();
-        let big_text = big_lines.join("\n");
-        assert!(big_text.len() > MAX_CHUNK_CHARS);
-
-        let chunk = CodeChunk {
-            id: None,
-            repo_id: 99,
-            file_path: "meta.rs".to_string(),
-            chunk_type: "function".to_string(),
-            symbol_name: Some("big_fn".to_string()),
-            language: Language::Rust,
-            start_line: 5,
-            end_line: 45,
-            chunk_text: big_text,
-            context_text: "ctx".to_string(),
-            file_hash: "meta_hash".to_string(),
-            content_hash: None,
-        };
-
-        let result = split_oversized(vec![chunk]);
-        assert!(result.len() > 1);
-        for c in &result {
-            assert_eq!(c.repo_id, 99);
-            assert_eq!(c.file_path, "meta.rs");
-            assert_eq!(c.chunk_type, "function");
-            assert_eq!(c.symbol_name.as_deref(), Some("big_fn"));
-            assert_eq!(c.language, Language::Rust);
-            assert_eq!(c.file_hash, "meta_hash");
-            // Context text should be regenerated (not the original "ctx")
-            assert!(c.context_text.contains("File: meta.rs"));
-        }
-    }
-
-    #[test]
-    fn test_split_oversized_line_numbers_are_sequential() {
-        let long_line = "w".repeat(300);
-        let big_lines: Vec<String> = (0..40)
-            .map(|i| format!("// line {}: {}", i, long_line))
-            .collect();
-        let big_text = big_lines.join("\n");
-        assert!(big_text.len() > MAX_CHUNK_CHARS);
-
-        let chunk = CodeChunk {
-            id: None,
-            repo_id: 1,
-            file_path: "seq.rs".to_string(),
-            chunk_type: "top_level".to_string(),
-            symbol_name: None,
-            language: Language::Rust,
-            start_line: 10,
-            end_line: 50,
-            chunk_text: big_text,
-            context_text: "ctx".to_string(),
-            file_hash: "h".to_string(),
-            content_hash: None,
-        };
-
-        let result = split_oversized(vec![chunk]);
-        assert!(result.len() > 1);
-        // Verify line numbers are monotonically increasing and non-overlapping
-        for i in 1..result.len() {
-            assert!(
-                result[i].start_line > result[i - 1].start_line,
-                "start_line should be increasing: chunk {} starts at {} but prev starts at {}",
-                i,
-                result[i].start_line,
-                result[i - 1].start_line
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_skeleton_chunk_basic() {
-        // Create a source with enough lines for a "large" container
-        let mut src_lines: Vec<String> = Vec::new();
-        src_lines.push("/// Docs for BigStruct.".to_string());
-        src_lines.push("pub struct BigStruct {".to_string());
-        for i in 0..110 {
-            src_lines.push(format!("    field_{}: i32,", i));
-        }
-        src_lines.push("}".to_string());
-
-        let lines: Vec<&str> = src_lines.iter().map(|s| s.as_str()).collect();
-
-        let container =
-            make_symbol_with_lines(SymbolKind::Struct, "BigStruct", 2, lines.len(), None, None);
-
-        let method = make_symbol_with_lines(
-            SymbolKind::Method,
-            "do_thing",
-            50,
-            55,
-            Some("BigStruct"),
-            Some("fn do_thing(&self) -> i32"),
-        );
-
-        let all_symbols = vec![container.clone(), method];
-
-        let skeleton = build_skeleton_chunk(
-            &lines,
-            &all_symbols[0],
-            &all_symbols,
-            Language::Rust,
-            1,
-            "big.rs",
-            "bh",
-        );
-
-        assert_eq!(skeleton.chunk_type, "class");
-        assert_eq!(skeleton.symbol_name.as_deref(), Some("BigStruct"));
-        assert_eq!(skeleton.repo_id, 1);
-        assert_eq!(skeleton.file_path, "big.rs");
-        assert_eq!(skeleton.file_hash, "bh");
-        // Skeleton should contain the "... methods ..." marker
-        assert!(
-            skeleton.chunk_text.contains("// ... methods ..."),
-            "Skeleton should contain the methods marker"
-        );
-        // Skeleton should contain the method signature
-        assert!(
-            skeleton.chunk_text.contains("fn do_thing(&self) -> i32"),
-            "Skeleton should contain method signature"
-        );
-        // Should contain leading doc comment
-        assert!(
-            skeleton.chunk_text.contains("/// Docs for BigStruct"),
-            "Skeleton should include leading doc comments"
-        );
-        // Context text should be properly formed
-        assert!(skeleton.context_text.contains("File: big.rs"));
-        assert!(skeleton.context_text.contains("Symbol: BigStruct (class)"));
-    }
-
-    #[test]
-    fn test_build_skeleton_chunk_no_methods() {
-        let mut src_lines: Vec<String> = Vec::new();
-        src_lines.push("pub struct EmptyBig {".to_string());
-        for i in 0..110 {
-            src_lines.push(format!("    field_{}: i32,", i));
-        }
-        src_lines.push("}".to_string());
-
-        let lines: Vec<&str> = src_lines.iter().map(|s| s.as_str()).collect();
-
-        let container =
-            make_symbol_with_lines(SymbolKind::Struct, "EmptyBig", 1, lines.len(), None, None);
-
-        let skeleton = build_skeleton_chunk(
-            &lines,
-            &container,
-            std::slice::from_ref(&container),
-            Language::Rust,
-            1,
-            "empty_big.rs",
-            "ebh",
-        );
-
-        // Should still contain the header and methods marker but no signatures
-        assert!(skeleton.chunk_text.contains("// ... methods ..."));
-        assert!(skeleton.chunk_text.contains("pub struct EmptyBig"));
-    }
-
-    #[test]
-    fn test_build_skeleton_chunk_multiple_methods() {
-        let mut src_lines: Vec<String> = Vec::new();
-        src_lines.push("impl BigImpl {".to_string());
-        for i in 0..120 {
-            src_lines.push(format!("    // line {}", i));
-        }
-        src_lines.push("}".to_string());
-
-        let lines: Vec<&str> = src_lines.iter().map(|s| s.as_str()).collect();
-
-        let container =
-            make_symbol_with_lines(SymbolKind::Impl, "BigImpl", 1, lines.len(), None, None);
-        let method_a = make_symbol_with_lines(
-            SymbolKind::Method,
-            "alpha",
-            10,
-            20,
-            Some("BigImpl"),
-            Some("fn alpha(&self)"),
-        );
-        let method_b = make_symbol_with_lines(
-            SymbolKind::Function,
-            "beta",
-            30,
-            40,
-            Some("BigImpl"),
-            Some("fn beta() -> bool"),
-        );
-
-        let all_symbols = vec![container.clone(), method_a, method_b];
-
-        let skeleton = build_skeleton_chunk(
-            &lines,
-            &all_symbols[0],
-            &all_symbols,
-            Language::Rust,
-            1,
-            "multi_method.rs",
-            "mmh",
-        );
-
-        assert!(skeleton.chunk_text.contains("fn alpha(&self)"));
-        assert!(skeleton.chunk_text.contains("fn beta() -> bool"));
-        // Each method signature should be followed by { ... }
-        assert!(skeleton.chunk_text.contains("{ ... }"));
-    }
-
-    #[test]
-    fn test_build_skeleton_chunk_method_without_signature() {
-        let mut src_lines: Vec<String> = Vec::new();
-        src_lines.push("impl NoSig {".to_string());
-        for i in 0..110 {
-            src_lines.push(format!("    // padding line {}", i));
-        }
-        src_lines.push("}".to_string());
-
-        let lines: Vec<&str> = src_lines.iter().map(|s| s.as_str()).collect();
-
-        let container =
-            make_symbol_with_lines(SymbolKind::Impl, "NoSig", 1, lines.len(), None, None);
-        // Method without a signature field
-        let method = make_symbol_with_lines(
-            SymbolKind::Method,
-            "no_sig_method",
-            10,
-            20,
-            Some("NoSig"),
-            None, // No signature
-        );
-
-        let all_symbols = vec![container.clone(), method];
-
-        let skeleton = build_skeleton_chunk(
-            &lines,
-            &all_symbols[0],
-            &all_symbols,
-            Language::Rust,
-            1,
-            "nosig.rs",
-            "nsh",
-        );
-
-        // Method without signature should not appear in skeleton signatures
-        assert!(
-            !skeleton.chunk_text.contains("no_sig_method"),
-            "Method without signature should not add a line to the skeleton"
-        );
-    }
-
-    #[test]
-    fn test_chunk_file_large_impl_triggers_skeleton() {
-        // Build a Rust source file with an impl block > LARGE_CLASS_LINES (100)
-        let mut src = String::new();
-        src.push_str("pub struct BigThing {\n    val: i32,\n}\n\n");
-        src.push_str("impl BigThing {\n");
-        // Create multiple methods, each with enough lines to pass min thresholds
-        for i in 0..15 {
-            src.push_str(&format!("    /// Method {i} does stuff.\n"));
-            src.push_str(&format!("    pub fn method_{i}(&self) -> i32 {{\n"));
-            for j in 0..6 {
-                src.push_str(&format!("        let v{j} = self.val + {j};\n"));
-            }
-            src.push_str("        0\n");
-            src.push_str("    }\n\n");
-        }
-        src.push_str("}\n");
-
-        let (symbols, chunks) = chunk_file(&src, Language::Rust, 1, "big_thing.rs", "bth").unwrap();
-
-        assert!(!symbols.is_empty());
-        assert!(!chunks.is_empty());
-
-        // Verify that we got some function-typed chunks for the methods
-        let fn_chunks: Vec<_> = chunks
-            .iter()
-            .filter(|c| c.chunk_type == "function")
-            .collect();
-        assert!(
-            !fn_chunks.is_empty(),
-            "Large impl should produce individual method chunks"
-        );
-    }
-
-    #[test]
-    fn test_chunk_file_mixed_rust_symbols() {
-        let src = r#"
-use std::fmt;
-
-/// A color enum.
-pub enum Color {
-    Red,
-    Green,
-    Blue,
-    Custom(u8, u8, u8),
-}
-
-/// A shape struct.
-pub struct Shape {
-    name: String,
-    color: Color,
-}
-
-/// Creates a default shape with meaningful content.
-pub fn default_shape() -> Shape {
-    let name = String::from("circle");
-    let color = Color::Blue;
-    Shape { name, color }
-}
-
-/// Formats a shape for display with extra detail.
-pub fn format_shape(s: &Shape) -> String {
-    let prefix = "Shape";
-    let result = format!("{}: {}", prefix, s.name);
-    result
-}
-"#;
-        let (symbols, chunks) = chunk_file(src, Language::Rust, 1, "shapes.rs", "sh").unwrap();
-
-        assert!(!symbols.is_empty());
-        assert!(!chunks.is_empty());
-
-        let names: Vec<_> = chunks
-            .iter()
-            .filter_map(|c| c.symbol_name.as_deref())
-            .collect();
-
-        // Should include the enum, struct, and standalone functions
-        assert!(
-            names.contains(&"Color"),
-            "Should chunk Color enum: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"Shape"),
-            "Should chunk Shape struct: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"default_shape"),
-            "Should chunk default_shape fn: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"format_shape"),
-            "Should chunk format_shape fn: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn test_chunk_file_whitespace_only() {
-        let src = "   \n\n\n   \n";
-        let (symbols, chunks) = chunk_file(src, Language::Rust, 1, "ws.rs", "wh").unwrap();
-        assert!(symbols.is_empty());
-        assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_file_function_with_attrs_and_docs() {
-        let src = r#"
-/// This function is well documented.
-/// It has multiple doc comment lines.
-#[inline]
-#[must_use]
-pub fn documented_fn(input: &str) -> String {
-    let trimmed = input.trim();
-    let result = trimmed.to_uppercase();
-    result
-}
-"#;
-        let (_, chunks) = chunk_file(src, Language::Rust, 1, "documented.rs", "dh").unwrap();
-
-        let fn_chunk = chunks
-            .iter()
-            .find(|c| c.symbol_name.as_deref() == Some("documented_fn"));
-        assert!(fn_chunk.is_some(), "Should chunk the documented function");
-        let fc = fn_chunk.unwrap();
-        // The chunk should include docs and attributes via gather_leading_context
-        assert!(
-            fc.chunk_text
-                .contains("/// This function is well documented"),
-            "Chunk should include doc comments"
-        );
-        assert!(
-            fc.chunk_text.contains("#[inline]"),
-            "Chunk should include #[inline] attribute"
-        );
-        assert!(
-            fc.chunk_text.contains("#[must_use]"),
-            "Chunk should include #[must_use] attribute"
-        );
-    }
-
-    #[test]
-    fn test_chunk_file_metadata_propagation() {
-        let src = r#"
-/// A helper function with enough lines.
-pub fn helper(x: i32) -> i32 {
-    let a = x + 1;
-    let b = a * 2;
-    b
-}
-"#;
-        let repo_id = 42;
-        let file_hash = "deadbeef";
-        let (_, chunks) = chunk_file(src, Language::Rust, repo_id, "meta.rs", file_hash).unwrap();
-
-        assert!(!chunks.is_empty());
-        for c in &chunks {
-            assert_eq!(c.repo_id, repo_id, "repo_id should propagate");
-            assert_eq!(c.file_hash, file_hash, "file_hash should propagate");
-            assert_eq!(c.file_path, "meta.rs", "file_path should propagate");
-            assert_eq!(c.language, Language::Rust, "language should propagate");
-        }
-    }
-
-    #[test]
-    fn test_chunk_lua_single_function() {
-        let src = r#"
--- A greeting function
-function greet(name)
-    local msg = "Hello, " .. name
-    print(msg)
-    return msg
-end
-"#;
-        let (symbols, chunks) =
-            chunk_file(src, Language::Lua, 1, "greet.lua", "lua_hash1").unwrap();
-
-        assert!(!symbols.is_empty(), "Should extract at least 1 symbol");
-        assert!(!chunks.is_empty(), "Should produce at least 1 chunk");
-
-        // All chunks should have correct metadata
-        for chunk in &chunks {
-            assert_eq!(chunk.language, Language::Lua);
-            assert_eq!(chunk.file_path, "greet.lua");
-            assert_eq!(chunk.file_hash, "lua_hash1");
-            assert!(chunk.context_text.contains("Language: Lua"));
-            assert!(chunk.context_text.contains("File: greet.lua"));
-        }
-    }
-
-    #[test]
-    fn test_chunk_lua_multiple_functions() {
-        let src = r#"
--- Module configuration
-local M = {}
-
-function M.setup(opts)
-    M.config = opts or {}
-    M.config.enabled = M.config.enabled ~= false
-    return M
-end
-
-local function validate(input)
-    if type(input) ~= "string" then
-        return false, "expected string"
-    end
-    if #input == 0 then
-        return false, "empty string"
-    end
-    return true
-end
-
-function M.process(data)
-    local ok, err = validate(data)
-    if not ok then
-        error(err)
-    end
-    return string.upper(data)
-end
-
-return M
-"#;
-        let (symbols, chunks) =
-            chunk_file(src, Language::Lua, 1, "module.lua", "lua_hash2").unwrap();
-
-        // Should find multiple function symbols
-        let func_symbols: Vec<_> = symbols
-            .iter()
-            .filter(|s| s.symbol_kind == SymbolKind::Function)
-            .collect();
-        assert!(
-            func_symbols.len() >= 2,
-            "Expected at least 2 function symbols, got {}",
-            func_symbols.len()
-        );
-
-        // Should have chunks
-        assert!(!chunks.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_lua_empty_file() {
-        let src = "";
-        let (symbols, chunks) =
-            chunk_file(src, Language::Lua, 1, "empty.lua", "empty_hash").unwrap();
-        assert!(symbols.is_empty());
-        assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_lua_only_comments() {
-        let src = r#"
--- This is a comment
--- Another comment
--- Yet another comment
-"#;
-        let (symbols, _chunks) =
-            chunk_file(src, Language::Lua, 1, "comments.lua", "ch").unwrap();
-        assert!(symbols.is_empty(), "Comments should not produce symbols");
-    }
-
-    #[test]
-    fn test_chunk_lua_metadata_propagation() {
-        let src = r#"
-function compute(x)
-    local result = x * 2
-    result = result + 1
-    return result
-end
-"#;
-        let repo_id = 99;
-        let file_hash = "lua_meta";
-        let (_, chunks) =
-            chunk_file(src, Language::Lua, repo_id, "compute.lua", file_hash).unwrap();
-
-        for c in &chunks {
-            assert_eq!(c.repo_id, repo_id);
-            assert_eq!(c.file_hash, file_hash);
-            assert_eq!(c.file_path, "compute.lua");
-            assert_eq!(c.language, Language::Lua);
-        }
-    }
-
-    #[test]
-    fn test_chunk_json_produces_top_level_chunk() {
-        let src = r#"
-{
-    "name": "my-project",
-    "version": "1.0.0",
-    "description": "A sample project",
-    "main": "index.js",
-    "scripts": {
-        "build": "tsc",
-        "test": "jest --coverage",
-        "lint": "eslint . --fix"
-    },
-    "dependencies": {
-        "express": "^4.18.0",
-        "lodash": "^4.17.21"
-    },
-    "devDependencies": {
-        "typescript": "^5.0.0",
-        "jest": "^29.0.0",
-        "eslint": "^8.0.0"
-    }
-}
-"#;
-        let (symbols, chunks) =
-            chunk_file(src, Language::Json, 1, "package.json", "json_hash").unwrap();
-
-        // JSON has no code symbols
-        assert!(
-            symbols.is_empty(),
-            "JSON should not produce symbols, got: {:?}",
-            symbols.iter().map(|s| &s.symbol_name).collect::<Vec<_>>()
-        );
-
-        // But it should still produce top-level chunks (for search)
-        if !chunks.is_empty() {
-            for c in &chunks {
-                assert_eq!(c.language, Language::Json);
-                assert_eq!(c.file_path, "package.json");
-                assert_eq!(c.chunk_type, "top_level");
-                assert!(c.context_text.contains("Language: JSON"));
-            }
-        }
-    }
-
-    #[test]
-    fn test_chunk_json_empty_object() {
-        let src = "{}";
-        let (symbols, _chunks) =
-            chunk_file(src, Language::Json, 1, "empty.json", "h").unwrap();
-        assert!(symbols.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_json_no_symbols_but_preserves_metadata() {
-        let src = r#"
-{
-    "compilerOptions": {
-        "target": "ES2020",
-        "module": "commonjs",
-        "strict": true,
-        "esModuleInterop": true,
-        "skipLibCheck": true,
-        "forceConsistentCasingInFileNames": true,
-        "outDir": "./dist",
-        "rootDir": "./src"
-    }
-}
-"#;
-        let (symbols, chunks) =
-            chunk_file(src, Language::Json, 7, "tsconfig.json", "ts_hash").unwrap();
-        assert!(symbols.is_empty());
-        for c in &chunks {
-            assert_eq!(c.repo_id, 7);
-            assert_eq!(c.file_hash, "ts_hash");
-        }
-    }
-
-    #[test]
-    fn test_chunk_yaml_produces_top_level_chunk() {
-        let src = r#"
-name: Build and Test
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
-
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rust: [stable, nightly]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-      - run: cargo test --all-features
-"#;
-        let (symbols, chunks) =
-            chunk_file(src, Language::Yaml, 1, "ci.yaml", "yaml_hash").unwrap();
-
-        assert!(symbols.is_empty(), "YAML should not produce symbols");
-
-        if !chunks.is_empty() {
-            for c in &chunks {
-                assert_eq!(c.language, Language::Yaml);
-                assert_eq!(c.file_path, "ci.yaml");
-                assert!(c.context_text.contains("Language: YAML"));
-            }
-        }
-    }
-
-    #[test]
-    fn test_chunk_yaml_simple_config() {
-        let src = "key: value\n";
-        let (symbols, _chunks) =
-            chunk_file(src, Language::Yaml, 1, "config.yml", "h").unwrap();
-        assert!(symbols.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_yaml_docker_compose() {
-        let src = r#"
-version: "3.8"
-services:
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    ports:
-      - "8080:8080"
-    environment:
-      - DATABASE_URL=postgres://localhost/mydb
-      - REDIS_URL=redis://localhost:6379
-    depends_on:
-      - db
-      - redis
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: mydb
-      POSTGRES_PASSWORD: secret
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-volumes:
-  pgdata:
-"#;
-        let (symbols, chunks) =
-            chunk_file(src, Language::Yaml, 2, "docker-compose.yml", "dc_hash").unwrap();
-        assert!(symbols.is_empty());
-        for c in &chunks {
-            assert_eq!(c.repo_id, 2);
-            assert_eq!(c.language, Language::Yaml);
-        }
-    }
-
-    #[test]
-    fn test_chunk_dockerfile_returns_error() {
-        // Dockerfile has no tree-sitter grammar, so chunk_file (which calls parse_file)
-        // should return an error.
-        let src = r#"
-FROM rust:1.75-slim as builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/app /usr/local/bin/
-EXPOSE 8080
-CMD ["app"]
-"#;
-        let result = chunk_file(src, Language::Dockerfile, 1, "Dockerfile", "df_hash");
-        assert!(
-            result.is_err(),
-            "Dockerfile chunking should fail (no grammar)"
-        );
     }
 
     #[test]
     fn test_build_context_text_lua() {
         let ctx = build_context_text(
-            "init.lua",
+            "plugin.lua",
             Language::Lua,
             "function",
             Some("setup"),
             None,
-            "function setup(opts)",
+            "function setup() end",
         );
-        assert!(ctx.contains("File: init.lua"));
         assert!(ctx.contains("Language: Lua"));
         assert!(ctx.contains("Symbol: setup (function)"));
-        assert!(ctx.contains("function setup(opts)"));
+        assert!(ctx.contains("function setup() end"));
     }
 
     #[test]
     fn test_build_context_text_json() {
-        let ctx = build_context_text(
-            "package.json",
-            Language::Json,
-            "top_level",
-            None,
-            None,
-            "",
-        );
-        assert!(ctx.contains("File: package.json"));
+        let ctx = build_context_text("package.json", Language::Json, "top_level", None, None, "");
         assert!(ctx.contains("Language: JSON"));
+        assert!(ctx.contains("Type: top_level"));
     }
 
     #[test]
     fn test_build_context_text_yaml() {
-        let ctx = build_context_text(
-            "ci.yaml",
-            Language::Yaml,
-            "top_level",
-            None,
-            None,
-            "",
-        );
-        assert!(ctx.contains("File: ci.yaml"));
+        let ctx = build_context_text("ci.yaml", Language::Yaml, "top_level", None, None, "");
         assert!(ctx.contains("Language: YAML"));
+        assert!(ctx.contains("Type: top_level"));
     }
 
     #[test]
@@ -2437,7 +1532,921 @@ CMD ["app"]
             None,
             "",
         );
-        assert!(ctx.contains("File: Dockerfile"));
         assert!(ctx.contains("Language: Dockerfile"));
+    }
+
+    #[test]
+    fn test_extract_imports_javascript() {
+        let src = "import React from 'react';\nimport { useState } from 'react';\n\nconst App = () => {};";
+        let imports = extract_imports(src, Language::JavaScript);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("import React from 'react';"));
+        assert!(imports.contains("import { useState } from 'react';"));
+    }
+
+    #[test]
+    fn test_extract_imports_java() {
+        let src = "package com.example;\n\nimport java.util.List;\nimport java.util.Map;\n\npublic class Foo {}";
+        let imports = extract_imports(src, Language::Java);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("package com.example;"));
+        assert!(imports.contains("import java.util.List;"));
+    }
+
+    #[test]
+    fn test_extract_imports_c() {
+        let src = "#include <stdio.h>\n#include \"myheader.h\"\n\nint main() { return 0; }";
+        let imports = extract_imports(src, Language::C);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("#include <stdio.h>"));
+        assert!(imports.contains("#include \"myheader.h\""));
+    }
+
+    #[test]
+    fn test_extract_imports_caps_at_limit() {
+        // Many imports should be capped at MAX_IMPORT_CONTEXT_CHARS.
+        let imports_src: String = (0..100)
+            .map(|i| format!("use crate::module{}::SomeLongTypeName;", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let src = format!("{}\n\nfn main() {{}}", imports_src);
+        let imports = extract_imports(&src, Language::Rust);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.len() <= MAX_IMPORT_CONTEXT_CHARS + 10); // +10 for trailing "// ...\n"
+        assert!(imports.contains("// ..."));
+    }
+
+    #[test]
+    fn test_chunk_file_large_class_splitting() {
+        // Create a Python class with > LARGE_CLASS_LINES (100) lines
+        // so that it triggers the skeleton + per-method chunking path.
+        let mut src = String::from("import os\n\nclass BigClass:\n");
+        // Add methods so total line count > 100
+        for i in 0..40 {
+            src.push_str(&format!(
+                "    def method_{}(self):\n        return {}\n\n",
+                i, i
+            ));
+        }
+        // Should be well over 100 lines
+        let line_count = src.lines().count();
+        assert!(
+            line_count > LARGE_CLASS_LINES,
+            "Test source should be > {} lines, got {}",
+            LARGE_CLASS_LINES,
+            line_count
+        );
+
+        let (symbols, chunks) =
+            chunk_file(&src, Language::Python, 1, "big_class.py", "bighash").unwrap();
+        assert!(!symbols.is_empty());
+        assert!(!chunks.is_empty());
+
+        // Should have a skeleton chunk for the class
+        let class_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.symbol_name.as_deref() == Some("BigClass") && c.chunk_type == "class")
+            .collect();
+        assert!(
+            !class_chunks.is_empty(),
+            "Should have a skeleton class chunk for BigClass"
+        );
+
+        // The skeleton chunk should contain method signatures placeholder
+        let skeleton = &class_chunks[0];
+        assert!(
+            skeleton.chunk_text.contains("// ... methods ..."),
+            "Skeleton should contain method signature placeholder"
+        );
+
+        // Should have individual method chunks
+        let method_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.chunk_type == "function" && c.symbol_name.is_some())
+            .collect();
+        assert!(
+            !method_chunks.is_empty(),
+            "Should have individual method chunks from the large class"
+        );
+    }
+
+    #[test]
+    fn test_build_symbol_chunk_method_type() {
+        let sym = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.rs".to_string(),
+            symbol_name: "do_something".to_string(),
+            symbol_kind: SymbolKind::Method,
+            parent_symbol: Some("MyStruct".to_string()),
+            language: Language::Rust,
+            start_line: 2,
+            end_line: 5,
+            signature: Some("fn do_something(&self)".to_string()),
+        };
+        let lines = vec![
+            "impl MyStruct {",
+            "    fn do_something(&self) {",
+            "        println!(\"hello\");",
+            "    }",
+            "}",
+        ];
+        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "hash", None);
+        assert_eq!(chunk.chunk_type, "function");
+        assert_eq!(chunk.symbol_name.as_deref(), Some("do_something"));
+        assert!(chunk.context_text.contains("Parent: MyStruct"));
+        assert!(chunk
+            .context_text
+            .contains("Signature: fn do_something(&self)"));
+    }
+
+    #[test]
+    fn test_build_symbol_chunk_constant_type() {
+        let sym = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.rs".to_string(),
+            symbol_name: "MAX_SIZE".to_string(),
+            symbol_kind: SymbolKind::Constant,
+            parent_symbol: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 1,
+            signature: None,
+        };
+        let lines = vec!["const MAX_SIZE: usize = 100;"];
+        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "hash", None);
+        assert_eq!(chunk.chunk_type, "top_level");
+        assert_eq!(chunk.symbol_name.as_deref(), Some("MAX_SIZE"));
+    }
+
+    #[test]
+    fn test_build_symbol_chunk_module_type() {
+        let sym = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.rs".to_string(),
+            symbol_name: "utils".to_string(),
+            symbol_kind: SymbolKind::Module,
+            parent_symbol: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 3,
+            signature: None,
+        };
+        let lines = vec!["mod utils {", "    pub fn helper() {}", "}"];
+        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "hash", None);
+        assert_eq!(chunk.chunk_type, "module_header");
+    }
+
+    #[test]
+    fn test_build_symbol_chunk_enum_type() {
+        let sym = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.rs".to_string(),
+            symbol_name: "Color".to_string(),
+            symbol_kind: SymbolKind::Enum,
+            parent_symbol: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 4,
+            signature: None,
+        };
+        let lines = vec!["enum Color {", "    Red,", "    Blue,", "}"];
+        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "hash", None);
+        assert_eq!(chunk.chunk_type, "class");
+    }
+
+    #[test]
+    fn test_build_symbol_chunk_interface_type() {
+        let sym = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.ts".to_string(),
+            symbol_name: "UserService".to_string(),
+            symbol_kind: SymbolKind::Interface,
+            parent_symbol: None,
+            language: Language::TypeScript,
+            start_line: 1,
+            end_line: 3,
+            signature: None,
+        };
+        let lines = vec!["interface UserService {", "    getUser(): User;", "}"];
+        let chunk = build_symbol_chunk(
+            &lines,
+            &sym,
+            Language::TypeScript,
+            1,
+            "test.ts",
+            "hash",
+            None,
+        );
+        assert_eq!(chunk.chunk_type, "class");
+    }
+
+    #[test]
+    fn test_build_symbol_chunk_trait_type() {
+        let sym = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.rs".to_string(),
+            symbol_name: "Drawable".to_string(),
+            symbol_kind: SymbolKind::Trait,
+            parent_symbol: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 3,
+            signature: None,
+        };
+        let lines = vec!["trait Drawable {", "    fn draw(&self);", "}"];
+        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "hash", None);
+        assert_eq!(chunk.chunk_type, "class");
+    }
+
+    #[test]
+    fn test_build_symbol_chunk_with_imports() {
+        let sym = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.rs".to_string(),
+            symbol_name: "process".to_string(),
+            symbol_kind: SymbolKind::Function,
+            parent_symbol: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 3,
+            signature: Some("fn process() -> bool".to_string()),
+        };
+        let lines = vec!["fn process() -> bool {", "    true", "}"];
+        let imports = "use std::io;\n";
+        let chunk = build_symbol_chunk(
+            &lines,
+            &sym,
+            Language::Rust,
+            1,
+            "test.rs",
+            "hash",
+            Some(imports),
+        );
+        assert!(chunk.context_text.contains("Imports:"));
+        assert!(chunk.context_text.contains("use std::io;"));
+    }
+
+    #[test]
+    fn test_build_symbol_chunk_empty_range() {
+        // When end <= start, the text should be empty
+        let sym = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.rs".to_string(),
+            symbol_name: "empty".to_string(),
+            symbol_kind: SymbolKind::Function,
+            parent_symbol: None,
+            language: Language::Rust,
+            start_line: 5,
+            end_line: 1, // end before start
+            signature: None,
+        };
+        let lines = vec!["line1", "line2"];
+        let chunk = build_symbol_chunk(&lines, &sym, Language::Rust, 1, "test.rs", "hash", None);
+        assert!(chunk.chunk_text.is_empty());
+    }
+
+    #[test]
+    fn test_build_skeleton_chunk_with_methods() {
+        // Build a class symbol with child methods
+        let class_sym = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.py".to_string(),
+            symbol_name: "Calculator".to_string(),
+            symbol_kind: SymbolKind::Class,
+            parent_symbol: None,
+            language: Language::Python,
+            start_line: 1,
+            end_line: 15,
+            signature: Some("class Calculator".to_string()),
+        };
+
+        let method1 = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.py".to_string(),
+            symbol_name: "add".to_string(),
+            symbol_kind: SymbolKind::Method,
+            parent_symbol: Some("Calculator".to_string()),
+            language: Language::Python,
+            start_line: 3,
+            end_line: 5,
+            signature: Some("def add(self, a, b)".to_string()),
+        };
+
+        let method2 = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.py".to_string(),
+            symbol_name: "subtract".to_string(),
+            symbol_kind: SymbolKind::Method,
+            parent_symbol: Some("Calculator".to_string()),
+            language: Language::Python,
+            start_line: 7,
+            end_line: 9,
+            signature: Some("def subtract(self, a, b)".to_string()),
+        };
+
+        // A function not belonging to Calculator - should be excluded
+        let other_fn = CodeSymbol {
+            id: None,
+            repo_id: 1,
+            file_path: "test.py".to_string(),
+            symbol_name: "standalone".to_string(),
+            symbol_kind: SymbolKind::Function,
+            parent_symbol: None,
+            language: Language::Python,
+            start_line: 11,
+            end_line: 13,
+            signature: Some("def standalone()".to_string()),
+        };
+
+        let all_symbols = vec![class_sym.clone(), method1, method2, other_fn];
+
+        let mut lines = Vec::new();
+        for i in 0..15 {
+            lines.push(format!("# line {}", i));
+        }
+        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+
+        let chunk = build_skeleton_chunk(
+            &line_refs,
+            &class_sym,
+            &all_symbols,
+            Language::Python,
+            1,
+            "test.py",
+            "hash",
+            None,
+        );
+
+        assert_eq!(chunk.chunk_type, "class");
+        assert_eq!(chunk.symbol_name.as_deref(), Some("Calculator"));
+        // Should contain method signatures
+        assert!(
+            chunk.chunk_text.contains("def add(self, a, b)"),
+            "Skeleton should include add method signature. Got: {}",
+            chunk.chunk_text
+        );
+        assert!(
+            chunk.chunk_text.contains("def subtract(self, a, b)"),
+            "Skeleton should include subtract method signature"
+        );
+        // Should NOT contain standalone function (different parent)
+        assert!(
+            !chunk.chunk_text.contains("def standalone()"),
+            "Skeleton should not include functions from other parents"
+        );
+        assert!(chunk.chunk_text.contains("// ... methods ..."));
+    }
+
+    #[test]
+    fn test_build_top_level_chunks_basic() {
+        let lines = vec![
+            "// This is a top-level comment",
+            "// describing the module",
+            "",
+            "// Another block",
+            "// of comments",
+        ];
+        let covered_lines = vec![false, false, false, false, false];
+        let mut chunks = Vec::new();
+
+        build_top_level_chunks(
+            &lines,
+            &covered_lines,
+            Language::Rust,
+            1,
+            "test.rs",
+            "hash",
+            None,
+            &mut chunks,
+        );
+
+        assert!(
+            !chunks.is_empty(),
+            "Should produce at least one top-level chunk"
+        );
+        for c in &chunks {
+            assert_eq!(c.chunk_type, "top_level");
+            assert!(c.symbol_name.is_none());
+        }
+    }
+
+    #[test]
+    fn test_build_top_level_chunks_split_on_double_blank() {
+        // Two consecutive blank lines should split blocks
+        let lines = vec![
+            "// Block 1 line 1",
+            "// Block 1 line 2",
+            "",
+            "",
+            "// Block 2 line 1",
+            "// Block 2 line 2",
+        ];
+        let covered_lines = vec![false, false, false, false, false, false];
+        let mut chunks = Vec::new();
+
+        build_top_level_chunks(
+            &lines,
+            &covered_lines,
+            Language::Rust,
+            1,
+            "test.rs",
+            "hash",
+            None,
+            &mut chunks,
+        );
+
+        assert!(
+            chunks.len() >= 2,
+            "Double blank line should split into at least 2 blocks, got {}",
+            chunks.len()
+        );
+    }
+
+    #[test]
+    fn test_build_top_level_chunks_covered_lines_end_block() {
+        // A covered line in the middle should end the current block
+        let lines = vec![
+            "// uncovered line 1",
+            "// uncovered line 2",
+            "fn covered_fn() {}", // covered
+            "// uncovered line 3",
+            "// uncovered line 4",
+        ];
+        let covered_lines = vec![false, false, true, false, false];
+        let mut chunks = Vec::new();
+
+        build_top_level_chunks(
+            &lines,
+            &covered_lines,
+            Language::Rust,
+            1,
+            "test.rs",
+            "hash",
+            None,
+            &mut chunks,
+        );
+
+        // Should produce 2 blocks: lines 0-1 and lines 3-4
+        assert!(
+            chunks.len() >= 2,
+            "Covered line should split into separate blocks, got {}",
+            chunks.len()
+        );
+    }
+
+    #[test]
+    fn test_build_top_level_chunks_all_covered() {
+        let lines = vec!["fn a() {}", "fn b() {}"];
+        let covered_lines = vec![true, true];
+        let mut chunks = Vec::new();
+
+        build_top_level_chunks(
+            &lines,
+            &covered_lines,
+            Language::Rust,
+            1,
+            "test.rs",
+            "hash",
+            None,
+            &mut chunks,
+        );
+
+        assert!(
+            chunks.is_empty(),
+            "All covered lines should produce no top-level chunks"
+        );
+    }
+
+    #[test]
+    fn test_build_top_level_chunks_below_min_size() {
+        // Lines too short (< MIN_CHUNK_CHARS) should be skipped
+        let lines = vec!["x"];
+        let covered_lines = vec![false];
+        let mut chunks = Vec::new();
+
+        build_top_level_chunks(
+            &lines,
+            &covered_lines,
+            Language::Rust,
+            1,
+            "test.rs",
+            "hash",
+            None,
+            &mut chunks,
+        );
+
+        assert!(
+            chunks.is_empty(),
+            "Text below MIN_CHUNK_CHARS should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_gather_leading_context_python_triple_quote_multiline() {
+        let lines = vec![
+            "\"\"\"",
+            "This is a multi-line",
+            "docstring.",
+            "\"\"\"",
+            "def documented_func():",
+            "    pass",
+        ];
+        let start = gather_leading_context(&lines, 4);
+        assert!(
+            start == 0,
+            "Should walk back through entire triple-quote docstring, got start={}",
+            start
+        );
+    }
+
+    #[test]
+    fn test_gather_leading_context_python_single_line_triple_quote() {
+        let lines = vec![
+            "\"\"\"Single-line docstring.\"\"\"",
+            "def func():",
+            "    pass",
+        ];
+        let start = gather_leading_context(&lines, 1);
+        assert_eq!(
+            start, 0,
+            "Should walk back past single-line triple-quote docstring"
+        );
+    }
+
+    #[test]
+    fn test_gather_leading_context_python_triple_single_quote() {
+        let lines = vec!["'''", "Docstring body", "'''", "def func():", "    pass"];
+        let start = gather_leading_context(&lines, 3);
+        assert_eq!(
+            start, 0,
+            "Should walk back through ''' multi-line docstring"
+        );
+    }
+
+    #[test]
+    fn test_gather_leading_context_rust_inner_attribute() {
+        let lines = vec!["#![allow(unused)]", "fn main() {}"];
+        let start = gather_leading_context(&lines, 1);
+        assert_eq!(start, 0, "Should walk back past #![] inner attribute");
+    }
+
+    #[test]
+    fn test_gather_leading_context_past_bounds() {
+        let lines = vec!["line0"];
+        // start_0idx beyond array length should return the same index
+        let start = gather_leading_context(&lines, 5);
+        assert_eq!(start, 5, "Out of bounds start should be returned as-is");
+    }
+
+    #[test]
+    fn test_extract_imports_typescript() {
+        let src = "import { Component } from '@angular/core';\nconst x = require('lodash');\n\nclass Foo {}";
+        let imports = extract_imports(src, Language::TypeScript);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("import { Component }"));
+        assert!(imports.contains("require('lodash')"));
+    }
+
+    #[test]
+    fn test_extract_imports_csharp() {
+        let src = "using System;\nusing System.Collections.Generic;\n\nclass Program {}";
+        let imports = extract_imports(src, Language::CSharp);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("using System;"));
+        assert!(imports.contains("using System.Collections.Generic;"));
+    }
+
+    #[test]
+    fn test_extract_imports_ruby() {
+        let src = "require 'json'\nrequire_relative 'utils'\n\ndef main; end";
+        let imports = extract_imports(src, Language::Ruby);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("require 'json'"));
+        assert!(imports.contains("require_relative 'utils'"));
+    }
+
+    #[test]
+    fn test_extract_imports_php() {
+        let src = "namespace App\\Controllers;\n\nuse App\\Models\\User;\nuse Illuminate\\Http\\Request;\n\nclass Controller {}";
+        let imports = extract_imports(src, Language::Php);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("namespace App\\Controllers;"));
+        assert!(imports.contains("use App\\Models\\User;"));
+    }
+
+    #[test]
+    fn test_extract_imports_swift() {
+        let src = "import UIKit\nimport Foundation\n\nclass ViewController {}";
+        let imports = extract_imports(src, Language::Swift);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("import UIKit"));
+        assert!(imports.contains("import Foundation"));
+    }
+
+    #[test]
+    fn test_extract_imports_dart() {
+        let src = "import 'dart:io';\npart 'generated.g.dart';\n\nvoid main() {}";
+        let imports = extract_imports(src, Language::Dart);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("import 'dart:io';"));
+        assert!(imports.contains("part 'generated.g.dart';"));
+    }
+
+    #[test]
+    fn test_extract_imports_cpp() {
+        let src = "#include <iostream>\n#include \"myheader.h\"\n\nint main() { return 0; }";
+        let imports = extract_imports(src, Language::Cpp);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("#include <iostream>"));
+    }
+
+    #[test]
+    fn test_extract_imports_kotlin() {
+        let src = "package com.example.app\n\nimport kotlinx.coroutines.*\nimport java.util.List\n\nfun main() {}";
+        let imports = extract_imports(src, Language::Kotlin);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("package com.example.app"));
+        assert!(imports.contains("import kotlinx.coroutines.*"));
+    }
+
+    #[test]
+    fn test_extract_imports_go_single() {
+        let src = "package main\n\nimport \"fmt\"\n\nfunc main() {}";
+        let imports = extract_imports(src, Language::Go);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("import \"fmt\""));
+    }
+
+    #[test]
+    fn test_extract_imports_lua_no_imports() {
+        // Lua doesn't match any import patterns (not in the language branches)
+        let src = "local x = require('foo')\n\nfunction main() end";
+        let imports = extract_imports(src, Language::Lua);
+        assert!(imports.is_none(), "Lua has no import detection patterns");
+    }
+
+    #[test]
+    fn test_extract_imports_rust_pub_use() {
+        let src = "pub use crate::types::*;\nuse std::io;\n\nfn main() {}";
+        let imports = extract_imports(src, Language::Rust);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("pub use crate::types::*;"));
+        assert!(imports.contains("use std::io;"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_auto_pattern() {
+        assert!(is_likely_generated("", "types.auto.dart"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_generated_dir() {
+        assert!(is_likely_generated("", "src/generated/api.rs"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_freezed_dart() {
+        assert!(is_likely_generated("", "model.freezed.dart"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_g_dart() {
+        assert!(is_likely_generated("", "model.g.dart"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_bundle_js() {
+        assert!(is_likely_generated("", "vendor.bundle.js"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_dist_dir() {
+        assert!(is_likely_generated("", "project/dist/app.js"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_auto_generated_header() {
+        let src = "# Auto-generated file\nclass Foo: pass";
+        assert!(is_likely_generated(src, "model.py"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_automatically_generated_header() {
+        let src = "// Automatically generated by codegen\npackage main";
+        assert!(is_likely_generated(src, "main.go"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_pb_cc() {
+        assert!(is_likely_generated("", "service.pb.cc"));
+    }
+
+    #[test]
+    fn test_is_likely_generated_underscore_generated() {
+        assert!(is_likely_generated("", "schema_generated.rs"));
+    }
+
+    #[test]
+    fn test_chunk_file_standalone_constant() {
+        let src = r#"
+const MAX_RETRIES: u32 = 3;
+const TIMEOUT: u64 = 5000;
+
+fn process() {
+    println!("processing");
+}
+"#;
+        let (symbols, chunks) = chunk_file(src, Language::Rust, 1, "config.rs", "hash").unwrap();
+        assert!(!symbols.is_empty());
+
+        // Check that constants and function are both chunked
+        let fn_chunk = chunks
+            .iter()
+            .find(|c| c.symbol_name.as_deref() == Some("process"));
+        assert!(fn_chunk.is_some(), "Should have a process function chunk");
+    }
+
+    #[test]
+    fn test_chunk_file_multiple_standalone_functions() {
+        let src = r#"
+fn alpha() -> i32 {
+    1
+}
+
+fn beta() -> i32 {
+    2
+}
+
+fn gamma() -> i32 {
+    3
+}
+"#;
+        let (_, chunks) = chunk_file(src, Language::Rust, 1, "funcs.rs", "hash").unwrap();
+        let fn_names: Vec<&str> = chunks
+            .iter()
+            .filter_map(|c| c.symbol_name.as_deref())
+            .collect();
+        assert!(
+            fn_names.contains(&"alpha"),
+            "Missing alpha, got: {:?}",
+            fn_names
+        );
+        assert!(
+            fn_names.contains(&"beta"),
+            "Missing beta, got: {:?}",
+            fn_names
+        );
+        assert!(
+            fn_names.contains(&"gamma"),
+            "Missing gamma, got: {:?}",
+            fn_names
+        );
+    }
+
+    #[test]
+    fn test_split_oversized_with_overlap() {
+        // Create a chunk that will split into multiple parts and verify overlap
+        let long_line = "y".repeat(250);
+        let lines: Vec<String> = (0..40)
+            .map(|i| format!("// ln{}: {}", i, long_line))
+            .collect();
+        let big_text = lines.join("\n");
+        assert!(big_text.len() > MAX_CHUNK_CHARS);
+
+        let chunk = CodeChunk {
+            id: None,
+            repo_id: 1,
+            file_path: "overlap.rs".to_string(),
+            chunk_type: "function".to_string(),
+            symbol_name: Some("big_fn".to_string()),
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 40,
+            chunk_text: big_text,
+            context_text: "File: overlap.rs".to_string(),
+            file_hash: "hash".to_string(),
+            content_hash: None,
+        };
+        let result = split_oversized(vec![chunk]);
+        assert!(result.len() > 1, "Should produce multiple chunks");
+
+        // Verify that the second chunk's start overlaps with the first chunk's end
+        if result.len() >= 2 {
+            let first_lines: Vec<&str> = result[0].chunk_text.lines().collect();
+            let second_lines: Vec<&str> = result[1].chunk_text.lines().collect();
+            // The overlap should mean the first few lines of chunk 2 match the last few of chunk 1
+            let overlap_end = first_lines.len().min(OVERLAP_LINES);
+            let first_tail = &first_lines[first_lines.len().saturating_sub(overlap_end)..];
+            let second_head = &second_lines[..overlap_end.min(second_lines.len())];
+            // At least one line should overlap
+            assert!(
+                first_tail.iter().any(|line| second_head.contains(line)),
+                "Split chunks should have overlapping context lines"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_context_prefix_empty_imports() {
+        let ctx = build_context_prefix(
+            "test.rs",
+            Language::Rust,
+            "function",
+            Some("f"),
+            None,
+            None,
+            Some(""),
+        );
+        // Empty imports should not add "Imports:" section
+        assert!(!ctx.contains("Imports:"));
+    }
+
+    #[test]
+    fn test_chunk_file_javascript_with_require() {
+        let src = "const fs = require('fs');\nconst path = require('path');\n\nfunction readFile(name) {\n    return fs.readFileSync(name);\n}\n";
+        let (_, chunks) = chunk_file(src, Language::JavaScript, 1, "app.js", "hash").unwrap();
+
+        // Should find a function chunk
+        let fn_chunk = chunks
+            .iter()
+            .find(|c| c.symbol_name.as_deref() == Some("readFile"));
+        assert!(fn_chunk.is_some(), "Should have readFile function chunk");
+
+        // Context should include require imports
+        if let Some(fc) = fn_chunk {
+            assert!(
+                fc.context_text.contains("Imports:"),
+                "JS chunk should have import context with require()"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_file_go_with_imports() {
+        let src = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n";
+        let (_, chunks) = chunk_file(src, Language::Go, 1, "main.go", "hash").unwrap();
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_extract_imports_go_empty_lines_in_block() {
+        // Go import block with blank lines between imports should skip blanks
+        let src = "package main\n\nimport (\n\t\"fmt\"\n\n\t\"os\"\n)\n\nfunc main() {}";
+        let imports = extract_imports(src, Language::Go);
+        assert!(imports.is_some());
+        let imports = imports.unwrap();
+        assert!(imports.contains("\"fmt\""));
+        assert!(imports.contains("\"os\""));
+    }
+
+    #[test]
+    fn test_build_top_level_chunks_single_blank_does_not_split() {
+        // A single blank line should NOT split blocks (only 2+ consecutive blanks split)
+        let lines = vec!["// First line of block", "", "// Third line of block"];
+        let covered_lines = vec![false, false, false];
+        let mut chunks = Vec::new();
+
+        build_top_level_chunks(
+            &lines,
+            &covered_lines,
+            Language::Rust,
+            1,
+            "test.rs",
+            "hash",
+            None,
+            &mut chunks,
+        );
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "Single blank line should not split blocks, got {} chunks",
+            chunks.len()
+        );
     }
 }

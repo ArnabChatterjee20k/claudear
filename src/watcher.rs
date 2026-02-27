@@ -2,27 +2,19 @@
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::feedback::{
-    format_similar_issues_context, FeedbackAnalyzer, FixOutcome, IssueEmbeddingService, Outcome,
-};
+use crate::feedback::{FeedbackAnalyzer, IssueEmbeddingService, Outcome};
 use crate::github::GitHubClient;
 use crate::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
-use crate::notifier::send_to_all_and_wait_first_reply;
 use crate::notifier::Notifier;
-use crate::qa::{
-    build_correlation_id, embed_text, find_reusable_qa, format_answer_context,
-    format_reuse_context, format_timeout_context, normalize_text,
-};
 use crate::repo::{worktree_path, GitOps, RepoIndex, RepoRelationships};
 use crate::retry::RetryManager;
 use crate::runner::{self, AgentRunner};
 use crate::scm::{PrReviewState, PrStatus, ReviewEvent, ReviewWatcher, ScmProvider};
 use crate::source::IssueSource;
-use crate::storage::{classify_error, compute_error_hash, FixAttemptTracker};
+use crate::storage::FixAttemptTracker;
 use crate::types::{
-    ActivityLogEntry, AskRequest, ErrorPattern, FixAttemptStats, FixAttemptStatus, Issue,
-    IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric, QaKnowledgeEntry,
-    RegressionWatch,
+    ActivityLogEntry, FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType,
+    MatchPriority, MatchResult, ProcessingMetric, RegressionWatch,
 };
 use crate::users::UserRegistry;
 use chrono::{DateTime, Utc};
@@ -33,6 +25,72 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
+
+/// Extracts the source name from a processing key of the form "source:issue_id".
+fn source_from_processing_key(key: &str) -> &str {
+    key.split_once(':').map_or(key, |(source, _)| source)
+}
+
+/// Tracks which issues are currently being processed, with O(1) per-source count lookups.
+struct ProcessingState {
+    keys: HashSet<String>,
+    source_counts: HashMap<String, usize>,
+}
+
+impl ProcessingState {
+    fn new() -> Self {
+        Self {
+            keys: HashSet::new(),
+            source_counts: HashMap::new(),
+        }
+    }
+
+    /// Insert a processing key. Returns `true` if the key was newly inserted.
+    fn insert(&mut self, key: String) -> bool {
+        if self.keys.insert(key.clone()) {
+            let source = source_from_processing_key(&key).to_string();
+            *self.source_counts.entry(source).or_insert(0) += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a processing key. Returns `true` if the key was present.
+    fn remove(&mut self, key: &str) -> bool {
+        if self.keys.remove(key) {
+            let source = source_from_processing_key(key).to_string();
+            if let Some(count) = self.source_counts.get_mut(&source) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.source_counts.remove(&source);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.keys.contains(key)
+    }
+
+    /// O(1) count of active processing items for a given source.
+    fn source_count(&self, source: &str) -> usize {
+        self.source_counts.get(source).copied().unwrap_or(0)
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
 
 /// Options for creating a watcher.
 pub struct WatcherOptions {
@@ -73,7 +131,7 @@ pub struct Watcher {
     agent: Arc<dyn AgentRunner>,
     dry_run: bool,
     is_running: AtomicBool,
-    processing: RwLock<HashSet<String>>,
+    processing: RwLock<ProcessingState>,
     active_processing: AtomicUsize,
     /// Feedback analyzer for learning from past outcomes
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
@@ -105,7 +163,7 @@ impl Watcher {
             user_registry: options.user_registry,
             dry_run: options.dry_run,
             is_running: AtomicBool::new(false),
-            processing: RwLock::new(HashSet::new()),
+            processing: RwLock::new(ProcessingState::new()),
             active_processing: AtomicUsize::new(0),
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             last_seen_releases: RwLock::new(HashMap::new()),
@@ -124,7 +182,7 @@ impl Watcher {
         duration: Option<f64>,
         poll_interval_ms: u64,
     ) {
-        let dsn = match std::env::var("SENTRY_DSN") {
+        let dsn = match std::env::var("CLAUDEAR_SENTRY_DSN") {
             Ok(d) if !d.is_empty() => d,
             _ => return,
         };
@@ -144,7 +202,7 @@ impl Watcher {
         }
         let ingest = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
 
-        let environment = std::env::var("SENTRY_ENVIRONMENT").unwrap_or_default();
+        let environment = std::env::var("CLAUDEAR_SENTRY_ENVIRONMENT").unwrap_or_default();
         let interval_minutes = (poll_interval_ms / 60_000).max(1);
 
         let mut url = format!(
@@ -417,6 +475,83 @@ impl Watcher {
         };
 
         inferrer.with_index(|index| self.tracker.sync_from_index(index, sync_files))
+    }
+
+    /// Incrementally re-index a single repository's code after a fetch.
+    ///
+    /// Uses file-content hashing so only changed files are re-parsed and re-embedded.
+    /// No-ops when code indexing is disabled or the embedding client is unavailable.
+    async fn reindex_repo(&self, repo_name: &str, repo_path: &std::path::Path) {
+        if !self.config.code_index.enabled {
+            return;
+        }
+        let emb_client = match self.embedding_client {
+            Some(ref c) => c.clone(),
+            None => return,
+        };
+        let code_indexer = crate::repo::code_index::CodeIndexer::with_config(
+            self.tracker.clone(),
+            emb_client,
+            self.config.code_index.max_file_size_kb,
+            self.config.code_index.batch_size,
+        );
+        match code_indexer.index_repo(repo_name, repo_path).await {
+            Ok(stats) => {
+                if stats.files_processed > 0 {
+                    tracing::info!(
+                        repo = %repo_name,
+                        files = stats.files_processed,
+                        chunks = stats.chunks_created,
+                        "Re-indexed repo after fetch"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(repo = %repo_name, error = %e, "Failed to re-index repo after fetch");
+            }
+        }
+    }
+
+    /// Pull (fetch) and re-index all known repositories.
+    ///
+    /// Iterates through every repo in the index, runs `git fetch origin`, then
+    /// incrementally re-indexes changed files.  Called periodically by the
+    /// housekeeping worker based on `code_index.reindex_interval_hours`.
+    pub async fn pull_and_reindex_all_repos(&self) {
+        let inferrer = match &self.inferrer {
+            Some(inf) => inf,
+            None => return,
+        };
+
+        let repos: Vec<(String, std::path::PathBuf, String)> = inferrer
+            .with_index(|index| {
+                Ok(index
+                    .list()
+                    .into_iter()
+                    .filter(|r| r.path.exists())
+                    .map(|r| (r.name.clone(), r.path.clone(), r.scm_url.clone()))
+                    .collect())
+            })
+            .unwrap_or_default();
+
+        if repos.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            count = repos.len(),
+            "Pulling and re-indexing all repositories"
+        );
+
+        for (name, path, scm_url) in &repos {
+            if let Err(e) = GitOps::ensure_repo_fetched(path, scm_url).await {
+                tracing::warn!(repo = %name, error = %e, "Failed to fetch repo during periodic reindex");
+                continue;
+            }
+            self.reindex_repo(name, path).await;
+        }
+
+        tracing::info!("Periodic pull and re-index complete");
     }
 
     /// Warm-start: clone repos, sync to DB, index code, and load feedback outcomes.
@@ -765,6 +900,15 @@ impl Watcher {
     /// Check if the watcher is in dry-run mode.
     pub fn is_dry_run(&self) -> bool {
         self.dry_run
+    }
+
+    /// Returns the configured periodic reindex interval, or `None` if disabled (0).
+    pub fn reindex_interval(&self) -> Option<std::time::Duration> {
+        let hours = self.config.code_index.reindex_interval_hours;
+        if !self.config.code_index.enabled || hours <= 0.0 {
+            return None;
+        }
+        Some(std::time::Duration::from_secs_f64(hours * 3600.0))
     }
 
     /// Check for new PR reviews that require action.
@@ -1359,11 +1503,24 @@ impl Watcher {
     }
 
     /// Get the cascade depth of an attempt (0 for root, 1 for first cascade, etc.)
+    ///
+    /// Includes cycle detection via a visited set to prevent infinite loops
+    /// if cyclic parent references exist in the database.
     fn get_cascade_depth(&self, attempt: &crate::types::FixAttempt) -> usize {
+        const MAX_CASCADE_DEPTH: usize = 64;
         let mut depth = 0;
         let mut current_parent = attempt.parent_attempt_id;
+        let mut visited = HashSet::new();
 
         while let Some(parent_id) = current_parent {
+            if !visited.insert(parent_id) || depth >= MAX_CASCADE_DEPTH {
+                tracing::warn!(
+                    depth = depth,
+                    parent_id = parent_id,
+                    "Cascade depth walk terminated: cycle detected or max depth reached"
+                );
+                break;
+            }
             depth += 1;
             match self.tracker.get_attempt_by_id(parent_id).ok().flatten() {
                 Some(parent) => current_parent = parent.parent_attempt_id,
@@ -1431,6 +1588,9 @@ impl Watcher {
                 "Failed to fetch downstream repo, continuing anyway"
             );
         }
+
+        // Incrementally re-index code after fetch so code search is up-to-date
+        self.reindex_repo(downstream_repo_name, &project_dir).await;
 
         // Create a per-cascade worktree so concurrent cascades don't interfere
         let cascade_id = format!("cascade-{}", parent_attempt.short_id);
@@ -1588,7 +1748,10 @@ Create a PR with your changes.{custom_instructions}"#,
                     reason = %reason,
                     "Cascade succeeded but no PR URL"
                 );
-                self.tracker.mark_cascade_failed(attempt_id, &format!("Cascade completed without creating a PR: {}", reason))?;
+                self.tracker.mark_cascade_failed(
+                    attempt_id,
+                    &format!("Cascade completed without creating a PR: {}", reason),
+                )?;
 
                 let mut cascade_issue = Issue::new(
                     &parent_attempt.issue_id,
@@ -1606,10 +1769,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     parent_attempt.short_id.clone(),
                 );
                 cascade_issue.set_metadata("completion_reason", reason);
-                let _ = self
-                    .notifier
-                    .notify_completed(&cascade_issue)
-                    .await;
+                let _ = self.notifier.notify_completed(&cascade_issue).await;
             }
         } else {
             let base_error = result.error.unwrap_or_else(|| "Unknown error".to_string());
@@ -2339,7 +2499,7 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         // Get already attempted issue IDs
-        let attempted_ids = self.tracker.get_attempted_issue_ids(source.name());
+        let attempted_ids = self.tracker.get_attempted_issue_ids(source.name())?;
         tracing::info!(
             source = source.name(),
             count = attempted_ids.len(),
@@ -2694,12 +2854,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Number of active processing items for a specific source.
     async fn active_processing_for_source(&self, source_name: &str) -> usize {
-        let prefix = format!("{}:", source_name);
-        let processing = self.processing.read().await;
-        processing
-            .iter()
-            .filter(|key| key.starts_with(&prefix))
-            .count()
+        self.processing.read().await.source_count(source_name)
     }
 
     fn record_source_decision(
@@ -2738,15 +2893,17 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Process a single issue.
     ///
     /// Uses the RepoInferrer engine to determine which repository to use
-    /// for fixing the issue.
+    /// for fixing the issue. Delegates to the shared `IssueProcessor` pipeline.
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
-        mut issue: Issue,
+        issue: Issue,
         match_result: MatchResult,
         review_feedback: Option<String>,
         existing_pr_branch: Option<String>,
     ) -> bool {
+        use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
+
         if self.is_rate_limit_paused().await {
             tracing::info!(
                 short_id = %issue.short_id,
@@ -2755,11 +2912,9 @@ Create a PR with your changes.{custom_instructions}"#,
             return false;
         }
 
-        let processing_started_at = std::time::Instant::now();
         let processing_key = format!("{}:{}", source.name(), issue.id);
 
         // Atomic check-and-insert to prevent race conditions.
-        // Use a single write lock for both checking and inserting.
         {
             let mut processing = self.processing.write().await;
             if processing.contains(&processing_key) {
@@ -2807,11 +2962,20 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
+        // Get the attempt ID for the processing pipeline
+        let attempt_id = self
+            .tracker
+            .get_attempt(source.name(), &issue.id)
+            .ok()
+            .flatten()
+            .map(|a| a.id);
+
         // Infer the target repository using the shared resolution function
         let resolution =
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
 
-        let project_dir = match &resolution {
+        // Log resolution decision (watcher-specific verbose logging)
+        match &resolution {
             RepoResolution::Resolved { project_dir, .. } => {
                 self.record_issue_decision(
                     &issue,
@@ -2824,1050 +2988,49 @@ Create a PR with your changes.{custom_instructions}"#,
                         "project_dir": project_dir.display().to_string(),
                     }),
                 );
-                project_dir.clone()
             }
-            RepoResolution::Skip { reason } => {
-                self.record_issue_decision(
-                    &issue,
-                    "repo_resolution_skipped",
-                    format!("Skipped {} due to repository resolution", issue.short_id),
-                    json!({
-                        "reason": reason,
-                    }),
-                );
-                tracing::debug!(short_id = %issue.short_id, reason = %reason, "Skipping issue");
-                let resolution_error = format!("Repository resolution failed: {}", reason);
-                if let Err(e) =
-                    self.tracker
-                        .mark_failed(source.name(), &issue.id, &resolution_error)
-                {
-                    tracing::warn!(
-                        short_id = %issue.short_id,
-                        error = %e,
-                        "Failed to mark issue as failed after repository resolution skip"
-                    );
-                }
-                // Clean up processing state before returning
-                {
-                    let mut processing = self.processing.write().await;
-                    processing.remove(&processing_key);
-                }
-                self.active_processing.fetch_sub(1, Ordering::SeqCst);
-                return true;
-            }
+            RepoResolution::Skip { .. } => {}
+        }
+
+        // Save issue info before move for post-processing
+        let issue_short_id = issue.short_id.clone();
+
+        // Build IssueProcessor and delegate to shared pipeline
+        let processor = IssueProcessor {
+            config: self.config.clone(),
+            tracker: Arc::clone(&self.tracker),
+            notifier: Arc::clone(&self.notifier),
+            agent: Arc::clone(&self.agent),
+            inferrer: self.inferrer.clone(),
+            embedding_client: self.embedding_client.clone(),
+            issue_embedding_service: self.issue_embedding_service.clone(),
+            code_search_service: self.code_search_service.clone(),
+            feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
+                FeedbackAnalyzer::new().with_tracker(self.tracker.clone()),
+            )),
+            review_watcher: self.review_watcher.clone(),
+            user_registry: self.user_registry.clone(),
+            github_client: None,
         };
 
-        // Fetch the parent repo (no checkout/reset — just update the object store)
-        // then create an isolated per-issue worktree for Claude to work in.
-        if let (Some(scm_url), Some(default_branch), Some(repo_name)) = (
-            resolution.scm_url(),
-            resolution.default_branch(),
-            resolution.repo_name(),
-        ) {
-            self.record_issue_decision(
-                &issue,
-                "repo_sync_started",
-                format!("Syncing repository {} for {}", repo_name, issue.short_id),
-                json!({
-                    "repo_name": repo_name,
-                    "scm_url": scm_url,
-                    "default_branch": default_branch,
-                    "project_dir": project_dir.display().to_string(),
-                }),
-            );
-            tracing::info!(
-                short_id = %issue.short_id,
-                repo = %repo_name,
-                "Fetching latest changes"
-            );
-
-            if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, scm_url).await {
-                let pull_error = format!("Failed to fetch repository: {}", e);
-                self.record_issue_decision(
-                    &issue,
-                    "repo_sync_failed",
-                    format!("Repository sync failed for {}", issue.short_id),
-                    json!({
-                        "repo_name": repo_name,
-                        "error": pull_error.clone(),
-                    }),
-                );
-                if let Err(mark_err) =
-                    self.tracker
-                        .mark_failed(source.name(), &issue.id, &pull_error)
-                {
-                    tracing::warn!(
-                        short_id = %issue.short_id,
-                        error = %mark_err,
-                        "Failed to mark issue as failed after repository fetch failure"
-                    );
-                }
-                tracing::error!(
-                    short_id = %issue.short_id,
-                    repo = %repo_name,
-                    error = %e,
-                    "Failed to fetch repository, skipping issue"
-                );
-                // Clean up processing state before returning
-                {
-                    let mut processing = self.processing.write().await;
-                    processing.remove(&processing_key);
-                }
-                self.active_processing.fetch_sub(1, Ordering::SeqCst);
-                return true;
-            }
-
-            // For review reruns, fetch the PR branch; otherwise use the default branch.
-            let checkout_ref = if let Some(ref branch) = existing_pr_branch {
-                if let Err(e) = GitOps::fetch_branch(&project_dir, branch).await {
-                    tracing::warn!(
-                        short_id = %issue.short_id,
-                        error = %e,
-                        branch = %branch,
-                        "Failed to fetch PR branch, falling back to default"
-                    );
-                    format!("origin/{}", default_branch)
-                } else {
-                    format!("origin/{}", branch)
-                }
-            } else {
-                format!("origin/{}", default_branch)
-            };
-
-            // Create per-issue worktree.
-            // For review reruns, check out the actual PR branch so Claude can push
-            // to it.  For initial runs, use detached HEAD (Claude creates a new branch).
-            let wt_path = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
-            let wt_result = if let Some(ref branch) = existing_pr_branch {
-                GitOps::create_worktree_on_branch(&project_dir, &wt_path, branch, &checkout_ref)
-                    .await
-            } else {
-                GitOps::create_worktree(&project_dir, &wt_path, &checkout_ref).await
-            };
-            if let Err(e) = wt_result {
-                let wt_error = format!("Failed to create worktree: {}", e);
-                self.record_issue_decision(
-                    &issue,
-                    "worktree_failed",
-                    format!("Worktree creation failed for {}", issue.short_id),
-                    json!({
-                        "repo_name": repo_name,
-                        "error": wt_error.clone(),
-                    }),
-                );
-                if let Err(mark_err) = self
-                    .tracker
-                    .mark_failed(source.name(), &issue.id, &wt_error)
-                {
-                    tracing::warn!(
-                        short_id = %issue.short_id,
-                        error = %mark_err,
-                        "Failed to mark issue as failed after worktree creation failure"
-                    );
-                }
-                tracing::error!(
-                    short_id = %issue.short_id,
-                    repo = %repo_name,
-                    error = %e,
-                    "Failed to create worktree, skipping issue"
-                );
-                {
-                    let mut processing = self.processing.write().await;
-                    processing.remove(&processing_key);
-                }
-                self.active_processing.fetch_sub(1, Ordering::SeqCst);
-                return true;
-            }
-
-            self.record_issue_decision(
-                &issue,
-                "repo_sync_completed",
-                format!("Repository synced (worktree) for {}", issue.short_id),
-                json!({
-                    "repo_name": repo_name,
-                    "project_dir": wt_path.display().to_string(),
-                }),
-            );
-
-            // Re-index files and sync to database
-            if let Some(inferrer) = &self.inferrer {
-                if let Err(e) = inferrer.index_cloned_repo(repo_name) {
-                    tracing::warn!(
-                        short_id = %issue.short_id,
-                        repo = %repo_name,
-                        error = %e,
-                        "Failed to re-index repository files"
-                    );
-                }
-
-                // Sync updated files to database
-                if let Some(repo) = inferrer.get_repo(repo_name) {
-                    if let Err(e) = self.tracker.sync_repo_files(&repo) {
-                        tracing::warn!(
-                            short_id = %issue.short_id,
-                            repo = %repo_name,
-                            error = %e,
-                            "Failed to sync repository files to database"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Use the per-issue worktree as the effective working directory for Claude.
-        // Fall back to project_dir only when no repo was resolved (no worktree attempted).
-        let effective_project_dir = if let Some(repo_name) = resolution.repo_name() {
-            let wt = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
-            if !wt.exists() {
-                let err = format!("Worktree disappeared after creation: {:?}", wt);
-                tracing::error!(short_id = %issue.short_id, error = %err);
-                self.tracker
-                    .mark_failed(source.name(), &issue.id, &err)
-                    .ok();
-                self.processing.write().await.remove(&processing_key);
-                self.active_processing.fetch_sub(1, Ordering::SeqCst);
-                return true;
-            }
-            wt
-        } else {
-            project_dir.clone()
+        let input = ProcessingInput {
+            issue,
+            source_name: source.name().to_string(),
+            match_result,
+            resolution,
+            attempt_id,
+            review_feedback,
+            existing_pr_branch,
         };
 
-        // Run code quality evaluation baseline (BEFORE hook)
-        let eval_before_snapshots = if self.config.evaluation.enabled {
-            match crate::evaluation::CodeQualityEvaluator::run_baseline(
-                &effective_project_dir,
-                &self.config.evaluation,
-            )
-            .await
-            {
-                Ok(snapshots) => {
-                    tracing::info!(
-                        short_id = %issue.short_id,
-                        tools = snapshots.len(),
-                        "Evaluation baseline captured"
-                    );
-                    snapshots
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        short_id = %issue.short_id,
-                        error = %e,
-                        "Evaluation baseline failed, continuing without"
-                    );
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
+        let context_provider = crate::processing::SourceContext(source.as_ref());
+        let outcome = processor.run(input, &context_provider).await;
 
-        // Get the attempt ID for analytics tracking
-        let attempt_id = self
-            .tracker
-            .get_attempt(source.name(), &issue.id)
-            .ok()
-            .flatten()
-            .map(|a| a.id);
-
-        // Resolve issue assignee to a configured user
-        if let Some(assignee) = issue.get_metadata::<String>("assignee") {
-            if let Some(resolved) = self.user_registry.resolve(&issue.source, &assignee) {
-                tracing::info!(
-                    short_id = %issue.short_id,
-                    user = %resolved.slug,
-                    "Resolved issue assignee to user"
-                );
-                issue.set_metadata("resolved_user", &resolved.slug);
-            }
-        }
-
-        // Dedup gate: skip if this issue is a semantic duplicate of one already handled
-        if let Some(ref embedding_service) = self.issue_embedding_service {
-            if let Ok(Some(duplicate)) = embedding_service
-                .check_duplicate(&issue, source.name())
-                .await
-            {
-                let similar_id = duplicate
-                    .embedding
-                    .short_id
-                    .as_deref()
-                    .unwrap_or(&duplicate.embedding.issue_id);
-                let similarity_pct = duplicate.similarity * 100.0;
-
-                tracing::info!(
-                    short_id = %issue.short_id,
-                    similar_to = %similar_id,
-                    similarity = %format!("{:.0}%", similarity_pct),
-                    "Skipping semantic duplicate"
-                );
-
-                self.record_issue_decision(
-                    &issue,
-                    "semantic_duplicate_skipped",
-                    format!(
-                        "{} skipped as semantic duplicate of {}",
-                        issue.short_id, similar_id
-                    ),
-                    json!({
-                        "similar_issue_id": duplicate.embedding.issue_id,
-                        "similar_short_id": similar_id,
-                        "similarity": duplicate.similarity,
-                        "similar_issue_status": duplicate.outcome.as_deref(),
-                    }),
-                );
-
-                let metric = ProcessingMetric::new("semantic_duplicate_skipped", 1.0)
-                    .with_source(source.name().to_string());
-                self.tracker.record_metric(&metric).ok();
-
-                let _ = self.tracker.mark_failed(
-                    source.name(),
-                    &issue.id,
-                    &format!(
-                        "Semantic duplicate of {} ({:.0}% similar)",
-                        similar_id, similarity_pct
-                    ),
-                );
-
-                // Cleanup
-                {
-                    let mut processing = self.processing.write().await;
-                    processing.remove(&processing_key);
-                }
-                self.active_processing.fetch_sub(1, Ordering::SeqCst);
-                return false;
-            }
-        }
-
-        let result = async {
-            // Notify start
-            self.notifier.notify_start(&issue).await?;
-
-            // Find similar issues for context (if embedding service is available)
-            let similar_issues_context = if let Some(ref embedding_service) = self.issue_embedding_service {
-                match embedding_service.find_similar(&issue, source.name()).await {
-                    Ok(similar) if !similar.is_empty() => {
-                        tracing::info!(
-                            short_id = %issue.short_id,
-                            similar_count = similar.len(),
-                            "Found similar past issues for context"
-                        );
-                        self.record_issue_decision(
-                            &issue,
-                            "similar_issues_context_added",
-                            format!("{} similar issues added to context for {}", similar.len(), issue.short_id),
-                            json!({
-                                "similar_count": similar.len(),
-                                "similarities": similar.iter().map(|s| json!({
-                                    "issue_id": s.embedding.issue_id,
-                                    "short_id": s.embedding.short_id,
-                                    "similarity": s.similarity,
-                                })).collect::<Vec<_>>(),
-                            }),
-                        );
-                        let metric = ProcessingMetric::new("similar_issues_context_added", 1.0)
-                            .with_source(source.name().to_string());
-                        self.tracker.record_metric(&metric).ok();
-                        format_similar_issues_context(&similar)
-                    }
-                    Ok(_) => String::new(),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to find similar issues");
-                        String::new()
-                    }
-                }
-            } else {
-                String::new()
-            };
-
-            // Build context and run Claude with attempt ID for analytics
-            let mut context = source.build_issue_context(&issue).await?;
-
-            // Append similar issues context if available
-            if !similar_issues_context.is_empty() {
-                context = format!("{}\n{}", context, similar_issues_context);
-            }
-
-            // Enrich context with relevant code from the repository
-            if self.config.code_index.enabled {
-                if let Some(ref code_search) = self.code_search_service {
-                    let query = crate::repo::code_index::build_code_search_query(&issue);
-                    let repo_id = resolution.repo_id();
-                    match code_search.search(&query, repo_id, 5).await {
-                        Ok(results) if !results.is_empty() => {
-                            tracing::info!(
-                                short_id = %issue.short_id,
-                                snippet_count = results.len(),
-                                "Found relevant code snippets for context"
-                            );
-                            self.record_issue_decision(
-                                &issue,
-                                "code_search_context_added",
-                                format!(
-                                    "{} code snippets added to context for {}",
-                                    results.len(),
-                                    issue.short_id
-                                ),
-                                json!({
-                                    "snippet_count": results.len(),
-                                    "snippets": results.iter().map(|r| json!({
-                                        "file": r.chunk.file_path,
-                                        "symbol": r.chunk.symbol_name,
-                                        "score": r.score,
-                                    })).collect::<Vec<_>>(),
-                                }),
-                            );
-                            let metric =
-                                ProcessingMetric::new("code_search_context_added", 1.0)
-                                    .with_source(source.name().to_string());
-                            self.tracker.record_metric(&metric).ok();
-
-                            context = format!(
-                                "{}\n{}",
-                                context,
-                                crate::repo::code_index::format_code_search_context(&results)
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to search code index");
-                        }
-                    }
-                }
-            }
-
-            // Append PR review feedback context for review-driven reruns.
-            if let Some(ref feedback) = review_feedback {
-                let mut review_context = format!(
-                    "\n\n## PR Review Feedback\n{}\n\nAddress all review feedback in this update.",
-                    feedback
-                );
-                if let Some(ref branch) = existing_pr_branch {
-                    review_context.push_str(&format!(
-                        "\n\nIMPORTANT: You are updating an existing PR on branch `{}`. \
-                         Push your changes to this branch. Do NOT create a new branch or a new PR.",
-                        branch
-                    ));
-                }
-                context = format!("{}{}", context, review_context);
-            }
-
-            let repo_scope = resolution.repo_name().map(|v| v.to_string());
-            let mut used_qa_ids: Vec<i64> = Vec::new();
-
-            // Preload reusable Q&A context before the first Claude run.
-            if self.config.ask.enabled {
-                let preload_query = format!("{} {}", issue.title, context);
-                let preload_norm = normalize_text(&preload_query);
-                let preload_embedding = embed_text(self.embedding_client.as_deref(), &preload_query).await;
-                match find_reusable_qa(
-                    self.tracker.as_ref(),
-                    &self.config.ask,
-                    source.name(),
-                    repo_scope.as_deref(),
-                    &preload_norm,
-                    preload_embedding.as_deref(),
-                ) {
-                    Ok(matches) if !matches.is_empty() => {
-                        context = format!("{}\n\n{}", context, format_reuse_context(&matches));
-                        if let Some(id) = attempt_id {
-                            for m in &matches {
-                                let _ = self
-                                    .tracker
-                                    .record_qa_usage(id, m.entry.id, "reused", m.final_score);
-                            }
-                        }
-                        used_qa_ids.extend(matches.into_iter().map(|m| m.entry.id));
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "Failed to preload reusable Q&A context"),
-                }
-            }
-
-            let mut rounds: u8 = 0;
-            let (claude_result, last_prompt) = loop {
-                let prompt = self.agent.build_prompt_for_issue(&issue, &context, &effective_project_dir);
-
-                // Enhance prompt with learnings from past outcomes (semantic when possible).
-                let prompt = {
-                    let analyzer = self.feedback_analyzer.lock().await;
-                    let issue_emb = self
-                        .issue_embedding_service
-                        .as_ref()
-                        .and_then(|svc| svc.get_embedding(source.name(), &issue.id).ok().flatten());
-                    match issue_emb.and_then(|emb| emb.embedding) {
-                        Some(ref emb) => analyzer.enhance_prompt(&prompt, &issue, emb),
-                        None => prompt,
-                    }
-                };
-
-                let prompt = self.enhance_prompt_with_learning(
-                    &prompt,
-                    &issue,
-                    resolution.repo_name(),
-                );
-                let mut run_result = self
-                    .agent
-                    .execute_with_attempt(&prompt, Some(&issue), attempt_id, &effective_project_dir)
-                    .await?;
-                run_result.used_qa_ids = used_qa_ids.clone();
-
-                let blocking_question = match (self.config.ask.enabled, run_result.blocking_question.clone()) {
-                    (true, Some(q)) => q,
-                    _ => break (run_result, prompt),
-                };
-
-                if rounds >= self.config.ask.max_rounds_per_attempt {
-                    run_result.success = false;
-                    run_result.error = Some(format!(
-                        "Maximum blocking-question rounds ({}) reached",
-                        self.config.ask.max_rounds_per_attempt
-                    ));
-                    break (run_result, prompt);
-                }
-                rounds = rounds.saturating_add(1);
-
-                let question_norm = normalize_text(&blocking_question.question);
-                let question_embedding =
-                    embed_text(self.embedding_client.as_deref(), &blocking_question.question).await;
-
-                let reusable = match find_reusable_qa(
-                    self.tracker.as_ref(),
-                    &self.config.ask,
-                    source.name(),
-                    repo_scope.as_deref(),
-                    &question_norm,
-                    question_embedding.as_deref(),
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to query reusable Q&A for blocking question");
-                        Vec::new()
-                    }
-                };
-
-                if let Some(best) = reusable.first() {
-                    if let Some(id) = attempt_id {
-                        let _ = self
-                            .tracker
-                            .record_qa_usage(id, best.entry.id, "reused", best.final_score);
-                    }
-                    if !used_qa_ids.contains(&best.entry.id) {
-                        used_qa_ids.push(best.entry.id);
-                    }
-                    let activity = ActivityLogEntry::new(
-                        "question_reused",
-                        format!("Reused stored Q&A for {}", issue.short_id),
-                    )
-                    .with_source(issue.source.clone())
-                    .with_issue(issue.id.clone(), issue.short_id.clone())
-                    .with_metadata(json!({
-                        "qa_id": best.entry.id,
-                        "score": best.final_score,
-                    }));
-                    self.tracker.record_activity(&activity).ok();
-
-                    context = format!(
-                        "{}\n\n{}",
-                        context,
-                        format_answer_context(
-                            &blocking_question,
-                            &best.entry.answer_text,
-                            &best.entry.channel,
-                            true,
-                        )
-                    );
-                    continue;
-                }
-
-                let resolved_user = issue.get_metadata::<String>("resolved_user");
-                let target_discord_id = resolved_user
-                    .as_deref()
-                    .and_then(|slug| self.user_registry.get_by_slug(slug))
-                    .and_then(|u| u.discord_id.clone());
-                let target_email = resolved_user
-                    .as_deref()
-                    .and_then(|slug| self.user_registry.get_by_slug(slug))
-                    .and_then(|u| u.email.clone());
-                let ask_request = AskRequest {
-                    correlation_id: build_correlation_id(&issue.short_id),
-                    source: issue.source.clone(),
-                    repo: repo_scope.clone(),
-                    issue_id: issue.id.clone(),
-                    short_id: issue.short_id.clone(),
-                    question: blocking_question.clone(),
-                    asked_at: Utc::now(),
-                    target_discord_id,
-                    target_email,
-                    target_slack_id: resolved_user
-                        .as_deref()
-                        .and_then(|slug| self.user_registry.get_by_slug(slug))
-                        .and_then(|u| u.slack_id.clone()),
-                };
-
-                let asked_activity = ActivityLogEntry::new(
-                    "question_asked",
-                    format!("Asked human question for {}", issue.short_id),
-                )
-                .with_source(issue.source.clone())
-                .with_issue(issue.id.clone(), issue.short_id.clone())
-                .with_metadata(json!({
-                    "correlation_id": ask_request.correlation_id,
-                    "question": blocking_question.question,
-                }));
-                self.tracker.record_activity(&asked_activity).ok();
-
-                let reply = send_to_all_and_wait_first_reply(
-                    Arc::clone(&self.notifier),
-                    &issue,
-                    &ask_request,
-                    Duration::from_secs(self.config.ask.wait_timeout_secs),
-                    Duration::from_secs(self.config.ask.poll_interval_secs),
-                )
-                .await?;
-
-                if let Some(reply) = reply {
-                    let answered_activity = ActivityLogEntry::new(
-                        "question_answered",
-                        format!("Human answered question for {}", issue.short_id),
-                    )
-                    .with_source(issue.source.clone())
-                    .with_issue(issue.id.clone(), issue.short_id.clone())
-                    .with_metadata(json!({
-                        "channel": reply.channel,
-                        "responder": reply.responder,
-                        "correlation_id": reply.correlation_id,
-                    }));
-                    self.tracker.record_activity(&answered_activity).ok();
-
-                    let qa_entry = QaKnowledgeEntry {
-                        id: 0,
-                        source: issue.source.clone(),
-                        repo: repo_scope.clone(),
-                        issue_id: issue.id.clone(),
-                        short_id: issue.short_id.clone(),
-                        question_text: blocking_question.question.clone(),
-                        question_norm,
-                        question_embedding: question_embedding.clone(),
-                        answer_text: reply.answer.clone(),
-                        answer_norm: normalize_text(&reply.answer),
-                        answer_embedding: embed_text(self.embedding_client.as_deref(), &reply.answer).await,
-                        channel: reply.channel.clone(),
-                        responder: reply.responder.clone(),
-                        correlation_id: ask_request.correlation_id.clone(),
-                        asked_at: ask_request.asked_at,
-                        answered_at: reply.replied_at,
-                        success_count: 0,
-                        failure_count: 0,
-                        last_used_at: None,
-                        metadata: Some(json!({
-                            "context": blocking_question.context,
-                            "options": blocking_question.options,
-                            "why": blocking_question.why,
-                        })),
-                    };
-
-                    if let Ok(qa_id) = self.tracker.store_qa_knowledge(&qa_entry) {
-                        if let Some(id) = attempt_id {
-                            let _ = self.tracker.record_qa_usage(id, qa_id, "asked", 1.0);
-                        }
-                        if !used_qa_ids.contains(&qa_id) {
-                            used_qa_ids.push(qa_id);
-                        }
-                    }
-
-                    context = format!(
-                        "{}\n\n{}",
-                        context,
-                        format_answer_context(&blocking_question, &reply.answer, &reply.channel, false)
-                    );
-                    continue;
-                }
-
-                let timeout_activity = ActivityLogEntry::new(
-                    "question_timeout_best_effort",
-                    format!("No human reply received for {}", issue.short_id),
-                )
-                .with_source(issue.source.clone())
-                .with_issue(issue.id.clone(), issue.short_id.clone())
-                .with_metadata(json!({
-                    "best_effort": self.config.ask.best_effort_on_timeout,
-                    "question": blocking_question.question,
-                }));
-                self.tracker.record_activity(&timeout_activity).ok();
-
-                if self.config.ask.best_effort_on_timeout {
-                    context = format!("{}\n\n{}", context, format_timeout_context(&blocking_question));
-                    continue;
-                }
-
-                run_result.success = false;
-                run_result.error = Some("Timed out waiting for human reply".to_string());
-                break (run_result, prompt);
-            };
-
-            if self.config.learning.strategy_fingerprinting {
-                if let Some(aid) = attempt_id {
-                    if let Ok(execs) = self.tracker.get_executions_for_attempt(aid) {
-                        if let Some(exec) = execs.first() {
-                            if let Some(ref log_path) = exec.stdout_log_path {
-                                let path = std::path::Path::new(log_path);
-                                if path.exists() {
-                                    match crate::learning::StrategyParser::parse_from_log(path, aid) {
-                                        Ok(fp) => {
-                                            if let Err(e) = self.tracker.store_strategy_fingerprint(&fp) {
-                                                tracing::warn!(error = %e, "Failed to store strategy fingerprint");
-                                            }
-                                        }
-                                        Err(e) => tracing::debug!(error = %e, "Failed to parse strategy from log"),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if claude_result.success {
-                // For review reruns, resolve the effective PR URL:
-                // 1. If Claude returned a PR URL, prefer the existing one (Claude
-                //    should not create new PRs during review reruns).
-                // 2. If Claude did NOT return a PR URL (common when it just pushes
-                //    to the existing branch), fall back to the attempt's stored URL.
-                let effective_pr_url = if existing_pr_branch.is_some() {
-                    let stored_url = self
-                        .tracker
-                        .get_attempt(source.name(), &issue.id)
-                        .ok()
-                        .flatten()
-                        .and_then(|a| a.pr_url);
-                    match (&claude_result.pr_url, &stored_url) {
-                        (Some(new_url), Some(existing_url)) if new_url != existing_url => {
-                            tracing::warn!(
-                                short_id = %issue.short_id,
-                                existing_pr = %existing_url,
-                                claude_pr = %new_url,
-                                "Review rerun produced a different PR URL; keeping original"
-                            );
-                            stored_url
-                        }
-                        (None, Some(_)) => {
-                            tracing::info!(
-                                short_id = %issue.short_id,
-                                "Review rerun pushed to existing branch (no new PR URL)"
-                            );
-                            stored_url
-                        }
-                        _ => claude_result.pr_url.clone(),
-                    }
-                } else {
-                    claude_result.pr_url.clone()
-                };
-
-                if let Some(ref pr_url) = effective_pr_url {
-                    self.record_issue_decision(
-                        &issue,
-                        "claude_run_succeeded_with_pr",
-                        format!("Claude produced PR for {}", issue.short_id),
-                        json!({
-                            "pr_url": pr_url,
-                            "attempt_id": attempt_id,
-                            "used_qa_ids": claude_result.used_qa_ids,
-                        }),
-                    );
-                    tracing::info!(short_id = %issue.short_id, pr_url = %pr_url, "Success! PR created");
-                    self.tracker
-                        .mark_success(source.name(), &issue.id, pr_url)?;
-                    if existing_pr_branch.is_some() {
-                        issue.set_metadata("is_pr_update", true);
-                    }
-                    if let Some(ref changelog) = claude_result.changelog {
-                        issue.set_metadata("changelog", changelog.clone());
-                    }
-                    self.notifier.notify_success(&issue, pr_url).await?;
-                    if let Some(id) = attempt_id {
-                        let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, true);
-                    }
-
-                    // Record metric for PR creation
-                    let metric = ProcessingMetric::new("pr_created", 1.0)
-                        .with_source(source.name().to_string());
-                    if let Err(e) = self.tracker.record_metric(&metric) {
-                        tracing::warn!(error = %e, "Failed to record pr_created metric");
-                    }
-
-                    // Create or update prs table record
-                    if let Some((repo, pr_number)) = crate::storage::parse_pr_url(pr_url) {
-                        // Try to load existing record to preserve accumulated fields
-                        let mut pr_record = if let Ok(Some(existing)) = self.tracker.get_pr(pr_url) {
-                            existing
-                        } else {
-                            crate::types::PrRecord::for_issue(
-                                pr_url.clone(),
-                                &repo,
-                                pr_number,
-                                source.name(),
-                                &issue.id,
-                            )
-                        };
-                        pr_record.attempt_id = attempt_id;
-
-                        // Fetch branch info from GitHub
-                        if let Some(ref gh) = self.github_client {
-                            match gh.get_pr_info(&repo, pr_number).await {
-                                Ok(info) => {
-                                    pr_record.head_branch = info.head_branch;
-                                    pr_record.base_branch = info.base_branch;
-                                    pr_record.title = info.title;
-                                    pr_record.author = info.author;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "Failed to fetch PR info from GitHub");
-                                }
-                            }
-                        }
-
-                        if let Err(e) = self.tracker.upsert_pr(&pr_record) {
-                            tracing::warn!(error = %e, "Failed to upsert PR record");
-                        }
-                    }
-
-                    // Store embedding for future similarity lookups
-                    if let Some(ref embedding_service) = self.issue_embedding_service {
-                        match embedding_service.embed_issue(&issue, source.name()).await {
-                            Ok(_) => {
-                                self.record_issue_decision(
-                                    &issue,
-                                    "issue_embedding_stored",
-                                    format!("Stored embedding for {}", issue.short_id),
-                                    json!({}),
-                                );
-                                let metric = ProcessingMetric::new("issue_embedding_stored", 1.0)
-                                    .with_source(source.name().to_string());
-                                self.tracker.record_metric(&metric).ok();
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to store issue embedding");
-                            }
-                        }
-                    }
-
-                    // Register PR for review watching
-                    if let Some(ref review_watcher) = self.review_watcher {
-                        if let Some((repo, pr_number)) = crate::storage::parse_pr_url(pr_url) {
-                            let state = PrReviewState::new(
-                                pr_url,
-                                &repo,
-                                pr_number,
-                                &issue.id,
-                                source.name(),
-                            );
-                            review_watcher.watch_pr(state);
-                            tracing::info!(
-                                component = "review_watcher",
-                                pr_url = %pr_url,
-                                repo = %repo,
-                                pr_number = pr_number,
-                                issue_id = %issue.id,
-                                "PR registered for review watching"
-                            );
-                        }
-                    }
-
-                    // Log processing_completed activity
-                    let activity = ActivityLogEntry::new(
-                        "processing_completed",
-                        format!("Processing completed for {}", issue.short_id),
-                    )
-                    .with_source(issue.source.clone())
-                    .with_issue(issue.id.clone(), issue.short_id.clone())
-                    .with_metadata(json!({
-                        "has_pr": true,
-                        "pr_url": pr_url
-                    }));
-                    self.tracker.record_activity(&activity).ok();
-                } else {
-                    self.record_issue_decision(
-                        &issue,
-                        "claude_run_succeeded_without_pr",
-                        format!("Claude returned success without PR for {}", issue.short_id),
-                        json!({
-                            "attempt_id": attempt_id,
-                            "used_qa_ids": claude_result.used_qa_ids,
-                        }),
-                    );
-                    let reason = if claude_result.output.is_empty() {
-                        "No PR URL found in output".to_string()
-                    } else if claude_result.output.chars().count() > 500 {
-                        let truncated: String = claude_result.output.chars().take(497).collect();
-                        format!("{}...", truncated)
-                    } else {
-                        claude_result.output.clone()
-                    };
-                    tracing::info!(short_id = %issue.short_id, reason = %reason, "Completed without PR");
-                    issue.set_metadata("completion_reason", reason.clone());
-                    self.tracker.mark_failed(
-                        source.name(),
-                        &issue.id,
-                        &format!("Claude completed without creating a PR: {}", reason),
-                    )?;
-                    self.notifier.notify_completed(&issue).await?;
-                    if let Some(id) = attempt_id {
-                        let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, false);
-                    }
-
-                    // Record feedback outcome
-                    if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
-                        self.record_feedback_outcome(&attempt, &issue, &last_prompt, Outcome::Failed).await;
-                    }
-
-                    // Log processing_completed activity (no PR produced)
-                    let activity = ActivityLogEntry::new(
-                        "processing_completed_no_pr",
-                        format!("Completed without PR for {}: {}", issue.short_id, reason),
-                    )
-                    .with_source(issue.source.clone())
-                    .with_issue(issue.id.clone(), issue.short_id.clone())
-                    .with_metadata(json!({
-                        "has_pr": false,
-                        "pr_url": Option::<String>::None
-                    }));
-                    self.tracker.record_activity(&activity).ok();
-                }
-            } else {
-                let base_error = claude_result.error.as_deref().unwrap_or("Unknown error");
-                // Include Claude's summary if available for richer error context
-                let error = if !claude_result.output.is_empty() {
-                    let summary = if claude_result.output.len() > 500 {
-                        format!("{}...", &claude_result.output[..497])
-                    } else {
-                        claude_result.output.clone()
-                    };
-                    format!("{}\n\nClaude's summary: {}", base_error, summary)
-                } else {
-                    base_error.to_string()
-                };
-                self.record_issue_decision(
-                    &issue,
-                    "claude_run_failed",
-                    format!("Claude failed for {}", issue.short_id),
-                    json!({
-                        "error": error,
-                        "attempt_id": attempt_id,
-                        "used_qa_ids": claude_result.used_qa_ids,
-                    }),
-                );
-                tracing::error!(short_id = %issue.short_id, error = %error, "Failed");
-                self.tracker.mark_failed(source.name(), &issue.id, &error)?;
-                self.notify_failed_with_escalation(&issue, &error).await?;
-                if let Some(id) = attempt_id {
-                    let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, false);
-                }
-
-                // Record feedback outcome
-                if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
-                    self.record_feedback_outcome(&attempt, &issue, &last_prompt, Outcome::Failed).await;
-                }
-
-                // Record error pattern for analytics
-                self.record_error_pattern(source.name(), &issue.id, &error);
-            }
-
-            // Run code quality evaluation after fix (AFTER hook)
-            if !eval_before_snapshots.is_empty() {
-                let eval_attempt_id = attempt_id.unwrap_or(0);
-                let eval_repo = resolution.repo_name().unwrap_or("unknown");
-                match crate::evaluation::CodeQualityEvaluator::run_after_and_compute_deltas(
-                    &effective_project_dir,
-                    &self.config.evaluation,
-                    eval_before_snapshots.clone(),
-                    eval_attempt_id,
-                    eval_repo,
-                ).await {
-                    Ok(eval_result) => {
-                        if !eval_result.deltas.is_empty() {
-                            tracing::info!(
-                                short_id = %issue.short_id,
-                                improved = eval_result.overall_improved,
-                                deltas = eval_result.deltas.len(),
-                                "Evaluation complete"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            short_id = %issue.short_id,
-                            error = %e,
-                            "Post-fix evaluation failed"
-                        );
-                    }
-                }
-            }
-
-            Ok::<_, crate::error::Error>(())
-        }
-        .await;
-
-        if let Err(ref e) = result {
-            tracing::error!(short_id = %issue.short_id, error = %e, "Error processing issue");
-            let error_str = e.to_string();
-            self.record_issue_decision(
-                &issue,
-                "processing_pipeline_error",
-                format!("Processing pipeline error for {}", issue.short_id),
-                json!({
-                    "error": error_str.clone(),
-                    "attempt_id": attempt_id,
-                }),
-            );
-            let _ = self
-                .tracker
-                .mark_failed(source.name(), &issue.id, &error_str);
-            if let Some(id) = attempt_id {
-                let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, false);
-            }
-            let _ = self.notify_failed_with_escalation(&issue, &error_str).await;
-
-            // Record feedback outcome
-            if let Ok(Some(attempt)) = self.tracker.get_attempt(source.name(), &issue.id) {
-                self.record_feedback_outcome_from_attempt(&attempt, Outcome::Failed)
-                    .await;
-            }
-
-            // Record error pattern for analytics
-            self.record_error_pattern(source.name(), &issue.id, &error_str);
-        }
-
-        // Record processing duration as a first-class metric for telemetry dashboards.
-        let final_status = self
-            .tracker
-            .get_attempt(source.name(), &issue.id)
-            .ok()
-            .flatten()
-            .map(|a| a.status.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let processing_time_metric = ProcessingMetric::new(
-            "processing_time",
-            processing_started_at.elapsed().as_secs_f64(),
-        )
-        .with_source(source.name().to_string())
-        .with_tags(json!({ "status": final_status }));
-        if let Err(e) = self.tracker.record_metric(&processing_time_metric) {
-            tracing::debug!(error = %e, "Failed to record processing_time metric");
-        }
-
-        // Cleanup worktree
-        if let Some(repo_name) = resolution.repo_name() {
-            let wt_path = worktree_path(&self.config.workspace, repo_name, &issue.short_id);
-            if wt_path.exists() {
-                if let Err(e) = GitOps::remove_worktree(&project_dir, &wt_path).await {
-                    tracing::warn!(
-                        short_id = %issue.short_id,
-                        error = %e,
-                        "Failed to remove worktree"
-                    );
-                }
+        // Watcher-specific: check for rate limit errors and pause if needed
+        if let ProcessingOutcome::Failed { ref error } = outcome {
+            if runner::is_rate_limit_error(error) {
+                let tmp_issue = Issue::new("", &issue_short_id, "", "", source.name());
+                self.pause_until_rate_limit_reset(&tmp_issue, error).await;
             }
         }
 
@@ -3877,69 +3040,11 @@ Create a PR with your changes.{custom_instructions}"#,
             processing.remove(&processing_key);
         }
         self.active_processing.fetch_sub(1, Ordering::SeqCst);
-        true
-    }
 
-    /// Record an error pattern to the analytics database.
-    fn record_error_pattern(&self, source: &str, issue_id: &str, error_msg: &str) {
-        let error_type = classify_error(error_msg);
-        let pattern_hash = compute_error_hash(error_msg);
-
-        let mut pattern = ErrorPattern::new(pattern_hash);
-        pattern.error_type = Some(error_type.to_string());
-        pattern.error_message = Some(error_msg.to_string());
-        pattern.sources = Some(vec![source.to_string()]);
-        pattern.example_issue_ids = Some(vec![issue_id.to_string()]);
-
-        if let Err(e) = self.tracker.record_error_pattern(&pattern) {
-            tracing::warn!(error = %e, "Failed to record error pattern");
-        }
-    }
-
-    /// Route hard failures to the global notifier user (override per-issue assignee routing).
-    async fn notify_failed_with_escalation(&self, issue: &Issue, error: &str) -> Result<()> {
-        let is_rate_limited = runner::is_rate_limit_error(error);
-        let rate_limit_pause_until = if is_rate_limited {
-            self.pause_until_rate_limit_reset(issue, error).await
-        } else {
-            None
-        };
-
-        if runner::is_hard_error(error) {
-            self.record_issue_decision(
-                issue,
-                "hard_error_escalated",
-                format!("Escalating hard error for {}", issue.short_id),
-                json!({
-                    "error": Self::truncate_error_for_activity(error),
-                    "rate_limited": is_rate_limited,
-                    "rate_limit_pause_until": rate_limit_pause_until.map(|t| t.to_rfc3339()),
-                }),
-            );
-            let mut global_issue = issue.clone();
-            global_issue.metadata.remove("resolved_user");
-            global_issue
-                .metadata
-                .insert("hard_error".to_string(), serde_json::Value::Bool(true));
-
-            let activity = ActivityLogEntry::new(
-                "error",
-                format!("Hard Claude error escalated for {}", issue.short_id),
-            )
-            .with_source(issue.source.clone())
-            .with_issue(issue.id.clone(), issue.short_id.clone())
-            .with_metadata(json!({
-                "hard_error": true,
-                "rate_limited": is_rate_limited,
-                "rate_limit_pause_until": rate_limit_pause_until.map(|t| t.to_rfc3339()),
-                "error": Self::truncate_error_for_activity(error),
-            }));
-            self.tracker.record_activity(&activity).ok();
-
-            return self.notifier.notify_failed(&global_issue, error).await;
-        }
-
-        self.notifier.notify_failed(issue, error).await
+        // Return false for semantic duplicate skips (don't count as processed),
+        // true for everything else
+        !matches!(&outcome, ProcessingOutcome::Failed { error }
+            if error.contains("Semantic duplicate of"))
     }
 
     async fn clear_rate_limit_pause(&self) {
@@ -4029,7 +3134,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 json!({
                     "pause_until": effective_until.to_rfc3339(),
                     "reset_time_parsed": reset_time_parsed,
-                    "error": Self::truncate_error_for_activity(error),
+                    "error": crate::processing::truncate_error_for_activity(error),
                 }),
             );
 
@@ -4159,59 +3264,6 @@ Create a PR with your changes.{custom_instructions}"#,
         Some(now + chrono::Duration::seconds(seconds))
     }
 
-    fn truncate_error_for_activity(error: &str) -> String {
-        let max_len = 500;
-        if error.len() <= max_len {
-            error.to_string()
-        } else {
-            let safe_end = error
-                .char_indices()
-                .take_while(|(i, _)| *i <= max_len.saturating_sub(3))
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            format!("{}...", &error[..safe_end])
-        }
-    }
-
-    /// Record a feedback outcome to both DB and in-memory analyzer.
-    async fn record_feedback_outcome(
-        &self,
-        attempt: &crate::types::FixAttempt,
-        issue: &Issue,
-        prompt: &str,
-        outcome: Outcome,
-    ) {
-        let mut fix_outcome = FixOutcome::from_attempt(attempt, issue, prompt, outcome);
-
-        // Compute embedding for the outcome's issue text (reuse existing issue embedding if available)
-        if let Some(ref embedding_client) = self.embedding_client {
-            let embedding = match self
-                .issue_embedding_service
-                .as_ref()
-                .and_then(|svc| svc.get_embedding(&attempt.source, &issue.id).ok().flatten())
-                .and_then(|existing| existing.embedding)
-            {
-                Some(existing) => Some(existing),
-                None => embedding_client.embed(&fix_outcome.issue_text).await.ok(),
-            };
-            if let Some(emb) = embedding {
-                fix_outcome.set_embedding(emb);
-            }
-        }
-
-        // Store to DB (including embedding if computed)
-        if let Err(e) = self.tracker.store_feedback_outcome(&fix_outcome) {
-            tracing::warn!(error = %e, "Failed to store feedback outcome to DB");
-        }
-
-        // Store in-memory for prompt enhancement
-        let mut analyzer = self.feedback_analyzer.lock().await;
-        if let Err(e) = analyzer.record_outcome(attempt, issue, prompt, outcome) {
-            tracing::warn!(error = %e, "Failed to record feedback outcome in memory");
-        }
-    }
-
     /// Record a feedback outcome from an attempt (when we lack the Issue object).
     /// Reconstructs a minimal Issue from attempt data and retrieves prompt from executions.
     async fn record_feedback_outcome_from_attempt(
@@ -4227,17 +3279,16 @@ Create a PR with your changes.{custom_instructions}"#,
             &attempt.source,
         );
 
-        // Try to get the prompt from the most recent execution
-        let prompt = self
-            .tracker
-            .get_executions_for_attempt(attempt.id)
-            .ok()
-            .and_then(|execs| execs.into_iter().next())
-            .and_then(|exec| exec.prompt_used)
-            .unwrap_or_default();
-
-        self.record_feedback_outcome(attempt, &issue, &prompt, outcome)
-            .await;
+        crate::processing::record_feedback_outcome(
+            &self.tracker,
+            self.embedding_client.as_deref(),
+            self.issue_embedding_service.as_deref(),
+            &self.feedback_analyzer,
+            &attempt.source,
+            &issue,
+            outcome,
+        )
+        .await;
     }
 
     /// Run periodic learning subsystem tasks (QA promotion, cluster detection).
@@ -4506,90 +3557,6 @@ Create a PR with your changes.{custom_instructions}"#,
         }
     }
 
-    /// Enhance a prompt with continuous learning context.
-    fn enhance_prompt_with_learning(
-        &self,
-        base_prompt: &str,
-        _issue: &Issue,
-        repo: Option<&str>,
-    ) -> String {
-        let learning = &self.config.learning;
-        let Some(repo_name) = repo else {
-            return base_prompt.to_string();
-        };
-
-        let mut extra_context = String::new();
-
-        // System 4: Per-repo knowledge context
-        if learning.repo_knowledge {
-            if let Ok(knowledge) = self.tracker.get_repo_knowledge(repo_name) {
-                let ctx =
-                    crate::learning::RepoKnowledgeManager::format_knowledge_context(&knowledge);
-                if !ctx.is_empty() {
-                    extra_context.push_str(&ctx);
-                }
-            }
-        }
-
-        // System 3: Promoted instructions
-        if learning.qa_promotion {
-            if let Ok(instructions) = self.tracker.get_promoted_instructions(repo_name) {
-                let ctx = crate::learning::QaPromoter::format_promoted_context(&instructions);
-                if !ctx.is_empty() {
-                    extra_context.push_str(&ctx);
-                }
-            }
-        }
-
-        // System 6: Strategy suggestions
-        if learning.strategy_fingerprinting {
-            if let Ok(strategies) = self.tracker.get_successful_strategies(repo_name, 3) {
-                let ctx = crate::learning::StrategyParser::format_strategy_suggestions(&strategies);
-                if !ctx.is_empty() {
-                    extra_context.push_str(&ctx);
-                }
-            }
-        }
-
-        // System 8: Cluster context
-        if learning.cluster_detection {
-            if let Ok(clusters) = self.tracker.get_active_clusters(&_issue.source) {
-                for cluster in &clusters {
-                    if cluster.issue_ids.contains(&_issue.id) {
-                        extra_context.push_str(
-                            &crate::learning::ClusterDetector::format_cluster_context(cluster),
-                        );
-                        extra_context.push('\n');
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Cross-repo correlation context
-        if learning.cross_repo_correlation {
-            match crate::learning::CrossRepoCorrelator::get_active_insights(
-                self.tracker.as_ref(),
-                3,                                    // min_count
-                learning.cross_repo_window_hours * 2, // max_age = 2x window
-            ) {
-                Ok(insights) if !insights.is_empty() => {
-                    let ctx = crate::learning::CrossRepoCorrelator::format_context(&insights);
-                    if !ctx.is_empty() {
-                        extra_context.push_str(&ctx);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if extra_context.is_empty() {
-            return base_prompt.to_string();
-        }
-
-        format!("{}\n---\n\n{}", extra_context, base_prompt)
-    }
-
     /// Manually trigger processing for a specific issue.
     pub async fn trigger_issue(&self, source_name: &str, issue_id: &str) -> Result<()> {
         self.trigger_issue_with_feedback(
@@ -4822,7 +3789,7 @@ mod tests {
     use crate::notifier::Notifier;
     use crate::reports::Report;
     use crate::source::IssueSource;
-    use crate::storage::SqliteTracker;
+    use crate::storage::{ActivityStore, AttemptTracker, SqliteTracker};
     use crate::types::IssuePriority;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -5054,6 +4021,8 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            chat: crate::config::ChatConfig::default(),
+            tls: crate::config::TlsConfig::default(),
         }
     }
 
@@ -6939,14 +5908,14 @@ mod tests {
     #[test]
     fn test_truncate_error_short_message() {
         let error = "short error";
-        let result = Watcher::truncate_error_for_activity(error);
+        let result = crate::processing::truncate_error_for_activity(error);
         assert_eq!(result, "short error");
     }
 
     #[test]
     fn test_truncate_error_exactly_500_chars() {
         let error = "a".repeat(500);
-        let result = Watcher::truncate_error_for_activity(&error);
+        let result = crate::processing::truncate_error_for_activity(&error);
         assert_eq!(result.len(), 500);
         assert!(!result.ends_with("..."));
     }
@@ -6954,14 +5923,14 @@ mod tests {
     #[test]
     fn test_truncate_error_over_500_chars() {
         let error = "a".repeat(600);
-        let result = Watcher::truncate_error_for_activity(&error);
+        let result = crate::processing::truncate_error_for_activity(&error);
         assert!(result.len() <= 500);
         assert!(result.ends_with("..."));
     }
 
     #[test]
     fn test_truncate_error_empty_string() {
-        let result = Watcher::truncate_error_for_activity("");
+        let result = crate::processing::truncate_error_for_activity("");
         assert_eq!(result, "");
     }
 
@@ -6972,7 +5941,7 @@ mod tests {
         // Add a 4-byte emoji right at the boundary
         error.push('\u{1F600}'); // emoji: 4 bytes
         error.push_str(&"b".repeat(100));
-        let result = Watcher::truncate_error_for_activity(&error);
+        let result = crate::processing::truncate_error_for_activity(&error);
         assert!(result.ends_with("..."));
         // Verify it doesn't panic and doesn't split a char
         assert!(result.is_char_boundary(result.len()));
@@ -6981,7 +5950,7 @@ mod tests {
     #[test]
     fn test_truncate_error_501_chars() {
         let error = "x".repeat(501);
-        let result = Watcher::truncate_error_for_activity(&error);
+        let result = crate::processing::truncate_error_for_activity(&error);
         assert!(result.ends_with("..."));
         // Should be at most 500 chars (497 + "...")
         assert!(result.len() <= 500);
@@ -7260,9 +6229,19 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, sources, false);
 
         // Should not panic
-        watcher.record_error_pattern("linear", "ISSUE-42", "build failed: exit code 1");
-        watcher.record_error_pattern("sentry", "SENTRY-99", "timeout after 300s");
-        watcher.record_error_pattern("test", "T-1", "");
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "linear",
+            "ISSUE-42",
+            "build failed: exit code 1",
+        );
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "sentry",
+            "SENTRY-99",
+            "timeout after 300s",
+        );
+        crate::processing::record_error_pattern(&watcher.tracker, "test", "T-1", "");
     }
 
     #[test]
@@ -7538,7 +6517,13 @@ mod tests {
 
         let base = "Fix the bug in module X";
         let issue = test_issue();
-        let result = watcher.enhance_prompt_with_learning(base, &issue, None);
+        let result = crate::processing::enhance_prompt_with_learning(
+            &watcher.config,
+            &watcher.tracker,
+            base,
+            &issue,
+            None,
+        );
         assert_eq!(result, base);
     }
 
@@ -7553,7 +6538,13 @@ mod tests {
 
         let base = "Fix the bug in module X";
         let issue = test_issue();
-        let result = watcher.enhance_prompt_with_learning(base, &issue, Some("my-repo"));
+        let result = crate::processing::enhance_prompt_with_learning(
+            &watcher.config,
+            &watcher.tracker,
+            base,
+            &issue,
+            Some("my-repo"),
+        );
         // With no learning enabled and no data, should return base prompt
         assert_eq!(result, base);
     }
@@ -8574,7 +7565,13 @@ mod tests {
         let base = "Fix the authentication bug";
         let issue = test_issue();
         // With learning enabled but no data in DB, should return base prompt unchanged
-        let result = watcher.enhance_prompt_with_learning(base, &issue, Some("org/my-repo"));
+        let result = crate::processing::enhance_prompt_with_learning(
+            &watcher.config,
+            &watcher.tracker,
+            base,
+            &issue,
+            Some("org/my-repo"),
+        );
         assert_eq!(result, base);
     }
 
@@ -8587,7 +7584,13 @@ mod tests {
         let base = "Fix the bug";
         let issue = test_issue();
         // Empty string repo name should still attempt learning but find nothing
-        let result = watcher.enhance_prompt_with_learning(base, &issue, Some(""));
+        let result = crate::processing::enhance_prompt_with_learning(
+            &watcher.config,
+            &watcher.tracker,
+            base,
+            &issue,
+            Some(""),
+        );
         assert_eq!(result, base);
     }
 
@@ -8598,9 +7601,13 @@ mod tests {
         let watcher = create_test_watcher(notifier.clone(), tracker, vec![], false);
 
         let issue = test_issue();
-        let result = watcher
-            .notify_failed_with_escalation(&issue, "simple build error")
-            .await;
+        let result = crate::processing::notify_failed_with_escalation(
+            &watcher.notifier,
+            &watcher.tracker,
+            &issue,
+            "simple build error",
+        )
+        .await;
         assert!(result.is_ok());
         // Should have called notify_failed once
         assert_eq!(notifier.get_call_count(), 1);
@@ -8614,9 +7621,13 @@ mod tests {
 
         let issue = test_issue();
         // "rate limit" triggers hard error escalation
-        let result = watcher
-            .notify_failed_with_escalation(&issue, "rate limit exceeded, try again later")
-            .await;
+        let result = crate::processing::notify_failed_with_escalation(
+            &watcher.notifier,
+            &watcher.tracker,
+            &issue,
+            "rate limit exceeded, try again later",
+        )
+        .await;
         assert!(result.is_ok());
         assert_eq!(notifier.get_call_count(), 1);
     }
@@ -8628,9 +7639,13 @@ mod tests {
         let watcher = create_test_watcher(notifier.clone(), tracker, vec![], false);
 
         let issue = test_issue();
-        let result = watcher
-            .notify_failed_with_escalation(&issue, "process timed out after 300s")
-            .await;
+        let result = crate::processing::notify_failed_with_escalation(
+            &watcher.notifier,
+            &watcher.tracker,
+            &issue,
+            "process timed out after 300s",
+        )
+        .await;
         assert!(result.is_ok());
         assert_eq!(notifier.get_call_count(), 1);
     }
@@ -8648,9 +7663,13 @@ mod tests {
         );
 
         // Hard error should remove resolved_user (escalate to global)
-        let result = watcher
-            .notify_failed_with_escalation(&issue, "failed to spawn claude")
-            .await;
+        let result = crate::processing::notify_failed_with_escalation(
+            &watcher.notifier,
+            &watcher.tracker,
+            &issue,
+            "failed to spawn claude",
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -8661,11 +7680,36 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, vec![], false);
 
         // Test multiple error types
-        watcher.record_error_pattern("test", "1", "rate limit exceeded");
-        watcher.record_error_pattern("test", "2", "process timed out after 300s");
-        watcher.record_error_pattern("test", "3", "No PR URL found in output");
-        watcher.record_error_pattern("test", "4", "Repository resolution failed: no match");
-        watcher.record_error_pattern("test", "5", "Failed to create worktree: git error");
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "test",
+            "1",
+            "rate limit exceeded",
+        );
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "test",
+            "2",
+            "process timed out after 300s",
+        );
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "test",
+            "3",
+            "No PR URL found in output",
+        );
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "test",
+            "4",
+            "Repository resolution failed: no match",
+        );
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "test",
+            "5",
+            "Failed to create worktree: git error",
+        );
     }
 
     #[tokio::test]
@@ -8767,11 +7811,17 @@ mod tests {
         sqlite.record_attempt("test", "1", "T-1").unwrap();
         let attempt = sqlite.get_attempt("test", "1").unwrap().unwrap();
         let issue = test_issue();
-        let prompt = "Fix the bug in auth module";
 
-        watcher
-            .record_feedback_outcome(&attempt, &issue, prompt, Outcome::Failed)
-            .await;
+        crate::processing::record_feedback_outcome(
+            &watcher.tracker,
+            watcher.embedding_client.as_deref(),
+            watcher.issue_embedding_service.as_deref(),
+            &watcher.feedback_analyzer,
+            &attempt.source,
+            &issue,
+            Outcome::Failed,
+        )
+        .await;
 
         // Verify outcome was stored
         let outcome = sqlite.get_feedback_outcome_by_attempt(attempt.id);
@@ -9481,14 +8531,14 @@ mod tests {
     fn test_truncate_error_exactly_at_boundary() {
         // Test with exactly 497 chars (no truncation needed for exactly 500 total)
         let error = "b".repeat(497);
-        let result = Watcher::truncate_error_for_activity(&error);
+        let result = crate::processing::truncate_error_for_activity(&error);
         assert_eq!(result.len(), 497);
         assert!(!result.ends_with("..."));
     }
 
     #[test]
     fn test_truncate_error_single_char() {
-        let result = Watcher::truncate_error_for_activity("x");
+        let result = crate::processing::truncate_error_for_activity("x");
         assert_eq!(result, "x");
     }
 
@@ -9496,7 +8546,7 @@ mod tests {
     fn test_truncate_error_all_unicode() {
         // A string of 200 4-byte emojis (800 bytes, 200 chars)
         let error: String = std::iter::repeat_n('\u{1F600}', 200).collect();
-        let result = Watcher::truncate_error_for_activity(&error);
+        let result = crate::processing::truncate_error_for_activity(&error);
         // Should not panic and should end with "..."
         assert!(result.ends_with("..."));
         assert!(result.is_char_boundary(result.len()));
@@ -10182,7 +9232,13 @@ mod tests {
 
         let base = "Fix the auth bug";
         let issue = test_issue();
-        let result = watcher.enhance_prompt_with_learning(base, &issue, Some("org/my-repo"));
+        let result = crate::processing::enhance_prompt_with_learning(
+            &watcher.config,
+            &watcher.tracker,
+            base,
+            &issue,
+            Some("org/my-repo"),
+        );
         // With no clusters stored, should return base prompt
         assert_eq!(result, base);
     }
@@ -10660,9 +9716,24 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new(true));
         let watcher = create_test_watcher_with_sqlite(notifier, sqlite.clone(), vec![]);
 
-        watcher.record_error_pattern("linear", "ISSUE-42", "build failed: exit code 1");
-        watcher.record_error_pattern("sentry", "SENTRY-99", "timeout after 300s");
-        watcher.record_error_pattern("test", "T-1", "rate limit exceeded");
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "linear",
+            "ISSUE-42",
+            "build failed: exit code 1",
+        );
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "sentry",
+            "SENTRY-99",
+            "timeout after 300s",
+        );
+        crate::processing::record_error_pattern(
+            &watcher.tracker,
+            "test",
+            "T-1",
+            "rate limit exceeded",
+        );
 
         // Verify error patterns were stored
         let patterns = sqlite.get_error_patterns(10).unwrap();
@@ -10677,24 +9748,24 @@ mod tests {
     fn test_truncate_error_boundary_cases() {
         // Exactly 500 chars: no truncation
         let exactly_500 = "a".repeat(500);
-        let result = Watcher::truncate_error_for_activity(&exactly_500);
+        let result = crate::processing::truncate_error_for_activity(&exactly_500);
         assert_eq!(result.len(), 500);
         assert!(!result.ends_with("..."));
 
         // 501 chars: should truncate
         let chars_501 = "b".repeat(501);
-        let result = Watcher::truncate_error_for_activity(&chars_501);
+        let result = crate::processing::truncate_error_for_activity(&chars_501);
         assert!(result.ends_with("..."));
         assert!(result.len() <= 500);
 
         // Empty string
-        let result = Watcher::truncate_error_for_activity("");
+        let result = crate::processing::truncate_error_for_activity("");
         assert_eq!(result, "");
 
         // Multi-byte UTF-8 near boundary: 495 ASCII chars + some 4-byte emojis
         let mut multi_byte = "x".repeat(495);
         multi_byte.push_str("\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}");
-        let result = Watcher::truncate_error_for_activity(&multi_byte);
+        let result = crate::processing::truncate_error_for_activity(&multi_byte);
         assert!(result.ends_with("..."));
         assert!(result.is_char_boundary(result.len()));
         // Verify no panic, no split codepoint
@@ -10704,7 +9775,7 @@ mod tests {
 
         // Very long string: 10000 chars
         let very_long = "z".repeat(10000);
-        let result = Watcher::truncate_error_for_activity(&very_long);
+        let result = crate::processing::truncate_error_for_activity(&very_long);
         assert!(result.ends_with("..."));
         assert!(result.len() <= 500);
     }
@@ -10721,9 +9792,13 @@ mod tests {
             .insert("resolved_user".to_string(), json!("alice"));
 
         // "rate limit" is a hard error keyword
-        let result = watcher
-            .notify_failed_with_escalation(&issue, "rate limit exceeded: please slow down")
-            .await;
+        let result = crate::processing::notify_failed_with_escalation(
+            &watcher.notifier,
+            &watcher.tracker,
+            &issue,
+            "rate limit exceeded: please slow down",
+        )
+        .await;
         assert!(result.is_ok());
 
         // Notifier should have been called once (via notify_failed)
@@ -10749,9 +9824,13 @@ mod tests {
         let issue = test_issue();
 
         // A normal error message that is NOT a hard error
-        let result = watcher
-            .notify_failed_with_escalation(&issue, "compilation failed: missing semicolon")
-            .await;
+        let result: crate::error::Result<()> = crate::processing::notify_failed_with_escalation(
+            &watcher.notifier,
+            &watcher.tracker,
+            &issue,
+            "compilation failed: missing semicolon",
+        )
+        .await;
         assert!(result.is_ok());
 
         // Notifier should have been called once
@@ -11019,6 +10098,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -11086,6 +10167,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -11120,5 +10203,1177 @@ mod tests {
         });
 
         assert!(watcher.config.workspace.to_str().is_some());
+    }
+
+    // ========================================================================
+    // Additional coverage tests
+    // ========================================================================
+
+    // --- source_from_processing_key ---
+
+    #[test]
+    fn test_source_from_processing_key_with_colon() {
+        assert_eq!(source_from_processing_key("sentry:ISSUE-42"), "sentry");
+    }
+
+    #[test]
+    fn test_source_from_processing_key_without_colon() {
+        // When there's no colon, the whole key is the source
+        assert_eq!(source_from_processing_key("no_colon_here"), "no_colon_here");
+    }
+
+    #[test]
+    fn test_source_from_processing_key_empty() {
+        assert_eq!(source_from_processing_key(""), "");
+    }
+
+    #[test]
+    fn test_source_from_processing_key_colon_at_start() {
+        assert_eq!(source_from_processing_key(":issue-1"), "");
+    }
+
+    #[test]
+    fn test_source_from_processing_key_multiple_colons() {
+        // split_once only splits on the first colon
+        assert_eq!(source_from_processing_key("a:b:c"), "a");
+    }
+
+    #[test]
+    fn test_source_from_processing_key_colon_at_end() {
+        assert_eq!(source_from_processing_key("source:"), "source");
+    }
+
+    // --- ProcessingState ---
+
+    #[test]
+    fn test_processing_state_new() {
+        let state = ProcessingState::new();
+        assert!(state.is_empty());
+        assert_eq!(state.len(), 0);
+    }
+
+    #[test]
+    fn test_processing_state_insert_returns_true_for_new() {
+        let mut state = ProcessingState::new();
+        assert!(state.insert("sentry:123".to_string()));
+    }
+
+    #[test]
+    fn test_processing_state_insert_returns_false_for_duplicate() {
+        let mut state = ProcessingState::new();
+        assert!(state.insert("sentry:123".to_string()));
+        assert!(!state.insert("sentry:123".to_string()));
+    }
+
+    #[test]
+    fn test_processing_state_len_and_is_empty() {
+        let mut state = ProcessingState::new();
+        assert!(state.is_empty());
+        assert_eq!(state.len(), 0);
+
+        state.insert("a:1".to_string());
+        assert!(!state.is_empty());
+        assert_eq!(state.len(), 1);
+
+        state.insert("a:2".to_string());
+        assert_eq!(state.len(), 2);
+
+        state.insert("b:1".to_string());
+        assert_eq!(state.len(), 3);
+    }
+
+    #[test]
+    fn test_processing_state_contains() {
+        let mut state = ProcessingState::new();
+        assert!(!state.contains("x:1"));
+        state.insert("x:1".to_string());
+        assert!(state.contains("x:1"));
+        assert!(!state.contains("x:2"));
+    }
+
+    #[test]
+    fn test_processing_state_source_count() {
+        let mut state = ProcessingState::new();
+        assert_eq!(state.source_count("sentry"), 0);
+
+        state.insert("sentry:1".to_string());
+        assert_eq!(state.source_count("sentry"), 1);
+
+        state.insert("sentry:2".to_string());
+        assert_eq!(state.source_count("sentry"), 2);
+
+        state.insert("linear:1".to_string());
+        assert_eq!(state.source_count("sentry"), 2);
+        assert_eq!(state.source_count("linear"), 1);
+    }
+
+    #[test]
+    fn test_processing_state_remove_returns_true_when_present() {
+        let mut state = ProcessingState::new();
+        state.insert("sentry:1".to_string());
+        assert!(state.remove("sentry:1"));
+    }
+
+    #[test]
+    fn test_processing_state_remove_returns_false_when_absent() {
+        let mut state = ProcessingState::new();
+        assert!(!state.remove("nonexistent:1"));
+    }
+
+    #[test]
+    fn test_processing_state_remove_decrements_source_count() {
+        let mut state = ProcessingState::new();
+        state.insert("sentry:1".to_string());
+        state.insert("sentry:2".to_string());
+        assert_eq!(state.source_count("sentry"), 2);
+
+        state.remove("sentry:1");
+        assert_eq!(state.source_count("sentry"), 1);
+
+        state.remove("sentry:2");
+        assert_eq!(state.source_count("sentry"), 0);
+    }
+
+    #[test]
+    fn test_processing_state_remove_cleans_up_zero_count() {
+        let mut state = ProcessingState::new();
+        state.insert("src:1".to_string());
+        state.remove("src:1");
+        // After removing the last key for a source, source_count returns 0
+        assert_eq!(state.source_count("src"), 0);
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn test_processing_state_insert_remove_reinsert() {
+        let mut state = ProcessingState::new();
+        state.insert("a:1".to_string());
+        state.remove("a:1");
+        assert_eq!(state.source_count("a"), 0);
+
+        // Re-insert should work
+        assert!(state.insert("a:1".to_string()));
+        assert_eq!(state.source_count("a"), 1);
+        assert_eq!(state.len(), 1);
+    }
+
+    #[test]
+    fn test_processing_state_key_without_colon() {
+        let mut state = ProcessingState::new();
+        state.insert("nocolon".to_string());
+        // The entire key is treated as the source name
+        assert_eq!(state.source_count("nocolon"), 1);
+        assert!(state.contains("nocolon"));
+    }
+
+    // --- is_dry_run accessor ---
+
+    #[test]
+    fn test_is_dry_run_true() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], true);
+        assert!(watcher.is_dry_run());
+    }
+
+    #[test]
+    fn test_is_dry_run_false() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+        assert!(!watcher.is_dry_run());
+    }
+
+    // --- set_running ---
+
+    #[test]
+    fn test_set_running_true() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+        assert!(!watcher.is_running());
+        watcher.set_running(true);
+        assert!(watcher.is_running());
+    }
+
+    #[test]
+    fn test_set_running_false() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+        watcher.set_running(true);
+        watcher.set_running(false);
+        assert!(!watcher.is_running());
+    }
+
+    // --- reindex_interval ---
+
+    #[test]
+    fn test_reindex_interval_disabled() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.code_index.enabled = false;
+        config.code_index.reindex_interval_hours = 6.0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+
+        assert!(watcher.reindex_interval().is_none());
+    }
+
+    #[test]
+    fn test_reindex_interval_zero_hours() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.code_index.enabled = true;
+        config.code_index.reindex_interval_hours = 0.0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+
+        assert!(watcher.reindex_interval().is_none());
+    }
+
+    #[test]
+    fn test_reindex_interval_negative_hours() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.code_index.enabled = true;
+        config.code_index.reindex_interval_hours = -1.0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+
+        assert!(watcher.reindex_interval().is_none());
+    }
+
+    #[test]
+    fn test_reindex_interval_enabled_with_hours() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.code_index.enabled = true;
+        config.code_index.reindex_interval_hours = 2.0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+
+        let interval = watcher.reindex_interval().unwrap();
+        assert_eq!(interval, std::time::Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_reindex_interval_fractional_hours() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.code_index.enabled = true;
+        config.code_index.reindex_interval_hours = 0.5; // 30 minutes
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+
+        let interval = watcher.reindex_interval().unwrap();
+        assert_eq!(interval, std::time::Duration::from_secs(1800));
+    }
+
+    // --- Rate limit extraction: banner with PM ---
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_pm() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit · resets 3pm (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-23T15:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_12am() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit · resets 12am (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-24T00:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_12pm() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit · resets 12pm (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-23T12:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_with_minutes() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit · resets 6:30am (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-23T06:30:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_missing_utc() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // No (UTC) at end
+        let msg = "You've hit your limit · resets 6am";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_invalid_hour() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Hour 0 is invalid in 12-hour format
+        let msg = "You've hit your limit · resets 0am (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_hour_13() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit · resets 13am (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_minute_60() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit · resets 6:60am (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_banner_utc_no_resets_keyword() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit at 6am (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_from_banner_utc(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    // --- Rate limit extraction: retry-after ---
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_retry_after() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "429 Too Many Requests. Retry-After: 120";
+        let parsed = Watcher::extract_rate_limit_reset_from_retry_after(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-23T10:02:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_retry_after_zero_seconds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // retry-after 0 is invalid (seconds <= 0)
+        let msg = "Retry-After: 0";
+        let parsed = Watcher::extract_rate_limit_reset_from_retry_after(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_retry_after_no_digits() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Retry-After: soon";
+        let parsed = Watcher::extract_rate_limit_reset_from_retry_after(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_retry_after_missing_keyword() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Wait 120 seconds";
+        let parsed = Watcher::extract_rate_limit_reset_from_retry_after(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    // --- Rate limit extraction: resets_at edge cases ---
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_resets_at_no_key() {
+        let msg = "Claude rate limit hit: some error";
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_resets_at_invalid_timestamp() {
+        let msg = r#"{"resetsAt": "not-a-valid-date"}"#;
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_resets_at_empty_key() {
+        let msg = r#"{"resetsAt": ""}"#;
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_from_resets_at_multiple_keys() {
+        // Multiple occurrences: first invalid, second valid
+        let msg = r#"{"resetsAt": "invalid"} and {"resetsAt": "2026-03-01T12:00:00Z"}"#;
+        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
+        assert!(parsed.is_some());
+        assert_eq!(parsed.unwrap().to_rfc3339(), "2026-03-01T12:00:00+00:00");
+    }
+
+    // --- extract_rate_limit_reset_time combined ---
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_prefers_resets_at() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Has both resetsAt JSON and retry-after header; should prefer resetsAt
+        let msg = r#"{"resetsAt": "2026-02-23T12:00:00Z"} Retry-After: 120"#;
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-23T12:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_falls_back_to_banner() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "You've hit your limit · resets 6am (UTC)";
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-23T06:00:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_falls_back_to_retry_after() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Rate limited. Retry-After: 60";
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-02-23T10:01:00+00:00");
+    }
+
+    #[test]
+    fn test_extract_rate_limit_reset_time_none_when_no_match() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = "Some random error with no rate limit info";
+        let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
+        assert!(parsed.is_none());
+    }
+
+    // --- is_rate_limit_paused / clear_rate_limit_pause ---
+
+    #[tokio::test]
+    async fn test_is_rate_limit_paused_when_not_paused() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+        assert!(!watcher.is_rate_limit_paused().await);
+    }
+
+    #[tokio::test]
+    async fn test_is_rate_limit_paused_when_paused_in_future() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+
+        // Set pause until far in the future
+        {
+            let mut pause_until = watcher.rate_limit_pause_until.write().await;
+            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+        }
+
+        assert!(watcher.is_rate_limit_paused().await);
+    }
+
+    #[tokio::test]
+    async fn test_is_rate_limit_paused_clears_expired() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+
+        // Set pause until the past
+        {
+            let mut pause_until = watcher.rate_limit_pause_until.write().await;
+            *pause_until = Some(Utc::now() - chrono::Duration::seconds(10));
+        }
+
+        // Should return false and clear the expired pause
+        assert!(!watcher.is_rate_limit_paused().await);
+
+        // Verify it was cleared
+        let pause = watcher.rate_limit_pause_until.read().await;
+        assert!(pause.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_rate_limit_pause_clears_value() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+
+        {
+            let mut pause_until = watcher.rate_limit_pause_until.write().await;
+            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+        }
+
+        watcher.clear_rate_limit_pause().await;
+
+        let pause = watcher.rate_limit_pause_until.read().await;
+        assert!(pause.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_rate_limit_pause_noop_when_not_set() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+
+        // Should not panic when nothing to clear
+        watcher.clear_rate_limit_pause().await;
+
+        let pause = watcher.rate_limit_pause_until.read().await;
+        assert!(pause.is_none());
+    }
+
+    // --- pause_until_rate_limit_reset ---
+
+    #[tokio::test]
+    async fn test_pause_until_rate_limit_reset_sets_pause() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+
+        let issue = test_issue();
+        let error = r#"{"resetsAt": "2026-12-31T23:59:59Z"}"#;
+
+        let result = watcher.pause_until_rate_limit_reset(&issue, error).await;
+        assert!(result.is_some());
+
+        let pause = watcher.rate_limit_pause_until.read().await;
+        assert!(pause.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pause_until_rate_limit_reset_fallback_when_no_parse() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+
+        let issue = test_issue();
+        // Error with no parseable time info
+        let error = "rate limit hit, no timing info";
+
+        let result = watcher.pause_until_rate_limit_reset(&issue, error).await;
+        assert!(result.is_some());
+
+        // Fallback is 15 minutes + 1 minute buffer
+        let pause = watcher.rate_limit_pause_until.read().await;
+        assert!(pause.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pause_until_rate_limit_reset_does_not_lower_existing() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+
+        // Set a pause until far in the future
+        let far_future = Utc::now() + chrono::Duration::hours(24);
+        {
+            let mut pause_until = watcher.rate_limit_pause_until.write().await;
+            *pause_until = Some(far_future);
+        }
+
+        let issue = test_issue();
+        // This would parse to a time much sooner
+        let error = "Retry-After: 60";
+        watcher.pause_until_rate_limit_reset(&issue, error).await;
+
+        // The pause should NOT be lowered below the existing far_future value
+        let pause = watcher.rate_limit_pause_until.read().await;
+        assert!(pause.unwrap() >= far_future);
+    }
+
+    // --- check_releases_and_cascade early returns ---
+
+    #[tokio::test]
+    async fn test_check_releases_and_cascade_disabled() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.cascade.enabled = false;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+
+        let result = watcher.check_releases_and_cascade().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_releases_and_cascade_no_scm() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.cascade.enabled = true;
+        config.cascade.rules = vec![crate::config::CascadeRule {
+            upstream: "org/lib".to_string(),
+            downstream: "org/app".to_string(),
+            trigger: crate::config::CascadeTrigger::Release,
+            version_update: true,
+            target_branch: None,
+            instructions: None,
+        }];
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None, // No GitHub client
+            scm_provider: None,  // No SCM provider
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+
+        let result = watcher.check_releases_and_cascade().await;
+        assert!(result.is_ok());
+    }
+
+    // --- discover_dependencies early returns ---
+
+    #[tokio::test]
+    async fn test_discover_dependencies_no_inferrer() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+        assert!(watcher.inferrer.is_none());
+        // Should return early without panicking
+        watcher.discover_dependencies().await;
+    }
+
+    // --- pull_and_reindex_all_repos no inferrer ---
+
+    #[tokio::test]
+    async fn test_pull_and_reindex_all_repos_no_inferrer() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+        assert!(watcher.inferrer.is_none());
+        // Should return early without panicking
+        watcher.pull_and_reindex_all_repos().await;
+    }
+
+    // --- reindex_repo early returns ---
+
+    #[tokio::test]
+    async fn test_reindex_repo_disabled() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.code_index.enabled = false;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+
+        // Should return early without panicking
+        watcher
+            .reindex_repo("test-repo", std::path::Path::new("/tmp/test"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_reindex_repo_no_embedding_client() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.code_index.enabled = true;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None, // No embedding client
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+
+        // Should return early without panicking
+        watcher
+            .reindex_repo("test-repo", std::path::Path::new("/tmp/test"))
+            .await;
+    }
+
+    // --- build_inferrer_with_embeddings early returns ---
+
+    #[tokio::test]
+    async fn test_build_inferrer_with_embeddings_no_known_orgs() {
+        let mut config = test_config();
+        config.known_orgs = vec![];
+
+        let result = Watcher::build_inferrer_with_embeddings(&config, None)
+            .await
+            .unwrap();
+        assert!(result.0.is_none());
+        assert!(result.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_inferrer_with_embeddings_no_discovery() {
+        let mut config = test_config();
+        config.known_orgs = vec!["org".to_string()];
+        config.auto_discover_paths = vec![];
+
+        let result = Watcher::build_inferrer_with_embeddings(&config, None)
+            .await
+            .unwrap();
+        assert!(result.0.is_none());
+        assert!(result.1.is_none());
+    }
+
+    // --- poll paused by rate limit ---
+
+    #[tokio::test]
+    async fn test_poll_returns_early_when_rate_limited() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker.clone(), vec![], false);
+
+        // Set pause until the future
+        {
+            let mut pause_until = watcher.rate_limit_pause_until.write().await;
+            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+        }
+
+        let result = watcher.poll().await;
+        assert!(result.is_ok());
+
+        // No metrics should be recorded since we returned early
+        let poll_cycle = tracker
+            .get_metrics("poll_cycle_duration_secs", None, 10)
+            .unwrap();
+        assert!(poll_cycle.is_empty());
+    }
+
+    // --- run_housekeeping_cycle when rate limited ---
+
+    #[tokio::test]
+    async fn test_run_housekeeping_cycle_returns_early_when_rate_limited() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker.clone(), vec![], false);
+
+        {
+            let mut pause_until = watcher.rate_limit_pause_until.write().await;
+            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+        }
+
+        let result = watcher.run_housekeeping_cycle().await;
+        assert!(result.is_ok());
+
+        // No housekeeping metrics recorded
+        let duration = tracker
+            .get_metrics("housekeeping_cycle_duration_secs", None, 10)
+            .unwrap();
+        assert!(duration.is_empty());
+    }
+
+    // --- poll_source when rate limited ---
+
+    #[tokio::test]
+    async fn test_poll_source_returns_early_when_rate_limited() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issues = vec![Issue::new(
+            "1",
+            "T-1",
+            "Issue 1",
+            "http://example.com/1",
+            "test",
+        )];
+        let source = Arc::new(MockSource::with_issues("test", issues)) as Arc<dyn IssueSource>;
+
+        let watcher = create_test_watcher(notifier, tracker.clone(), vec![source.clone()], false);
+
+        {
+            let mut pause_until = watcher.rate_limit_pause_until.write().await;
+            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+        }
+
+        let result = watcher.poll_source(&source).await;
+        assert!(result.is_ok());
+
+        // No metrics recorded since we returned early
+        let fetched = tracker.get_metrics("issues_fetched", None, 10).unwrap();
+        assert!(fetched.is_empty());
+    }
+
+    // --- process_issue when rate limited ---
+
+    #[tokio::test]
+    async fn test_process_issue_returns_false_when_rate_limited() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issue = Issue::new("1", "T-1", "Test", "http://example.com", "mock");
+        let source =
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source.clone()], false);
+
+        {
+            let mut pause_until = watcher.rate_limit_pause_until.write().await;
+            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+        }
+
+        let match_result = MatchResult::matched("Test", MatchPriority::Normal);
+        let result = watcher
+            .process_issue(source, issue, match_result, None, None)
+            .await;
+        assert!(
+            !result,
+            "process_issue should return false when rate limited"
+        );
+    }
+
+    // --- process_ready_retries closed PR trigger reason ---
+
+    #[tokio::test]
+    async fn test_process_ready_retries_closed_pr_builds_trigger_reason() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Create a closed attempt that would be retried
+        tracker
+            .record_attempt("mock", "closed-1", "MOCK-C1")
+            .unwrap();
+        tracker
+            .mark_success("mock", "closed-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.mark_closed("mock", "closed-1").unwrap();
+
+        let source = Arc::new(MockSource::new("mock")) as Arc<dyn IssueSource>;
+
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        config.processing_delay_ms = 0;
+
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![source],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(crate::runner::ClaudeAgentRunner::new(
+                crate::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        });
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        let result = watcher.process_ready_retries().await;
+        assert!(result.is_ok());
+
+        let attempt = tracker.get_attempt("mock", "closed-1").unwrap().unwrap();
+        assert_eq!(attempt.retry_count, 1);
+    }
+
+    // --- Resolved status in fix attempt ---
+
+    #[test]
+    fn test_is_terminal_attempt_status_exhaustive() {
+        // Verify we haven't missed any variants
+        let all_statuses = [
+            FixAttemptStatus::Pending,
+            FixAttemptStatus::Success,
+            FixAttemptStatus::Failed,
+            FixAttemptStatus::Merged,
+            FixAttemptStatus::Closed,
+            FixAttemptStatus::CannotFix,
+        ];
+
+        let terminal_count = all_statuses
+            .iter()
+            .filter(|s| Watcher::is_terminal_attempt_status(**s))
+            .count();
+        assert_eq!(terminal_count, 3, "Expected exactly 3 terminal statuses");
+
+        let non_terminal_count = all_statuses
+            .iter()
+            .filter(|s| !Watcher::is_terminal_attempt_status(**s))
+            .count();
+        assert_eq!(
+            non_terminal_count, 3,
+            "Expected exactly 3 non-terminal statuses"
+        );
+    }
+
+    // --- refresh_repos when one of the two optionals is None ---
+
+    #[tokio::test]
+    async fn test_refresh_repos_no_embedding_client() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        // inferrer is None so it returns 0 before checking embedding_client
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+        let result = watcher.refresh_repos().await.unwrap();
+        assert_eq!(result, 0);
+    }
+
+    // --- ProcessingState with many sources ---
+
+    #[test]
+    fn test_processing_state_multiple_sources() {
+        let mut state = ProcessingState::new();
+
+        for i in 0..10 {
+            state.insert(format!("sentry:{}", i));
+        }
+        for i in 0..5 {
+            state.insert(format!("linear:{}", i));
+        }
+        for i in 0..3 {
+            state.insert(format!("jira:{}", i));
+        }
+
+        assert_eq!(state.len(), 18);
+        assert_eq!(state.source_count("sentry"), 10);
+        assert_eq!(state.source_count("linear"), 5);
+        assert_eq!(state.source_count("jira"), 3);
+        assert_eq!(state.source_count("unknown"), 0);
+
+        // Remove some from sentry
+        for i in 0..5 {
+            state.remove(&format!("sentry:{}", i));
+        }
+
+        assert_eq!(state.source_count("sentry"), 5);
+        assert_eq!(state.len(), 13);
+    }
+
+    // --- Sort stability with mixed priorities ---
+
+    #[test]
+    fn test_sort_by_priority_mixed_match_and_issue_priority() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(notifier, tracker, vec![], false);
+
+        let mut issues = vec![
+            (
+                test_issue_with_priority("1", IssuePriority::Critical),
+                MatchResult::matched("Normal match critical issue", MatchPriority::Normal),
+            ),
+            (
+                test_issue_with_priority("2", IssuePriority::Low),
+                MatchResult::matched("Urgent match low issue", MatchPriority::Urgent),
+            ),
+            (
+                test_issue_with_priority("3", IssuePriority::High),
+                MatchResult::matched("Normal match high issue", MatchPriority::Normal),
+            ),
+        ];
+
+        watcher.sort_by_priority(&mut issues);
+
+        // Urgent match comes first regardless of issue priority
+        assert_eq!(issues[0].0.id, "2");
+        assert_eq!(issues[0].1.priority, MatchPriority::Urgent);
+
+        // Among Normal match, Critical comes before High
+        assert_eq!(issues[1].0.id, "1");
+        assert_eq!(issues[1].0.priority, IssuePriority::Critical);
+        assert_eq!(issues[2].0.id, "3");
+        assert_eq!(issues[2].0.priority, IssuePriority::High);
     }
 }

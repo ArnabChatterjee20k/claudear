@@ -119,6 +119,10 @@ impl ClusterDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{
+        ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore, ExperimentStore,
+        KnowledgeStore, RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
+    };
     use std::collections::HashMap;
 
     /// Simple mock that returns canned arrivals.
@@ -127,12 +131,12 @@ mod tests {
     }
 
     // Minimal FixAttemptTracker impl for testing
-    impl FixAttemptTracker for MockTracker {
+    impl AttemptTracker for MockTracker {
         fn has_attempted(&self, _: &str, _: &str) -> Result<bool> {
             Ok(false)
         }
-        fn get_attempted_issue_ids(&self, _: &str) -> std::collections::HashSet<String> {
-            std::collections::HashSet::new()
+        fn get_attempted_issue_ids(&self, _: &str) -> Result<std::collections::HashSet<String>> {
+            Ok(std::collections::HashSet::new())
         }
         fn record_attempt(&self, _: &str, _: &str, _: &str) -> Result<()> {
             Ok(())
@@ -203,6 +207,9 @@ mod tests {
         fn prepare_for_retry(&self, _: &str, _: &str) -> Result<()> {
             Ok(())
         }
+    }
+    impl ActivityStore for MockTracker {}
+    impl KnowledgeStore for MockTracker {
         fn get_recent_issue_arrivals(
             &self,
             _source: &str,
@@ -211,6 +218,15 @@ mod tests {
             Ok(self.arrivals.clone())
         }
     }
+    impl EmbeddingStore for MockTracker {}
+    impl RepoStore for MockTracker {}
+    impl UserStore for MockTracker {}
+    impl ChatStore for MockTracker {}
+    impl RegressionStore for MockTracker {}
+    impl ExperimentStore for MockTracker {}
+    impl EvaluationStore for MockTracker {}
+    impl WebhookStore for MockTracker {}
+    impl SimilarityStore for MockTracker {}
 
     #[test]
     fn test_detect_clusters_too_few() {

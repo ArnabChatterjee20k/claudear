@@ -28,12 +28,17 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 1024 * 1024;
 /// Default embedding batch size.
 const DEFAULT_BATCH_SIZE: usize = 32;
 
+/// Bump this when the indexing pipeline changes (parser, chunker, analyzer,
+/// embedding context format, etc.) to force a full re-index on the next run.
+pub const CODE_INDEX_VERSION: &str = "1";
+
 /// Write-side: indexes a repository's source code.
 pub struct CodeIndexer {
     tracker: Arc<dyn FixAttemptTracker>,
     embedding_client: Arc<EmbeddingClient>,
     max_file_size: u64,
     batch_size: usize,
+    force_reindex: bool,
 }
 
 impl CodeIndexer {
@@ -46,6 +51,7 @@ impl CodeIndexer {
             embedding_client,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
+            force_reindex: false,
         }
     }
 
@@ -64,7 +70,15 @@ impl CodeIndexer {
             } else {
                 batch_size
             },
+            force_reindex: false,
         }
+    }
+
+    /// When set, deletes all existing code data for the repo before indexing,
+    /// bypassing file-hash based incremental detection.
+    pub fn with_force_reindex(mut self, force: bool) -> Self {
+        self.force_reindex = force;
+        self
     }
 
     /// Index (or incrementally re-index) a repository.
@@ -72,17 +86,43 @@ impl CodeIndexer {
         let repo_id = self.tracker.get_or_create_repo_id(repo_name)?;
         let mut stats = CodeIndexStats::default();
 
-        if let Ok(Some(stored_model)) = self.tracker.get_code_embedding_model(repo_id) {
-            let current_model = self.embedding_client.model();
-            if stored_model != current_model {
-                tracing::warn!(
-                    repo = %repo_name,
-                    old_model = %stored_model,
-                    new_model = %current_model,
-                    "Embedding model changed — deleting all code data to force full re-index"
-                );
-                self.tracker.delete_all_code_data_for_repo(repo_id)?;
+        let mut needs_full_reindex = self.force_reindex;
+
+        // Check if the indexer version changed since last run.
+        if !needs_full_reindex {
+            if let Ok(Some(stored_ver)) = self.tracker.get_code_index_meta(repo_id, "index_version")
+            {
+                if stored_ver != CODE_INDEX_VERSION {
+                    tracing::info!(
+                        repo = %repo_name,
+                        old_version = %stored_ver,
+                        new_version = %CODE_INDEX_VERSION,
+                        "Code index version changed — forcing full re-index"
+                    );
+                    needs_full_reindex = true;
+                }
             }
+        }
+
+        // Check if the embedding model changed.
+        if !needs_full_reindex {
+            if let Ok(Some(stored_model)) = self.tracker.get_code_embedding_model(repo_id) {
+                let current_model = self.embedding_client.model();
+                if stored_model != current_model {
+                    tracing::warn!(
+                        repo = %repo_name,
+                        old_model = %stored_model,
+                        new_model = %current_model,
+                        "Embedding model changed — forcing full re-index"
+                    );
+                    needs_full_reindex = true;
+                }
+            }
+        }
+
+        if needs_full_reindex {
+            tracing::info!(repo = %repo_name, "Deleting all code data for full re-index");
+            self.tracker.delete_all_code_data_for_repo(repo_id)?;
         }
 
         // Collect all source files.
@@ -196,6 +236,11 @@ impl CodeIndexer {
         // Clean up entries for deleted files.
         self.tracker.cleanup_stale_code_data(repo_id, &seen_paths)?;
 
+        // Stamp the current index version so future runs can detect changes.
+        let _ = self
+            .tracker
+            .set_code_index_meta(repo_id, "index_version", CODE_INDEX_VERSION);
+
         tracing::info!(repo = %repo_name, %stats, "Code indexing complete");
         Ok(stats)
     }
@@ -242,16 +287,11 @@ impl CodeIndexer {
                 chunk_to_embed_idx.push(idx);
             } else {
                 let idx = unique_texts.len();
-                // Reconstruct full context text for embedding:
-                // stored prefix (context_text) + "\n" + chunk_text
-                let full_context = chunker::build_context_text(
-                    &chunk.file_path,
-                    chunk.language,
-                    &chunk.chunk_type,
-                    chunk.symbol_name.as_deref(),
-                    None,
-                    &chunk.chunk_text,
-                );
+                // Build full embedding text from the stored context prefix
+                // (includes file path, language, symbol, signature, imports)
+                // combined with the code body.
+                let full_context =
+                    chunker::build_embedding_text(&chunk.context_text, &chunk.chunk_text);
                 unique_texts.push(full_context);
                 hash_to_embed_idx.insert(content_hash.to_string(), idx);
                 chunk_to_embed_idx.push(idx);
@@ -1377,14 +1417,12 @@ mod tests {
         let files = indexer.collect_source_files(dir.path());
         assert_eq!(files.len(), 1, "Should find 1 Dockerfile");
         assert_eq!(files[0].1, Language::Dockerfile);
-        assert!(
-            files[0]
-                .0
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .contains("Dockerfile")
-        );
+        assert!(files[0]
+            .0
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("Dockerfile"));
     }
 
     #[test]
@@ -1503,5 +1541,519 @@ mod tests {
                 ctx
             );
         }
+    }
+
+    // --- Tests for CodeIndexer with_force_reindex ---
+
+    #[test]
+    fn test_code_indexer_with_force_reindex_true() {
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client).with_force_reindex(true);
+        assert!(indexer.force_reindex);
+    }
+
+    #[test]
+    fn test_code_indexer_with_force_reindex_false() {
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client).with_force_reindex(false);
+        assert!(!indexer.force_reindex);
+    }
+
+    #[test]
+    fn test_code_indexer_force_reindex_default_is_false() {
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+        assert!(!indexer.force_reindex);
+    }
+
+    // --- Tests for build_code_search_query edge cases ---
+
+    #[test]
+    fn test_build_code_search_query_sentry_empty_culprit_not_included() {
+        let mut issue = crate::types::Issue::new("1", "S-1", "Err", "url", "sentry");
+        issue.set_metadata("culprit", "");
+        issue.set_metadata("error_type", "ValueError");
+
+        let query = super::build_code_search_query(&issue);
+        // Should have title + error_type, but NOT empty culprit
+        assert!(query.contains("Err"));
+        assert!(query.contains("ValueError"));
+        // Check no double spaces
+        let parts: Vec<&str> = query.split(' ').filter(|s| !s.is_empty()).collect();
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn test_build_code_search_query_sentry_all_fields_present() {
+        let mut issue = crate::types::Issue::new("1", "S-1", "Error", "url", "sentry");
+        issue.description = Some("desc".to_string());
+        issue.set_metadata("error_type", "TypeError");
+        issue.set_metadata("error_value", "null ref");
+        issue.set_metadata("culprit", "main.js");
+        issue.set_metadata("filename", "src/main.js");
+        issue.set_metadata("function", "handleClick");
+
+        let query = super::build_code_search_query(&issue);
+        let parts: Vec<&str> = query.split(' ').collect();
+        // title, desc, error_type, error_value (2 words), culprit, filename, function
+        assert!(parts.len() >= 8);
+    }
+
+    #[test]
+    fn test_build_code_search_query_github_source() {
+        let mut issue = crate::types::Issue::new("1", "GH-1", "Bug report", "url", "github");
+        issue.description = Some("Steps to reproduce".to_string());
+        let query = super::build_code_search_query(&issue);
+        assert_eq!(query, "Bug report Steps to reproduce");
+    }
+
+    // --- Tests for format_code_search_context edge cases ---
+
+    #[test]
+    fn test_format_code_search_context_zero_score() {
+        let chunk = make_chunk("a.rs", None, "function", Language::Rust, 1, 1, "x");
+        let results = vec![make_search_result(chunk, 0.0)];
+        let ctx = super::format_code_search_context(&results);
+        assert!(ctx.contains("Similarity: 0%"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_perfect_score() {
+        let chunk = make_chunk("a.rs", None, "function", Language::Rust, 1, 1, "x");
+        let results = vec![make_search_result(chunk, 1.0)];
+        let ctx = super::format_code_search_context(&results);
+        assert!(ctx.contains("Similarity: 100%"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_many_results() {
+        let results: Vec<CodeSearchResult> = (1..=5)
+            .map(|i| {
+                let chunk = make_chunk(
+                    &format!("src/file{}.rs", i),
+                    Some(&format!("func_{}", i)),
+                    "function",
+                    Language::Rust,
+                    i * 10,
+                    i * 10 + 5,
+                    &format!("fn func_{}() {{}}", i),
+                );
+                make_search_result(chunk, 1.0 - (i as f64 * 0.1))
+            })
+            .collect();
+
+        let ctx = super::format_code_search_context(&results);
+
+        for i in 1..=5 {
+            assert!(
+                ctx.contains(&format!("### {}.", i)),
+                "Should contain result {}",
+                i
+            );
+            assert!(ctx.contains(&format!("func_{}", i)));
+        }
+    }
+
+    #[test]
+    fn test_format_code_search_context_code_exactly_2000_chars() {
+        let code = "x".repeat(2000);
+        let chunk = make_chunk("a.rs", None, "function", Language::Rust, 1, 100, &code);
+        let results = vec![make_search_result(chunk, 0.5)];
+        let ctx = super::format_code_search_context(&results);
+        // Exactly 2000 chars should NOT be truncated
+        assert!(!ctx.contains("(truncated)"));
+        assert!(ctx.contains(&"x".repeat(2000)));
+    }
+
+    #[test]
+    fn test_format_code_search_context_code_2001_chars() {
+        let code = "x".repeat(2001);
+        let chunk = make_chunk("a.rs", None, "function", Language::Rust, 1, 100, &code);
+        let results = vec![make_search_result(chunk, 0.5)];
+        let ctx = super::format_code_search_context(&results);
+        // 2001 chars should be truncated
+        assert!(ctx.contains("(truncated)"));
+    }
+
+    // --- Tests for collect_source_files with symlinks ---
+
+    #[test]
+    fn test_collect_source_files_ignores_non_file_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a subdirectory (not a file)
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        // Put a .rs file in it
+        std::fs::write(sub.join("nested.rs"), "fn nested() {}").unwrap();
+        // Put a file at root
+        std::fs::write(dir.path().join("root.rs"), "fn root() {}").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let files = indexer.collect_source_files(dir.path());
+        assert_eq!(
+            files.len(),
+            2,
+            "Should find files in subdirs but not dirs themselves"
+        );
+    }
+
+    // --- Tests for index_repo ---
+
+    #[tokio::test]
+    async fn test_index_repo_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let stats = indexer.index_repo("test-repo", dir.path()).await.unwrap();
+        assert_eq!(stats.files_processed, 0);
+        assert_eq!(stats.files_skipped, 0);
+        assert_eq!(stats.files_failed, 0);
+        assert_eq!(stats.symbols_extracted, 0);
+        assert_eq!(stats.chunks_created, 0);
+    }
+
+    #[tokio::test]
+    async fn test_index_repo_with_rust_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            r#"
+fn main() {
+    println!("Hello, world!");
+}
+
+fn helper() -> i32 {
+    42
+}
+"#,
+        )
+        .unwrap();
+
+        let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
+            Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(Arc::clone(&tracker), embedding_client);
+
+        let stats = indexer.index_repo("test-repo", dir.path()).await.unwrap();
+        assert!(stats.files_processed >= 1, "Should process at least 1 file");
+        assert!(stats.chunks_created >= 1, "Should create at least 1 chunk");
+    }
+
+    #[tokio::test]
+    async fn test_index_repo_incremental_skips_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+        )
+        .unwrap();
+
+        let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
+            Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(Arc::clone(&tracker), Arc::clone(&embedding_client));
+
+        // First run
+        let stats1 = indexer.index_repo("test-repo", dir.path()).await.unwrap();
+        assert!(stats1.files_processed >= 1);
+
+        // Second run with same content
+        let indexer2 = CodeIndexer::new(Arc::clone(&tracker), embedding_client);
+        let stats2 = indexer2.index_repo("test-repo", dir.path()).await.unwrap();
+        assert_eq!(
+            stats2.files_processed, 0,
+            "Unchanged files should be skipped"
+        );
+        assert!(stats2.files_skipped >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_index_repo_force_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.rs"), "fn app() { let x = 1; }").unwrap();
+
+        let tracker: Arc<dyn crate::storage::FixAttemptTracker> =
+            Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(Arc::clone(&tracker), Arc::clone(&embedding_client));
+
+        // First index
+        let stats1 = indexer.index_repo("test-repo", dir.path()).await.unwrap();
+        assert!(stats1.files_processed >= 1);
+
+        // Force reindex
+        let indexer2 =
+            CodeIndexer::new(Arc::clone(&tracker), embedding_client).with_force_reindex(true);
+        let stats2 = indexer2.index_repo("test-repo", dir.path()).await.unwrap();
+        assert!(
+            stats2.files_processed >= 1,
+            "Force reindex should re-process files"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_repo_multiple_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}").unwrap();
+        std::fs::write(dir.path().join("c.py"), "def c(): pass").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let stats = indexer.index_repo("multi-repo", dir.path()).await.unwrap();
+        assert!(stats.files_processed >= 2, "Should process multiple files");
+    }
+
+    // --- Tests for CodeSearchService ---
+
+    #[tokio::test]
+    async fn test_code_search_service_search_empty_repo() {
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let service = CodeSearchService::new(tracker, embedding_client);
+
+        let results = service.search("test query", None, 10).await.unwrap();
+        assert!(results.is_empty(), "Empty DB should return no results");
+    }
+
+    #[tokio::test]
+    async fn test_code_search_service_find_similar_to_code() {
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let service = CodeSearchService::new(tracker, embedding_client);
+
+        let results = service
+            .find_similar_to_code("fn main() {}", None, 5)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "Empty DB should return no results");
+    }
+
+    #[test]
+    fn test_code_search_service_find_symbol_empty() {
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let service = CodeSearchService::new(tracker, embedding_client);
+
+        let results = service.find_symbol("nonexistent", None, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_code_search_service_find_symbol_with_kind() {
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let service = CodeSearchService::new(tracker, embedding_client);
+
+        let results = service
+            .find_symbol("test", Some(SymbolKind::Function), None)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_code_search_service_find_symbol_with_repo_id() {
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let service = CodeSearchService::new(tracker, embedding_client);
+
+        let results = service.find_symbol("test", None, Some(1)).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // --- Tests for sha256_hex with various content types ---
+
+    #[test]
+    fn test_sha256_hex_binary_like_content() {
+        let content = "\x00\x01\x02\x03\x7f";
+        let hash = sha256_hex(content);
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // --- Tests for CODE_INDEX_VERSION constant ---
+
+    #[test]
+    fn test_code_index_version_is_not_empty() {
+        assert!(!CODE_INDEX_VERSION.is_empty());
+    }
+
+    // --- Tests for index_repo with unreadable file (simulate by directory perm) ---
+
+    #[tokio::test]
+    async fn test_index_repo_skips_files_in_hidden_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = dir.path().join(".git");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::write(hidden.join("config.rs"), "fn git_config() {}").unwrap();
+        std::fs::write(dir.path().join("visible.rs"), "fn visible() {}").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        let stats = indexer.index_repo("hidden-test", dir.path()).await.unwrap();
+        // Only visible.rs should be processed
+        assert!(stats.files_processed <= 1);
+    }
+
+    // --- Test with_config large file size ---
+
+    #[test]
+    fn test_code_indexer_with_config_large_file_size() {
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::with_config(tracker, embedding_client, 10240, 128);
+
+        assert_eq!(indexer.max_file_size, 10240 * 1024);
+        assert_eq!(indexer.batch_size, 128);
+    }
+
+    // --- Test collect_source_files with root dir starting with dot ---
+
+    #[test]
+    fn test_collect_source_files_root_dir_with_dot_prefix() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let dot_dir = parent_dir.path().join(".my-project");
+        std::fs::create_dir(&dot_dir).unwrap();
+        std::fs::write(dot_dir.join("main.rs"), "fn main() {}").unwrap();
+
+        let tracker = Arc::new(crate::storage::SqliteTracker::in_memory().unwrap());
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let indexer = CodeIndexer::new(tracker, embedding_client);
+
+        // The root dir itself starts with '.', but depth 0 always included
+        let files = indexer.collect_source_files(&dot_dir);
+        assert_eq!(
+            files.len(),
+            1,
+            "Root dir with dot prefix should still be walked"
+        );
+    }
+
+    // --- Test format_code_search_context with Ruby and PHP ---
+
+    #[test]
+    fn test_format_code_search_context_ruby_fence() {
+        let chunk = make_chunk(
+            "app.rb",
+            None,
+            "function",
+            Language::Ruby,
+            1,
+            1,
+            "puts 'hi'",
+        );
+        let results = vec![make_search_result(chunk, 0.5)];
+        let ctx = super::format_code_search_context(&results);
+        assert!(ctx.contains("```ruby"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_php_fence() {
+        let chunk = make_chunk(
+            "app.php",
+            None,
+            "function",
+            Language::Php,
+            1,
+            1,
+            "<?php echo 1;",
+        );
+        let results = vec![make_search_result(chunk, 0.5)];
+        let ctx = super::format_code_search_context(&results);
+        assert!(ctx.contains("```php"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_swift_fence() {
+        let chunk = make_chunk(
+            "app.swift",
+            None,
+            "function",
+            Language::Swift,
+            1,
+            1,
+            "print(1)",
+        );
+        let results = vec![make_search_result(chunk, 0.5)];
+        let ctx = super::format_code_search_context(&results);
+        assert!(ctx.contains("```swift"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_kotlin_fence() {
+        let chunk = make_chunk(
+            "app.kt",
+            None,
+            "function",
+            Language::Kotlin,
+            1,
+            1,
+            "fun main() {}",
+        );
+        let results = vec![make_search_result(chunk, 0.5)];
+        let ctx = super::format_code_search_context(&results);
+        assert!(ctx.contains("```kotlin"));
+    }
+
+    #[test]
+    fn test_format_code_search_context_tsx_fence() {
+        let chunk = make_chunk(
+            "App.tsx",
+            None,
+            "function",
+            Language::Tsx,
+            1,
+            1,
+            "const App = () => <div/>;",
+        );
+        let results = vec![make_search_result(chunk, 0.5)];
+        let ctx = super::format_code_search_context(&results);
+        assert!(ctx.contains("```tsx"));
     }
 }

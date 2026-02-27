@@ -991,17 +991,9 @@ end
             "hello.lua",
         );
 
-        let json_file = analyze_file(
-            r#"{"key": "value"}"#,
-            Language::Json,
-            "config.json",
-        );
+        let json_file = analyze_file(r#"{"key": "value"}"#, Language::Json, "config.json");
 
-        let yaml_file = analyze_file(
-            "key: value\n",
-            Language::Yaml,
-            "config.yaml",
-        );
+        let yaml_file = analyze_file("key: value\n", Language::Yaml, "config.yaml");
 
         let dockerfile = analyze_file(
             "FROM rust:1.75\nRUN cargo build\n",

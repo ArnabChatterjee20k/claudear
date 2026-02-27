@@ -48,10 +48,10 @@ pub fn classify_node(lang: Language, node_type: &str) -> Option<SymbolKind> {
         Language::Kotlin => classify_kotlin(node_type),
         Language::CSharp => classify_csharp(node_type),
         Language::Dart => classify_dart(node_type),
-        Language::Json => None,  // data format, no symbols
-        Language::Yaml => None,  // data format, no symbols
+        Language::Json => None, // data format, no symbols
+        Language::Yaml => None, // data format, no symbols
         Language::Lua => classify_lua(node_type),
-        Language::Dockerfile => None,  // no tree-sitter grammar
+        Language::Dockerfile => None, // no tree-sitter grammar
     }
 }
 
@@ -387,9 +387,7 @@ fn classify_lua(node_type: &str) -> Option<SymbolKind> {
 
 fn lua_name_field(node_type: &str) -> Option<&'static str> {
     match node_type {
-        "function_declaration" | "local_function" | "function_definition_statement" => {
-            Some("name")
-        }
+        "function_declaration" | "local_function" | "function_definition_statement" => Some("name"),
         _ => None,
     }
 }
@@ -1351,15 +1349,7 @@ mod tests {
     fn test_classify_json_all_node_types_return_none() {
         // JSON is a data format — no node type should produce a symbol
         for node_type in [
-            "object",
-            "array",
-            "pair",
-            "string",
-            "number",
-            "true",
-            "false",
-            "null",
-            "document",
+            "object", "array", "pair", "string", "number", "true", "false", "null", "document",
         ] {
             assert_eq!(
                 classify_node(Language::Json, node_type),

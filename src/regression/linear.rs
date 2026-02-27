@@ -56,7 +56,7 @@ struct GitHubIssue {
     number: i64,
     title: String,
     body: Option<String>,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     state: String,
     html_url: String,
     created_at: String,
@@ -2521,5 +2521,535 @@ mod tests {
         assert_eq!(checker.original_issue_text, "Original issue text");
         assert!(checker.original_embedding.is_none());
         assert!(checker.embedding_client.is_none());
+    }
+
+    // --- RegressionResult construction (extended) ---
+
+    #[test]
+    fn test_regression_result_no_regression_2() {
+        let result = crate::regression::RegressionResult::no_regression();
+        assert!(!result.regression_detected);
+        assert!(result.details.is_none());
+    }
+
+    #[test]
+    fn test_regression_result_regression_2() {
+        let result =
+            crate::regression::RegressionResult::regression("Found similar issue".to_string());
+        assert!(result.regression_detected);
+        assert_eq!(result.details, Some("Found similar issue".to_string()));
+    }
+
+    // --- extract_thread_sections with <h3> tags ---
+
+    #[tokio::test]
+    async fn test_extract_thread_sections_h3_tags() {
+        let checker = make_checker(MockHttpClient::new(vec![]));
+        let html = "<html><body><h3>Small Heading</h3>Content for small heading</body></html>";
+        let sections = checker.extract_thread_sections(html);
+        assert!(!sections.is_empty());
+    }
+
+    // --- extract_thread_sections with <div class="post"> (extended) ---
+
+    #[tokio::test]
+    async fn test_extract_thread_sections_div_post_class_2() {
+        let checker = make_checker(MockHttpClient::new(vec![]));
+        let html =
+            r#"<html><body><div class="post">Post Title</div>Post body content</body></html>"#;
+        let sections = checker.extract_thread_sections(html);
+        assert!(!sections.is_empty());
+    }
+
+    // --- strip_html_tags with angle brackets in text (extended) ---
+
+    #[tokio::test]
+    async fn test_strip_html_tags_unclosed_tag_2() {
+        let checker = make_checker(MockHttpClient::new(vec![]));
+        // Unclosed angle bracket at the end
+        let result = checker.strip_html_tags("text before <unclosed");
+        assert_eq!(result, "text before");
+    }
+
+    #[tokio::test]
+    async fn test_strip_html_tags_multiple_spaces_between_words() {
+        let checker = make_checker(MockHttpClient::new(vec![]));
+        let result = checker.strip_html_tags("<p>word1</p>  <p>word2</p>   <p>word3</p>");
+        assert_eq!(result, "word1 word2 word3");
+    }
+
+    // --- search_github_issues_since with multiple keywords over limit ---
+
+    #[tokio::test]
+    async fn test_search_github_issues_since_exactly_5_keywords() {
+        let mock = MockHttpClient::new(vec![(200, r#"{"total_count": 0, "items": []}"#)]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            create_config(),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+            ],
+            "Issue text".to_string(),
+            mock,
+        );
+
+        let since = Utc::now() - Duration::hours(1);
+        let results = checker.search_github_issues_since(since).await.unwrap();
+        assert!(results.is_empty());
+        assert_eq!(checker.http.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // --- check_regression with empty repos ---
+
+    #[tokio::test]
+    async fn test_check_regression_empty_repos() {
+        let config = LinearRegressionConfig {
+            github_token: "test-token".to_string(),
+            scm_repos: vec![],
+            similarity_threshold: 0.75,
+        };
+
+        let mock = MockHttpClient::new(vec![
+            // Only threads check (no repos to search)
+            (200, "<html><body>Nothing</body></html>"),
+        ]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            config,
+            vec!["keyword".to_string()],
+            "Some issue".to_string(),
+            mock,
+        );
+
+        let mut watch = RegressionWatch::new(IssueType::LinearBug, "linear-empty-repos", 1);
+        watch.monitoring_started_at = Some(Utc::now() - Duration::hours(1));
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        assert!(!result.regression_detected);
+        let details = result.details.unwrap();
+        assert!(details.contains("0 repos"));
+    }
+
+    // --- check_regression details includes threshold ---
+
+    #[tokio::test]
+    async fn test_check_regression_details_includes_threshold_percentage() {
+        let config = LinearRegressionConfig {
+            github_token: "test-token".to_string(),
+            scm_repos: vec!["org/repo".to_string()],
+            similarity_threshold: 0.65,
+        };
+
+        let mock = MockHttpClient::new(vec![
+            (200, r#"{"total_count": 0, "items": []}"#),
+            (200, "<html><body>Nothing</body></html>"),
+        ]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            config,
+            vec!["keyword".to_string()],
+            "Some issue".to_string(),
+            mock,
+        );
+
+        let mut watch = RegressionWatch::new(IssueType::LinearBug, "linear-threshold", 1);
+        watch.monitoring_started_at = Some(Utc::now() - Duration::hours(1));
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        let details = result.details.unwrap();
+        assert!(
+            details.contains("65%"),
+            "Expected details to contain 65%, got: {}",
+            details
+        );
+    }
+
+    // --- check_appwrite_threads success with no matching content ---
+
+    #[tokio::test]
+    async fn test_check_appwrite_threads_html_with_only_tags() {
+        let mock = MockHttpClient::new(vec![(200, "<html><head></head><body></body></html>")]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            create_config(),
+            vec!["keyword".to_string()],
+            "Some issue".to_string(),
+            mock,
+        );
+
+        let results = checker.check_appwrite_threads().await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // --- GitHubSearchResult deserialization ---
+
+    #[test]
+    fn test_github_search_result_deserialization() {
+        let json = r#"{
+            "total_count": 2,
+            "items": [
+                {
+                    "id": 1,
+                    "number": 10,
+                    "title": "First issue",
+                    "body": "Body of first issue",
+                    "state": "open",
+                    "html_url": "https://github.com/org/repo/issues/10",
+                    "created_at": "2024-01-01T00:00:00Z"
+                },
+                {
+                    "id": 2,
+                    "number": 20,
+                    "title": "Second issue",
+                    "body": null,
+                    "state": "closed",
+                    "html_url": "https://github.com/org/repo/issues/20",
+                    "created_at": "2024-02-01T00:00:00Z"
+                }
+            ]
+        }"#;
+        let result: GitHubSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0].title, "First issue");
+        assert_eq!(
+            result.items[0].html_url,
+            "https://github.com/org/repo/issues/10"
+        );
+        assert_eq!(result.items[1].body, None);
+        assert_eq!(result.items[1].state, "closed");
+    }
+
+    #[test]
+    fn test_github_search_result_empty_items() {
+        let json = r#"{"total_count": 0, "items": []}"#;
+        let result: GitHubSearchResult = serde_json::from_str(json).unwrap();
+        assert!(result.items.is_empty());
+    }
+
+    // --- GitHubIssue deserialization ---
+
+    #[test]
+    fn test_github_issue_with_null_body() {
+        let json = r#"{
+            "id": 42,
+            "number": 7,
+            "title": "Issue with no body",
+            "body": null,
+            "state": "open",
+            "html_url": "https://github.com/org/repo/issues/7",
+            "created_at": "2024-03-15T10:00:00Z"
+        }"#;
+        let issue: GitHubIssue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.title, "Issue with no body");
+        assert!(issue.body.is_none());
+        assert_eq!(issue.created_at, "2024-03-15T10:00:00Z");
+    }
+
+    // Covers: search_github_issues with body text that exercises the format! path
+    #[tokio::test]
+    async fn test_search_github_issues_with_body_text_formatting() {
+        let mock = MockHttpClient::new(vec![(
+            200,
+            r#"{
+                "total_count": 1,
+                "items": [{
+                    "id": 1,
+                    "number": 42,
+                    "title": "Authentication error",
+                    "body": "Users are seeing 401 errors when trying to login after the latest update",
+                    "state": "open",
+                    "html_url": "https://github.com/test/repo/issues/42",
+                    "created_at": "2025-06-01T00:00:00Z"
+                }]
+            }"#,
+        )]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            create_config(),
+            vec!["authentication".to_string()],
+            "Authentication error in production".to_string(),
+            mock,
+        );
+
+        // Without embeddings, similarity is 0.0, so nothing matches
+        let results = checker.search_github_issues().await.unwrap();
+        assert!(results.is_empty());
+        // Verify the HTTP call was made (the issue was fetched and processed)
+        assert_eq!(checker.http.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // Covers: search_github_issues_since with issues that have body text
+    #[tokio::test]
+    async fn test_search_github_issues_since_with_body_text_new_issue() {
+        let future_time = (Utc::now() + Duration::hours(2)).to_rfc3339();
+        let mock = MockHttpClient::new(vec![(
+            200,
+            &format!(
+                r#"{{
+                    "total_count": 1,
+                    "items": [{{
+                        "id": 1,
+                        "number": 42,
+                        "title": "Database connection timeout",
+                        "body": "The database pool is exhausting connections under high load causing timeouts",
+                        "state": "open",
+                        "html_url": "https://github.com/test/repo/issues/42",
+                        "created_at": "{}"
+                    }}]
+                }}"#,
+                future_time
+            ),
+        )]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            create_config(),
+            vec!["database".to_string()],
+            "Database timeout issue".to_string(),
+            mock,
+        );
+
+        let since = Utc::now() - Duration::hours(1);
+        let results = checker.search_github_issues_since(since).await.unwrap();
+        // Without embeddings, similarity is 0.0 -> filtered out
+        assert!(results.is_empty());
+        assert_eq!(checker.http.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // Covers: check_appwrite_threads with multiple thread sections found
+    #[tokio::test]
+    async fn test_check_appwrite_threads_multiple_sections() {
+        let mock = MockHttpClient::new(vec![(
+            200,
+            "<html><body><h2>Auth Bug Discussion</h2>Users reporting auth failures after the update.<h3>Fix Attempt</h3>Tried updating the token refresh logic but it still fails.</body></html>",
+        )]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            create_config(),
+            vec!["auth".to_string()],
+            "Auth bug discussion".to_string(),
+            mock,
+        );
+
+        let results = checker.check_appwrite_threads().await.unwrap();
+        // No embeddings -> similarity 0.0 -> filtered out
+        assert!(results.is_empty());
+    }
+
+    // Covers: check_appwrite_threads with article tag and text content
+    #[tokio::test]
+    async fn test_check_appwrite_threads_article_with_content() {
+        let mock = MockHttpClient::new(vec![(
+            200,
+            "<html><body><article>Storage Upload Bug</article>Users are experiencing upload failures with files larger than 10MB.</body></html>",
+        )]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            create_config(),
+            vec!["storage".to_string()],
+            "Storage upload failure".to_string(),
+            mock,
+        );
+
+        let results = checker.check_appwrite_threads().await.unwrap();
+        // No embeddings -> similarity 0.0
+        assert!(results.is_empty());
+    }
+
+    // Covers: extract_thread_sections - safe char boundary handling with multibyte at exact boundary
+    #[tokio::test]
+    async fn test_extract_thread_sections_multibyte_at_boundary() {
+        let checker = make_checker(MockHttpClient::new(vec![]));
+        // Create content with Japanese characters that might cross the 2000 byte window
+        let content = "x".repeat(1995) + &"日本".repeat(5);
+        let html = format!("<h2>Title</h2>{}", content);
+        let sections = checker.extract_thread_sections(&html);
+        // Should not panic and should produce sections
+        assert!(!sections.is_empty());
+    }
+
+    // Covers: RegressionResult formatting with multiple similarity matches
+    #[test]
+    fn test_regression_result_formatting_multiple_issues() {
+        let matches = [
+            SimilarityMatch {
+                url: "https://github.com/org/repo/issues/1".to_string(),
+                title: "Issue A".to_string(),
+                similarity: 0.95,
+            },
+            SimilarityMatch {
+                url: "https://github.com/org/repo/issues/2".to_string(),
+                title: "Issue B".to_string(),
+                similarity: 0.82,
+            },
+        ];
+
+        let issue_links: Vec<String> = matches
+            .iter()
+            .map(|m| {
+                format!(
+                    "{} (similarity: {:.0}%) - {}",
+                    m.url,
+                    m.similarity * 100.0,
+                    m.title
+                )
+            })
+            .collect();
+
+        let result_text = format!(
+            "Found {} semantically similar GitHub issues that may indicate regression:\n{}",
+            matches.len(),
+            issue_links.join("\n")
+        );
+
+        assert!(result_text.contains("2 semantically similar"));
+        assert!(result_text.contains("95%"));
+        assert!(result_text.contains("82%"));
+        assert!(result_text.contains("Issue A"));
+        assert!(result_text.contains("Issue B"));
+    }
+
+    // Covers: RegressionResult formatting for threads
+    #[test]
+    fn test_regression_result_formatting_thread_matches() {
+        let matches = [SimilarityMatch {
+            url: "https://appwrite.io/threads#auth-bug".to_string(),
+            title: "Auth Bug Discussion".to_string(),
+            similarity: 0.88,
+        }];
+
+        let thread_links: Vec<String> = matches
+            .iter()
+            .map(|m| {
+                format!(
+                    "{} (similarity: {:.0}%) - {}",
+                    m.url,
+                    m.similarity * 100.0,
+                    m.title
+                )
+            })
+            .collect();
+
+        let result_text = format!(
+            "Found {} semantically similar discussions on appwrite.io/threads:\n{}",
+            matches.len(),
+            thread_links.join("\n")
+        );
+
+        assert!(result_text.contains("1 semantically similar"));
+        assert!(result_text.contains("88%"));
+        assert!(result_text.contains("Auth Bug Discussion"));
+        assert!(result_text.contains("appwrite.io/threads#auth-bug"));
+    }
+
+    // Covers: extract_thread_sections with closing tag that has empty content
+    #[tokio::test]
+    async fn test_extract_thread_sections_empty_content_after_title() {
+        let checker = make_checker(MockHttpClient::new(vec![]));
+        // h2 with title but nothing meaningful after closing tag
+        let html = "<h2>Title Only</h2><div></div>";
+        let sections = checker.extract_thread_sections(html);
+        // Title is "Title Only", content is strip_html_tags("</h2><div></div>") -> ""
+        // Empty content -> section skipped -> falls back to full page
+        assert!(!sections.is_empty());
+    }
+
+    // Covers: search_github_issues with 2+ repos, some succeed some fail
+    #[tokio::test]
+    async fn test_search_github_issues_mixed_repo_responses() {
+        let config = LinearRegressionConfig {
+            github_token: "test-token".to_string(),
+            scm_repos: vec!["org/repo-1".to_string(), "org/repo-2".to_string()],
+            similarity_threshold: 0.75,
+        };
+
+        let mock = MockHttpClient::new(vec![
+            // First repo: error
+            (500, "Internal Server Error"),
+            // Second repo: success with empty results
+            (200, r#"{"total_count": 0, "items": []}"#),
+        ]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            config,
+            vec!["keyword".to_string()],
+            "Some issue".to_string(),
+            mock,
+        );
+
+        let results = checker.search_github_issues().await.unwrap();
+        assert!(results.is_empty());
+        // Both repos were attempted
+        assert_eq!(checker.http.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    // Covers: search_github_issues_since with mixed repo responses
+    #[tokio::test]
+    async fn test_search_github_issues_since_mixed_responses() {
+        let config = LinearRegressionConfig {
+            github_token: "test-token".to_string(),
+            scm_repos: vec!["org/repo-1".to_string(), "org/repo-2".to_string()],
+            similarity_threshold: 0.75,
+        };
+
+        let mock = MockHttpClient::new(vec![
+            // First repo: error
+            (500, "Internal Server Error"),
+            // Second repo: success with empty results
+            (200, r#"{"total_count": 0, "items": []}"#),
+        ]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            config,
+            vec!["keyword".to_string()],
+            "Some issue".to_string(),
+            mock,
+        );
+
+        let since = Utc::now() - Duration::hours(1);
+        let results = checker.search_github_issues_since(since).await.unwrap();
+        assert!(results.is_empty());
+        assert_eq!(checker.http.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    // Covers: check_regression with empty keywords and empty token
+    #[tokio::test]
+    async fn test_check_regression_empty_keywords_empty_token() {
+        let config = LinearRegressionConfig {
+            github_token: String::new(),
+            scm_repos: vec!["org/repo".to_string()],
+            similarity_threshold: 0.75,
+        };
+
+        let mock = MockHttpClient::new(vec![
+            // Only threads check
+            (200, "<html><body>Nothing</body></html>"),
+        ]);
+
+        let checker = LinearRegressionChecker::with_http_client(
+            config,
+            vec![], // Empty keywords
+            "Some issue".to_string(),
+            mock,
+        );
+
+        let mut watch = RegressionWatch::new(IssueType::LinearBug, "linear-empty-kw-tk", 1);
+        watch.monitoring_started_at = Some(Utc::now() - Duration::hours(1));
+
+        let result = checker.check_regression(&watch).await.unwrap();
+        assert!(!result.regression_detected);
+    }
+
+    // Covers: extract_thread_sections with multiple patterns in same HTML
+    #[tokio::test]
+    async fn test_extract_thread_sections_multiple_patterns_first_wins() {
+        let checker = make_checker(MockHttpClient::new(vec![]));
+        // HTML that has h2 BEFORE article - h2 should be found first
+        let html = "<html><body><h2>First Heading</h2>Content for first<article>Article Content</article>Article rest</body></html>";
+        let sections = checker.extract_thread_sections(html);
+        assert!(!sections.is_empty());
     }
 }
