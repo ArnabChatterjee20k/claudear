@@ -21,6 +21,8 @@ import ConfigPage from './pages/config'
 import IssuesPage from './pages/issues'
 import SettingsPage from './pages/settings'
 import LearningPage from './pages/learning'
+import ChatPage from './pages/chat'
+import ModelsPage from './pages/models'
 
 function SentryFallback() {
   return (
@@ -53,6 +55,8 @@ const routes: Record<string, () => JSX.Element | null> = {
   '/experiments': ExperimentsPage,
   '/repos': ReposPage,
   '/learning': LearningPage,
+  '/chat': ChatPage,
+  '/models': ModelsPage,
   '/inference': InferencePage,
   '/activity': ActivityPage,
   '/telemetry': TelemetryPage,

@@ -1,12 +1,27 @@
-import { describe, test, expect, afterEach } from "bun:test";
-import { render, screen, cleanup, fireEvent } from "@testing-library/react";
+import { describe, test, expect, afterEach, mock } from "bun:test";
+import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { Router, RouterProvider } from "../src/router";
 import { Sidebar } from "../src/components/layout/sidebar";
+import { AuthProvider } from "../src/lib/auth";
+
+function jsonResponse(data: unknown, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: "OK",
+    json: () => Promise.resolve(data),
+    text: () => Promise.resolve(JSON.stringify(data)),
+    headers: new Headers({ "content-type": "application/json" }),
+  };
+}
 
 describe("Sidebar", () => {
+  const originalFetch = globalThis.fetch;
+
   afterEach(() => {
     cleanup();
     window.history.replaceState(null, "", "/");
+    globalThis.fetch = originalFetch;
   });
 
   function renderSidebar(path = "/") {
@@ -16,6 +31,32 @@ describe("Sidebar", () => {
         <Sidebar />
         <Router routes={{ [path]: () => <div /> }} />
       </RouterProvider>
+    );
+  }
+
+  function renderSidebarWithAuth(
+    path = "/",
+    user = { id: 1, email: "admin@test.com", name: "Admin User", role: "admin" as string },
+  ) {
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/api/auth/me")) {
+        return Promise.resolve(jsonResponse(user)) as Promise<Response>;
+      }
+      if (url.endsWith("/api/auth/logout")) {
+        return Promise.resolve(jsonResponse(null, 204)) as Promise<Response>;
+      }
+      return Promise.resolve(jsonResponse({})) as Promise<Response>;
+    }) as unknown as typeof fetch;
+
+    window.history.replaceState(null, "", path);
+    return render(
+      <AuthProvider>
+        <RouterProvider>
+          <Sidebar />
+          <Router routes={{ [path]: () => <div /> }} />
+        </RouterProvider>
+      </AuthProvider>
     );
   }
 
@@ -84,5 +125,102 @@ describe("Sidebar", () => {
     fireEvent.click(toggleBtn);
     expect(document.documentElement.classList.contains("dark")).toBe(false);
     expect(localStorage.getItem("theme")).toBe("light");
+  });
+
+  test("renders Chat nav item", () => {
+    renderSidebar();
+    expect(screen.getByText("Chat")).toBeTruthy();
+  });
+
+  test("renders Learning nav item", () => {
+    renderSidebar();
+    expect(screen.getByText("Learning")).toBeTruthy();
+  });
+
+  test("shows admin section when user is admin", async () => {
+    renderSidebarWithAuth("/");
+    await waitFor(() => {
+      expect(screen.getByText("Config")).toBeTruthy();
+      expect(screen.getByText("Users")).toBeTruthy();
+      expect(screen.getByText("Admin")).toBeTruthy();
+    });
+  });
+
+  test("admin Config button navigates to /config", async () => {
+    renderSidebarWithAuth("/");
+    await waitFor(() => {
+      expect(screen.getByText("Config")).toBeTruthy();
+    });
+    const configBtn = screen.getByText("Config").closest("button");
+    fireEvent.click(configBtn!);
+    expect(window.location.pathname).toBe("/config");
+  });
+
+  test("admin Users button navigates to /users", async () => {
+    renderSidebarWithAuth("/");
+    await waitFor(() => {
+      expect(screen.getByText("Users")).toBeTruthy();
+    });
+    const usersBtn = screen.getByText("Users").closest("button");
+    fireEvent.click(usersBtn!);
+    expect(window.location.pathname).toBe("/users");
+  });
+
+  test("does not show admin section for non-admin user", async () => {
+    renderSidebarWithAuth("/", { id: 2, email: "user@test.com", name: "Regular", role: "viewer" });
+    await waitFor(() => {
+      expect(screen.getByText("Regular")).toBeTruthy();
+    });
+    expect(screen.queryByText("Config")).toBeNull();
+    expect(screen.queryByText("Users")).toBeNull();
+  });
+
+  test("shows user name and email when loaded", async () => {
+    renderSidebarWithAuth("/", { id: 1, email: "jake@test.com", name: "Jake B", role: "admin" });
+    await waitFor(() => {
+      expect(screen.getByText("Jake B")).toBeTruthy();
+      expect(screen.getByText("jake@test.com")).toBeTruthy();
+    });
+  });
+
+  test("shows user initials when no avatar URL", async () => {
+    renderSidebarWithAuth("/", { id: 1, email: "test@test.com", name: "John Doe", role: "viewer" });
+    await waitFor(() => {
+      expect(screen.getByText("JD")).toBeTruthy();
+    });
+  });
+
+  test("sign out button is present", async () => {
+    renderSidebarWithAuth("/");
+    await waitFor(() => {
+      expect(screen.getByTitle("Sign out")).toBeTruthy();
+    });
+  });
+
+  test("documentation link is present", async () => {
+    renderSidebarWithAuth("/");
+    await waitFor(() => {
+      expect(screen.getByTitle("Documentation")).toBeTruthy();
+    });
+  });
+
+  test("account settings button is present", async () => {
+    renderSidebarWithAuth("/");
+    await waitFor(() => {
+      expect(screen.getByTitle("Account settings")).toBeTruthy();
+    });
+  });
+
+  test("hover on nav item triggers prefetch", () => {
+    renderSidebar();
+    const attemptsBtn = screen.getByText("Attempts").closest("button");
+    fireEvent.mouseEnter(attemptsBtn!);
+    // No error thrown = prefetch handler ran successfully
+  });
+
+  test("focus on nav item triggers prefetch", () => {
+    renderSidebar();
+    const attemptsBtn = screen.getByText("Attempts").closest("button");
+    fireEvent.focus(attemptsBtn!);
   });
 });

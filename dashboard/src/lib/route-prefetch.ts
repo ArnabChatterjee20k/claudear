@@ -123,3 +123,7 @@ export function prefetchRouteData(path: string) {
   prefetchedRoutes.add(path)
   prefetch()
 }
+
+export function resetPrefetchedRoutes() {
+  prefetchedRoutes.clear()
+}

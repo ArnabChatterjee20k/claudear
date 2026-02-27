@@ -3,8 +3,10 @@ import * as SWR from "swr";
 
 type FetchCall = { url: string; method: string };
 type PrefetchRouteData = typeof import("../src/lib/route-prefetch").prefetchRouteData;
+type ResetPrefetchedRoutes = typeof import("../src/lib/route-prefetch").resetPrefetchedRoutes;
 
 let prefetchRouteData: PrefetchRouteData | null = null;
+let resetPrefetchedRoutes: ResetPrefetchedRoutes | null = null;
 
 function response(data: unknown, status = 200) {
   return {
@@ -147,9 +149,10 @@ describe("prefetchRouteData", () => {
           Promise.resolve().then(fetcher),
       }));
 
-      ({ prefetchRouteData } = await import("../src/lib/route-prefetch"));
+      ({ prefetchRouteData, resetPrefetchedRoutes } = await import("../src/lib/route-prefetch"));
     }
 
+    resetPrefetchedRoutes!();
     calls = [];
     globalThis.fetch = mock((input: string | URL | Request, init?: RequestInit) => {
       const requestUrl =

@@ -6,7 +6,7 @@ pub mod auth;
 pub(crate) mod embedded;
 mod routes;
 
-pub use routes::{create_api_router, create_api_router_with_dashboard};
+pub use routes::{create_api_router, create_api_router_full, create_api_router_with_dashboard};
 
 use crate::config::Config;
 use crate::error::Result;
@@ -119,32 +119,38 @@ impl ApiServer {
         .layer(SentryHttpLayer::new().enable_transaction())
         .layer(NewSentryLayer::new_from_top());
 
-        let addr = format!("{}:{}", self.config.bind_address, self.port);
-        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied && self.port < 1024 {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Cannot bind to port {} (privileged ports < 1024 require root). \
-                         Use a port >= 1024 or run with elevated privileges.",
-                        self.port
-                    ),
-                )
-            } else {
-                e
-            }
-        })?;
+        let tls_enabled = self.config.tls.enabled;
+        let scheme = if tls_enabled { "https" } else { "http" };
 
-        tracing::info!("Dashboard API server listening on {}", addr);
+        tracing::info!(
+            "Dashboard API server starting ({}://{}:{})",
+            scheme,
+            self.config.bind_address,
+            if tls_enabled {
+                self.config.tls.https_port
+            } else {
+                self.port
+            }
+        );
         if self.dashboard_dir.is_some() {
             tracing::info!(
-                "Serving dashboard from filesystem at http://localhost:{}",
-                self.port
+                "Serving dashboard from filesystem at {}://localhost:{}",
+                scheme,
+                if tls_enabled {
+                    self.config.tls.https_port
+                } else {
+                    self.port
+                }
             );
         } else if embedded::has_dashboard() {
             tracing::info!(
-                "Serving embedded dashboard at http://localhost:{}",
-                self.port
+                "Serving embedded dashboard at {}://localhost:{}",
+                scheme,
+                if tls_enabled {
+                    self.config.tls.https_port
+                } else {
+                    self.port
+                }
             );
         } else {
             tracing::info!(
@@ -171,7 +177,11 @@ impl ApiServer {
             }
         });
 
-        axum::serve(listener, app).await?;
+        if tls_enabled {
+            crate::tls::serve_with_tls(&self.config.tls, &self.config.bind_address, app).await?;
+        } else {
+            crate::tls::serve_plain_http(&self.config.bind_address, self.port, app).await?;
+        }
 
         Ok(())
     }

@@ -871,6 +871,8 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            chat: crate::config::ChatConfig::default(),
+            tls: crate::config::TlsConfig::default(),
         }
     }
 

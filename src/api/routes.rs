@@ -37,6 +37,8 @@ pub struct ApiState {
     pub indexing_rx: tokio::sync::watch::Receiver<crate::storage::IndexingProgress>,
     /// General-purpose storage directory for user uploads (avatars, etc.).
     pub storage_dir: PathBuf,
+    /// Chat service for model browsing/downloading (None if chat is disabled).
+    pub chat_service: Option<Arc<crate::chat::ChatService>>,
 }
 
 /// Create the API router.
@@ -57,6 +59,25 @@ pub fn create_api_router_with_dashboard(
     indexing_rx: tokio::sync::watch::Receiver<crate::storage::IndexingProgress>,
     dashboard_dir: Option<PathBuf>,
 ) -> Router {
+    create_api_router_full(
+        config,
+        tracker,
+        config_path,
+        indexing_rx,
+        dashboard_dir,
+        None,
+    )
+}
+
+/// Create the API router with all optional features.
+pub fn create_api_router_full(
+    config: Config,
+    tracker: Arc<dyn FixAttemptTracker>,
+    config_path: PathBuf,
+    indexing_rx: tokio::sync::watch::Receiver<crate::storage::IndexingProgress>,
+    dashboard_dir: Option<PathBuf>,
+    chat_state: Option<crate::chat::ChatState>,
+) -> Router {
     let storage_dir = config.storage_dir.clone();
 
     // Ensure avatar upload directory exists
@@ -65,6 +86,8 @@ pub fn create_api_router_with_dashboard(
         tracing::warn!(error = %e, path = %avatars_dir.display(), "Failed to create avatars directory");
     }
 
+    let chat_service = chat_state.as_ref().map(|cs| cs.chat_service.clone());
+
     let state = ApiState {
         config,
         tracker,
@@ -72,6 +95,7 @@ pub fn create_api_router_with_dashboard(
         config_path,
         indexing_rx,
         storage_dir: storage_dir.clone(),
+        chat_service,
     };
 
     let api_routes = Router::new()
@@ -157,8 +181,28 @@ pub fn create_api_router_with_dashboard(
                 .put(update_user_handler)
                 .delete(delete_user_handler),
         )
+        // Model browsing & download routes
+        .route(
+            "/api/chat/models/browse",
+            axum::routing::get(browse_models_handler),
+        )
+        .route(
+            "/api/chat/models/browse/{name}",
+            axum::routing::get(model_info_handler),
+        )
+        .route(
+            "/api/chat/models/download",
+            axum::routing::post(download_model_handler),
+        )
         .with_state(state)
         .nest_service("/avatars", ServeDir::new(avatars_dir));
+
+    // Merge chat routes if enabled
+    let api_routes = if let Some(chat_state) = chat_state {
+        api_routes.merge(crate::chat::create_chat_router(chat_state))
+    } else {
+        api_routes
+    };
 
     // If dashboard directory is provided, serve from filesystem (development override)
     if let Some(dashboard_path) = dashboard_dir {
@@ -2452,6 +2496,138 @@ async fn put_config_handler(
     ))
 }
 
+/// Browse GGUF models from HuggingFace.
+async fn browse_models_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+    Query(query): Query<crate::chat::models::types::ListModelsQuery>,
+) -> Result<Json<crate::chat::models::types::BrowseResponse>, StatusCode> {
+    // Chat service not required — this queries HuggingFace directly
+    let _ = &state;
+
+    let search = query.search.as_deref().unwrap_or("");
+    let cursor = query.cursor.as_deref();
+    let limit = query.limit;
+
+    crate::chat::models::HuggingFaceProvider::search(search, cursor, limit)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to browse models from HuggingFace");
+            StatusCode::BAD_GATEWAY
+        })
+}
+
+/// Get info about a specific HuggingFace model.
+async fn model_info_handler(
+    _user: AuthUser,
+    State(_state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<crate::chat::models::types::ModelInfoResponse>, StatusCode> {
+    // Fetch model info from HuggingFace API
+    let url = format!("https://huggingface.co/api/models/{}", name);
+    let response = crate::chat::models::HTTP_CLIENT
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to fetch model info");
+            StatusCode::BAD_GATEWAY
+        })?
+        .error_for_status()
+        .map_err(|e| {
+            tracing::error!(error = %e, "HuggingFace API error");
+            if e.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_GATEWAY
+            }
+        })?;
+
+    #[derive(serde::Deserialize)]
+    struct HfModel {
+        #[serde(alias = "id")]
+        model_id: String,
+        #[serde(default)]
+        siblings: Option<Vec<HfSibling>>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HfSibling {
+        rfilename: String,
+        #[serde(default)]
+        size: Option<u64>,
+    }
+
+    let model: HfModel = response.json().await.map_err(|e| {
+        tracing::error!(error = %e, "Failed to parse model info");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let gguf_size = model.siblings.as_ref().and_then(|s| {
+        s.iter()
+            .find(|f| f.rfilename.ends_with(".gguf"))
+            .and_then(|f| f.size)
+    });
+
+    let details = Some(crate::chat::models::types::ModelDetails {
+        format: Some("gguf".to_string()),
+        family: crate::chat::models::providers::extract_model_family(&model.model_id),
+        parameter_size: crate::chat::models::providers::extract_param_size(&model.model_id),
+        quantization_level: model
+            .siblings
+            .as_ref()
+            .and_then(|s| {
+                s.iter()
+                    .find(|f| f.rfilename.ends_with(".gguf"))
+                    .map(|f| &f.rfilename)
+            })
+            .and_then(|name| crate::chat::models::providers::extract_quantization(name)),
+    });
+
+    Ok(Json(crate::chat::models::types::ModelInfoResponse {
+        name: model.model_id,
+        gguf_size,
+        details,
+    }))
+}
+
+/// Download a GGUF model (admin only).
+async fn download_model_handler(
+    _admin: AdminUser,
+    State(state): State<ApiState>,
+    Json(body): Json<crate::chat::models::types::DownloadRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let chat_service = state.chat_service.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Chat feature is not enabled" })),
+        )
+    })?;
+
+    // Check if model already exists on disk
+    if chat_service.is_model_available() && body.url.is_none() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "Model already exists on disk" })),
+        ));
+    }
+
+    let url = body
+        .url
+        .as_deref()
+        .unwrap_or_else(|| chat_service.model_url());
+
+    chat_service.start_download(url).map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(StatusCode::ACCEPTED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2496,6 +2672,8 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            chat: crate::config::ChatConfig::default(),
+            tls: crate::config::TlsConfig::default(),
         }
     }
 
@@ -7221,5 +7399,384 @@ mod tests {
         assert!(result.p95_secs.unwrap() >= 94.0 && result.p95_secs.unwrap() <= 96.0);
         // p99 should be around 99
         assert!(result.p99_secs.unwrap() >= 98.0 && result.p99_secs.unwrap() <= 100.0);
+    }
+
+    #[test]
+    fn test_knowledge_key_label_known_keys() {
+        assert_eq!(
+            knowledge_key_label("common_fix_dirs"),
+            "Common Fix Directories"
+        );
+        assert_eq!(knowledge_key_label("file_conventions"), "File Conventions");
+        assert_eq!(knowledge_key_label("test_pattern"), "Test Patterns");
+        assert_eq!(
+            knowledge_key_label("review_preferences"),
+            "Review Preferences"
+        );
+        assert_eq!(
+            knowledge_key_label("common_root_causes"),
+            "Common Root Causes"
+        );
+        assert_eq!(knowledge_key_label("promoted_qa"), "Promoted Q&A");
+    }
+
+    #[test]
+    fn test_knowledge_key_label_unknown_key() {
+        assert_eq!(
+            knowledge_key_label("something_unknown"),
+            "something_unknown"
+        );
+        assert_eq!(knowledge_key_label(""), "");
+    }
+
+    #[tokio::test]
+    async fn test_sources_with_whatsapp_configured() {
+        let tracker = create_test_tracker();
+        let mut config = test_config();
+        config.notifiers.whatsapp.source_enabled = true;
+        config.notifiers.whatsapp.access_token = Some(crate::secret::SecretValue::new("wa_token"));
+        config.notifiers.whatsapp.phone_number_id = Some("12345".to_string());
+
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        tracker
+            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/sources", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sources = resp["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["name"], "whatsapp");
+        assert_eq!(sources[0]["config"]["has_access_token"], true);
+        assert_eq!(sources[0]["config"]["has_phone_number_id"], true);
+    }
+
+    #[tokio::test]
+    async fn test_sources_with_telegram_configured() {
+        let tracker = create_test_tracker();
+        let mut config = test_config();
+        config.notifiers.telegram.source_enabled = true;
+        config.notifiers.telegram.bot_token = Some(crate::secret::SecretValue::new("tg_bot_token"));
+        config.notifiers.telegram.chat_id = Some("123456789".to_string());
+
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        tracker
+            .create_user("test@example.com", &password_hash, "Test", "admin")
+            .unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        let response = router
+            .oneshot(auth_get("/api/sources", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sources = resp["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["name"], "telegram");
+        assert_eq!(sources[0]["config"]["has_bot_token"], true);
+        assert_eq!(sources[0]["config"]["chat_id"], true);
+    }
+
+    #[tokio::test]
+    async fn test_repo_learning_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/repos/test-org%2Ftest-repo/learning", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["repo"], "test-org/test-repo");
+        assert_eq!(resp["knowledge_total"], 0);
+        assert!(resp["knowledge"].as_array().unwrap().is_empty());
+        assert!(resp["instructions"].as_array().unwrap().is_empty());
+        assert!(resp["review_patterns"].as_array().unwrap().is_empty());
+        assert_eq!(resp["review_pattern_summary"]["total_patterns"], 0);
+        assert_eq!(resp["review_pattern_summary"]["promoted_count"], 0);
+        assert!(resp["strategies"].as_array().unwrap().is_empty());
+        assert!(resp["diff_analyses"].as_array().unwrap().is_empty());
+        assert!(resp["correlations"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_users_list_endpoint() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/users", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let users: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        // Should have at least the test user created by create_authenticated_router
+        assert!(!users.is_empty());
+        assert_eq!(users[0]["email"], "test@example.com");
+    }
+
+    #[tokio::test]
+    async fn test_create_user_endpoint() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_post_json(
+                "/api/users",
+                &token,
+                serde_json::json!({
+                    "email": "newuser@example.com",
+                    "password": "securepass123",
+                    "name": "New User",
+                    "role": "viewer"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user["email"], "newuser@example.com");
+        assert_eq!(user["name"], "New User");
+        assert_eq!(user["role"], "viewer");
+    }
+
+    #[tokio::test]
+    async fn test_create_user_duplicate_email() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // test@example.com already exists from create_authenticated_router
+        let response = router
+            .oneshot(auth_post_json(
+                "/api/users",
+                &token,
+                serde_json::json!({
+                    "email": "test@example.com",
+                    "password": "password123",
+                    "name": "Duplicate",
+                    "role": "viewer"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        // Should fail with conflict
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_id() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/users/1", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user["email"], "test@example.com");
+    }
+
+    #[tokio::test]
+    async fn test_get_user_not_found() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/users/99999", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_endpoint() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_put_json(
+                "/api/users/1",
+                &token,
+                serde_json::json!({
+                    "name": "Updated Name",
+                    "role": "admin"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_endpoint() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Create a second user to delete
+        tracker
+            .create_user(
+                "todelete@example.com",
+                &bcrypt::hash("pass", 4).unwrap(),
+                "Delete Me",
+                "viewer",
+            )
+            .unwrap();
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/api/users/2")
+            .header("cookie", format!("claudear_session={}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_users_endpoint_viewer_forbidden() {
+        let tracker = create_test_tracker();
+        let config = test_config();
+        let password_hash = bcrypt::hash("testpass", 4).unwrap();
+        tracker
+            .create_user("viewer@test.com", &password_hash, "Viewer", "viewer")
+            .unwrap();
+        let token = tracker.create_session(1, "2099-12-31 23:59:59").unwrap();
+
+        let indexing_rx = test_indexing_rx(&tracker);
+        let router = create_api_router(
+            config,
+            tracker.clone(),
+            PathBuf::from("claudear.toml"),
+            indexing_rx,
+        )
+        .layer(CookieManagerLayer::new());
+
+        // Viewer can list users (GET) but not create (POST)
+        let response = router
+            .oneshot(auth_post_json(
+                "/api/users",
+                &token,
+                serde_json::json!({
+                    "email": "new@example.com",
+                    "password": "password123",
+                    "name": "New User",
+                    "role": "viewer"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_endpoint_valid_toml_fails_validation() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        // Valid TOML that fails Config::validate() (no sources configured)
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/api/config")
+            .header("cookie", format!("claudear_session={}", token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "content": "workspace = \"/tmp/repos\"\n"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_knowledge_group_serialization() {
+        let group = KnowledgeGroup {
+            key: "test_pattern".to_string(),
+            label: "Test Patterns".to_string(),
+            entries: vec![KnowledgeEntry {
+                id: 1,
+                value: "always run unit tests".to_string(),
+                source_type: "feedback".to_string(),
+                confidence: 0.95,
+                occurrence_count: 3,
+                updated_at: chrono::Utc::now(),
+            }],
+        };
+        let json = serde_json::to_string(&group).unwrap();
+        assert!(json.contains("test_pattern"));
+        assert!(json.contains("Test Patterns"));
+        assert!(json.contains("always run unit tests"));
+        assert!(json.contains("0.95"));
+    }
+
+    #[test]
+    fn test_review_pattern_summary_serialization() {
+        let mut by_category = HashMap::new();
+        by_category.insert("security".to_string(), 5);
+        by_category.insert("missing_tests".to_string(), 3);
+        let summary = ReviewPatternSummary {
+            total_patterns: 8,
+            by_category,
+            promoted_count: 2,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"total_patterns\":8"));
+        assert!(json.contains("\"promoted_count\":2"));
+        assert!(json.contains("security"));
+    }
+
+    #[test]
+    fn test_compute_processing_time_summary_empty() {
+        let metrics: Vec<crate::types::ProcessingMetric> = vec![];
+        let summary = compute_processing_time_summary(metrics);
+        assert_eq!(summary.samples, 0);
+        assert!(summary.avg_secs.is_none());
+        assert!(summary.max_secs.is_none());
     }
 }

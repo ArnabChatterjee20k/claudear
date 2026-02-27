@@ -7,6 +7,7 @@ import {
   BarChart3, AlertTriangle, MessageSquare, Shield, FlaskConical,
   FolderGit2, Brain, ScrollText, LayoutDashboard, ListChecks, GitPullRequest,
   Users, LogOut, Gauge, Settings, Sun, Moon, Ticket, GraduationCap, BookOpen,
+  MessageSquareCode, Package,
 } from 'lucide-react'
 import { setSentryColorScheme } from '../../lib/sentry'
 
@@ -45,6 +46,13 @@ const navGroups: NavGroup[] = [
       { path: '/inference', label: 'Inference', icon: Brain },
       { path: '/repos', label: 'Repos', icon: FolderGit2 },
       { path: '/learning', label: 'Learning', icon: GraduationCap },
+    ],
+  },
+  {
+    label: 'Tools',
+    items: [
+      { path: '/chat', label: 'Chat', icon: MessageSquareCode },
+      { path: '/models', label: 'Models', icon: Package },
     ],
   },
   {

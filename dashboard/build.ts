@@ -20,9 +20,9 @@ const result = await Bun.build({
   format: "esm",
   naming: "assets/[name]-[hash].[ext]",
   define: {
-    "process.env.SENTRY_DSN": JSON.stringify(process.env.SENTRY_DSN || ""),
-    "process.env.SENTRY_RELEASE": JSON.stringify(process.env.SENTRY_RELEASE || ""),
-    "process.env.SENTRY_ENVIRONMENT": JSON.stringify(process.env.SENTRY_ENVIRONMENT || ""),
+    "process.env.CLAUDEAR_SENTRY_DSN": JSON.stringify(process.env.CLAUDEAR_SENTRY_DSN || ""),
+    "process.env.CLAUDEAR_SENTRY_RELEASE": JSON.stringify(process.env.CLAUDEAR_SENTRY_RELEASE || ""),
+    "process.env.CLAUDEAR_SENTRY_ENVIRONMENT": JSON.stringify(process.env.CLAUDEAR_SENTRY_ENVIRONMENT || ""),
     "__SENTRY_DEBUG__": "false",
     "__RRWEB_EXCLUDE_IFRAME__": "true",
     "__RRWEB_EXCLUDE_SHADOW_DOM__": "true",
@@ -111,10 +111,10 @@ for (const output of result.outputs) {
 console.log(`  dist/assets/${cssFilename} (${(cssContent.length / 1024).toFixed(1)} KB)`);
 
 // 8. Upload source maps to Sentry (if configured), then strip them from dist
-const sentryToken = process.env.SENTRY_AUTH_TOKEN;
-const sentryOrg = process.env.SENTRY_ORG;
-const sentryProject = process.env.SENTRY_PROJECT;
-const sentryRelease = process.env.SENTRY_RELEASE;
+const sentryToken = process.env.CLAUDEAR_SENTRY_AUTH_TOKEN;
+const sentryOrg = process.env.CLAUDEAR_SENTRY_ORG;
+const sentryProject = process.env.CLAUDEAR_SENTRY_PROJECT;
+const sentryRelease = process.env.CLAUDEAR_SENTRY_RELEASE;
 
 if (sentryToken && sentryOrg && sentryProject && sentryRelease) {
   console.log(`Uploading source maps to Sentry (org=${sentryOrg}, project=${sentryProject}, release=${sentryRelease})...`);
@@ -137,7 +137,7 @@ if (sentryToken && sentryOrg && sentryProject && sentryRelease) {
     console.log("Source maps uploaded to Sentry successfully");
   }
 } else {
-  console.log("Skipping Sentry source map upload (SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT, or SENTRY_RELEASE not set)");
+  console.log("Skipping Sentry source map upload (CLAUDEAR_SENTRY_AUTH_TOKEN, CLAUDEAR_SENTRY_ORG, CLAUDEAR_SENTRY_PROJECT, or CLAUDEAR_SENTRY_RELEASE not set)");
 }
 
 // Remove .map files from dist to avoid serving them publicly

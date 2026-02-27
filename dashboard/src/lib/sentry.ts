@@ -1,14 +1,14 @@
 import * as Sentry from '@sentry/react'
 
-const dsn = process.env.SENTRY_DSN || ''
+const dsn = process.env.CLAUDEAR_SENTRY_DSN || ''
 
 export function initSentry() {
   if (!dsn) return
 
   Sentry.init({
     dsn,
-    release: process.env.SENTRY_RELEASE || undefined,
-    environment: process.env.SENTRY_ENVIRONMENT || undefined,
+    release: process.env.CLAUDEAR_SENTRY_RELEASE || undefined,
+    environment: process.env.CLAUDEAR_SENTRY_ENVIRONMENT || undefined,
     integrations: [
       Sentry.browserTracingIntegration(),
       Sentry.replayIntegration(),
