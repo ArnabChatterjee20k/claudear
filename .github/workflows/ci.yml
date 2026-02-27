@@ -131,8 +131,11 @@ jobs:
     name: Test (Windows)
     runs-on: windows-latest
     env:
-      FASTEMBED_CACHE_DIR: C:\Users\runneradmin\.cache\fastembed
+      FASTEMBED_CACHE_DIR: ${{ runner.temp }}\.cache\fastembed
     steps:
+      - name: Configure git
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
@@ -152,8 +155,11 @@ jobs:
       - name: Cache fastembed model
         uses: actions/cache@v5
         with:
-          path: C:\Users\runneradmin\.cache\fastembed
+          path: ${{ runner.temp }}\.cache\fastembed
           key: fastembed-nomic-v15-windows
+
+      - name: Warmup embedding model
+        run: cargo test --all-features -- feedback::embeddings::tests::test_warmup_downloads_model --exact --nocapture
 
       - name: Run tests
         run: cargo test --all-features

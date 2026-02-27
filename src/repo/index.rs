@@ -428,9 +428,12 @@ impl RepoIndex {
     /// Vendor paths follow the pattern: .../vendor/{org}/{repo}/...
     /// This extracts {org}/{repo} and looks it up in the index.
     fn find_by_vendor_path(&self, filename: &str) -> Option<&IndexedRepo> {
+        // Normalise to forward slashes so Windows paths (`\vendor\`) are handled.
+        let normalised = filename.replace('\\', "/");
+
         // Look for /vendor/ in the path
-        let vendor_idx = filename.find("/vendor/")?;
-        let after_vendor = &filename[vendor_idx + 8..]; // Skip "/vendor/"
+        let vendor_idx = normalised.find("/vendor/")?;
+        let after_vendor = &normalised[vendor_idx + 8..]; // Skip "/vendor/"
 
         // Split the remainder to get org/repo
         let parts: Vec<&str> = after_vendor.split('/').collect();
