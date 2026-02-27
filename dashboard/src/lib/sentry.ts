@@ -68,8 +68,10 @@ export function initSentry() {
 export function setSentryColorScheme(dark: boolean) {
   const feedback = Sentry.getFeedback()
   if (!feedback) return
-  feedback.remove()
-  feedback.createWidget({ colorScheme: dark ? 'dark' : 'light' })
+  if (typeof feedback.remove === 'function') feedback.remove()
+  if (typeof feedback.createWidget === 'function') {
+    feedback.createWidget({ colorScheme: dark ? 'dark' : 'light' })
+  }
 }
 
 export function hideSentryFeedbackWidget() {
