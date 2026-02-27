@@ -6,7 +6,7 @@ import { fetchChatModels } from '../lib/chat'
 import { browseModels, downloadModel, type BrowseModel, type BrowseResponse } from '../lib/models'
 import {
   Search, Download, Loader2, Package, HardDrive,
-  CheckCircle2, AlertCircle, Cpu,
+  AlertCircle, Cpu,
 } from 'lucide-react'
 
 function formatBytes(bytes: number): string {

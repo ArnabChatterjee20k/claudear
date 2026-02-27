@@ -1,12 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import useSWR from 'swr'
-import { PageHeader } from '../components/layout/page-header'
 import { ChatMessage } from '../components/chat/ChatMessage'
 import { ChatInput } from '../components/chat/ChatInput'
 import { ChatSessions } from '../components/chat/ChatSessions'
 import { ModelStatus } from '../components/chat/ModelStatus'
 import { useChat, fetchChatSessions, deleteChatSession, type ChatSession } from '../lib/chat'
-import { MessageSquareCode, PanelLeftClose, PanelLeft, Settings } from 'lucide-react'
+import { MessageSquareCode, PanelLeftClose, PanelLeft } from 'lucide-react'
 
 export default function ChatPage() {
   const [sidebarOpen, setSidebarOpen] = useState(true)

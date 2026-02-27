@@ -197,7 +197,7 @@ export async function deleteChatSession(id: string): Promise<void> {
   if (!res.ok) throw new Error(`Failed to delete session: ${res.statusText}`)
 }
 
-export async function fetchChatModels(): Promise<{ models: Array<{ name: string; status: string; context_length: number }> }> {
+export async function fetchChatModels(): Promise<{ models: Array<{ name: string; status: string; context_length: number; download_progress?: number }> }> {
   const res = await fetch(`${API_BASE}/chat/models`)
   if (!res.ok) throw new Error(`Failed to fetch models: ${res.statusText}`)
   return res.json()

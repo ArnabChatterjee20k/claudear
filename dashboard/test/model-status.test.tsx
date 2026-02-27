@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, render, screen, waitFor, act } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { ModelStatus } from "../src/components/chat/ModelStatus";
 import { SWRConfig } from "swr";
 

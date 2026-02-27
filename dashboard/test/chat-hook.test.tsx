@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { cleanup, render, screen, act, fireEvent } from "@testing-library/react";
 import { useChat } from "../src/lib/chat";
-import { useState } from "react";
 
 afterEach(() => {
   cleanup();
