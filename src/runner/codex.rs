@@ -260,6 +260,8 @@ impl AgentRunner for CodexAgentRunner {
                     )),
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 });
             }
         };
@@ -322,6 +324,8 @@ impl AgentRunner for CodexAgentRunner {
             error,
             blocking_question: None,
             used_qa_ids: Vec::new(),
+            confidence: 0,
+            confidence_reasoning: None,
         })
     }
 }

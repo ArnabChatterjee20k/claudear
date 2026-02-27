@@ -238,6 +238,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -370,6 +372,8 @@ mod tests {
                     error: Some("failed to fix".to_string()),
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -604,6 +608,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -907,6 +913,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -967,6 +975,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -1031,6 +1041,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -1092,6 +1104,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -1150,6 +1164,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: Vec::new(),
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
@@ -1281,6 +1297,8 @@ mod tests {
                     error: None,
                     blocking_question: None,
                     used_qa_ids: vec![1],
+                    confidence: 0,
+                    confidence_reasoning: None,
                 })
             }
         }
