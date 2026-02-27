@@ -85,14 +85,19 @@
         <table>
           <thead><tr><th>Env var</th><th>Purpose</th></tr></thead>
           <tbody>
-            <tr><td><code>LINEAR_API_KEY</code></td><td>Linear API key override</td></tr>
-            <tr><td><code>SENTRY_AUTH_TOKEN</code></td><td>Sentry auth token override</td></tr>
-            <tr><td><code>GITHUB_TOKEN</code></td><td>GitHub SCM token override</td></tr>
-            <tr><td><code>LINEAR_WEBHOOK_SECRET</code></td><td>Linear webhook verification</td></tr>
-            <tr><td><code>SENTRY_CLIENT_SECRET</code></td><td>Sentry webhook verification</td></tr>
-            <tr><td><code>GITHUB_WEBHOOK_SECRET</code></td><td>GitHub webhook verification</td></tr>
-            <tr><td><code>EMBEDDING_MODEL</code></td><td>Embedding model selection</td></tr>
-            <tr><td><code>EMBEDDING_CACHE_DIR</code></td><td>Embedding cache directory</td></tr>
+            <tr><td><code>CLAUDEAR_LINEAR_API_KEY</code></td><td>Linear API key override</td></tr>
+            <tr><td><code>CLAUDEAR_SENTRY_AUTH_TOKEN</code></td><td>Sentry auth token override</td></tr>
+            <tr><td><code>CLAUDEAR_GITHUB_TOKEN</code></td><td>GitHub SCM token override</td></tr>
+            <tr><td><code>CLAUDEAR_LINEAR_WEBHOOK_SECRET</code></td><td>Linear webhook verification</td></tr>
+            <tr><td><code>CLAUDEAR_SENTRY_CLIENT_SECRET</code></td><td>Sentry webhook verification</td></tr>
+            <tr><td><code>CLAUDEAR_GITHUB_WEBHOOK_SECRET</code></td><td>GitHub webhook verification</td></tr>
+            <tr><td><code>CLAUDEAR_EMBEDDING_MODEL</code></td><td>Embedding model selection</td></tr>
+            <tr><td><code>CLAUDEAR_EMBEDDING_CACHE_DIR</code></td><td>Embedding cache directory</td></tr>
+            <tr><td><code>CLAUDEAR_SENTRY_DSN</code></td><td>Sentry DSN for error reporting</td></tr>
+            <tr><td><code>CLAUDEAR_SENTRY_ENVIRONMENT</code></td><td>Sentry environment name</td></tr>
+            <tr><td><code>CLAUDEAR_TELEGRAM_WEBHOOK_SECRET</code></td><td>Telegram webhook secret</td></tr>
+            <tr><td><code>CLAUDEAR_WHATSAPP_WEBHOOK_VERIFY_TOKEN</code></td><td>WhatsApp webhook verify token</td></tr>
+            <tr><td><code>CLAUDEAR_VECTORLITE_PATH</code></td><td>Path to vectorlite extension</td></tr>
           </tbody>
         </table>
 
@@ -457,6 +462,23 @@
             <li><code>max_plan_monthly_cost</code>: monthly cost of your Claude Max plan, used to estimate per-fix cost when token pricing is unavailable. Set to <code>0</code> to disable.</li>
             <li><code>hourly_engineer_rate</code>: hourly engineer rate for cost-savings calculations (default: <code>75.0</code>).</li>
             </ul>
+          </div>
+        </details>
+
+        <details id="tls-config">
+          <summary>TLS auto-provisioning (<code>[tls]</code>) <span class="summary-desc">Let's Encrypt ACME certificates</span></summary>
+          <div class="details-content">
+            <p>Automatically provision and renew TLS certificates using the ACME TLS-ALPN-01 challenge. No reverse proxy required. When disabled (default), behaviour is unchanged&mdash;plain HTTP on <code>webhook_port</code>.</p>
+            <ul>
+            <li><code>enabled</code>: enable automatic TLS certificate provisioning (default: <code>false</code>).</li>
+            <li><code>domains</code>: domain names to provision certificates for (<strong>required</strong> when enabled). Accepts a single string or a list.</li>
+            <li><code>email</code>: contact email for Let&rsquo;s Encrypt expiry notifications (recommended).</li>
+            <li><code>production</code>: use Let&rsquo;s Encrypt production environment (default: <code>false</code> = staging). Staging is useful for testing; production issues real browser-trusted certificates.</li>
+            <li><code>cache_dir</code>: directory for caching ACME certificates. Certificates persist across restarts (default: <code>./acme_cache</code>). In Docker, use a volume path like <code>/app/data/acme_cache</code>.</li>
+            <li><code>https_port</code>: HTTPS listen port (default: <code>443</code>).</li>
+            <li><code>http_redirect_port</code>: HTTP port for automatic HTTP&rarr;HTTPS redirect (default: <code>80</code>). Set to <code>0</code> to disable the redirect listener.</li>
+            </ul>
+            <p>Environment variable overrides: <code>CLAUDEAR_TLS_ENABLED</code>, <code>CLAUDEAR_TLS_DOMAINS</code> (comma-separated), <code>CLAUDEAR_TLS_EMAIL</code>, <code>CLAUDEAR_TLS_PRODUCTION</code>, <code>CLAUDEAR_TLS_CACHE_DIR</code>, <code>CLAUDEAR_TLS_HTTPS_PORT</code>, <code>CLAUDEAR_TLS_HTTP_REDIRECT_PORT</code>.</p>
           </div>
         </details>
 
@@ -1010,8 +1032,9 @@ priority = 0
 # Monitoring
 # ============================================
 # Sentry error monitoring (set via environment variables):
-#   SENTRY_DSN          - Sentry DSN for backend error reporting (disabled when empty/unset)
-#   SENTRY_ENVIRONMENT  - Environment name (e.g. &quot;production&quot;, &quot;staging&quot;)
+#   CLAUDEAR_SENTRY_DSN          - Sentry DSN for backend error reporting (disabled when empty/unset)
+#   CLAUDEAR_SENTRY_ENVIRONMENT  - Environment name (e.g. &quot;production&quot;, &quot;staging&quot;)
+#   CLAUDEAR_SENTRY_RELEASE      - Release tag (auto-detected if unset)
 #
 # Tracks post-fix regressions after releases.
 
@@ -1220,7 +1243,48 @@ fail_on_regression = false
 max_plan_monthly_cost = 0.0
 
 # Hourly engineer rate for cost-savings calculation (default: 75.0)
-hourly_engineer_rate = 75.0</code></pre>
+hourly_engineer_rate = 75.0
+
+# ============================================
+# TLS Auto-Provisioning (Let's Encrypt)
+# ============================================
+# Automatically provision and renew TLS certificates using the ACME
+# TLS-ALPN-01 challenge. No reverse proxy required.
+#
+# When enabled, the server listens on https_port (default 443) for HTTPS
+# and optionally redirects HTTP traffic from http_redirect_port (default 80).
+# When disabled, behavior is unchanged (plain HTTP on webhook_port).
+#
+# Environment variable overrides:
+#   CLAUDEAR_TLS_ENABLED             tls.enabled
+#   CLAUDEAR_TLS_DOMAINS             tls.domains (comma-separated)
+#   CLAUDEAR_TLS_EMAIL               tls.email
+#   CLAUDEAR_TLS_PRODUCTION          tls.production
+#   CLAUDEAR_TLS_CACHE_DIR           tls.cache_dir
+#   CLAUDEAR_TLS_HTTPS_PORT          tls.https_port
+#   CLAUDEAR_TLS_HTTP_REDIRECT_PORT  tls.http_redirect_port
+
+[tls]
+# Enable automatic TLS certificate provisioning (default: false)
+enabled = false
+
+# Domain names to provision certificates for (required when enabled)
+# domains = [&quot;claudear.example.com&quot;]
+
+# Contact email for Let's Encrypt notifications (recommended)
+# email = &quot;admin@example.com&quot;
+
+# Use Let's Encrypt production environment (default: false = staging)
+# production = false
+
+# Directory for caching ACME certificates (default: ./acme_cache)
+# cache_dir = &quot;./acme_cache&quot;
+
+# HTTPS port (default: 443)
+# https_port = 443
+
+# HTTP port for HTTP-&gt;HTTPS redirect (default: 80, set to 0 to disable)
+# http_redirect_port = 80</code></pre>
           </div>
         </details>
 
@@ -1266,6 +1330,7 @@ hourly_engineer_rate = 75.0</code></pre>
         <li class="toc-item" data-toc-text="code indexing ([code_index])"><a class="toc-link" data-toc-link href="#code-index" data-target-id="code-index"><span class="toc-link-label">Code indexing</span></a></li>
         <li class="toc-item" data-toc-text="self-evaluation ([evaluation])"><a class="toc-link" data-toc-link href="#evaluation" data-target-id="evaluation"><span class="toc-link-label">Self-evaluation</span></a></li>
         <li class="toc-item" data-toc-text="dashboard ([dashboard])"><a class="toc-link" data-toc-link href="#dashboard-config" data-target-id="dashboard-config"><span class="toc-link-label">Dashboard</span></a></li>
+        <li class="toc-item" data-toc-text="tls auto-provisioning ([tls])"><a class="toc-link" data-toc-link href="#tls-config" data-target-id="tls-config"><span class="toc-link-label">TLS auto-provisioning</span></a></li>
         <li class="toc-item" data-toc-text="minimal config"><a class="toc-link" data-toc-link href="#minimal-config" data-target-id="minimal-config"><span class="toc-link-label">Minimal config</span></a></li>
         <li class="toc-item" data-toc-text="full annotated example"><a class="toc-link" data-toc-link href="#full-annotated-example-config-appendix" data-target-id="full-annotated-example-config-appendix"><span class="toc-link-label">Full annotated example</span></a></li>
         </ul>

@@ -377,18 +377,30 @@ All config values can be overridden with environment variables, useful for keepi
 
 | Variable | Config Path |
 |----------|-------------|
-| `LINEAR_API_KEY` | `issues.linear.api_key` |
-| `SENTRY_AUTH_TOKEN` | `issues.sentry.auth_token` |
-| `GITHUB_TOKEN` | `scm.github.token` |
-| `GITLAB_TOKEN` | `scm.gitlab.token` |
-| `JIRA_API_TOKEN` | `issues.jira.api_token` |
-| `LINEAR_WEBHOOK_SECRET` | `issues.linear.webhook_secret` |
-| `SENTRY_CLIENT_SECRET` | `issues.sentry.client_secret` |
-| `GITHUB_WEBHOOK_SECRET` | `scm.github.webhook_secret` |
-| `GITLAB_WEBHOOK_SECRET` | `scm.gitlab.webhook_secret` |
-| `EMBEDDING_MODEL` | Embedding model (`nomic`, `minilm`, `bge`) |
-| `EMBEDDING_CACHE_DIR` | Embedding model cache directory |
-| `SENTRY_DSN` | Sentry DSN for backend error reporting |
+| `CLAUDEAR_LINEAR_API_KEY` | `issues.linear.api_key` |
+| `CLAUDEAR_SENTRY_AUTH_TOKEN` | `issues.sentry.auth_token` |
+| `CLAUDEAR_GITHUB_TOKEN` | `scm.github.token` |
+| `CLAUDEAR_GITLAB_TOKEN` | `scm.gitlab.token` |
+| `CLAUDEAR_JIRA_API_TOKEN` | `issues.jira.api_token` |
+| `CLAUDEAR_LINEAR_WEBHOOK_SECRET` | `issues.linear.webhook_secret` |
+| `CLAUDEAR_SENTRY_CLIENT_SECRET` | `issues.sentry.client_secret` |
+| `CLAUDEAR_GITHUB_WEBHOOK_SECRET` | `scm.github.webhook_secret` |
+| `CLAUDEAR_GITLAB_WEBHOOK_SECRET` | `scm.gitlab.webhook_secret` |
+| `CLAUDEAR_EMBEDDING_MODEL` | Embedding model (`nomic`, `minilm`, `bge`) |
+| `CLAUDEAR_EMBEDDING_CACHE_DIR` | Embedding model cache directory |
+| `CLAUDEAR_SENTRY_DSN` | Sentry DSN for backend error reporting |
+| `CLAUDEAR_SENTRY_RELEASE` | Sentry release tag |
+| `CLAUDEAR_SENTRY_ENVIRONMENT` | Sentry environment name |
+| `CLAUDEAR_TELEGRAM_WEBHOOK_SECRET` | Telegram webhook secret token |
+| `CLAUDEAR_WHATSAPP_WEBHOOK_VERIFY_TOKEN` | WhatsApp webhook verify token |
+| `CLAUDEAR_VECTORLITE_PATH` | Path to vectorlite SQLite extension |
+| `CLAUDEAR_TLS_ENABLED` | `tls.enabled` |
+| `CLAUDEAR_TLS_DOMAINS` | `tls.domains` (comma-separated) |
+| `CLAUDEAR_TLS_EMAIL` | `tls.email` |
+| `CLAUDEAR_TLS_PRODUCTION` | `tls.production` |
+| `CLAUDEAR_TLS_CACHE_DIR` | `tls.cache_dir` |
+| `CLAUDEAR_TLS_HTTPS_PORT` | `tls.https_port` |
+| `CLAUDEAR_TLS_HTTP_REDIRECT_PORT` | `tls.http_redirect_port` |
 
 ### Minimal Configuration
 
@@ -442,6 +454,7 @@ api_key = "lin_api_xxxx"
 | `code_index` | Tree-sitter code indexing: enable, file size limits, batch size |
 | `evaluation` | Self-evaluation: test/lint/coverage deltas, timeouts, custom commands |
 | `dashboard` | Dashboard display: cost estimation, engineer hourly rate |
+| `tls` | Let's Encrypt TLS auto-provisioning: domains, ACME settings, HTTPS/redirect ports |
 | `users` | User registry mapping across services |
 
 See [`claudear.example.toml`](claudear.example.toml) for a fully documented example with every option.

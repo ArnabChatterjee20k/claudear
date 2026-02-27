@@ -138,9 +138,9 @@ claudear stop       # gracefully shut down</code></pre>
   &lt;string&gt;/path/to/your/project&lt;/string&gt;
   &lt;key&gt;EnvironmentVariables&lt;/key&gt;
   &lt;dict&gt;
-    &lt;key&gt;GITHUB_TOKEN&lt;/key&gt;
+    &lt;key&gt;CLAUDEAR_GITHUB_TOKEN&lt;/key&gt;
     &lt;string&gt;ghp_...&lt;/string&gt;
-    &lt;key&gt;LINEAR_API_KEY&lt;/key&gt;
+    &lt;key&gt;CLAUDEAR_LINEAR_API_KEY&lt;/key&gt;
     &lt;string&gt;lin_api_...&lt;/string&gt;
   &lt;/dict&gt;
   &lt;key&gt;StandardOutPath&lt;/key&gt;
@@ -172,8 +172,8 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target</code></pre>
         <p>Store secrets in <code>/etc/claudear/env</code>:</p>
-        <pre><code class="language-bash">GITHUB_TOKEN=ghp_...
-LINEAR_API_KEY=lin_api_...</code></pre>
+        <pre><code class="language-bash">CLAUDEAR_GITHUB_TOKEN=ghp_...
+CLAUDEAR_LINEAR_API_KEY=lin_api_...</code></pre>
         <p>Enable and start the service:</p>
         <pre><code class="language-bash">sudo systemctl daemon-reload
 sudo systemctl enable claudear
@@ -209,28 +209,44 @@ docker compose down</code></pre>
             </thead>
             <tbody>
               <tr>
-                <td><code>LINEAR_API_KEY</code></td>
+                <td><code>CLAUDEAR_LINEAR_API_KEY</code></td>
                 <td><code>issues.linear.api_key</code></td>
               </tr>
               <tr>
-                <td><code>SENTRY_AUTH_TOKEN</code></td>
+                <td><code>CLAUDEAR_SENTRY_AUTH_TOKEN</code></td>
                 <td><code>issues.sentry.auth_token</code></td>
               </tr>
               <tr>
-                <td><code>GITHUB_TOKEN</code></td>
+                <td><code>CLAUDEAR_GITHUB_TOKEN</code></td>
                 <td><code>scm.github.token</code></td>
               </tr>
               <tr>
-                <td><code>JIRA_API_TOKEN</code></td>
+                <td><code>CLAUDEAR_JIRA_API_TOKEN</code></td>
                 <td><code>issues.jira.api_token</code></td>
               </tr>
               <tr>
-                <td><code>DISCORD_BOT_TOKEN</code></td>
+                <td><code>CLAUDEAR_DISCORD_BOT_TOKEN</code></td>
                 <td><code>notifiers.discord.bot_token</code></td>
               </tr>
               <tr>
-                <td><code>SLACK_BOT_TOKEN</code></td>
+                <td><code>CLAUDEAR_SLACK_BOT_TOKEN</code></td>
                 <td><code>notifiers.slack.bot_token</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_TLS_ENABLED</code></td>
+                <td><code>tls.enabled</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_TLS_DOMAINS</code></td>
+                <td><code>tls.domains</code> (comma-separated)</td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_TLS_EMAIL</code></td>
+                <td><code>tls.email</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_TLS_PRODUCTION</code></td>
+                <td><code>tls.production</code></td>
               </tr>
             </tbody>
           </table>
@@ -242,6 +258,7 @@ docker compose down</code></pre>
           <li><strong>Reply-capable notifications</strong> &mdash; use a reply-capable notification channel so you can answer AI questions directly from chat</li>
           <li><strong>Health monitoring</strong> &mdash; monitor the <code>/api/health</code> endpoint with your existing uptime checker or alerting tool</li>
           <li><strong>Concurrency</strong> &mdash; start with conservative <code>max_concurrent</code> (1&ndash;2) and increase as needed once you are confident in the pipeline</li>
+          <li><strong>Native TLS</strong> &mdash; set <code>tls.enabled = true</code> with your domain in <code>tls.domains</code> to auto-provision Let&rsquo;s Encrypt certificates without a reverse proxy. Test with <code>tls.production = false</code> (staging) first, then switch to production once verified</li>
         </ul>
 
       </article>

@@ -8,17 +8,17 @@ ARG VECTORLITE_VERSION=16a01af79add
 ARG GIT_USER_NAME="Claudear"
 ARG GIT_USER_EMAIL="claudear@noreply.local"
 
-ARG SENTRY_DSN=""
-ARG SENTRY_ENVIRONMENT="production"
-ARG SENTRY_RELEASE="claudear-dashboard@${APP_VERSION}"
+ARG CLAUDEAR_SENTRY_DSN=""
+ARG CLAUDEAR_SENTRY_ENVIRONMENT="production"
+ARG CLAUDEAR_SENTRY_RELEASE="claudear-dashboard@${APP_VERSION}"
 
 FROM oven/bun:${BUN_VERSION} AS dashboard
-ARG SENTRY_DSN
-ARG SENTRY_ENVIRONMENT
-ARG SENTRY_RELEASE
-ENV SENTRY_DSN=${SENTRY_DSN}
-ENV SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT}
-ENV SENTRY_RELEASE=${SENTRY_RELEASE}
+ARG CLAUDEAR_SENTRY_DSN
+ARG CLAUDEAR_SENTRY_ENVIRONMENT
+ARG CLAUDEAR_SENTRY_RELEASE
+ENV CLAUDEAR_SENTRY_DSN=${CLAUDEAR_SENTRY_DSN}
+ENV CLAUDEAR_SENTRY_ENVIRONMENT=${CLAUDEAR_SENTRY_ENVIRONMENT}
+ENV CLAUDEAR_SENTRY_RELEASE=${CLAUDEAR_SENTRY_RELEASE}
 
 WORKDIR /app/dashboard
 COPY dashboard/package.json dashboard/bun.lock* ./
@@ -66,6 +66,8 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
     build-essential \
+    cmake \
+    libclang-dev \
     libssl-dev \
     pkg-config \
     perl \
@@ -96,6 +98,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     jq \
+    libgomp1 \
     openssh-client \
     sqlite3 \
     && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/locale/* \
@@ -135,7 +138,7 @@ ENV EMBEDDING_CACHE_DIR=/home/appuser/.cache/fastembed
 #   Option 2: Omit ANTHROPIC_API_KEY and the entrypoint will run 'claude auth login'
 #             (prints a URL to open in your browser for OAuth)
 
-EXPOSE 3100
+EXPOSE 3100 443 80
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3100/api/health || exit 1

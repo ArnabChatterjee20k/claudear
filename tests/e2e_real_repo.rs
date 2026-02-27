@@ -5,7 +5,7 @@ use claudear::config::{AskConfig, Config, RetryConfig};
 use claudear::notifier::Notifier;
 use claudear::repo::{IndexedRepo, RepoIndex};
 use claudear::source::IssueSource;
-use claudear::storage::{FixAttemptTracker, SqliteTracker};
+use claudear::storage::{AttemptTracker, FixAttemptTracker, SqliteTracker};
 use claudear::types::{FixAttemptStatus, Issue, MatchPriority, MatchResult};
 use claudear::watcher::{Watcher, WatcherOptions};
 use claudear::{Error, RepoInferrer, Result, UserRegistry};

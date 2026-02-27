@@ -594,8 +594,9 @@ poll_interval_ms = 300000
 # Monitoring
 # ============================================
 # Sentry error monitoring (set via environment variables):
-#   SENTRY_DSN          - Sentry DSN for backend error reporting (disabled when empty/unset)
-#   SENTRY_ENVIRONMENT  - Environment name (e.g. "production", "staging")
+#   CLAUDEAR_SENTRY_DSN          - Sentry DSN for backend error reporting (disabled when empty/unset)
+#   CLAUDEAR_SENTRY_ENVIRONMENT  - Environment name (e.g. "production", "staging")
+#   CLAUDEAR_SENTRY_RELEASE      - Release tag (auto-detected if unset)
 #
 # Tracks post-fix regressions after releases.
 
@@ -817,3 +818,48 @@ max_plan_monthly_cost = 0.0
 
 # Hourly engineer rate for cost-savings calculation (default: 150.0)
 hourly_engineer_rate = 150.0
+
+# ============================================
+# TLS Auto-Provisioning (Let's Encrypt)
+# ============================================
+# Automatically provision and renew TLS certificates using the ACME
+# TLS-ALPN-01 challenge. No reverse proxy required.
+#
+# When enabled, the server listens on https_port (default 443) for HTTPS
+# and optionally redirects HTTP traffic from http_redirect_port (default 80).
+# When disabled, behavior is unchanged (plain HTTP on webhook_port).
+#
+# Environment variable overrides:
+#   CLAUDEAR_TLS_ENABLED             tls.enabled
+#   CLAUDEAR_TLS_DOMAINS             tls.domains (comma-separated)
+#   CLAUDEAR_TLS_EMAIL               tls.email
+#   CLAUDEAR_TLS_PRODUCTION          tls.production
+#   CLAUDEAR_TLS_CACHE_DIR           tls.cache_dir
+#   CLAUDEAR_TLS_HTTPS_PORT          tls.https_port
+#   CLAUDEAR_TLS_HTTP_REDIRECT_PORT  tls.http_redirect_port
+
+[tls]
+# Enable automatic TLS certificate provisioning (default: false)
+enabled = false
+
+# Domain names to provision certificates for (required when enabled)
+# Accepts a single string or a list: "example.com" or ["example.com", "www.example.com"]
+domains = ["claudear.example.com"]
+
+# Contact email for Let's Encrypt notifications (recommended)
+email = "admin@example.com"
+
+# Use Let's Encrypt production environment (default: false = staging)
+# Staging is useful for testing; production issues real certificates.
+# See: https://letsencrypt.org/docs/staging-environment/
+production = false
+
+# Directory for caching ACME certificates (default: ./acme_cache)
+# Certificates persist across restarts. In Docker, use a volume path.
+cache_dir = "./acme_cache"
+
+# HTTPS port (default: 443)
+https_port = 443
+
+# HTTP port for HTTP→HTTPS redirect (default: 80, set to 0 to disable)
+http_redirect_port = 80
