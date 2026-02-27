@@ -18,6 +18,7 @@ claudear.toml
 logs
 .worktrees/
 cobertura.xml
+tarpaulin-report.json
 vectorlite.dylib
 vectorlite.so
 claudear.toml
