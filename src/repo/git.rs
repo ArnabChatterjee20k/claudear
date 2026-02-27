@@ -27,6 +27,21 @@ fn validate_ref(name: &str, label: &str) -> Result<()> {
 }
 
 impl GitOps {
+    /// Convert a potentially-relative path to absolute using the process CWD.
+    ///
+    /// Git commands use `.current_dir(repo_path)` which changes git's working
+    /// directory. Any relative paths passed as arguments would then be resolved
+    /// relative to `repo_path` instead of the process CWD, causing mismatches.
+    fn make_absolute(path: &Path) -> Result<PathBuf> {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .map_err(|e| Error::io(format!("Failed to get current directory: {}", e)))
+        }
+    }
+
     /// Ensure a repository is available and up to date.
     ///
     /// If the repository doesn't exist locally, it will be cloned.
@@ -110,6 +125,11 @@ impl GitOps {
     ) -> Result<()> {
         validate_ref(checkout_ref, "checkout ref")?;
 
+        // Make worktree_path absolute so git resolves it correctly even when
+        // current_dir is set to repo_path (which differs from the process CWD).
+        let worktree_path = Self::make_absolute(worktree_path)?;
+        let worktree_path = worktree_path.as_path();
+
         // Crash recovery: remove stale worktree
         if worktree_path.exists() {
             tracing::warn!(worktree = ?worktree_path, "Stale worktree found, removing");
@@ -168,6 +188,11 @@ impl GitOps {
         validate_ref(branch, "branch")?;
         validate_ref(start_point, "start point")?;
 
+        // Make worktree_path absolute so git resolves it correctly even when
+        // current_dir is set to repo_path (which differs from the process CWD).
+        let worktree_path = Self::make_absolute(worktree_path)?;
+        let worktree_path = worktree_path.as_path();
+
         // Crash recovery: remove stale worktree
         if worktree_path.exists() {
             tracing::warn!(worktree = ?worktree_path, "Stale worktree found, removing");
@@ -219,6 +244,11 @@ impl GitOps {
 
     /// Remove a git worktree and clean up.
     pub async fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+        // Make worktree_path absolute so git resolves it correctly even when
+        // current_dir is set to repo_path (which differs from the process CWD).
+        let worktree_path = Self::make_absolute(worktree_path)?;
+        let worktree_path = worktree_path.as_path();
+
         tracing::debug!(
             repo = ?repo_path,
             worktree = ?worktree_path,
