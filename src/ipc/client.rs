@@ -1,19 +1,16 @@
 //! IPC client for communicating with the watcher daemon.
 //!
-//! On Unix, connects via Unix domain sockets.
-//! On Windows, connects via TCP to localhost.
+//! Transport details are handled by [`super::transport`] — this file is
+//! platform-agnostic.
 
 use super::default_socket_path;
 use super::protocol::{IpcCommand, IpcData, IpcResponse};
+use super::transport;
 use crate::error::{Error, Result};
 
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(windows)]
-use tokio::net::TcpStream;
-#[cfg(not(windows))]
-use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 /// Default timeout for IPC operations.
@@ -50,23 +47,7 @@ impl IpcClient {
 
     /// Check if the daemon is running.
     pub fn is_daemon_running(&self) -> bool {
-        #[cfg(not(windows))]
-        {
-            self.socket_path.exists()
-                && std::os::unix::net::UnixStream::connect(&self.socket_path).is_ok()
-        }
-        #[cfg(windows)]
-        {
-            if !self.socket_path.exists() {
-                return false;
-            }
-            if let Ok(contents) = std::fs::read_to_string(&self.socket_path) {
-                if let Ok(port) = contents.trim().parse::<u16>() {
-                    return std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
-                }
-            }
-            false
-        }
+        transport::check_connection(&self.socket_path)
     }
 
     /// Send a command and receive a response.
@@ -79,38 +60,8 @@ impl IpcClient {
         }
     }
 
-    #[cfg(not(windows))]
     async fn send_internal(&self, command: IpcCommand) -> Result<IpcResponse> {
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|e| Error::Other(format!("Failed to connect to daemon: {}", e)))?;
-
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-
-        // Send command
-        let json = serde_json::to_string(&command)? + "\n";
-        writer.write_all(json.as_bytes()).await?;
-
-        // Read response
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-
-        let response: IpcResponse = serde_json::from_str(line.trim())?;
-        Ok(response)
-    }
-
-    #[cfg(windows)]
-    async fn send_internal(&self, command: IpcCommand) -> Result<IpcResponse> {
-        // Read port from port file
-        let port_str = std::fs::read_to_string(&self.socket_path)
-            .map_err(|e| Error::Other(format!("Failed to read port file: {}", e)))?;
-        let port: u16 = port_str
-            .trim()
-            .parse()
-            .map_err(|e| Error::Other(format!("Invalid port in port file: {}", e)))?;
-
-        let stream = TcpStream::connect(("127.0.0.1", port))
+        let stream = transport::connect(&self.socket_path)
             .await
             .map_err(|e| Error::Other(format!("Failed to connect to daemon: {}", e)))?;
 

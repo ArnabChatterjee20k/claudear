@@ -44,6 +44,7 @@ pub mod inference;
 pub mod ipc;
 pub mod learning;
 pub mod notifier;
+pub mod platform;
 pub mod prioritisation;
 pub mod processing;
 pub mod qa;

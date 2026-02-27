@@ -1,16 +1,18 @@
 //! IPC server implementation.
 //!
-//! On Unix, uses Unix domain sockets.
-//! On Windows, uses TCP on localhost with a port file for discovery.
+//! Transport details (Unix sockets vs TCP) are abstracted by the
+//! [`super::transport`] module — this file is platform-agnostic.
 
 use super::protocol::{
     ActivityEntry, ActivityType, IpcCommand, IpcData, IpcResponse, WatcherState,
 };
+use super::transport::{self, IpcStream};
 use super::{
     cleanup_stale_files, default_socket_path, remove_pid_file, remove_socket_file, write_pid_file,
 };
 use crate::error::Result;
 use crate::notifier::Notifier;
+use crate::platform;
 use crate::source::IssueSource;
 use crate::storage::FixAttemptTracker;
 use crate::types::{ActivityLogEntry, FixAttemptStatus};
@@ -22,10 +24,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(windows)]
-use tokio::net::{TcpListener, TcpStream};
-#[cfg(not(windows))]
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 /// Default maximum number of activity entries to keep (can be overridden via config).
@@ -251,29 +249,12 @@ impl IpcServer {
         // Write PID file
         write_pid_file()?;
 
-        // Bind to socket (Unix) or TCP (Windows)
-        #[cfg(not(windows))]
-        let listener = UnixListener::bind(&self.socket_path)?;
-        #[cfg(not(windows))]
+        // Bind the IPC listener (Unix socket or TCP — handled by transport)
+        let listener = transport::bind(&self.socket_path)?;
         tracing::info!("IPC server listening on {:?}", self.socket_path);
 
-        #[cfg(windows)]
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        #[cfg(windows)]
-        {
-            let local_addr = listener.local_addr()?;
-            let port = local_addr.port();
-            super::write_port_file(port)?;
-            tracing::info!("IPC server listening on 127.0.0.1:{}", port);
-        }
-
-        // Set permissions (owner only) on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&self.socket_path, perms)?;
-        }
+        // Restrict socket file permissions on Unix (no-op on Windows)
+        platform::set_file_permissions_secure(&self.socket_path)?;
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let conn_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
@@ -333,56 +314,9 @@ impl IpcServer {
     }
 }
 
-/// Handle a single IPC connection.
-#[cfg(not(windows))]
+/// Handle a single IPC connection (platform-agnostic via [`IpcStream`]).
 async fn handle_connection(
-    stream: UnixStream,
-    tracker: Arc<dyn FixAttemptTracker>,
-    sources: Vec<Arc<dyn IssueSource>>,
-    notifier: Arc<dyn Notifier>,
-    watcher: Option<Arc<Watcher>>,
-    state: Arc<ServerState>,
-    shutdown_tx: broadcast::Sender<()>,
-) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-
-    while reader.read_line(&mut line).await? > 0 {
-        let command: IpcCommand = match serde_json::from_str(line.trim()) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                let response = IpcResponse::error(format!("Invalid command: {}", e));
-                let json = serde_json::to_string(&response)? + "\n";
-                writer.write_all(json.as_bytes()).await?;
-                line.clear();
-                continue;
-            }
-        };
-
-        let response = handle_command(
-            command,
-            &tracker,
-            &sources,
-            &notifier,
-            &watcher,
-            &state,
-            &shutdown_tx,
-        )
-        .await;
-
-        let json = serde_json::to_string(&response)? + "\n";
-        writer.write_all(json.as_bytes()).await?;
-        line.clear();
-    }
-
-    Ok(())
-}
-
-/// Handle a single IPC connection (Windows: TCP stream).
-#[cfg(windows)]
-async fn handle_connection(
-    stream: TcpStream,
+    stream: IpcStream,
     tracker: Arc<dyn FixAttemptTracker>,
     sources: Vec<Arc<dyn IssueSource>>,
     notifier: Arc<dyn Notifier>,

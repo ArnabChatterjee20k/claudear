@@ -598,18 +598,7 @@ pub fn detect_tools(project_dir: &Path, overrides: &ToolOverrides) -> Vec<Detect
 }
 
 fn which_exists(binary: &str) -> bool {
-    #[cfg(not(windows))]
-    let cmd = "which";
-    #[cfg(windows)]
-    let cmd = "where";
-
-    std::process::Command::new(cmd)
-        .arg(binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::platform::command_exists(binary)
 }
 
 fn shell_words(cmd: &str) -> Vec<String> {
