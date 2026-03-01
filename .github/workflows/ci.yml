@@ -130,8 +130,6 @@ jobs:
   test-windows:
     name: Test (Windows)
     runs-on: windows-latest
-    env:
-      FASTEMBED_CACHE_DIR: ${{ runner.temp }}\.cache\fastembed
     steps:
       - name: Configure git
         run: git config --global core.autocrlf false
@@ -160,9 +158,13 @@ jobs:
 
       - name: Warmup embedding model
         run: cargo test --all-features -- feedback::embeddings::tests::test_warmup_downloads_model --exact --nocapture
+        env:
+          FASTEMBED_CACHE_DIR: ${{ runner.temp }}\.cache\fastembed
 
       - name: Run tests
         run: cargo test --all-features
+        env:
+          FASTEMBED_CACHE_DIR: ${{ runner.temp }}\.cache\fastembed
 
   dashboard:
     name: Dashboard
