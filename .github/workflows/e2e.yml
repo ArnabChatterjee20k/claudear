@@ -33,7 +33,7 @@ jobs:
         run: cargo build --release --bin claudear --bin claudear-e2e
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-binaries
           path: |
