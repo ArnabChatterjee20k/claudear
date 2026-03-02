@@ -2485,9 +2485,9 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "llama-cpp-2"
-version = "0.1.136"
+version = "0.1.137"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6347a802381f3953cd871d42572463a11b888ca2878065390d12f3339025e88"
+checksum = "aedc4f4ca22ad992bc43fe20734b3a0f37363b9621419727821bf6572b9c0395"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2499,9 +2499,9 @@ dependencies = [
 
 [[package]]
 name = "llama-cpp-sys-2"
-version = "0.1.136"
+version = "0.1.137"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8536707545e27a8a889cb089fd5064a3a22fe0b7b9a71b23bf91e84b1a7a90d"
+checksum = "da365e84fbe4d10e849fa3bfd5a0d70b3b4a59e8c5adc8b7be5c189327566bdb"
 dependencies = [
  "bindgen",
  "cc",
@@ -4641,9 +4641,9 @@ dependencies = [
 
 [[package]]
 name = "tempfile"
-version = "3.25.0"
+version = "3.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0136791f7c95b1f6dd99f9cc786b91bb81c3800b639b3478e561ddb7be95e5f1"
+checksum = "82a72c767771b47409d2345987fda8628641887d5466101319899796367354a0"
 dependencies = [
  "fastrand",
  "getrandom 0.4.1",
@@ -5059,9 +5059,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.26.5"
+version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12987371f54efc9b9306a20dc87ed5aaee9f320c8a8b115e28515c412b2efe39"
+checksum = "13f456d2108c3fef07342ba4689a8503ec1fb5beed245e2b9be93096ef394848"
 dependencies = [
  "cc",
  "regex",
