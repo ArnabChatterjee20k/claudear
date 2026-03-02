@@ -120,7 +120,7 @@ jobs:
           claude --version
 
       - name: Download binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: e2e-binaries
           path: bin
