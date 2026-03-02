@@ -18,8 +18,8 @@ pub struct GitLabClient<H: HttpClient = crate::http::ReqwestHttpClient> {
 
 // Internal deserialization structs for GitLab API responses
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct GitLabMergeRequest {
+    #[allow(dead_code)]
     iid: i64,
     state: String, // "opened", "closed", "merged"
     source_branch: Option<String>,
@@ -35,13 +35,13 @@ pub struct GitLabUser {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct GitLabNote {
     id: i64,
     body: String,
     author: GitLabUser,
     created_at: String,
     updated_at: String,
+    #[allow(dead_code)]
     #[serde(rename = "type")]
     note_type: Option<String>,
     system: bool,
