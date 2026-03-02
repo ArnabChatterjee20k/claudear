@@ -607,6 +607,7 @@ impl CascadeConfig {
             .filter(|r| r.trigger == CascadeTrigger::Release)
             .map(|r| r.upstream.as_str())
             .collect();
+        upstreams.sort_unstable();
         upstreams.dedup();
         upstreams
     }
