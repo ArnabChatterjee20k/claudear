@@ -73,18 +73,15 @@ jobs:
 
       - name: Warmup embedding model
         run: |
-          REPO="nomic-ai/nomic-embed-text-v1.5"
-          MODEL_DIR="${FASTEMBED_CACHE_DIR}/models--nomic-ai--nomic-embed-text-v1.5"
-          COMMIT=$(curl -sf "https://huggingface.co/api/models/${REPO}" | grep -o '"sha":"[^"]*"' | head -1 | cut -d'"' -f4)
-          mkdir -p "${MODEL_DIR}/refs" "${MODEL_DIR}/blobs" "${MODEL_DIR}/snapshots/${COMMIT}/onnx"
-          printf '%s' "${COMMIT}" > "${MODEL_DIR}/refs/main"
-          for file in tokenizer.json config.json special_tokens_map.json onnx/model.onnx; do
-            ETAG=$(curl -sI "https://huggingface.co/${REPO}/resolve/main/${file}" | sed -n 's/.*X-Linked-ETag: "\([^"]*\)".*/\1/p')
-            curl -sfL "https://huggingface.co/${REPO}/resolve/main/${file}" -o "${MODEL_DIR}/blobs/${ETAG}"
-            DEPTH=$(echo "${file}" | tr -cd '/' | wc -c | tr -d ' ')
-            [ "${DEPTH}" -eq 0 ] && REL="../../" || REL="../../../"
-            ln -sf "${REL}blobs/${ETAG}" "${MODEL_DIR}/snapshots/${COMMIT}/${file}"
-          done
+          python3 -m pip install -q huggingface-hub
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              'nomic-ai/nomic-embed-text-v1.5',
+              allow_patterns=['onnx/model.onnx', 'tokenizer.json', 'config.json', 'special_tokens_map.json'],
+              cache_dir='${FASTEMBED_CACHE_DIR}',
+          )
+          "
 
       - name: Run tests
         run: cargo tarpaulin --out Xml --all-features
