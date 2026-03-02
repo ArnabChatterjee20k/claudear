@@ -73,7 +73,7 @@ jobs:
 
       - name: Warmup embedding model
         run: |
-          pip install -q huggingface-hub
+          python3 -m pip install -q huggingface-hub
           huggingface-cli download nomic-ai/nomic-embed-text-v1.5 \
             onnx/model.onnx tokenizer.json config.json special_tokens_map.json \
             --cache-dir $FASTEMBED_CACHE_DIR
