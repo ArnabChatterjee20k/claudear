@@ -368,6 +368,36 @@ pub struct RepoEmbedding {
     pub embedding: Vec<f32>,
 }
 
+// Scoring weights for weighted repository inference
+const WEIGHT_SENTRY_PROJECT: f32 = 35.0;
+const WEIGHT_EXPLICIT_REPO_REF: f32 = 45.0;
+const WEIGHT_DIRECT_FILE_MATCH: f32 = 41.0;
+const WEIGHT_FUZZY_SINGLE: f32 = 25.0;
+const WEIGHT_FUZZY_ALL_SAME_REPO: f32 = 22.0;
+const WEIGHT_BASENAME_SINGLE: f32 = 10.0;
+const WEIGHT_EMBEDDING_MULTIPLIER: f32 = 40.0;
+
+// Confidence thresholds for score-to-confidence mapping
+const THRESHOLD_HIGH: f32 = 32.0;
+const THRESHOLD_MEDIUM: f32 = 21.0;
+const THRESHOLD_LOW: f32 = 5.0;
+
+/// Internal signal from a single scoring strategy.
+#[derive(Debug, Clone)]
+struct ScoredSignal {
+    weight: f32,
+    reason: String,
+    matched_file: Option<String>,
+}
+
+/// Internal candidate accumulating signals for a single repo.
+#[derive(Debug, Clone)]
+struct RepoCandidate {
+    repo: IndexedRepo,
+    signals: Vec<ScoredSignal>,
+    total_score: f32,
+}
+
 /// Maximum number of repository embeddings to store in memory.
 /// Beyond this limit, oldest embeddings are evicted (LRU-style).
 const MAX_REPO_EMBEDDINGS: usize = 1000;
@@ -774,20 +804,17 @@ impl RepoInferrer {
         best_match
     }
 
-    /// Infer the target repository for an issue.
+    /// Core weighted scoring logic.
     ///
-    /// Tries multiple strategies in order of confidence:
-    /// 0. Sentry project name matching (for Sentry issues)
-    /// 1. Explicit repository reference (org/repo format)
-    /// 2. Direct file path match
-    /// 3. Fuzzy file search
-    /// 4. Basename match
-    pub fn infer(&self, issue: &Issue) -> Option<InferredRepo> {
+    /// Runs ALL strategies, accumulates scores per repo, and picks the
+    /// candidate with the highest aggregate score. Per-filename cascade
+    /// ensures each filename only contributes its strongest signal.
+    fn infer_scored(&self, issue: &Issue, query_embedding: Option<&[f32]>) -> Option<InferredRepo> {
         let context = IssueContext::from_issue(issue);
         let index = match self.index.read() {
             Ok(i) => i,
             Err(e) => {
-                tracing::error!(error = %e, "index RwLock poisoned in infer");
+                tracing::error!(error = %e, "index RwLock poisoned in infer_scored");
                 return None;
             }
         };
@@ -800,104 +827,104 @@ impl RepoInferrer {
             "Extracted issue context"
         );
 
+        let mut candidates: std::collections::HashMap<String, RepoCandidate> =
+            std::collections::HashMap::new();
+
         // Strategy 0: Sentry project name matching
-        // Sentry projects map 1:1 with top-level repos.
-        // Try to find a repo whose name ends with the project name.
         if issue.source == "sentry" {
             if let Some(project) = issue.metadata.get("project").and_then(|v| v.as_str()) {
                 if let Some(repo) = self.find_repo_by_project_name(&index, project) {
-                    tracing::info!(
-                        issue_id = %issue.short_id,
-                        repo = %repo.name,
-                        project = %project,
-                        "High confidence match: Sentry project name"
-                    );
-                    return Some(InferredRepo {
-                        repo: repo.clone(),
-                        confidence: Confidence::High,
+                    let entry =
+                        candidates
+                            .entry(repo.name.clone())
+                            .or_insert_with(|| RepoCandidate {
+                                repo: repo.clone(),
+                                signals: Vec::new(),
+                                total_score: 0.0,
+                            });
+                    entry.signals.push(ScoredSignal {
+                        weight: WEIGHT_SENTRY_PROJECT,
                         reason: format!("Sentry project: {} -> {}", project, repo.name),
                         matched_file: None,
                     });
+                    entry.total_score += WEIGHT_SENTRY_PROJECT;
                 }
             }
         }
 
-        // Strategy 1: Explicit repository reference (e.g., "utopia-php/database")
-        // Only exact matches — no partial/substring matching to avoid false positives
-        // like "cloud" matching "cloudevents". Fuzzy resolution is left to
-        // file-based and embedding strategies below.
+        // Strategy 1: Explicit repository references
         for repo_ref in &context.repos {
             if let Some(repo) = index.get(repo_ref) {
-                tracing::info!(
-                    issue_id = %issue.short_id,
-                    repo = %repo.name,
-                    "High confidence match: explicit repo reference"
-                );
-                return Some(InferredRepo {
-                    repo: repo.clone(),
-                    confidence: Confidence::High,
+                let entry = candidates
+                    .entry(repo.name.clone())
+                    .or_insert_with(|| RepoCandidate {
+                        repo: repo.clone(),
+                        signals: Vec::new(),
+                        total_score: 0.0,
+                    });
+                entry.signals.push(ScoredSignal {
+                    weight: WEIGHT_EXPLICIT_REPO_REF,
                     reason: format!("Explicit repo reference: {}", repo_ref),
                     matched_file: None,
                 });
+                entry.total_score += WEIGHT_EXPLICIT_REPO_REF;
             }
         }
 
-        // Strategy 2: Direct file path match
+        // Per-filename cascade: for each filename, only the strongest strategy contributes
         for filename in &context.filenames {
+            // Try direct file match first
             if let Some(repo) = index.find_by_file(filename) {
-                tracing::info!(
-                    issue_id = %issue.short_id,
-                    repo = %repo.name,
-                    file = %filename,
-                    "High confidence match: direct file path"
-                );
-                return Some(InferredRepo {
-                    repo: repo.clone(),
-                    confidence: Confidence::High,
+                let entry = candidates
+                    .entry(repo.name.clone())
+                    .or_insert_with(|| RepoCandidate {
+                        repo: repo.clone(),
+                        signals: Vec::new(),
+                        total_score: 0.0,
+                    });
+                entry.signals.push(ScoredSignal {
+                    weight: WEIGHT_DIRECT_FILE_MATCH,
                     reason: format!("Direct file match: {}", filename),
                     matched_file: Some(filename.clone()),
                 });
+                entry.total_score += WEIGHT_DIRECT_FILE_MATCH;
+                continue;
             }
-        }
 
-        // Strategy 3: Fuzzy file search (partial match)
-        for filename in &context.filenames {
+            // Try fuzzy file search
             let matches = index.search_files(filename);
-
-            // If we have exactly one match, it's medium confidence
             if matches.len() == 1 {
                 let (repo, matched_path) = matches[0];
-                tracing::info!(
-                    issue_id = %issue.short_id,
-                    repo = %repo.name,
-                    query = %filename,
-                    matched = %matched_path,
-                    "Medium confidence match: single fuzzy match"
-                );
-                return Some(InferredRepo {
-                    repo: repo.clone(),
-                    confidence: Confidence::Medium,
+                let entry = candidates
+                    .entry(repo.name.clone())
+                    .or_insert_with(|| RepoCandidate {
+                        repo: repo.clone(),
+                        signals: Vec::new(),
+                        total_score: 0.0,
+                    });
+                entry.signals.push(ScoredSignal {
+                    weight: WEIGHT_FUZZY_SINGLE,
                     reason: format!("Fuzzy match: {} -> {}", filename, matched_path),
                     matched_file: Some(matched_path.to_string()),
                 });
+                entry.total_score += WEIGHT_FUZZY_SINGLE;
+                continue;
             }
 
-            // If we have multiple matches in the same repo, still medium confidence
             if !matches.is_empty() {
                 let first_repo = &matches[0].0.name;
-                let all_same_repo = matches.iter().all(|(r, _)| r.name == *first_repo);
-
-                if all_same_repo {
+                if matches.iter().all(|(r, _)| r.name == *first_repo) {
                     let (repo, matched_path) = matches[0];
-                    tracing::info!(
-                        issue_id = %issue.short_id,
-                        repo = %repo.name,
-                        matches = matches.len(),
-                        "Medium confidence match: all matches in same repo"
-                    );
-                    return Some(InferredRepo {
-                        repo: repo.clone(),
-                        confidence: Confidence::Medium,
+                    let entry =
+                        candidates
+                            .entry(repo.name.clone())
+                            .or_insert_with(|| RepoCandidate {
+                                repo: repo.clone(),
+                                signals: Vec::new(),
+                                total_score: 0.0,
+                            });
+                    entry.signals.push(ScoredSignal {
+                        weight: WEIGHT_FUZZY_ALL_SAME_REPO,
                         reason: format!(
                             "Fuzzy match ({} files): {} -> {}",
                             matches.len(),
@@ -906,103 +933,152 @@ impl RepoInferrer {
                         ),
                         matched_file: Some(matched_path.to_string()),
                     });
+                    entry.total_score += WEIGHT_FUZZY_ALL_SAME_REPO;
+                    continue;
                 }
             }
-        }
 
-        // Strategy 3: Try just the basename of each filename
-        for filename in &context.filenames {
+            // Try basename match
             let basename = std::path::Path::new(filename)
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| filename.clone());
 
-            let matches = index.search_files(&basename);
-
-            if matches.len() == 1 {
-                let (repo, matched_path) = matches[0];
-                tracing::info!(
-                    issue_id = %issue.short_id,
-                    repo = %repo.name,
-                    basename = %basename,
-                    matched = %matched_path,
-                    "Low confidence match: basename match"
-                );
-                return Some(InferredRepo {
-                    repo: repo.clone(),
-                    confidence: Confidence::Low,
+            let basename_matches = index.search_files(&basename);
+            if basename_matches.len() == 1 {
+                let (repo, matched_path) = basename_matches[0];
+                let entry = candidates
+                    .entry(repo.name.clone())
+                    .or_insert_with(|| RepoCandidate {
+                        repo: repo.clone(),
+                        signals: Vec::new(),
+                        total_score: 0.0,
+                    });
+                entry.signals.push(ScoredSignal {
+                    weight: WEIGHT_BASENAME_SINGLE,
                     reason: format!("Basename match: {} -> {}", basename, matched_path),
                     matched_file: Some(matched_path.to_string()),
                 });
+                entry.total_score += WEIGHT_BASENAME_SINGLE;
             }
         }
 
-        // No match found with file-based strategies
-        tracing::debug!(
-            issue_id = %issue.short_id,
-            "No repository match found"
-        );
-        None
-    }
-
-    /// Infer with a pre-computed query embedding as fallback.
-    ///
-    /// First tries all file-based strategies, then falls back to semantic
-    /// similarity if embeddings are available and no match was found.
-    pub fn infer_with_embedding(
-        &self,
-        issue: &Issue,
-        query_embedding: Option<&[f32]>,
-    ) -> Option<InferredRepo> {
-        // First try file-based inference
-        if let Some(result) = self.infer(issue) {
-            return Some(result);
-        }
-
-        // Fall back to embedding-based inference if available
+        // Embedding signal
         if let Some(embedding) = query_embedding {
             if self.has_embeddings() {
-                const MIN_SIMILARITY: f32 = 0.5; // Threshold for semantic match
-
+                const MIN_SIMILARITY: f32 = 0.5;
                 if let Some((repo_name, similarity)) =
                     self.find_by_embedding(embedding, MIN_SIMILARITY)
                 {
-                    let index = match self.index.read() {
-                        Ok(i) => i,
-                        Err(e) => {
-                            tracing::error!(error = %e, "index RwLock poisoned in infer_with_embedding");
-                            return None;
-                        }
-                    };
                     if let Some(repo) = index.get(&repo_name) {
-                        let confidence = if similarity >= 0.8 {
-                            Confidence::High
-                        } else if similarity >= 0.65 {
-                            Confidence::Medium
-                        } else {
-                            Confidence::Low
-                        };
-
-                        tracing::info!(
-                            issue_id = %issue.short_id,
-                            repo = %repo.name,
-                            similarity = %format!("{:.2}", similarity),
-                            confidence = %confidence,
-                            "Semantic similarity match"
-                        );
-
-                        return Some(InferredRepo {
-                            repo: repo.clone(),
-                            confidence,
+                        let score = WEIGHT_EMBEDDING_MULTIPLIER * similarity;
+                        let entry =
+                            candidates
+                                .entry(repo.name.clone())
+                                .or_insert_with(|| RepoCandidate {
+                                    repo: repo.clone(),
+                                    signals: Vec::new(),
+                                    total_score: 0.0,
+                                });
+                        entry.signals.push(ScoredSignal {
+                            weight: score,
                             reason: format!("Semantic similarity: {:.1}%", similarity * 100.0),
                             matched_file: None,
                         });
+                        entry.total_score += score;
                     }
                 }
             }
         }
 
-        None
+        // Pick the candidate with the highest total score
+        if candidates.is_empty() {
+            tracing::debug!(issue_id = %issue.short_id, "No repository match found");
+            return None;
+        }
+
+        let best = candidates.into_values().max_by(|a, b| {
+            a.total_score
+                .partial_cmp(&b.total_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+
+        if best.total_score < THRESHOLD_LOW {
+            tracing::debug!(
+                issue_id = %issue.short_id,
+                score = best.total_score,
+                "Score below minimum threshold"
+            );
+            return None;
+        }
+
+        let confidence = if best.total_score >= THRESHOLD_HIGH {
+            Confidence::High
+        } else if best.total_score >= THRESHOLD_MEDIUM {
+            Confidence::Medium
+        } else {
+            Confidence::Low
+        };
+
+        // Build composite reason
+        let reason = if best.signals.len() == 1 {
+            best.signals[0].reason.clone()
+        } else {
+            let parts: Vec<String> = best
+                .signals
+                .iter()
+                .map(|s| format!("{} ({:.0})", s.reason, s.weight))
+                .collect();
+            format!("{} [score: {:.0}]", parts.join(" + "), best.total_score)
+        };
+
+        // Use the matched_file from the highest-weight signal that has one
+        let matched_file = best
+            .signals
+            .iter()
+            .filter(|s| s.matched_file.is_some())
+            .max_by(|a, b| {
+                a.weight
+                    .partial_cmp(&b.weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .and_then(|s| s.matched_file.clone());
+
+        tracing::info!(
+            issue_id = %issue.short_id,
+            repo = %best.repo.name,
+            confidence = %confidence,
+            score = best.total_score,
+            signals = best.signals.len(),
+            "Repository inferred via weighted scoring"
+        );
+
+        Some(InferredRepo {
+            repo: best.repo,
+            confidence,
+            reason,
+            matched_file,
+        })
+    }
+
+    /// Infer the target repository for an issue.
+    ///
+    /// Runs all strategies (Sentry project, repo ref, file match, fuzzy, basename)
+    /// and returns the repo with the highest aggregate score.
+    pub fn infer(&self, issue: &Issue) -> Option<InferredRepo> {
+        self.infer_scored(issue, None)
+    }
+
+    /// Infer with a pre-computed query embedding for semantic matching.
+    ///
+    /// All strategies (file-based and embedding) run and contribute scores;
+    /// the repo with the highest aggregate score wins.
+    pub fn infer_with_embedding(
+        &self,
+        issue: &Issue,
+        query_embedding: Option<&[f32]>,
+    ) -> Option<InferredRepo> {
+        self.infer_scored(issue, query_embedding)
     }
 
     /// Get the number of indexed repositories.
@@ -1298,12 +1374,13 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_prefers_sentry_project_over_vendor() {
+    fn test_infer_vendor_evidence_overrides_sentry_project() {
         let index = create_test_index_with_cloud();
         let inferrer = RepoInferrer::new(index);
 
-        // Issue with both project name and vendor packages in stacktrace
-        // Sentry project should take precedence
+        // Issue with Sentry project "cloud-staging" but stack trace pointing to database library.
+        // The accumulated evidence (repo ref + file match) for database should outweigh
+        // the project name, since the error originates in the library dependency.
         let mut issue = create_test_issue("sentry", "MySQL server has gone away", "");
         issue
             .metadata
@@ -1319,11 +1396,10 @@ mod tests {
 
         let result = inferrer.infer(&issue);
 
-        // Should match appwrite/cloud (from project name), not utopia-php/database
+        // database wins: repo ref (45) + file match (41) = 86 > project name (35)
         assert!(result.is_some());
         let inferred = result.unwrap();
-        assert_eq!(inferred.repo.name, "appwrite/cloud");
-        assert!(inferred.reason.contains("Sentry project"));
+        assert_eq!(inferred.repo.name, "utopia-php/database");
     }
 
     #[test]
@@ -3160,5 +3236,141 @@ mod tests {
             "Expected Sentry project reason, got: {}",
             result.reason
         );
+    }
+
+    // --- Weighted scoring tests ---
+
+    #[test]
+    fn test_multi_signal_reinforcement() {
+        // 3 file matches in the same repo should accumulate to high score
+        let mut index = RepoIndex::new();
+        let mut repo = IndexedRepo::new("org/backend", "/path/backend");
+        repo.files = vec![
+            "src/api/handler.rs".to_string(),
+            "src/api/router.rs".to_string(),
+            "src/api/middleware.rs".to_string(),
+        ];
+        index.add_repo(repo);
+
+        let inferrer = RepoInferrer::new(index);
+
+        let issue = create_test_issue(
+            "linear",
+            "API issues",
+            "Errors in src/api/handler.rs, src/api/router.rs, and src/api/middleware.rs",
+        );
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert_eq!(inferred.repo.name, "org/backend");
+        // 3 direct file matches × 41 = 123 → High
+        assert_eq!(inferred.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn test_disambiguation_by_aggregate_score() {
+        // 2 files in repo A vs 1 file in repo B → A should win
+        let mut index = RepoIndex::new();
+        let mut repo_a = IndexedRepo::new("org/repo-a", "/path/repo-a");
+        repo_a.files = vec![
+            "src/utils/auth.rs".to_string(),
+            "src/utils/session.rs".to_string(),
+        ];
+        index.add_repo(repo_a);
+
+        let mut repo_b = IndexedRepo::new("org/repo-b", "/path/repo-b");
+        repo_b.files = vec!["src/utils/config.rs".to_string()];
+        index.add_repo(repo_b);
+
+        let inferrer = RepoInferrer::new(index);
+
+        let issue = create_test_issue(
+            "linear",
+            "Auth and session issues",
+            "Check src/utils/auth.rs, src/utils/session.rs, and src/utils/config.rs",
+        );
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        // repo-a: 2×41=82, repo-b: 1×41=41 → repo-a wins
+        assert_eq!(inferred.repo.name, "org/repo-a");
+        assert_eq!(inferred.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn test_weak_signals_sum_to_medium() {
+        // A fuzzy-all-same-repo match (22 points) reaches Medium but not High
+        let mut index = RepoIndex::new();
+        let mut repo = IndexedRepo::new("org/service", "/path/service");
+        repo.files = vec![
+            "src/auth/session_handler.py".to_string(),
+            "src/auth/token_handler.py".to_string(),
+        ];
+        index.add_repo(repo);
+
+        let inferrer = RepoInferrer::new(index);
+
+        // "handler.py" doesn't exist as a basename in file_index
+        // (basenames are "session_handler.py" and "token_handler.py")
+        // But search_files("handler.py") matches both via substring → all same repo → 22 points
+        // 22 >= THRESHOLD_MEDIUM (21) → Medium confidence
+        let mut issue = create_test_issue("sentry", "Handler error", "");
+        issue
+            .metadata
+            .insert("filename".to_string(), json!("handler.py"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert_eq!(inferred.repo.name, "org/service");
+        assert_eq!(inferred.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn test_composite_reason_format() {
+        // Multi-signal reason should include score breakdown
+        let mut index = RepoIndex::new();
+        let mut repo = IndexedRepo::new("org/service", "/path/service");
+        repo.files = vec!["src/handler.rs".to_string(), "src/router.rs".to_string()];
+        index.add_repo(repo);
+
+        let inferrer = RepoInferrer::new(index);
+
+        let issue = create_test_issue(
+            "linear",
+            "Issues",
+            "Errors in src/handler.rs and src/router.rs",
+        );
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        // Two signals → composite reason with score breakdown
+        assert!(
+            inferred.reason.contains("[score:"),
+            "Multi-signal reason should include score, got: {}",
+            inferred.reason
+        );
+        assert!(
+            inferred.reason.contains("Direct file match"),
+            "Reason should mention direct file match, got: {}",
+            inferred.reason
+        );
+    }
+
+    #[test]
+    fn test_scoring_constants() {
+        assert_eq!(WEIGHT_SENTRY_PROJECT, 35.0);
+        assert_eq!(WEIGHT_EXPLICIT_REPO_REF, 45.0);
+        assert_eq!(WEIGHT_DIRECT_FILE_MATCH, 41.0);
+        assert_eq!(WEIGHT_FUZZY_SINGLE, 25.0);
+        assert_eq!(WEIGHT_FUZZY_ALL_SAME_REPO, 22.0);
+        assert_eq!(WEIGHT_BASENAME_SINGLE, 10.0);
+        assert_eq!(WEIGHT_EMBEDDING_MULTIPLIER, 40.0);
+        assert_eq!(THRESHOLD_HIGH, 32.0);
+        assert_eq!(THRESHOLD_MEDIUM, 21.0);
+        assert_eq!(THRESHOLD_LOW, 5.0);
     }
 }
