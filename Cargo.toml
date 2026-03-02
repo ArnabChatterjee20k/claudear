@@ -28,12 +28,12 @@ tokio = { version = "1", features = ["full", "process", "signal", "net"] }
 # HTTP server & client
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
-reqwest = { version = "0.13", features = ["json", "form", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider", "charset", "http2"] }
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 
 # TLS auto-provisioning (Let's Encrypt ACME)
-rustls-acme = { version = "0.15", features = ["axum", "aws-lc-rs"] }
+rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 
 # Database
 rusqlite = { version = "0.38", features = ["bundled", "load_extension"], optional = true }

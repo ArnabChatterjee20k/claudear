@@ -89,6 +89,7 @@ jobs:
   build:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -101,8 +102,6 @@ jobs:
             os: windows-latest
             artifact: claudear-windows
             binary_path: target/release/claudear.exe
-    env:
-      AWS_LC_SYS_PREBUILT_NASM: 1
     steps:
       - uses: actions/checkout@v6
 
@@ -132,8 +131,7 @@ jobs:
   test-windows:
     name: Test (Windows)
     runs-on: windows-latest
-    env:
-      AWS_LC_SYS_PREBUILT_NASM: 1
+    timeout-minutes: 30
     steps:
       - name: Configure git
         run: git config --global core.autocrlf false
