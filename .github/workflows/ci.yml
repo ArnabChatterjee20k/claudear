@@ -70,7 +70,11 @@ jobs:
           key: fastembed-nomic-v15
 
       - name: Warmup embedding model
-        run: cargo test --all-features -- feedback::embeddings::tests::test_warmup_downloads_model --exact --nocapture
+        run: |
+          pip install -q huggingface-hub
+          huggingface-cli download nomic-ai/nomic-embed-text-v1.5 \
+            onnx/model.onnx tokenizer.json config.json special_tokens_map.json \
+            --cache-dir $FASTEMBED_CACHE_DIR
 
       - name: Run tests
         run: cargo tarpaulin --out Xml --all-features
