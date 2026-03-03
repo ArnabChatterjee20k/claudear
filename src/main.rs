@@ -1330,6 +1330,9 @@ fn start_regression_monitoring(
 }
 
 fn main() -> anyhow::Result<()> {
+    // Install ring as the global TLS crypto provider (must happen before any HTTPS calls)
+    claudear::init_tls();
+
     // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
     let _sentry_guard = sentry::init((
         std::env::var("CLAUDEAR_SENTRY_DSN").unwrap_or_default(),

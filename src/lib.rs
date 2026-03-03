@@ -25,6 +25,15 @@
 //! claudear webhook
 //! ```
 
+/// Install the ring crypto provider for all rustls consumers (reqwest, axum-server, etc.).
+///
+/// Must be called once before any TLS connections are made.  Subsequent calls
+/// are harmless (the function is idempotent).
+pub fn init_tls() {
+    // `install_default` returns Err if a provider is already installed – that's fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 pub mod api;
 pub mod api_events;
 pub(crate) mod ask_reply_inbox;

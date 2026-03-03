@@ -743,6 +743,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rusqlite",
  "rust-embed",
+ "rustls",
  "rustls-acme",
  "semver",
  "sentry",
