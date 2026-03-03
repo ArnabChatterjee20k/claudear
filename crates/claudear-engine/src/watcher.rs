@@ -257,6 +257,7 @@ impl Watcher {
     pub async fn build_inferrer(
         config: &Config,
         github_client: Option<&claudear_integrations::github::GitHubClient>,
+        tracker: Option<&dyn FixAttemptTracker>,
     ) -> Result<Option<RepoInferrer>> {
         if config.known_orgs.is_empty() {
             tracing::info!("No known_orgs configured, inference disabled");
@@ -274,7 +275,7 @@ impl Watcher {
             return Ok(None);
         }
 
-        let index = build_repo_index_with_fallback(
+        let mut index = build_repo_index_with_fallback(
             &config.known_orgs,
             &config.auto_discover_paths,
             github_client,
@@ -288,6 +289,23 @@ impl Watcher {
         if index.is_empty() {
             tracing::warn!("Repository index is empty, no repos discovered");
             return Ok(None);
+        }
+
+        // Load known repository renames so vendor-path inference can resolve
+        // old package names (e.g. utopia-php/framework) to the current repo.
+        if let Some(t) = tracker {
+            match t.get_all_repo_aliases() {
+                Ok(aliases) => {
+                    let count = aliases.len();
+                    for (former, current) in aliases {
+                        index.add_alias(&former, &current);
+                    }
+                    if count > 0 {
+                        tracing::debug!(count, "Loaded repository rename aliases into index");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "Failed to load repo aliases"),
+            }
         }
 
         tracing::info!(
@@ -307,6 +325,7 @@ impl Watcher {
     pub async fn build_inferrer_with_embeddings(
         config: &Config,
         github_client: Option<&claudear_integrations::github::GitHubClient>,
+        tracker: Option<&dyn FixAttemptTracker>,
     ) -> Result<(
         Option<RepoInferrer>,
         Option<Arc<claudear_analysis::feedback::EmbeddingClient>>,
@@ -330,7 +349,7 @@ impl Watcher {
             return Ok((None, None));
         }
 
-        let index = build_repo_index_with_fallback(
+        let mut index = build_repo_index_with_fallback(
             &config.known_orgs,
             &config.auto_discover_paths,
             github_client,
@@ -344,6 +363,21 @@ impl Watcher {
         if index.is_empty() {
             tracing::warn!("Repository index is empty, no repos discovered");
             return Ok((None, None));
+        }
+
+        if let Some(t) = tracker {
+            match t.get_all_repo_aliases() {
+                Ok(aliases) => {
+                    let count = aliases.len();
+                    for (former, current) in aliases {
+                        index.add_alias(&former, &current);
+                    }
+                    if count > 0 {
+                        tracing::debug!(count, "Loaded repository rename aliases into index");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "Failed to load repo aliases"),
+            }
         }
 
         tracing::info!(
@@ -9947,7 +9981,7 @@ mod tests {
         let mut config = test_config();
         config.known_orgs = vec![];
 
-        let result = Watcher::build_inferrer(&config, None).await.unwrap();
+        let result = Watcher::build_inferrer(&config, None, None).await.unwrap();
         assert!(result.is_none(), "Expected None when known_orgs is empty");
     }
 
@@ -9958,7 +9992,7 @@ mod tests {
         config.auto_discover_paths = vec![];
         // No github client passed
 
-        let result = Watcher::build_inferrer(&config, None).await.unwrap();
+        let result = Watcher::build_inferrer(&config, None, None).await.unwrap();
         assert!(
             result.is_none(),
             "Expected None when no auto_discover_paths and no GitHub client"
@@ -11134,7 +11168,7 @@ mod tests {
         let mut config = test_config();
         config.known_orgs = vec![];
 
-        let result = Watcher::build_inferrer_with_embeddings(&config, None)
+        let result = Watcher::build_inferrer_with_embeddings(&config, None, None)
             .await
             .unwrap();
         assert!(result.0.is_none());
@@ -11147,7 +11181,7 @@ mod tests {
         config.known_orgs = vec!["org".to_string()];
         config.auto_discover_paths = vec![];
 
-        let result = Watcher::build_inferrer_with_embeddings(&config, None)
+        let result = Watcher::build_inferrer_with_embeddings(&config, None, None)
             .await
             .unwrap();
         assert!(result.0.is_none());

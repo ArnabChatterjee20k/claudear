@@ -170,8 +170,9 @@ impl WebhookServer {
     pub async fn build_inferrer(
         config: &Config,
         github_client: Option<&crate::github::GitHubClient>,
+        tracker: Option<&dyn FixAttemptTracker>,
     ) -> Result<Option<RepoInferrer>> {
-        crate::watcher::Watcher::build_inferrer(config, github_client).await
+        crate::watcher::Watcher::build_inferrer(config, github_client, tracker).await
     }
 
     /// Start the server.

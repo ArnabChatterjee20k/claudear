@@ -169,8 +169,12 @@ pub async fn build_app(
 
     // GitHub client for inferrer
     let github_client = github::GitHubClient::new(config.github().clone());
-    let (inferrer, embedding_client) =
-        watcher::Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
+    let (inferrer, embedding_client) = watcher::Watcher::build_inferrer_with_embeddings(
+        &config,
+        Some(&github_client),
+        Some(tracker.as_ref()),
+    )
+    .await?;
 
     // Review watcher
     let review_watcher = build_review_watcher(&config, tracker.clone());
