@@ -210,6 +210,10 @@ impl WebhookHandler for TelegramWebhookHandler {
 mod tests {
     use super::*;
     use claudear_config::config::TelegramConfig;
+    use std::sync::Mutex;
+
+    /// Guard to serialize tests that manipulate `CLAUDEAR_TELEGRAM_WEBHOOK_SECRET`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn make_handler(listen_chat_id: Option<&str>) -> TelegramWebhookHandler {
         TelegramWebhookHandler::new(TelegramConfig {
@@ -289,6 +293,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_no_env_secret() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // When no CLAUDEAR_TELEGRAM_WEBHOOK_SECRET env, should accept any request
         std::env::remove_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET");
         let handler = make_handler(None);
@@ -297,6 +302,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_with_env_secret_missing_header() {
+        let _lock = ENV_LOCK.lock().unwrap();
         std::env::set_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET", "mysecret");
         let handler = make_handler(None);
         assert!(!handler.verify_signature(b"any", &HashMap::new()));
@@ -305,6 +311,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_with_env_secret_correct() {
+        let _lock = ENV_LOCK.lock().unwrap();
         std::env::set_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET", "mysecret");
         let handler = make_handler(None);
         let mut headers = HashMap::new();
@@ -318,6 +325,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_with_env_secret_wrong() {
+        let _lock = ENV_LOCK.lock().unwrap();
         std::env::set_var("CLAUDEAR_TELEGRAM_WEBHOOK_SECRET", "mysecret");
         let handler = make_handler(None);
         let mut headers = HashMap::new();

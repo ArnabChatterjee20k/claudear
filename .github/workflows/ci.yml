@@ -35,6 +35,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Create dashboard dist stub
+        run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
+
       - name: Compile all test targets
         run: cargo test --workspace --all-features --no-run
 
@@ -136,6 +139,10 @@ jobs:
           )
           "
 
+      - name: Create dashboard dist stub
+        if: matrix.crate == 'claudear-engine' || matrix.crate == 'claudear'
+        run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
+
       - name: Run tests
         run: cargo tarpaulin -p ${{ matrix.crate }} --all-features --out Xml
 
@@ -167,6 +174,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      - name: Create dashboard dist stub
+        run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
 
       - name: Build release
         run: cargo build --release
