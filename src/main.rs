@@ -1950,8 +1950,8 @@ async fn async_main() -> anyhow::Result<()> {
 
             ReposCommands::Reindex { repo } => {
                 use claudear::feedback::{EmbeddingClient, EmbeddingConfig};
-                use claudear::repo::code_index::CodeIndexer;
                 use claudear::repo::build_repo_index;
+                use claudear::repo::code_index::CodeIndexer;
 
                 if !config.code_index.enabled {
                     anyhow::bail!(
