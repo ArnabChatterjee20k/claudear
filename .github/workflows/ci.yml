@@ -13,8 +13,8 @@ env:
   HF_HOME: /home/runner/.cache/fastembed
 
 jobs:
-  lint:
-    name: Lint
+  compile:
+    name: Compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -24,14 +24,49 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v5
+      - name: Restore cargo cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Compile all test targets
+        run: cargo test --workspace --all-features --no-run
+
+      - name: Save compiled cache
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-compiled-${{ github.sha }}
+
+  lint:
+    name: Lint
+    needs: [compile]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Restore compiled cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-compiled-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -43,6 +78,7 @@ jobs:
 
   test:
     name: Test (${{ matrix.crate }})
+    needs: [compile]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -67,14 +103,14 @@ jobs:
       - name: Install cargo-tarpaulin
         run: cargo binstall --no-confirm cargo-tarpaulin
 
-      - name: Cache cargo registry
-        uses: actions/cache@v5
+      - name: Restore compiled cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-compiled-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
