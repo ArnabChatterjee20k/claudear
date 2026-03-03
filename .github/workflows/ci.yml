@@ -24,6 +24,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo-tarpaulin
+        run: cargo binstall --no-confirm cargo-tarpaulin
+
       - name: Restore cargo cache
         uses: actions/cache/restore@v5
         with:
@@ -38,8 +44,8 @@ jobs:
       - name: Create dashboard dist stub
         run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
 
-      - name: Compile all test targets
-        run: cargo test --workspace --all-features --no-run
+      - name: Compile all test targets via tarpaulin
+        run: cargo tarpaulin --workspace --all-features --no-run
 
       - name: Save compiled cache
         uses: actions/cache/save@v5
@@ -144,7 +150,7 @@ jobs:
         run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
 
       - name: Run tests
-        run: cargo tarpaulin -p ${{ matrix.crate }} --all-features --out Xml
+        run: cargo tarpaulin -p ${{ matrix.crate }} --all-features --skip-clean --out Xml
 
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != ''
