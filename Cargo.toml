@@ -111,14 +111,14 @@ tree-sitter-kotlin-ng = "1.1"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
-tree-sitter-lua = "0.4"
+tree-sitter-lua = "0.5"
 
 # Local LLM inference (llama.cpp bindings)
 llama-cpp-2 = "0.1"
 encoding_rs = "0.8"
 
 # System info (memory detection for batch sizing)
-sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 # Parallel iteration
 rayon = "1"

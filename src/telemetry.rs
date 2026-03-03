@@ -25,11 +25,6 @@ macro_rules! delegate {
             self.inner.$method($($arg),*)
         }
     };
-    (async fn $method:ident(&self $(, $arg:ident: $ty:ty)*) -> $ret:ty) => {
-        async fn $method(&self $(, $arg: $ty)*) -> $ret {
-            self.inner.$method($($arg),*).await
-        }
-    };
 }
 
 pub struct InstrumentedSource {

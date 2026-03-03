@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
+      HF_HOME: /home/runner/.cache/fastembed
     steps:
       - uses: actions/checkout@v6
 
@@ -46,6 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
+      HF_HOME: /home/runner/.cache/fastembed
     steps:
       - uses: actions/checkout@v6
 
@@ -69,11 +71,21 @@ jobs:
       - name: Cache fastembed model
         uses: actions/cache@v5
         with:
-          path: /home/runner/.cache/fastembed
-          key: fastembed-nomic-v15
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: fastembed-nomic-embed-text-v1.5
+          enableCrossOsArchive: true
 
       - name: Warmup embedding model
-        run: cargo test --all-features -- feedback::embeddings::tests::test_warmup_downloads_model --exact --nocapture
+        run: |
+          python3 -m pip install -q huggingface-hub
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              'nomic-ai/nomic-embed-text-v1.5',
+              allow_patterns=['onnx/model.onnx', 'tokenizer.json', 'config.json', 'special_tokens_map.json'],
+              cache_dir='${FASTEMBED_CACHE_DIR}',
+          )
+          "
 
       - name: Run tests
         run: cargo tarpaulin --out Xml --all-features
@@ -123,7 +135,7 @@ jobs:
         run: cargo build --release
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.binary_path }}
@@ -166,12 +178,14 @@ jobs:
         run: cargo test --all-features -- feedback::embeddings::tests::test_warmup_downloads_model --exact --nocapture
         env:
           FASTEMBED_CACHE_DIR: ${{ runner.temp }}\.cache\fastembed
+          HF_HOME: ${{ runner.temp }}\.cache\fastembed
 
       - name: Run tests
         timeout-minutes: 10
         run: cargo test --all-features
         env:
           FASTEMBED_CACHE_DIR: ${{ runner.temp }}\.cache\fastembed
+          HF_HOME: ${{ runner.temp }}\.cache\fastembed
 
   dashboard:
     name: Dashboard

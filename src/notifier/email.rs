@@ -2726,23 +2726,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
-    fn send_config_multi_recipient() -> EmailConfig {
-        EmailConfig {
-            smtp_host: Some("localhost".to_string()),
-            smtp_port: 25,
-            smtp_username: Some("user".to_string()),
-            smtp_password: Some("pass".into()),
-            from_address: Some("bot@example.com".to_string()),
-            to_addresses: vec![
-                "alice@example.com".to_string(),
-                "bob@example.com".to_string(),
-            ],
-            use_tls: false,
-            ..Default::default()
-        }
-    }
-
     #[tokio::test]
     async fn test_send_email_builds_message_and_fails_on_transport() {
         let notifier = EmailNotifier::new(send_config(), empty_registry()).unwrap();

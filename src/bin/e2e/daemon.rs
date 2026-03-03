@@ -143,6 +143,14 @@ pub fn start_docker(
     let default_vol = format!("claudear-e2e-db-{}", port);
     let vol = volume_name.unwrap_or(&default_vol);
 
+    // Remove any stale container with the same name from a previous run.
+    // Must happen BEFORE volume removal — a running container holds a reference
+    // to the volume, causing `docker volume rm` to fail silently.
+    let container_name = format!("claudear-e2e-{}", label);
+    let _ = Command::new("docker")
+        .args(["rm", "-f", &container_name])
+        .output();
+
     if reset_volume {
         // Remove stale volume from previous run (ignore errors if it doesn't exist)
         let _ = Command::new("docker")
@@ -153,12 +161,6 @@ pub fn start_docker(
     // Ensure volume exists
     let _ = Command::new("docker")
         .args(["volume", "create", vol])
-        .output();
-
-    // Remove any stale container with the same name from a previous run
-    let container_name = format!("claudear-e2e-{}", label);
-    let _ = Command::new("docker")
-        .args(["rm", "-f", &container_name])
         .output();
 
     // Build docker args dynamically
