@@ -5,7 +5,7 @@ use crate::retry::RetryManager;
 use chrono::{DateTime, Utc};
 use claudear_analysis::feedback::{FeedbackAnalyzer, IssueEmbeddingService, Outcome};
 use claudear_analysis::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
-use claudear_analysis::repo::{worktree_path, GitOps, RepoIndex, RepoRelationships};
+use claudear_analysis::repo::{worktree_path, GitOps, RepoRelationships};
 use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;

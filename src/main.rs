@@ -18,7 +18,7 @@ use claudear::{
         SentryRegressionConfig,
     },
     release::{ReleaseTracker, ReleaseTrackerConfig},
-    repo::{build_repo_index, DependencyType, RepoIndex, RepoRelationships},
+    repo::{build_repo_index, DependencyType, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
     runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
@@ -1951,7 +1951,7 @@ async fn async_main() -> anyhow::Result<()> {
             ReposCommands::Reindex { repo } => {
                 use claudear::feedback::{EmbeddingClient, EmbeddingConfig};
                 use claudear::repo::code_index::CodeIndexer;
-                use claudear::repo::{build_repo_index, RepoIndex};
+                use claudear::repo::build_repo_index;
 
                 if !config.code_index.enabled {
                     anyhow::bail!(
@@ -2014,7 +2014,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
 
             ReposCommands::Sync { skip_files } => {
-                use claudear::repo::{build_repo_index, RepoIndex};
+                use claudear::repo::build_repo_index;
 
                 println!("\nSyncing repository index to database...");
 
