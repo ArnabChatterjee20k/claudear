@@ -42,16 +42,30 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    name: Test
+    name: Test (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - claudear-core
+          - claudear-config
+          - claudear-storage
+          - claudear-analysis
+          - claudear-engine
+          - claudear-integrations
+          - claudear
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        run: cargo binstall --no-confirm cargo-tarpaulin
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -65,13 +79,16 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Cache fastembed model
+        if: matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
+        id: fastembed-cache
         uses: actions/cache@v5
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
           key: fastembed-nomic-embed-text-v1.5
           enableCrossOsArchive: true
 
-      - name: Warmup embedding model
+      - name: Download embedding model
+        if: (matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear') && steps.fastembed-cache.outputs.cache-hit != 'true'
         run: |
           python3 -m pip install -q huggingface-hub
           python3 -c "
@@ -84,13 +101,14 @@ jobs:
           "
 
       - name: Run tests
-        run: cargo tarpaulin --workspace --out Xml --all-features
+        run: cargo tarpaulin -p ${{ matrix.crate }} --all-features --out Xml
 
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v5
         with:
           fail_ci_if_error: true
+          flags: ${{ matrix.crate }}
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
