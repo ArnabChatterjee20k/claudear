@@ -84,7 +84,7 @@ jobs:
           "
 
       - name: Run tests
-        run: cargo tarpaulin --out Xml --all-features
+        run: cargo tarpaulin --workspace --out Xml --all-features
 
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != ''
