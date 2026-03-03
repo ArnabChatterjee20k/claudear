@@ -1,0 +1,29 @@
+[package]
+name = "claudear-config"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+claudear-core = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# File system
+dirs = { workspace = true }
+
+# Regex
+regex-lite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

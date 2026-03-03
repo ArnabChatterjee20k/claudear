@@ -1,29 +1,10 @@
-[package]
-name = "claudear"
-version = "1.0.0"
-edition = "2021"
+[workspace]
+members = ["crates/*"]
+resolver = "2"
 
-[[bin]]
-name = "claudear"
-path = "src/main.rs"
-required-features = ["sqlite"]
-
-[[bin]]
-name = "claudear-e2e"
-path = "src/bin/e2e/main.rs"
-required-features = ["sqlite"]
-
-[lib]
-name = "claudear"
-path = "src/lib.rs"
-
-[features]
-default = ["sqlite"]
-sqlite = ["dep:rusqlite"]
-
-[dependencies]
+[workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full", "process", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "process", "signal", "fs", "net", "io-util", "macros"] }
 
 # HTTP server & client
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
@@ -36,7 +17,7 @@ tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 rustls-acme = { version = "0.15", features = ["axum", "aws-lc-rs"] }
 
 # Database
-rusqlite = { version = "0.38", features = ["bundled", "load_extension"], optional = true }
+rusqlite = { version = "0.38", features = ["bundled", "load_extension"] }
 
 # Embeddings
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls"] }
@@ -70,7 +51,7 @@ sentry = { version = "0.46", features = ["tower-axum-matched-path", "tracing", "
 thiserror = "2"
 anyhow = "1"
 
-# Crypto for webhook signatures and config encryption
+# Crypto
 aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
@@ -113,11 +94,11 @@ tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
 tree-sitter-lua = "0.5"
 
-# Local LLM inference (llama.cpp bindings)
+# Local LLM inference
 llama-cpp-2 = "0.1"
 encoding_rs = "0.8"
 
-# System info (memory detection for batch sizing)
+# System info
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 # Parallel iteration
@@ -154,6 +135,182 @@ imap = "2.4"
 native-tls = "0.2"
 mailparse = "0.16"
 
+# tempfile
+tempfile = "3"
+
+# Dev/test
+mockall = "0.14"
+http-body-util = "0.1"
+
+# Internal crates
+claudear-core = { path = "crates/claudear-core" }
+claudear-config = { path = "crates/claudear-config" }
+claudear-storage = { path = "crates/claudear-storage" }
+claudear-analysis = { path = "crates/claudear-analysis" }
+claudear-integrations = { path = "crates/claudear-integrations" }
+claudear-engine = { path = "crates/claudear-engine" }
+
+[package]
+name = "claudear"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "claudear"
+path = "src/main.rs"
+required-features = ["sqlite"]
+
+[lib]
+name = "claudear"
+path = "src/lib.rs"
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite", "claudear-core/sqlite", "claudear-storage/sqlite", "claudear-analysis/sqlite", "claudear-integrations/sqlite", "claudear-engine/sqlite"]
+
+[dependencies]
+claudear-core = { workspace = true }
+claudear-config = { workspace = true }
+claudear-storage = { workspace = true }
+claudear-analysis = { workspace = true }
+claudear-integrations = { workspace = true }
+claudear-engine = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP server & client
+axum = { workspace = true }
+axum-server = { workspace = true }
+reqwest = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# TLS auto-provisioning (Let's Encrypt ACME)
+rustls-acme = { workspace = true }
+
+# Database
+rusqlite = { workspace = true, optional = true }
+
+# Embeddings
+fastembed = { workspace = true }
+
+# ORT runtime
+ort = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+indicatif = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+
+# Error monitoring
+sentry = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Crypto
+aes-gcm = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
+
+# JWT for GitHub App authentication
+jsonwebtoken = { workspace = true }
+
+# GraphQL for Linear
+graphql_client = { workspace = true }
+
+# Async utilities
+futures = { workspace = true }
+futures-util = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+
+# Regex
+regex-lite = { workspace = true }
+
+# Tree-sitter code parsing
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-ruby = { workspace = true }
+tree-sitter-php = { workspace = true }
+tree-sitter-swift = { workspace = true }
+tree-sitter-kotlin-ng = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-yaml = { workspace = true }
+tree-sitter-lua = { workspace = true }
+
+# Local LLM inference
+llama-cpp-2 = { workspace = true }
+encoding_rs = { workspace = true }
+
+# System info
+sysinfo = { workspace = true }
+
+# Parallel iteration
+rayon = { workspace = true }
+
+# File system utilities
+walkdir = { workspace = true }
+dirs = { workspace = true }
+
+# URL encoding/parsing
+urlencoding = { workspace = true }
+url = { workspace = true }
+
+# UUID generation
+uuid = { workspace = true }
+
+# Base64 encoding
+base64 = { workspace = true }
+
+# Semantic versioning
+semver = { workspace = true }
+
+# Embedded dashboard
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+
+# Authentication
+bcrypt = { workspace = true }
+tower-cookies = { workspace = true }
+
+# Email (SMTP)
+lettre = { workspace = true }
+imap = { workspace = true }
+native-tls = { workspace = true }
+mailparse = { workspace = true }
+
+# tempfile is used by both dev tests and the claudear-e2e binary
+tempfile = { workspace = true }
+
 # Vendor OpenSSL for Linux cross-compilation (native-tls uses openssl-sys on Linux)
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
@@ -162,14 +319,17 @@ openssl = { version = "0.10", features = ["vendored"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# tempfile is used by both dev tests and the claudear-e2e binary
-[dependencies.tempfile]
-version = "3"
-
 [dev-dependencies]
-mockall = "0.14"
+mockall = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
+http-body-util = { workspace = true }
+
+[profile.dev]
+debug = 1                  # Line tables only (not full debuginfo)
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 1              # Slightly optimize deps (faster runtime, similar compile)
 
 [profile.release]
 opt-level = 3

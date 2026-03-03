@@ -1,16 +1,12 @@
 //! Multi-repository support module.
 //!
-//! Provides git operations, dependency tracking, cascading changes, and repository indexing.
+//! Core repo types and analysis are provided by `claudear_analysis::repo`.
+//! SCM-specific index building functions are provided by `claudear_engine::repo_index`.
 
-pub mod code_index;
-mod discovery;
-mod git;
-mod index;
-mod relationships;
+// Re-export everything from the analysis crate's repo module
+pub use claudear_analysis::repo::*;
 
-pub use discovery::{DependencyDiscovery, DiscoveredDependency};
-pub use git::{worktree_path, GitOps};
-pub use index::{IndexedRepo, RepoIndex};
-pub use relationships::{
-    CascadingChange, DependencyGraph, DependencyType, RepoRelationships, Repository,
+// Re-export SCM-specific index functions from the engine crate
+pub use claudear_engine::repo_index::{
+    build_repo_index_from_github, build_repo_index_from_gitlab, build_repo_index_with_fallback,
 };
