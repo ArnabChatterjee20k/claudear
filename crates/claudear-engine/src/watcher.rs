@@ -2085,6 +2085,16 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Process any issues that are ready for retry.
     async fn process_ready_retries(&self) -> Result<()> {
+        // Skip retries while paused for rate limits — attempting them would
+        // just burn retry attempts without doing any work.
+        if self.is_rate_limit_paused().await {
+            tracing::debug!(
+                component = "watcher",
+                "Skipping ready retries while paused for Claude rate limit"
+            );
+            return Ok(());
+        }
+
         let retry_manager = RetryManager::new(self.config.retry.clone(), self.tracker.clone());
         let ready = retry_manager.get_ready_retries()?;
         let ready_count = ready.len();

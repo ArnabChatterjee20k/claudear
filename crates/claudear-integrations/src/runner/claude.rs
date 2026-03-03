@@ -112,6 +112,19 @@ struct CliUsage {
     cache_creation_input_tokens: Option<i64>,
 }
 
+/// Rate-limit info nested inside a `rate_limit_event`.
+#[derive(Debug, Deserialize)]
+struct RateLimitInfo {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default, rename = "resetsAt")]
+    resets_at: Option<serde_json::Value>,
+    #[serde(default, rename = "rateLimitType")]
+    rate_limit_type: Option<String>,
+    #[serde(default)]
+    utilization: Option<f64>,
+}
+
 /// Top-level NDJSON events emitted by `claude --output-format stream-json`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -139,6 +152,15 @@ enum StreamEvent {
         duration_api_ms: Option<i64>,
         #[serde(default)]
         usage: Option<CliUsage>,
+    },
+    /// Structured rate-limit signal from the Claude CLI.
+    #[serde(rename = "rate_limit_event")]
+    RateLimitEvent {
+        #[serde(default)]
+        rate_limit_info: Option<RateLimitInfo>,
+        /// Top-level resetsAt (alternative location).
+        #[serde(default, rename = "resetsAt")]
+        resets_at: Option<serde_json::Value>,
     },
     /// Forward-compat: ignore unknown event types.
     #[serde(other)]
@@ -394,23 +416,16 @@ The PR title should include the issue ID: {}
     }
 
     fn compose_failure_message(exit_code: i32, stdout_output: &str, stderr_output: &str) -> String {
-        use std::borrow::Cow;
-
         let stderr_trimmed = stderr_output.trim();
         let stdout_trimmed = stdout_output.trim();
-        let combined: Cow<'_, str> = if stderr_trimmed.is_empty() {
-            Cow::Borrowed(stdout_trimmed)
-        } else if stdout_trimmed.is_empty() {
-            Cow::Borrowed(stderr_trimmed)
-        } else {
-            Cow::Owned(format!("{}\n{}", stderr_trimmed, stdout_trimmed))
-        };
 
-        if Self::is_rate_limit_error(&combined) {
-            let msg = if combined.is_empty() {
+        // Only check stderr for rate limits — stdout (assistant text) can contain
+        // rate-limit strings from analyzed code and cause false positives.
+        if Self::is_rate_limit_error(stderr_trimmed) {
+            let msg = if stderr_trimmed.is_empty() {
                 "Too many requests"
             } else {
-                &combined
+                stderr_trimmed
             };
             return format!(
                 "Claude rate limit hit: {}",
@@ -825,68 +840,12 @@ The PR title should include the issue ID: {}
                 // Parse NDJSON stream events; accumulate decoded text.
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
-                    if !signaled_rate_limit && ClaudeAgentRunner::is_rate_limit_error(trimmed) {
-                        signaled_rate_limit = true;
-                        let msg = format!(
-                            "Claude rate limit hit: {}",
-                            ClaudeAgentRunner::truncate(trimmed, EXECUTION_LOG_PREVIEW_LIMIT)
-                        );
-                        let _ = stdout_early_failure_tx.send(msg.clone());
-                        ClaudeAgentRunner::append_execution_event(
-                            &stdout_event_writer,
-                            label_stdout.as_str(),
-                            "rate_limit_detected_live",
-                            json!({
-                                "source": "stdout_line",
-                                "line_number": line_number,
-                                "message": ClaudeAgentRunner::truncate(trimmed, 500),
-                            }),
-                        )
-                        .await;
-                        tracing::warn!(
-                            component = "claude",
-                            label = label_stdout.as_str(),
-                            line_number,
-                            "Detected Claude rate-limit output in stdout stream; requesting early termination"
-                        );
-                    }
-
                     match serde_json::from_str::<StreamEvent>(trimmed) {
                         Ok(StreamEvent::Assistant { message }) => {
                             if let Some(msg) = message {
                                 for block in &msg.content {
                                     match block {
                                         CliContentBlock::Text { ref text } => {
-                                            if !signaled_rate_limit
-                                                && ClaudeAgentRunner::is_rate_limit_error(text)
-                                            {
-                                                signaled_rate_limit = true;
-                                                let msg = format!(
-                                                    "Claude rate limit hit: {}",
-                                                    ClaudeAgentRunner::truncate(
-                                                        text,
-                                                        EXECUTION_LOG_PREVIEW_LIMIT
-                                                    )
-                                                );
-                                                let _ = stdout_early_failure_tx.send(msg);
-                                                ClaudeAgentRunner::append_execution_event(
-                                                    &stdout_event_writer,
-                                                    label_stdout.as_str(),
-                                                    "rate_limit_detected_live",
-                                                    json!({
-                                                        "source": "assistant_text",
-                                                        "line_number": line_number,
-                                                        "message": ClaudeAgentRunner::truncate(text, 500),
-                                                    }),
-                                                )
-                                                .await;
-                                                tracing::warn!(
-                                                    component = "claude",
-                                                    label = label_stdout.as_str(),
-                                                    line_number,
-                                                    "Detected Claude rate-limit banner in assistant text; requesting early termination"
-                                                );
-                                            }
                                             text_output.push_str(text);
                                             if let Some(file) = writer.as_mut() {
                                                 if !write_failed
@@ -947,6 +906,67 @@ The PR title should include the issue ID: {}
                                 result_output_tokens = u.output_tokens;
                                 result_cache_read_tokens = u.cache_read_input_tokens;
                                 result_cache_creation_tokens = u.cache_creation_input_tokens;
+                            }
+                        }
+                        Ok(StreamEvent::RateLimitEvent {
+                            rate_limit_info,
+                            resets_at: top_level_resets_at,
+                        }) => {
+                            // Structural rate-limit detection: Claude CLI emits
+                            // rate_limit_event with rate_limit_info.status.
+                            // "allowed" / "allowed_warning" are informational.
+                            // Anything else (e.g. "exceeded") is a real block.
+                            let status = rate_limit_info
+                                .as_ref()
+                                .and_then(|info| info.status.as_deref())
+                                .unwrap_or("");
+                            let is_informational =
+                                status == "allowed" || status == "allowed_warning";
+
+                            if !is_informational && !signaled_rate_limit {
+                                signaled_rate_limit = true;
+                                // Include the raw JSON so the watcher can extract
+                                // resetsAt for pause scheduling.
+                                let msg = format!(
+                                    "Claude rate limit hit: {}",
+                                    ClaudeAgentRunner::truncate(
+                                        trimmed,
+                                        EXECUTION_LOG_PREVIEW_LIMIT
+                                    )
+                                );
+                                let _ = stdout_early_failure_tx.send(msg);
+                                let utilization = rate_limit_info
+                                    .as_ref()
+                                    .and_then(|info| info.utilization);
+                                let rate_limit_type = rate_limit_info
+                                    .as_ref()
+                                    .and_then(|info| info.rate_limit_type.as_deref());
+                                let resets_at = rate_limit_info
+                                    .as_ref()
+                                    .and_then(|info| info.resets_at.as_ref())
+                                    .or(top_level_resets_at.as_ref());
+                                ClaudeAgentRunner::append_execution_event(
+                                    &stdout_event_writer,
+                                    label_stdout.as_str(),
+                                    "rate_limit_detected_live",
+                                    json!({
+                                        "source": "rate_limit_event",
+                                        "line_number": line_number,
+                                        "status": status,
+                                        "utilization": utilization,
+                                        "rate_limit_type": rate_limit_type,
+                                        "resets_at": resets_at,
+                                    }),
+                                )
+                                .await;
+                                tracing::warn!(
+                                    component = "claude",
+                                    label = label_stdout.as_str(),
+                                    line_number,
+                                    status,
+                                    ?utilization,
+                                    "Detected rate_limit_event with non-allowed status; requesting early termination"
+                                );
                             }
                         }
                         Ok(_) => { /* System, User, Unknown — ignored */ }
@@ -1486,11 +1506,13 @@ The PR title should include the issue ID: {}
                 &stderr_output,
             ))
         };
+        // Rate-limit detection: only trust structured signals and CLI-controlled
+        // output (stderr, failure message). Never scan text_output — it contains
+        // assistant text that may discuss rate limiting in analyzed code.
         let is_rate_limited = failure_msg
             .as_ref()
             .map(|msg| Self::is_rate_limit_error(msg))
             .unwrap_or(false)
-            || Self::is_rate_limit_error(&text_output)
             || Self::is_rate_limit_error(&stderr_output);
 
         // Complete and record the execution
@@ -2630,9 +2652,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_failure_message_rate_limit_in_stdout() {
+    fn test_compose_failure_message_rate_limit_in_stdout_not_detected() {
+        // Rate-limit strings in stdout (assistant text) are NOT detected by
+        // compose_failure_message — only stderr is trusted to avoid false
+        // positives from codebase content.
         let msg = ClaudeAgentRunner::compose_failure_message(1, "429 too many requests", "");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        assert!(msg.starts_with("Process exited with code 1"));
     }
 
     #[test]
@@ -3355,6 +3380,80 @@ mod tests {
         let json = r#"{"type":"user","message":{"role":"user","content":"hello"},"extra":true}"#;
         let event: StreamEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, StreamEvent::User {}));
+    }
+
+    #[test]
+    fn test_stream_event_rate_limit_event_allowed() {
+        let json = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","utilization":0.5}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::RateLimitEvent {
+                rate_limit_info, ..
+            } => {
+                let info = rate_limit_info.unwrap();
+                assert_eq!(info.status.as_deref(), Some("allowed"));
+                assert!((info.utilization.unwrap() - 0.5).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected RateLimitEvent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stream_event_rate_limit_event_allowed_warning_full() {
+        let json = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1772096400,"rateLimitType":"seven_day","utilization":0.81,"isUsingOverage":false,"surpassedThreshold":0.75},"uuid":"addd358a-c64f-48cd-b9a2-97af382e0fd6","session_id":"f450b721-71e2-4d8f-8a2d-07827df35f1d"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::RateLimitEvent {
+                rate_limit_info, ..
+            } => {
+                let info = rate_limit_info.unwrap();
+                assert_eq!(info.status.as_deref(), Some("allowed_warning"));
+                assert_eq!(info.rate_limit_type.as_deref(), Some("seven_day"));
+                assert!((info.utilization.unwrap() - 0.81).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected RateLimitEvent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stream_event_rate_limit_event_exceeded() {
+        let json = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"exceeded","resetsAt":"2026-02-23T06:00:00Z","rateLimitType":"seven_day","utilization":1.0}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::RateLimitEvent {
+                rate_limit_info, ..
+            } => {
+                let info = rate_limit_info.unwrap();
+                assert_eq!(info.status.as_deref(), Some("exceeded"));
+                // Not "allowed" or "allowed_warning" → should trigger rate limit
+                let is_informational = matches!(
+                    info.status.as_deref(),
+                    Some("allowed") | Some("allowed_warning")
+                );
+                assert!(!is_informational);
+            }
+            other => panic!("Expected RateLimitEvent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stream_event_rate_limit_event_with_top_level_resets_at() {
+        let json =
+            r#"{"type":"rate_limit_event","resetsAt":"2026-02-23T06:00:00Z"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::RateLimitEvent {
+                resets_at,
+                rate_limit_info,
+            } => {
+                assert!(rate_limit_info.is_none());
+                assert_eq!(
+                    resets_at.unwrap().as_str().unwrap(),
+                    "2026-02-23T06:00:00Z"
+                );
+            }
+            other => panic!("Expected RateLimitEvent, got {:?}", other),
+        }
     }
 
     #[test]
@@ -4122,9 +4221,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_failure_message_quota_exceeded_in_stdout() {
+    fn test_compose_failure_message_quota_exceeded_in_stdout_not_detected() {
+        // Rate-limit strings in stdout are not detected — only stderr is checked.
         let msg = ClaudeAgentRunner::compose_failure_message(1, "quota exceeded for project", "");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        assert!(msg.starts_with("Process exited with code 1"));
     }
 
     #[test]
@@ -4141,9 +4241,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_failure_message_very_long_rate_limit_truncated() {
+    fn test_compose_failure_message_very_long_rate_limit_in_stderr_truncated() {
         let long_rate_limit = format!("rate limit: {}", "x".repeat(5000));
-        let msg = ClaudeAgentRunner::compose_failure_message(1, &long_rate_limit, "");
+        let msg = ClaudeAgentRunner::compose_failure_message(1, "", &long_rate_limit);
         assert!(msg.starts_with("Claude rate limit hit:"));
         // The inner message should be truncated
         assert!(msg.len() <= EXECUTION_LOG_PREVIEW_LIMIT + 30);
@@ -4976,9 +5076,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_failure_message_rate_limit_429_in_stdout() {
+    fn test_compose_failure_message_rate_limit_429_in_stdout_not_detected() {
+        // Rate-limit strings in stdout are not detected — only stderr is checked.
         let msg = ClaudeAgentRunner::compose_failure_message(1, "Error 429 too many requests", "");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        assert!(msg.starts_with("Process exited with code 1"));
     }
 
     #[test]
@@ -6051,10 +6152,11 @@ more output"#;
     }
 
     #[test]
-    fn test_compose_failure_message_rate_limit_resource_exhausted_in_stdout() {
+    fn test_compose_failure_message_rate_limit_resource_exhausted_in_stdout_not_detected() {
+        // Rate-limit strings in stdout are not detected — only stderr is checked.
         let msg =
             ClaudeAgentRunner::compose_failure_message(1, "resource exhausted for billing", "");
-        assert!(msg.starts_with("Claude rate limit hit:"));
+        assert!(msg.starts_with("Process exited with code 1"));
     }
 
     #[test]
