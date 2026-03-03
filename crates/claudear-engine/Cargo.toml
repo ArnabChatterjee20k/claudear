@@ -1,0 +1,83 @@
+[package]
+name = "claudear-engine"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = []
+sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite", "claudear-analysis/sqlite", "claudear-integrations/sqlite"]
+
+[dependencies]
+claudear-core = { workspace = true }
+claudear-config = { workspace = true }
+claudear-storage = { workspace = true }
+claudear-analysis = { workspace = true }
+claudear-integrations = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP server & client
+axum = { workspace = true }
+reqwest = { workspace = true }
+tower-http = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error monitoring
+sentry = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Async utilities
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Crypto
+sha2 = { workspace = true }
+
+# Authentication
+bcrypt = { workspace = true }
+tower-cookies = { workspace = true }
+
+# Embedded dashboard
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Crypto
+hex = { workspace = true }
+rand = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# URL
+url = { workspace = true }
+
+# Regex
+regex-lite = { workspace = true }
+
+# HTTP middleware
+tower = { workspace = true }
+
+# CLI
+indicatif = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+http-body-util = { workspace = true }

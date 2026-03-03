@@ -909,7 +909,6 @@ mod tests {
         AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, IssuesConfig, LearningConfig,
         NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig, ScmConfig,
     };
-    use crate::feedback::Outcome;
     use crate::notifier::Notifier;
     use crate::processing::{
         enhance_prompt_with_learning, notify_failed_with_escalation, record_error_pattern,
@@ -917,6 +916,7 @@ mod tests {
     };
     use crate::reports::Report;
     use crate::storage::{AttemptTracker, SqliteTracker, WebhookStore};
+    use crate::types::Outcome;
     use crate::types::{Issue, MatchPriority, MatchResult};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};

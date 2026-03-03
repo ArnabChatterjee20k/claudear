@@ -25,44 +25,57 @@
 //! claudear webhook
 //! ```
 
-pub mod api;
-pub mod api_events;
-pub(crate) mod ask_reply_inbox;
-pub mod chat;
-pub mod config;
-pub mod discord;
-pub mod env_writer;
-pub mod error;
-pub mod evaluation;
-pub mod feedback;
-pub mod github;
-pub mod github_app;
-pub mod gitlab;
-pub mod housekeeping;
-pub mod http;
-pub mod inference;
-pub mod ipc;
-pub mod learning;
-pub mod notifier;
-pub mod prioritisation;
-pub mod processing;
-pub mod qa;
-pub mod regression;
-pub mod release;
+// Re-exported from claudear-core
+pub use claudear_core::error;
+pub use claudear_core::http;
+pub use claudear_core::secret;
+pub use claudear_core::templates;
+pub use claudear_core::types;
+
+// Re-exported from claudear-config
+pub use claudear_config::config;
+pub use claudear_config::env_writer;
+pub use claudear_config::users;
+
+// Re-exported from claudear-storage
+pub use claudear_storage as storage;
+
+// Re-exported from claudear-analysis
+pub use claudear_analysis::evaluation;
+pub use claudear_analysis::feedback;
+pub use claudear_analysis::inference;
+pub use claudear_analysis::learning;
+pub use claudear_analysis::prioritisation;
+pub use claudear_analysis::qa;
+pub use claudear_analysis::regression;
+pub use claudear_analysis::release;
+
+// Re-exported from claudear-integrations
+pub use claudear_integrations::ask_reply_inbox;
+pub use claudear_integrations::chat;
+pub use claudear_integrations::discord;
+pub use claudear_integrations::github;
+pub use claudear_integrations::github_app;
+pub use claudear_integrations::gitlab;
+pub use claudear_integrations::notifier;
+pub use claudear_integrations::reports;
+pub use claudear_integrations::runner;
+pub use claudear_integrations::scm;
+pub use claudear_integrations::source;
+pub use claudear_integrations::telemetry;
+pub use claudear_integrations::tls;
+// Re-exported from claudear-engine
+pub use claudear_engine::api;
+pub use claudear_engine::api_events;
+pub use claudear_engine::housekeeping;
+pub use claudear_engine::ipc;
+pub use claudear_engine::processing;
+pub use claudear_engine::repo_index;
+pub use claudear_engine::retry;
+pub use claudear_engine::watcher;
+
+// Local modules (thin wrappers)
 pub mod repo;
-pub mod reports;
-pub mod retry;
-pub mod runner;
-pub mod scm;
-pub mod secret;
-pub mod source;
-pub mod storage;
-pub mod telemetry;
-pub mod templates;
-pub mod tls;
-pub mod types;
-pub mod users;
-pub mod watcher;
 pub mod webhook;
 
 pub use chat::{ChatService, ChatState};
@@ -103,8 +116,9 @@ pub use ipc::{
     IpcResponse, IpcServer, WatcherState,
 };
 pub use repo::{
-    DependencyDiscovery, DependencyGraph, DependencyType, DiscoveredDependency, IndexedRepo,
-    RepoIndex, RepoRelationships, Repository,
+    build_repo_index, build_repo_index_from_github, build_repo_index_from_gitlab,
+    build_repo_index_with_fallback, index_repo_files, DependencyDiscovery, DependencyGraph,
+    DependencyType, DiscoveredDependency, IndexedRepo, RepoIndex, RepoRelationships, Repository,
 };
 pub use reports::{Report, ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler};
 pub use retry::{RetryDecision, RetryManager};

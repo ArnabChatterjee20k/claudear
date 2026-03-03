@@ -18,7 +18,7 @@ use claudear::{
         SentryRegressionConfig,
     },
     release::{ReleaseTracker, ReleaseTrackerConfig},
-    repo::{DependencyType, RepoIndex, RepoRelationships},
+    repo::{build_repo_index, DependencyType, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
     runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
@@ -1584,7 +1584,7 @@ async fn async_main() -> anyhow::Result<()> {
                     );
                 }
 
-                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                let index = build_repo_index(&config.known_orgs, &config.auto_discover_paths)?;
 
                 if index.is_empty() {
                     println!("\nNo repositories found from known orgs in the specified paths.");
@@ -1672,7 +1672,7 @@ async fn async_main() -> anyhow::Result<()> {
                     let files_with_types: Vec<(String, Option<String>)> = repo
                         .files
                         .iter()
-                        .map(|f| {
+                        .map(|f: &String| {
                             let file_type = std::path::Path::new(f)
                                 .extension()
                                 .map(|e| e.to_string_lossy().to_string());
@@ -1756,7 +1756,7 @@ async fn async_main() -> anyhow::Result<()> {
 
                 println!("\nSearching for '{}'...", query);
 
-                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                let index = build_repo_index(&config.known_orgs, &config.auto_discover_paths)?;
                 let matches = index.search_files(query);
 
                 if matches.is_empty() {
@@ -1954,8 +1954,8 @@ async fn async_main() -> anyhow::Result<()> {
 
             ReposCommands::Reindex { repo } => {
                 use claudear::feedback::{EmbeddingClient, EmbeddingConfig};
+                use claudear::repo::build_repo_index;
                 use claudear::repo::code_index::CodeIndexer;
-                use claudear::repo::RepoIndex;
 
                 if !config.code_index.enabled {
                     anyhow::bail!(
@@ -1976,7 +1976,7 @@ async fn async_main() -> anyhow::Result<()> {
                 .with_force_reindex(true);
 
                 // Collect repos to reindex
-                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                let index = build_repo_index(&config.known_orgs, &config.auto_discover_paths)?;
                 let repos: Vec<_> = index
                     .list()
                     .into_iter()
@@ -2018,7 +2018,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
 
             ReposCommands::Sync { skip_files } => {
-                use claudear::repo::RepoIndex;
+                use claudear::repo::build_repo_index;
 
                 println!("\nSyncing repository index to database...");
 
@@ -2027,7 +2027,7 @@ async fn async_main() -> anyhow::Result<()> {
                 }
 
                 // Build in-memory index
-                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                let index = build_repo_index(&config.known_orgs, &config.auto_discover_paths)?;
                 if index.is_empty() {
                     println!("No repositories found.");
                     return Ok(());
