@@ -8,7 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-Dwarnings"
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-Dwarnings -C linker=clang -C link-arg=-fuse-ld=mold"
   FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
   HF_HOME: /home/runner/.cache/fastembed
 
@@ -19,16 +20,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install system dependencies
+        run: sudo apt-get install -y mold
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
+      - name: Cache cargo bin
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-bin-tarpaulin
 
       - name: Install cargo-tarpaulin
-        run: cargo binstall --no-confirm cargo-tarpaulin
+        run: |
+          if ! command -v cargo-tarpaulin &> /dev/null; then
+            cargo install cargo-tarpaulin
+          fi
 
       - name: Restore cargo cache
         uses: actions/cache/restore@v5
@@ -45,7 +55,7 @@ jobs:
         run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
 
       - name: Compile all test targets via tarpaulin
-        run: cargo tarpaulin --workspace --all-features --no-run
+        run: cargo tarpaulin --workspace --all-features --skip-clean --no-run
 
       - name: Save compiled cache
         uses: actions/cache/save@v5
@@ -62,6 +72,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y mold
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -103,14 +116,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install system dependencies
+        run: sudo apt-get install -y mold
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
-
-      - name: Install cargo-tarpaulin
-        run: cargo binstall --no-confirm cargo-tarpaulin
+      - name: Restore cargo bin cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-bin-tarpaulin
 
       - name: Restore compiled cache
         uses: actions/cache/restore@v5
@@ -164,6 +180,8 @@ jobs:
   build:
     name: Build (macOS)
     runs-on: macos-latest
+    env:
+      RUSTFLAGS: "-Dwarnings"
     steps:
       - uses: actions/checkout@v6
 
