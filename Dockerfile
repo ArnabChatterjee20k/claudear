@@ -102,7 +102,9 @@ COPY crates ./crates
 COPY migrations ./migrations
 
 COPY --from=dashboard /app/dashboard/dist ./dashboard/dist
-RUN touch src/main.rs src/lib.rs && cargo build --release --bin claudear
+RUN touch src/main.rs src/lib.rs \
+    && for c in core config storage analysis integrations engine; do touch crates/claudear-$c/src/lib.rs; done \
+    && cargo build --release --bin claudear
 
 FROM debian:${DEBIAN_VERSION}-slim AS final
 ARG GIT_USER_NAME
