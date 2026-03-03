@@ -2710,6 +2710,10 @@ impl KnowledgeStore for SqliteTracker {
         SqliteTracker::get_repo_knowledge_by_key(self, repo, key)
     }
 
+    fn get_all_repo_aliases(&self) -> Result<Vec<(String, String)>> {
+        SqliteTracker::get_all_repo_aliases(self)
+    }
+
     fn upsert_review_pattern(&self, pattern: &crate::types::ReviewPattern) -> Result<i64> {
         SqliteTracker::upsert_review_pattern(self, pattern)
     }
@@ -6926,6 +6930,21 @@ impl SqliteTracker {
                     created_at: Self::parse_datetime(&row.get::<_, String>(7)?)?,
                     updated_at: Self::parse_datetime(&row.get::<_, String>(8)?)?,
                 })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Return all known repository renames as (former_name, current_name) pairs.
+    pub fn get_all_repo_aliases(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT knowledge_value, repo FROM repo_knowledge WHERE knowledge_key = 'former_name'",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .filter_map(|r| r.ok())
             .collect();

@@ -608,6 +608,14 @@ pub trait KnowledgeStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Return all known repository renames as (former_name, current_name) pairs.
+    ///
+    /// Reads `repo_knowledge` rows where `knowledge_key = "former_name"`.
+    /// The `repo` column holds the current name; `knowledge_value` is the old name.
+    fn get_all_repo_aliases(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     /// System 5: Upsert a review pattern.
     fn upsert_review_pattern(&self, _pattern: &crate::types::ReviewPattern) -> Result<i64> {
         Ok(0)

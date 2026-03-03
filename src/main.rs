@@ -688,8 +688,12 @@ async fn build_watcher_deps(
     let github_client = GitHubClient::new(config.github().clone());
 
     // Inferrer + embedding client
-    let (inferrer, embedding_client) =
-        Watcher::build_inferrer_with_embeddings(config, Some(&github_client)).await?;
+    let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
+        config,
+        Some(&github_client),
+        Some(tracker.as_ref()),
+    )
+    .await?;
     if inferrer.is_some() {
         tracing::info!("Repository inference enabled");
     }
@@ -2548,7 +2552,7 @@ async fn async_main() -> anyhow::Result<()> {
 
         // Build embedding client for code search
         let (_, embedding_client) =
-            claudear::watcher::Watcher::build_inferrer_with_embeddings(&config, None).await?;
+            claudear::watcher::Watcher::build_inferrer_with_embeddings(&config, None, None).await?;
 
         let embedding_client = embedding_client.ok_or_else(|| {
             anyhow::anyhow!("Embedding client required for chat. Ensure code_index is enabled.")
@@ -3251,8 +3255,12 @@ async fn async_main() -> anyhow::Result<()> {
         let github_client = GitHubClient::new(config.github().clone());
 
         // Build inferrer for retry processing (with embeddings for semantic matching)
-        let (inferrer, embedding_client) =
-            Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
+        let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
+            &config,
+            Some(&github_client),
+            Some(tracker.as_ref()),
+        )
+        .await?;
 
         // Create ReviewWatcher for PR review tracking
         let review_watcher = create_review_watcher(&config, tracker.clone());
@@ -3566,8 +3574,12 @@ async fn async_main() -> anyhow::Result<()> {
             let github_client = GitHubClient::new(config.github().clone());
 
             // Build inferrer for repo inference (with embeddings for semantic matching)
-            let (inferrer, embedding_client) =
-                Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
+            let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
+                &config,
+                Some(&github_client),
+                Some(tracker.as_ref()),
+            )
+            .await?;
 
             // Create ReviewWatcher for PR review tracking
             let review_watcher = create_review_watcher(&config, tracker.clone());

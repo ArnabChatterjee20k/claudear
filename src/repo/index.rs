@@ -100,6 +100,8 @@ pub struct RepoIndex {
     repos: HashMap<String, IndexedRepo>,
     /// File path to repository name mapping for fast lookups.
     file_index: HashMap<String, String>,
+    /// Known renames: old name -> current name.
+    aliases: HashMap<String, String>,
 }
 
 impl RepoIndex {
@@ -108,7 +110,15 @@ impl RepoIndex {
         Self {
             repos: HashMap::new(),
             file_index: HashMap::new(),
+            aliases: HashMap::new(),
         }
+    }
+
+    /// Register a known repository rename so vendor-path lookups can resolve
+    /// the old name to the current indexed repo.
+    pub fn add_alias(&mut self, former_name: &str, current_name: &str) {
+        self.aliases
+            .insert(former_name.to_string(), current_name.to_string());
     }
 
     /// Build an index by scanning auto_discover_paths for repos from known_orgs.
@@ -419,8 +429,17 @@ impl RepoIndex {
         let parts: Vec<&str> = after_vendor.split('/').collect();
         if parts.len() >= 2 {
             let repo_name = format!("{}/{}", parts[0], parts[1]);
+
+            // Direct lookup by current name
             if let Some(repo) = self.repos.get(&repo_name) {
                 return Some(repo);
+            }
+
+            // Fall back to aliases (handles renames, e.g. utopia-php/framework -> utopia-php/http)
+            if let Some(current_name) = self.aliases.get(&repo_name) {
+                if let Some(repo) = self.repos.get(current_name) {
+                    return Some(repo);
+                }
             }
         }
 
