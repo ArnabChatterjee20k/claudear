@@ -2509,12 +2509,9 @@ impl RepoIndex {
 
     /// Add a repository to the index.
     pub fn add_repo(&mut self, repo: IndexedRepo) {
+        // Index all files by full path for fast exact lookup
         for file in &repo.files {
             self.file_index.insert(file.clone(), repo.name.clone());
-            if let Some(filename) = std::path::Path::new(file).file_name() {
-                self.file_index
-                    .insert(filename.to_string_lossy().to_string(), repo.name.clone());
-            }
         }
         self.repos.insert(repo.name.clone(), repo);
     }
@@ -2533,13 +2530,6 @@ impl RepoIndex {
         }
         if let Some(repo) = self.find_by_vendor_path(filename) {
             return Some(repo);
-        }
-        let basename = std::path::Path::new(filename)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| filename.to_string());
-        if let Some(repo_name) = self.file_index.get(&basename) {
-            return self.repos.get(repo_name);
         }
         None
     }
