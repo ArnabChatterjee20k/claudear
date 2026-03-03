@@ -360,16 +360,9 @@ impl RepoIndex {
 
     /// Add a repository to the index.
     pub fn add_repo(&mut self, repo: IndexedRepo) {
-        // Index all files for fast lookup
+        // Index all files by full path for fast exact lookup
         for file in &repo.files {
-            // Index by full path
             self.file_index.insert(file.clone(), repo.name.clone());
-
-            // Index by filename only (for basename matching)
-            if let Some(filename) = Path::new(file).file_name() {
-                self.file_index
-                    .insert(filename.to_string_lossy().to_string(), repo.name.clone());
-            }
         }
 
         self.repos.insert(repo.name.clone(), repo);
@@ -408,16 +401,6 @@ impl RepoIndex {
         // Try vendor path extraction (e.g., /usr/src/code/vendor/utopia-php/database/src/... -> utopia-php/database)
         if let Some(repo) = self.find_by_vendor_path(filename) {
             return Some(repo);
-        }
-
-        // Try basename match (last resort - can match wrong repo if filename is common)
-        let basename = Path::new(filename)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| filename.to_string());
-
-        if let Some(repo_name) = self.file_index.get(&basename) {
-            return self.repos.get(repo_name);
         }
 
         None
