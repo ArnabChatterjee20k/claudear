@@ -179,6 +179,12 @@ max_reuse_candidates = 3
 # On timeout, continue with uncertainty note instead of hard-fail (default: true)
 best_effort_on_timeout = true
 
+# Require human approval before processing each issue (default: false)
+require_approval = false
+
+# Timeout for approval requests in seconds (falls back to wait_timeout_secs when unset)
+# approval_timeout_secs = 900
+
 # ============================================
 # SCM (Source Control Management)
 # ============================================
@@ -447,6 +453,17 @@ workspace = "mycompany"
 # Slack user ID (e.g., bot's own user ID for reply detection)
 user_id = ""
 
+# Slack signing secret for verifying Events API webhook requests
+# Set via SLACK_SIGNING_SECRET env var for security
+signing_secret = ""
+
+# Slack app ID used for apps.manifest.export/update auto-configuration
+app_id = ""
+
+# Slack app configuration token used for manifest API calls
+# Set via SLACK_APP_CONFIG_TOKEN env var for security
+app_config_token = ""
+
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
 
@@ -558,6 +575,17 @@ phone_number_id = ""
 
 # Meta Graph API access token
 access_token = ""
+
+# WhatsApp Business Account (WABA) ID for webhook subscription setup
+business_account_id = ""
+
+# Meta app secret for verifying webhook signatures
+# Set via WHATSAPP_APP_SECRET env var for security
+app_secret = ""
+
+# Verify token used for WhatsApp webhook callback challenge
+# Set via WHATSAPP_WEBHOOK_VERIFY_TOKEN env var for security
+webhook_verify_token = ""
 
 # Default recipient phone numbers
 to_numbers = []
@@ -766,6 +794,9 @@ max_file_size_kb = 1024
 # Embedding batch size (default: 32)
 batch_size = 32
 
+# How often (in hours) to pull and re-index all repositories (default: 6.0, 0 = disable)
+reindex_interval_hours = 6.0
+
 # ============================================
 # Self-Evaluation
 # ============================================
@@ -818,6 +849,57 @@ max_plan_monthly_cost = 0.0
 
 # Hourly engineer rate for cost-savings calculation (default: 150.0)
 hourly_engineer_rate = 150.0
+
+# ============================================
+# Local LLM
+# ============================================
+# Local inference model used for repo classification and code chat.
+
+[llm]
+# Enable the local LLM (default: false)
+enabled = false
+
+# Path to the GGUF model file
+model_path = "~/.cache/claudear/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+
+# Download URL for the model file (auto-downloaded on startup if missing)
+model_url = "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+
+# Context window length in tokens (default: 4096)
+context_length = 4096
+
+# Number of layers to offload to GPU (0 = CPU only, 99 = all; default: 99)
+gpu_layers = 99
+
+# Number of threads for inference (0 = auto-detect; default: 0)
+threads = 0
+
+# ============================================
+# Code Chat
+# ============================================
+# Local code chat feature (requires [llm] to also be enabled).
+
+[chat]
+# Enable the chat feature (default: false)
+enabled = false
+
+# Default generation temperature (default: 0.7)
+temperature = 0.7
+
+# Default top-p sampling (default: 0.9)
+top_p = 0.9
+
+# Maximum tokens to generate per response (default: 2048)
+max_tokens = 2048
+
+# Number of code chunks to retrieve per query (default: 10)
+max_context_chunks = 10
+
+# Maximum conversation history messages to include in context (default: 20)
+max_history_messages = 20
+
+# Session TTL in days, cleaned by housekeeping (default: 7)
+session_ttl_days = 7
 
 # ============================================
 # TLS Auto-Provisioning (Let's Encrypt)
