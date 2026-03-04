@@ -1365,6 +1365,7 @@ impl IssueProcessor {
                 repo_id: None,
                 scm_url: inferred.repo.scm_url,
                 default_branch: inferred.repo.default_branch,
+                confidence: Some(inferred.confidence),
             };
         }
 
@@ -2010,6 +2011,7 @@ mod tests {
             scm_url: "https://github.com/org/repo".to_string(),
             default_branch: "main".to_string(),
             repo_id: Some(42),
+            confidence: None,
         };
         assert_eq!(resolution.repo_name(), Some("org/repo"));
         assert_eq!(resolution.scm_url(), Some("https://github.com/org/repo"));
@@ -2408,6 +2410,7 @@ mod tests {
             scm_url: "https://github.com/user/repo".to_string(),
             default_branch: "develop".to_string(),
             repo_id: None,
+            confidence: None,
         };
         assert_eq!(
             resolution.project_dir(),

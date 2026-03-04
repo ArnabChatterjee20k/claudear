@@ -5,7 +5,9 @@ use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
 use chrono::{DateTime, Utc};
 use claudear_analysis::feedback::{FeedbackAnalyzer, IssueEmbeddingService, Outcome};
-use claudear_analysis::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
+use claudear_analysis::inference::{
+    resolve_repo_for_cascade, resolve_repo_for_issue, Confidence, RepoInferrer, RepoResolution,
+};
 use claudear_analysis::qa::build_correlation_id;
 use claudear_analysis::repo::{worktree_path, GitOps, RepoRelationships};
 use claudear_config::config::Config;
@@ -36,20 +38,45 @@ fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
 }
 
+/// Decision from parsing an approval reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalDecision {
+    /// User approved processing.
+    Approved,
+    /// User denied processing.
+    Denied,
+    /// User redirected to a different repo.
+    Redirect { repo_name: String },
+    /// Reply could not be parsed.
+    Unrecognized,
+}
+
 /// Parse a human reply to an approval request.
-///
-/// Returns `Some(true)` for affirmative, `Some(false)` for negative, `None` for unrecognized.
-fn parse_approval_reply(answer: &str) -> Option<bool> {
+fn parse_approval_reply(answer: &str) -> ApprovalDecision {
     let normalized = answer
         .trim()
         .trim_end_matches(|c: char| c.is_ascii_punctuation())
         .to_lowercase();
 
+    // Check redirect prefixes first
+    for prefix in &["use ", "redirect to ", "try "] {
+        if let Some(repo) = normalized.strip_prefix(prefix) {
+            let repo = repo.trim();
+            if !repo.is_empty() {
+                return ApprovalDecision::Redirect {
+                    repo_name: repo.to_string(),
+                };
+            }
+        }
+    }
+
     match normalized.as_str() {
         "yes" | "y" | "approve" | "ok" | "sure" | "go ahead" | "lgtm" | "yep" | "yeah"
-        | "proceed" => Some(true),
-        "no" | "n" | "skip" | "deny" | "reject" | "nope" | "nah" | "stop" | "pass" => Some(false),
-        _ => None,
+        | "proceed" => ApprovalDecision::Approved,
+        "no" | "n" | "skip" | "deny" | "reject" | "nope" | "nah" | "stop" | "pass" => {
+            ApprovalDecision::Denied
+        }
+        _ => ApprovalDecision::Unrecognized,
     }
 }
 
@@ -2938,13 +2965,6 @@ Create a PR with your changes.{custom_instructions}"#,
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
 
-            // Approval gate: if enabled, ask human before processing
-            if self.config.ask.require_approval
-                && !self.request_approval(source.name(), &issue).await
-            {
-                continue;
-            }
-
             // Process the issue
             let source_clone = Arc::clone(source);
             let this = self;
@@ -2973,21 +2993,54 @@ Create a PR with your changes.{custom_instructions}"#,
         self.processing.read().await.source_count(source_name)
     }
 
+    /// Check whether an approval request should be sent for the given resolution.
+    fn should_request_approval(&self, resolution: &RepoResolution) -> bool {
+        if self.config.ask.require_approval {
+            return true;
+        }
+        if let Some(ref threshold_str) = self.config.ask.approval_confidence_threshold {
+            if let Ok(threshold) = threshold_str.parse::<Confidence>() {
+                let confidence = resolution.confidence().unwrap_or(Confidence::None);
+                return confidence <= threshold;
+            }
+        }
+        false
+    }
+
     /// Request human approval before processing an issue.
     ///
-    /// Returns `true` if approved, `false` otherwise (denied, timeout, error, unrecognized).
-    async fn request_approval(&self, source_name: &str, issue: &Issue) -> bool {
+    /// Returns the parsed `ApprovalDecision`.
+    async fn request_approval(
+        &self,
+        source_name: &str,
+        issue: &Issue,
+        resolution: &RepoResolution,
+    ) -> ApprovalDecision {
+        // Build question text with repo + confidence context
+        let repo_info = match (resolution.repo_name(), resolution.confidence()) {
+            (Some(name), Some(conf)) => format!(" (inferred repo: {}, confidence: {})", name, conf),
+            (Some(name), None) => format!(" (repo: {})", name),
+            _ => String::new(),
+        };
+
         let ask_request = AskRequest {
             correlation_id: build_correlation_id(&issue.short_id),
             source: source_name.to_string(),
-            repo: None,
+            repo: resolution.repo_name().map(|s| s.to_string()),
             issue_id: issue.id.clone(),
             short_id: issue.short_id.clone(),
             question: BlockingQuestion {
-                question: format!("Should I work on {}: {}?", issue.short_id, issue.title),
+                question: format!(
+                    "Should I work on {}: {}?{}",
+                    issue.short_id, issue.title, repo_info
+                ),
                 why: Some("Approval required before processing".to_string()),
                 context: issue.description.clone(),
-                options: vec!["Yes".to_string(), "No".to_string()],
+                options: vec![
+                    "Yes".to_string(),
+                    "No".to_string(),
+                    "use <repo_name>".to_string(),
+                ],
             },
             asked_at: chrono::Utc::now(),
             target_discord_id: None,
@@ -3021,14 +3074,14 @@ Create a PR with your changes.{custom_instructions}"#,
         )
         .await;
 
-        let approved = match reply {
-            Ok(Some(ref r)) => parse_approval_reply(&r.answer).unwrap_or(false),
+        let decision = match reply {
+            Ok(Some(ref r)) => parse_approval_reply(&r.answer),
             Ok(None) => {
                 tracing::info!(
                     short_id = %issue.short_id,
                     "Approval timed out, skipping issue"
                 );
-                false
+                ApprovalDecision::Denied
             }
             Err(ref e) => {
                 tracing::warn!(
@@ -3036,21 +3089,25 @@ Create a PR with your changes.{custom_instructions}"#,
                     error = %e,
                     "Error requesting approval, skipping issue"
                 );
-                false
+                ApprovalDecision::Denied
             }
         };
 
-        let decision = if approved {
-            "approval_granted"
-        } else {
-            "approval_denied"
+        let decision_label = match &decision {
+            ApprovalDecision::Approved => "approval_granted",
+            ApprovalDecision::Redirect { .. } => "approval_redirect",
+            _ => "approval_denied",
         };
         self.record_issue_decision(
             issue,
-            decision,
+            decision_label,
             format!(
                 "Approval {} for {}",
-                if approved { "granted" } else { "denied" },
+                match &decision {
+                    ApprovalDecision::Approved => "granted",
+                    ApprovalDecision::Redirect { .. } => "redirected",
+                    _ => "denied",
+                },
                 issue.short_id
             ),
             json!({
@@ -3059,7 +3116,7 @@ Create a PR with your changes.{custom_instructions}"#,
             }),
         );
 
-        approved
+        decision
     }
 
     fn record_source_decision(
@@ -3176,7 +3233,7 @@ Create a PR with your changes.{custom_instructions}"#,
             .map(|a| a.id);
 
         // Infer the target repository using the shared resolution function
-        let resolution =
+        let mut resolution =
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
 
         // Log resolution decision (watcher-specific verbose logging)
@@ -3195,6 +3252,43 @@ Create a PR with your changes.{custom_instructions}"#,
                 );
             }
             RepoResolution::Skip { .. } => {}
+        }
+
+        // Confidence-aware approval gate
+        if self.should_request_approval(&resolution) {
+            match self
+                .request_approval(source.name(), &issue, &resolution)
+                .await
+            {
+                ApprovalDecision::Approved => { /* continue processing */ }
+                ApprovalDecision::Redirect { repo_name } => {
+                    let redirected = resolve_repo_for_cascade(self.inferrer.as_ref(), &repo_name);
+                    if redirected.is_resolved() {
+                        tracing::info!(
+                            short_id = %issue.short_id,
+                            repo = %repo_name,
+                            "Approval redirected to different repo"
+                        );
+                        resolution = redirected;
+                    } else {
+                        tracing::warn!(
+                            short_id = %issue.short_id,
+                            repo = %repo_name,
+                            "Redirect repo not found, skipping issue"
+                        );
+                        let mut processing = self.processing.write().await;
+                        processing.remove(&processing_key);
+                        self.active_processing.fetch_sub(1, Ordering::SeqCst);
+                        return false;
+                    }
+                }
+                ApprovalDecision::Denied | ApprovalDecision::Unrecognized => {
+                    let mut processing = self.processing.write().await;
+                    processing.remove(&processing_key);
+                    self.active_processing.fetch_sub(1, Ordering::SeqCst);
+                    return false;
+                }
+            }
         }
 
         // Save issue info before move for post-processing
@@ -11692,57 +11786,84 @@ mod tests {
 
     #[test]
     fn test_parse_approval_reply_multiple_punctuation() {
-        assert_eq!(parse_approval_reply("yes!!!"), Some(true));
-        assert_eq!(parse_approval_reply("no..."), Some(false));
-        assert_eq!(parse_approval_reply("approve!!"), Some(true));
-        assert_eq!(parse_approval_reply("reject??"), Some(false));
+        assert_eq!(parse_approval_reply("yes!!!"), ApprovalDecision::Approved);
+        assert_eq!(parse_approval_reply("no..."), ApprovalDecision::Denied);
+        assert_eq!(
+            parse_approval_reply("approve!!"),
+            ApprovalDecision::Approved
+        );
+        assert_eq!(parse_approval_reply("reject??"), ApprovalDecision::Denied);
     }
 
     #[test]
     fn test_parse_approval_reply_mixed_case_with_punctuation() {
-        assert_eq!(parse_approval_reply("Go Ahead!"), Some(true));
-        assert_eq!(parse_approval_reply("PROCEED."), Some(true));
-        assert_eq!(parse_approval_reply("NOPE!"), Some(false));
-        assert_eq!(parse_approval_reply("Pass."), Some(false));
+        assert_eq!(
+            parse_approval_reply("Go Ahead!"),
+            ApprovalDecision::Approved
+        );
+        assert_eq!(parse_approval_reply("PROCEED."), ApprovalDecision::Approved);
+        assert_eq!(parse_approval_reply("NOPE!"), ApprovalDecision::Denied);
+        assert_eq!(parse_approval_reply("Pass."), ApprovalDecision::Denied);
     }
 
     #[test]
     fn test_parse_approval_reply_only_whitespace() {
-        assert_eq!(parse_approval_reply("   "), None);
-        assert_eq!(parse_approval_reply("\t"), None);
-        assert_eq!(parse_approval_reply("\n"), None);
+        assert_eq!(parse_approval_reply("   "), ApprovalDecision::Unrecognized);
+        assert_eq!(parse_approval_reply("\t"), ApprovalDecision::Unrecognized);
+        assert_eq!(parse_approval_reply("\n"), ApprovalDecision::Unrecognized);
     }
 
     #[test]
     fn test_parse_approval_reply_only_punctuation() {
-        assert_eq!(parse_approval_reply("!!!"), None);
-        assert_eq!(parse_approval_reply("..."), None);
-        assert_eq!(parse_approval_reply("?"), None);
+        assert_eq!(parse_approval_reply("!!!"), ApprovalDecision::Unrecognized);
+        assert_eq!(parse_approval_reply("..."), ApprovalDecision::Unrecognized);
+        assert_eq!(parse_approval_reply("?"), ApprovalDecision::Unrecognized);
     }
 
     #[test]
     fn test_parse_approval_reply_partial_match_not_accepted() {
         // "yesss" is not "yes", "noo" is not "no"
-        assert_eq!(parse_approval_reply("yesss"), None);
-        assert_eq!(parse_approval_reply("noo"), None);
-        assert_eq!(parse_approval_reply("approved"), None);
-        assert_eq!(parse_approval_reply("rejected"), None);
-        assert_eq!(parse_approval_reply("skipping"), None);
-        assert_eq!(parse_approval_reply("okayy"), None);
+        assert_eq!(
+            parse_approval_reply("yesss"),
+            ApprovalDecision::Unrecognized
+        );
+        assert_eq!(parse_approval_reply("noo"), ApprovalDecision::Unrecognized);
+        assert_eq!(
+            parse_approval_reply("approved"),
+            ApprovalDecision::Unrecognized
+        );
+        assert_eq!(
+            parse_approval_reply("rejected"),
+            ApprovalDecision::Unrecognized
+        );
+        assert_eq!(
+            parse_approval_reply("skipping"),
+            ApprovalDecision::Unrecognized
+        );
+        assert_eq!(
+            parse_approval_reply("okayy"),
+            ApprovalDecision::Unrecognized
+        );
     }
 
     #[test]
     fn test_parse_approval_reply_with_newlines() {
         // Newline after the word — trim handles leading/trailing whitespace
-        assert_eq!(parse_approval_reply("yes\n"), Some(true));
-        assert_eq!(parse_approval_reply("\nno\n"), Some(false));
+        assert_eq!(parse_approval_reply("yes\n"), ApprovalDecision::Approved);
+        assert_eq!(parse_approval_reply("\nno\n"), ApprovalDecision::Denied);
     }
 
     #[test]
     fn test_parse_approval_reply_multiword_with_extra_spaces() {
-        assert_eq!(parse_approval_reply("  go ahead  "), Some(true));
+        assert_eq!(
+            parse_approval_reply("  go ahead  "),
+            ApprovalDecision::Approved
+        );
         // Extra internal spacing should NOT match
-        assert_eq!(parse_approval_reply("go  ahead"), None);
+        assert_eq!(
+            parse_approval_reply("go  ahead"),
+            ApprovalDecision::Unrecognized
+        );
     }
 
     #[test]
@@ -11752,8 +11873,8 @@ mod tests {
         ] {
             assert_eq!(
                 parse_approval_reply(word),
-                Some(true),
-                "Expected Some(true) for {:?}",
+                ApprovalDecision::Approved,
+                "Expected Approved for {:?}",
                 word
             );
         }
@@ -11766,8 +11887,8 @@ mod tests {
         ] {
             assert_eq!(
                 parse_approval_reply(word),
-                Some(false),
-                "Expected Some(false) for {:?}",
+                ApprovalDecision::Denied,
+                "Expected Denied for {:?}",
                 word
             );
         }
@@ -11775,27 +11896,210 @@ mod tests {
 
     #[test]
     fn test_parse_approval_reply_case_insensitive() {
-        assert_eq!(parse_approval_reply("YES"), Some(true));
-        assert_eq!(parse_approval_reply("Yes"), Some(true));
-        assert_eq!(parse_approval_reply("LGTM"), Some(true));
-        assert_eq!(parse_approval_reply("NO"), Some(false));
-        assert_eq!(parse_approval_reply("Skip"), Some(false));
+        assert_eq!(parse_approval_reply("YES"), ApprovalDecision::Approved);
+        assert_eq!(parse_approval_reply("Yes"), ApprovalDecision::Approved);
+        assert_eq!(parse_approval_reply("LGTM"), ApprovalDecision::Approved);
+        assert_eq!(parse_approval_reply("NO"), ApprovalDecision::Denied);
+        assert_eq!(parse_approval_reply("Skip"), ApprovalDecision::Denied);
     }
 
     #[test]
     fn test_parse_approval_reply_with_whitespace_and_punctuation() {
-        assert_eq!(parse_approval_reply("  yes  "), Some(true));
-        assert_eq!(parse_approval_reply("no!"), Some(false));
-        assert_eq!(parse_approval_reply("  approve. "), Some(true));
-        assert_eq!(parse_approval_reply("reject!"), Some(false));
+        assert_eq!(parse_approval_reply("  yes  "), ApprovalDecision::Approved);
+        assert_eq!(parse_approval_reply("no!"), ApprovalDecision::Denied);
+        assert_eq!(
+            parse_approval_reply("  approve. "),
+            ApprovalDecision::Approved
+        );
+        assert_eq!(parse_approval_reply("reject!"), ApprovalDecision::Denied);
     }
 
     #[test]
     fn test_parse_approval_reply_unrecognized() {
-        assert_eq!(parse_approval_reply("maybe"), None);
-        assert_eq!(parse_approval_reply(""), None);
-        assert_eq!(parse_approval_reply("I think so"), None);
-        assert_eq!(parse_approval_reply("not sure"), None);
+        assert_eq!(
+            parse_approval_reply("maybe"),
+            ApprovalDecision::Unrecognized
+        );
+        assert_eq!(parse_approval_reply(""), ApprovalDecision::Unrecognized);
+        assert_eq!(
+            parse_approval_reply("I think so"),
+            ApprovalDecision::Unrecognized
+        );
+        assert_eq!(
+            parse_approval_reply("not sure"),
+            ApprovalDecision::Unrecognized
+        );
+    }
+
+    // --- parse_approval_reply redirect variants ---
+
+    #[test]
+    fn test_parse_approval_reply_redirect_use() {
+        assert_eq!(
+            parse_approval_reply("use org/other-repo"),
+            ApprovalDecision::Redirect {
+                repo_name: "org/other-repo".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_approval_reply_redirect_try() {
+        assert_eq!(
+            parse_approval_reply("try org/other-repo"),
+            ApprovalDecision::Redirect {
+                repo_name: "org/other-repo".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_approval_reply_redirect_to() {
+        assert_eq!(
+            parse_approval_reply("redirect to org/other-repo"),
+            ApprovalDecision::Redirect {
+                repo_name: "org/other-repo".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_approval_reply_redirect_case_insensitive() {
+        assert_eq!(
+            parse_approval_reply("Use Org/Repo"),
+            ApprovalDecision::Redirect {
+                repo_name: "org/repo".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_approval_reply_redirect_empty_repo_is_unrecognized() {
+        // "use " with nothing after is unrecognized, not a redirect
+        assert_eq!(parse_approval_reply("use "), ApprovalDecision::Unrecognized);
+        assert_eq!(
+            parse_approval_reply("use  "),
+            ApprovalDecision::Unrecognized
+        );
+    }
+
+    #[test]
+    fn test_parse_approval_reply_bare_repo_is_unrecognized() {
+        // A bare repo name without a prefix should NOT be treated as redirect
+        assert_eq!(
+            parse_approval_reply("org/repo"),
+            ApprovalDecision::Unrecognized
+        );
+    }
+
+    // --- should_request_approval ---
+
+    #[test]
+    fn test_should_request_approval_require_approval_true() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier, tracker, true, None);
+        let resolution = RepoResolution::Resolved {
+            project_dir: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "org/repo".to_string(),
+            repo_id: None,
+            scm_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+            confidence: Some(Confidence::High),
+        };
+        assert!(watcher.should_request_approval(&resolution));
+    }
+
+    #[test]
+    fn test_should_request_approval_threshold_triggers() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut watcher = create_approval_watcher(notifier, tracker, false, None);
+        watcher.config.ask.approval_confidence_threshold = Some("low".to_string());
+
+        // Low confidence should trigger (Low <= Low)
+        let resolution = RepoResolution::Resolved {
+            project_dir: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "org/repo".to_string(),
+            repo_id: None,
+            scm_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+            confidence: Some(Confidence::Low),
+        };
+        assert!(watcher.should_request_approval(&resolution));
+    }
+
+    #[test]
+    fn test_should_request_approval_threshold_skips_high_confidence() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut watcher = create_approval_watcher(notifier, tracker, false, None);
+        watcher.config.ask.approval_confidence_threshold = Some("low".to_string());
+
+        // High confidence should NOT trigger (High > Low)
+        let resolution = RepoResolution::Resolved {
+            project_dir: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "org/repo".to_string(),
+            repo_id: None,
+            scm_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+            confidence: Some(Confidence::High),
+        };
+        assert!(!watcher.should_request_approval(&resolution));
+    }
+
+    #[test]
+    fn test_should_request_approval_no_threshold_no_require() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier, tracker, false, None);
+        let resolution = RepoResolution::Resolved {
+            project_dir: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "org/repo".to_string(),
+            repo_id: None,
+            scm_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+            confidence: Some(Confidence::High),
+        };
+        assert!(!watcher.should_request_approval(&resolution));
+    }
+
+    #[test]
+    fn test_should_request_approval_none_confidence_below_threshold() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut watcher = create_approval_watcher(notifier, tracker, false, None);
+        watcher.config.ask.approval_confidence_threshold = Some("low".to_string());
+
+        // None confidence (direct lookup) should trigger (None <= Low)
+        let resolution = RepoResolution::Resolved {
+            project_dir: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "org/repo".to_string(),
+            repo_id: None,
+            scm_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+            confidence: None,
+        };
+        assert!(watcher.should_request_approval(&resolution));
+    }
+
+    // --- Confidence ordering and FromStr ---
+
+    #[test]
+    fn test_confidence_ordering() {
+        assert!(Confidence::None < Confidence::Low);
+        assert!(Confidence::Low < Confidence::Medium);
+        assert!(Confidence::Medium < Confidence::High);
+    }
+
+    #[test]
+    fn test_confidence_from_str() {
+        assert_eq!("high".parse::<Confidence>(), Ok(Confidence::High));
+        assert_eq!("medium".parse::<Confidence>(), Ok(Confidence::Medium));
+        assert_eq!("low".parse::<Confidence>(), Ok(Confidence::Low));
+        assert_eq!("none".parse::<Confidence>(), Ok(Confidence::None));
+        assert_eq!("HIGH".parse::<Confidence>(), Ok(Confidence::High));
+        assert!("invalid".parse::<Confidence>().is_err());
     }
 
     // --- request_approval integration tests ---
@@ -11928,6 +12232,17 @@ mod tests {
         })
     }
 
+    fn test_resolution() -> RepoResolution {
+        RepoResolution::Resolved {
+            project_dir: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "org/repo".to_string(),
+            repo_id: None,
+            scm_url: "https://github.com/org/repo".to_string(),
+            default_branch: "main".to_string(),
+            confidence: Some(Confidence::Medium),
+        }
+    }
+
     #[tokio::test]
     async fn test_request_approval_yes_reply() {
         let notifier = Arc::new(ApprovalMockNotifier::with_reply("yes"));
@@ -11935,9 +12250,10 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
 
         let issue = test_issue();
-        let approved = watcher.request_approval("test", &issue).await;
+        let resolution = test_resolution();
+        let decision = watcher.request_approval("test", &issue, &resolution).await;
 
-        assert!(approved);
+        assert_eq!(decision, ApprovalDecision::Approved);
         assert_eq!(notifier.ask_count(), 1);
 
         // Verify activity was logged
@@ -11959,9 +12275,10 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
 
         let issue = test_issue();
-        let approved = watcher.request_approval("test", &issue).await;
+        let resolution = test_resolution();
+        let decision = watcher.request_approval("test", &issue, &resolution).await;
 
-        assert!(!approved);
+        assert_eq!(decision, ApprovalDecision::Denied);
         assert_eq!(notifier.ask_count(), 1);
 
         let activities = tracker.get_recent_activities(10, None).unwrap();
@@ -11982,7 +12299,11 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
 
         let issue = test_issue();
-        assert!(watcher.request_approval("test", &issue).await);
+        let resolution = test_resolution();
+        assert_eq!(
+            watcher.request_approval("test", &issue, &resolution).await,
+            ApprovalDecision::Approved
+        );
     }
 
     #[tokio::test]
@@ -11992,7 +12313,11 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
 
         let issue = test_issue();
-        assert!(!watcher.request_approval("test", &issue).await);
+        let resolution = test_resolution();
+        assert_eq!(
+            watcher.request_approval("test", &issue, &resolution).await,
+            ApprovalDecision::Denied
+        );
     }
 
     #[tokio::test]
@@ -12002,9 +12327,14 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
 
         let issue = test_issue();
-        let approved = watcher.request_approval("test", &issue).await;
+        let resolution = test_resolution();
+        let decision = watcher.request_approval("test", &issue, &resolution).await;
 
-        assert!(!approved, "Unrecognized reply should be treated as denied");
+        assert_eq!(
+            decision,
+            ApprovalDecision::Unrecognized,
+            "Unrecognized reply should return Unrecognized"
+        );
     }
 
     #[tokio::test]
@@ -12015,9 +12345,14 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, Some(1));
 
         let issue = test_issue();
-        let approved = watcher.request_approval("test", &issue).await;
+        let resolution = test_resolution();
+        let decision = watcher.request_approval("test", &issue, &resolution).await;
 
-        assert!(!approved, "Timeout should be treated as denied");
+        assert_eq!(
+            decision,
+            ApprovalDecision::Denied,
+            "Timeout should be treated as denied"
+        );
     }
 
     #[tokio::test]
@@ -12027,8 +12362,12 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, Some(60));
 
         let issue = test_issue();
+        let resolution = test_resolution();
         // Should still approve since mock replies immediately
-        assert!(watcher.request_approval("test", &issue).await);
+        assert_eq!(
+            watcher.request_approval("test", &issue, &resolution).await,
+            ApprovalDecision::Approved
+        );
     }
 
     #[tokio::test]
@@ -12038,7 +12377,8 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
 
         let issue = test_issue();
-        watcher.request_approval("test", &issue).await;
+        let resolution = test_resolution();
+        watcher.request_approval("test", &issue, &resolution).await;
 
         let activities = tracker.get_recent_activities(10, None).unwrap();
         assert!(
@@ -12056,7 +12396,11 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
 
         let issue = test_issue();
-        assert!(watcher.request_approval("test", &issue).await);
+        let resolution = test_resolution();
+        assert_eq!(
+            watcher.request_approval("test", &issue, &resolution).await,
+            ApprovalDecision::Approved
+        );
     }
 
     #[tokio::test]
@@ -12066,6 +12410,27 @@ mod tests {
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
 
         let issue = test_issue();
-        assert!(!watcher.request_approval("test", &issue).await);
+        let resolution = test_resolution();
+        assert_eq!(
+            watcher.request_approval("test", &issue, &resolution).await,
+            ApprovalDecision::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_redirect_variant() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("use org/other-repo"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
+
+        let issue = test_issue();
+        let resolution = test_resolution();
+        let decision = watcher.request_approval("test", &issue, &resolution).await;
+        assert_eq!(
+            decision,
+            ApprovalDecision::Redirect {
+                repo_name: "org/other-repo".to_string()
+            }
+        );
     }
 }

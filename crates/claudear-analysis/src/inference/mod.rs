@@ -63,6 +63,8 @@ pub enum RepoResolution {
         scm_url: String,
         /// Default branch name.
         default_branch: String,
+        /// Inference confidence level (None for direct lookups).
+        confidence: Option<Confidence>,
     },
     /// Could not resolve - processing should be skipped.
     Skip {
@@ -116,6 +118,14 @@ impl RepoResolution {
             RepoResolution::Skip { .. } => None,
         }
     }
+
+    /// Returns the inference confidence level if resolved.
+    pub fn confidence(&self) -> Option<Confidence> {
+        match self {
+            RepoResolution::Resolved { confidence, .. } => *confidence,
+            RepoResolution::Skip { .. } => None,
+        }
+    }
 }
 
 /// Resolve the target repository for an issue.
@@ -144,6 +154,7 @@ pub fn resolve_repo_for_cascade(
             repo_id: None,
             scm_url: repo.scm_url,
             default_branch: repo.default_branch,
+            confidence: None,
         },
         Ok(None) => RepoResolution::Skip {
             reason: format!("Repository '{}' not found in index", repo_name),
@@ -226,6 +237,7 @@ pub fn resolve_repo_for_issue_with_embedding(
                         repo_id,
                         scm_url: inferred.repo.scm_url.clone(),
                         default_branch: inferred.repo.default_branch.clone(),
+                        confidence: Some(inferred.confidence),
                     }
                 }
                 None => {
@@ -356,16 +368,20 @@ fn record_inference_attempt(
 }
 
 /// Confidence level for repository inference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Variants are ordered from lowest to highest so that derived
+/// `PartialOrd`/`Ord` give the natural comparison:
+/// `None < Low < Medium < High`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Confidence {
-    /// Direct file path match.
-    High,
-    /// Fuzzy/partial match.
-    Medium,
-    /// Content similarity only.
-    Low,
     /// No match found.
     None,
+    /// Content similarity only.
+    Low,
+    /// Fuzzy/partial match.
+    Medium,
+    /// Direct file path match.
+    High,
 }
 
 impl std::fmt::Display for Confidence {
@@ -375,6 +391,20 @@ impl std::fmt::Display for Confidence {
             Confidence::Medium => write!(f, "medium"),
             Confidence::Low => write!(f, "low"),
             Confidence::None => write!(f, "none"),
+        }
+    }
+}
+
+impl std::str::FromStr for Confidence {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "high" => Ok(Confidence::High),
+            "medium" => Ok(Confidence::Medium),
+            "low" => Ok(Confidence::Low),
+            "none" => Ok(Confidence::None),
+            other => Err(format!("unknown confidence level: {}", other)),
         }
     }
 }
@@ -1873,6 +1903,7 @@ mod tests {
             repo_id: Some(42),
             scm_url: "https://github.com/org/repo".to_string(),
             default_branch: "main".to_string(),
+            confidence: None,
         };
         assert!(res.is_resolved());
         assert_eq!(res.project_dir(), Some(&PathBuf::from("/path/repo")));
@@ -1903,6 +1934,7 @@ mod tests {
             repo_id: Some(99),
             scm_url: "https://github.com/org/repo".to_string(),
             default_branch: "main".to_string(),
+            confidence: None,
         };
         assert_eq!(res.repo_id(), Some(99));
     }
@@ -1915,6 +1947,7 @@ mod tests {
             repo_id: None,
             scm_url: "https://github.com/org/repo".to_string(),
             default_branch: "main".to_string(),
+            confidence: None,
         };
         assert_eq!(res.repo_id(), None);
         // is_resolved should still be true even without a repo_id
@@ -2447,6 +2480,7 @@ mod tests {
             repo_id: None,
             scm_url: "https://github.com/org/repo".to_string(),
             default_branch: "main".to_string(),
+            confidence: None,
         };
         assert!(res.is_resolved());
         assert_eq!(res.repo_name(), Some("org/repo"));
@@ -2467,6 +2501,7 @@ mod tests {
                 repo_id,
                 scm_url,
                 default_branch,
+                ..
             } => {
                 assert_eq!(project_dir, PathBuf::from("/path/console"));
                 assert_eq!(repo_name, "appwrite/console");
@@ -3562,6 +3597,7 @@ mod tests {
             repo_id: Some(123),
             scm_url: "https://github.com/my-org/my-repo".to_string(),
             default_branch: "develop".to_string(),
+            confidence: Some(Confidence::High),
         };
 
         assert!(res.is_resolved());

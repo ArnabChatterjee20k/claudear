@@ -3699,8 +3699,7 @@ async fn async_main() -> anyhow::Result<()> {
 
             // Eagerly load LLM engine — download model if not present on disk
             let llm_engine = if config.llm.enabled {
-                let model_path =
-                    claudear::chat::service::expand_tilde(&config.llm.model_path);
+                let model_path = claudear::chat::service::expand_tilde(&config.llm.model_path);
                 let model_ready = if model_path.exists() && model_path.is_file() {
                     true
                 } else if !config.llm.model_url.is_empty() {
@@ -3709,9 +3708,8 @@ async fn async_main() -> anyhow::Result<()> {
                         target = %model_path.display(),
                         "LLM model not found, downloading..."
                     );
-                    let progress = Arc::new(
-                        claudear::chat::models::download::DownloadProgress::new(),
-                    );
+                    let progress =
+                        Arc::new(claudear::chat::models::download::DownloadProgress::new());
                     match claudear::chat::models::download::download_gguf(
                         &config.llm.model_url,
                         &model_path,

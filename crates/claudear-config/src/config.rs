@@ -439,7 +439,7 @@ impl Default for LlmModelConfig {
             enabled: false,
             model_path: PathBuf::from("~/.cache/claudear/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"),
             model_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf".to_string(),
-            context_length: 4096,
+            context_length: 16384,
             gpu_layers: 99,
             threads: 0,
         }
@@ -577,6 +577,13 @@ pub struct AskConfig {
     /// Timeout for approval requests (falls back to wait_timeout_secs when None).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_timeout_secs: Option<u64>,
+    /// Confidence threshold for triggering approval requests.
+    ///
+    /// When set, approval is requested when repo inference confidence is at or
+    /// below this level. Valid values: "high", "medium", "low", "none".
+    /// Only applies when `require_approval` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_confidence_threshold: Option<String>,
 }
 
 impl Default for AskConfig {
@@ -592,6 +599,7 @@ impl Default for AskConfig {
             best_effort_on_timeout: true,
             require_approval: false,
             approval_timeout_secs: None,
+            approval_confidence_threshold: None,
         }
     }
 }

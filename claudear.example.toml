@@ -185,6 +185,12 @@ require_approval = false
 # Timeout for approval requests in seconds (falls back to wait_timeout_secs when unset)
 # approval_timeout_secs = 900
 
+# Confidence threshold for triggering approval (optional).
+# When set, approval is requested when repo inference confidence
+# is at or below this level. Valid: "high", "medium", "low", "none".
+# Replies can be "yes", "no", or "use <repo_name>" to redirect.
+# approval_confidence_threshold = "low"
+
 # ============================================
 # SCM (Source Control Management)
 # ============================================
@@ -865,8 +871,8 @@ model_path = "~/.cache/claudear/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
 # Download URL for the model file (auto-downloaded on startup if missing)
 model_url = "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
 
-# Context window length in tokens (default: 4096)
-context_length = 4096
+# Context window length in tokens (default: 16384)
+context_length = 16384
 
 # Number of layers to offload to GPU (0 = CPU only, 99 = all; default: 99)
 gpu_layers = 99
