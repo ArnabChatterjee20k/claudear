@@ -652,15 +652,21 @@ mod tests {
     fn create_chat_router_constructs_successfully() {
         use claudear_analysis::feedback::EmbeddingClient;
         use claudear_analysis::repo::code_index::CodeSearchService;
-        use claudear_config::config::ChatConfig;
+        use claudear_config::config::{ChatConfig, LlmModelConfig};
         use claudear_storage::SqliteTracker;
 
         let tracker: Arc<dyn claudear_storage::FixAttemptTracker> =
             Arc::new(SqliteTracker::in_memory().unwrap());
         let config = ChatConfig::default();
+        let llm_config = LlmModelConfig::default();
         let emb_client = Arc::new(EmbeddingClient::new(Default::default()).unwrap());
         let search = CodeSearchService::new(tracker.clone(), emb_client);
-        let chat_service = Arc::new(ChatService::new(config, search, tracker.clone()));
+        let chat_service = Arc::new(ChatService::new(
+            config,
+            llm_config,
+            search,
+            tracker.clone(),
+        ));
 
         let state = ChatState {
             chat_service,

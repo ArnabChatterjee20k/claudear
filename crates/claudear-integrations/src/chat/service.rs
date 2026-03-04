@@ -5,7 +5,7 @@ use super::models::download::DownloadProgress;
 use super::prompt;
 use super::types::*;
 use claudear_analysis::repo::code_index::{format_code_search_context, CodeSearchService};
-use claudear_config::config::ChatConfig;
+use claudear_config::config::{ChatConfig, LlmModelConfig};
 use claudear_core::error::{Error, Result};
 use claudear_storage::FixAttemptTracker;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 /// and local LLM inference (llama-cpp-2) into a streaming chat pipeline.
 pub struct ChatService {
     config: ChatConfig,
+    llm_config: LlmModelConfig,
     search: CodeSearchService,
     tracker: Arc<dyn FixAttemptTracker>,
     llm: Mutex<Option<Arc<LlmEngine>>>,
@@ -28,14 +29,34 @@ impl ChatService {
     /// Create a new chat service.
     pub fn new(
         config: ChatConfig,
+        llm_config: LlmModelConfig,
         search: CodeSearchService,
         tracker: Arc<dyn FixAttemptTracker>,
     ) -> Self {
         Self {
             config,
+            llm_config,
             search,
             tracker,
             llm: Mutex::new(None),
+            download_progress: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Create a new chat service with a pre-loaded LLM engine.
+    pub fn with_engine(
+        config: ChatConfig,
+        llm_config: LlmModelConfig,
+        search: CodeSearchService,
+        tracker: Arc<dyn FixAttemptTracker>,
+        engine: Arc<LlmEngine>,
+    ) -> Self {
+        Self {
+            config,
+            llm_config,
+            search,
+            tracker,
+            llm: Mutex::new(Some(engine)),
             download_progress: Arc::new(Mutex::new(None)),
         }
     }
@@ -50,14 +71,14 @@ impl ChatService {
             return Ok(engine.clone());
         }
 
-        let model_path = expand_tilde(&self.config.model_path);
+        let model_path = expand_tilde(&self.llm_config.model_path);
         llm::validate_model_path(&model_path)?;
 
         let llm_config = llm::LlmConfig {
             model_path,
-            context_length: self.config.context_length,
-            gpu_layers: self.config.gpu_layers,
-            threads: self.config.threads,
+            context_length: self.llm_config.context_length,
+            gpu_layers: self.llm_config.gpu_layers,
+            threads: self.llm_config.threads,
         };
 
         let engine = Arc::new(LlmEngine::load(&llm_config)?);
@@ -213,7 +234,7 @@ impl ChatService {
 
     /// Check if the model is configured and the file exists.
     pub fn is_model_available(&self) -> bool {
-        let path = expand_tilde(&self.config.model_path);
+        let path = expand_tilde(&self.llm_config.model_path);
         path.exists() && path.is_file()
     }
 
@@ -224,7 +245,7 @@ impl ChatService {
 
     /// Get the model name from the file path.
     pub fn model_name(&self) -> String {
-        self.config
+        self.llm_config
             .model_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -234,17 +255,17 @@ impl ChatService {
 
     /// Get the configured context length.
     pub fn context_length(&self) -> u32 {
-        self.config.context_length
+        self.llm_config.context_length
     }
 
     /// Get the configured model URL.
     pub fn model_url(&self) -> &str {
-        &self.config.model_url
+        &self.llm_config.model_url
     }
 
     /// Get the expanded model path.
     pub fn model_path_expanded(&self) -> PathBuf {
-        expand_tilde(&self.config.model_path)
+        expand_tilde(&self.llm_config.model_path)
     }
 
     /// Start downloading a GGUF model file.

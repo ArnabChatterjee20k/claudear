@@ -377,6 +377,9 @@ pub struct Config {
     /// Dashboard display configuration.
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// Local LLM configuration (model path, download URL, hardware settings).
+    #[serde(default)]
+    pub llm: LlmModelConfig,
     /// Local code chat configuration.
     #[serde(default)]
     pub chat: ChatConfig,
@@ -409,20 +412,46 @@ impl Default for DashboardConfig {
     }
 }
 
-/// Local code chat configuration.
+/// Local LLM configuration.
+///
+/// Controls the local inference model used for repo classification and code chat.
+/// Configured under the `[llm]` TOML section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ChatConfig {
-    /// Enable the chat feature.
+pub struct LlmModelConfig {
+    /// Enable the local LLM (for repo classification and chat).
     pub enabled: bool,
     /// Path to the GGUF model file.
     pub model_path: PathBuf,
+    /// Download URL for the model file (used for auto-download on startup).
+    pub model_url: String,
     /// Context window length (tokens).
     pub context_length: u32,
     /// Number of layers to offload to GPU (0 = CPU only, 99 = all).
     pub gpu_layers: u32,
-    /// Inference threads (0 = auto-detect).
+    /// Number of threads for inference (0 = auto-detect).
     pub threads: u32,
+}
+
+impl Default for LlmModelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: PathBuf::from("~/.cache/claudear/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"),
+            model_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf".to_string(),
+            context_length: 4096,
+            gpu_layers: 99,
+            threads: 0,
+        }
+    }
+}
+
+/// Local code chat configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// Enable the chat feature (requires [llm] to also be enabled).
+    pub enabled: bool,
     /// Default generation temperature.
     pub temperature: f32,
     /// Default top-p sampling.
@@ -435,25 +464,18 @@ pub struct ChatConfig {
     pub max_history_messages: usize,
     /// Session TTL in days (cleaned by housekeeping).
     pub session_ttl_days: u32,
-    /// Default URL for downloading a GGUF model file.
-    pub model_url: String,
 }
 
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            model_path: PathBuf::from("~/.cache/claudear/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"),
-            context_length: 4096,
-            gpu_layers: 99,
-            threads: 0,
             temperature: 0.7,
             top_p: 0.9,
             max_tokens: 2048,
             max_context_chunks: 10,
             max_history_messages: 20,
             session_ttl_days: 7,
-            model_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf".to_string(),
         }
     }
 }
@@ -523,6 +545,7 @@ impl Default for Config {
             evaluation: EvaluationConfig::default(),
             storage_dir: default_storage_dir(),
             dashboard: DashboardConfig::default(),
+            llm: LlmModelConfig::default(),
             chat: ChatConfig::default(),
             tls: TlsConfig::default(),
         }
