@@ -8,8 +8,8 @@ use claudear_integrations::chat::llm::{GenerationParams, LlmEngine};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Maximum total prompt size in characters (~3000 tokens at ~4 chars/token).
-const MAX_PROMPT_CHARS: usize = 12000;
+/// Maximum total prompt size in characters (~16000 tokens at ~3 chars/token).
+const MAX_PROMPT_CHARS: usize = 48000;
 
 /// LLM-based repository classifier.
 pub struct LlmRepoClassifier {

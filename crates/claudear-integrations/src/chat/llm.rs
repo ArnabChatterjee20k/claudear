@@ -23,7 +23,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             model_path: PathBuf::new(),
-            context_length: 4096,
+            context_length: 16384,
             gpu_layers: 99,
             threads: 0,
         }
@@ -111,6 +111,7 @@ impl LlmEngine {
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(self.context_length))
+            .with_n_batch(self.context_length)
             .with_n_threads(threads as i32)
             .with_n_threads_batch(threads as i32);
 
@@ -232,6 +233,7 @@ impl LlmEngine {
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(self.context_length))
+            .with_n_batch(self.context_length)
             .with_n_threads(threads as i32)
             .with_n_threads_batch(threads as i32);
 
@@ -363,7 +365,7 @@ mod tests {
     #[test]
     fn test_llm_config_default() {
         let config = LlmConfig::default();
-        assert_eq!(config.context_length, 4096);
+        assert_eq!(config.context_length, 16384);
         assert_eq!(config.gpu_layers, 99);
         assert_eq!(config.threads, 0);
     }
