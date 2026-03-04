@@ -10,6 +10,7 @@ pub mod github;
 pub mod github_app;
 pub mod gitlab;
 pub mod notifier;
+pub mod port_forward;
 pub mod reports;
 pub mod runner;
 pub mod scm;
