@@ -520,11 +520,8 @@ impl RepoInferrer {
 
         tracing::info!("Found {} new repositories to embed", new_repos.len());
 
-        // Generate embeddings for new repos
-        let texts: Vec<String> = new_repos
-            .iter()
-            .map(|r| r.name.replace(['/', '-'], " "))
-            .collect();
+        // Generate embeddings for new repos using rich descriptions
+        let texts: Vec<String> = new_repos.iter().map(|r| build_repo_description(r)).collect();
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
         let vectors = embedding_client.embed_batch(&text_refs).await?;
@@ -981,7 +978,7 @@ impl RepoInferrer {
         // Embedding signal
         if let Some(embedding) = query_embedding {
             if self.has_embeddings() {
-                const MIN_SIMILARITY: f32 = 0.5;
+                const MIN_SIMILARITY: f32 = 0.6;
                 if let Some((repo_name, similarity)) =
                     self.find_by_embedding(embedding, MIN_SIMILARITY)
                 {
@@ -1163,9 +1160,185 @@ impl RepoInferrer {
     }
 }
 
+/// Build a rich text description of a repository for embedding.
+///
+/// Combines multiple signals to produce a ~100-300 word description:
+/// 1. Humanized repo name
+/// 2. First paragraph of README.md (if on disk)
+/// 3. Package description from composer.json / package.json / Cargo.toml
+/// 4. Top-level directory names (from indexed files)
+/// 5. Language distribution summary (file extension counts)
+fn build_repo_description(repo: &IndexedRepo) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // 1. Humanized repo name
+    parts.push(repo.name.replace(['/', '-'], " "));
+
+    // 2. README.md first paragraph
+    let readme_path = repo.path.join("README.md");
+    if let Ok(content) = std::fs::read_to_string(&readme_path) {
+        let first_para = extract_readme_first_paragraph(&content);
+        if !first_para.is_empty() {
+            let truncated = truncate_to_chars(&first_para, 200);
+            parts.push(truncated);
+        }
+    }
+
+    // 3. Package description from manifest files
+    if let Some(desc) = read_package_description(&repo.path) {
+        parts.push(desc);
+    }
+
+    // 4. Top-level directory names from indexed files
+    let top_dirs = extract_top_level_dirs(&repo.files);
+    if !top_dirs.is_empty() {
+        parts.push(format!("directories: {}", top_dirs.join(" ")));
+    }
+
+    // 5. Language distribution summary
+    let lang_summary = build_language_summary(&repo.files);
+    if !lang_summary.is_empty() {
+        parts.push(format!("languages: {}", lang_summary));
+    }
+
+    parts.join(". ")
+}
+
+/// Extract the first non-empty, non-heading paragraph from README content.
+fn extract_readme_first_paragraph(content: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut in_paragraph = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Skip empty lines before a paragraph
+        if trimmed.is_empty() {
+            if in_paragraph {
+                break; // End of first paragraph
+            }
+            continue;
+        }
+
+        // Skip markdown headings, badges, HTML tags
+        if trimmed.starts_with('#')
+            || trimmed.starts_with('[')
+            || trimmed.starts_with('<')
+            || trimmed.starts_with('!')
+            || trimmed.starts_with("---")
+            || trimmed.starts_with("===")
+        {
+            if in_paragraph {
+                break;
+            }
+            continue;
+        }
+
+        in_paragraph = true;
+        lines.push(trimmed);
+    }
+
+    lines.join(" ")
+}
+
+/// Read package description from common manifest files.
+fn read_package_description(repo_path: &std::path::Path) -> Option<String> {
+    // Try composer.json
+    if let Ok(content) = std::fs::read_to_string(repo_path.join("composer.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(desc) = json.get("description").and_then(|v| v.as_str()) {
+                if !desc.is_empty() {
+                    return Some(desc.to_string());
+                }
+            }
+        }
+    }
+
+    // Try package.json
+    if let Ok(content) = std::fs::read_to_string(repo_path.join("package.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(desc) = json.get("description").and_then(|v| v.as_str()) {
+                if !desc.is_empty() {
+                    return Some(desc.to_string());
+                }
+            }
+        }
+    }
+
+    // Try Cargo.toml (simple extraction without full TOML parser)
+    if let Ok(content) = std::fs::read_to_string(repo_path.join("Cargo.toml")) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("description") {
+                let rest = rest.trim().strip_prefix('=').unwrap_or(rest).trim();
+                let desc = rest.trim_matches('"').trim_matches('\'');
+                if !desc.is_empty() {
+                    return Some(desc.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract unique top-level directory names from file paths.
+fn extract_top_level_dirs(files: &[String]) -> Vec<String> {
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for file in files {
+        if let Some(first_segment) = file.split('/').next() {
+            // Only include directories (files with no slash are top-level files)
+            if file.contains('/') && !first_segment.starts_with('.') {
+                dirs.insert(first_segment.to_string());
+            }
+        }
+    }
+    dirs.into_iter().collect()
+}
+
+/// Build a language distribution summary from file extensions.
+fn build_language_summary(files: &[String]) -> String {
+    let mut ext_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for file in files {
+        if let Some(ext) = file.rsplit('.').next() {
+            if ext != file {
+                // Has an actual extension
+                *ext_counts.entry(ext).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if ext_counts.is_empty() {
+        return String::new();
+    }
+
+    // Sort by count descending, take top 5
+    let mut counts: Vec<(&&str, &usize)> = ext_counts.iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(a.1));
+
+    counts
+        .iter()
+        .take(5)
+        .map(|(ext, count)| format!("{} {}", count, ext))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Truncate a string to approximately `max_chars` characters at a word boundary.
+fn truncate_to_chars(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    // Find last space before max_chars
+    match s[..max_chars].rfind(' ') {
+        Some(pos) => s[..pos].to_string(),
+        None => s[..max_chars].to_string(),
+    }
+}
+
 /// Build repository embeddings for semantic inference.
 ///
-/// Creates embeddings for each repository name to enable semantic matching.
+/// Creates embeddings for each repository using rich descriptions.
 pub async fn build_repo_embeddings(
     index: &RepoIndex,
     embedding_client: &crate::feedback::EmbeddingClient,
@@ -1173,15 +1346,8 @@ pub async fn build_repo_embeddings(
     let repos = index.list();
     let mut embeddings = Vec::with_capacity(repos.len());
 
-    // Create descriptive text for each repo
-    let texts: Vec<String> = repos
-        .iter()
-        .map(|r| {
-            // Use repo name as the main identifier
-            // Could be enhanced with README content, file list summary, etc.
-            r.name.replace(['/', '-'], " ")
-        })
-        .collect();
+    // Create rich descriptive text for each repo
+    let texts: Vec<String> = repos.iter().map(|r| build_repo_description(r)).collect();
 
     let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
@@ -1806,8 +1972,8 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(result.unwrap().confidence, Confidence::Low);
 
-        // Low similarity (cos ~0.507) -> score ~7.6 -> Low confidence
-        let low_emb = vec![0.5, 0.85, 0.0];
+        // Low similarity (cos ~0.625) -> score ~9.4 -> Low confidence
+        let low_emb = vec![0.625, 0.78, 0.0];
         let result = inferrer.infer_with_embedding(&issue, Some(&low_emb));
         assert!(result.is_some());
         assert_eq!(result.unwrap().confidence, Confidence::Low);
@@ -1822,7 +1988,7 @@ mod tests {
         }];
         let inferrer = RepoInferrer::with_embeddings(index, embeddings);
 
-        // Very orthogonal query -> below 0.5 threshold
+        // Very orthogonal query -> below 0.6 threshold
         let issue = create_test_issue("linear", "test", "");
         let orthogonal = vec![0.0, 1.0, 0.0]; // cos sim = 0.0
         let result = inferrer.infer_with_embedding(&issue, Some(&orthogonal));
@@ -2531,11 +2697,11 @@ mod tests {
 
         let issue = create_test_issue("linear", "test", "");
 
-        // Embedding that produces exactly 0.5 similarity
-        // cos_sim([1,0,0], [0.5,0.866,0]) = 0.5
-        let emb = vec![0.5, 0.866_025_4, 0.0];
+        // Embedding that produces exactly 0.6 similarity
+        // cos_sim([1,0,0], [0.6, 0.8, 0]) = 0.6
+        let emb = vec![0.6, 0.8, 0.0];
         let result = inferrer.infer_with_embedding(&issue, Some(&emb));
-        // 0.5 is exactly the threshold (>= 0.5), so should match
+        // 0.6 is exactly the threshold (>= 0.6), so should match
         assert!(result.is_some());
         assert_eq!(result.unwrap().confidence, Confidence::Low);
     }
@@ -2551,9 +2717,9 @@ mod tests {
 
         let issue = create_test_issue("linear", "test", "");
 
-        // Embedding that produces similarity just below 0.5
-        // cos_sim([1,0,0], [0.4, 0.9165, 0]) ~ 0.4
-        let emb = vec![0.4, 0.916_515, 0.0];
+        // Embedding that produces similarity just below 0.6
+        // cos_sim([1,0,0], [0.5, 0.866, 0]) = 0.5
+        let emb = vec![0.5, 0.866_025_4, 0.0];
         let result = inferrer.infer_with_embedding(&issue, Some(&emb));
         assert!(result.is_none());
     }
@@ -3406,5 +3572,112 @@ mod tests {
         assert_eq!(THRESHOLD_HIGH, 35.0);
         assert_eq!(THRESHOLD_MEDIUM, 15.0);
         assert_eq!(THRESHOLD_LOW, 5.0);
+    }
+
+    // --- build_repo_description tests ---
+
+    #[test]
+    fn test_build_repo_description_basic() {
+        let repo = IndexedRepo::new("appwrite/console", "/nonexistent/path");
+        let desc = build_repo_description(&repo);
+        assert!(desc.contains("appwrite console"));
+    }
+
+    #[test]
+    fn test_build_repo_description_with_files() {
+        let mut repo = IndexedRepo::new("org/backend", "/nonexistent/path");
+        repo.files = vec![
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "tests/integration.rs".to_string(),
+            "docs/README.md".to_string(),
+        ];
+        let desc = build_repo_description(&repo);
+        assert!(desc.contains("org backend"));
+        assert!(desc.contains("directories:"));
+        assert!(desc.contains("src"));
+        assert!(desc.contains("tests"));
+        assert!(desc.contains("docs"));
+        assert!(desc.contains("languages:"));
+        assert!(desc.contains("rs"));
+    }
+
+    #[test]
+    fn test_extract_top_level_dirs() {
+        let files = vec![
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "tests/test.rs".to_string(),
+            "README.md".to_string(), // top-level file, no dir
+        ];
+        let dirs = extract_top_level_dirs(&files);
+        assert!(dirs.contains(&"src".to_string()));
+        assert!(dirs.contains(&"tests".to_string()));
+        assert!(!dirs.contains(&"README.md".to_string()));
+    }
+
+    #[test]
+    fn test_extract_top_level_dirs_skips_hidden() {
+        let files = vec![
+            ".github/workflows/ci.yml".to_string(),
+            "src/main.rs".to_string(),
+        ];
+        let dirs = extract_top_level_dirs(&files);
+        assert!(dirs.contains(&"src".to_string()));
+        assert!(!dirs.contains(&".github".to_string()));
+    }
+
+    #[test]
+    fn test_build_language_summary() {
+        let files = vec![
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "src/utils.rs".to_string(),
+            "package.json".to_string(),
+            "README.md".to_string(),
+        ];
+        let summary = build_language_summary(&files);
+        assert!(summary.contains("3 rs"));
+        assert!(summary.contains("1 json"));
+        assert!(summary.contains("1 md"));
+    }
+
+    #[test]
+    fn test_build_language_summary_empty() {
+        let files: Vec<String> = vec![];
+        let summary = build_language_summary(&files);
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn test_extract_readme_first_paragraph() {
+        let readme = "# My Project\n\n![badge](url)\n\nThis is a great project that does things.\nIt has many features.\n\n## Installation\n";
+        let para = extract_readme_first_paragraph(readme);
+        assert_eq!(
+            para,
+            "This is a great project that does things. It has many features."
+        );
+    }
+
+    #[test]
+    fn test_extract_readme_first_paragraph_no_content() {
+        let readme = "# Title\n\n## Section\n";
+        let para = extract_readme_first_paragraph(readme);
+        assert!(para.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_to_chars() {
+        assert_eq!(truncate_to_chars("short", 100), "short");
+        // "hello world foo bar" truncated to 15 -> "hello world foo" is 15 chars,
+        // rfind(' ') at pos 11 -> "hello world"
+        assert_eq!(truncate_to_chars("hello world foo bar", 15), "hello world");
+        assert_eq!(truncate_to_chars("hello world foo bar", 19), "hello world foo bar");
+    }
+
+    #[test]
+    fn test_read_package_description_none_for_missing() {
+        let desc = read_package_description(std::path::Path::new("/nonexistent/path"));
+        assert!(desc.is_none());
     }
 }

@@ -33,6 +33,11 @@ static VENDOR_NODE_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
 static VENDOR_GO_RE: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"(?:vendor/)?github\.com/([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)/").ok());
 
+/// Regex to match PHP fully-qualified class names (e.g., `Appwrite\Utopia\Request::getHeader()`)
+static PHP_FQCN_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"\b([A-Z][a-zA-Z0-9]*(?:\\[A-Z][a-zA-Z0-9]*)*)(?:::(\w+))?\b").ok()
+});
+
 static CLASS_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r"\b([A-Z][a-zA-Z0-9]+(?:Controller|Service|Handler|Manager|Repository|Factory|Provider|Module|Component|Middleware))\b").ok()
 });
@@ -445,6 +450,39 @@ fn extract_from_text(context: &mut IssueContext, text: &str) {
                     && !repo.starts_with("app/")
                 {
                     context.repos.push(repo.to_string());
+                }
+            }
+        }
+    }
+
+    // Extract PHP fully-qualified class names (e.g., Appwrite\Utopia\Request::getHeader())
+    if let Some(re) = PHP_FQCN_RE.as_ref() {
+        for cap in re.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                let fqcn = m.as_str();
+                let segments: Vec<&str> = fqcn.split('\\').collect();
+                // Need at least 2 segments to be a namespace (e.g., Utopia\Request)
+                if segments.len() >= 2 {
+                    // Add ClassName.php (last segment)
+                    if let Some(class_name) = segments.last() {
+                        context
+                            .filenames
+                            .push(format!("{}.php", class_name));
+                    }
+
+                    // Add partial namespace path as filename
+                    // e.g., Utopia\Http\Request -> Http/Request.php
+                    if segments.len() >= 3 {
+                        let path_segments = &segments[1..]; // skip top-level namespace
+                        context
+                            .filenames
+                            .push(format!("{}.php", path_segments.join("/")));
+                    }
+
+                    // Convert first namespace segment to lowercase for repo matching
+                    // e.g., Utopia -> "utopia" as keyword for repo search
+                    let first_lower = segments[0].to_lowercase();
+                    context.keywords.push(format!("repo:{}", first_lower));
                 }
             }
         }
@@ -2403,5 +2441,142 @@ mod tests {
         assert_eq!(original.keywords, cloned.keywords);
         assert_eq!(original.repos, cloned.repos);
         assert_eq!(original.raw_text, cloned.raw_text);
+    }
+
+    // --- PHP FQCN extraction tests ---
+
+    #[test]
+    fn test_php_fqcn_extracts_class_filename() {
+        let mut context = IssueContext::new();
+        extract_from_text(
+            &mut context,
+            r"Appwrite\Utopia\Request::getHeader() is broken",
+        );
+
+        assert!(
+            context.filenames.iter().any(|f| f == "Request.php"),
+            "Should extract ClassName.php from FQCN, got: {:?}",
+            context.filenames
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_extracts_partial_namespace_path() {
+        let mut context = IssueContext::new();
+        extract_from_text(
+            &mut context,
+            r"Appwrite\Utopia\Request::getHeader() is broken",
+        );
+
+        assert!(
+            context.filenames.iter().any(|f| f == "Utopia/Request.php"),
+            "Should extract partial namespace path, got: {:?}",
+            context.filenames
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_adds_repo_keyword() {
+        let mut context = IssueContext::new();
+        extract_from_text(
+            &mut context,
+            r"Appwrite\Utopia\Request::getHeader() is broken",
+        );
+
+        assert!(
+            context.keywords.iter().any(|k| k == "repo:appwrite"),
+            "Should add repo:lowercase keyword for first namespace segment, got: {:?}",
+            context.keywords
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_deep_namespace() {
+        let mut context = IssueContext::new();
+        extract_from_text(
+            &mut context,
+            r"Utopia\Http\Adapter\Swoole\Request is causing issues",
+        );
+
+        assert!(
+            context.filenames.iter().any(|f| f == "Request.php"),
+            "Should extract class name from deep namespace"
+        );
+        assert!(
+            context
+                .filenames
+                .iter()
+                .any(|f| f == "Http/Adapter/Swoole/Request.php"),
+            "Should extract partial namespace path from deep namespace, got: {:?}",
+            context.filenames
+        );
+        assert!(
+            context.keywords.iter().any(|k| k == "repo:utopia"),
+            "Should add repo keyword for first segment"
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_without_method() {
+        let mut context = IssueContext::new();
+        extract_from_text(&mut context, r"Fix Utopia\Database\Document handling");
+
+        assert!(
+            context.filenames.iter().any(|f| f == "Document.php"),
+            "Should extract class name without method call"
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_single_segment_not_matched() {
+        let mut context = IssueContext::new();
+        extract_from_text(&mut context, "The Request class is broken");
+
+        // Single segment (no backslash) should NOT produce FQCN filenames
+        assert!(
+            !context.filenames.iter().any(|f| f == "Request.php"),
+            "Single segment should not be treated as FQCN"
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_in_sentry_issue_title() {
+        let issue = create_test_issue(
+            "sentry",
+            r"Appwrite\Utopia\Request::getHeader() error",
+            "",
+        );
+
+        let context = IssueContext::from_sentry(&issue);
+
+        assert!(
+            context.filenames.iter().any(|f| f == "Request.php"),
+            "FQCN in Sentry title should produce filename, got: {:?}",
+            context.filenames
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_in_linear_issue() {
+        let issue = create_test_issue(
+            "linear",
+            r"Bug: Utopia\Database\Adapter\MariaDB fails",
+            "",
+        );
+
+        let context = IssueContext::from_linear(&issue);
+
+        assert!(
+            context.filenames.iter().any(|f| f == "MariaDB.php"),
+            "FQCN in Linear title should produce filename"
+        );
+        assert!(
+            context
+                .filenames
+                .iter()
+                .any(|f| f == "Database/Adapter/MariaDB.php"),
+            "Should produce partial namespace path, got: {:?}",
+            context.filenames
+        );
     }
 }
