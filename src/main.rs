@@ -3697,6 +3697,72 @@ async fn async_main() -> anyhow::Result<()> {
                     tracker.clone(),
                 )));
 
+            // Eagerly load LLM engine — download model if not present on disk
+            let llm_engine = if config.llm.enabled {
+                let model_path =
+                    claudear::chat::service::expand_tilde(&config.llm.model_path);
+                let model_ready = if model_path.exists() && model_path.is_file() {
+                    true
+                } else if !config.llm.model_url.is_empty() {
+                    tracing::info!(
+                        url = %config.llm.model_url,
+                        target = %model_path.display(),
+                        "LLM model not found, downloading..."
+                    );
+                    let progress = Arc::new(
+                        claudear::chat::models::download::DownloadProgress::new(),
+                    );
+                    match claudear::chat::models::download::download_gguf(
+                        &config.llm.model_url,
+                        &model_path,
+                        progress.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                size_mb = progress
+                                    .total_bytes
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    / 1_048_576,
+                                "LLM model downloaded successfully"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to download LLM model, classification disabled");
+                            false
+                        }
+                    }
+                } else {
+                    tracing::debug!("LLM model not found and no download URL configured");
+                    false
+                };
+
+                if model_ready {
+                    let llm_config = claudear::chat::llm::LlmConfig {
+                        model_path,
+                        context_length: config.llm.context_length,
+                        gpu_layers: config.llm.gpu_layers,
+                        threads: config.llm.threads,
+                    };
+                    match claudear::chat::llm::LlmEngine::load(&llm_config) {
+                        Ok(engine) => {
+                            tracing::info!("LLM engine loaded for classification + chat");
+                            Some(Arc::new(engine))
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to load LLM engine");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let tracker_for_api = tracker.clone();
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
@@ -3718,7 +3784,7 @@ async fn async_main() -> anyhow::Result<()> {
                 user_registry: user_registry.clone(),
                 agent,
                 dry_run,
-                llm_engine: None,
+                llm_engine,
             }));
 
             // Handle shutdown signals
