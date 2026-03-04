@@ -465,9 +465,7 @@ fn extract_from_text(context: &mut IssueContext, text: &str) {
                 if segments.len() >= 2 {
                     // Add ClassName.php (last segment)
                     if let Some(class_name) = segments.last() {
-                        context
-                            .filenames
-                            .push(format!("{}.php", class_name));
+                        context.filenames.push(format!("{}.php", class_name));
                     }
 
                     // Add partial namespace path as filename
@@ -2541,11 +2539,7 @@ mod tests {
 
     #[test]
     fn test_php_fqcn_in_sentry_issue_title() {
-        let issue = create_test_issue(
-            "sentry",
-            r"Appwrite\Utopia\Request::getHeader() error",
-            "",
-        );
+        let issue = create_test_issue("sentry", r"Appwrite\Utopia\Request::getHeader() error", "");
 
         let context = IssueContext::from_sentry(&issue);
 
@@ -2558,11 +2552,7 @@ mod tests {
 
     #[test]
     fn test_php_fqcn_in_linear_issue() {
-        let issue = create_test_issue(
-            "linear",
-            r"Bug: Utopia\Database\Adapter\MariaDB fails",
-            "",
-        );
+        let issue = create_test_issue("linear", r"Bug: Utopia\Database\Adapter\MariaDB fails", "");
 
         let context = IssueContext::from_linear(&issue);
 
