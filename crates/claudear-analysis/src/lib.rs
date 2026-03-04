@@ -8,6 +8,7 @@ pub mod evaluation;
 pub mod feedback;
 pub mod inference;
 pub mod learning;
+pub mod llm;
 pub mod prioritisation;
 pub mod qa;
 pub mod regression;

@@ -103,6 +103,26 @@ impl LogExtractor {
         learnings
     }
 
+    /// Extract learnings with LLM if available, falling back to heuristics.
+    pub fn extract_with_llm(
+        log_path: &Path,
+        llm: Option<&dyn crate::llm::LlmAnalyzer>,
+    ) -> claudear_core::error::Result<ExtractedLearnings> {
+        let content = std::fs::read_to_string(log_path).map_err(|e| {
+            claudear_core::error::Error::Other(format!(
+                "Failed to read log file '{}': {}",
+                log_path.display(),
+                e
+            ))
+        })?;
+        if let Some(analyzer) = llm {
+            if let Some(analysis) = analyzer.extract_learnings(&content) {
+                return Ok(analysis.learnings);
+            }
+        }
+        Ok(Self::extract_from_text(&content))
+    }
+
     /// Create a compact summary string for storage.
     pub fn summarize(learnings: &ExtractedLearnings) -> String {
         let mut parts = Vec::new();

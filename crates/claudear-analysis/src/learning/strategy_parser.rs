@@ -106,6 +106,30 @@ impl StrategyParser {
         }
     }
 
+    /// Parse strategy with LLM if available, falling back to heuristics.
+    pub fn parse_with_llm(
+        log_path: &Path,
+        attempt_id: i64,
+        llm: Option<&dyn crate::llm::LlmAnalyzer>,
+    ) -> claudear_core::error::Result<StrategyFingerprint> {
+        let content = std::fs::read_to_string(log_path).map_err(|e| {
+            claudear_core::error::Error::Other(format!(
+                "Failed to read log file '{}': {}",
+                log_path.display(),
+                e
+            ))
+        })?;
+        if let Some(analyzer) = llm {
+            if let Some(analysis) = analyzer.extract_learnings(&content) {
+                let mut fp = Self::parse_from_text(&content, attempt_id);
+                fp.fix_approach = analysis.fix_approach;
+                fp.strategy_summary = analysis.strategy_summary;
+                return Ok(fp);
+            }
+        }
+        Ok(Self::parse_from_text(&content, attempt_id))
+    }
+
     /// Format strategy suggestions for prompt injection.
     pub fn format_strategy_suggestions(strategies: &[StrategyFingerprint]) -> String {
         if strategies.is_empty() {

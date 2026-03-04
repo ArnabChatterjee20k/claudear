@@ -674,6 +674,7 @@ struct WatcherDeps {
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<claudear::repo::code_index::CodeSearchService>>,
     agent: Arc<dyn AgentRunner>,
+    llm_engine: Option<Arc<claudear::chat::llm::LlmEngine>>,
 }
 
 /// Build the common watcher dependencies shared between `Commands::Start` and
@@ -790,6 +791,69 @@ async fn build_watcher_deps(
         tracker.clone(),
     )));
 
+    // Eagerly load LLM engine — download model if not present on disk
+    let llm_engine = if config.llm.enabled {
+        let model_path = claudear::chat::service::expand_tilde(&config.llm.model_path);
+        let model_ready = if model_path.exists() && model_path.is_file() {
+            true
+        } else if !config.llm.model_url.is_empty() {
+            tracing::info!(
+                url = %config.llm.model_url,
+                target = %model_path.display(),
+                "LLM model not found, downloading..."
+            );
+            let progress = Arc::new(claudear::chat::models::download::DownloadProgress::new());
+            match claudear::chat::models::download::download_gguf(
+                &config.llm.model_url,
+                &model_path,
+                progress.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        size_mb = progress
+                            .total_bytes
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            / 1_048_576,
+                        "LLM model downloaded successfully"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to download LLM model, classification disabled");
+                    false
+                }
+            }
+        } else {
+            tracing::debug!("LLM model not found and no download URL configured");
+            false
+        };
+
+        if model_ready {
+            let llm_config = claudear::chat::llm::LlmConfig {
+                model_path,
+                context_length: config.llm.context_length,
+                gpu_layers: config.llm.gpu_layers,
+                threads: config.llm.threads,
+            };
+            match claudear::chat::llm::LlmEngine::load(&llm_config) {
+                Ok(engine) => {
+                    tracing::info!("LLM engine loaded for classification + chat");
+                    Some(Arc::new(engine))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to load LLM engine");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(WatcherDeps {
         sources,
         scm_provider,
@@ -801,6 +865,7 @@ async fn build_watcher_deps(
         issue_embedding_service,
         code_search_service,
         agent,
+        llm_engine,
     })
 }
 
@@ -2473,19 +2538,20 @@ async fn async_main() -> anyhow::Result<()> {
         let db_tracker = Arc::new(SqliteTracker::new(&config.db_path)?);
 
         // Apply model override if provided
-        let mut chat_config = config.chat.clone();
+        let chat_config = config.chat.clone();
+        let mut llm_config = config.llm.clone();
         if let Some(model_path) = model {
-            chat_config.model_path = model_path.clone();
+            llm_config.model_path = model_path.clone();
         }
 
         // Download model if requested and not present
         if download_model {
-            let target = claudear::chat::service::expand_tilde(&chat_config.model_path);
+            let target = claudear::chat::service::expand_tilde(&llm_config.model_path);
             if !target.exists() {
                 use std::sync::Arc as StdArc;
                 let progress = StdArc::new(claudear::chat::models::DownloadProgress::new());
                 let progress_clone = progress.clone();
-                let url = chat_config.model_url.clone();
+                let url = llm_config.model_url.clone();
                 let target_clone = target.clone();
 
                 println!("Downloading model to {}...", target.display());
@@ -2563,8 +2629,12 @@ async fn async_main() -> anyhow::Result<()> {
             embedding_client,
         );
 
-        let chat_service =
-            claudear::chat::ChatService::new(chat_config, code_search, db_tracker.clone());
+        let chat_service = claudear::chat::ChatService::new(
+            chat_config,
+            llm_config,
+            code_search,
+            db_tracker.clone(),
+        );
 
         // Resolve repo_id if repo name given
         let repo_id = if let Some(repo_name) = repo {
@@ -2797,6 +2867,7 @@ async fn async_main() -> anyhow::Result<()> {
             user_registry: user_registry.clone(),
             agent: deps.agent.clone(),
             dry_run: false,
+            llm_engine: deps.llm_engine.clone(),
         }));
 
         // Create IPC server
@@ -3321,6 +3392,7 @@ async fn async_main() -> anyhow::Result<()> {
             user_registry: user_registry.clone(),
             agent,
             dry_run: false,
+            llm_engine: None,
         });
 
         for attempt in ready {
@@ -3503,6 +3575,7 @@ async fn async_main() -> anyhow::Result<()> {
                 user_registry: user_registry.clone(),
                 agent: deps.agent.clone(),
                 dry_run: false,
+                llm_engine: deps.llm_engine.clone(),
             }));
 
             let worker = HousekeepingWorker::new(watcher.clone(), config.poll_interval_ms);
@@ -3645,6 +3718,7 @@ async fn async_main() -> anyhow::Result<()> {
                 user_registry: user_registry.clone(),
                 agent,
                 dry_run,
+                llm_engine: None,
             }));
 
             // Handle shutdown signals

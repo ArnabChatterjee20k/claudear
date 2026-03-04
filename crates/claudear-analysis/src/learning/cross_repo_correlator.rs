@@ -133,6 +133,28 @@ impl CrossRepoCorrelator {
             .collect())
     }
 
+    /// Enrich correlation insights with LLM-generated causal explanations.
+    pub fn enrich_with_llm(
+        insights: &mut [CorrelationInsight],
+        llm: Option<&dyn crate::llm::LlmAnalyzer>,
+        issues_context: &str,
+    ) {
+        let Some(analyzer) = llm else { return };
+        let tuples: Vec<_> = insights
+            .iter()
+            .map(|i| (i.repo_a.clone(), i.repo_b.clone(), i.correlation_count))
+            .collect();
+        let explanations = analyzer.explain_correlations(&tuples, issues_context);
+        for expl in explanations {
+            if let Some(insight) = insights
+                .iter_mut()
+                .find(|i| i.repo_a == expl.repo_a && i.repo_b == expl.repo_b)
+            {
+                insight.message = expl.explanation;
+            }
+        }
+    }
+
     /// Format correlation insights as context for prompt injection.
     pub fn format_context(insights: &[CorrelationInsight]) -> String {
         if insights.is_empty() {

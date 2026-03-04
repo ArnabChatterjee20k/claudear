@@ -74,6 +74,7 @@ pub struct IssueProcessor {
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub user_registry: UserRegistry,
     pub github_client: Option<Arc<GitHubClient>>,
+    pub llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
 }
 
 /// Everything the caller provides to `IssueProcessor::run()`.
@@ -964,8 +965,12 @@ impl IssueProcessor {
                         if let Some(ref log_path) = exec.stdout_log_path {
                             let path = std::path::Path::new(log_path);
                             if path.exists() {
-                                match claudear_analysis::learning::StrategyParser::parse_from_log(
-                                    path, aid,
+                                match claudear_analysis::learning::StrategyParser::parse_with_llm(
+                                    path,
+                                    aid,
+                                    self.llm_analyzer
+                                        .as_deref()
+                                        .map(|a| a as &dyn claudear_analysis::llm::LlmAnalyzer),
                                 ) {
                                     Ok(fp) => {
                                         if let Err(e) = self.tracker.store_strategy_fingerprint(&fp)
@@ -2726,6 +2731,7 @@ mod tests {
                 std::collections::HashMap::new(),
             ),
             github_client: None,
+            llm_analyzer: None,
         };
 
         let input = ProcessingInput {

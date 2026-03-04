@@ -8,9 +8,10 @@ pub mod content_cluster;
 pub mod scorer;
 pub mod suppression;
 
+use crate::llm::LlmAnalyzer;
 use claudear_config::config::PrioritisationConfig;
 use claudear_core::types::{
-    ContentCluster, Issue, MatchResult, PrioritisedIssue, SuppressionResult,
+    ContentCluster, Issue, MatchResult, PrioritisedIssue, SeverityScore, SuppressionResult,
 };
 use claudear_storage::FixAttemptTracker;
 
@@ -30,6 +31,7 @@ pub fn prioritise(
     candidates: Vec<(Issue, MatchResult)>,
     tracker: &dyn FixAttemptTracker,
     embeddings: &std::collections::HashMap<String, Vec<f32>>,
+    llm: Option<&dyn LlmAnalyzer>,
 ) -> (Vec<PrioritisedIssue>, Vec<(Issue, SuppressionResult)>) {
     // Step 1: Suppress -- consume candidates without cloning by partitioning
     // into kept and suppressed via the suppression engine.
@@ -54,6 +56,14 @@ pub fn prioritise(
         })
         .collect();
 
+    // LLM batch assessment (severity + blast radius + fingerprint)
+    let llm_assessments: std::collections::HashMap<String, crate::llm::LlmIssueAssessment> = llm
+        .and_then(|l| l.assess_issues(&kept))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| (a.issue_id.clone(), a))
+        .collect();
+
     // Step 2 + 3: Detect content clusters (needs full candidate list for grouping)
     let clusters = if config.content_clustering {
         content_cluster::detect(&kept, config, embeddings)
@@ -63,7 +73,7 @@ pub fn prioritise(
     let clustered_ids = content_cluster::clustered_issue_ids(&clusters);
 
     // Build a lookup map from issue_id -> cluster_key to avoid O(M*K) linear scan
-    let cluster_key_map: std::collections::HashMap<String, String> = clusters
+    let mut cluster_key_map: std::collections::HashMap<String, String> = clusters
         .iter()
         .flat_map(|c| {
             c.issue_ids
@@ -72,15 +82,37 @@ pub fn prioritise(
         })
         .collect();
 
+    // Merge LLM fingerprint-based clusters: issues sharing a fingerprint get the same cluster_key
+    for (issue_id, assessment) in &llm_assessments {
+        if !cluster_key_map.contains_key(issue_id) && !assessment.fingerprint.is_empty() {
+            cluster_key_map.insert(issue_id.clone(), format!("llm:{}", assessment.fingerprint));
+        }
+    }
+
     // Step 4: Classify and score each issue
     let mut prioritised: Vec<PrioritisedIssue> = kept
         .drain(..)
         .map(|(issue, match_result)| {
-            let br = blast_radius::classify(&issue, config);
-            let in_cluster = clustered_ids.contains(&issue.id);
-            let severity_score = scorer::compute(&issue, &match_result, br, in_cluster, config);
-
-            let cluster_key = cluster_key_map.get(&issue.id).cloned();
+            let (br, severity_score, cluster_key) =
+                if let Some(assessment) = llm_assessments.get(&issue.id) {
+                    // Use LLM assessment with meaningful component breakdown
+                    let br_component = blast_radius::blast_radius_score(assessment.blast_radius);
+                    let score = SeverityScore {
+                        score: assessment.severity,
+                        severity_component: assessment.severity,
+                        blast_radius_component: br_component,
+                        ..SeverityScore::default()
+                    };
+                    let ck = cluster_key_map.get(&issue.id).cloned();
+                    (assessment.blast_radius, score, ck)
+                } else {
+                    // Heuristic fallback
+                    let br = blast_radius::classify(&issue, config);
+                    let in_cluster = clustered_ids.contains(&issue.id);
+                    let score = scorer::compute(&issue, &match_result, br, in_cluster, config);
+                    let ck = cluster_key_map.get(&issue.id).cloned();
+                    (br, score, ck)
+                };
 
             PrioritisedIssue {
                 issue,
@@ -254,6 +286,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(suppressed.is_empty());
         assert_eq!(result.len(), 2);
@@ -289,6 +322,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].issue.id, "real");
@@ -316,6 +350,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
     }
@@ -348,6 +383,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result[0].issue.id, "auth");
         assert_eq!(
@@ -360,8 +396,13 @@ mod tests {
     fn test_empty_candidates() {
         let config = PrioritisationConfig::default();
         let tracker = NoOpTracker;
-        let (result, suppressed) =
-            prioritise(&config, vec![], &tracker, &std::collections::HashMap::new());
+        let (result, suppressed) = prioritise(
+            &config,
+            vec![],
+            &tracker,
+            &std::collections::HashMap::new(),
+            None,
+        );
         assert!(result.is_empty(), "empty input must produce empty output");
         assert!(suppressed.is_empty());
     }
@@ -381,6 +422,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         assert!(suppressed.is_empty());
@@ -420,6 +462,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(
             result.is_empty(),
@@ -473,6 +516,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert_eq!(result.len(), 2);
@@ -535,6 +579,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert_eq!(result.len(), 2);
@@ -577,6 +622,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(suppressed.is_empty());
         assert_eq!(result.len(), 4);
@@ -639,6 +685,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert_eq!(
@@ -824,6 +871,7 @@ mod tests {
             vec![(issue1, mr1), (issue2, mr2)],
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert_eq!(result.len(), 2);
@@ -860,6 +908,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(suppressed.is_empty());
         // Duplicate issue IDs are deduplicated: the match_map is keyed by id,
@@ -899,6 +948,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         assert!(
@@ -929,6 +979,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         let score = &result[0].severity_score;
@@ -961,6 +1012,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         let score = &result[0].severity_score;
@@ -994,6 +1046,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 2);
         // IssuePriority::None (0.0) + MatchPriority::Low (0.25) < Low (0.25) + Low (0.25)
@@ -1031,6 +1084,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         let score = &result[0].severity_score;
 
@@ -1078,6 +1132,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 2);
         for pi in &result {
@@ -1110,6 +1165,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result[0].issue.id, "high");
         assert_eq!(result[1].issue.id, "low");
@@ -1168,6 +1224,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert!(
@@ -1227,6 +1284,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert_eq!(result.len(), 1, "one issue should remain");
@@ -1275,6 +1333,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert_eq!(suppressed.len(), 1);
@@ -1308,6 +1367,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 3);
         // All should have equal scores
@@ -1342,6 +1402,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 5);
 
@@ -1416,6 +1477,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 3);
 
@@ -1478,6 +1540,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 2);
         // Titles are similar but not 99%+ so no cluster should form
@@ -1524,6 +1587,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 3);
         for pi in &result {
@@ -1565,6 +1629,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 2);
 
@@ -1602,6 +1667,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         let score = &result[0].severity_score;
@@ -1675,6 +1741,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(!result.is_empty());
 
@@ -1743,6 +1810,7 @@ mod tests {
             test_cases,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         for pi in &result {
             let s = &pi.severity_score;
@@ -1801,6 +1869,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 100);
 
@@ -1854,6 +1923,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(
             suppressed.len(),
@@ -1934,6 +2004,7 @@ mod tests {
                 candidates,
                 &tracker,
                 &std::collections::HashMap::new(),
+                None,
             );
             assert_eq!(result.len(), 1);
             assert_eq!(
@@ -1959,6 +2030,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -2005,6 +2077,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(result.is_empty());
         assert_eq!(suppressed.len(), 1);
@@ -2047,6 +2120,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert_eq!(suppressed.len(), 1);
@@ -2087,6 +2161,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 2);
         // No error_type or culprit metadata, so clustering should skip them
@@ -2128,6 +2203,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 4);
 
@@ -2188,6 +2264,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         let key = result[0]
@@ -2233,6 +2310,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         // Both have culprit and similar titles, should cluster
@@ -2292,6 +2370,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert_eq!(result.len(), 3);
@@ -2332,6 +2411,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result[0].issue.id, "urgent");
         assert_eq!(result[1].issue.id, "low");
@@ -2360,6 +2440,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 2);
         assert!(suppressed.is_empty());
@@ -2385,12 +2466,14 @@ mod tests {
             make_batch(),
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         let (result2, _) = prioritise(
             &config,
             make_batch(),
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         assert_eq!(result1.len(), result2.len());
@@ -2442,6 +2525,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result[0].issue.id, "high-freq");
         assert_eq!(result[1].issue.id, "low-freq");
@@ -2483,6 +2567,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].issue.id, "real");
@@ -2512,6 +2597,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].match_result.reason, "specific-reason");
@@ -2863,6 +2949,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "d1");
@@ -2898,6 +2985,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "c1");
@@ -2930,6 +3018,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(result.len(), 0);
@@ -2964,6 +3053,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "e1");
@@ -2996,6 +3086,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(result.len(), 0);
@@ -3026,6 +3117,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(result.len(), 0);
@@ -3060,6 +3152,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "m1");
@@ -3097,6 +3190,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         // Only the one with exact title "crash" should be suppressed
         assert_eq!(suppressed.len(), 1);
@@ -3130,6 +3224,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         // Invalid regex should fail to compile, so nothing is suppressed
         assert!(suppressed.is_empty(), "invalid regex should not suppress");
@@ -3153,6 +3248,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(
             result[0].blast_radius,
@@ -3176,6 +3272,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(
             result[0].blast_radius,
@@ -3206,6 +3303,7 @@ mod tests {
                 candidates,
                 &tracker,
                 &std::collections::HashMap::new(),
+                None,
             );
             assert_eq!(
                 result[0].blast_radius,
@@ -3238,6 +3336,7 @@ mod tests {
                 candidates,
                 &tracker,
                 &std::collections::HashMap::new(),
+                None,
             );
             assert_eq!(
                 result[0].blast_radius,
@@ -3269,6 +3368,7 @@ mod tests {
                 candidates,
                 &tracker,
                 &std::collections::HashMap::new(),
+                None,
             );
             assert_eq!(
                 result[0].blast_radius,
@@ -3301,6 +3401,7 @@ mod tests {
                 candidates,
                 &tracker,
                 &std::collections::HashMap::new(),
+                None,
             );
             assert_eq!(
                 result[0].blast_radius,
@@ -3327,6 +3428,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(
             result[0].blast_radius,
@@ -3359,6 +3461,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(
             result[0].blast_radius,
@@ -3387,6 +3490,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         // With all path lists empty, should fall through to Peripheral
         assert_eq!(
@@ -3419,6 +3523,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(
             result[0].severity_score.score < 0.0,
@@ -3449,6 +3554,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(
             result[0].severity_score.score.is_finite(),
@@ -3482,6 +3588,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result[0].issue.id, "hu");
         assert_eq!(result[1].issue.id, "lu");
@@ -3513,6 +3620,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(
             result[0].issue.id, "cr",
@@ -3545,6 +3653,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result[0].issue.id, "f");
         assert_eq!(result[1].issue.id, "p");
@@ -3595,6 +3704,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 3);
         // Clustered issues should have higher scores
@@ -3625,6 +3735,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         let fc = result[0].severity_score.frequency_component;
         assert!(
@@ -3660,6 +3771,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         // error level issue should rank higher due to regression component
         assert_eq!(result[0].issue.id, "lvl");
@@ -3688,6 +3800,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result[0].issue.id, "uh");
         assert_eq!(result[1].issue.id, "h");
@@ -3730,6 +3843,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result[0].issue.id, "err");
         assert_eq!(result[1].issue.id, "warn");
@@ -3770,6 +3884,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         // Both have same error_type and no culprit, should cluster
@@ -3844,6 +3959,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 6);
 
@@ -3885,6 +4001,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         // min_content_cluster_size=1 means a single issue forms a cluster
@@ -3928,6 +4045,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         // With threshold=0, even dissimilar titles should cluster
         assert!(
@@ -3957,6 +4075,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         let s = &result[0].severity_score;
 
@@ -4000,6 +4119,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(
             (result[0].severity_score.severity_component - 0.65).abs() < 1e-10,
@@ -4032,6 +4152,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         let pi = &result[0];
 
@@ -4073,6 +4194,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 1);
         let (issue, sr) = &suppressed[0];
@@ -4109,6 +4231,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 500);
 
@@ -4158,6 +4281,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 30);
 
@@ -4219,6 +4343,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 2);
         assert_eq!(result.len(), 1);
@@ -4256,6 +4381,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         // Empty pattern with Contains mode: "" is contained in any string
         // This is technically valid -- the issue IS suppressed.
@@ -4323,6 +4449,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
 
         // n1 should be suppressed
@@ -4362,6 +4489,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         assert!(!result[0].match_result.matches);
@@ -4400,6 +4528,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 5);
         // All should have same score since everything else is equal
@@ -4440,6 +4569,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         // Source comparison is case-insensitive (eq_ignore_ascii_case)
         assert_eq!(
@@ -4478,6 +4608,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(
             suppressed.len(),
@@ -4506,6 +4637,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].issue.title, "");
@@ -4544,6 +4676,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(result.len(), 3);
         for pi in &result {
@@ -4585,6 +4718,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].0.id, "u1");
@@ -4778,6 +4912,7 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         assert!(result[0].severity_score.frequency_component > 0.0);
     }
@@ -4799,12 +4934,244 @@ mod tests {
             candidates,
             &tracker,
             &std::collections::HashMap::new(),
+            None,
         );
         // severity_component = 0.6*0.0 + 0.4*0.5 = 0.2
         assert!(
             (result[0].severity_score.severity_component - 0.2).abs() < 1e-10,
             "default priority should yield severity_component of 0.2, got {}",
             result[0].severity_score.severity_component
+        );
+    }
+
+    // --- Mock LLM tests ---
+
+    struct MockLlmAnalyzer {
+        assessments: Option<Vec<crate::llm::LlmIssueAssessment>>,
+    }
+
+    impl crate::llm::LlmAnalyzer for MockLlmAnalyzer {
+        fn assess_issues(
+            &self,
+            _candidates: &[(Issue, MatchResult)],
+        ) -> Option<Vec<crate::llm::LlmIssueAssessment>> {
+            self.assessments.clone()
+        }
+
+        fn classify_review(
+            &self,
+            _comment_body: &str,
+        ) -> Option<claudear_core::types::ReviewCategory> {
+            None
+        }
+
+        fn extract_learnings(&self, _log_text: &str) -> Option<crate::llm::LlmLogAnalysis> {
+            None
+        }
+
+        fn explain_correlations(
+            &self,
+            _correlations: &[(String, String, i64)],
+            _issues_context: &str,
+        ) -> Vec<crate::llm::LlmCorrelationExplanation> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn test_prioritise_with_mock_llm() {
+        let config = PrioritisationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tracker = NoOpTracker;
+
+        let (issue, mr) = make_candidate(
+            "LLM-1",
+            "Fatal crash in payment service",
+            IssuePriority::Critical,
+            MatchPriority::High,
+        );
+
+        let mock = MockLlmAnalyzer {
+            assessments: Some(vec![crate::llm::LlmIssueAssessment {
+                issue_id: "LLM-1".to_string(),
+                severity: 0.95,
+                blast_radius: claudear_core::types::BlastRadius::Critical,
+                fingerprint: "payment_crash".to_string(),
+            }]),
+        };
+
+        let (result, _) = prioritise(
+            &config,
+            vec![(issue, mr)],
+            &tracker,
+            &std::collections::HashMap::new(),
+            Some(&mock),
+        );
+
+        assert_eq!(result.len(), 1);
+        assert!(
+            (result[0].severity_score.score - 0.95).abs() < 1e-10,
+            "LLM severity should be used, got {}",
+            result[0].severity_score.score
+        );
+        assert_eq!(
+            result[0].blast_radius,
+            claudear_core::types::BlastRadius::Critical
+        );
+        assert_eq!(result[0].cluster_key.as_deref(), Some("llm:payment_crash"));
+    }
+
+    #[test]
+    fn test_prioritise_llm_fallback() {
+        let config = PrioritisationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tracker = NoOpTracker;
+
+        let (issue, mr) = make_candidate(
+            "FALL-1",
+            "Minor CSS glitch",
+            IssuePriority::Low,
+            MatchPriority::Normal,
+        );
+
+        // Mock returns None → heuristic path
+        let mock = MockLlmAnalyzer { assessments: None };
+
+        let (result, _) = prioritise(
+            &config,
+            vec![(issue, mr)],
+            &tracker,
+            &std::collections::HashMap::new(),
+            Some(&mock),
+        );
+
+        assert_eq!(result.len(), 1);
+        // Should have heuristic components filled (not all zeroed)
+        // severity_component is always > 0 for a matched issue
+        assert!(
+            result[0].severity_score.severity_component > 0.0,
+            "Heuristic fallback should produce non-zero severity_component"
+        );
+    }
+
+    #[test]
+    fn test_prioritise_llm_clustering_by_fingerprint() {
+        let config = PrioritisationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tracker = NoOpTracker;
+
+        let (issue1, mr1) = make_candidate(
+            "CL-1",
+            "NullPointer in auth A",
+            IssuePriority::High,
+            MatchPriority::Normal,
+        );
+        let (issue2, mr2) = make_candidate(
+            "CL-2",
+            "NullPointer in auth B",
+            IssuePriority::High,
+            MatchPriority::Normal,
+        );
+
+        let mock = MockLlmAnalyzer {
+            assessments: Some(vec![
+                crate::llm::LlmIssueAssessment {
+                    issue_id: "CL-1".to_string(),
+                    severity: 0.8,
+                    blast_radius: claudear_core::types::BlastRadius::Core,
+                    fingerprint: "null_ref_auth".to_string(),
+                },
+                crate::llm::LlmIssueAssessment {
+                    issue_id: "CL-2".to_string(),
+                    severity: 0.75,
+                    blast_radius: claudear_core::types::BlastRadius::Core,
+                    fingerprint: "null_ref_auth".to_string(),
+                },
+            ]),
+        };
+
+        let (result, _) = prioritise(
+            &config,
+            vec![(issue1, mr1), (issue2, mr2)],
+            &tracker,
+            &std::collections::HashMap::new(),
+            Some(&mock),
+        );
+
+        assert_eq!(result.len(), 2);
+        // Both should share the same cluster key
+        assert_eq!(
+            result[0].cluster_key, result[1].cluster_key,
+            "Issues with same fingerprint should share cluster key"
+        );
+        assert_eq!(result[0].cluster_key.as_deref(), Some("llm:null_ref_auth"));
+    }
+
+    #[test]
+    fn test_prioritise_llm_partial_assessment() {
+        // LLM returns assessment for only one of two issues — the other should
+        // fall back to heuristic scoring.
+        let config = PrioritisationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tracker = NoOpTracker;
+
+        let (issue1, mr1) = make_candidate(
+            "PA-1",
+            "Critical crash",
+            IssuePriority::Critical,
+            MatchPriority::High,
+        );
+        let (issue2, mr2) = make_candidate(
+            "PA-2",
+            "Minor style issue",
+            IssuePriority::Low,
+            MatchPriority::Low,
+        );
+
+        let mock = MockLlmAnalyzer {
+            // Only return assessment for PA-1, not PA-2
+            assessments: Some(vec![crate::llm::LlmIssueAssessment {
+                issue_id: "PA-1".to_string(),
+                severity: 0.99,
+                blast_radius: claudear_core::types::BlastRadius::Critical,
+                fingerprint: "critical_crash".to_string(),
+            }]),
+        };
+
+        let (result, _) = prioritise(
+            &config,
+            vec![(issue1, mr1), (issue2, mr2)],
+            &tracker,
+            &std::collections::HashMap::new(),
+            Some(&mock),
+        );
+
+        assert_eq!(result.len(), 2);
+
+        // PA-1 should use LLM score
+        let pa1 = result.iter().find(|r| r.issue.id == "PA-1").unwrap();
+        assert!(
+            (pa1.severity_score.score - 0.99).abs() < 1e-10,
+            "PA-1 should use LLM severity"
+        );
+        assert_eq!(
+            pa1.blast_radius,
+            claudear_core::types::BlastRadius::Critical
+        );
+
+        // PA-2 should use heuristic score (severity_component > 0)
+        let pa2 = result.iter().find(|r| r.issue.id == "PA-2").unwrap();
+        assert!(
+            pa2.severity_score.severity_component > 0.0,
+            "PA-2 should fall back to heuristic scoring"
         );
     }
 }

@@ -11,9 +11,42 @@ use crate::repo::{build_repo_index, index_repo_files, IndexedRepo, RepoIndex};
 use claudear_core::types::{ActivityLogEntry, Issue};
 use claudear_storage::FixAttemptTracker;
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Rich context bundle passed to the classifier.
+pub struct ClassificationRequest {
+    /// Issue title.
+    pub title: String,
+    /// Issue description (if any).
+    pub description: Option<String>,
+    /// Issue source (sentry, linear, jira, github, etc.).
+    pub source: String,
+    /// Extracted metadata: stacktrace, filename, function, culprit, project, message.
+    pub metadata: HashMap<String, String>,
+    /// Already-extracted filenames from IssueContext.
+    pub extracted_filenames: Vec<String>,
+    /// Already-extracted function names from IssueContext.
+    pub extracted_functions: Vec<String>,
+    /// Already-extracted keywords from IssueContext.
+    pub extracted_keywords: Vec<String>,
+    /// Already-extracted repo references from IssueContext.
+    pub extracted_repos: Vec<String>,
+    /// Rich repo profiles: (repo_name, profile_text).
+    /// profile_text includes README excerpt, package description, dirs, languages, sample files.
+    pub candidates: Vec<(String, String)>,
+}
+
+/// Trait for classifying issues into repositories.
+///
+/// Implemented in the engine layer using a local LLM, but defined here
+/// so the analysis crate can use it without depending on integrations.
+pub trait RepoClassifier: Send + Sync {
+    /// Classify an issue into a repo. Returns (repo_name, confidence 0.0-1.0).
+    fn classify(&self, request: &ClassificationRequest) -> Option<(String, f32)>;
+}
 
 /// Result of attempting to resolve a repository for an issue.
 #[derive(Debug, Clone)]
@@ -376,6 +409,7 @@ const WEIGHT_FUZZY_SINGLE: f32 = 12.0;
 const WEIGHT_FUZZY_ALL_SAME_REPO: f32 = 10.0;
 const WEIGHT_BASENAME_SINGLE: f32 = 3.0;
 const WEIGHT_EMBEDDING_MULTIPLIER: f32 = 15.0;
+const WEIGHT_LLM_CLASSIFIER: f32 = 35.0;
 
 // Confidence thresholds for score-to-confidence mapping
 const THRESHOLD_HIGH: f32 = 35.0;
@@ -418,6 +452,8 @@ pub struct RepoInferrer {
     known_orgs: Vec<String>,
     /// Paths to scan for repos.
     discover_paths: Vec<String>,
+    /// Optional LLM-based classifier for repo inference.
+    classifier: Option<Arc<dyn RepoClassifier>>,
 }
 
 impl RepoInferrer {
@@ -428,6 +464,7 @@ impl RepoInferrer {
             repo_embeddings: Arc::new(std::sync::RwLock::new(Vec::new())),
             known_orgs: Vec::new(),
             discover_paths: Vec::new(),
+            classifier: None,
         }
     }
 
@@ -438,6 +475,7 @@ impl RepoInferrer {
             repo_embeddings: Arc::new(std::sync::RwLock::new(repo_embeddings)),
             known_orgs: Vec::new(),
             discover_paths: Vec::new(),
+            classifier: None,
         }
     }
 
@@ -453,7 +491,13 @@ impl RepoInferrer {
             repo_embeddings: Arc::new(std::sync::RwLock::new(repo_embeddings)),
             known_orgs,
             discover_paths,
+            classifier: None,
         }
+    }
+
+    /// Set the LLM-based classifier for repo inference.
+    pub fn set_classifier(&mut self, classifier: Arc<dyn RepoClassifier>) {
+        self.classifier = Some(classifier);
     }
 
     /// Check if embeddings are available.
@@ -521,7 +565,10 @@ impl RepoInferrer {
         tracing::info!("Found {} new repositories to embed", new_repos.len());
 
         // Generate embeddings for new repos using rich descriptions
-        let texts: Vec<String> = new_repos.iter().map(|r| build_repo_description(r)).collect();
+        let texts: Vec<String> = new_repos
+            .iter()
+            .map(|r| build_repo_description(r))
+            .collect();
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
         let vectors = embedding_client.embed_batch(&text_refs).await?;
@@ -1003,6 +1050,64 @@ impl RepoInferrer {
             }
         }
 
+        // LLM classifier signal
+        if let Some(ref classifier) = self.classifier {
+            let metadata: HashMap<String, String> = issue
+                .metadata
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect();
+
+            let candidate_profiles: Vec<(String, String)> = index
+                .list()
+                .iter()
+                .filter(|r| !excluded_repos.contains(&r.name))
+                .map(|r| (r.name.clone(), build_repo_profile(r)))
+                .collect();
+
+            if !candidate_profiles.is_empty() {
+                let request = ClassificationRequest {
+                    title: issue.title.clone(),
+                    description: issue.description.clone(),
+                    source: issue.source.clone(),
+                    metadata,
+                    extracted_filenames: context.filenames.clone(),
+                    extracted_functions: context.functions.clone(),
+                    extracted_keywords: context.keywords.clone(),
+                    extracted_repos: context.repos.clone(),
+                    candidates: candidate_profiles,
+                };
+
+                let start = Instant::now();
+                if let Some((repo_name, confidence)) = classifier.classify(&request) {
+                    let elapsed = start.elapsed();
+                    tracing::debug!(
+                        repo = %repo_name,
+                        confidence = %confidence,
+                        elapsed_ms = elapsed.as_millis(),
+                        "LLM classifier result"
+                    );
+                    if let Some(repo) = index.get(&repo_name) {
+                        let score = WEIGHT_LLM_CLASSIFIER * confidence;
+                        let entry =
+                            candidates
+                                .entry(repo.name.clone())
+                                .or_insert_with(|| RepoCandidate {
+                                    repo: repo.clone(),
+                                    signals: Vec::new(),
+                                    total_score: 0.0,
+                                });
+                        entry.signals.push(ScoredSignal {
+                            weight: score,
+                            reason: format!("LLM classification: {:.0}%", confidence * 100.0),
+                            matched_file: None,
+                        });
+                        entry.total_score += score;
+                    }
+                }
+            }
+        }
+
         // Pick the candidate with the highest total score
         // Remove excluded repos from candidates
         if !excluded_repos.is_empty() {
@@ -1158,6 +1263,141 @@ impl RepoInferrer {
             }
         }
     }
+}
+
+/// Build a comprehensive repo profile for LLM classification.
+///
+/// Produces a structured text block including:
+/// - Repository name
+/// - Package description
+/// - README excerpt
+/// - Language distribution
+/// - Top-level directories
+/// - Representative sample files
+pub fn build_repo_profile(repo: &IndexedRepo) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    lines.push(format!("Repository: {}", repo.name));
+
+    // Package description
+    if let Some(desc) = read_package_description(&repo.path) {
+        lines.push(format!("Description: {}", desc));
+    }
+
+    // README excerpt
+    let readme_path = repo.path.join("README.md");
+    if let Ok(content) = std::fs::read_to_string(&readme_path) {
+        let first_para = extract_readme_first_paragraph(&content);
+        if !first_para.is_empty() {
+            let truncated = truncate_to_chars(&first_para, 200);
+            lines.push(format!("README: {}", truncated));
+        }
+    }
+
+    // Language summary
+    let lang_summary = build_language_summary(&repo.files);
+    if !lang_summary.is_empty() {
+        lines.push(format!("Languages: {}", lang_summary));
+    }
+
+    // Top-level dirs
+    let top_dirs = extract_top_level_dirs(&repo.files);
+    if !top_dirs.is_empty() {
+        lines.push(format!("Directories: {}", top_dirs.join(", ")));
+    }
+
+    // Sample files
+    let samples = extract_sample_files(&repo.files, 8);
+    if !samples.is_empty() {
+        lines.push(format!("Sample files: {}", samples.join(", ")));
+    }
+
+    lines.join("\n")
+}
+
+/// Extract representative sample files from a repository's file list.
+///
+/// Prioritizes source directories (src/, lib/, app/) over tests/docs,
+/// and tries to pick files from diverse subdirectories.
+fn extract_sample_files(files: &[String], max: usize) -> Vec<String> {
+    if files.is_empty() || max == 0 {
+        return Vec::new();
+    }
+
+    let priority_prefixes = ["src/", "lib/", "app/", "pkg/", "internal/", "cmd/"];
+    let depriority_prefixes = [
+        "test/",
+        "tests/",
+        "spec/",
+        "docs/",
+        "doc/",
+        "examples/",
+        "fixtures/",
+        ".github/",
+        "vendor/",
+        "node_modules/",
+    ];
+
+    // Partition into priority, normal, deprioritized
+    let mut priority_files: Vec<&String> = Vec::new();
+    let mut normal_files: Vec<&String> = Vec::new();
+    let mut depriority_files: Vec<&String> = Vec::new();
+
+    for file in files {
+        let lower = file.to_lowercase();
+        if depriority_prefixes.iter().any(|p| lower.starts_with(p)) {
+            depriority_files.push(file);
+        } else if priority_prefixes.iter().any(|p| lower.starts_with(p)) {
+            priority_files.push(file);
+        } else {
+            normal_files.push(file);
+        }
+    }
+
+    // Pick from diverse subdirectories
+    let mut result: Vec<String> = Vec::new();
+    let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let pick_diverse = |source: &[&String],
+                        result: &mut Vec<String>,
+                        seen: &mut std::collections::HashSet<String>,
+                        limit: usize| {
+        for file in source {
+            if result.len() >= limit {
+                break;
+            }
+            // Get the first two path components as the "directory key"
+            let parts: Vec<&str> = file.split('/').collect();
+            let dir_key = if parts.len() >= 2 {
+                format!("{}/{}", parts[0], parts[1])
+            } else {
+                parts[0].to_string()
+            };
+            if seen.insert(dir_key) {
+                result.push(file.to_string());
+            }
+        }
+        // If we still have room, fill with remaining files
+        for file in source {
+            if result.len() >= limit {
+                break;
+            }
+            if !result.contains(file) {
+                result.push(file.to_string());
+            }
+        }
+    };
+
+    pick_diverse(&priority_files, &mut result, &mut seen_dirs, max);
+    if result.len() < max {
+        pick_diverse(&normal_files, &mut result, &mut seen_dirs, max);
+    }
+    if result.len() < max {
+        pick_diverse(&depriority_files, &mut result, &mut seen_dirs, max);
+    }
+
+    result.truncate(max);
+    result
 }
 
 /// Build a rich text description of a repository for embedding.
@@ -3672,12 +3912,156 @@ mod tests {
         // "hello world foo bar" truncated to 15 -> "hello world foo" is 15 chars,
         // rfind(' ') at pos 11 -> "hello world"
         assert_eq!(truncate_to_chars("hello world foo bar", 15), "hello world");
-        assert_eq!(truncate_to_chars("hello world foo bar", 19), "hello world foo bar");
+        assert_eq!(
+            truncate_to_chars("hello world foo bar", 19),
+            "hello world foo bar"
+        );
     }
 
     #[test]
     fn test_read_package_description_none_for_missing() {
         let desc = read_package_description(std::path::Path::new("/nonexistent/path"));
         assert!(desc.is_none());
+    }
+
+    // --- RepoClassifier / LLM scoring tests ---
+
+    #[test]
+    fn test_scoring_constants_includes_llm() {
+        assert_eq!(WEIGHT_LLM_CLASSIFIER, 35.0);
+    }
+
+    struct MockClassifier {
+        result: Option<(String, f32)>,
+    }
+    impl RepoClassifier for MockClassifier {
+        fn classify(&self, _request: &ClassificationRequest) -> Option<(String, f32)> {
+            self.result.clone()
+        }
+    }
+
+    #[test]
+    fn test_classifier_returns_matching_repo() {
+        let index = create_test_index();
+        let mut inferrer = RepoInferrer::new(index);
+        inferrer.set_classifier(Arc::new(MockClassifier {
+            result: Some(("appwrite/console".to_string(), 0.9)),
+        }));
+
+        // Issue with no file signals — only classifier should contribute
+        let issue = create_test_issue("linear", "UI bug", "Button is broken");
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert_eq!(inferred.repo.name, "appwrite/console");
+        // Score = 35.0 * 0.9 = 31.5 → Medium confidence
+        assert_eq!(inferred.confidence, Confidence::Medium);
+        assert!(inferred.reason.contains("LLM classification"));
+    }
+
+    #[test]
+    fn test_no_classifier_set_skips_cleanly() {
+        let index = create_test_index();
+        let inferrer = RepoInferrer::new(index);
+
+        // Issue with no signals at all
+        let issue = create_test_issue("linear", "Unknown issue", "No context");
+        let result = inferrer.infer(&issue);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_classifier_returns_none() {
+        let index = create_test_index();
+        let mut inferrer = RepoInferrer::new(index);
+        inferrer.set_classifier(Arc::new(MockClassifier { result: None }));
+
+        let issue = create_test_issue("linear", "Unknown issue", "No context");
+        let result = inferrer.infer(&issue);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_classifier_returns_unknown_repo() {
+        let index = create_test_index();
+        let mut inferrer = RepoInferrer::new(index);
+        inferrer.set_classifier(Arc::new(MockClassifier {
+            result: Some(("org/nonexistent-repo".to_string(), 1.0)),
+        }));
+
+        let issue = create_test_issue("linear", "Unknown issue", "No context");
+        let result = inferrer.infer(&issue);
+        // Repo not in index, so no signal added
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_llm_signal_accumulates_with_file_signal() {
+        let index = create_test_index();
+        let mut inferrer = RepoInferrer::new(index);
+        inferrer.set_classifier(Arc::new(MockClassifier {
+            result: Some(("appwrite/console".to_string(), 0.8)),
+        }));
+
+        // Issue with a direct file match for console + classifier also picks console
+        let mut issue = create_test_issue("sentry", "Auth error", "");
+        issue
+            .metadata
+            .insert("filename".to_string(), json!("src/routes/auth.ts"));
+
+        let result = inferrer.infer(&issue);
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert_eq!(inferred.repo.name, "appwrite/console");
+        // Direct file match (25) + LLM (35*0.8=28) = 53 → High confidence
+        assert_eq!(inferred.confidence, Confidence::High);
+    }
+
+    // --- extract_sample_files tests ---
+
+    #[test]
+    fn test_extract_sample_files_prioritizes_src() {
+        let files = vec![
+            "tests/test_main.rs".to_string(),
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "docs/README.md".to_string(),
+            "src/handlers/auth.rs".to_string(),
+            "app/controllers/home.php".to_string(),
+        ];
+        let samples = extract_sample_files(&files, 3);
+        assert_eq!(samples.len(), 3);
+        // src/ and app/ files should come first
+        assert!(samples.iter().any(|s| s.starts_with("src/")));
+    }
+
+    #[test]
+    fn test_extract_sample_files_empty() {
+        let samples = extract_sample_files(&[], 5);
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sample_files_respects_max() {
+        let files: Vec<String> = (0..20).map(|i| format!("src/file{}.rs", i)).collect();
+        let samples = extract_sample_files(&files, 5);
+        assert_eq!(samples.len(), 5);
+    }
+
+    // --- build_repo_profile tests ---
+
+    #[test]
+    fn test_build_repo_profile_basic() {
+        let mut repo = IndexedRepo::new("appwrite/console", "/nonexistent/path");
+        repo.files = vec![
+            "src/routes/auth.ts".to_string(),
+            "src/components/Button.tsx".to_string(),
+            "tests/auth.test.ts".to_string(),
+        ];
+        let profile = build_repo_profile(&repo);
+        assert!(profile.contains("Repository: appwrite/console"));
+        assert!(profile.contains("Directories:"));
+        assert!(profile.contains("src"));
+        assert!(profile.contains("Sample files:"));
     }
 }

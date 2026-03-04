@@ -854,6 +854,7 @@ async fn process_issue(
         review_watcher: state.review_watcher.clone(),
         user_registry: state.user_registry.clone(),
         github_client: None,
+        llm_analyzer: None,
     };
 
     let input = ProcessingInput {
@@ -1056,6 +1057,7 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            llm: crate::config::LlmModelConfig::default(),
             chat: crate::config::ChatConfig::default(),
             tls: crate::config::TlsConfig::default(),
         }

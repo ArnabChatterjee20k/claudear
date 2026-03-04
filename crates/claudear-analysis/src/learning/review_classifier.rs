@@ -164,6 +164,68 @@ impl ReviewClassifier {
         Ok(patterns)
     }
 
+    /// Classify with LLM if available, falling back to keyword heuristics.
+    pub fn classify_with_llm(
+        comment_body: &str,
+        llm: Option<&dyn crate::llm::LlmAnalyzer>,
+    ) -> ReviewCategory {
+        if let Some(analyzer) = llm {
+            if let Some(cat) = analyzer.classify_review(comment_body) {
+                return cat;
+            }
+        }
+        Self::classify(comment_body)
+    }
+
+    /// Process review comments with optional LLM classification.
+    pub fn process_review_comments_with_llm(
+        tracker: &dyn FixAttemptTracker,
+        repo: &str,
+        comments: &[PrReviewComment],
+        review_body: Option<&str>,
+        llm: Option<&dyn crate::llm::LlmAnalyzer>,
+    ) -> Result<Vec<ReviewPattern>> {
+        let mut patterns = Vec::new();
+
+        if let Some(body) = review_body {
+            if !body.trim().is_empty() {
+                let category = Self::classify_with_llm(body, llm);
+                let pattern = ReviewPattern {
+                    id: 0,
+                    scm_repo: repo.to_string(),
+                    category,
+                    pattern_text: truncate(body, 200),
+                    example_comments: vec![truncate(body, 500)],
+                    occurrence_count: 1,
+                    promoted_to_instruction: false,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                };
+                tracker.upsert_review_pattern(&pattern)?;
+                patterns.push(pattern);
+            }
+        }
+
+        for comment in comments {
+            let category = Self::classify_with_llm(&comment.body, llm);
+            let pattern = ReviewPattern {
+                id: 0,
+                scm_repo: repo.to_string(),
+                category,
+                pattern_text: truncate(&comment.body, 200),
+                example_comments: vec![truncate(&comment.body, 500)],
+                occurrence_count: 1,
+                promoted_to_instruction: false,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            tracker.upsert_review_pattern(&pattern)?;
+            patterns.push(pattern);
+        }
+
+        Ok(patterns)
+    }
+
     /// Check if any patterns have crossed the promotion threshold.
     pub fn check_promotion_threshold(
         tracker: &dyn FixAttemptTracker,
@@ -1673,5 +1735,59 @@ mod tests {
         );
         assert_eq!(patterns[0].scm_repo, "org/repo");
         assert_eq!(patterns[0].occurrence_count, 1);
+    }
+
+    // --- classify_with_llm tests ---
+
+    struct MockLlmReview {
+        result: Option<ReviewCategory>,
+    }
+
+    impl crate::llm::LlmAnalyzer for MockLlmReview {
+        fn assess_issues(
+            &self,
+            _: &[(
+                claudear_core::types::Issue,
+                claudear_core::types::MatchResult,
+            )],
+        ) -> Option<Vec<crate::llm::LlmIssueAssessment>> {
+            None
+        }
+        fn classify_review(&self, _: &str) -> Option<ReviewCategory> {
+            self.result
+        }
+        fn extract_learnings(&self, _: &str) -> Option<crate::llm::LlmLogAnalysis> {
+            None
+        }
+        fn explain_correlations(
+            &self,
+            _: &[(String, String, i64)],
+            _: &str,
+        ) -> Vec<crate::llm::LlmCorrelationExplanation> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn test_classify_with_llm_succeeds() {
+        let mock = MockLlmReview {
+            result: Some(ReviewCategory::Security),
+        };
+        let cat = ReviewClassifier::classify_with_llm("some comment", Some(&mock));
+        assert_eq!(cat, ReviewCategory::Security);
+    }
+
+    #[test]
+    fn test_classify_with_llm_falls_back() {
+        let mock = MockLlmReview { result: None };
+        // "test" keyword → MissingTests via heuristic
+        let cat = ReviewClassifier::classify_with_llm("add more test coverage", Some(&mock));
+        assert_eq!(cat, ReviewCategory::MissingTests);
+    }
+
+    #[test]
+    fn test_classify_with_llm_none_analyzer() {
+        let cat = ReviewClassifier::classify_with_llm("add more test coverage", None);
+        assert_eq!(cat, ReviewCategory::MissingTests);
     }
 }

@@ -1,5 +1,6 @@
 //! Main watcher that coordinates sources, Claude, and notifications.
 
+use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
 use chrono::{DateTime, Utc};
@@ -132,6 +133,8 @@ pub struct WatcherOptions {
     pub user_registry: UserRegistry,
     pub agent: Arc<dyn AgentRunner>,
     pub dry_run: bool,
+    /// Optional pre-loaded LLM engine for repo classification.
+    pub llm_engine: Option<Arc<claudear_integrations::chat::llm::LlmEngine>>,
 }
 
 /// Main watcher that coordinates sources, Claude, and notifications.
@@ -160,6 +163,8 @@ pub struct Watcher {
     last_seen_releases: RwLock<HashMap<String, String>>,
     /// Transient watcher pause for provider rate limits (clears on restart).
     rate_limit_pause_until: RwLock<Option<DateTime<Utc>>>,
+    /// Optional LLM analyzer for enhanced analysis across the pipeline.
+    llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
 }
 
 impl Watcher {
@@ -167,13 +172,27 @@ impl Watcher {
     pub fn new(options: WatcherOptions) -> Self {
         let feedback_analyzer = FeedbackAnalyzer::new().with_tracker(options.tracker.clone());
 
+        // Wire LLM classifier into inferrer if both are available
+        let mut inferrer = options.inferrer;
+        if let (Some(ref mut inf), Some(ref engine)) = (&mut inferrer, &options.llm_engine) {
+            let classifier = LlmRepoClassifier::new(engine.clone());
+            inf.set_classifier(Arc::new(classifier));
+            tracing::info!("LLM repo classifier enabled");
+        }
+
+        // Create LLM analyzer for enhanced pipeline analysis
+        let llm_analyzer = options.llm_engine.as_ref().map(|engine| {
+            tracing::info!("LLM analyzer enabled");
+            Arc::new(crate::llm_analyzer::LlmAnalyzerImpl::new(engine.clone()))
+        });
+
         Self {
             agent: options.agent,
             config: options.config,
             sources: options.sources,
             notifier: options.notifier,
             tracker: options.tracker,
-            inferrer: options.inferrer,
+            inferrer,
             embedding_client: options.embedding_client,
             review_watcher: options.review_watcher,
             issue_embedding_service: options.issue_embedding_service,
@@ -189,7 +208,15 @@ impl Watcher {
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             last_seen_releases: RwLock::new(HashMap::new()),
             rate_limit_pause_until: RwLock::new(None),
+            llm_analyzer,
         }
+    }
+
+    /// Get a trait-object reference to the LLM analyzer, if available.
+    fn llm(&self) -> Option<&dyn claudear_analysis::llm::LlmAnalyzer> {
+        self.llm_analyzer
+            .as_deref()
+            .map(|a| a as &dyn claudear_analysis::llm::LlmAnalyzer)
     }
 
     /// Send a cron check-in to Sentry's HTTP API (fire-and-forget).
@@ -1113,11 +1140,12 @@ impl Watcher {
                 };
 
                 if let Err(e) =
-                    claudear_analysis::learning::ReviewClassifier::process_review_comments(
+                    claudear_analysis::learning::ReviewClassifier::process_review_comments_with_llm(
                         self.tracker.as_ref(),
                         repo,
                         &[mock_comment],
                         Some(feedback),
+                        self.llm(),
                     )
                 {
                     tracing::warn!(error = %e, "Failed to classify review feedback");
@@ -2702,6 +2730,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 candidates,
                 self.tracker.as_ref(),
                 &std::collections::HashMap::new(),
+                self.llm(),
             );
 
             // Log and record suppressions
@@ -3187,6 +3216,7 @@ Create a PR with your changes.{custom_instructions}"#,
             review_watcher: self.review_watcher.clone(),
             user_registry: self.user_registry.clone(),
             github_client: None,
+            llm_analyzer: self.llm_analyzer.clone(),
         };
 
         let input = ProcessingInput {
@@ -3583,7 +3613,19 @@ Create a PR with your changes.{custom_instructions}"#,
                 self.tracker.as_ref(),
                 learning.cross_repo_window_hours,
             ) {
-                Ok(insights) if !insights.is_empty() => {
+                Ok(mut insights) if !insights.is_empty() => {
+                    // Build context summary from the detected insights for LLM enrichment
+                    let issues_context: String = insights
+                        .iter()
+                        .map(|i| format!("{} \u{2194} {}: {}", i.repo_a, i.repo_b, i.message))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    // Enrich with LLM explanations if available
+                    claudear_analysis::learning::CrossRepoCorrelator::enrich_with_llm(
+                        &mut insights,
+                        self.llm(),
+                        &issues_context,
+                    );
                     for insight in &insights {
                         tracing::info!(
                             upstream = %insight.repo_a,
@@ -3618,10 +3660,15 @@ Create a PR with your changes.{custom_instructions}"#,
                     if let Some(ref log_path) = exec.stdout_log_path {
                         let path = std::path::Path::new(log_path);
                         if path.exists() {
-                            match claudear_analysis::learning::LogExtractor::extract_learnings_from_log(path) {
+                            match claudear_analysis::learning::LogExtractor::extract_with_llm(
+                                path,
+                                self.llm(),
+                            ) {
                                 Ok(learnings) => {
                                     let summary =
-                                        claudear_analysis::learning::LogExtractor::summarize(&learnings);
+                                        claudear_analysis::learning::LogExtractor::summarize(
+                                            &learnings,
+                                        );
                                     // Store learnings on the feedback outcome
                                     if let Ok(Some(outcome)) =
                                         self.tracker.get_feedback_outcome_by_attempt(attempt.id)
@@ -4200,6 +4247,7 @@ mod tests {
             evaluation: claudear_config::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: claudear_config::config::DashboardConfig::default(),
+            llm: claudear_config::config::LlmModelConfig::default(),
             chat: claudear_config::config::ChatConfig::default(),
             tls: claudear_config::config::TlsConfig::default(),
         }
@@ -4232,6 +4280,7 @@ mod tests {
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             agent,
             dry_run,
+            llm_engine: None,
         })
     }
 
@@ -4535,6 +4584,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: true,
+            llm_engine: None,
         };
 
         assert!(options.dry_run);
@@ -5116,6 +5166,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
 
@@ -5169,6 +5220,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
 
@@ -5240,6 +5292,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
 
@@ -5303,6 +5356,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
 
@@ -5719,6 +5773,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         assert_eq!(watcher.config.max_issues_per_cycle, 10);
@@ -5804,6 +5859,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: true,
+            llm_engine: None,
         });
 
         // Poll should complete successfully
@@ -5849,6 +5905,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
 
@@ -6467,6 +6524,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         assert!(!watcher.dry_run);
@@ -6829,6 +6887,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         assert_eq!(watcher.config.max_issues_per_cycle, 42);
@@ -6938,6 +6997,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = FixAttempt {
@@ -7001,6 +7061,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = FixAttempt {
@@ -7059,6 +7120,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = FixAttempt {
@@ -7122,6 +7184,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = FixAttempt {
@@ -7299,6 +7362,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: true,
+            llm_engine: None,
         });
 
         watcher.poll().await.unwrap();
@@ -7430,6 +7494,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Verify initial state
@@ -7521,6 +7586,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: true,
+            llm_engine: None,
         });
 
         watcher.poll_source(&source).await.unwrap();
@@ -7603,6 +7669,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Record a root attempt and a child attempt so depth = 1
@@ -7716,6 +7783,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: true,
+            llm_engine: None,
         });
 
         watcher.poll_source(&source).await.unwrap();
@@ -7758,6 +7826,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let base = "Fix the authentication bug";
@@ -7967,6 +8036,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Record an attempt so we can reconstruct it
@@ -8004,6 +8074,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         sqlite.record_attempt("test", "1", "T-1").unwrap();
@@ -8055,6 +8126,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Should complete without panicking
@@ -8093,6 +8165,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Should complete without panicking even with no data
@@ -8130,6 +8203,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         watcher.run_periodic_learning().await;
@@ -8166,6 +8240,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         watcher.run_periodic_learning().await;
@@ -8201,6 +8276,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = claudear_core::types::FixAttempt {
@@ -8257,6 +8333,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = claudear_core::types::FixAttempt {
@@ -8314,6 +8391,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = claudear_core::types::FixAttempt {
@@ -8371,6 +8449,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = claudear_core::types::FixAttempt {
@@ -8428,6 +8507,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = claudear_core::types::FixAttempt {
@@ -8479,6 +8559,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Create a chain: root -> child -> grandchild
@@ -8531,6 +8612,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         sqlite.record_attempt("test", "root", "ROOT").unwrap();
@@ -8658,6 +8740,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: true,
+            llm_engine: None,
         });
 
         let result = watcher.poll_source(&source).await;
@@ -8885,6 +8968,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: true,
+            llm_engine: None,
         });
 
         assert!(watcher.dry_run);
@@ -8933,6 +9017,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
 
@@ -9000,6 +9085,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
         // NOT setting is_running - should break the retry loop early
         watcher.is_running.store(false, Ordering::SeqCst);
@@ -9114,6 +9200,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = FixAttempt {
@@ -9290,6 +9377,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: true,
+            llm_engine: None,
         });
 
         watcher.poll_source(&source).await.unwrap();
@@ -9365,6 +9453,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let attempt = FixAttempt {
@@ -9426,6 +9515,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let base = "Fix the auth bug";
@@ -9534,6 +9624,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Just verify the watcher was created successfully with feedback_analyzer initialized
@@ -9565,6 +9656,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         assert!(!watcher.is_running());
@@ -9738,6 +9830,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
 
@@ -9782,6 +9875,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         sqlite.record_attempt("test", "1", "T-1").unwrap();
@@ -9842,6 +9936,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         })
     }
 
@@ -10201,6 +10296,7 @@ mod tests {
                 sqlite.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Should complete instantly with all learning disabled
@@ -10324,6 +10420,7 @@ mod tests {
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             dry_run: true,
+            llm_engine: None,
             agent: mock_agent,
         });
 
@@ -10402,6 +10499,7 @@ mod tests {
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             dry_run: true,
+            llm_engine: None,
             agent,
         });
 
@@ -10638,6 +10736,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         assert!(watcher.reindex_interval().is_none());
@@ -10670,6 +10769,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         assert!(watcher.reindex_interval().is_none());
@@ -10702,6 +10802,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         assert!(watcher.reindex_interval().is_none());
@@ -10734,6 +10835,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let interval = watcher.reindex_interval().unwrap();
@@ -10767,6 +10869,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let interval = watcher.reindex_interval().unwrap();
@@ -11147,6 +11250,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let result = watcher.check_releases_and_cascade().await;
@@ -11187,6 +11291,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         let result = watcher.check_releases_and_cascade().await;
@@ -11245,6 +11350,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Should return early without panicking
@@ -11279,6 +11385,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
 
         // Should return early without panicking
@@ -11461,6 +11568,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         });
         watcher.is_running.store(true, Ordering::SeqCst);
 
@@ -11816,6 +11924,7 @@ mod tests {
                 tracker.clone(),
             )),
             dry_run: false,
+            llm_engine: None,
         })
     }
 
