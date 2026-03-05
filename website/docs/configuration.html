@@ -143,7 +143,7 @@
             <ul>
             <li><code>default_provider</code>: which provider to use (default: <code>"claude"</code>).</li>
             <li><code>timeout_secs</code>: maximum time an agent run can take before being stopped.</li>
-            <li><code>use_llm</code>: use the local LLM model as the agent runner instead of an external provider. Requires <code>[llm]</code> to be enabled. Fully offline but much slower and cannot create PRs (default: <code>false</code>).</li>
+            <li><code>use_llm</code>: use the local LLM model as the agent runner instead of an external provider. Requires <code>[llm]</code> to be enabled. Fully offline but much slower. Creates PRs via <code>gh</code> CLI (default: <code>false</code>).</li>
             </ul>
             <h3 id="claude-provider"><a class="anchor-link" href="#claude-provider" aria-label="Link to Claude provider settings">#</a>Claude provider settings (<code>[agent.providers.claude]</code>)</h3>
             <ul>
@@ -592,7 +592,7 @@ default_provider = &quot;claude&quot;
 timeout_secs = 21600
 
 # Use the local LLM as the agent runner instead of an external provider (default: false)
-# Requires [llm] to be enabled. Fully offline but much slower and cannot create PRs.
+# Requires [llm] to be enabled. Fully offline but much slower. Creates PRs via `gh` CLI.
 use_llm = false
 
 [agent.providers.claude]

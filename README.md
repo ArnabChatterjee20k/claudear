@@ -852,7 +852,7 @@ default_provider = "claude"
 timeout_secs = 21600
 
 # Use the local LLM as the agent runner instead of an external provider (default: false)
-# Requires [llm] to be enabled. Fully offline but much slower and cannot create PRs.
+# Requires [llm] to be enabled. Fully offline but much slower. Creates PRs via `gh` CLI.
 use_llm = false
 
 [agent.providers.claude]
