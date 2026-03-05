@@ -861,6 +861,23 @@ async fn build_watcher_deps(
         None
     };
 
+    // Optionally swap agent runner to use local LLM
+    let agent: Arc<dyn AgentRunner> = if config.agent.use_llm {
+        if let Some(ref engine) = llm_engine {
+            tracing::info!("Using local LLM as agent runner (agent.use_llm = true)");
+            Arc::new(claudear_engine::llm_agent_runner::LlmAgentRunner::new(
+                engine.clone(),
+            ))
+        } else {
+            tracing::warn!(
+                "agent.use_llm = true but LLM engine not available, using default agent"
+            );
+            agent
+        }
+    } else {
+        agent
+    };
+
     Ok(WatcherDeps {
         sources,
         scm_provider,

@@ -199,9 +199,16 @@ impl Watcher {
     pub fn new(options: WatcherOptions) -> Self {
         let feedback_analyzer = FeedbackAnalyzer::new().with_tracker(options.tracker.clone());
 
-        // Wire LLM classifier into inferrer if both are available
+        // Wire classifier into inferrer: prefer agent-based when use_agent is set
         let mut inferrer = options.inferrer;
-        if let (Some(ref mut inf), Some(ref engine)) = (&mut inferrer, &options.llm_engine) {
+        if options.config.llm.use_agent {
+            if let Some(ref mut inf) = inferrer {
+                let agent_classifier =
+                    crate::agent_classifier::AgentRepoClassifier::new(options.agent.clone());
+                inf.set_classifier(Arc::new(agent_classifier));
+                tracing::info!("Agent-based repo classifier enabled (using configured agent)");
+            }
+        } else if let (Some(ref mut inf), Some(ref engine)) = (&mut inferrer, &options.llm_engine) {
             let classifier = LlmRepoClassifier::new(engine.clone());
             inf.set_classifier(Arc::new(classifier));
             tracing::info!("LLM repo classifier enabled");

@@ -88,6 +88,9 @@ pub struct AgentConfig {
     /// Optional A/B experiments.
     #[serde(default)]
     pub experiments: Vec<ExperimentConfig>,
+    /// Use the local LLM model as the agent runner instead of an external
+    /// provider. Requires [llm] to be enabled. Much slower but fully offline.
+    pub use_llm: bool,
 }
 
 impl Default for AgentConfig {
@@ -99,6 +102,7 @@ impl Default for AgentConfig {
             timeout_secs: 21600,
             providers,
             experiments: Vec::new(),
+            use_llm: false,
         }
     }
 }
@@ -455,6 +459,9 @@ pub struct LlmModelConfig {
     pub threads: u32,
     /// Maximum time in seconds for a single LLM inference call (0 = no limit).
     pub inference_timeout_secs: u64,
+    /// Use the configured agent (claude/codex) for LLM repo classification
+    /// instead of the local model. Much faster but costs API credits.
+    pub use_agent: bool,
 }
 
 impl Default for LlmModelConfig {
@@ -467,6 +474,7 @@ impl Default for LlmModelConfig {
             gpu_layers: 99,
             threads: 0,
             inference_timeout_secs: 120,
+            use_agent: false,
         }
     }
 }
@@ -8215,5 +8223,45 @@ workspace = "/tmp/repos"
         assert!(deser.enabled);
         assert_eq!(deser.providers.len(), 2);
         assert!((deser.providers[0].weight - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_llm_config_use_agent_default_false() {
+        let config = LlmModelConfig::default();
+        assert!(!config.use_agent, "use_agent should default to false");
+    }
+
+    #[test]
+    fn test_llm_config_use_agent_from_toml() {
+        let toml_str = r#"
+            [llm]
+            use_agent = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            llm: LlmModelConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!(wrapper.llm.use_agent);
+    }
+
+    #[test]
+    fn test_agent_config_use_llm_default_false() {
+        let config = AgentConfig::default();
+        assert!(!config.use_llm, "use_llm should default to false");
+    }
+
+    #[test]
+    fn test_agent_config_use_llm_from_toml() {
+        let toml_str = r#"
+            [agent]
+            use_llm = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            agent: AgentConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!(wrapper.agent.use_llm);
     }
 }
