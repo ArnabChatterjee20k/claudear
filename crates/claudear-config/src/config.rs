@@ -431,17 +431,20 @@ pub struct LlmModelConfig {
     pub gpu_layers: u32,
     /// Number of threads for inference (0 = auto-detect).
     pub threads: u32,
+    /// Maximum time in seconds for a single LLM inference call (0 = no limit).
+    pub inference_timeout_secs: u64,
 }
 
 impl Default for LlmModelConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            model_path: PathBuf::from("~/.cache/claudear/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"),
-            model_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf".to_string(),
-            context_length: 16384,
+            model_path: PathBuf::from("~/.cache/claudear/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"),
+            model_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf".to_string(),
+            context_length: 8192,
             gpu_layers: 99,
             threads: 0,
+            inference_timeout_secs: 120,
         }
     }
 }

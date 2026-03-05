@@ -79,6 +79,13 @@ impl ChatService {
             context_length: self.llm_config.context_length,
             gpu_layers: self.llm_config.gpu_layers,
             threads: self.llm_config.threads,
+            timeout: if self.llm_config.inference_timeout_secs > 0 {
+                Some(std::time::Duration::from_secs(
+                    self.llm_config.inference_timeout_secs,
+                ))
+            } else {
+                None
+            },
         };
 
         let engine = Arc::new(LlmEngine::load(&llm_config)?);

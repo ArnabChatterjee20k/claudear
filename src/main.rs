@@ -836,6 +836,13 @@ async fn build_watcher_deps(
                 context_length: config.llm.context_length,
                 gpu_layers: config.llm.gpu_layers,
                 threads: config.llm.threads,
+                timeout: if config.llm.inference_timeout_secs > 0 {
+                    Some(std::time::Duration::from_secs(
+                        config.llm.inference_timeout_secs,
+                    ))
+                } else {
+                    None
+                },
             };
             match claudear::chat::llm::LlmEngine::load(&llm_config) {
                 Ok(engine) => {
@@ -3743,6 +3750,13 @@ async fn async_main() -> anyhow::Result<()> {
                         context_length: config.llm.context_length,
                         gpu_layers: config.llm.gpu_layers,
                         threads: config.llm.threads,
+                        timeout: if config.llm.inference_timeout_secs > 0 {
+                            Some(std::time::Duration::from_secs(
+                                config.llm.inference_timeout_secs,
+                            ))
+                        } else {
+                            None
+                        },
                     };
                     match claudear::chat::llm::LlmEngine::load(&llm_config) {
                         Ok(engine) => {

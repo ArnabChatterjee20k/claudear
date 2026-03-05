@@ -4,6 +4,7 @@ use claudear_core::error::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing;
 
 /// Configuration for the LLM engine.
@@ -17,15 +18,18 @@ pub struct LlmConfig {
     pub gpu_layers: u32,
     /// Number of threads for inference (0 = auto-detect).
     pub threads: u32,
+    /// Maximum time for a single inference call (None = no limit).
+    pub timeout: Option<Duration>,
 }
 
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             model_path: PathBuf::new(),
-            context_length: 16384,
+            context_length: 8192,
             gpu_layers: 99,
             threads: 0,
+            timeout: Some(Duration::from_secs(120)),
         }
     }
 }
@@ -55,6 +59,7 @@ pub struct LlmEngine {
     model: llama_cpp_2::model::LlamaModel,
     _backend: llama_cpp_2::llama_backend::LlamaBackend,
     context_length: u32,
+    timeout: Option<Duration>,
 }
 
 impl LlmEngine {
@@ -89,6 +94,7 @@ impl LlmEngine {
             model,
             _backend: backend,
             context_length: config.context_length,
+            timeout: config.timeout,
         })
     }
 
@@ -166,8 +172,25 @@ impl LlmEngine {
             .max_tokens
             .min(self.context_length - tokens.len() as u32);
         let mut accumulated = String::new();
+        let start = Instant::now();
 
         for _ in 0..max_gen {
+            // Check inference timeout
+            if let Some(timeout) = self.timeout {
+                if start.elapsed() > timeout {
+                    tracing::warn!(
+                        elapsed_secs = start.elapsed().as_secs(),
+                        timeout_secs = timeout.as_secs(),
+                        tokens_generated = output_tokens.len(),
+                        "LLM inference timed out"
+                    );
+                    return Err(Error::Other(format!(
+                        "LLM inference timed out after {}s",
+                        timeout.as_secs()
+                    )));
+                }
+            }
+
             // Sample next token using the sampler chain
             let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(new_token);
@@ -281,10 +304,26 @@ impl LlmEngine {
             .max_tokens
             .min(self.context_length - tokens.len() as u32);
         let mut accumulated = String::new();
+        let start = Instant::now();
 
         for _ in 0..max_gen {
             if cancel.load(Ordering::Relaxed) {
                 break;
+            }
+
+            // Check inference timeout
+            if let Some(timeout) = self.timeout {
+                if start.elapsed() > timeout {
+                    tracing::warn!(
+                        elapsed_secs = start.elapsed().as_secs(),
+                        timeout_secs = timeout.as_secs(),
+                        "LLM inference timed out (streaming channel)"
+                    );
+                    return Err(Error::Other(format!(
+                        "LLM inference timed out after {}s",
+                        timeout.as_secs()
+                    )));
+                }
             }
 
             let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -365,9 +404,10 @@ mod tests {
     #[test]
     fn test_llm_config_default() {
         let config = LlmConfig::default();
-        assert_eq!(config.context_length, 16384);
+        assert_eq!(config.context_length, 8192);
         assert_eq!(config.gpu_layers, 99);
         assert_eq!(config.threads, 0);
+        assert_eq!(config.timeout, Some(Duration::from_secs(120)));
     }
 
     #[test]
@@ -414,13 +454,15 @@ mod tests {
     fn test_llm_config_custom() {
         let config = LlmConfig {
             model_path: PathBuf::from("/some/path.gguf"),
-            context_length: 8192,
+            context_length: 4096,
             gpu_layers: 0,
             threads: 4,
+            timeout: None,
         };
-        assert_eq!(config.context_length, 8192);
+        assert_eq!(config.context_length, 4096);
         assert_eq!(config.gpu_layers, 0);
         assert_eq!(config.threads, 4);
+        assert_eq!(config.timeout, None);
     }
 
     #[test]

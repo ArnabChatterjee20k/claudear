@@ -866,19 +866,22 @@ hourly_engineer_rate = 150.0
 enabled = false
 
 # Path to the GGUF model file
-model_path = "~/.cache/claudear/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+model_path = "~/.cache/claudear/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
 
 # Download URL for the model file (auto-downloaded on startup if missing)
-model_url = "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+model_url = "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
 
-# Context window length in tokens (default: 16384)
-context_length = 16384
+# Context window length in tokens (default: 8192)
+context_length = 8192
 
 # Number of layers to offload to GPU (0 = CPU only, 99 = all; default: 99)
 gpu_layers = 99
 
 # Number of threads for inference (0 = auto-detect; default: 0)
 threads = 0
+
+# Maximum time in seconds for a single LLM inference call (0 = no limit; default: 120)
+inference_timeout_secs = 120
 
 # ============================================
 # Code Chat

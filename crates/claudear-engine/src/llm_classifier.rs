@@ -440,6 +440,7 @@ mod tests {
             context_length: 4096,
             gpu_layers: 99,
             threads: 0,
+            timeout: Some(std::time::Duration::from_secs(120)),
         };
         let engine = Arc::new(
             claudear_integrations::chat::llm::LlmEngine::load(&config)
