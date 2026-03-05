@@ -1140,20 +1140,16 @@ impl RepoInferrer {
                         );
                         if let Some(repo) = index.get(&repo_name) {
                             let score = WEIGHT_LLM_CLASSIFIER * confidence;
-                            let entry =
-                                candidates
-                                    .entry(repo.name.clone())
-                                    .or_insert_with(|| RepoCandidate {
-                                        repo: repo.clone(),
-                                        signals: Vec::new(),
-                                        total_score: 0.0,
-                                    });
+                            let entry = candidates.entry(repo.name.clone()).or_insert_with(|| {
+                                RepoCandidate {
+                                    repo: repo.clone(),
+                                    signals: Vec::new(),
+                                    total_score: 0.0,
+                                }
+                            });
                             entry.signals.push(ScoredSignal {
                                 weight: score,
-                                reason: format!(
-                                    "LLM classification: {:.0}%",
-                                    confidence * 100.0
-                                ),
+                                reason: format!("LLM classification: {:.0}%", confidence * 100.0),
                                 matched_file: None,
                             });
                             entry.total_score += score;

@@ -786,6 +786,29 @@ suppression_rules = [
 ]
 
 # ============================================
+# Embedding Model
+# ============================================
+# ONNX embedding model settings for code indexing and semantic search.
+# GPU acceleration requires building with `--features cuda`.
+
+[embedding]
+# Try CUDA execution provider for GPU-accelerated embeddings (default: false)
+# Requires the binary to be compiled with `--features cuda` AND a CUDA-capable GPU.
+# Falls back to CPU gracefully if CUDA is unavailable.
+gpu = false
+
+# CUDA device index (default: 0)
+device_id = 0
+
+# Override model instance pool size (0 = auto-detect from CPUs/RAM; default: 0)
+# GPU should use 1 to avoid wasting VRAM.
+pool_size = 0
+
+# Override sub-batch size (0 = auto-detect from available memory; default: 0)
+# GPU can handle larger batches (64-256) vs CPU (4-16).
+sub_batch_size = 0
+
+# ============================================
 # Code Indexing
 # ============================================
 # Tree-sitter based code indexing for semantic search across repositories.

@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite"]
+cuda = ["ort/cuda"]
 
 [dependencies]
 claudear-core = { workspace = true }

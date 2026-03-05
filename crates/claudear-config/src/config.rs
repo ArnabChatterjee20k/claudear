@@ -386,6 +386,9 @@ pub struct Config {
     /// TLS auto-provisioning configuration (Let's Encrypt ACME).
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Embedding model configuration (GPU acceleration, pool size).
+    #[serde(default)]
+    pub embedding: EmbeddingModelConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -410,6 +413,25 @@ impl Default for DashboardConfig {
             hourly_engineer_rate: 75.0,
         }
     }
+}
+
+/// Embedding model configuration.
+///
+/// Controls GPU acceleration and pool/batch sizing for the ONNX embedding model.
+/// Configured under the `[embedding]` TOML section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingModelConfig {
+    /// Whether to try the CUDA execution provider (requires `--features cuda`).
+    pub gpu: bool,
+    /// CUDA device index (default: 0).
+    pub device_id: i32,
+    /// Override model instance pool size (0 = auto-detect from available CPUs/RAM).
+    /// GPU should typically use 1 to avoid wasting VRAM.
+    pub pool_size: u32,
+    /// Override sub-batch size (0 = auto-detect from available memory).
+    /// GPU can handle larger batches (64-256) than CPU (4-16).
+    pub sub_batch_size: u32,
 }
 
 /// Local LLM configuration.
@@ -441,7 +463,7 @@ impl Default for LlmModelConfig {
             enabled: false,
             model_path: PathBuf::from("~/.cache/claudear/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"),
             model_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf".to_string(),
-            context_length: 8192,
+            context_length: 16384,
             gpu_layers: 99,
             threads: 0,
             inference_timeout_secs: 120,
@@ -551,6 +573,7 @@ impl Default for Config {
             llm: LlmModelConfig::default(),
             chat: ChatConfig::default(),
             tls: TlsConfig::default(),
+            embedding: EmbeddingModelConfig::default(),
         }
     }
 }

@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite", "claudear-analysis/sqlite", "claudear-integrations/sqlite"]
+cuda = ["claudear-analysis/cuda", "ort/cuda"]
 
 [dependencies]
 claudear-core = { workspace = true }
@@ -13,6 +14,9 @@ claudear-config = { workspace = true }
 claudear-storage = { workspace = true }
 claudear-analysis = { workspace = true }
 claudear-integrations = { workspace = true }
+
+# ORT runtime (for execution provider types)
+ort = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

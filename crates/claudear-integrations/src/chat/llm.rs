@@ -26,7 +26,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             model_path: PathBuf::new(),
-            context_length: 8192,
+            context_length: 16384,
             gpu_layers: 99,
             threads: 0,
             timeout: Some(Duration::from_secs(120)),
@@ -73,8 +73,11 @@ impl LlmEngine {
             "Loading LLM model"
         );
 
-        let backend = llama_cpp_2::llama_backend::LlamaBackend::init()
+        let mut backend = llama_cpp_2::llama_backend::LlamaBackend::init()
             .map_err(|e| Error::config(format!("Failed to init llama backend: {e}")))?;
+
+        // Suppress verbose llama.cpp internal logging (KV cache layers, scheduler, etc.)
+        backend.void_logs();
 
         let model_params = {
             let params = llama_cpp_2::model::params::LlamaModelParams::default();
@@ -110,6 +113,20 @@ impl LlmEngine {
         use llama_cpp_2::llama_batch::LlamaBatch;
         use llama_cpp_2::sampling::LlamaSampler;
 
+        // Tokenize and check length BEFORE creating the expensive context
+        let tokens = self
+            .model
+            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
+            .map_err(|e| Error::Other(format!("Tokenization failed: {e}")))?;
+
+        if tokens.len() as u32 >= self.context_length {
+            return Err(Error::Other(format!(
+                "Prompt ({} tokens) exceeds context length ({})",
+                tokens.len(),
+                self.context_length
+            )));
+        }
+
         let threads = std::thread::available_parallelism()
             .map(|n| (n.get() as u32).max(1) / 2)
             .unwrap_or(4)
@@ -125,20 +142,6 @@ impl LlmEngine {
             .model
             .new_context(&self._backend, ctx_params)
             .map_err(|e| Error::Other(format!("Failed to create context: {e}")))?;
-
-        // Tokenize the prompt
-        let tokens = self
-            .model
-            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
-            .map_err(|e| Error::Other(format!("Tokenization failed: {e}")))?;
-
-        if tokens.len() as u32 >= self.context_length {
-            return Err(Error::Other(format!(
-                "Prompt ({} tokens) exceeds context length ({})",
-                tokens.len(),
-                self.context_length
-            )));
-        }
 
         // Create batch and fill with prompt tokens
         let mut batch = LlamaBatch::new(self.context_length as usize, 1);
@@ -249,6 +252,20 @@ impl LlmEngine {
         use llama_cpp_2::llama_batch::LlamaBatch;
         use llama_cpp_2::sampling::LlamaSampler;
 
+        // Tokenize and check length BEFORE creating the expensive context
+        let tokens = self
+            .model
+            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
+            .map_err(|e| Error::Other(format!("Tokenization failed: {e}")))?;
+
+        if tokens.len() as u32 >= self.context_length {
+            return Err(Error::Other(format!(
+                "Prompt ({} tokens) exceeds context length ({})",
+                tokens.len(),
+                self.context_length
+            )));
+        }
+
         let threads = std::thread::available_parallelism()
             .map(|n| (n.get() as u32).max(1) / 2)
             .unwrap_or(4)
@@ -264,19 +281,6 @@ impl LlmEngine {
             .model
             .new_context(&self._backend, ctx_params)
             .map_err(|e| Error::Other(format!("Failed to create context: {e}")))?;
-
-        let tokens = self
-            .model
-            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
-            .map_err(|e| Error::Other(format!("Tokenization failed: {e}")))?;
-
-        if tokens.len() as u32 >= self.context_length {
-            return Err(Error::Other(format!(
-                "Prompt ({} tokens) exceeds context length ({})",
-                tokens.len(),
-                self.context_length
-            )));
-        }
 
         let mut batch = LlamaBatch::new(self.context_length as usize, 1);
 
@@ -404,7 +408,7 @@ mod tests {
     #[test]
     fn test_llm_config_default() {
         let config = LlmConfig::default();
-        assert_eq!(config.context_length, 8192);
+        assert_eq!(config.context_length, 16384);
         assert_eq!(config.gpu_layers, 99);
         assert_eq!(config.threads, 0);
         assert_eq!(config.timeout, Some(Duration::from_secs(120)));

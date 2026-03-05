@@ -947,6 +947,7 @@ dependencies = [
  "indicatif 0.18.4",
  "libc",
  "mime_guess",
+ "ort",
  "rand 0.10.0",
  "regex-lite",
  "reqwest 0.13.2",

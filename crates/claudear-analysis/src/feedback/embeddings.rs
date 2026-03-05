@@ -3,7 +3,7 @@
 //! Uses the Nomic Embed Text model for generating embeddings.
 
 use claudear_core::error::{Error, Result};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, ExecutionProviderDispatch, InitOptions, TextEmbedding};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +18,10 @@ pub struct EmbeddingConfig {
     pub cache_dir: Option<String>,
     /// Number of model instances in the pool (defaults to available CPUs).
     pub pool_size: usize,
+    /// ONNX Runtime execution providers (e.g. CUDA). Empty = CPU only.
+    pub execution_providers: Vec<ExecutionProviderDispatch>,
+    /// Override sub-batch size (0 = auto-detect).
+    pub sub_batch_size: usize,
 }
 
 fn default_pool_size() -> usize {
@@ -33,6 +37,8 @@ impl Default for EmbeddingConfig {
             show_download_progress: true,
             cache_dir: None,
             pool_size: default_pool_size(),
+            execution_providers: Vec::new(),
+            sub_batch_size: 0,
         }
     }
 }
@@ -63,6 +69,8 @@ impl EmbeddingConfig {
             show_download_progress: true,
             cache_dir,
             pool_size,
+            execution_providers: Vec::new(),
+            sub_batch_size: 0,
         }
     }
 
@@ -73,6 +81,8 @@ impl EmbeddingConfig {
             show_download_progress: true,
             cache_dir: None,
             pool_size: default_pool_size(),
+            execution_providers: Vec::new(),
+            sub_batch_size: 0,
         }
     }
 }
@@ -86,6 +96,10 @@ pub struct EmbeddingClient {
     next: AtomicUsize,
     dimension: usize,
     model_name: String,
+    /// Config-level sub-batch override (0 = auto-detect).
+    sub_batch_override: usize,
+    /// Whether GPU execution providers were configured.
+    gpu: bool,
 }
 
 impl EmbeddingClient {
@@ -116,11 +130,17 @@ impl EmbeddingClient {
         sys.refresh_memory();
         let mem_before = sys.available_memory();
 
+        let has_gpu_providers = !config.execution_providers.is_empty();
+
         let mut first_model = {
             let mut init_options = InitOptions::new(config.model.clone())
                 .with_show_download_progress(config.show_download_progress);
             if let Some(ref cache_dir) = config.cache_dir {
                 init_options = init_options.with_cache_dir(cache_dir.into());
+            }
+            if !config.execution_providers.is_empty() {
+                init_options =
+                    init_options.with_execution_providers(config.execution_providers.clone());
             }
             TextEmbedding::try_new(init_options)
                 .map_err(|e| Error::Other(format!("Failed to initialize embedding model: {}", e)))?
@@ -180,6 +200,10 @@ impl EmbeddingClient {
             if let Some(ref cache_dir) = config.cache_dir {
                 init_options = init_options.with_cache_dir(cache_dir.into());
             }
+            if !config.execution_providers.is_empty() {
+                init_options =
+                    init_options.with_execution_providers(config.execution_providers.clone());
+            }
 
             let model = TextEmbedding::try_new(init_options).map_err(|e| {
                 Error::Other(format!("Failed to initialize embedding model: {}", e))
@@ -187,18 +211,28 @@ impl EmbeddingClient {
             pool.push(Arc::new(Mutex::new(model)));
         }
 
+        let ep_label = if has_gpu_providers {
+            "GPU (CUDA)"
+        } else {
+            "CPU"
+        };
         tracing::info!(
-            "Initialized embedding model: {} ({}d, pool_size={})",
+            "Initialized embedding model: {} ({}d, pool_size={}, execution_provider={})",
             model_name,
             dimension,
             pool_size,
+            ep_label,
         );
+
+        let sub_batch_override = config.sub_batch_size;
 
         Ok(Self {
             pool,
             next: AtomicUsize::new(0),
             dimension,
             model_name,
+            sub_batch_override,
+            gpu: has_gpu_providers,
         })
     }
 
@@ -212,7 +246,9 @@ impl EmbeddingClient {
     ///
     /// Uses 50% of available RAM as a budget.  Falls back to 32 if sysinfo
     /// reports 0.  Respects `EMBEDDING_SUB_BATCH` env var for manual override.
-    fn compute_sub_batch(dimension: usize) -> usize {
+    /// When GPU is enabled, the upper clamp is raised to 256 (GPU VRAM can
+    /// handle much larger batches than CPU).
+    fn compute_sub_batch(dimension: usize, gpu: bool) -> usize {
         if let Some(val) = std::env::var("CLAUDEAR_EMBEDDING_SUB_BATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -236,7 +272,8 @@ impl EmbeddingClient {
         // sub-batch stays small enough to prevent arena over-allocation.
         let mb_per_text: u64 = if dimension >= 768 { 100 } else { 40 };
         let budget_mb = available_mb / 2;
-        (budget_mb / mb_per_text).clamp(4, 16) as usize
+        let max_batch = if gpu { 256 } else { 16 };
+        (budget_mb / mb_per_text).clamp(4, max_batch) as usize
     }
 
     /// Create with default configuration from environment.
@@ -291,7 +328,11 @@ impl EmbeddingClient {
     /// them onto the blocking pool.  Mutex contention naturally limits
     /// concurrency to `pool_size` simultaneous ONNX calls.
     pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let sub_batch = Self::compute_sub_batch(self.dimension);
+        let sub_batch = if self.sub_batch_override > 0 {
+            self.sub_batch_override
+        } else {
+            Self::compute_sub_batch(self.dimension, self.gpu)
+        };
 
         let mut handles = Vec::new();
 
@@ -729,7 +770,7 @@ mod tests {
     #[test]
     fn test_compute_sub_batch_without_env_high_dim() {
         std::env::remove_var("EMBEDDING_SUB_BATCH");
-        let result = EmbeddingClient::compute_sub_batch(768);
+        let result = EmbeddingClient::compute_sub_batch(768, false);
         // Should be between 4 and 16 (memory-based clamp range)
         assert!((4..=16).contains(&result));
     }
@@ -737,9 +778,17 @@ mod tests {
     #[test]
     fn test_compute_sub_batch_without_env_low_dim() {
         std::env::remove_var("EMBEDDING_SUB_BATCH");
-        let result = EmbeddingClient::compute_sub_batch(384);
+        let result = EmbeddingClient::compute_sub_batch(384, false);
         // Low dimension uses 40 MB/text, so budget allows more per batch
         assert!((4..=16).contains(&result));
+    }
+
+    #[test]
+    fn test_compute_sub_batch_gpu_higher_upper_bound() {
+        std::env::remove_var("EMBEDDING_SUB_BATCH");
+        let result = EmbeddingClient::compute_sub_batch(768, true);
+        // GPU allows up to 256 (vs 16 for CPU)
+        assert!((4..=256).contains(&result));
     }
 
     // === Coverage: default_pool_size ===

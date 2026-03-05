@@ -1201,6 +1201,7 @@ mod tests {
                 show_download_progress: false,
                 cache_dir: None,
                 pool_size: 1,
+                ..EmbeddingConfig::default()
             })
             .expect("Failed to create test embedding client"),
         )

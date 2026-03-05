@@ -167,6 +167,7 @@ path = "src/lib.rs"
 [features]
 default = ["sqlite"]
 sqlite = ["dep:rusqlite", "claudear-core/sqlite", "claudear-storage/sqlite", "claudear-analysis/sqlite", "claudear-integrations/sqlite", "claudear-engine/sqlite"]
+cuda = ["claudear-analysis/cuda", "claudear-engine/cuda"]
 
 [dependencies]
 claudear-core = { workspace = true }

@@ -1709,6 +1709,7 @@ mod tests {
             chat: claudear_config::config::ChatConfig::default(),
             tls: claudear_config::config::TlsConfig::default(),
             llm: claudear_config::config::LlmModelConfig::default(),
+            embedding: claudear_config::config::EmbeddingModelConfig::default(),
         }
     }
 
