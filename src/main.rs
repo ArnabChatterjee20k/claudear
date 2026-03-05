@@ -1445,9 +1445,7 @@ fn enrich_path_from_login_shell() {
         .output();
 
     let login_path = match output {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => return,
     };
 
