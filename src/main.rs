@@ -792,6 +792,11 @@ async fn build_watcher_deps(
                 .default_provider_config()
                 .and_then(|p| p.binary.clone())
                 .unwrap_or_else(|| "claude".to_string()),
+            env: config
+                .agent
+                .default_provider_config()
+                .map(|p| p.env.clone())
+                .unwrap_or_default(),
         },
         tracker.clone(),
     )));
@@ -1427,7 +1432,54 @@ fn start_regression_monitoring(
     Some(handle)
 }
 
+/// Enrich the process PATH with entries from the user's login shell.
+///
+/// When started via systemd or cron, the PATH is minimal and won't include
+/// user-local directories like `~/.local/bin` or nvm/fnm node paths. This
+/// runs `$SHELL -l -c 'echo $PATH'` to capture the full login PATH and
+/// prepends any missing entries to the current PATH.
+fn enrich_path_from_login_shell() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-c", "echo $PATH"])
+        .output();
+
+    let login_path = match output {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => return,
+    };
+
+    if login_path.is_empty() {
+        return;
+    }
+
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let current_entries: std::collections::HashSet<&str> = current_path.split(':').collect();
+
+    let mut new_entries: Vec<&str> = Vec::new();
+    for entry in login_path.split(':') {
+        if !entry.is_empty() && !current_entries.contains(entry) {
+            new_entries.push(entry);
+        }
+    }
+
+    if !new_entries.is_empty() {
+        let merged = if current_path.is_empty() {
+            new_entries.join(":")
+        } else {
+            format!("{}:{}", new_entries.join(":"), current_path)
+        };
+        std::env::set_var("PATH", &merged);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    // Resolve the user's login shell PATH so that user-local binaries
+    // (e.g. claude via nvm/node) are discoverable when started via systemd.
+    enrich_path_from_login_shell();
+
     // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
     let _sentry_guard = sentry::init((
         std::env::var("CLAUDEAR_SENTRY_DSN").unwrap_or_default(),
@@ -3444,6 +3496,11 @@ async fn async_main() -> anyhow::Result<()> {
                         .default_provider_config()
                         .and_then(|p| p.binary.clone())
                         .unwrap_or_else(|| "claude".to_string()),
+                    env: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.env.clone())
+                        .unwrap_or_default(),
                 },
                 tracker.clone(),
             )));
@@ -3770,6 +3827,11 @@ async fn async_main() -> anyhow::Result<()> {
                             .default_provider_config()
                             .and_then(|p| p.binary.clone())
                             .unwrap_or_else(|| "claude".to_string()),
+                        env: config
+                            .agent
+                            .default_provider_config()
+                            .map(|p| p.env.clone())
+                            .unwrap_or_default(),
                     },
                     tracker.clone(),
                 )));
