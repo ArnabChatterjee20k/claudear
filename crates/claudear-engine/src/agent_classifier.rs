@@ -5,7 +5,6 @@
 
 use claudear_analysis::inference::{ClassificationRequest, RepoClassifier};
 use claudear_integrations::runner::AgentRunner;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,7 +23,7 @@ impl AgentRepoClassifier {
 impl RepoClassifier for AgentRepoClassifier {
     fn classify(&self, request: &ClassificationRequest) -> Option<(String, f32)> {
         let prompt = build_prompt(request);
-        let temp_dir = PathBuf::from("/tmp/claudear-agent-classify");
+        let temp_dir = std::env::temp_dir();
 
         let start = Instant::now();
 
